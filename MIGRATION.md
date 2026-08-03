@@ -106,7 +106,8 @@ Not everything agent-shaped moves. These stay in the gateway because they are
 about *inference*, not about *agents*:
 
 - `api_logs.agent_job_id` and the cost/usage queries over it — this is the
-  billing ledger, and it is what enforces a job's budget.
+  attribution ledger for reporting what a job spent. Monetary enforcement is
+  the gateway's existing per-user quota; there is no per-job budget.
 - The grant verification path (`model_auth.py` → a gateway-owned grants module):
   the gateway mints and verifies inference grants, so the signing secret never
   leaves it.
@@ -130,7 +131,7 @@ about *inference*, not about *agents*:
 | C | C5–C8 — inference grants, usage, contracts | ⏳ not started | needs Murphy design review |
 | D | D1 — host package skeleton | ✅ done | landed with the B1 scaffold |
 | D | D2 — sandbox, runtimes, egress (+proxy) | ✅ merged | this repo #2 |
-| D | D3+D4 — workspace setup/paths/snapshot + patch gate | 🔍 in review | this repo #3; one PR because `workspace_snapshot` imports `patch_gate` |
+| D | D3+D4 — workspace setup/paths/snapshot + patch gate | 🔍 code in review; D3 acceptance pending D6 | this repo #3; one PR because `workspace_snapshot` imports `patch_gate`; snapshot tests are owned by D6 above |
 | D5–H | remaining moves, web, host pool, cutover | ⏳ not started | — |
 
 Update this table as tasks land. It is the answer to "what is actually done" —

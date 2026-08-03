@@ -1,12 +1,11 @@
 """No tracked file may carry a real credential.
 
-CI runs gitleaks over the tree and the full history, but ``.gitleaks.toml``
-exempts ``tests/*.py`` wholesale — test files legitimately carry
-credential-shaped fixtures, starting with the patch gate's own detector tests.
-This test closes the gap that exemption opens, in the repository's own
-language: it scans every tracked file for the credential formats this project
-and its gateway actually issue, which the scanner's default rules do not all
-know, and it exempts fixtures by literal value rather than by directory.
+CI runs gitleaks over the tree and the full history. Its config allowlists only
+one exact fake fixture line — never a path — so history remains covered. This
+test adds the repository's own language: it scans every tracked file for the
+credential formats this project and its gateway actually issue, which the
+scanner's default rules do not all know, and it exempts fixtures by literal
+value rather than by directory.
 
 The layout is inherited from the source repository, which learned it the hard
 way: a wholesale path exemption hid a live key there for months. This
@@ -32,7 +31,7 @@ REPO = Path(__file__).resolve().parents[2]
 # Credential shapes worth failing on. Each is deliberately narrow: enough
 # random-looking payload that a hand-written fixture will not match.
 SECRET_SHAPES = {
-    "FreeInference gateway API key": re.compile(r"hyi-[A-Za-z0-9]{32,}"),
+    "FreeInference gateway API key": re.compile(r"hyi-[A-Za-z0-9_-]{32,}"),
     "Agent control/worker token": re.compile(r"ajt\.[A-Za-z0-9_\-]{24,}\.[A-Za-z0-9_\-]{24,}"),
     "OpenRouter key": re.compile(r"sk-or-v1-[A-Za-z0-9]{32,}"),
     "Anthropic key": re.compile(r"sk-ant-[A-Za-z0-9\-_]{40,}"),
@@ -115,7 +114,10 @@ def test_the_shapes_actually_discriminate() -> None:
     this file — the scan reads tracked files, and this file is one of them.
     """
     gateway = SECRET_SHAPES["FreeInference gateway API key"]
-    sample = "hyi-" + "QQ7mKp2XvR9tLbN4wZcE6yHsA1dJfG3uT8oViM5rPkB"
+    # ``generate_api_key`` uses secrets.token_urlsafe(32), so both URL-safe
+    # punctuation characters are part of the real alphabet. An alphanumeric-
+    # only sample would let the detector silently miss most keys it protects.
+    sample = "hyi-" + "QQ7mKp2XvR9tLbN4_wZcE6yHsA1-dJfG3uT8oViM5rPkB"
     assert gateway.fullmatch(sample)
     # Short, obviously-fake fixtures must keep passing.
     for fixture in ("hyi-not-a-real-key", "hyi-" + "d" * 8):

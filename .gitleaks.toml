@@ -2,24 +2,25 @@
 # this repository actually needs.
 #
 # Division of labour: gitleaks runs its default rules over the tree AND the
-# history (secret-scan.yml), but test files are exempted wholesale below —
-# they legitimately carry credential-shaped fixtures, starting with the patch
-# gate's own detector tests. The gap that exemption opens is closed in the
-# repository's own language by tests/unit/test_no_committed_credentials.py,
-# which scans every tracked file for the credential formats this project and
-# its gateway actually issue, and exempts fixtures by literal value rather
-# than by directory.
+# history (secret-scan.yml). Its one allowlist entry below is the exact fake
+# Slack token line in the patch gate's detector tests — never a path. That
+# precision matters for the history scan: a path exemption would also hide a
+# real credential committed to a test and removed in a later commit.
+# tests/unit/test_no_committed_credentials.py complements the default rules by
+# scanning every tracked file for credential formats this project and its
+# gateway issue but gitleaks may not know, including hyi- and ajt. tokens.
 #
 # The source repo learned this layout the hard way: a wholesale exemption on
-# docs paths hid a live key for months. This file therefore exempts ONLY
-# tests/*.py. If docs with credential-shaped samples arrive, add the narrow
-# rule then — with the backstop extended first.
+# docs paths hid a live key for months. Never add a directory-wide exemption
+# here. If another credential-shaped sample arrives, allowlist its exact known
+# fake value or line, with the backstop extended first where needed.
 
 [extend]
 useDefault = true
 
 [[allowlists]]
-description = "Test fixtures — intentionally credential-shaped values in test code, backstopped by test_no_committed_credentials.py."
-paths = [
-  '''^tests/.*\.py$''',
+description = "Known fake Slack token in the patch-gate detector test."
+regexTarget = "line"
+regexes = [
+  '''\("slack_token", "xoxb-123456789012-abcdefghijkl"\),''',
 ]
