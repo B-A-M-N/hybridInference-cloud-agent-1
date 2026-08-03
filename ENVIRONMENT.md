@@ -104,6 +104,7 @@ need a gateway secret here, the design is wrong — stop and escalate.
 | `AGENT_TERMINAL_MAX_SESSIONS` | existing | |
 | `AGENT_GENERIC_COMMAND` | existing | |
 | `AGENT_ENROLL_TOKEN` | **NEW** | One-time host enrollment token (task G2). Issued from the admin dashboard, consumed once at first boot, then replaced by a stored host credential. |
+| `AGENT_LOG_LEVEL` | **NEW** | Host process log level (default INFO). Read by `configure_process_logging()` at the runner entrypoint; replaces the source repo's import-side-effect logging setup (task D6). |
 
 ## Sandbox isolation (host agent reads, sandbox inherits)
 
