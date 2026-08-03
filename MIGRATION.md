@@ -52,6 +52,33 @@ calls with the same capability token and store fence as model calls, so it stays
 on the gateway side and inference grants must describe MCP access as well as
 models. See the manifest's coordination notes.
 
+## Post-freeze drift register
+
+The freeze promise is "copy from `764a6f97` and you copy what runs on dev".
+Two files have drifted since — both formatting-only, verified by
+`git diff 764a6f97..dev`:
+
+| File | Drift | Consumer task |
+|---|---|---|
+| `apps/frontend/src/components/features/agents/IntegrationsView.tsx` | Prettier prose re-wrap, 2 lines | F2 |
+| `tests/servers/test_agent_jobs_api.py` | two blank lines restored between test sections (the ruff fix that rode in with upstream #1177's merge) | E10 |
+
+Rule for those tasks: copy from the freeze commit as usual, then run this
+repo's formatter and confirm the result matches dev's copy — the diff against
+dev must stay formatting-only. Any *new* drift discovered during a task gets a
+row here before the task proceeds; **semantic** drift additionally needs
+Murphy's sign-off, because it means the freeze was violated upstream.
+
+## Deferred behaviour register
+
+Differences against the source repo that are deliberate now and owed a fix by
+a named task. Each entry lists the tripwire that keeps it from being
+forgotten.
+
+| Deferred | Owner | Tripwire |
+|---|---|---|
+| Host logging is unconfigured. The source's `get_logger` initialised root logging as a side effect; the shim (`host/cloud_agent_host/logging_utils.py`) deliberately does not, so INFO events from host modules (e.g. `agent_sandbox_spawn`) go nowhere until an entrypoint configures logging. | **D6** (runner move): acceptance includes entrypoint logging configuration **and a test that a host module INFO event reaches a handler**. | `tests/unit/test_logging_utils.py` pins the shim's no-side-effects contract; this row. |
+
 ## Upstream provenance
 
 The cloud agent was built in the source repository between **2026-07-28** and
@@ -97,9 +124,11 @@ about *inference*, not about *agents*:
 | A | A3 — file manifest | ✅ done | upstream |
 | C | C1 — identity JWKS endpoint (+ key rotation) | ✅ merged | upstream #1174 |
 | C | C2/C3 — authorization code + token exchange | ✅ merged | upstream #1177 |
-| C | C4 — /authorize consent page | 🔍 in review | upstream #1179 |
+| C | C4 — /authorize consent page | ✅ merged | upstream #1179 |
 | C | C5–C8 — inference grants, usage, contracts | ⏳ not started | needs Murphy design review |
-| D–H | moves, web, host pool, cutover | ⏳ not started | D blocked on this PR merging (CI) |
+| D | D1 — host package skeleton | ✅ done | landed with the B1 scaffold |
+| D | D2 — sandbox, runtimes, egress (+proxy) | 🔍 in review | this repo #2 |
+| D3–H | remaining moves, web, host pool, cutover | ⏳ not started | — |
 
 Update this table as tasks land. It is the answer to "what is actually done" —
 the plan describes intent, this describes reality.
