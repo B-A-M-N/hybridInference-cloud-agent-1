@@ -18,19 +18,24 @@ this file and in commit messages instead.
 | | |
 |---|---|
 | Source repository | `HarvardMadSys/hybridInference` (private) |
-| Freeze commit | _not yet declared_ — see below |
+| Freeze commit | `764a6f97477504deb4542e1c28c3128ff9601c94` (2026-08-03) |
 | Manifest | `docs/agents/plans/cloud-agent-split-manifest.md` in the source repo |
 | Plan | `docs/agents/plans/2026-08-03-cloud-agent-repo-split.md` in the source repo |
 
-**The freeze commit is not yet set.** It is declared once these pull requests
-land or close (task A1): #1147 (egress allowlist proxy), #1148 (MCP via the
-gateway), #1167 (runner-host lock order), #1168 (Kata provisioning), #1170
-(remote runner relay). Anything still open at freeze time has to be re-ported by
-hand, so they are resolved first. Until then, migration tasks must not start —
-they would copy files that are about to change.
+Every migration task copies from this commit. Fetch a file with
+`git show 764a6f97:<path>` rather than from the source repo's `dev`, which will
+have moved on.
 
-When declared, record it here as `FREEZE_SHA` and regenerate the manifest
-against it.
+The freeze waited on five pull requests — #1147 (egress allowlist proxy), #1148
+(MCP via the gateway), #1167 (runner-host lock order), #1168 (Kata
+provisioning), #1170 (remote runner relay) — because anything unmerged at freeze
+time would have to be re-ported by hand. All five landed on 2026-08-03, adding
+13 files to the manifest.
+
+One of them changed the shape of the split. The MCP proxy authenticates tool
+calls with the same capability token and store fence as model calls, so it stays
+on the gateway side and inference grants must describe MCP access as well as
+models. See the manifest's coordination notes.
 
 ## Upstream provenance
 
@@ -72,9 +77,11 @@ about *inference*, not about *agents*:
 | B | B2 — CI and secret scanning | ✅ landed | this PR |
 | B | B3 — migration record | ✅ landed | this PR |
 | B | B4 — environment inventory | ✅ landed | this PR |
-| A | A1 — resolve open agent PRs | ⏳ blocked (human) | — |
-| A | A2 — declare freeze | ⏳ blocked on A1 | — |
-| C–H | contracts, moves, cutover | ⏳ not started | — |
+| A | A1 — resolve open agent PRs | ✅ done | 5 PRs merged upstream |
+| A | A2 — declare freeze | ✅ done | `764a6f97` upstream |
+| A | A3 — file manifest | ✅ done | upstream |
+| C | C1 — identity JWKS endpoint | 🔍 in review | upstream #1174 |
+| D–H | moves, web, host pool, cutover | ⏳ not started | — |
 
 Update this table as tasks land. It is the answer to "what is actually done" —
 the plan describes intent, this describes reality.
