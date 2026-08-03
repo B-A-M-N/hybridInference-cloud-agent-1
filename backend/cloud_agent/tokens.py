@@ -46,11 +46,15 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 from typing import Any
 
 # Domain separation: a signature over this prefix is meaningless anywhere else.
 _TOKEN_PREFIX = "ajt"
 _SIGNING_CONTEXT = b"agent-job-worker-token:v1"
+
+# Host credentials get their own prefix — see ``mint_host_token``.
+_HOST_TOKEN_PREFIX = "aht"
 
 
 class InvalidAgentToken(Exception):
@@ -100,6 +104,16 @@ def _b64decode(value: str) -> bytes:
 SCOPE_FULL = "full"
 SCOPE_MODEL = "model"
 _VALID_SCOPES = (SCOPE_FULL, SCOPE_MODEL)
+
+# ``host`` is the third scope, and it is deliberately *not* in the tuple above.
+#
+# A worker token names an attempt; a host token names a machine, and lives for
+# as long as that machine is enrolled. Putting them in one namespace would mean
+# ``mint_worker_token(scope="host")`` could produce a machine credential bound
+# to an attempt, and ``parse_worker_token`` would have to be trusted to notice.
+# Separate prefixes make the two mutually unparseable, so the check is
+# structural rather than a comparison somebody has to remember to write.
+SCOPE_HOST = "host"
 
 
 def mint_worker_token(
@@ -157,3 +171,61 @@ def parse_worker_token(token: str) -> dict[str, Any]:
         }
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise InvalidAgentToken("bad claims") from exc
+
+
+class InvalidHostToken(Exception):
+    """Raised when a host credential is malformed, mis-signed, or truncated."""
+
+
+def mint_host_token(*, host: str) -> str:
+    """Mint the credential a host receives when it enrolls.
+
+    Unlike a worker token this is not self-revoking — there is no attempt whose
+    fence expires under it — so revocation is external: the control plane
+    stores only ``sha256`` of this string, and clearing that column kills the
+    credential. That is why a nonce is included. Two enrollments of the same
+    host must produce two different credentials, otherwise revoking one and
+    re-issuing would hand back the token that was just revoked.
+    """
+    payload = json.dumps(
+        {"h": host, "n": secrets.token_hex(8), "s": SCOPE_HOST},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    signature = hmac.new(_signing_key(), payload, hashlib.sha256).digest()
+    return f"{_HOST_TOKEN_PREFIX}.{_b64encode(payload)}.{_b64encode(signature)}"
+
+
+def parse_host_token(token: str) -> dict[str, Any]:
+    """Verify a host credential and return the machine it names.
+
+    Returns ``{"host", "scope"}``. The signature proves this service minted it;
+    it does **not** prove the credential is still valid. The caller must still
+    compare its hash against the host row, because that comparison is the only
+    thing revocation can act on.
+    """
+    if not token:
+        raise InvalidHostToken("empty token")
+    parts = token.split(".")
+    if len(parts) != 3 or parts[0] != _HOST_TOKEN_PREFIX:
+        raise InvalidHostToken("malformed token")
+    try:
+        payload = _b64decode(parts[1])
+        signature = _b64decode(parts[2])
+    except (ValueError, TypeError) as exc:
+        raise InvalidHostToken("undecodable token") from exc
+
+    expected = hmac.new(_signing_key(), payload, hashlib.sha256).digest()
+    if not hmac.compare_digest(signature, expected):
+        raise InvalidHostToken("bad signature")
+
+    try:
+        claims = json.loads(payload)
+        if str(claims.get("s")) != SCOPE_HOST:
+            raise InvalidHostToken("not a host credential")
+        host = str(claims["h"])
+        if not host:
+            raise InvalidHostToken("bad claims")
+        return {"host": host, "scope": SCOPE_HOST}
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise InvalidHostToken("bad claims") from exc

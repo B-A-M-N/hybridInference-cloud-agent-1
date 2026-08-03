@@ -48,6 +48,7 @@ from cloud_agent.api.deps import (
     verify_admin_access,
     verify_api_key,
 )
+from cloud_agent.broker_routing import broker_for_attempt, broker_for_job
 from cloud_agent.entitlement import (
     REPO_PATTERN,
     RepoNotAllowed,
@@ -56,6 +57,7 @@ from cloud_agent.entitlement import (
 )
 from cloud_agent.gateway import GatewayError
 from cloud_agent.github_app import AppNotInstalled, GitHubAppError
+from cloud_agent.host_pool import hash_secret
 from cloud_agent.logging_utils import get_logger
 from cloud_agent.schemas import (
     BASE_REF_METADATA_KEY,
@@ -120,7 +122,9 @@ from cloud_agent.tokens import (
     SCOPE_FULL,
     SCOPE_MODEL,
     InvalidAgentToken,
+    InvalidHostToken,
     mint_worker_token,
+    parse_host_token,
     parse_worker_token,
 )
 from cloud_agent.visible_models import agent_model_resolvable, agent_visible_models
@@ -133,7 +137,6 @@ from cloud_agent_host.runtimes import registered_runtimes, runtimes_supporting_m
 from cloud_agent_host.workspace_broker_client import (
     WorkspaceBrokerClient,
     WorkspaceBrokerError,
-    workspace_broker_from_env,
 )
 from cloud_agent_host.workspace_browser import (
     WorkspacePathError,
@@ -1089,7 +1092,8 @@ async def cancel_agent_job(
     job_store = _require_store(store)
     await _owned_job(job_store, job_id, user)
     state = await job_store.request_cancel(job_id=job_id, user_id=user["user_id"])
-    if state in TERMINAL_STATES and await resume_settled_terminal(job_id):
+    settled_broker = await broker_for_job(job_store, job_id)
+    if state in TERMINAL_STATES and await resume_settled_terminal(job_id, broker=settled_broker):
         await job_store.mark_terminal_resume_complete(job_id=job_id)
     job = await job_store.get_job(job_id)
     return AgentJobCancelResponse(
@@ -1493,7 +1497,7 @@ async def _terminal_owner_workspace(
             store=job_store,
             app_credentials=app_credentials,
         )
-    broker = workspace_broker_from_env()
+    broker = await broker_for_attempt(job_store, job.get("current_attempt_id"))
     if broker is None:
         raise HTTPException(
             status_code=409,
@@ -1505,7 +1509,10 @@ async def _terminal_owner_workspace(
             },
         )
     if job.get("terminal_resume_pending"):
-        if not await resume_settled_terminal(_workspace_id(job)):
+        # The broker resolved a few lines up is this job's own host's, so the
+        # resume goes to the machine holding the worktree rather than to
+        # whatever the deployment's single-host variable names.
+        if not await resume_settled_terminal(_workspace_id(job), broker=broker):
             raise HTTPException(
                 status_code=503,
                 detail={
@@ -1552,7 +1559,7 @@ async def get_agent_job_workspace_file(
     # New self-hosted runners retain one real worktree per job. Prefer it
     # before consulting GitHub/snapshots; only a pre-broker job falls through
     # to the archived view.
-    broker = workspace_broker_from_env()
+    broker = await broker_for_attempt(job_store, job.get("current_attempt_id"))
     if broker is not None:
         try:
             return AgentWorkspaceResponse(**(await broker.files(_workspace_id(job), safe_path)))
@@ -1698,7 +1705,7 @@ async def write_agent_job_workspace_file(
     await _require_workspace_entitlement(
         job=job, user=user, store=job_store, app_credentials=app_credentials
     )
-    broker = workspace_broker_from_env()
+    broker = await broker_for_attempt(job_store, job.get("current_attempt_id"))
     if broker is None:
         raise HTTPException(
             status_code=409,
@@ -1741,7 +1748,7 @@ async def run_agent_job_terminal_command(
     await _require_workspace_entitlement(
         job=job, user=user, store=job_store, app_credentials=app_credentials
     )
-    broker = workspace_broker_from_env()
+    broker = await broker_for_attempt(job_store, job.get("current_attempt_id"))
     if broker is None:
         raise HTTPException(status_code=409, detail="This deployment has no live workspace broker.")
     try:
@@ -1957,7 +1964,7 @@ async def get_agent_job_git_workspace(
     await _require_workspace_entitlement(
         job=job, user=user, store=job_store, app_credentials=app_credentials
     )
-    broker = workspace_broker_from_env()
+    broker = await broker_for_attempt(job_store, job.get("current_attempt_id"))
     if broker is None:
         return AgentGitWorkspaceResponse(available=False)
     try:
@@ -2059,11 +2066,30 @@ async def stream_agent_job_events(
 
 # ── Worker endpoints (capability-token authenticated) ──────────────────
 
+#: Labels a dispatcher identity that came from a host credential rather than
+#: from the shared token, for logs and audit. It is **not** what the claim
+#: reads to decide which host it is talking to — an identity string is
+#: attacker-adjacent input once E7 sources it from a JWT ``sub``, and a
+#: prefix match on it would be a way to claim as another machine. The
+#: authoritative answer is stashed on ``request.state`` below.
+_HOST_IDENTITY_PREFIX = "host:"
+
+#: Set by ``verify_dispatcher_access`` when, and only when, the caller
+#: authenticated with a host credential. Absent means "not a host", including
+#: for every dependency override a test installs.
+_HOST_REQUEST_ATTR = "agent_host"
+
+#: Cheap structural check before touching the signing key: host credentials
+#: carry their own token prefix, so a dispatcher or admin token never reaches
+#: the host parser at all.
+_HOST_TOKEN_HINT = "aht."
+
 
 async def verify_dispatcher_access(
     request: Request,
     authorization: str | None = Header(None),
     op_store=Depends(get_operational_store),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
 ) -> str:
     """Gate for the machine-to-machine worker claim.
 
@@ -2078,12 +2104,55 @@ async def verify_dispatcher_access(
 
     The dedicated token opens nothing else: no other route reads it, and to
     every other authenticator it is just an invalid credential.
+
+    **A host credential (phase G) is the third and narrowest key.** The
+    dispatcher token is shared by the whole pool, so it says "a runner" and not
+    "which"; an enrolled host presents a credential naming itself, and the
+    claim then reports the host from that credential rather than from the
+    request body. A compromised host can drain the queue either way, but it
+    cannot claim *as its neighbour* — which is what makes pinning, draining and
+    revoking mean anything against a machine that has been taken over.
+
+    Checked after the dispatcher token so the existing path is untouched, and
+    returns ``host:<name>`` so the caller can tell the two apart.
     """
     configured = (os.environ.get("AGENT_DISPATCHER_TOKEN") or "").strip()
-    if configured and authorization and authorization.startswith("Bearer "):
-        presented = authorization[7:].strip()
-        if presented and secrets.compare_digest(presented, configured):
-            return "dispatcher"
+    presented = (
+        authorization[7:].strip() if authorization and authorization.startswith("Bearer ") else ""
+    )
+    if configured and presented and secrets.compare_digest(presented, configured):
+        return "dispatcher"
+    if presented and store is not None and presented.startswith(_HOST_TOKEN_HINT):
+        try:
+            claims = parse_host_token(presented)
+        except (InvalidHostToken, ValueError):
+            # ValueError is the unset-``AGENT_CONTROL_TOKEN_SECRET`` case.
+            # Falling through to the admin gate — and a 401 — is right: a
+            # deployment with no signing secret cannot mint this attempt's
+            # worker token either, so the claim was never going to succeed,
+            # and 401 is a better answer than a 500 from a dependency.
+            claims = None
+        if claims is not None:
+            host = await store.authenticate_host(
+                host=claims["host"], credential_hash=hash_secret(presented)
+            )
+            if host is None:
+                # Signed by us but no longer live: revoked, superseded, or
+                # naming a host that was forgotten. Refuse here rather than
+                # falling through to the admin gate, where a well-formed host
+                # credential would otherwise be read as a malformed admin one
+                # and produce a misleading answer.
+                raise HTTPException(
+                    status_code=401,
+                    detail={
+                        "error": {
+                            "type": "unauthorized",
+                            "message": "This host credential is no longer valid.",
+                        }
+                    },
+                )
+            request.state.__setattr__(_HOST_REQUEST_ATTR, host["host"])
+            return f"{_HOST_IDENTITY_PREFIX}{host['host']}"
     return await verify_admin_access(
         request=request, authorization=authorization, op_store=op_store
     )
@@ -2171,6 +2240,7 @@ async def _restore_terminal_suspension(
 
 @router.post("/worker/claim", response_model=WorkerClaimResponse | None)
 async def worker_claim(
+    request: Request,
     body: WorkerClaimRequest,
     _dispatcher: str = Depends(verify_dispatcher_access),
     store: AgentJobStore | None = Depends(get_agent_job_store),
@@ -2200,10 +2270,20 @@ async def worker_claim(
     per-attempt token goes in.
     """
     job_store = _require_store(store)
+    # An enrolled host is named by its credential, not by what it typed in the
+    # body. The body's ``host`` is still how a runner on the shared dispatcher
+    # token reports itself — that is #1158's pool, unchanged — but a machine
+    # holding its own credential cannot claim under another machine's name.
+    #
+    # Read off ``request.state``, which only ``verify_dispatcher_access`` writes
+    # and only after verifying a signature and a stored hash. Deriving it from
+    # the identity string instead would make "which host am I" a substring
+    # match on a value E7 will source from a JWT.
+    host = getattr(request.state, _HOST_REQUEST_ATTR, None) or body.host
     claim = await job_store.claim_job(
         worker_id=body.worker_id,
         lease_ttl_seconds=body.lease_ttl_seconds,
-        host=body.host,
+        host=host,
     )
     if claim is None:
         return None
@@ -2391,7 +2471,7 @@ async def worker_suspend_terminals(
     )
     if event_id is None:
         raise _lease_lost()
-    broker = workspace_broker_from_env()
+    broker = await broker_for_attempt(job_store, claims["attempt_id"])
     if broker is not None:
         try:
             await broker.suspend_terminals(
@@ -2427,7 +2507,7 @@ async def worker_resume_terminals(
     )
     if not fenced:
         raise _lease_lost()
-    broker = workspace_broker_from_env()
+    broker = await broker_for_attempt(job_store, claims["attempt_id"])
     if broker is not None:
         try:
             await broker.resume_terminals(
@@ -2524,7 +2604,7 @@ async def worker_finish(
     )
     if not fenced:
         raise _lease_lost()
-    broker = workspace_broker_from_env()
+    broker = await broker_for_attempt(job_store, claims["attempt_id"])
     if broker is not None:
         try:
             await broker.resume_terminals(

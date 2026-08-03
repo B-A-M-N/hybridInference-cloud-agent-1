@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI
 
+from cloud_agent.host_pool import HEARTBEAT_INTERVAL_S, MISSED_HEARTBEATS_BEFORE_OFFLINE
 from cloud_agent.logging_utils import configure_process_logging, get_logger
 
 if TYPE_CHECKING:
@@ -53,12 +54,40 @@ MAX_ATTEMPTS = 3
 
 
 async def _reconcile_settled_terminals(store: AgentJobStore) -> None:
-    """Replay durable settled-terminal recovery markers after restarts."""
+    """Replay durable settled-terminal recovery markers after restarts.
+
+    The broker is resolved per job, because with a host pool there is no
+    "the" broker: each job's retained terminal lives on the machine that ran
+    it. A single env-configured client here would resume one host's terminals
+    and quietly report success for every other host's.
+    """
+    from cloud_agent.broker_routing import broker_for_job
     from cloud_agent.terminal_coordination import resume_settled_terminal
 
     for job_id in await store.list_terminal_resumes_pending():
-        if await resume_settled_terminal(job_id):
+        broker = await broker_for_job(store, job_id)
+        if await resume_settled_terminal(job_id, broker=broker):
             await store.mark_terminal_resume_complete(job_id=job_id)
+
+
+async def _reap_offline_hosts(store: AgentJobStore) -> None:
+    """Move hosts that stopped heartbeating to ``offline``.
+
+    Runs on the same loop as the attempt reaper rather than on its own, because
+    the two are one recovery story told in order: a host disappears, it stops
+    being claimable, and then the work it was holding comes back. Splitting
+    them into two schedules would make the interval between them a race that
+    only shows up under load.
+    """
+    offline = await store.reap_offline_hosts(
+        interval_seconds=HEARTBEAT_INTERVAL_S,
+        missed_intervals=MISSED_HEARTBEATS_BEFORE_OFFLINE,
+    )
+    if offline:
+        logger.warning(
+            "agent_hosts_offline",
+            extra={"event": "agent_hosts_offline", "hosts": offline},
+        )
 
 
 async def reap_expired_attempts(
@@ -80,6 +109,19 @@ async def reap_expired_attempts(
         logger.warning("Initial settled terminal reconciliation failed", exc_info=True)
     while True:
         await asyncio.sleep(interval_seconds)
+        # Hosts first. A machine that stopped heartbeating should be out of the
+        # claim gate before the pass that requeues its work, otherwise the
+        # requeued job can be handed straight back to the host that just lost
+        # it — the retry budget burns down while nothing moves.
+        #
+        # In its own try, though. Sharing one with the attempt reaper below
+        # would let a host-reaping failure skip lease reaping and stalled
+        # publishes for that pass, which is a strictly worse outage than the
+        # one it was reporting: jobs stop being recovered at all.
+        try:
+            await _reap_offline_hosts(store)
+        except Exception:
+            logger.warning("Host reaper pass failed", exc_info=True)
         try:
             actions = await store.reap_expired(max_attempts=max_attempts)
             await _reconcile_settled_terminals(store)
@@ -212,7 +254,7 @@ def create_app() -> FastAPI:
     """Build the control plane application."""
     configure_process_logging()
 
-    from cloud_agent.api import admin_hosts, routes
+    from cloud_agent.api import admin_hosts, hosts, routes
 
     app = FastAPI(
         title="FreeInference Cloud Agent",
@@ -221,6 +263,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     app.include_router(routes.router)
+    app.include_router(hosts.router)
     app.include_router(admin_hosts.router)
 
     @app.get("/healthz")

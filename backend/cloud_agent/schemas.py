@@ -15,6 +15,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
 from cloud_agent.entitlement import REPO_PATTERN
+from cloud_agent.host_pool import ENROLL_TOKEN_TTL_S
 
 # A lease is the only thing that lets the reaper take a job back from a stuck
 # or malicious worker. If the worker could pick the TTL, it could pick one long
@@ -694,7 +695,13 @@ class RepoBranchesResponse(BaseModel):
 
 
 class AgentRunnerHost(BaseModel):  # type: ignore[no-any-unimported]
-    """One machine in the agent runner pool."""
+    """One machine in the agent runner pool.
+
+    Everything below ``seconds_since_seen`` arrived with the dynamic pool
+    (phase G) and every one of those fields has a default. A host that joined
+    by polling — the only way in before enrollment existed — has none of them
+    set, and it must still render on the admin page rather than 500 it.
+    """
 
     host: str
     active: bool
@@ -709,6 +716,37 @@ class AgentRunnerHost(BaseModel):  # type: ignore[no-any-unimported]
             "its longest job."
         ),
     )
+    status: str = Field(
+        "online",
+        description=(
+            "Pool lifecycle state: enrolling, online, draining, disabled or "
+            "offline. Only an online host takes new claims."
+        ),
+    )
+    enrolled: bool = Field(
+        False,
+        description=(
+            "Whether this host holds a credential issued by enrollment. False "
+            "means it joined by polling and is not expected to heartbeat, so "
+            "the offline reaper leaves it alone."
+        ),
+    )
+    labels: dict[str, Any] = Field(default_factory=dict)
+    capabilities: list[str] = Field(
+        default_factory=list,
+        description="What this machine can run. A job may only go to a host declaring all of it.",
+    )
+    slots_total: int | None = Field(
+        None,
+        description="Concurrent attempts this host accepts. Null means unmetered.",
+    )
+    slots_used: int = Field(0, description="Attempts currently holding one of this host's slots.")
+    runner_version: str | None = None
+    broker_url: str | None = Field(
+        None,
+        description="Where this host's workspace broker listens, as the control plane reaches it.",
+    )
+    last_heartbeat_at: datetime | None = None
 
 
 class ListAgentRunnerHostsResponse(BaseModel):  # type: ignore[no-any-unimported]
@@ -728,4 +766,119 @@ class SetActiveAgentRunnerHostRequest(BaseModel):  # type: ignore[no-any-unimpor
         None,
         max_length=253,
         description="A host that has polled at least once, or null to unpin.",
+    )
+
+
+# ── Host pool: enrollment and heartbeat ────────────────────────────────
+#
+# The host name is charset-checked in the same shape and for the same reason
+# as ``WorkerClaimRequest.host``: it is a primary key an operator reads off a
+# page and clicks, and it is interpolated into nothing but parameters — but a
+# machine that can write arbitrary bytes into the pool list can make the list
+# unreadable, which is a denial of the one tool for fixing a bad host.
+HOST_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
+
+
+class IssueHostEnrollTokenRequest(BaseModel):  # type: ignore[no-any-unimported]
+    """Admin request for a one-time host enrollment token."""
+
+    ttl_seconds: float = Field(
+        ENROLL_TOKEN_TTL_S,
+        gt=0,
+        le=86400.0,
+        description=(
+            "How long the token may be redeemed for. Short by default: it is "
+            "pasted into a machine being set up right now, and a token still "
+            "live tomorrow is a credential nobody is tracking."
+        ),
+    )
+
+
+class IssueHostEnrollTokenResponse(BaseModel):  # type: ignore[no-any-unimported]
+    """The enrollment token, shown exactly once."""
+
+    enroll_token: str = Field(
+        ...,
+        description=(
+            "Single-use. Only its hash is stored, so this value cannot be "
+            "recovered — issue another one rather than looking it up."
+        ),
+    )
+    expires_at: datetime
+
+
+class HostRegisterRequest(BaseModel):  # type: ignore[no-any-unimported]
+    """A machine presenting an enrollment token to join the pool."""
+
+    enroll_token: str = Field(..., min_length=1, max_length=512)
+    name: str = Field(..., max_length=253, pattern=HOST_NAME_PATTERN)
+    capabilities: list[str] = Field(
+        default_factory=list,
+        max_length=64,
+        description=(
+            "What this machine can run — runtime tiers, sandbox backends, "
+            "whatever a job may ask for. A job goes to a host only when the "
+            "host declares everything the job requires."
+        ),
+    )
+    slots_total: int | None = Field(
+        None,
+        gt=0,
+        le=1024,
+        description="Concurrent attempts to accept. Omit for unmetered (the pre-pool behaviour).",
+    )
+    broker_url: str | None = Field(
+        None,
+        max_length=2048,
+        description=(
+            "Where this host's workspace broker listens, as the control plane "
+            "reaches it. Omit on a deployment still using the global "
+            "AGENT_WORKSPACE_BROKER_URL."
+        ),
+    )
+    runner_version: str | None = Field(None, max_length=128)
+    labels: dict[str, str] = Field(default_factory=dict)
+
+
+class HostRegisterResponse(BaseModel):  # type: ignore[no-any-unimported]
+    """The host's identity and the credential it authenticates with."""
+
+    host: str
+    credential: str = Field(
+        ...,
+        description=(
+            "Long-lived host credential. Shown once; only its hash is stored. "
+            "Revoking the host clears that hash and the credential dies."
+        ),
+    )
+    status: str
+
+
+class HostHeartbeatRequest(BaseModel):  # type: ignore[no-any-unimported]
+    """A host reporting that it is still there, and what it now looks like.
+
+    Every field is optional and only overwrites when present, so a heartbeat
+    that carries nothing but liveness does not blank out what enrollment
+    declared.
+    """
+
+    slots_total: int | None = Field(None, gt=0, le=1024)
+    runner_version: str | None = Field(None, max_length=128)
+    broker_url: str | None = Field(None, max_length=2048)
+    capabilities: list[str] | None = Field(None, max_length=64)
+
+
+class HostHeartbeatResponse(BaseModel):  # type: ignore[no-any-unimported]
+    """What the control plane thinks of this host after the heartbeat."""
+
+    host: str
+    status: str
+    slots_total: int | None = None
+    slots_used: int = 0
+    heartbeat_interval_seconds: float = Field(
+        ...,
+        description=(
+            "How often to report in. Missing three consecutive intervals is "
+            "what moves a host to offline."
+        ),
     )

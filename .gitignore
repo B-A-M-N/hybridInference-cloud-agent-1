@@ -36,3 +36,4 @@ out/
 
 # Local agent workspaces
 /workspaces/
+next-env.d.ts
