@@ -95,8 +95,11 @@ about *inference*, not about *agents*:
 | A | A1 — resolve open agent PRs | ✅ done | 5 PRs merged upstream |
 | A | A2 — declare freeze | ✅ done | `764a6f97` upstream |
 | A | A3 — file manifest | ✅ done | upstream |
-| C | C1 — identity JWKS endpoint | 🔍 in review | upstream #1174 |
-| D–H | moves, web, host pool, cutover | ⏳ not started | — |
+| C | C1 — identity JWKS endpoint (+ key rotation) | ✅ merged | upstream #1174 |
+| C | C2/C3 — authorization code + token exchange | ✅ merged | upstream #1177 |
+| C | C4 — /authorize consent page | 🔍 in review | upstream #1179 |
+| C | C5–C8 — inference grants, usage, contracts | ⏳ not started | needs Murphy design review |
+| D–H | moves, web, host pool, cutover | ⏳ not started | D blocked on this PR merging (CI) |
 
 Update this table as tasks land. It is the answer to "what is actually done" —
 the plan describes intent, this describes reality.
