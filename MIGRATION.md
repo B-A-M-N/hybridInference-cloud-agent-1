@@ -81,6 +81,42 @@ forgotten.
 | ~~`workspace_snapshot.py` moved in D3 without its test file.~~ | ~~**D6**~~ ✅ closed — `test_agent_workspace_snapshot.py` moved with the runner, unmodified. | — |
 | ~~`workspace_paths.py` moved in D3 without dedicated coverage: its tests live inside `test_agent_workspace_broker.py` (D5).~~ | ~~**D5**~~ ✅ closed — the broker test file arrived in D5 and covers it. | — |
 
+## Open decisions
+
+Things a migration task surfaced that are **design calls, not mechanical
+moves**, and so were deliberately not decided by the task that found them.
+
+### The co-located runner overlay (found in D7)
+
+`deploy/docker/docker-compose.agent-runner.yml` and `ops/deploy/agent_runner.sh`
+did **not** move. They are not standalone: the compose declares a `backend:`
+service and is composed *on top of* the gateway's own `docker-compose.yml`
+(`-f docker-compose.yml -f docker-compose.agent-runner.yml`). The remote-runner
+file says why in its own header — pointing the overlay at a machine with no
+gateway does not fail, it *starts a gateway there*.
+
+This repository has no `docker-compose.yml` base and no `backend` service, so
+moving the pair as-is would land files that cannot run, and adapting them into
+a standalone stack is a redesign that a migration task must not perform.
+
+The two options, for whoever decides:
+
+1. **Drop them.** A co-located runner becomes "the standalone remote-runner
+   compose, with the tunnel pointing at localhost" — a configuration, not a
+   second file. Cheapest, and it leaves one deployment shape to maintain.
+2. **Keep a co-located topology as a first-class file here**, written against
+   this repository's own services rather than the gateway's.
+
+Their tests stay with them: `tests/unit/test_agent_deploy_config.py` asserts on
+that compose, and `tests/unit/ops/test_agent_runner_preflight.py` executes
+`agent_runner.sh`. Both are still in the source repo. The behaviours they pin
+(internal egress network, read-only docker socket, non-root sandbox, kata
+preflight) are **not currently covered here** — closing that gap is part of
+whichever option is chosen. `tests/unit/test_deploy_paths.py` covers the moved
+files' paths only, and says so.
+
+Until this is decided, H4 must not delete the source repo's copies.
+
 ## Manifest corrections
 
 Classification errors found while executing tasks. Fold these into the source
@@ -89,6 +125,8 @@ repo's manifest when it is next edited.
 | File | Manifest says | Actually | Why |
 |---|---|---|---|
 | `apps/backend/serving/agent_jobs/terminal_coordination.py` | `move:host`, D5 | `move:control`, E6 | Its docstring says "Gateway-owned recovery"; its consumers at the freeze are `servers/bootstrap.py` and `servers/routers/agent_jobs.py` — control-plane code. It imports the broker *client* (`workspace_broker_client`, the caller side), not the broker. The route cases move with `test_agent_jobs_api.py` in E10; E6 ports the settled-terminal reconciliation case from `test_bootstrap.py`. |
+| `deploy/docker/pi-freeinference`, `opencode-freeinference`, `kilo-freeinference`, `codex-requirements.toml` | absent from the manifest | `move:deploy`, D7 (moved to `deploy/sandbox/`) | `Dockerfile.agent-sandbox` `COPY`s all four. The manifest listed the Dockerfile but not its assets, so a literal reading of D7 would have produced an image that fails to build. |
+| `deploy/docker/docker-compose.agent-runner.yml`, `ops/deploy/agent_runner.sh` (+ their two test files) | `move:deploy`, D7 | **undecided** — see Open decisions | They are an overlay on the gateway's compose stack, not a standalone deployment. |
 
 ## Upstream provenance
 
@@ -143,7 +181,8 @@ about *inference*, not about *agents*:
 | D | D3+D4 — workspace setup/paths/snapshot + patch gate | ✅ merged; D3 acceptance pending D6 | this repo #3; one PR because `workspace_snapshot` imports `patch_gate`; snapshot tests are owned by D6 above |
 | D | D5 — workspace broker + browser | 🔍 in review | this repo #4; `terminal_coordination` reclassified to Phase E (see manifest corrections) |
 | D | D6 — runner + broker client (+ logging entrypoint) | 🔍 in review | this repo #5, stacked on #4; closes both D6 register rows; D3's pending acceptance resolves here |
-| D7–H | deploy files, web, host pool, cutover | ⏳ not started | — |
+| D | D7 — host deploy files | 🔍 in review | this repo #6; co-located overlay undecided (see Open decisions) |
+| E–H | control plane, web, host pool, cutover | ⏳ not started | — |
 
 Update this table as tasks land. It is the answer to "what is actually done" —
 the plan describes intent, this describes reality.

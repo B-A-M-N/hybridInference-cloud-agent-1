@@ -1,0 +1,62 @@
+name: Docker Build
+
+# The acceptance check for the deploy files. Their diff is mostly path edits,
+# and a `COPY` naming a path from the source repo's layout fails at build time
+# on a runner host — long after review, in the one place nobody is watching.
+# Building both images here is what turns "the paths look right" into a fact.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'deploy/**'
+      - 'host/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/docker-build.yml'
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'deploy/**'
+      - 'host/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/docker-build.yml'
+
+concurrency:
+  group: docker-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.image.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - name: runner
+            dockerfile: deploy/host/Dockerfile.agent-runner
+          - name: sandbox
+            dockerfile: deploy/sandbox/Dockerfile.agent-sandbox
+          - name: egress-proxy
+            dockerfile: deploy/host/Dockerfile.agent-egress-proxy
+          - name: gateway-tunnel
+            dockerfile: deploy/host/Dockerfile.agent-gateway-tunnel
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build only — never push. These images carry no credentials and this
+      # repository publishes none; the point is that the build resolves.
+      - name: Build ${{ matrix.image.name }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.image.dockerfile }}
+          push: false
+          load: false
+          cache-from: type=gha,scope=${{ matrix.image.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
