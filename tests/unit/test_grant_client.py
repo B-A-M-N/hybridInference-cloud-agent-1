@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 from cloud_agent.gateway import GatewayError
-from cloud_agent.grants import GrantClient
+from cloud_agent.grants import GRANT_TTL_S, GrantClient
 
 BASE = "https://gateway.example"
 TOKEN = "dispatch-token"
@@ -91,10 +91,30 @@ async def test_omitted_scope_is_not_sent_as_null() -> None:
         seen["body"] = json.loads(request.content)
         return httpx.Response(200, json=GRANT)
 
-    await _client(handler).mint(user_id="user_1", job_id="job_1", attempt_id="1")
+    await _client(handler).mint(user_id="user_1", job_id="job_1", attempt_id="1", ttl_seconds=None)
     assert "allowed_models" not in seen["body"]
     assert "allowed_mcp" not in seen["body"]
     assert "ttl_seconds" not in seen["body"]
+
+
+async def test_a_lifetime_is_always_asked_for() -> None:
+    """The caller does not pass one, so the default is what defends the loop.
+
+    Left to the gateway's own default, the grant's lifetime would be a number
+    this service does not know and cannot keep in step with the pass that
+    renews it — and the failure would be a sandbox losing its capability
+    mid-run for no visible reason.
+    """
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=GRANT)
+
+    await _client(handler).mint(user_id="user_1", job_id="job_1", attempt_id="1")
+    assert seen["body"]["ttl_seconds"] == GRANT_TTL_S
 
 
 async def test_an_attempt_id_is_sent_as_a_string() -> None:
@@ -169,6 +189,59 @@ async def test_a_refused_renewal_raises_rather_than_pretending() -> None:
     """
     with pytest.raises(GatewayError):
         await _client(_serves({}, 404)).renew("agr_1")
+
+
+async def test_a_refusal_carries_why_and_not_only_that() -> None:
+    """The renewal loop abandons running attempts on a refusal, so it must be
+    able to tell "no such grant" from "your dispatch token is wrong" — and at
+    this gateway both are 404-or-401 with the reason only in the body."""
+    payload = {"error": {"type": "grant_not_live", "message": "That grant is revoked."}}
+    with pytest.raises(GatewayError) as raised:
+        await _client(_serves(payload, 404)).renew("agr_1")
+
+    assert raised.value.status_code == 404
+    assert raised.value.error_type == "grant_not_live"
+    assert raised.value.definitive is True
+
+
+async def test_an_unreachable_gateway_carries_no_verdict() -> None:
+    """No answer means no status and no type. A caller that reads a missing
+    status as a refusal cannot help but treat downtime as a verdict."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    with pytest.raises(GatewayError) as raised:
+        await _client(handler).renew("agr_1")
+
+    assert raised.value.status_code is None
+    assert raised.value.error_type is None
+    assert raised.value.definitive is False
+
+
+@pytest.mark.parametrize("status_code", [429, 408, 500, 503])
+async def test_ask_again_answers_are_not_definitive(status_code: int) -> None:
+    """Backpressure and a sick gateway are requests for patience, not verdicts
+    on the request — the caller may retry, and giving up on them would give up
+    on every grant at once the moment the gateway had a bad minute."""
+    with pytest.raises(GatewayError) as raised:
+        await _client(_serves({}, status_code)).renew("agr_1")
+
+    assert raised.value.definitive is False
+
+
+async def test_a_refusal_without_a_readable_body_still_carries_its_status() -> None:
+    """A proxy's HTML 502, or an empty 401: no type to read, and the absence
+    must not be mistaken for a type this service recognises."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, text="<html>not authorized</html>")
+
+    with pytest.raises(GatewayError) as raised:
+        await _client(handler).renew("agr_1")
+
+    assert raised.value.status_code == 401
+    assert raised.value.error_type is None
 
 
 # ---------------------------------------------------------------------------

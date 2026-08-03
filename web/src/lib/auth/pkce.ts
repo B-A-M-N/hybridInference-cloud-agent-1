@@ -20,9 +20,11 @@
 // when the user has two tabs open. The `state` already uniquely identifies a
 // flow and already travels to the gateway and back, so it is the key.
 //
-// Nothing accumulates: an entry is deleted the moment it is read, entries
-// older than `MAX_AGE_MS` are ignored, and starting a new flow sweeps the ones
-// that were abandoned.
+// Nothing accumulates: an entry is deleted the moment it is read, entries older
+// than `MAX_AGE_MS` are ignored, and starting a new flow sweeps every entry that
+// can no longer be redeemed — the expired ones and the unreadable ones. A flow
+// abandoned *within* `MAX_AGE_MS` is deliberately left alone, because from here
+// it is indistinguishable from a sign-in still running in another tab.
 
 const STORAGE_PREFIX = 'cloud-agent:pkce:';
 
@@ -104,7 +106,14 @@ function readAt(key: string): PkcePending | null {
   }
 }
 
-/** Drop entries that can no longer be redeemed, so abandoned flows do not pile up. */
+/**
+ * Drop entries that can no longer be redeemed, so abandoned flows do not pile up.
+ *
+ * "No longer redeemable" is the whole rule: unparseable, or past `MAX_AGE_MS`.
+ * A younger entry survives even if nobody will ever come back for it — the
+ * alternative, clearing everything a new flow finds, is what broke concurrent
+ * sign-ins in the first place.
+ */
 function purgeExpired(): void {
   for (const key of pendingKeys()) {
     if (readAt(key) !== null) continue;

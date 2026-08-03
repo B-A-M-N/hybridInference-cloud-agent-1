@@ -154,17 +154,28 @@ def _session_secret() -> str:
     return secret
 
 
-def mint_session(*, user_id: str, email: str | None, role: str) -> str:
+def mint_session(
+    *, user_id: str, email: str | None, role: str, user_name: str | None = None
+) -> str:
     """Mint the session token the browser holds.
 
     HS256 rather than RS256: this token is issued and verified by the same
     service, so there is nothing to publish and a symmetric key is the simpler
     correct choice.
 
+    **Everything the session routes answer with is minted in here.** ``/me`` has
+    nothing but these claims to read, so anything login reports that this token
+    does not carry is something the two routes will disagree about for the whole
+    life of the cookie.
+
     Args:
         user_id: The gateway's user identifier, carried as ``sub``.
         email: The user's email, if known.
         role: The user's role at the time of sign-in.
+        user_name: The user's display name, if the gateway reported one.
+            Omitted from the claims when absent — which is every deployment
+            today, since neither the identity token nor the user-status record
+            carries a name.
 
     Returns:
         A signed session token.
@@ -181,6 +192,8 @@ def mint_session(*, user_id: str, email: str | None, role: str) -> str:
     }
     if email:
         claims["email"] = email
+    if user_name:
+        claims["user_name"] = user_name
     return jwt.encode(claims, _session_secret(), algorithm="HS256")
 
 

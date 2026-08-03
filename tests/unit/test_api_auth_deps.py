@@ -153,6 +153,10 @@ async def test_the_session_cookie_authenticates(client: AsyncClient) -> None:
     assert response.json() == {
         "user_id": _USER,
         "email": "owner@example.com",
+        # Absent from the claims, and therefore absent here — the same answer
+        # ``/v1/session/login`` gives, which is the point of carrying it in the
+        # session at all.
+        "user_name": None,
         "role": "internal",
         "is_admin": False,
         "authenticated": True,
@@ -214,6 +218,20 @@ async def test_a_deployment_with_no_session_secret_says_503(
     assert response.status_code == 503
 
 
+async def test_the_session_carries_the_display_name_when_there_is_one(
+    client: AsyncClient,
+) -> None:
+    """Whatever ``/me`` answers has to be provable from the cookie alone."""
+    client.cookies.set(
+        identity.SESSION_COOKIE,
+        identity.mint_session(user_id=_USER, email=None, role="free", user_name="Ada Lovelace"),
+    )
+
+    response = await client.get("/who")
+
+    assert response.json()["user_name"] == "Ada Lovelace"
+
+
 async def test_a_worker_token_is_not_read_as_a_session(client: AsyncClient) -> None:
     """Namespaces are selected before validation, not after a failure."""
     response = await client.get("/who", headers={"Authorization": "Bearer ajt.payload.signature"})
@@ -269,6 +287,41 @@ async def test_a_non_admin_session_does_not(client: AsyncClient, role: str) -> N
     response = await client.get("/admin")
 
     assert response.status_code == 401
+
+
+async def test_the_admin_door_diagnoses_a_missing_secret_the_same_way(
+    client: AsyncClient, monkeypatch
+) -> None:
+    """One misconfiguration, one diagnosis.
+
+    This used to answer 401 while ``get_current_user`` answered 503 for the
+    identical cause — an unset ``AGENT_SESSION_SECRET`` — because the broader
+    ``IdentityError`` was caught here. The 401 sent an operator hunting for a
+    credential problem that did not exist.
+    """
+    client.cookies.set(identity.SESSION_COOKIE, _session(role="admin"))
+    monkeypatch.delenv(identity.ENV_SESSION_SECRET, raising=False)
+
+    response = await client.get("/admin")
+
+    assert response.status_code == 503
+
+
+async def test_the_admin_token_still_opens_without_a_session_secret(
+    client: AsyncClient, monkeypatch
+) -> None:
+    """A deployment that authenticates machines only keeps working.
+
+    The token is compared before any session is verified, so 503 is the answer
+    for callers who need session verification — not for the one door that does
+    not.
+    """
+    monkeypatch.setenv(deps.ENV_ADMIN_TOKEN, "the-admin-token")
+    monkeypatch.delenv(identity.ENV_SESSION_SECRET, raising=False)
+
+    response = await client.get("/admin", headers={"Authorization": "Bearer the-admin-token"})
+
+    assert response.status_code == 200
 
 
 # ── get_client_ip ──────────────────────────────────────────────────────

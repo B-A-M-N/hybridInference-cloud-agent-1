@@ -2,7 +2,8 @@
 
 Two audiences, two authentication schemes:
 
-- **Owners** (users, via a browser JWT or normal API key): create, inspect,
+- **Owners** (users, via this service's session — the ``HttpOnly`` cookie
+  ``/v1/session/login`` sets, or the same token as a bearer): create, inspect,
   list, cancel jobs, read artifacts, and subscribe to the event stream. Every
   read and mutation is scoped to ``user_id`` so one user can never touch
   another's job. P0 remains dogfood-only, so the same dependency also requires
@@ -37,6 +38,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Requ
 from fastapi.responses import StreamingResponse
 
 from cloud_agent.api.deps import (
+    bearer_token,
     get_agent_app_credentials,
     get_agent_gitlab_oauth,
     get_agent_job_store,
@@ -44,10 +46,8 @@ from cloud_agent.api.deps import (
     get_gateway_client,
     get_grant_client,
     get_log_store,
-    get_operational_store,
     looks_like_agent_token,
     verify_admin_access,
-    verify_api_key,
 )
 from cloud_agent.broker_routing import broker_for_attempt, broker_for_job
 from cloud_agent.entitlement import (
@@ -184,58 +184,51 @@ _TERMINAL_ID_PATTERN = r"^term_[A-Za-z0-9_-]{1,80}$"
 _CLONE_SCOPE = {"contents": "read"}
 
 
-def _looks_like_browser_jwt(authorization: str | None) -> bool:
-    """Distinguish a web access JWT from API-key and sandbox credentials.
-
-    Browser login tokens are compact JWTs (three dot-separated segments).
-    Agent capability tokens are also structured, so exclude their dedicated
-    namespace before using the JWT dependency. Normal API keys, including
-    legacy opaque keys, continue through ``verify_api_key``.
-    """
-    if not authorization or not authorization.startswith("Bearer "):
-        return False
-    token = authorization[7:]
-    return token.count(".") == 2 and not looks_like_agent_token(token)
-
-
 async def authenticate_agent_owner(
     request: Request,
     authorization: str | None = Header(None),
-    x_api_key: str | None = Header(None, alias="X-API-Key"),
-    op_store=Depends(get_operational_store),
-    log_store=Depends(get_log_store),
-    agent_job_store=Depends(get_agent_job_store),
 ) -> dict[str, Any]:
-    """Authenticate an Agent owner from either a session or a normal API key.
+    """Authenticate an Agent owner from this service's session.
 
-    The Agents web app sends the access JWT returned by ``/auth/login``. API
-    clients send ``hyi-*`` keys. Passing both credential types to
-    ``verify_api_key`` made the web JWT look like an invalid API key, leaving
-    an otherwise logged-in user unable to load config or start a job.
+    There is **one** owner credential here: the session token
+    :mod:`cloud_agent.identity` mints, carried either in the ``HttpOnly``
+    cookie ``/v1/session/login`` sets — which is all the web app holds — or as
+    a bearer, for a programmatic caller that has one. ``get_current_user``
+    accepts both, preferring the cookie.
 
-    Credential namespaces are selected before validation rather than by
-    catching one validator and falling back to the other: an expired or forged
-    JWT must remain a JWT authentication failure, not get reinterpreted as an
-    API key.
+    **The API-key branch was deleted on 2026-08-04**, not merely disabled. It
+    resolved an ``hyi-*`` key through the gateway's ``api_keys`` table, which
+    did not move; nothing in this repository ever set the store it read, and
+    ``GatewayClient`` answers "may this user sign in", never "who owns this
+    key". A branch with no producer answers 503 in every real deployment while
+    looking implemented, and invites a later reader to "fix" it by reaching
+    back into the gateway's database — the coupling this split exists to
+    remove. Its ported test is recorded in MIGRATION.md's discarded register.
+    Restoring a programmatic owner credential means adding a gateway contract
+    under ``contracts/``, not resurrecting this.
 
-    **E8 added a third namespace, and it is now the first one checked.** The
-    web app holds no bearer at all: sign-in ends in an ``HttpOnly`` session
-    cookie, so a browser request arrives with an empty ``Authorization``
-    header. Without this branch every such request fell through to the API-key
-    path and 401'd — the same bug the JWT branch above was written to fix, one
-    credential later.
+    One namespace is still refused **before** the session verifier sees it: a
+    worker capability token (``ajt.*``) is the sandbox's credential, and a
+    credential that escaped the sandbox must be told apart from an unknown one
+    rather than reported as a missing session. The gateway spelled this as an
+    allowlist of inference paths because the same dependency also guarded
+    ``/v1/chat/completions``; this service serves no inference route, so it
+    collapses to a flat 403 ``insufficient_scope``. The cookie still wins when
+    both are present, which is the precedence ``session_token`` documents.
     """
-    if request.cookies.get(SESSION_COOKIE) or _looks_like_browser_jwt(authorization):
-        return await get_current_user(request=request, authorization=authorization)
+    presented = bearer_token(authorization)
+    if not request.cookies.get(SESSION_COOKIE) and looks_like_agent_token(presented):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "type": "insufficient_scope",
+                    "message": "This credential may only be used for model inference.",
+                }
+            },
+        )
 
-    return await verify_api_key(
-        request=request,
-        authorization=authorization,
-        x_api_key=x_api_key,
-        op_store=op_store,
-        log_store=log_store,
-        agent_job_store=agent_job_store,
-    )
+    return await get_current_user(request=request, authorization=authorization)
 
 
 async def require_agent_owner(
@@ -2096,7 +2089,6 @@ _HOST_TOKEN_HINT = "aht."
 async def verify_dispatcher_access(
     request: Request,
     authorization: str | None = Header(None),
-    op_store=Depends(get_operational_store),
     store: AgentJobStore | None = Depends(get_agent_job_store),
 ) -> str:
     """Gate for the machine-to-machine worker claim.
@@ -2161,9 +2153,7 @@ async def verify_dispatcher_access(
                 )
             request.state.__setattr__(_HOST_REQUEST_ATTR, host["host"])
             return f"{_HOST_IDENTITY_PREFIX}{host['host']}"
-    return await verify_admin_access(
-        request=request, authorization=authorization, op_store=op_store
-    )
+    return await verify_admin_access(request=request, authorization=authorization)
 
 
 def _worker_claims(authorization: str | None) -> dict[str, Any]:
@@ -2272,6 +2262,14 @@ async def _mint_sandbox_grant(
     renewal and revocation both need to find it later, and because the fence is
     what makes "is this attempt still the current one" answerable at all.
 
+    **A grant that cannot be linked is revoked, not handed over.** The link is
+    the only thing that will ever renew or revoke this capability, so a grant
+    without one is a live credential nothing owns: it survives to its TTL, it
+    is not renewed so the run fails anyway, and no operator can find it. Both
+    ways that can happen — a gateway answer with no ``grant_id``, and a fenced
+    UPDATE that matched nothing because the attempt was superseded in between —
+    end the same way: withdraw it and fail the claim.
+
     Args:
         job_store: The store holding the attempt.
         grants: The grant client.
@@ -2281,7 +2279,8 @@ async def _mint_sandbox_grant(
         The grant's bearer token — the only credential that enters the sandbox.
 
     Raises:
-        HTTPException: 503, after releasing the claim, if no grant could be got.
+        HTTPException: 503, after releasing the claim, if no grant could be got
+            or the one that was minted could not be linked to this attempt.
     """
     try:
         grant = await grants.mint(
@@ -2317,11 +2316,42 @@ async def _mint_sandbox_grant(
 
     sandbox_token = str(grant.get("token") or "")
     grant_id = str(grant.get("grant_id") or "")
-    if grant_id:
-        await job_store.record_attempt_grant(
+    linked = bool(grant_id) and await job_store.record_attempt_grant(
+        attempt_id=claim["attempt_id"],
+        lease_generation=claim["lease_generation"],
+        grant_id=grant_id,
+    )
+    if not linked:
+        # Withdraw it before anything else. This is the one moment the grant id
+        # is known to a process that is about to forget it, and after that only
+        # its TTL can end it.
+        if grant_id:
+            await grants.revoke(grant_id)
+        await job_store.release_claim(
+            job_id=claim["id"],
             attempt_id=claim["attempt_id"],
             lease_generation=claim["lease_generation"],
-            grant_id=grant_id,
+        )
+        logger.warning(
+            "agent_job_grant_unlinked",
+            extra={
+                "event": "agent_job_grant_unlinked",
+                "job_id": claim["id"],
+                "attempt_id": claim["attempt_id"],
+                "grant_id": grant_id or None,
+            },
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "type": "credential_unavailable",
+                    "message": (
+                        "The inference grant for this job could not be recorded against "
+                        "its attempt; it has been withdrawn and no attempt was spent."
+                    ),
+                }
+            },
         )
     return sandbox_token
 

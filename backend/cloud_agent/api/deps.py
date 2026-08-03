@@ -22,14 +22,20 @@ dependencies they asked for there. Three kinds arrive at this module:
   deployment's ``ADMIN_TOKEN`` or a session whose role claim says ``admin``.
   Nothing here consults a user table, because there is none to consult.
 
-- **Two contracts that did not come across, and are honest about it.**
-  ``get_operational_store`` and ``get_log_store`` both name gateway-side tables
-  (``api_keys``/``users``, and ``api_logs``). Neither is produced by anything in
-  this repository, so both answer ``None`` in every real deployment, and the
-  code paths behind them degrade the way they were written to: the API-key
-  branch answers 503 (fails closed, never open), and job spend is reported as
-  *absent* rather than as a fabricated zero. See MIGRATION.md's deferred
-  register for why the API-key branch is still here at all.
+  There used to be a third: ``verify_api_key``, resolving an ``hyi-*`` key
+  through a ``get_operational_store`` that nothing in this repository ever set.
+  **Both were deleted on 2026-08-04.** A dependency that answers 503 in every
+  real deployment is dead code that looks alive, and the only way to "fix" it
+  from inside this repository is to reach back into the gateway's database.
+  Resolving a key to a user needs a gateway contract in ``contracts/`` and a
+  ``GatewayClient`` method; until one exists the session is the only owner
+  credential. See MIGRATION.md's deferred register and its discarded-test row.
+
+- **One contract that did not come across, and is honest about it.**
+  ``get_log_store`` names a gateway-side table (``api_logs``). Nothing in this
+  repository produces it, so it answers ``None`` in every real deployment and
+  the code path behind it degrades the way it was written to: job spend is
+  reported as *absent* rather than as a fabricated zero.
 
 **Every decision below fails closed.** An unset secret, an unreachable gateway,
 an unconfigured store: each is a refusal, never a pass. That is the one property
@@ -38,13 +44,12 @@ worth re-reading a diff of this file for.
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 import os
 from typing import TYPE_CHECKING, Any
 
 import jwt
-from fastapi import Depends, Header, HTTPException, Request
+from fastapi import Header, HTTPException, Request
 
 from cloud_agent import identity
 
@@ -107,7 +112,7 @@ def get_agent_gitlab_oauth(request: Request) -> Any | None:
     return getattr(request.app.state, "gitlab_oauth", None)
 
 
-# ── The two gateway-side contracts that did not move ───────────────────
+# ── The gateway-side contract that did not move ────────────────────────
 
 
 def get_log_store(request: Request) -> Any | None:
@@ -121,23 +126,6 @@ def get_log_store(request: Request) -> Any | None:
     zero would read as "this job was free".
     """
     return getattr(request.app.state, "log_store", None)
-
-
-def get_operational_store(request: Request) -> Any | None:
-    """Dependency to obtain the operational store (if configured).
-
-    The gateway's ``users`` and ``api_keys`` tables did not move, and nothing
-    here sets ``app.state.operational_store`` — so in every real deployment
-    this is ``None`` and the router's API-key branch answers **503**, which is
-    closed, not open.
-
-    It is retained rather than deleted because deleting it means deleting the
-    router's API-key branch, and with it a ported test that asserts on
-    ``update_key_last_used``. Migration rule 3 forbids that. The decision —
-    drop the API-key surface, or give the gateway a key-verification contract —
-    is recorded in MIGRATION.md and belongs to whoever owns the API surface.
-    """
-    return getattr(request.app.state, "operational_store", None)
 
 
 # ── Roles and credential namespaces ────────────────────────────────────
@@ -241,8 +229,12 @@ async def get_current_user(
         authorization: The ``Authorization`` header, if the caller sent one.
 
     Returns:
-        ``{"user_id", "email", "role", "is_admin", "authenticated"}`` — the
-        keys ``routes.py`` reads.
+        ``{"user_id", "email", "user_name", "role", "is_admin",
+        "authenticated"}`` — the keys ``routes.py`` and ``/v1/session/me``
+        read. Everything in it comes from the session's own claims, which is
+        the only thing this dependency can prove: ``/me`` and ``/login``
+        therefore answer with the same values for the same session, rather than
+        login reporting a name that ``/me`` could only ever report as null.
 
     Raises:
         HTTPException: 401 when no valid session is presented, 503 when this
@@ -282,93 +274,20 @@ async def get_current_user(
     return {
         "user_id": user_id,
         "email": claims.get("email"),
+        # Carried in the session because the session is what ``/me`` can prove.
+        # Absent from the claims — every deployment today, since neither
+        # gateway contract reports a display name — reads as ``None`` here and
+        # at login alike.
+        "user_name": claims.get("user_name"),
         "role": role,
         "is_admin": role == "admin",
         "authenticated": True,
     }
 
 
-def hash_api_key(api_key: str) -> str:
-    """Hash a presented API key for the operational store lookup.
-
-    Plain SHA-256. The gateway derives its hash with ``API_KEY_SECRET``, which
-    AGENTS.md rule 4 forbids this repository from holding — one more reason the
-    branch below cannot be answered here.
-    """
-    return hashlib.sha256(api_key.encode()).hexdigest()
-
-
-async def verify_api_key(
-    request: Request,
-    authorization: str | None = Header(None),
-    x_api_key: str | None = Header(None, alias="X-API-Key"),
-    op_store=Depends(get_operational_store),
-    log_store=Depends(get_log_store),
-    agent_job_store=Depends(get_agent_job_store),
-) -> dict[str, Any]:
-    """Verify an API key and return the user context it authenticates.
-
-    **This branch has no store on this side.** ``get_operational_store``
-    answers ``None`` in every real deployment, so a programmatic caller gets a
-    503 here rather than a session. It is kept because the moved router's
-    credential dispatch and three ported tests describe it; see
-    ``get_operational_store``.
-
-    Two behaviours matter whatever happens to it:
-
-    - **A worker token is never an owner credential.** On the gateway this was
-      an allowlist of inference paths, because that dependency also guarded
-      ``/v1/chat/completions``. This service serves no inference route at all,
-      so the rule collapses to a flat refusal — the same 403 and the same
-      ``insufficient_scope`` type the sandbox would have got there.
-    - **Nothing falls open.** No store means 503, not "allowed".
-
-    Raises:
-        HTTPException: 403 for a sandbox credential, 401 for a missing or
-            unknown key, 503 when there is no store to resolve keys against.
-    """
-    presented = bearer_token(authorization) or (x_api_key or None)
-
-    if looks_like_agent_token(presented):
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "error": {
-                    "type": "insufficient_scope",
-                    "message": "This credential may only be used for model inference.",
-                }
-            },
-        )
-
-    if not presented:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing API key. Use 'Authorization: Bearer hyi-xxx' or 'X-API-Key: hyi-xxx'",
-        )
-
-    if not op_store:
-        raise HTTPException(status_code=503, detail="Authentication database unavailable.")
-
-    caller = await op_store.get_auth_context_by_key_hash(hash_api_key(presented))
-    if not caller:
-        raise HTTPException(status_code=401, detail="Invalid or expired API key")
-
-    await op_store.update_key_last_used(caller["id"])
-
-    user_role = caller.get("role") or "free"
-    return {
-        "user_id": caller["user_id"],
-        "user_name": caller.get("user_name"),
-        "role": user_role,
-        "authenticated": True,
-        "is_admin": user_role == "admin",
-    }
-
-
 async def verify_admin_access(
     request: Request,
     authorization: str | None = Header(None),
-    op_store=Depends(get_operational_store),
 ) -> str:
     """Authenticate an admin caller, returning an identifier for the audit log.
 
@@ -382,18 +301,25 @@ async def verify_admin_access(
       authenticates, and the role comes from the gateway's own answer at login
       rather than from anything the browser can edit.
 
+    **A missing ``AGENT_SESSION_SECRET`` is answered the same way here as at
+    :func:`get_current_user`: 503.** It used to be a 401, because the broader
+    ``IdentityError`` was caught and an unverifiable session simply did not
+    open the door — which sent an operator looking for a credential problem
+    that did not exist, while the same misconfiguration was diagnosed correctly
+    one function away. The admin *token* is checked first and is unaffected: a
+    deployment that authenticates machines only keeps working with no session
+    secret at all, because that path returns before this one is reached.
+
     Args:
         request: The incoming request, for its cookies.
         authorization: The ``Authorization`` header, if the caller sent one.
-        op_store: Accepted and unused — the gateway resolved an admin JWT
-            through its ``users`` table, and the moved router still passes this
-            positionally at ``verify_dispatcher_access``'s fallback.
 
     Returns:
         ``"admin-token"`` or ``"admin:<user_id>"``, for the audit trail.
 
     Raises:
-        HTTPException: 401 when neither door opens.
+        HTTPException: 401 when neither door opens, 503 when this deployment
+            cannot verify sessions at all.
     """
     presented = bearer_token(authorization)
     configured = (os.environ.get(ENV_ADMIN_TOKEN) or "").strip()
@@ -404,6 +330,8 @@ async def verify_admin_access(
     if token:
         try:
             claims = identity.verify_session(token)
+        except identity.IdentityNotConfigured as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from None
         except identity.IdentityError:
             claims = None
         if claims is not None and str(claims.get("role") or "") == "admin":
@@ -451,7 +379,8 @@ async def log_admin_action(
     """Append one admin action to this service's audit trail.
 
     The gateway's ``admin_audit_log`` stayed with the gateway, so this service
-    grew its own — migration ``0004`` — rather than a documented no-op. The
+    grew its own — migration ``0005_grants_and_audit`` — rather than a
+    documented no-op. The
     actions logged here revoke a machine's credential, retarget every future
     claim and remove hosts from the pool; a service that owns that surface and
     keeps no record of who used it has no answer to the only question asked

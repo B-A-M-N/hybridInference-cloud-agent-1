@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI
 
+from cloud_agent.gateway import GatewayError
+from cloud_agent.grants import RENEWAL_INTERVAL_S
 from cloud_agent.host_pool import HEARTBEAT_INTERVAL_S, MISSED_HEARTBEATS_BEFORE_OFFLINE
 from cloud_agent.logging_utils import configure_process_logging, get_logger
 
@@ -48,9 +50,55 @@ ENV_GITHUB_TOKEN = "AGENT_GITHUB_TOKEN"
 #: nothing else references them, and they stop without a word.
 _BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 
-#: How often the reaper looks for expired leases and stalled publishes.
-REAP_INTERVAL_S = 30.0
+#: How often the reaper looks for expired leases and stalled publishes — and,
+#: because the grant passes ride on the same loop, how often a live grant is
+#: renewed. It is :data:`cloud_agent.grants.RENEWAL_INTERVAL_S` rather than a
+#: number of its own precisely so it cannot drift from the grant TTL that is
+#: derived from it; the invariant is stated where those constants live.
+REAP_INTERVAL_S = RENEWAL_INTERVAL_S
 MAX_ATTEMPTS = 3
+
+#: The gateway refusals that are a verdict on the grant itself.
+#:
+#: Everything else it can say — a wrong dispatch token, an internal API it was
+#: never configured to expose, a 500, a connection it never accepted — is a
+#: statement about the gateway or about this service, and abandoning a user's
+#: running job over it would be answering our own outage by destroying their
+#: work. Only these three name the grant or its subject:
+#:
+#: * ``unknown_grant`` — the gateway has no record of it.
+#: * ``grant_not_live`` — revoked out of band, or expired past renewal.
+#: * ``subject_unavailable`` — the user was suspended mid-job.
+#:
+#: An unrecognised type is therefore *not* definitive, and that direction is
+#: deliberate: the cost of not giving up is a few more renewal attempts against
+#: a capability the TTL will retire anyway, while the cost of giving up wrongly
+#: is a destroyed attempt. Adding a type here is a decision to destroy work on
+#: it. Mirrored from the gateway's ``routers/agent_grants.py``.
+DEAD_GRANT_REFUSALS = frozenset({"unknown_grant", "grant_not_live", "subject_unavailable"})
+
+#: Consecutive *definitive* refusals of one grant before the control plane
+#: stops asking.
+#:
+#: Renewal needs a give-up for the same reason revocation detaches as it hands
+#: over: a grant the gateway has permanently refused — revoked out of band, its
+#: subject suspended — would otherwise be retried every pass for the life of the
+#: attempt, and the attempt would run on toward the moment its capability dies
+#: with nothing anywhere saying so.
+#:
+#: Definitive is the whole of it. A refusal that names *this grant* counts; a
+#: gateway that is unreachable, timing out, or 500ing has said nothing about
+#: this grant and must count for nothing. Conflating the two makes this
+#: threshold a fleet-wide demolition charge: at three passes, a gateway
+#: restart lasting ``GRANT_RENEWAL_GIVE_UP_AFTER * REAP_INTERVAL_S`` seconds
+#: would abandon every running attempt at once and throw away work that was
+#: about to finish. See :meth:`GatewayError.definitive`.
+#:
+#: Small on purpose. ``GRANT_RENEWAL_GIVE_UP_AFTER * REAP_INTERVAL_S`` must stay
+#: below the gateway's renewal step, so that giving up happens while the
+#: capability is still alive and the attempt can be stopped cleanly instead of
+#: discovering its token dead mid-call. ``test_grant_lifecycle.py`` pins that.
+GRANT_RENEWAL_GIVE_UP_AFTER = 3
 
 
 async def _reconcile_settled_terminals(store: AgentJobStore) -> None:
@@ -98,7 +146,47 @@ async def _revoke_dead_grants(store: AgentJobStore, grants: Any) -> None:
             )
 
 
-async def _renew_live_grants(store: AgentJobStore, grants: Any) -> None:
+async def _abandon_unrenewable_attempt(store: AgentJobStore, row: dict[str, Any]) -> None:
+    """Stop an attempt whose grant the gateway will not renew.
+
+    **Giving up has to be something the attempt notices.** Simply stopping the
+    renewal calls would leave the sandbox running until its capability expired
+    and then failing at a model call, with the cause several minutes and one
+    process away. Releasing the claim is the same answer the claim path already
+    gives when a grant cannot be minted at all: the attempt is aborted, the
+    worker's next heartbeat says ``ok: False`` — stop immediately — and the job
+    goes back to the queue **without spending a retry**, where the next claim
+    asks for a fresh grant rather than nursing a dead one.
+
+    Nothing revokes the grant here. The release makes the attempt non-current,
+    which is exactly what ``take_revocable_grants`` selects, so the revocation
+    pass picks it up once and detaches it. Revoking inline would be a second
+    call to the gateway that just refused us, on a path that has already
+    decided the TTL is the backstop.
+
+    Args:
+        store: The agent store.
+        row: A ``list_renewable_grants`` row, carrying the attempt's fence.
+    """
+    released = await store.release_claim(
+        job_id=row["job_id"],
+        attempt_id=row["attempt_id"],
+        lease_generation=row["lease_generation"],
+    )
+    logger.warning(
+        "agent_grant_renewal_given_up",
+        extra={
+            "event": "agent_grant_renewal_given_up",
+            "job_id": row["job_id"],
+            "attempt_id": row["attempt_id"],
+            "requeued": released,
+        },
+    )
+
+
+async def _renew_live_grants(
+    store: AgentJobStore, grants: Any, *, failures: dict[str, int]
+) -> None:
     """Extend the grants of attempts that are still current — and only those.
 
     **The store is consulted every pass, and that is the fence.** The gateway
@@ -109,13 +197,46 @@ async def _renew_live_grants(store: AgentJobStore, grants: Any) -> None:
     that are ``running`` with an unexpired lease, so a superseded attempt stops
     being renewed on the very next pass and its capability dies at its own TTL.
 
-    A refused renewal is logged, not retried here: the next pass tries again if
-    the attempt is still live, and stops trying the moment it is not.
+    A failed renewal is retried on the next pass — one bad minute at the
+    gateway must not end a job — but a *definitively refused* one is not
+    retried forever. After :data:`GRANT_RENEWAL_GIVE_UP_AFTER` consecutive
+    definitive refusals of the same grant the attempt is abandoned rather than
+    left running toward a capability that is about to expire; see
+    :func:`_abandon_unrenewable_attempt`.
+
+    **Only a refusal that names this grant counts toward that** — see
+    :data:`DEAD_GRANT_REFUSALS`. An unreachable gateway, a rotated dispatch
+    token and a revoked grant all arrive as the same exception type, and
+    treating them alike would mean a brief outage or one bad environment
+    variable abandoned every running attempt in the fleet at once: the failure
+    modes where giving up is most expensive and least justified. Anything
+    other than a verdict on the grant therefore leaves the count untouched. It
+    is neither evidence against the grant nor evidence for it, so it neither
+    advances the give-up nor forgives refusals already counted; only a
+    successful renewal clears those.
+
+    Args:
+        store: The agent store.
+        grants: The grant client.
+        failures: Consecutive definitive refusals per grant id, owned by the
+            caller so it survives between passes. Pruned here to the grants
+            still live, so a finished job leaves nothing behind.
     """
+    seen: set[str] = set()
     for row in await store.list_renewable_grants():
+        grant_id = row["grant_id"]
+        seen.add(grant_id)
         try:
-            await grants.renew(row["grant_id"])
-        except Exception:
+            await grants.renew(grant_id)
+        except Exception as exc:
+            definitive = (
+                isinstance(exc, GatewayError)
+                and exc.definitive
+                and exc.error_type in DEAD_GRANT_REFUSALS
+            )
+            refusals = failures.get(grant_id, 0) + (1 if definitive else 0)
+            if definitive:
+                failures[grant_id] = refusals
             logger.warning(
                 "agent_grant_renewal_failed",
                 exc_info=True,
@@ -123,8 +244,31 @@ async def _renew_live_grants(store: AgentJobStore, grants: Any) -> None:
                     "event": "agent_grant_renewal_failed",
                     "job_id": row["job_id"],
                     "attempt_id": row["attempt_id"],
+                    "definitive": definitive,
+                    "consecutive_refusals": refusals,
                 },
             )
+            if definitive and refusals >= GRANT_RENEWAL_GIVE_UP_AFTER:
+                try:
+                    await _abandon_unrenewable_attempt(store, row)
+                except Exception:
+                    # Leave the count at or above the threshold, so the next
+                    # pass that is again definitively refused retries the
+                    # release rather than resuming renewals this one has
+                    # already decided are hopeless. A pass that merely cannot
+                    # reach the gateway retries neither: releasing an attempt
+                    # requires the gateway too, and there is nothing to gain by
+                    # asking a second time in the same outage.
+                    logger.warning("Abandoning an unrenewable attempt failed", exc_info=True)
+                else:
+                    seen.discard(grant_id)
+            continue
+        # Consecutive, not cumulative: one refused pass followed by a good one
+        # is a gateway blip, and must not accumulate toward a give-up over the
+        # hours a long job runs.
+        failures.pop(grant_id, None)
+    for grant_id in [known for known in failures if known not in seen]:
+        del failures[grant_id]
 
 
 async def _reap_offline_hosts(store: AgentJobStore) -> None:
@@ -168,6 +312,12 @@ async def reap_expired_attempts(
         await _reconcile_settled_terminals(store)
     except Exception:
         logger.warning("Initial settled terminal reconciliation failed", exc_info=True)
+    # Consecutive renewal refusals, per grant. Held by the loop rather than by
+    # the module, so two reapers (a test's and a running app's) cannot count
+    # each other's failures toward a give-up — and so a restart forgets, which
+    # is the right way round: a fresh process should ask the gateway again
+    # before abandoning anyone's attempt.
+    renewal_failures: dict[str, int] = {}
     while True:
         await asyncio.sleep(interval_seconds)
         # Hosts first. A machine that stopped heartbeating should be out of the
@@ -212,7 +362,7 @@ async def reap_expired_attempts(
             except Exception:
                 logger.warning("Grant revocation pass failed", exc_info=True)
             try:
-                await _renew_live_grants(store, grants)
+                await _renew_live_grants(store, grants, failures=renewal_failures)
             except Exception:
                 logger.warning("Grant renewal pass failed", exc_info=True)
 

@@ -19,6 +19,12 @@ nothing — a released claim is not a spent attempt.
 **The link is recorded under the fence.** Renewal and revocation are both
 lookups through ``agent_attempts.grant_id``; a grant recorded against an
 attempt that was superseded in the meantime would be a grant renewed forever.
+
+**And a grant that cannot be linked is withdrawn, not handed over.** The link
+is the only thing that will ever renew or revoke a capability, so an unlinked
+one is live, unowned and unfindable until its TTL runs out. Both ways it can
+happen — no ``grant_id`` in the answer, and a fenced UPDATE that matched
+nothing — are pinned below.
 """
 
 from __future__ import annotations
@@ -100,15 +106,24 @@ class _ClaimStore:
 class _Grants:
     """The grant client, answering or refusing on demand."""
 
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, grant_id: str | None = "agr_7") -> None:
         self.fail = fail
+        self.grant_id = grant_id
         self.calls: list[dict[str, Any]] = []
+        self.revoked: list[str] = []
 
     async def mint(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(kwargs)
         if self.fail:
             raise GatewayError("gateway answered 503 for /internal/agent-grants")
-        return {"grant_id": "agr_7", "token": "agr.header.signature"}
+        minted: dict[str, Any] = {"token": "agr.header.signature"}
+        if self.grant_id is not None:
+            minted["grant_id"] = self.grant_id
+        return minted
+
+    async def revoke(self, grant_id: str) -> bool:
+        self.revoked.append(grant_id)
+        return True
 
 
 def _app(store: _ClaimStore, grants: _Grants) -> FastAPI:
@@ -193,6 +208,39 @@ async def test_a_refused_grant_returns_the_job_to_the_queue(claim):
     assert response.json()["detail"]["error"]["type"] == "credential_unavailable"
     assert store.released == [(_JOB, _ATTEMPT)]
     assert store.grants == {}
+
+
+async def test_a_grant_that_cannot_be_linked_is_revoked_not_handed_over(claim):
+    """The fence moved between the mint and the write.
+
+    Handing the token over anyway would put a live capability inside a sandbox
+    that nothing will renew and nothing will revoke: it would survive to its
+    TTL with no owner, and no operator could find it from either side.
+    """
+    store, grants = _ClaimStore(fence_still_current=False), _Grants()
+
+    response = await claim(store, grants)
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["error"]["type"] == "credential_unavailable"
+    assert grants.revoked == ["agr_7"]
+    assert store.grants == {}
+
+
+async def test_a_grant_with_no_id_is_refused_rather_than_used(claim):
+    """A token this service cannot name is a token it cannot ever withdraw.
+
+    Nothing can be revoked here — there is no id to revoke — so the only
+    remaining protection is refusing to run with it.
+    """
+    store, grants = _ClaimStore(), _Grants(grant_id=None)
+
+    response = await claim(store, grants)
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["error"]["type"] == "credential_unavailable"
+    assert grants.revoked == []
+    assert store.released == [(_JOB, _ATTEMPT)]
 
 
 async def test_an_empty_queue_never_asks_for_a_grant(claim):

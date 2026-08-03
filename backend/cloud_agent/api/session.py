@@ -147,9 +147,21 @@ async def session_login(
     role = str(status.get("role") or "free")
     email = status.get("email") or claims.get("email")
     email = str(email) if email else None
+    # Read from either source and then **minted into the session**, because the
+    # session is the only thing ``/me`` can read. Sourcing it here and returning
+    # it without minting it is what made the two routes disagree: login answered
+    # with a name and ``/me`` answered ``null`` for the same signed-in person,
+    # for the whole seven days the cookie lasts. Today no gateway contract
+    # reports a name at all, so both answer ``null`` — but they now do so for
+    # the same reason, and a gateway that grows the field is answered
+    # consistently without a second change here.
+    user_name = status.get("user_name") or claims.get("user_name")
+    user_name = str(user_name) if user_name else None
 
     try:
-        session = identity.mint_session(user_id=user_id, email=email, role=role)
+        session = identity.mint_session(
+            user_id=user_id, email=email, role=role, user_name=user_name
+        )
     except identity.IdentityNotConfigured as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
 
@@ -166,12 +178,7 @@ async def session_login(
         secure=_cookie_is_secure(),
         path="/",
     )
-    return SessionUserResponse(
-        id=user_id,
-        email=email,
-        role=role,
-        user_name=(str(status["user_name"]) if status.get("user_name") else None),
-    )
+    return SessionUserResponse(id=user_id, email=email, role=role, user_name=user_name)
 
 
 @router.post("/logout")
@@ -204,6 +211,10 @@ async def session_me(request: Request) -> SessionUserResponse:
     expiry bounds how stale that answer can get; putting a gateway round trip
     on the call every page load makes the whole app unavailable whenever the
     gateway is, for a question already answered.
+
+    **Every field here comes out of the session ``/login`` minted**, which is
+    what makes the two routes answer the same thing for the same person. They
+    disagreed about ``user_name`` until login started minting it.
     """
     user = await get_current_user(
         request=request, authorization=request.headers.get("authorization")

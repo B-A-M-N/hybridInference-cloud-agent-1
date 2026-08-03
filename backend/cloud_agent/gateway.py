@@ -35,7 +35,49 @@ _CONNECT_TIMEOUT_S = 5.0
 
 
 class GatewayError(Exception):
-    """The gateway could not answer, or answered unusably."""
+    """The gateway could not answer, or answered unusably.
+
+    ``status_code`` is the gateway's, when there was one, and ``error_type``
+    is the machine-readable reason from its error body. ``None`` for the
+    status means the request never got an answer — unreachable, timed out,
+    unparsable — and that distinction is load-bearing for any caller deciding
+    whether to give up: a 4xx says *this request* is wrong and will stay
+    wrong, while ``None`` says nothing about the request at all and everything
+    about the network. Treating them alike turns a minute of gateway downtime
+    into a fleet-wide abort.
+
+    ``error_type`` matters for the same reason one level down. Status codes at
+    this gateway are overloaded — 404 is both "no such grant" and "this
+    deployment exposes no internal endpoints" — so a caller that reads only
+    the status cannot tell a dead subject from its own misconfiguration.
+    Callers whose reaction is destructive should key off the type.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_type: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_type = error_type
+
+    @property
+    def definitive(self) -> bool:
+        """Whether retrying this exact request could ever succeed.
+
+        A 408 or 429 is the gateway asking for patience, and 5xx is the gateway
+        being unwell — neither is a verdict on the request. This says only that
+        the gateway answered and refused; it does not say *what* it refused,
+        which is what :attr:`error_type` is for.
+        """
+        if self.status_code is None:
+            return False
+        if self.status_code in (408, 429):
+            return False
+        return 400 <= self.status_code < 500
 
 
 class GatewayClient:
@@ -90,7 +132,10 @@ class GatewayClient:
             raise GatewayError(f"gateway unreachable: {exc}") from exc
 
         if response.status_code != 200:
-            raise GatewayError(f"gateway answered {response.status_code} for {path}")
+            raise GatewayError(
+                f"gateway answered {response.status_code} for {path}",
+                status_code=response.status_code,
+            )
         try:
             body = response.json()
         except ValueError as exc:

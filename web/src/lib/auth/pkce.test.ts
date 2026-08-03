@@ -77,15 +77,19 @@ describe('pkce pending flows', () => {
     expect(hasPending()).toBe(false);
   });
 
-  it('sweeps abandoned flows when a new one starts', () => {
+  it('sweeps unredeemable flows when a new one starts, and only those', () => {
     rememberPending(flow('abandoned', { createdAt: Date.now() - 11 * 60 * 1000 }));
+    rememberPending(flow('still-running'));
 
     rememberPending(flow('fresh'));
 
     // One key per flow only pays for itself if the flows nobody finishes are
     // cleaned up: a redirect the user closes leaves an entry behind forever
-    // otherwise.
+    // otherwise. But the sweep is by redeemability, not by abandonment — a
+    // still-young entry may be a sign-in running in another tab, and this
+    // module cannot tell the two apart.
     expect(localStorage.getItem('cloud-agent:pkce:abandoned')).toBeNull();
+    expect(localStorage.getItem('cloud-agent:pkce:still-running')).not.toBeNull();
     expect(localStorage.getItem('cloud-agent:pkce:fresh')).not.toBeNull();
   });
 

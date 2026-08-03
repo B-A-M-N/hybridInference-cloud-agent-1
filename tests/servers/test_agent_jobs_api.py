@@ -11,10 +11,10 @@ longer holds are supplied by the test app instead of by an import:
 - **The model catalog and the MCP registry** arrive over HTTP now, so the
   route registry the source stubbed is a fake ``GatewayClient`` here.
 - **The auth dependencies** are real as of E7, so nothing stands in for them
-  any more: ``get_current_user`` verifies this service's own session token,
-  ``verify_admin_access`` compares ``ADMIN_TOKEN``, and the API-key branch
-  resolves against whatever ``get_operational_store`` answers — ``None`` in
-  production, the fake below in these tests.
+  any more: ``get_current_user`` verifies this service's own session token and
+  ``verify_admin_access`` compares ``ADMIN_TOKEN``. There is no API-key branch
+  to stand in for since 2026-08-04 — it was deleted, along with the operational
+  store it read; the session is the only owner credential here.
 - **The sandbox's credential** is a gateway grant since E9, not something the
   claim mints, so the fake gateway client has a grant-minting sibling.
 
@@ -675,38 +675,9 @@ class FakeAgentJobStore:
         return True
 
 
-class FakeOwnerAuthStore:
-    """Operational-store slice needed by JWT and API-key owner auth."""
-
-    def __init__(self, *, role: str = "internal") -> None:
-        self.role = role
-        self.last_used_key_id: str | None = None
-
-    def _user(self) -> dict[str, Any]:
-        return {
-            "id": "key-1",
-            "user_id": _OWNER,
-            "user_name": "owner",
-            "email": "owner@example.com",
-            "role": self.role,
-            "status": "active",
-            "email_verified": True,
-            "quota_daily_cost_usd": 100.0,
-            "preferences": None,
-            "max_concurrent_requests": 4,
-        }
-
-    async def get_user_by_id(self, user_id: str) -> dict[str, Any] | None:
-        return self._user() if user_id == _OWNER else None
-
-    async def get_auth_context_by_key_hash(self, _key_hash: str) -> dict[str, Any]:
-        return self._user()
-
-    async def get_user_cost_today(self, _user_id: str) -> float:
-        return 0.0
-
-    async def update_key_last_used(self, key_id: str) -> None:
-        self.last_used_key_id = key_id
+# ``FakeOwnerAuthStore`` — the operational-store slice the ported API-key cases
+# installed — was deleted with the branch it fed on 2026-08-04. Nothing in this
+# service resolves a key to a user, so there is no store shape left to fake.
 
 
 @pytest.fixture(autouse=True)
@@ -795,7 +766,6 @@ def _build_app(store, *, role: str = "internal", dispatcher: bool = True):
         get_gateway_client,
         get_grant_client,
         get_log_store,
-        get_operational_store,
     )
 
     app = FastAPI()
@@ -807,9 +777,6 @@ def _build_app(store, *, role: str = "internal", dispatcher: bool = True):
     # The sandbox credential comes from the gateway (E9); without this the
     # claim would correctly refuse, having no configured grant client.
     app.dependency_overrides[get_grant_client] = _FakeGrants
-    # verify_admin_access resolves an operational store; the bare test app has
-    # no app.state, so supply it even when the gate is left real.
-    app.dependency_overrides[get_operational_store] = lambda: None
     # No GitHub App by default — the configuration most deployments start in,
     # and the one where a public repository still clones fine.
     app.dependency_overrides[get_agent_app_credentials] = lambda: None
@@ -1314,11 +1281,8 @@ async def test_follow_up_resolves_a_legacy_draft_pr_branch(
 
 async def test_browser_jwt_can_list_agent_jobs(store: FakeAgentJobStore):
     """Regression: the web login JWT was interpreted as an invalid API key."""
-    from cloud_agent.api.deps import get_operational_store
-
     app = _build_app(store)
     app.dependency_overrides.pop(agent_jobs_router.authenticate_agent_owner)
-    app.dependency_overrides[get_operational_store] = lambda: FakeOwnerAuthStore()
     token = _browser_session()
 
     transport = ASGITransport(app=app)
@@ -1336,11 +1300,8 @@ async def test_expired_browser_jwt_is_not_reinterpreted_as_api_key(store: FakeAg
     """Credential dispatch must preserve a JWT's own expiry failure."""
     from datetime import timedelta
 
-    from cloud_agent.api.deps import get_operational_store
-
     app = _build_app(store)
     app.dependency_overrides.pop(agent_jobs_router.authenticate_agent_owner)
-    app.dependency_overrides[get_operational_store] = lambda: FakeOwnerAuthStore()
     token = _browser_session(expires_delta=timedelta(seconds=-1))
 
     transport = ASGITransport(app=app)
@@ -1354,34 +1315,22 @@ async def test_expired_browser_jwt_is_not_reinterpreted_as_api_key(store: FakeAg
     assert response.json()["detail"].startswith("Token has expired")
 
 
-async def test_normal_api_key_still_authenticates_agent_owner(store: FakeAgentJobStore):
-    """Programmatic clients keep the existing API-key path and quota checks."""
-    from cloud_agent.api.deps import get_operational_store
-
-    auth_store = FakeOwnerAuthStore()
-    app = _build_app(store)
-    app.dependency_overrides.pop(agent_jobs_router.authenticate_agent_owner)
-    app.dependency_overrides[get_operational_store] = lambda: auth_store
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as api_client:
-        response = await api_client.get(
-            "/v1/agent/jobs",
-            headers={"Authorization": "Bearer hyi-programmatic-client"},
-        )
-
-    assert response.status_code == 200
-    assert auth_store.last_used_key_id == "key-1"
+# ``test_normal_api_key_still_authenticates_agent_owner`` stood here. It minted
+# an ``hyi-*`` key against a faked operational store and asserted 200 plus
+# ``update_key_last_used``. The API-key branch was deleted on 2026-08-04 — it
+# had no producer here and never will — so the case has no subject left and
+# passed only because it injected the store production never has. Recorded in
+# MIGRATION.md's "Discarded tests" register, which also says where the property
+# lives now: the gateway, which still authenticates API keys for its own
+# surfaces.
 
 
 async def test_sandbox_token_stays_out_of_owner_routes(store: FakeAgentJobStore):
     """A structured Agent token must not be mistaken for a browser JWT."""
-    from cloud_agent.api.deps import get_operational_store
     from cloud_agent.tokens import SCOPE_MODEL
 
     app = _build_app(store)
     app.dependency_overrides.pop(agent_jobs_router.authenticate_agent_owner)
-    app.dependency_overrides[get_operational_store] = lambda: FakeOwnerAuthStore()
     token = mint_worker_token(
         job_id="ajob_0001",
         attempt_id=1,
@@ -2615,18 +2564,15 @@ async def test_dedicated_dispatcher_token_opens_exactly_one_door(
         assert claimed.status_code == 200
         assert claimed.json()["repo"] == "owner/name"
 
-    # On the owner surface the same value is just an unknown API key: the
-    # only authenticator that recognizes it is the claim gate. (The base fake
-    # store validates any key, which would mask exactly this property.)
-    from cloud_agent.api.deps import get_operational_store
-
-    class _NoSuchKey(FakeOwnerAuthStore):
-        async def get_auth_context_by_key_hash(self, _key_hash: str) -> None:
-            return None
-
+    # On the owner surface the same value is just an unknown credential: the
+    # only authenticator that recognizes it is the claim gate. It used to be
+    # rejected as an unknown API key — through a store fake subclassed here to
+    # answer "no such key", since the base fake validated any key and would
+    # have masked exactly this property. The API-key branch is gone (2026-08-04),
+    # so the refusal now comes from the session verifier, which is the only
+    # owner authenticator left. Same assertion, one authenticator fewer.
     owner_app = _build_app(store, dispatcher=False)
     owner_app.dependency_overrides.pop(agent_jobs_router.authenticate_agent_owner)
-    owner_app.dependency_overrides[get_operational_store] = lambda: _NoSuchKey()
     transport = ASGITransport(app=owner_app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get(
@@ -2738,8 +2684,13 @@ async def test_terminal_stream_drains_beyond_one_page(
 # is precisely the credential E9 removed, because it was signed with a root the
 # gateway does not know and therefore bought nothing. The property it protected
 # (the sandbox gets a *different*, weaker credential than the runner) is pinned
-# below against the credential that replaced it. Recorded in MIGRATION.md's
-# discarded-test register.
+# below against the credential that replaced it.
+#
+# The case below is its in-place replacement. The full record — the original's
+# four assertions, which three of them the replacement keeps verbatim, and why
+# "does not parse at all" is stronger than "parses with a narrow scope" — is
+# MIGRATION.md § Discarded tests → "`test_agent_jobs_api.py` — two cases E9
+# replaced in place (E7/E8/E9)", case 1. Ratified 2026-08-04.
 
 
 async def test_the_claim_hands_over_a_gateway_grant_not_a_minted_token(
@@ -2774,8 +2725,12 @@ async def test_the_claim_hands_over_a_gateway_grant_not_a_minted_token(
 # the sandbox holds a gateway grant, which is not a credential in this
 # service's namespace at all, so it does not reach the scope check — it fails
 # to parse. Same guarantee, one step earlier and one status code over.
-# Recorded in MIGRATION.md's discarded-test register; the case below is its
-# replacement, driving the same four endpoints with the same intent.
+#
+# The case below is its in-place replacement: same four endpoints, same
+# positive control, line-for-line identical otherwise. The full record — and
+# the note that ``_worker_claims``' 403 scope branch lost its only test with
+# the original — is MIGRATION.md § Discarded tests → "`test_agent_jobs_api.py`
+# — two cases E9 replaced in place (E7/E8/E9)", case 2. Ratified 2026-08-04.
 
 
 async def test_the_sandbox_grant_cannot_write_job_state(client: AsyncClient):
@@ -2815,9 +2770,12 @@ async def test_the_sandbox_grant_cannot_write_job_state(client: AsyncClient):
 # This service serves no inference route, so there is nothing to port it
 # against and reproducing the predicate here would be inventing production
 # code inside a migration. The wire-level half of the same guarantee is
-# ``test_sandbox_token_stays_out_of_owner_routes`` (403 ``insufficient_scope``
-# on ``/v1/agent/jobs``) and ``test_sandbox_token_cannot_write_job_state``,
-# both of which are ported. Recorded in MIGRATION.md's discarded-test register.
+# ``test_sandbox_token_stays_out_of_owner_routes`` (ported; 403
+# ``insufficient_scope`` on ``/v1/agent/jobs``) and, for the worker surface,
+# ``test_the_sandbox_grant_cannot_write_job_state`` (E9's in-place replacement
+# for ``test_sandbox_token_cannot_write_job_state``; 401 against the gateway
+# grant the sandbox now carries). Recorded in MIGRATION.md's discarded-test
+# register.
 
 
 async def test_event_type_guard_rejects_a_trailing_newline(client: AsyncClient):

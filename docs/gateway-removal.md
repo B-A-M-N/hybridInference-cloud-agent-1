@@ -118,9 +118,10 @@ no per-job budget**; do not re-add one on the way out.
 > **These are `dev` paths, not freeze paths — the one exception to the header.**
 > C1–C4 landed *after* `764a6f97`: `identity.py` arrived with #1177 on
 > 2026-08-03, hours after the freeze. `git cat-file -e 764a6f97:<path>` fails
-> for all four files below, so line numbers here are `origin/dev`'s and will
-> move as `dev` does. Re-read them when H4 is scheduled; treat the route
-> definitions, not the numbers, as the identifier.
+> for **all seven paths named in this section** and succeeds for all seven on
+> `origin/dev` (re-counted and re-checked 2026-08-04), so line numbers here are
+> `origin/dev`'s and will move as `dev` does. Re-read them when H4 is
+> scheduled; treat the route definitions, not the numbers, as the identifier.
 
 The endpoints this service authenticates against, added by C1–C4 and already on
 `dev` (router prefix `/v1/identity`, declared at `identity.py:45`):
@@ -131,17 +132,26 @@ POST /v1/identity/code                                       :144   (origin/dev)
 POST /v1/identity/token                                      :197   (origin/dev)
 ```
 
-Plus `apps/backend/serving/utils/identity_keys.py`,
-`apps/backend/serving/utils/identity_tokens.py`, the authorization code storage
-(`tests/integration/storage/test_identity_auth_codes.py` names it), and the
-frontend's consent page `apps/frontend/src/app/authorize/page.tsx` with its
-`page.test.tsx`, and `apps/frontend/src/lib/api/identity.ts`. None of it is
-agent code; it is the login contract, and the agent service is only its first
-consumer.
+The seven, in full — one backend router, two backend utilities, one storage
+test, and three frontend files:
+
+```text
+apps/backend/serving/servers/routers/identity.py          (the three routes above)
+apps/backend/serving/utils/identity_keys.py
+apps/backend/serving/utils/identity_tokens.py
+tests/integration/storage/test_identity_auth_codes.py     (names the auth-code storage)
+apps/frontend/src/app/authorize/page.tsx                  (the consent page)
+apps/frontend/src/app/authorize/page.test.tsx
+apps/frontend/src/lib/api/identity.ts
+```
+
+None of it is agent code; it is the login contract, and the agent service is
+only its first consumer.
 
 ### 1.5 Not agent code at all
 
-`tests/unit/storage/test_agent_name_from_prompt.py` (314 lines, 30 cases)
+`tests/unit/storage/test_agent_name_from_prompt.py` (314 lines, 30 test
+functions, 60 executed cases — eight of them are parameterized)
 matched the manifest grep and is **not** cloud agent. It tests
 `serving/storage/utils.py::agent_name_from_prompt`, whose only consumer is
 `serving/storage/postgres_log.py:215` — parsing *which coding CLI* made an API
@@ -215,7 +225,7 @@ admin router.
 | `apps/frontend/src/app/agents/` | 8 files |
 | `apps/frontend/src/components/features/agents/` | 30 files |
 | `apps/frontend/src/lib/api/agents.ts` | |
-| `apps/frontend/src/lib/api/__tests__/agents.test.ts` | **526 lines, 25 cases.** Absent from both the plan's F2 text and the manifest's frontend inventory — the same omission shape as `schemas_admin.py`. It covers the SSE reader (frame parsing across chunk boundaries, cursor tracking, reconnect without a gap), so its absence from a list is not evidence it does not matter. |
+| `apps/frontend/src/lib/api/__tests__/agents.test.ts` | **526 lines, 27 cases** — 26 `it` blocks, one of which is an `it.each` of two, which is why counting the blocks gives 26 and running the file gives 27. Absent from both the plan's F2 text and the manifest's frontend inventory — the same omission shape as `schemas_admin.py`. It covers the SSE reader (frame parsing across chunk boundaries, cursor tracking, reconnect without a gap), so its absence from a list is not evidence it does not matter. |
 
 `/agents` becomes a redirect to the new domain.
 

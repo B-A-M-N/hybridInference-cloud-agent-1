@@ -2571,16 +2571,22 @@ class AgentJobStore:
         ``lease_expires_at > NOW()`` drops the ones whose lease died before the
         reaper noticed.
 
+        ``lease_generation`` rides along because the renewal pass may have to
+        *end* one of these attempts — a grant the gateway keeps refusing — and
+        every write that ends an attempt is fenced. Looking the generation up
+        again at that point would read a row that may have moved on in between.
+
         Args:
             limit: Most rows to return in one pass.
 
         Returns:
-            ``[{"attempt_id", "job_id", "grant_id"}]`` for live attempts only.
+            ``[{"attempt_id", "job_id", "grant_id", "lease_generation"}]`` for
+            live attempts only.
         """
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id AS attempt_id, job_id, grant_id
+                SELECT id AS attempt_id, job_id, grant_id, lease_generation
                 FROM agent_attempts
                 WHERE grant_id IS NOT NULL
                   AND status = 'running'
@@ -2595,6 +2601,7 @@ class AgentJobStore:
                 "attempt_id": row["attempt_id"],
                 "job_id": row["job_id"],
                 "grant_id": row["grant_id"],
+                "lease_generation": row["lease_generation"],
             }
             for row in rows
         ]

@@ -6,12 +6,10 @@ busy host is not removable by accident, and an illegal status change is a 409
 rather than a silent no-op. The database-backed half — atomicity, the reaper,
 slot arithmetic under concurrency — lives in the ``dbtest`` tier.
 
-Two E7 placeholders have to be supplied to get here at all: ``verify_admin_access``
-and ``get_operational_store`` both raise until the identity adapter lands, and
-``log_admin_action``/``get_client_ip`` with them. Overriding the first two and
-patching the last two is the same shape ``_build_app`` uses for the moved
-router, and it is the reason these tests are honest about *this* surface while
-saying nothing about the admin gate itself.
+The admin gate itself is deliberately not the subject: ``verify_admin_access``
+is overridden and ``log_admin_action``/``get_client_ip`` are patched, the same
+shape ``_build_app`` uses for the moved router. That is what makes these tests
+honest about *this* surface while saying nothing about the gate.
 """
 
 from __future__ import annotations
@@ -25,7 +23,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from cloud_agent.api import admin_hosts, hosts
-from cloud_agent.api.deps import get_agent_job_store, get_operational_store, verify_admin_access
+from cloud_agent.api.deps import get_agent_job_store, verify_admin_access
 from cloud_agent.host_pool import (
     HOST_DISABLED,
     HOST_DRAINING,
@@ -189,12 +187,9 @@ def _build_app(store: FakeHostPoolStore) -> FastAPI:
     app.include_router(hosts.router)
     app.include_router(admin_hosts.router)
     app.dependency_overrides[get_agent_job_store] = lambda: store
-    # E7 still owns both of these and both still raise. Supplied rather than
-    # left real because the subject here is the pool, not the admin gate — and
-    # a test that silently exercised a NotImplementedError would prove nothing
-    # about either.
+    # Supplied rather than left real because the subject here is the pool, not
+    # the admin gate; ``test_api_auth_deps.py`` is where the gate is pinned.
     app.dependency_overrides[verify_admin_access] = lambda: "admin@test"
-    app.dependency_overrides[get_operational_store] = lambda: None
     return app
 
 
@@ -619,9 +614,6 @@ async def claim_client(monkeypatch):
     app = FastAPI()
     app.include_router(routes.router)
     app.dependency_overrides[get_agent_job_store] = lambda: store
-    # Declared by ``verify_dispatcher_access`` and resolved by FastAPI *before*
-    # the function body runs, so even the host-credential path needs it.
-    app.dependency_overrides[get_operational_store] = lambda: None
     app.dependency_overrides[get_agent_app_credentials] = lambda: None
 
     transport = ASGITransport(app=app)

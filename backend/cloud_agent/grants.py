@@ -40,6 +40,46 @@ _TIMEOUT_S = 10.0
 _CONNECT_TIMEOUT_S = 5.0
 
 
+# ── The cadence and the lifetime are one decision ──────────────────────
+#
+# **Invariant: a grant must outlive several renewal passes.** Renewal runs on
+# the reaper's pass, so the cadence is a scheduling constant and the TTL is a
+# capability's lifetime — two numbers that live in different files and mean
+# nothing apart. If the TTL is ever shorter than the cadence plus its slack, a
+# running attempt loses its capability mid-run and the only symptom is a model
+# call refused inside a sandbox, far from either constant.
+#
+# So the cadence is defined here, next to the lifetime derived from it, and
+# ``cloud_agent.app.REAP_INTERVAL_S`` **is** this value rather than a second
+# copy of it. ``tests/unit/test_grant_lifecycle.py`` fails if the two stop
+# agreeing, if the headroom is spent, or if either number leaves the bounds the
+# gateway enforces.
+
+#: How often the control plane renews a live grant — the reaper's interval,
+#: because the renewal pass rides on it.
+RENEWAL_INTERVAL_S = 30.0
+
+#: Renewal passes a live grant can lose before it expires under a running
+#: attempt. Three is the least worth having (one slow gateway call, one missed
+#: pass, one retry); four is that with a pass to spare.
+RENEWAL_HEADROOM_PASSES = 4
+
+#: The lifetime :meth:`GrantClient.mint` asks for. **Derived, never typed**: a
+#: literal here is a number free to drift from the loop that keeps it alive.
+GRANT_TTL_S = int(RENEWAL_INTERVAL_S * RENEWAL_HEADROOM_PASSES)
+
+#: Mirrors of the gateway's own clamps, from the C5 work this service's grant
+#: calls are written against (`serving/grants.py`: ``MAX_GRANT_TTL_S`` and
+#: ``DEFAULT_GRANT_TTL_S``, which is also its renewal step). Mirrors because the
+#: gateway is reached over HTTP only and neither number is on the wire — asking
+#: for more than the maximum is silently clamped *down*, and a renewal always
+#: buys the step from now whatever was asked for at mint. Both would therefore
+#: break the invariant above without any call failing, which is why the test
+#: asserts our numbers stay inside them.
+GATEWAY_MAX_TTL_S = 900
+GATEWAY_RENEWAL_STEP_S = 300
+
+
 class GrantClient:
     """Mints, renews and revokes inference grants at the gateway."""
 
@@ -92,15 +132,22 @@ class GrantClient:
             # cannot be granted capability" and "unknown MCP server" are
             # different problems for whoever created the job.
             detail = ""
+            error_type = None
             try:
                 payload = response.json()
                 if isinstance(payload, dict):
-                    detail = str(payload.get("error", {}).get("message", ""))
+                    error = payload.get("error")
+                    if isinstance(error, dict):
+                        detail = str(error.get("message", ""))
+                        raw_type = error.get("type")
+                        error_type = str(raw_type) if raw_type else None
             except ValueError:
                 detail = ""
             raise GatewayError(
                 f"gateway answered {response.status_code} for {path}"
-                + (f": {detail}" if detail else "")
+                + (f": {detail}" if detail else ""),
+                status_code=response.status_code,
+                error_type=error_type,
             )
         try:
             payload = response.json()
@@ -118,7 +165,7 @@ class GrantClient:
         attempt_id: str,
         models: list[str] | None = None,
         mcp_servers: list[str] | None = None,
-        ttl_seconds: int | None = None,
+        ttl_seconds: int | None = GRANT_TTL_S,
     ) -> dict[str, Any]:
         """Ask for the capability one attempt runs with.
 
@@ -138,7 +185,11 @@ class GrantClient:
             models: Requested models; ``None`` means everything the role allows.
             mcp_servers: Requested MCP servers; ``None`` means the deployment's
                 defaults.
-            ttl_seconds: Requested lifetime, clamped by the gateway.
+            ttl_seconds: Requested lifetime, clamped by the gateway. Defaults to
+                :data:`GRANT_TTL_S`, which is derived from the renewal cadence —
+                see the invariant above. ``None`` is accepted and means "the
+                gateway's default", a number this service does not know and
+                cannot keep in step with its own loop; nothing here passes it.
 
         Returns:
             The grant, including its bearer ``token``.

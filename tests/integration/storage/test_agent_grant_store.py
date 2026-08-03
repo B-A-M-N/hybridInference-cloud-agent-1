@@ -12,7 +12,11 @@ So these three properties are checked against Postgres:
 - an attempt whose lease lapsed behaves the same way, before any reaper has
   run — expiry is immediate, not "once the reaper notices";
 - ``take_revocable_grants`` detaches as it hands over, so two callers cannot
-  both be handed the same grant.
+  both be handed the same grant;
+- the fence ``list_renewable_grants`` hands out is the one that will be
+  presented back, when a grant the gateway keeps refusing makes the renewal
+  pass end the attempt. A wrong column there is a give-up that silently does
+  nothing, and the unit tests supply their own row.
 """
 
 from __future__ import annotations
@@ -105,6 +109,37 @@ async def test_a_live_attempts_grant_is_renewable(store: AgentJobStore) -> None:
 
     renewable = await store.list_renewable_grants()
     assert [row["grant_id"] for row in renewable] == ["agr_1"]
+    assert await store.take_revocable_grants() == []
+
+
+async def test_a_renewable_row_carries_the_fence_that_can_end_it(store: AgentJobStore) -> None:
+    """The give-up path, end to end in SQL.
+
+    ``_renew_live_grants`` abandons an attempt whose grant the gateway keeps
+    refusing, and every write that ends an attempt is fenced. If the row's
+    ``lease_generation`` were the wrong column — or absent — the release would
+    match nothing and the give-up would be a log line: the attempt would run on
+    with a capability about to expire, which is the failure the give-up exists
+    to prevent.
+    """
+    claim = await _claimed(store)
+    await store.record_attempt_grant(
+        attempt_id=claim["attempt_id"],
+        lease_generation=claim["lease_generation"],
+        grant_id="agr_1",
+    )
+
+    row = (await store.list_renewable_grants())[0]
+    assert await store.release_claim(
+        job_id=row["job_id"],
+        attempt_id=row["attempt_id"],
+        lease_generation=row["lease_generation"],
+    )
+
+    # And the abandoned attempt's grant is now the revocation pass's problem,
+    # exactly once — nothing had to revoke it inline.
+    assert await store.list_renewable_grants() == []
+    assert [taken["grant_id"] for taken in await store.take_revocable_grants()] == ["agr_1"]
     assert await store.take_revocable_grants() == []
 
 

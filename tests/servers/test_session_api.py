@@ -15,6 +15,10 @@ Three properties are worth more than the rest, and each has its own case:
   a status call that cannot be made is not a status call that said yes.
 - **A 401 from ``/me`` is the ordinary answer**, not a server error. The web
   app's ``ProtectedRoute`` loops if it ever arrives as a 5xx.
+- **``/login`` and ``/me`` answer the same thing about the same person.** They
+  are one contract — ``SessionUserResponse`` — and the session login mints is
+  exactly what ``/me`` reads, so anything login reports that the session does
+  not carry is a field the two routes disagree about for seven days.
 """
 
 from __future__ import annotations
@@ -113,6 +117,22 @@ async def client_and_gateway():
     # https, because the cookie carries ``Secure`` and a client talking plain
     # http would silently drop it — which would make every case below pass for
     # the wrong reason, or fail for one.
+    async with AsyncClient(transport=transport, base_url="https://test") as client:
+        yield client, gateway
+
+
+@pytest_asyncio.fixture()
+async def client_and_gateway_named():
+    """A gateway whose status record carries a display name.
+
+    Hypothetical today — the contract has no such field — which is the point:
+    the plumbing has to be right before the field exists, or it arrives and
+    only one of the two routes reports it.
+    """
+    gateway = _FakeGateway(
+        {"exists": True, "active": True, "role": "internal", "user_name": "Ada Lovelace"}
+    )
+    transport = ASGITransport(app=_app(gateway))
     async with AsyncClient(transport=transport, base_url="https://test") as client:
         yield client, gateway
 
@@ -249,6 +269,41 @@ async def test_me_returns_the_current_user(client_and_gateway, key):
     assert response.status_code == 200
     assert response.json()["id"] == _USER
     assert response.json()["role"] == "internal"
+
+
+async def test_login_and_me_answer_the_same_thing(client_and_gateway, key):
+    """One contract, one answer.
+
+    ``/me`` can only report what the session carries, so login reporting
+    anything it did not mint is a field the two routes disagree about for the
+    life of the cookie. ``user_name`` was exactly that: login read it off the
+    gateway's status record and ``/me`` answered ``null``, always.
+    """
+    client, _ = client_and_gateway
+
+    login = await client.post("/v1/session/login", json={"identity_token": _identity_token(key)})
+    me = await client.get("/v1/session/me")
+
+    assert login.status_code == 200
+    assert me.status_code == 200
+    assert login.json() == me.json()
+
+
+async def test_a_display_name_survives_into_me(client_and_gateway_named, key):
+    """And when there *is* a name to report, both report it.
+
+    Nothing on either gateway contract carries a display name today, so the
+    agreement above would also hold if login had simply stopped reporting one.
+    This is what makes the fix the other one: the name is minted into the
+    session, so ``/me`` can prove it.
+    """
+    client, _ = client_and_gateway_named
+
+    login = await client.post("/v1/session/login", json={"identity_token": _identity_token(key)})
+    me = await client.get("/v1/session/me")
+
+    assert login.json()["user_name"] == "Ada Lovelace"
+    assert me.json()["user_name"] == "Ada Lovelace"
 
 
 async def test_me_is_401_without_a_session(client_and_gateway):

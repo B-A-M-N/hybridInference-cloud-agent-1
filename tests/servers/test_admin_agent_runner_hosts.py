@@ -17,7 +17,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from cloud_agent.api import admin_hosts as admin_router
-from cloud_agent.api.deps import get_agent_job_store, get_operational_store
+from cloud_agent.api.deps import get_agent_job_store
 
 ADMIN = {"Authorization": "Bearer test-admin"}
 
@@ -72,7 +72,6 @@ def _admin_app(store: FakeHostStore | None) -> FastAPI:
     app.state.store = store
     app.include_router(admin_router.router)
     app.dependency_overrides[get_agent_job_store] = lambda: store
-    app.dependency_overrides[get_operational_store] = lambda: None
     return app
 
 

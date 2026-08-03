@@ -128,6 +128,9 @@ async def api(monkeypatch):
     # environment. Overriding the credential resolver is the override the
     # source meant; ``internal`` is the least privilege the router's own
     # dogfood gate accepts, so the lifecycle stays the subject of the test.
+    # (``verify_api_key`` no longer exists here — the API-key branch was deleted
+    # on 2026-08-04 — so this paragraph is about the source, not about a
+    # dependency a reader will find.)
     app.dependency_overrides[agent_jobs_router.authenticate_agent_owner] = lambda: {
         "user_id": _OWNER,
         "role": "internal",
