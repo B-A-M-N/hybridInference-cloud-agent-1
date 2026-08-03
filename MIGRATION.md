@@ -83,6 +83,9 @@ forgotten.
 
 | The store's `initialize()` is a no-op. It used to create the schema **and run five data backfills** (threads and thread messages for jobs predating them, the singleton runner-policy row, `thread_id`/`turn_no` on legacy jobs) on every boot. All forty statements moved verbatim to `migrations/versions/0001_baseline.py`. | **E6** must not restore startup DDL when it moves the bootstrap call site; **H1** must run `alembic upgrade head` against the imported database, or the backfills never touch the migrated rows. | `tests/unit/test_migration_baseline.py` pins the statement inventory, the backfill count, and that the store executes no DDL. |
 
+| The `model` token scope still exists in `tokens.py`, and is dead weight: it is signed by a root the gateway does not know, so it buys nothing. Kept so the moved tests run unmodified — which is what makes them evidence that re-keying changed nothing else. | **E9**: remove `SCOPE_MODEL` when the runner asks the gateway for a grant instead. | This row; `tests/unit/test_agent_job_tokens.py` still exercises both scopes, so deleting one fails loudly. |
+| Re-keying control tokens invalidates every token in flight. An attempt holding one signed by the gateway's root is an attempt from before the migration. | **H2** (cutover): drain running attempts before switching, rather than expecting them to survive. | This row. |
+
 ## Open decisions
 
 Things a migration task surfaced that are **design calls, not mechanical
@@ -217,6 +220,7 @@ about *inference*, not about *agents*:
 | D | D3+D4 — workspace setup/paths/snapshot + patch gate | ✅ merged; D3 acceptance pending D6 | this repo #3; one PR because `workspace_snapshot` imports `patch_gate`; snapshot tests are owned by D6 above |
 | D | D5 — workspace broker + browser | 🔍 in review | this repo #4; `terminal_coordination` reclassified to Phase E (see manifest corrections) |
 | D | D6 — runner + broker client (+ logging entrypoint) | 🔍 in review | this repo #5, stacked on #4; closes both D6 register rows; D3's pending acceptance resolves here |
+| E | E2+E3 — schemas, entitlement, control tokens (re-keyed) | 🔍 in review | this repo #8, stacked on #7; `AGENT_CONTROL_TOKEN_SECRET` replaces the gateway's root |
 | E | E1 — store + Alembic baseline | 🔍 in review | this repo #7, stacked on #6; `initialize()` becomes a no-op, schema **and its five startup backfills** move to `0001_baseline` |
 | D | D7 — host deploy files | 🔍 in review | this repo #6; co-located overlay undecided (see Open decisions) |
 | E–H | control plane, web, host pool, cutover | ⏳ not started | — |
