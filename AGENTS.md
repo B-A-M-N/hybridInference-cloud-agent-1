@@ -78,21 +78,36 @@ needs an unchanged baseline to be worth anything.
   generation — a superseded attempt's writes are rejected by the store, which
   is what makes retries safe and stops duplicate pull requests.
 - **Grant.** A short-lived, per-attempt capability token minted by the gateway,
-  scoped to a user, job, model allowlist, and dollar budget. It is the only
-  credential that enters the sandbox. Revoked when the attempt is superseded.
+  scoped to a user, a job, and a model/MCP allowlist. It is the only credential
+  that enters the sandbox. Revoked when the attempt is superseded.
+  **There is no per-task dollar budget** — that design was considered and
+  rejected. All inference spend stays subject to the gateway's existing
+  per-user quota; a grant narrows *what* can be called, never re-implements
+  *how much*. If a task seems to need a budget field, stop — the plan's C5
+  section records the decision.
 - **Host.** A machine in the pool running the host agent. It registers with a
   one-time enrollment token, heartbeats, and claims jobs it has capacity and
   capabilities for. Hosts are added and removed without redeploying the control
   plane.
-- **Sandbox.** Per-task container. Untrusted repository code runs here with no
-  general internet egress — only the gateway, via a fixed-address relay.
+- **Sandbox.** Per-task container with **two egress phases**, enforced by the
+  code in `host/cloud_agent_host/egress.py` and `egress_proxy.py`:
+  - *Setup phase* — dependency installation may reach package registries, but
+    only through the Squid allowlist proxy, which permits CONNECT to an
+    allowlisted host by name and refuses everything else.
+  - *Agent phase* — untrusted repository code runs, and the sandbox reaches the
+    gateway only, via a fixed-address relay. The relay is not a proxy: the
+    caller cannot choose a destination.
 
 ## 7. Security boundaries — do not relax without review
 
-- The sandbox reaches exactly one network destination: the gateway relay. It is
-  a relay, not a proxy; the caller cannot choose a destination.
+- During the agent phase the sandbox reaches exactly one network destination:
+  the gateway relay. The setup-phase allowlist proxy is the only sanctioned
+  widening, and the escape hatches (`AGENT_SANDBOX_ALLOW_OPEN_NETWORK`,
+  `AGENT_EGRESS_AGENT_TIER=custom`) must stay unset anywhere untrusted
+  repositories run.
 - Long-lived or cross-task credentials never enter the sandbox. Only
-  short-lived, single-task, budget-capped, revocable grants do.
+  short-lived, single-task, scoped, revocable grants do — spend is governed by
+  the gateway's per-user quota, not by anything the sandbox holds.
 - Public multi-tenant use requires Kata/gVisor isolation, non-root, dropped
   capabilities, seccomp, and resource limits — plain Docker containers are for
   trusted internal repositories only.
