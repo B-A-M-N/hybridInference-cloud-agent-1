@@ -38,17 +38,13 @@ set -Eeuo pipefail
 APP_DIR="${APP_DIR:-$(pwd)}"
 cd "$APP_DIR"
 
+# `.env` is the whole configuration surface here. The source repo also layered
+# per-deployment env files from `distributions/`, which is that repository's
+# overlay mechanism and does not exist in this one.
 COMPOSE=(docker compose
   -p hybridinference-agent-remote
-  -f deploy/host/docker-compose.agent-remote-runner.yml)
-for env_file in "$APP_DIR"/distributions/*/deploy/*.env; do
-  [[ -f "$env_file" ]] && COMPOSE+=(--env-file "$env_file")
-done
-COMPOSE+=(--env-file .env)
-
-SANDBOX_IMAGE="${AGENT_SANDBOX_IMAGE:-hybridinference-agent-sandbox:latest}"
-GATEWAY_HOSTNAME="${AGENT_GATEWAY_HOSTNAME:-agent-gateway}"
-TUNNEL_PORT="${AGENT_TUNNEL_LISTEN_PORT:-8080}"
+  -f deploy/host/docker-compose.agent-remote-runner.yml
+  --env-file .env)
 
 log() { printf '[agent-remote-runner] %s\n' "$*"; }
 die() { printf '[agent-remote-runner] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -61,8 +57,27 @@ env_or_dotenv() {
     printf '%s' "${!name}"
     return 0
   fi
+  # `.env` is optional — a host may configure everything in the environment.
+  # The guard is load-bearing under `set -Eeuo pipefail`: without a file, sed
+  # fails, pipefail propagates that out of the command substitution, and the
+  # script dies at an assignment instead of taking the default. `require_env`
+  # got away with it only because a failure inside `[[ ]]` is exempt from
+  # `set -e`; that is luck, not a contract.
+  [[ -f .env ]] || return 0
   sed -n "s/^${name}=//p" .env 2>/dev/null | tail -1
 }
+
+# Read through env_or_dotenv, and therefore only after it exists. Taking these
+# from the shell environment alone silently ignored `.env` — the file this
+# script's own header tells you to configure — so `up` built and ran the
+# default image while `require_env`, which *does* read `.env`, reported the
+# configuration complete. The two disagreed, and the one that acted was wrong.
+SANDBOX_IMAGE="$(env_or_dotenv AGENT_SANDBOX_IMAGE)"
+SANDBOX_IMAGE="${SANDBOX_IMAGE:-hybridinference-agent-sandbox:latest}"
+GATEWAY_HOSTNAME="$(env_or_dotenv AGENT_GATEWAY_HOSTNAME)"
+GATEWAY_HOSTNAME="${GATEWAY_HOSTNAME:-agent-gateway}"
+TUNNEL_PORT="$(env_or_dotenv AGENT_TUNNEL_LISTEN_PORT)"
+TUNNEL_PORT="${TUNNEL_PORT:-8080}"
 
 require_env() {
   # Named up front, because each of these fails much later and much less
@@ -75,7 +90,7 @@ require_env() {
     [[ -n "$(env_or_dotenv "$name")" ]] || missing+=("$name")
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
-    die "missing in .env: ${missing[*]} (see docs/developer/agent-sandbox-operations.md)"
+    die "missing in .env: ${missing[*]} (see ENVIRONMENT.md)"
   fi
 
   local key known

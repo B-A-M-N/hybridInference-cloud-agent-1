@@ -5,8 +5,9 @@ user's repository, and publish the result as a pull request.
 
 Model calls go through the [FreeInference](https://freeinference.org) gateway.
 This service depends on that gateway through exactly two HTTP contracts —
-**identity** (who the user is) and **inference grants** (what a job may spend and
-on which models). No shared database, no shared signing secret, no shared code.
+**identity** (who the user is) and **inference grants** (which models and MCP
+servers a job may call). No shared database, no shared signing secret, no shared
+code.
 
 > **Status: under construction.** The implementation is being extracted from the
 > HybridInference monorepo. See [MIGRATION.md](MIGRATION.md) for what has landed

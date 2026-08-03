@@ -8,9 +8,11 @@
 #
 # 1. **No credentials are baked in.** The only secret that ever reaches this
 #    image is the job's model-scoped token, injected as an environment variable
-#    at run time and capped by the job's budget. There is no GitHub token here,
-#    because the agent never pushes — it emits a patch and the trusted
-#    publisher outside handles git.
+#    at run time. It authorizes a fixed set of models and MCP tools and nothing
+#    else — spend is governed by the user's quota at the gateway, not by
+#    anything this container holds. There is no GitHub token here, because the
+#    agent never pushes — it emits a patch and the trusted publisher outside
+#    handles git.
 # 2. **Nothing here is trusted at run time.** The container is thrown away
 #    after each job, runs as a non-root user, and (under the kata backend) has
 #    its own kernel. Anything the agent installs lives and dies with the job.

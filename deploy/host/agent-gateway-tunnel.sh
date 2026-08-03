@@ -8,9 +8,11 @@
 # routable one, forwarding a single port to a single destination.
 #
 # It is deliberately not a proxy. There is no CONNECT, no request routing, no
-# destination the caller can choose: the address is fixed at startup, so the
-# sandbox's reachable world stays exactly one endpoint — the same guarantee it
-# has when the gateway is local.
+# destination the caller can choose: the address is fixed at startup, so through
+# the agent phase the sandbox's reachable world stays exactly one endpoint — the
+# same guarantee it has when the gateway is local. (Setup runs earlier, on its
+# own tier, and may also reach the allowlist proxy; this tunnel is not on that
+# path.)
 #
 # SSH rather than plain TCP because the hop crosses a shared network and the
 # traffic is not incidental: every claim carries the dispatcher credential, and

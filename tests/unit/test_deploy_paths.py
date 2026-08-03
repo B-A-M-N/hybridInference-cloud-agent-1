@@ -30,10 +30,38 @@ DEPLOY_FILES = sorted(
 
 # `COPY <src> <dst>` / `COPY --from=x <src> <dst>` — src is repo-relative.
 _COPY = re.compile(r"^COPY(?:\s+--\S+)*\s+(\S+)\s+\S+\s*$", re.MULTILINE)
-# Paths this repo owns, wherever they appear in a shell script or compose file.
+# Top-level directories of THIS repository. A reference to one of these must
+# resolve. The list is the actual tree, not a sample: an earlier version checked
+# four prefixes while claiming to verify every path, and missed real breakage in
+# `distributions/` and `docs/` references precisely because they were not on it.
+_OWN_DIRS = ("backend", "contracts", "deploy", "docs", "host", "migrations", "tests", "web")
+
+# Top-level directories that exist only in the SOURCE repository. Any occurrence
+# is stale by construction — there is nothing here for it to resolve to.
+_SOURCE_ONLY_DIRS = ("apps", "ops", "config", "distributions", "services")
+
 # Trailing dots are excluded: these paths are frequently named mid-prose in
 # comments, and a sentence-ending period is not part of the filename.
-_REPO_PATH = re.compile(r"(?:deploy|host|backend|tests)/[A-Za-z0-9._/-]*[A-Za-z0-9_/-]")
+# Strings that match the shape above but are not references to this tree.
+# Exempt by literal value with a reason, never by directory — the same
+# discipline test_no_committed_credentials.py uses, and for the same reason: a
+# directory-wide exemption stops being read after the day it is added.
+_NOT_OUR_PATHS = {
+    # The pi CLI's own documentation, quoted in the wrapper's explanation of
+    # why that CLI needs a config file rather than OPENAI_BASE_URL.
+    "docs/models.md",
+    # Task F1 adds the Next.js app. web-ci.yml names these deliberately and
+    # guards on their absence, so referencing them before they exist is the
+    # intended behaviour, not a stale path.
+    "web/package.json",
+    "web/package-lock.json",
+}
+
+_PATH_TAIL = r"/[A-Za-z0-9._/*-]*[A-Za-z0-9_/*-]"
+_OWN_PATH = re.compile(rf"(?<![A-Za-z0-9._/-])(?:{'|'.join(_OWN_DIRS)}){_PATH_TAIL}")
+_SOURCE_ONLY_PATH = re.compile(
+    rf"(?<![A-Za-z0-9._/-])(?:{'|'.join(_SOURCE_ONLY_DIRS)}){_PATH_TAIL}"
+)
 
 
 @pytest.mark.parametrize("path", DEPLOY_FILES, ids=lambda p: str(p.relative_to(REPO)))
@@ -92,14 +120,43 @@ def test_the_remote_compose_invokes_host_modules() -> None:
     assert "cloud_agent_host.runner" in text
 
 
-def test_shell_scripts_reference_real_paths() -> None:
-    """Scripts name compose files and helpers; each must be in the tree."""
-    findings: list[str] = []
-    for script in sorted(HOST.glob("*.sh")):
-        for candidate in set(_REPO_PATH.findall(script.read_text(encoding="utf-8"))):
-            if not (REPO / candidate).exists():
-                findings.append(f"{script.name} -> {candidate}")
-    assert not findings, f"scripts point at paths that do not exist: {findings}"
+def _text_files() -> list[Path]:
+    """Deploy files plus the workflows — everything D7 rewrote paths in."""
+    return [*DEPLOY_FILES, *sorted((REPO / ".github/workflows").glob("*.yml"))]
+
+
+@pytest.mark.parametrize("path", _text_files(), ids=lambda p: str(p.relative_to(REPO)))
+def test_every_own_path_reference_resolves(path: Path) -> None:
+    """A path naming this repo's own tree must exist — including in prose.
+
+    Error strings and comments are checked deliberately: an operator following
+    a message that names a file we do not ship is worse than no message, and
+    that is exactly how a stale `docs/developer/...` reference survived review.
+    """
+    missing = sorted(
+        {
+            candidate
+            for candidate in _OWN_PATH.findall(path.read_text(encoding="utf-8"))
+            # A glob is a runtime match, not a file we can stat.
+            if "*" not in candidate
+            and candidate not in _NOT_OUR_PATHS
+            and not (REPO / candidate).exists()
+        }
+    )
+    assert not missing, f"{path.relative_to(REPO)} names paths that do not exist: {missing}"
+
+
+@pytest.mark.parametrize("path", _text_files(), ids=lambda p: str(p.relative_to(REPO)))
+def test_no_file_references_a_source_repo_only_directory(path: Path) -> None:
+    """`apps/`, `ops/`, `distributions/`, … do not exist here at all.
+
+    Separate from the check above because these can never resolve: they are
+    concepts of the repository we migrated *from*. A reference to one means a
+    rewrite was missed, and the failure is silent — a compose `--env-file` glob
+    that matches nothing simply contributes no configuration.
+    """
+    stale = sorted(set(_SOURCE_ONLY_PATH.findall(path.read_text(encoding="utf-8"))))
+    assert not stale, f"{path.relative_to(REPO)} references the source repo layout: {stale}"
 
 
 def test_the_workflow_targets_this_repository() -> None:

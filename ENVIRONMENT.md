@@ -157,9 +157,10 @@ Recorded here as *what has to be decided*, not as anyone's actual answer.
   under `/api` — e.g. `agents.example.org` and a staging sibling. The exact names
   go in the overlay, and must match `IDENTITY_ALLOWED_REDIRECTS` on the gateway
   exactly.
-- **Reaching the gateway**: the control plane needs a route to `GATEWAY_BASE_URL`,
-  and the sandbox needs one to the relay and nothing else. If a deployment
-  fronts either through a tunnel, the port allocation is overlay detail.
+- **Reaching the gateway**: the control plane needs a route to `GATEWAY_BASE_URL`.
+  The sandbox needs one to the relay and, during the setup phase only, one to
+  the allowlist proxy — nothing else, in either phase. If a deployment fronts
+  either through a tunnel, the port allocation is overlay detail.
 - **Sandbox image registry**: where `AGENT_SANDBOX_IMAGE` is pulled from. Decide
   before D7.
 

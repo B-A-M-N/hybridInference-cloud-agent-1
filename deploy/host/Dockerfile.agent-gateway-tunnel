@@ -1,5 +1,6 @@
 # The fixed-destination hop that lets a runner host without a gateway still
-# give its sandboxes one — and only one — thing to talk to.
+# give its sandboxes, on the closed agent-phase network, one — and only one —
+# thing to talk to.
 #
 # Small on purpose: it sits on the closed agent network, so everything
 # installed here is something a sandbox can reach. openssh-client and a shell,
