@@ -88,7 +88,7 @@ repo's manifest when it is next edited.
 
 | File | Manifest says | Actually | Why |
 |---|---|---|---|
-| `apps/backend/serving/agent_jobs/terminal_coordination.py` | `move:host`, D5 | `move:control`, Phase E (rides with the router/bootstrap wiring, E6/E8) | Its docstring says "Gateway-owned recovery"; its consumers at the freeze are `servers/bootstrap.py` and `servers/routers/agent_jobs.py` — control-plane code. It imports the broker *client* (`workspace_broker_client`, the caller side), not the broker. Its test coverage lives in `tests/servers/` (E10). |
+| `apps/backend/serving/agent_jobs/terminal_coordination.py` | `move:host`, D5 | `move:control`, E6 | Its docstring says "Gateway-owned recovery"; its consumers at the freeze are `servers/bootstrap.py` and `servers/routers/agent_jobs.py` — control-plane code. It imports the broker *client* (`workspace_broker_client`, the caller side), not the broker. The route cases move with `test_agent_jobs_api.py` in E10; E6 ports the settled-terminal reconciliation case from `test_bootstrap.py`. |
 
 ## Upstream provenance
 

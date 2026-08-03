@@ -338,6 +338,8 @@ def claim(
     if host:
         payload["host"] = host
     try:
+        # TODO(E9): point worker control traffic at AGENT_CONTROL_PLANE_URL;
+        # this legacy base_url still also feeds sandbox gateway traffic below.
         response = httpx.post(
             f"{base_url.rstrip('/')}/v1/agent/worker/claim",
             json=payload,
@@ -759,8 +761,9 @@ def run_agent(
         gateway_base_url=gateway_base_url,
         # Only the model-scoped credential crosses into the sandbox. The full
         # capability token — which can write events, artifacts and terminal
-        # states — stays out here with the runner, so an agent that leaks its
-        # credential can spend the job's capped budget and nothing more.
+        # states — stays out here with the runner. After E9, grant scope and
+        # TTL bound the sandbox credential; spend remains subject to the owning
+        # user's gateway quota. There is deliberately no per-job monetary cap.
         credential=job.sandbox_token,
         # Runtime-specific permission flags must follow the actual execution
         # boundary. In particular, Codex cannot nest bubblewrap inside the
@@ -1075,6 +1078,8 @@ def run_once(
             runtime,
             job=job,
             workdir=workdir,
+            # TODO(E9): replace this shared legacy value with AGENT_GATEWAY_URL;
+            # claim/control calls above must use AGENT_CONTROL_PLANE_URL instead.
             gateway_base_url=base_url,
             control=control,
             heart=heart,
