@@ -3,11 +3,28 @@
 Cloud coding agents that run in sandboxed containers on a pool of hosts, drive a
 user's repository, and publish the result as a pull request.
 
-Model calls go through the [FreeInference](https://freeinference.org) gateway.
-This service depends on that gateway through exactly two HTTP contracts —
-**identity** (who the user is) and **inference grants** (which models and MCP
-servers a job may call). No shared database, no shared signing secret, no shared
-code.
+## Powered by FreeInference
+
+Model calls go through the [FreeInference](https://freeinference.org) gateway,
+and **HTTP is the only thing these two services share** — no database, no
+signing secret, no Python import. Three contracts, each written down in
+[`contracts/`](contracts/):
+
+| Contract | What it answers | Why it cannot live here |
+|---|---|---|
+| **Identity** | Who this user is | The gateway owns the accounts. It signs with a private key and publishes the public half, so this service verifies without holding anything it could also mint with. |
+| **Inference grants** | Which models and MCP servers one attempt may call, for the next few minutes | Only the gateway knows what a role may reach — and it is the gateway that meters the spend. |
+| **Internal lookups** | The MCP registry, a user's model catalog, whether an account is still active | Three reads that used to be imports. |
+
+A grant says *what*, never *how much*: spend is governed by the account's daily
+quota at the gateway, and there is deliberately no per-task budget here. Grants
+live minutes and are renewed while an attempt is genuinely still running, so
+revocation is expiry rather than bookkeeping — and this service, not the
+gateway, is what decides an attempt is still current.
+
+Every call to the gateway fails **closed**. An unreachable catalog resolves to
+no models, not every model; an unreadable user status resolves to "cannot use
+the service", not "fine".
 
 > **Status: under construction.** The implementation is being extracted from the
 > HybridInference monorepo. See [MIGRATION.md](MIGRATION.md) for what has landed
@@ -50,7 +67,7 @@ Three deployment units, one repository:
 backend/cloud_agent/   control plane: API, auth adapter, scheduler, publishing
 host/cloud_agent_host/ runner, sandbox, runtimes, workspace broker
 web/                   Next.js app (user UI + admin dashboard)
-contracts/             OpenAPI mirrors of the two gateway contracts
+contracts/             OpenAPI documents for the three gateway contracts
 migrations/            Alembic migrations for the agent-owned database
 deploy/                control-plane / host / sandbox deployment
 tests/                 unit, servers, integration (dbtest marker)
