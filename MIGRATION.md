@@ -88,6 +88,9 @@ forgotten.
 
 | `apps/backend/serving/agent_jobs/patch_gate.py` | `move:host`, D4 | **shared** — host *and* control plane | At the freeze it is imported by `runner.py` and `workspace_snapshot.py` (host) **and** by `publisher.py`, `publish_worker.py` and the API router (control plane). E5 imports it from `cloud_agent_host`, which works in one repository but means a control-plane image must ship the host package. A shared third package is the eventual right answer; that is a deployment-layout decision, not something a migration task should make. Whoever writes `deploy/control-plane/` needs to know either way. |
 
+| `apps/backend/serving/servers/routers/agent_jobs.py` | "2,257 lines" | **2,550 lines** at the freeze commit | The count predates the five PRs that landed 2026-08-03. Anyone sizing E6 from the manifest would have under-estimated it by 13%. |
+| `apps/backend/serving/schemas_admin.py` | absent from the manifest | `move:control`, E6 | `admin_hosts.py` cannot import without `AgentRunnerHost`, `ListAgentRunnerHostsResponse` and `SetActiveAgentRunnerHostRequest`. The three classes were copied verbatim into `cloud_agent/schemas.py`. Same shape of omission as D7's sandbox assets: the manifest listed a module but not what it imports. |
+
 ## Discarded tests
 
 Migration moves test files whole. When an artifact is *rewritten* instead of
@@ -112,6 +115,8 @@ wrong: faithfully reporting what the gateway said, and **failing closed** when
 it cannot answer.
 
 | Source-control credentials are encrypted with `AGENT_SOURCE_CONTROL_ENCRYPTION_KEY`, not the gateway-derived key they were written under. | **H1**: migrating `agent_repo_grants` and `agent_gitlab_connections` is a decrypt-with-old, encrypt-with-new step. Copying ciphertext yields a connection that looks present and fails at first use. | This row; `ENV_ENCRYPTION_KEY`'s docstring in `source_control.py`. |
+
+| **`budget_usd` is now inert.** The create API still accepts it, the store still writes it, and job records still return it — but **nothing in this repository checks it**, because enforcement was the per-task budget C5/C6 deliberately removed in favour of the gateway's per-user quota. A caller setting `budget_usd: 5` would reasonably believe it caps the job. It does not. Kept by E6 because removing a field is a logic change a migration task must not make. | **Whoever owns the API surface**, before this service takes real traffic. Either drop the field from `AgentJobCreateRequest`/`create_job`/the store column, or make it mean something again. F2 already omits it from the web client, which closes the UI half only. | This row; `grep budget backend/` returns storage and plumbing but zero comparisons. |
 
 ## Open decisions
 
@@ -247,6 +252,7 @@ about *inference*, not about *agents*:
 | D | D3+D4 — workspace setup/paths/snapshot + patch gate | ✅ merged; D3 acceptance pending D6 | this repo #3; one PR because `workspace_snapshot` imports `patch_gate`; snapshot tests are owned by D6 above |
 | D | D5 — workspace broker + browser | 🔍 in review | this repo #4; `terminal_coordination` reclassified to Phase E (see manifest corrections) |
 | D | D6 — runner + broker client (+ logging entrypoint) | 🔍 in review | this repo #5, stacked on #4; closes both D6 register rows; D3's pending acceptance resolves here |
+| E | E6–E9 — API router, app shell, identity, sessions, grant client | 🔍 in review | this repo #11, stacked on #10; the control plane boots and serves 45 operations |
 | E | E5 — source control + publishing | 🔍 in review | this repo #10, stacked on #9; cipher re-keyed to `AGENT_SOURCE_CONTROL_ENCRYPTION_KEY` |
 | E | E4 — visible models over HTTP | 🔍 in review | this repo #9, stacked on #8; **rewritten, not moved** — see the discarded-test record below |
 | E | E2+E3 — schemas, entitlement, control tokens (re-keyed) | 🔍 in review | this repo #8, stacked on #7; `AGENT_CONTROL_TOKEN_SECRET` replaces the gateway's root |

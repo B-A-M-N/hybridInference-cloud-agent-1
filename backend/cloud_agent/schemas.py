@@ -4,6 +4,12 @@ from __future__ import annotations
 
 import base64
 import binascii
+
+# Runtime import, and it has to be: this module has `from __future__ import
+# annotations`, but pydantic still resolves every annotation when it builds the
+# model, so hiding this one behind TYPE_CHECKING leaves `AgentRunnerHost`
+# silently unbuilt and raises at the first request instead of at import.
+from datetime import datetime  # noqa: TC003
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -679,3 +685,47 @@ class RepoBranchesResponse(BaseModel):
 
     default: str | None = None
     branches: list[str] = Field(default_factory=list)
+
+
+# The runner-host pool. These three lived in the gateway's `schemas_admin.py`
+# alongside its own admin schemas; the pool is this service's to schedule, so
+# they move here rather than leaving `api/admin_hosts.py` importing across the
+# split. Copied unchanged.
+
+
+class AgentRunnerHost(BaseModel):  # type: ignore[no-any-unimported]
+    """One machine in the agent runner pool."""
+
+    host: str
+    active: bool
+    last_worker_id: str | None
+    first_seen_at: datetime
+    last_seen_at: datetime
+    seconds_since_seen: float = Field(
+        ...,
+        description=(
+            "Age of the last claim poll, by the server's clock. A runner polls "
+            "only between jobs, so a busy machine can look quiet for as long as "
+            "its longest job."
+        ),
+    )
+
+
+class ListAgentRunnerHostsResponse(BaseModel):  # type: ignore[no-any-unimported]
+    """The runner pool and which member currently takes jobs."""
+
+    hosts: list[AgentRunnerHost]
+    active_host: str | None = Field(
+        None,
+        description="Pinned host, or null when any runner may claim.",
+    )
+
+
+class SetActiveAgentRunnerHostRequest(BaseModel):  # type: ignore[no-any-unimported]
+    """Pin agent jobs to one host, or unpin with ``null``."""
+
+    host: str | None = Field(
+        None,
+        max_length=253,
+        description="A host that has polled at least once, or null to unpin.",
+    )
