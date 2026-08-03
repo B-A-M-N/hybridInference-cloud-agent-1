@@ -116,14 +116,27 @@ whichever option is chosen. `tests/unit/test_deploy_paths.py` covers the moved
 files' paths only, and says so.
 
 **Decided (2026-08-04): option 1.** The overlay is dropped; the standalone
-remote-runner compose is the only topology. The properties its tests pinned are
-re-asserted here — `tests/unit/test_deploy_security.py` (egress network
-internal, docker socket read-only for every holder, sandbox non-root, UID drift
-pin, no baked credentials, Codex MCP allowlist) and
-`tests/unit/test_setup_kata_runtime.py` (the Kata preflight, driving the real
-script). Two source assertions did not port because they keyed on the gateway's
-own `backend` service, which this repository does not have; a test records that
-so their absence reads as a decision. H4 deletes all four source files.
+remote-runner compose is the only topology, and a co-located runner is that
+compose with the tunnel pointing at localhost. H4 deletes all four source files.
+
+Its guarantees are kept by porting the source test file **whole** rather than
+by picking out the properties that seemed important:
+
+- `tests/unit/test_deploy_config.py` — all 50 source assertions, re-pointed at
+  the standalone compose. 45 pass unchanged; 3 are skipped with the Trusted-tier
+  reason below; 2 were adapted where they keyed on the gateway's `backend`
+  service, keeping the half that still exists.
+- `tests/unit/test_deploy_security.py` — only what the port could not carry.
+- `tests/unit/test_setup_kata_runtime.py` — the Kata preflight, driving the
+  real script. D7 had missed this file entirely.
+
+**Rule this produced: port test files whole, then adapt what fails.** A first
+attempt hand-picked "the four properties that matter" and produced 13
+assertions against the source's 50 — a 74% silent loss, in a file whose whole
+job is to catch silent failures. Reading the source list is not the same as
+porting it, and the compiler does not check prose. When a task drops an
+artifact, its tests move first and get deleted individually with reasons, never
+summarised.
 
 **One functional gap that came with the decision.** The Trusted egress tier —
 the Squid allowlist proxy and the `agent-egress-trusted` / `agent-egress-uplink`
