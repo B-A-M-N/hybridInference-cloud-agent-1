@@ -1,56 +1,57 @@
-"""Dependencies the routers ask for, and the ones that do not exist yet.
+"""Dependencies the routers ask for.
 
-The router moved from the gateway unchanged, so it still asks for the
-dependencies it asked for there. Two kinds arrive at this module:
+The routers moved from the gateway unchanged, so they still ask for the
+dependencies they asked for there. Three kinds arrive at this module:
 
 - **Wiring this service owns.** The job store, the GitHub App credential
-  minter, the GitLab OAuth client and the gateway client are all objects this
-  repository builds; they are read off ``app.state``, exactly as the source read
-  them off its own services container. ``None`` is a working answer for the
-  optional ones — a deployment without a configured database or App is a
-  supported shape, and the routes already handle it. The four attribute names
-  (``store``, ``gateway``, ``app_credentials``, ``gitlab_oauth``) are the
-  contract with ``app.py``'s lifespan; renaming one there without renaming it
-  here degrades silently to "not configured" rather than failing.
+  minter, the GitLab OAuth client, the gateway client and the grant client are
+  all objects this repository builds; they are read off ``app.state``, exactly
+  as the source read them off its own services container. ``None`` is a working
+  answer for the optional ones — a deployment without a configured database or
+  App is a supported shape, and the routes already handle it. The attribute
+  names (``store``, ``gateway``, ``grants``, ``app_credentials``,
+  ``gitlab_oauth``) are the contract with ``app.py``'s lifespan; renaming one
+  there without renaming it here degrades silently to "not configured" rather
+  than failing.
 
-- **Identity, admin auth and the billing ledger, which stayed on the gateway.**
-  Those are placeholders that raise. They keep the *names and signatures* the
-  router calls so that the moved file needs no edits when they are filled in,
-  and they raise rather than return a permissive stand-in because a migration
-  stub that quietly authenticates everyone is the one failure mode nobody
-  notices. Each says which task owns it:
+- **Identity and admin auth, which E7 answers from this service's own world.**
+  There is no ``users`` table here and no ``api_keys`` table: the gateway kept
+  both. So the browser credential is the session token
+  :mod:`cloud_agent.identity` mints — carried in an ``HttpOnly`` cookie, or as a
+  bearer for programmatic callers holding one — and the admin door is the
+  deployment's ``ADMIN_TOKEN`` or a session whose role claim says ``admin``.
+  Nothing here consults a user table, because there is none to consult.
 
-  - **E7** (identity adapter) owns ``get_current_user``, ``verify_api_key``,
-    ``verify_admin_access``, ``get_operational_store``, ``has_role``,
-    ``looks_like_agent_token``, ``log_admin_action`` and ``get_client_ip``.
-  - **E9** (grant client) owns ``get_log_store``: job spend was read from the
-    gateway's ``api_logs`` ledger, and after the split the budget is the
-    grant's.
+- **Two contracts that did not come across, and are honest about it.**
+  ``get_operational_store`` and ``get_log_store`` both name gateway-side tables
+  (``api_keys``/``users``, and ``api_logs``). Neither is produced by anything in
+  this repository, so both answer ``None`` in every real deployment, and the
+  code paths behind them degrade the way they were written to: the API-key
+  branch answers 503 (fails closed, never open), and job spend is reported as
+  *absent* rather than as a fabricated zero. See MIGRATION.md's deferred
+  register for why the API-key branch is still here at all.
 
-Until those land the HTTP surface imports, mounts and documents itself, and
-every authenticated route fails loudly at the first request.
+**Every decision below fails closed.** An unset secret, an unreachable gateway,
+an unconfigured store: each is a refusal, never a pass. That is the one property
+worth re-reading a diff of this file for.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import os
 from typing import TYPE_CHECKING, Any
 
-from fastapi import Depends, Header, Request
+import jwt
+from fastapi import Depends, Header, HTTPException, Request
+
+from cloud_agent import identity
 
 if TYPE_CHECKING:
     from cloud_agent.gateway import GatewayClient
+    from cloud_agent.grants import GrantClient
     from cloud_agent.storage.store import AgentJobStore
-
-# Raised by every placeholder below, so a half-wired deployment fails at the
-# call rather than at some later assertion about what the caller was allowed to
-# do. The message names the task, because "NotImplementedError" in a traceback
-# is not an instruction.
-_PENDING = "{name}() is not wired yet — {task} fills it in ({what})."
-
-
-def _pending(name: str, task: str, what: str) -> NotImplementedError:
-    """Build the refusal a not-yet-migrated dependency raises."""
-    return NotImplementedError(_PENDING.format(name=name, task=task, what=what))
 
 
 # ── Wiring this service owns ───────────────────────────────────────────
@@ -79,6 +80,23 @@ def get_gateway_client(request: Request) -> GatewayClient:
     return client
 
 
+def get_grant_client(request: Request) -> GrantClient:
+    """Dependency to obtain the client that asks the gateway for grants.
+
+    Built like the gateway client and for the same reason: an unconfigured one
+    constructs fine and refuses at the call, naming the two variables it needs.
+    A claim that cannot mint a grant hands the job back to the queue rather
+    than sending a runner off with no credential — see ``worker_claim``.
+    """
+    client = getattr(request.app.state, "grants", None)
+    if client is None:
+        from cloud_agent.grants import GrantClient as _GrantClient
+
+        client = _GrantClient()
+        request.app.state.grants = client
+    return client
+
+
 def get_agent_app_credentials(request: Request) -> Any | None:
     """Dependency to obtain the GitHub App credential minter (if configured)."""
     return getattr(request.app.state, "app_credentials", None)
@@ -89,57 +107,262 @@ def get_agent_gitlab_oauth(request: Request) -> Any | None:
     return getattr(request.app.state, "gitlab_oauth", None)
 
 
-# ── Billing ledger — E9 ────────────────────────────────────────────────
+# ── The two gateway-side contracts that did not move ───────────────────
 
 
 def get_log_store(request: Request) -> Any | None:
-    """Dependency to obtain the log store (if configured)."""
-    raise _pending(
-        "get_log_store",
-        "E9",
-        "job spend was summed from the gateway's api_logs; the grant carries the budget now",
-    )
+    """Dependency to obtain the log store (if configured).
 
-
-# ── Identity and admin auth — E7 ───────────────────────────────────────
+    Job spend was summed from the gateway's ``api_logs`` ledger, and that
+    ledger stayed there — MIGRATION.md's "What stays in HybridInference" says
+    so explicitly. Nothing in this repository sets ``app.state.log_store``, so
+    this answers ``None`` and ``_job_usage`` omits spend and token totals from
+    the job response. Absent, deliberately, rather than a fabricated zero: a
+    zero would read as "this job was free".
+    """
+    return getattr(request.app.state, "log_store", None)
 
 
 def get_operational_store(request: Request) -> Any | None:
-    """Dependency to obtain the operational store (if configured)."""
-    raise _pending(
-        "get_operational_store",
-        "E7",
-        "the gateway owns users and api_keys; this service verifies an identity JWT instead",
-    )
+    """Dependency to obtain the operational store (if configured).
+
+    The gateway's ``users`` and ``api_keys`` tables did not move, and nothing
+    here sets ``app.state.operational_store`` — so in every real deployment
+    this is ``None`` and the router's API-key branch answers **503**, which is
+    closed, not open.
+
+    It is retained rather than deleted because deleting it means deleting the
+    router's API-key branch, and with it a ported test that asserts on
+    ``update_key_last_used``. Migration rule 3 forbids that. The decision —
+    drop the API-key surface, or give the gateway a key-verification contract —
+    is recorded in MIGRATION.md and belongs to whoever owns the API surface.
+    """
+    return getattr(request.app.state, "operational_store", None)
+
+
+# ── Roles and credential namespaces ────────────────────────────────────
+
+#: Verbatim from the source's ``serving/config/settings.py``. Fail-closed on an
+#: unknown *required* role; an unknown *user* role ranks as ``free``.
+ROLE_RANK: dict[str, int] = {"free": 0, "pro": 1, "internal": 2, "admin": 3}
+
+#: The namespace :func:`cloud_agent.tokens.mint_worker_token` mints into. Kept
+#: as a literal rather than imported, because the token module's prefix is
+#: private; ``test_the_agent_token_prefix_still_matches_what_tokens_mints``
+#: fails the moment the two drift.
+AGENT_TOKEN_PREFIX = "ajt."
+
+#: The namespace :func:`cloud_agent.tokens.mint_host_token` mints into.
+HOST_TOKEN_PREFIX = "aht."
+
+ENV_ADMIN_TOKEN = "ADMIN_TOKEN"
+
+#: Off by default. An ``X-Forwarded-For`` header is caller-controlled input
+#: unless a proxy this deployment trusts overwrote it, so believing it without
+#: being told to would let anyone write any address into the audit trail.
+ENV_TRUST_PROXY_HEADERS = "AGENT_TRUST_PROXY_HEADERS"
+
+
+def has_role(user_role: str, required: str) -> bool:
+    """Whether ``user_role`` meets or exceeds the required role level.
+
+    Args:
+        user_role: The role the caller presented.
+        required: The role the route demands.
+
+    Returns:
+        Whether the caller ranks at or above ``required``. An unknown
+        *required* role is never satisfied (a typo must not open a door), and an
+        unknown *user* role ranks as ``free``.
+    """
+    if required not in ROLE_RANK:
+        return False
+    return ROLE_RANK.get(user_role, 0) >= ROLE_RANK[required]
+
+
+def looks_like_agent_token(api_key: str | None) -> bool:
+    """Whether a credential should be resolved as a worker token.
+
+    Structural, not a validation: it selects which authenticator a credential
+    reaches, so that an expired session stays a session failure instead of
+    being retried as something else.
+    """
+    return bool(api_key) and api_key.startswith(AGENT_TOKEN_PREFIX)
+
+
+def bearer_token(authorization: str | None) -> str | None:
+    """Return the bearer credential in an ``Authorization`` header, if any."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    return authorization[7:].strip() or None
+
+
+# ── Identity — E7 ──────────────────────────────────────────────────────
+
+
+def session_token(request: Request, authorization: str | None = None) -> str | None:
+    """Find this service's session credential on a request.
+
+    The cookie is preferred: it is what the web app sends, it is ``HttpOnly``,
+    and it is the only credential the browser holds. A bearer is accepted too,
+    for the programmatic caller that has one and for the router's existing
+    credential dispatch — a session token is this service's own credential
+    whichever way it travels, and reading it from a header weakens nothing that
+    reading it from a cookie does not.
+    """
+    cookie = request.cookies.get(identity.SESSION_COOKIE)
+    if cookie:
+        return cookie
+    presented = bearer_token(authorization)
+    if presented and not looks_like_agent_token(presented):
+        return presented
+    return None
 
 
 async def get_current_user(
+    request: Request,
     authorization: str | None = Header(None),
-    op_store=Depends(get_operational_store),
 ) -> dict[str, Any]:
-    """Verify a browser access token and return the current user context."""
-    raise _pending(
-        "get_current_user",
-        "E7",
-        "verify the identity JWT against GATEWAY_JWKS_URL and upsert the local user row",
-    )
+    """Verify this service's session and return the current user context.
+
+    The gateway verified its own access JWT here against its ``users`` table.
+    There is no users table on this side, so the session token *is* the
+    context: it was minted at ``/v1/session/login`` from a gateway identity
+    token, after the gateway was asked whether that user may sign in at all.
+
+    Deliberately **not** re-asking the gateway on every request. A per-request
+    status call would put the whole owner surface behind the gateway's
+    availability and fail closed on every page load during an outage; the
+    account check happens once, at login, and the cookie's own expiry bounds
+    how long a stale answer can survive.
+
+    Args:
+        request: The incoming request, for its cookies.
+        authorization: The ``Authorization`` header, if the caller sent one.
+
+    Returns:
+        ``{"user_id", "email", "role", "is_admin", "authenticated"}`` — the
+        keys ``routes.py`` reads.
+
+    Raises:
+        HTTPException: 401 when no valid session is presented, 503 when this
+            deployment cannot verify sessions at all.
+    """
+    token = session_token(request, authorization)
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing authentication token. Use 'Authorization: Bearer {token}' header.",
+        )
+
+    try:
+        claims = identity.verify_session(token)
+    except identity.IdentityNotConfigured as exc:
+        # A deployment with no session secret cannot verify anyone. 503, not
+        # 401: the caller did nothing wrong and retrying with another
+        # credential will not help.
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+    except identity.IdentityError as exc:
+        cause = exc.__cause__ if exc.__cause__ is not None else exc
+        if isinstance(cause, jwt.ExpiredSignatureError):
+            # An expired session must stay an expired session. The dispatch in
+            # ``authenticate_agent_owner`` exists so this is never retried as
+            # an API key, and the message is what tells a client which it was.
+            raise HTTPException(
+                status_code=401,
+                detail="Token has expired. Please refresh your token or login again.",
+            ) from None
+        raise HTTPException(status_code=401, detail="Invalid authentication token.") from None
+
+    user_id = str(claims.get("sub") or "")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token payload.")
+
+    role = str(claims.get("role") or "free")
+    return {
+        "user_id": user_id,
+        "email": claims.get("email"),
+        "role": role,
+        "is_admin": role == "admin",
+        "authenticated": True,
+    }
+
+
+def hash_api_key(api_key: str) -> str:
+    """Hash a presented API key for the operational store lookup.
+
+    Plain SHA-256. The gateway derives its hash with ``API_KEY_SECRET``, which
+    AGENTS.md rule 4 forbids this repository from holding — one more reason the
+    branch below cannot be answered here.
+    """
+    return hashlib.sha256(api_key.encode()).hexdigest()
 
 
 async def verify_api_key(
     request: Request,
     authorization: str | None = Header(None),
     x_api_key: str | None = Header(None, alias="X-API-Key"),
-    x_on_behalf_of: str | None = Header(None, alias="X-On-Behalf-Of"),
     op_store=Depends(get_operational_store),
     log_store=Depends(get_log_store),
     agent_job_store=Depends(get_agent_job_store),
 ) -> dict[str, Any]:
-    """Verify an API key and return the user context it authenticates."""
-    raise _pending(
-        "verify_api_key",
-        "E7",
-        "the api_keys table stayed on the gateway; this surface takes identity JWTs",
-    )
+    """Verify an API key and return the user context it authenticates.
+
+    **This branch has no store on this side.** ``get_operational_store``
+    answers ``None`` in every real deployment, so a programmatic caller gets a
+    503 here rather than a session. It is kept because the moved router's
+    credential dispatch and three ported tests describe it; see
+    ``get_operational_store``.
+
+    Two behaviours matter whatever happens to it:
+
+    - **A worker token is never an owner credential.** On the gateway this was
+      an allowlist of inference paths, because that dependency also guarded
+      ``/v1/chat/completions``. This service serves no inference route at all,
+      so the rule collapses to a flat refusal — the same 403 and the same
+      ``insufficient_scope`` type the sandbox would have got there.
+    - **Nothing falls open.** No store means 503, not "allowed".
+
+    Raises:
+        HTTPException: 403 for a sandbox credential, 401 for a missing or
+            unknown key, 503 when there is no store to resolve keys against.
+    """
+    presented = bearer_token(authorization) or (x_api_key or None)
+
+    if looks_like_agent_token(presented):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "type": "insufficient_scope",
+                    "message": "This credential may only be used for model inference.",
+                }
+            },
+        )
+
+    if not presented:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing API key. Use 'Authorization: Bearer hyi-xxx' or 'X-API-Key: hyi-xxx'",
+        )
+
+    if not op_store:
+        raise HTTPException(status_code=503, detail="Authentication database unavailable.")
+
+    caller = await op_store.get_auth_context_by_key_hash(hash_api_key(presented))
+    if not caller:
+        raise HTTPException(status_code=401, detail="Invalid or expired API key")
+
+    await op_store.update_key_last_used(caller["id"])
+
+    user_role = caller.get("role") or "free"
+    return {
+        "user_id": caller["user_id"],
+        "user_name": caller.get("user_name"),
+        "role": user_role,
+        "authenticated": True,
+        "is_admin": user_role == "admin",
+    }
 
 
 async def verify_admin_access(
@@ -147,52 +370,125 @@ async def verify_admin_access(
     authorization: str | None = Header(None),
     op_store=Depends(get_operational_store),
 ) -> str:
-    """Authenticate an admin caller, returning an identifier for the audit log."""
-    raise _pending(
-        "verify_admin_access",
-        "E7",
-        "admin role comes from the identity JWT, not from the gateway's users table",
-    )
+    """Authenticate an admin caller, returning an identifier for the audit log.
+
+    Two doors, and both of them are this service's own:
+
+    - ``ADMIN_TOKEN``, the machine-to-machine credential. Compared in constant
+      time, and an **unset** value opens nothing — otherwise a deployment that
+      forgot to configure it would be an open admin surface, which is the
+      failure mode this whole file is written against.
+    - A session whose role claim is ``admin``. That is how the dashboard
+      authenticates, and the role comes from the gateway's own answer at login
+      rather than from anything the browser can edit.
+
+    Args:
+        request: The incoming request, for its cookies.
+        authorization: The ``Authorization`` header, if the caller sent one.
+        op_store: Accepted and unused — the gateway resolved an admin JWT
+            through its ``users`` table, and the moved router still passes this
+            positionally at ``verify_dispatcher_access``'s fallback.
+
+    Returns:
+        ``"admin-token"`` or ``"admin:<user_id>"``, for the audit trail.
+
+    Raises:
+        HTTPException: 401 when neither door opens.
+    """
+    presented = bearer_token(authorization)
+    configured = (os.environ.get(ENV_ADMIN_TOKEN) or "").strip()
+    if configured and presented and hmac.compare_digest(presented, configured):
+        return "admin-token"
+
+    token = session_token(request, authorization)
+    if token:
+        try:
+            claims = identity.verify_session(token)
+        except identity.IdentityError:
+            claims = None
+        if claims is not None and str(claims.get("role") or "") == "admin":
+            return f"admin:{claims.get('sub')}"
+
+    if not presented and token is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing authentication. Provide a JWT or admin token via Authorization header.",
+        )
+    raise HTTPException(status_code=401, detail="Invalid authentication token.")
 
 
-def has_role(user_role: str, required: str) -> bool:
-    """Whether ``user_role`` meets or exceeds the required role level."""
-    raise _pending(
-        "has_role",
-        "E7",
-        "the role hierarchy arrives with the identity claims",
-    )
+# ── The admin audit trail — E7 ─────────────────────────────────────────
 
 
-def looks_like_agent_token(api_key: str | None) -> bool:
-    """Whether a credential should be resolved as a worker token."""
-    raise _pending(
-        "looks_like_agent_token",
-        "E7",
-        "it separates credential namespaces in the auth dispatch E7 replaces",
-    )
+def get_client_ip(request: Request) -> str:
+    """Return the best-effort originating client IP for a request.
+
+    The socket peer, unless this deployment says a proxy in front of it
+    rewrites ``X-Forwarded-For`` — see ``AGENT_TRUST_PROXY_HEADERS``. Believing
+    the header unconditionally would let any caller write any address into the
+    audit trail, which is worse than recording the proxy's address honestly.
+    """
+    if (os.environ.get(ENV_TRUST_PROXY_HEADERS) or "").strip().lower() in ("1", "true", "yes"):
+        forwarded = request.headers.get("x-forwarded-for") or ""
+        first_hop = forwarded.split(",")[0].strip()
+        if first_hop:
+            return first_hop
+        real_ip = (request.headers.get("x-real-ip") or "").strip()
+        if real_ip:
+            return real_ip
+    client = getattr(request, "client", None)
+    return getattr(client, "host", None) or "unknown"
 
 
 async def log_admin_action(
-    db_logger: Any,
+    store: Any,
     admin_ip: str,
     action: str,
     target_user_id: str | None = None,
     details: dict[str, Any] | None = None,
     success: bool = True,
 ) -> None:
-    """Append one admin action to the audit trail."""
-    raise _pending(
-        "log_admin_action",
-        "E7",
-        "the admin audit trail is a gateway table; this service needs its own",
-    )
+    """Append one admin action to this service's audit trail.
 
+    The gateway's ``admin_audit_log`` stayed with the gateway, so this service
+    grew its own — migration ``0004`` — rather than a documented no-op. The
+    actions logged here revoke a machine's credential, retarget every future
+    claim and remove hosts from the pool; a service that owns that surface and
+    keeps no record of who used it has no answer to the only question asked
+    after an incident.
 
-def get_client_ip(request: Request) -> str:
-    """Return the best-effort originating client IP for a request."""
-    raise _pending(
-        "get_client_ip",
-        "E7",
-        "the proxy-header resolution rules did not migrate with the router",
-    )
+    **Never raises, and never undoes the action it is recording.** The write
+    has already happened by the time this is called, so a failure here is
+    logged and swallowed: turning an audit-write failure into a 500 would tell
+    the operator their drain failed when it did not.
+
+    Args:
+        store: The agent job store, or ``None`` on a deployment with no
+            database. A store that predates ``record_admin_action`` is treated
+            the same way — the trail is skipped, not fabricated.
+        admin_ip: Best-effort caller address, from :func:`get_client_ip`.
+        action: Dotted action name, e.g. ``agent.runner_host.drain``.
+        target_user_id: The user acted upon, where there is one.
+        details: Structured context. Never a credential — this trail is read by
+            more people than hold the things it would otherwise contain.
+        success: Whether the action succeeded.
+    """
+    from cloud_agent.logging_utils import get_logger
+
+    recorder = getattr(store, "record_admin_action", None)
+    if recorder is None:
+        return
+    try:
+        await recorder(
+            action=action,
+            admin_ip=admin_ip,
+            target_user_id=target_user_id,
+            details=details,
+            success=success,
+        )
+    except Exception:
+        get_logger(__name__).warning(
+            "agent_admin_audit_write_failed",
+            exc_info=True,
+            extra={"event": "agent_admin_audit_write_failed", "action": action},
+        )

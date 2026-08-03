@@ -1,10 +1,10 @@
 """Tests for the admin agent runner host pool endpoints.
 
-Ported from the gateway with assertions untouched. Two pieces of wiring
-changed and could not not change: the gateway's ``AppServices`` container
-became ``app.state.store``, and ``verify_admin_access`` is still an E7
-placeholder, so ``tests.support.e7_auth`` supplies the ``ADMIN_TOKEN`` gate
-these tests knock on.
+Ported from the gateway with assertions untouched. One piece of wiring changed
+and could not not change: the gateway's ``AppServices`` container became
+``app.state.store``. ``verify_admin_access`` is this repository's own since E7
+and is left real — the ``ADMIN_TOKEN`` these tests knock with is the door it
+actually opens.
 """
 
 from __future__ import annotations
@@ -17,8 +17,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from cloud_agent.api import admin_hosts as admin_router
-from cloud_agent.api.deps import get_agent_job_store, get_operational_store, verify_admin_access
-from tests.support import e7_auth
+from cloud_agent.api.deps import get_agent_job_store, get_operational_store
 
 ADMIN = {"Authorization": "Bearer test-admin"}
 
@@ -74,7 +73,6 @@ def _admin_app(store: FakeHostStore | None) -> FastAPI:
     app.include_router(admin_router.router)
     app.dependency_overrides[get_agent_job_store] = lambda: store
     app.dependency_overrides[get_operational_store] = lambda: None
-    app.dependency_overrides[verify_admin_access] = e7_auth.verify_admin_access
     return app
 
 
@@ -84,7 +82,6 @@ async def admin_client(monkeypatch):
     app = _admin_app(store)
     monkeypatch.setenv("ADMIN_TOKEN", "test-admin")
     monkeypatch.setenv("AGENT_CONTROL_TOKEN_SECRET", "unit-test-secret")
-    e7_auth.install(monkeypatch)
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -221,7 +218,6 @@ async def test_endpoints_report_unconfigured_deployments_as_503(monkeypatch):
     app = _admin_app(None)
     monkeypatch.setenv("ADMIN_TOKEN", "test-admin")
     monkeypatch.setenv("AGENT_CONTROL_TOKEN_SECRET", "unit-test-secret")
-    e7_auth.install(monkeypatch)
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:

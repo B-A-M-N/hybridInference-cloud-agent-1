@@ -8,10 +8,12 @@
 // which this app holds a gateway credential is one function call wide.
 //
 // Order matters and is deliberate:
-//   1. `state` is checked against the value parked when the flow started. A
-//      callback we did not initiate is refused before anything is spent.
+//   1. The returned `state` is what the parked flow is looked up by, so a
+//      callback we did not initiate finds nothing and is refused before
+//      anything is spent.
 //   2. The pending record is consumed on read, so a code that fails to
-//      exchange cannot be retried against the same verifier.
+//      exchange cannot be retried against the same verifier. Only this flow's
+//      record is consumed — a sign-in running in another tab is untouched.
 //   3. Only after the session call succeeds does the app navigate anywhere.
 
 import { Suspense, useEffect, useRef, useState } from 'react';
@@ -20,7 +22,7 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import { useAuth } from '@/components/providers';
 import { exchangeAuthorizationCode, startSession } from '@/lib/api/session';
 import { callbackUri } from '@/lib/auth/signin';
-import { takePending } from '@/lib/auth/pkce';
+import { hasPending, takePending } from '@/lib/auth/pkce';
 import { getErrorMessage } from '@/lib/utils/errors';
 
 /** Only same-site paths. A returnTo from the query string is never trusted. */
@@ -42,17 +44,25 @@ function CallbackContent() {
 
     const code = searchParams?.get('code') ?? '';
     const state = searchParams?.get('state') ?? '';
-    const pending = takePending();
+    // The lookup *is* the state check: flows are parked under their own state,
+    // so a response naming a state we did not start finds nothing.
+    const pending = takePending(state);
+    // Read before anything can be thrown, and only when the lookup missed:
+    // another flow still parked means this response belongs to a request we
+    // did not make, which is a different thing to tell the user than "nothing
+    // is parked at all".
+    const another = pending === null && hasPending();
 
     async function finish() {
       if (!pending) {
-        throw new Error('This sign-in link has expired. Please start again.');
+        throw new Error(
+          another
+            ? 'This sign-in response did not match the request that started it.'
+            : 'This sign-in link has expired. Please start again.',
+        );
       }
       if (!code) {
         throw new Error('The gateway did not return an authorization code.');
-      }
-      if (state !== pending.state) {
-        throw new Error('This sign-in response did not match the request that started it.');
       }
       const identityToken = await exchangeAuthorizationCode({
         code,

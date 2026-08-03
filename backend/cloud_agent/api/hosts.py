@@ -20,8 +20,9 @@ its neighbour.
 
 Registration is unauthenticated *except* for the enrollment token, and that is
 the point: a machine being set up has no credential yet. The token is
-one-time, short-lived, and hashed at rest, so the window it opens is one
-machine, once, for fifteen minutes.
+one-time, short-lived, hashed at rest, and **names the host it may register**,
+so the window it opens is one machine, under one name, once, for fifteen
+minutes.
 """
 
 from __future__ import annotations
@@ -125,20 +126,29 @@ async def register_host(
     The host starts at ``enrolling`` and claims nothing until it heartbeats.
     A machine that registers and never comes up therefore never receives work,
     which is the difference between a pool entry and a promise.
+
+    ``name`` is checked against the name the token was issued for, inside the
+    same statement that spends it. Registration upserts, so a name already held
+    by a live host loses its credential and drops back to ``enrolling``; before
+    the binding, one typo here evicted a working machine from the pool. A
+    mismatch does not consume the token, so a typo is retried rather than
+    re-issued.
     """
     job_store = _require_store(store)
     if not await job_store.consume_enroll_token(
         token_hash=hash_secret(body.enroll_token), host=body.name
     ):
-        # One answer for expired, already-spent and never-issued: they are the
-        # same fact from the presenter's side — this token is not usable — and
-        # separating them says which of the three happened.
+        # One answer for expired, already-spent, never-issued and issued-for-
+        # another-host: they are the same fact from the presenter's side — this
+        # token is not usable here — and separating them says which happened.
         raise HTTPException(
             status_code=401,
             detail={
                 "error": {
                     "type": "unauthorized",
-                    "message": "This enrollment token is not valid. Issue a new one.",
+                    "message": (
+                        "This enrollment token is not valid for this host name. Issue a new one."
+                    ),
                 }
             },
         )

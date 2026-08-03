@@ -1210,33 +1210,50 @@ class AgentJobStore:
         return host
 
     async def issue_enroll_token(
-        self, *, token_hash: str, ttl_seconds: float, issued_by: str | None = None
+        self, *, token_hash: str, host: str, ttl_seconds: float, issued_by: str | None = None
     ) -> dict[str, Any]:
         """Record a one-time enrollment token by hash and return its expiry.
 
         Only the hash is stored. An operator who loses the token issues another
         one; nobody — including anyone who can read this table — can recover
         the value that was handed out.
+
+        ``host`` is the name this token may register, and it is stored in
+        clear: it is not a secret, it is the authenticated decision the token
+        carries. See :meth:`consume_enroll_token`.
         """
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO agent_host_enroll_tokens (token_hash, issued_by, expires_at)
-                VALUES ($1, $2, NOW() + make_interval(secs => $3))
+                INSERT INTO agent_host_enroll_tokens (token_hash, host, issued_by, expires_at)
+                VALUES ($1, $2, $3, NOW() + make_interval(secs => $4))
                 RETURNING expires_at, created_at
                 """,
                 token_hash,
+                host,
                 issued_by,
                 ttl_seconds,
             )
         return {"expires_at": row["expires_at"], "created_at": row["created_at"]}
 
     async def consume_enroll_token(self, *, token_hash: str, host: str) -> bool:
-        """Spend an enrollment token, exactly once.
+        """Spend an enrollment token, exactly once and only under its own name.
 
         Single-use is the UPDATE's own ``consumed_at IS NULL`` predicate rather
         than a read followed by a write: two machines booting from the same
         pasted token race here, and only one row update can win.
+
+        **The name is part of the predicate, not a check after the fact.**
+        ``register_host`` upserts, so registering under a live host's name
+        revokes that host's credential and resets its row to ``enrolling`` —
+        one typo during a setup takes a working machine out of the pool. The
+        name therefore comes from the token an admin issued rather than from
+        the machine presenting it. Because it is a predicate, a mismatch also
+        does not *spend* the token: the typo is retried, not re-issued.
+
+        A row whose ``host`` is NULL — issued before the binding existed —
+        matches nothing, because ``NULL = $2`` is never true. That is the
+        fail-closed direction: such a token was redeemable under any name.
         """
         async with self._pool.acquire() as conn:
             consumed = await conn.fetchval(
@@ -1244,6 +1261,7 @@ class AgentJobStore:
                 UPDATE agent_host_enroll_tokens
                 SET consumed_at = NOW(), consumed_host = $2
                 WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > NOW()
+                  AND host = $2
                 RETURNING token_hash
                 """,
                 token_hash,
@@ -1281,6 +1299,13 @@ class AgentJobStore:
         mid-job has a stale counter, and zero would over-subscribe it while the
         old attempts are still leased; counting is the only answer that is
         right in both the rebuilt and the merely-re-registered case.
+
+        The upsert is what makes a rebuild possible, and it is also what makes
+        a mistyped name destructive — it revokes whatever credential the name
+        currently holds. It stays an upsert; what changed is who chooses the
+        name. :meth:`consume_enroll_token` will only spend a token under the
+        name an admin bound to it, so reaching this method under a live host's
+        name is an operator's decision rather than a machine's.
         """
         async with self._pool.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
@@ -2495,3 +2520,181 @@ class AgentJobStore:
                     )
                 actions.append({"job_id": job_id, "attempt_id": attempt_id, "action": action})
         return actions
+
+    # ── Inference grants (E9) ──────────────────────────────────────────
+    #
+    # The grant itself lives at the gateway; what lives here is the *link*
+    # between an attempt and the capability minted for it, and that link is the
+    # fence. After the split the gateway holds no attempt or lease state at
+    # all, so nothing there can notice that an attempt was superseded — this
+    # store is the only place that knows, which is why renewal reads from here
+    # rather than from a timer.
+
+    async def record_attempt_grant(
+        self, *, attempt_id: int, lease_generation: int, grant_id: str
+    ) -> bool:
+        """Attach a minted grant to the attempt it was minted for.
+
+        Fenced like every other worker write: an attempt that was superseded
+        between the claim and this call does not get the grant recorded against
+        it, so the renewal pass never picks it up and the capability dies at its
+        own TTL.
+
+        Args:
+            attempt_id: The attempt the grant belongs to.
+            lease_generation: The fence the claim returned.
+            grant_id: The gateway's identifier for the grant.
+
+        Returns:
+            Whether the row was still current enough to write.
+        """
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE agent_attempts SET grant_id = $3
+                WHERE id = $1 AND lease_generation = $2 AND status = 'running'
+                """,
+                attempt_id,
+                lease_generation,
+                grant_id,
+            )
+        return result.endswith(" 1")
+
+    async def list_renewable_grants(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        """List the grants belonging to attempts that are still current.
+
+        **This is the fence.** A renewal loop that skipped this query and
+        renewed whatever it minted would keep a superseded attempt's sandbox
+        alive and spending, and the gateway could not catch it — it has no
+        attempt state to check. Every predicate here is load-bearing:
+        ``status = 'running'`` drops superseded and finished attempts, and
+        ``lease_expires_at > NOW()`` drops the ones whose lease died before the
+        reaper noticed.
+
+        Args:
+            limit: Most rows to return in one pass.
+
+        Returns:
+            ``[{"attempt_id", "job_id", "grant_id"}]`` for live attempts only.
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id AS attempt_id, job_id, grant_id
+                FROM agent_attempts
+                WHERE grant_id IS NOT NULL
+                  AND status = 'running'
+                  AND lease_expires_at > NOW()
+                ORDER BY id
+                LIMIT $1
+                """,
+                limit,
+            )
+        return [
+            {
+                "attempt_id": row["attempt_id"],
+                "job_id": row["job_id"],
+                "grant_id": row["grant_id"],
+            }
+            for row in rows
+        ]
+
+    async def take_revocable_grants(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        """Claim the grants of attempts that stopped being current, and clear them.
+
+        The complement of :meth:`list_renewable_grants`: a superseded attempt,
+        a finished one, or one whose lease lapsed. Returning them and clearing
+        the column in one statement is what stops two control-plane replicas —
+        or two passes of the same loop — from both trying to revoke, and what
+        stops a grant the gateway refuses to revoke from being retried forever.
+
+        The clear is a data-modifying CTE rather than
+        ``UPDATE ... RETURNING grant_id``, because ``RETURNING`` reports the
+        **new** value — which is the ``NULL`` just written. That version passed
+        every in-memory test and handed ``None`` to ``revoke`` against a real
+        database; ``tests/integration/storage/test_agent_grant_store.py`` is
+        what caught it.
+
+        Clearing before the gateway has confirmed anything is deliberate.
+        Revocation is an *acceleration* of the TTL, not the mechanism: the
+        capability expires on its own, so a failed revoke costs lateness, and a
+        row that kept being retried would cost a call every pass for as long as
+        the deployment ran.
+
+        Args:
+            limit: Most rows to take in one pass.
+
+        Returns:
+            ``[{"attempt_id", "job_id", "grant_id"}]``, now detached from their
+            attempts.
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH dead AS (
+                    SELECT id, job_id, grant_id
+                    FROM agent_attempts
+                    WHERE grant_id IS NOT NULL
+                      AND (status <> 'running' OR lease_expires_at <= NOW())
+                    ORDER BY id
+                    LIMIT $1
+                    FOR UPDATE SKIP LOCKED
+                ), cleared AS (
+                    UPDATE agent_attempts a SET grant_id = NULL
+                    FROM dead WHERE a.id = dead.id
+                    RETURNING a.id
+                )
+                SELECT id AS attempt_id, job_id, grant_id FROM dead
+                """,
+                limit,
+            )
+        return [
+            {
+                "attempt_id": row["attempt_id"],
+                "job_id": row["job_id"],
+                "grant_id": row["grant_id"],
+            }
+            for row in rows
+        ]
+
+    # ── Admin audit trail (E7) ─────────────────────────────────────────
+
+    async def record_admin_action(
+        self,
+        *,
+        action: str,
+        admin_ip: str,
+        target_user_id: str | None = None,
+        details: dict[str, Any] | None = None,
+        success: bool = True,
+    ) -> int:
+        """Append one row to this service's admin audit trail.
+
+        The gateway's ``admin_audit_log`` stayed with the gateway. This one is
+        ours, and it is append-only by convention rather than by constraint —
+        there is no code here that updates or deletes a row.
+
+        Args:
+            action: Dotted action name, e.g. ``agent.runner_host.drain``.
+            admin_ip: Best-effort caller address.
+            target_user_id: The user acted upon, where there is one.
+            details: Structured context. Never a credential.
+            success: Whether the action succeeded.
+
+        Returns:
+            The new row's id.
+        """
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(
+                """
+                INSERT INTO agent_admin_audit_log
+                    (action, admin_ip, target_user_id, details, success)
+                VALUES ($1, $2, $3, $4::jsonb, $5)
+                RETURNING id
+                """,
+                action,
+                admin_ip,
+                target_user_id,
+                json.dumps(details) if details is not None else None,
+                success,
+            )

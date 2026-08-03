@@ -54,8 +54,14 @@ const PENDING = {
   createdAt: Date.now(),
 };
 
+/** Flows are parked under their own `state`, one key each. */
+function keyFor(state: string) {
+  return `cloud-agent:pkce:${state}`;
+}
+
 function park(overrides: Partial<typeof PENDING> = {}) {
-  localStorage.setItem('cloud-agent:pkce', JSON.stringify({ ...PENDING, ...overrides }));
+  const record = { ...PENDING, ...overrides };
+  localStorage.setItem(keyFor(record.state), JSON.stringify(record));
 }
 
 describe('sign-in callback', () => {
@@ -94,7 +100,21 @@ describe('sign-in callback', () => {
     render(<CallbackPage />);
 
     await waitFor(() => expect(replace).toHaveBeenCalled());
-    expect(localStorage.getItem('cloud-agent:pkce')).toBeNull();
+    expect(localStorage.getItem(keyFor(PENDING.state))).toBeNull();
+  });
+
+  it('leaves a sign-in running in another tab alone', async () => {
+    park();
+    park({ state: 'another-tab', verifier: 'w'.repeat(43), returnTo: '/task-2' });
+
+    render(<CallbackPage />);
+
+    await waitFor(() => expect(replace).toHaveBeenCalledWith('/task-1'));
+    // Consuming one flow must not spend the other's verifier: a single fixed
+    // storage key made two concurrent sign-ins overwrite each other, and the
+    // first tab back got an exchange the gateway refused.
+    const survivor = JSON.parse(localStorage.getItem(keyFor('another-tab')) ?? 'null');
+    expect(survivor).toMatchObject({ state: 'another-tab', verifier: 'w'.repeat(43) });
   });
 
   it('refuses a response whose state does not match the request', async () => {

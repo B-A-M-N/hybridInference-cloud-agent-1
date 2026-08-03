@@ -57,15 +57,19 @@ class FakeHostPoolStore:
     # -- enrollment tokens
 
     async def issue_enroll_token(
-        self, *, token_hash: str, ttl_seconds: float, issued_by: str | None = None
+        self, *, token_hash: str, host: str, ttl_seconds: float, issued_by: str | None = None
     ) -> dict[str, Any]:
         now = datetime.now(UTC)
-        self.tokens[token_hash] = {"expires_at": now + timedelta(seconds=ttl_seconds)}
+        self.tokens[token_hash] = {"host": host, "expires_at": now + timedelta(seconds=ttl_seconds)}
         return {"expires_at": self.tokens[token_hash]["expires_at"], "created_at": now}
 
     async def consume_enroll_token(self, *, token_hash: str, host: str) -> bool:
         entry = self.tokens.get(token_hash)
         if entry is None or entry.get("consumed") or entry["expires_at"] <= datetime.now(UTC):
+            return False
+        # The name is part of the predicate in the store, so a mismatch here
+        # must also leave the token unspent rather than burning it.
+        if entry["host"] != host:
             return False
         entry["consumed"] = True
         return True
@@ -211,8 +215,10 @@ async def client(monkeypatch):
 
 
 async def _enroll(client, store, name="runner-a", **body) -> str:
-    """Issue a token, redeem it, and return the host credential."""
-    issued = await client.post("/admin/agent/runner-hosts/enroll-token", headers=ADMIN)
+    """Issue a token for ``name``, redeem it, and return the host credential."""
+    issued = await client.post(
+        "/admin/agent/runner-hosts/enroll-token", json={"host": name}, headers=ADMIN
+    )
     assert issued.status_code == 200
     response = await client.post(
         "/v1/agent/host/register",
@@ -247,29 +253,134 @@ def test_only_the_hash_of_a_credential_is_kept():
 
 
 async def test_a_replayed_enrollment_token_is_refused(client):
-    """Single-use, or a token pasted into a runbook enrols a fleet."""
+    """Single-use, or a token pasted into a runbook enrols a fleet.
+
+    Both halves present the *same* name, which is what isolates single-use now
+    that the token names its host: a second name would be refused by the
+    binding and this test would pass without proving anything about replay.
+    """
     async_client, _ = client
-    issued = await async_client.post("/admin/agent/runner-hosts/enroll-token", headers=ADMIN)
+    issued = await async_client.post(
+        "/admin/agent/runner-hosts/enroll-token", json={"host": "runner-a"}, headers=ADMIN
+    )
     token = issued.json()["enroll_token"]
 
     first = await async_client.post(
         "/v1/agent/host/register", json={"enroll_token": token, "name": "runner-a"}
     )
     second = await async_client.post(
-        "/v1/agent/host/register", json={"enroll_token": token, "name": "runner-b"}
+        "/v1/agent/host/register", json={"enroll_token": token, "name": "runner-a"}
     )
 
     assert first.status_code == 200
     assert second.status_code == 401
     assert (
-        "runner-b" not in second.text or second.json()["detail"]["error"]["type"] == "unauthorized"
+        "runner-a" not in second.text or second.json()["detail"]["error"]["type"] == "unauthorized"
     )
+
+
+async def test_a_typo_cannot_evict_a_live_host(client):
+    """The eviction the name binding exists to prevent.
+
+    Registration upserts. Before the token named its host, a machine being set
+    up as ``runner-b`` that was typed as ``runner-a`` revoked the running
+    ``runner-a``'s credential and reset its row to ``enrolling`` — so a live
+    machine holding two attempts stopped authenticating, stopped heartbeating
+    and stopped being claimable, while still running the work it had leased.
+
+    The token now names the machine an admin decided to enrol, so the typo is
+    refused and the incumbent is untouched.
+    """
+    async_client, store = client
+    store.seed(
+        "runner-a",
+        status=HOST_ONLINE,
+        credential_hash=hash_secret("runner-a-lives-here"),
+        enrolled=True,
+        slots_used=2,
+        slots_total=4,
+    )
+    issued = await async_client.post(
+        "/admin/agent/runner-hosts/enroll-token", json={"host": "runner-b"}, headers=ADMIN
+    )
+    token = issued.json()["enroll_token"]
+
+    typo = await async_client.post(
+        "/v1/agent/host/register", json={"enroll_token": token, "name": "runner-a"}
+    )
+
+    assert typo.status_code == 401
+    incumbent = store.rows["runner-a"]
+    assert incumbent["status"] == HOST_ONLINE
+    assert incumbent["credential_hash"] == hash_secret("runner-a-lives-here")
+    assert incumbent["slots_used"] == 2
+    # And the token survives the typo, so the machine it was minted for can
+    # still use it — a spent token would mean re-issuing one per mistake.
+    retry = await async_client.post(
+        "/v1/agent/host/register", json={"enroll_token": token, "name": "runner-b"}
+    )
+    assert retry.status_code == 200
+    assert store.rows["runner-b"]["status"] == HOST_ENROLLING
+
+
+async def test_a_token_admits_only_the_name_it_was_issued_for(client):
+    """Even when that name belongs to nobody: the token is the authority."""
+    async_client, store = client
+    issued = await async_client.post(
+        "/admin/agent/runner-hosts/enroll-token", json={"host": "runner-b"}, headers=ADMIN
+    )
+
+    response = await async_client.post(
+        "/v1/agent/host/register",
+        json={"enroll_token": issued.json()["enroll_token"], "name": "runner-c"},
+    )
+
+    assert response.status_code == 401
+    assert store.rows == {}
+
+
+async def test_the_issued_token_reports_the_host_it_is_bound_to(client):
+    """The operator has to be able to see what they just authorized."""
+    async_client, _ = client
+
+    issued = await async_client.post(
+        "/admin/agent/runner-hosts/enroll-token", json={"host": "runner-b"}, headers=ADMIN
+    )
+
+    assert issued.json()["host"] == "runner-b"
+
+
+async def test_an_enrollment_token_request_must_name_a_host(client):
+    """No default, and no 'any machine' token to leave lying around."""
+    async_client, _ = client
+
+    assert (
+        await async_client.post("/admin/agent/runner-hosts/enroll-token", headers=ADMIN)
+    ).status_code == 422
+
+
+async def test_a_rebuilt_machine_re_enrols_under_its_own_name(client):
+    """The case the upsert exists for, and which refusing names in use breaks.
+
+    A machine that was rebuilt comes back as itself: the admin issues a token
+    naming it, and the row is rewritten with a fresh credential. That is a
+    decision somebody made, which is the whole difference from the typo above.
+    """
+    async_client, store = client
+    old = await _enroll(async_client, store, name="runner-a")
+
+    new = await _enroll(async_client, store, name="runner-a")
+
+    assert old != new
+    assert store.rows["runner-a"]["credential_hash"] == hash_secret(new)
 
 
 async def test_an_expired_enrollment_token_is_refused(client):
     async_client, store = client
     issued = await async_client.post(
-        "/admin/agent/runner-hosts/enroll-token", json={"ttl_seconds": 1}, headers=ADMIN
+        "/admin/agent/runner-hosts/enroll-token",
+        json={"host": "runner-a", "ttl_seconds": 1},
+        headers=ADMIN,
     )
     token = issued.json()["enroll_token"]
     # Age it rather than sleeping: the property is the expiry check, not the clock.
@@ -296,8 +407,12 @@ async def test_the_enrollment_token_is_never_shown_twice(client):
     """Two calls must mint two tokens; there is no 'show me that one again'."""
     async_client, _ = client
 
-    first = await async_client.post("/admin/agent/runner-hosts/enroll-token", headers=ADMIN)
-    second = await async_client.post("/admin/agent/runner-hosts/enroll-token", headers=ADMIN)
+    first = await async_client.post(
+        "/admin/agent/runner-hosts/enroll-token", json={"host": "runner-a"}, headers=ADMIN
+    )
+    second = await async_client.post(
+        "/admin/agent/runner-hosts/enroll-token", json={"host": "runner-a"}, headers=ADMIN
+    )
 
     assert first.json()["enroll_token"] != second.json()["enroll_token"]
 

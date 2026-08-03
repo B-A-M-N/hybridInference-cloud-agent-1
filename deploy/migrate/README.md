@@ -105,6 +105,19 @@ comparison would fail on a correct migration and is not attempted.
 same user having connected twice. The run refuses rather than raising a
 duplicate-key error halfway through.
 
+`source` and `target` are whole-table row counts — `target` is what the target
+holds, not how many source rows were found in it — so each column counts the
+same rows its checksum is taken over. A fresh target reads `0` before the
+import and `source` after it; a larger number means the target holds rows the
+source does not, and the checksum will read `DIFFERS`.
+
+**A refused `--apply` has already upgraded the schema.** `alembic upgrade head`
+runs before the target's tables can be read, so a run that then refuses on a
+conflict or a stale row prints `mode: refused — no rows were written` followed
+by a note naming the revision the target now sits at. Rows were not touched;
+the schema was. Use `--skip-migrations` if the deploy already upgraded it and
+you want a refusal to leave the target exactly as it was.
+
 ## What it does not do
 
 - **No sequence surprise, but do check it.** The script resets each table's

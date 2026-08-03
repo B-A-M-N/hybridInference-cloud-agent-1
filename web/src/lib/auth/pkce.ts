@@ -9,14 +9,22 @@
 //
 // **Where the verifier is parked between the two halves of the flow.** It has
 // to survive a full-page navigation to the gateway and back, so it lives in
-// `localStorage` under a short expiry and is deleted the moment it is read.
-// `sessionStorage` would be the more natural per-tab home, but F2's acceptance
-// criterion forbids that API outright — it is how the old repo kept an access
-// token, and the grep that enforces its absence cannot tell the two uses apart.
-// The trade is small: a PKCE verifier is single-use, worthless without the
-// matching code, and gone within a minute either way.
+// `localStorage` — per-origin rather than per-tab, which is also what keeps the
+// flow working when the browser comes back into a different tab from the one
+// that started it.
+//
+// **One entry per flow, keyed by its `state`.** A single fixed key made
+// concurrent sign-ins destroy each other: a second tab starting a flow
+// overwrote the first tab's verifier, so the first callback redeemed its code
+// against the wrong one and the gateway refused it — a login that fails only
+// when the user has two tabs open. The `state` already uniquely identifies a
+// flow and already travels to the gateway and back, so it is the key.
+//
+// Nothing accumulates: an entry is deleted the moment it is read, entries
+// older than `MAX_AGE_MS` are ignored, and starting a new flow sweeps the ones
+// that were abandoned.
 
-const STORAGE_KEY = 'cloud-agent:pkce';
+const STORAGE_PREFIX = 'cloud-agent:pkce:';
 
 /** A verifier older than this is abandoned rather than replayed. */
 const MAX_AGE_MS = 10 * 60 * 1000;
@@ -57,31 +65,26 @@ export async function challengeFor(verifier: string): Promise<string> {
   return base64UrlEncode(new Uint8Array(digest));
 }
 
-/** Park the pending flow so the callback page can finish it. */
-export function rememberPending(pending: PkcePending): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(pending));
-  } catch {
-    // Blocked storage means the callback will have nothing to redeem with. The
-    // callback reports that as a plain failure rather than looping.
-  }
+function storageKey(state: string): string {
+  return `${STORAGE_PREFIX}${state}`;
 }
 
-/**
- * Read and consume the pending flow.
- *
- * Always clears, even when the entry is stale or unparseable: a verifier that
- * survives a failed exchange is a verifier waiting to be replayed.
- */
-export function takePending(): PkcePending | null {
-  let raw: string | null = null;
+/** Every key this module owns, or `[]` when storage is unavailable. */
+function pendingKeys(): string[] {
+  const keys: string[] = [];
   try {
-    raw = localStorage.getItem(STORAGE_KEY);
-    localStorage.removeItem(STORAGE_KEY);
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index);
+      if (key !== null && key.startsWith(STORAGE_PREFIX)) keys.push(key);
+    }
   } catch {
-    return null;
+    return [];
   }
-  if (!raw) return null;
+  return keys;
+}
+
+/** Parse one stored entry, treating stale or malformed as absent. */
+function parsePending(raw: string): PkcePending | null {
   try {
     const parsed = JSON.parse(raw) as PkcePending;
     if (typeof parsed?.verifier !== 'string' || typeof parsed?.state !== 'string') return null;
@@ -90,4 +93,71 @@ export function takePending(): PkcePending | null {
   } catch {
     return null;
   }
+}
+
+function readAt(key: string): PkcePending | null {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw === null ? null : parsePending(raw);
+  } catch {
+    return null;
+  }
+}
+
+/** Drop entries that can no longer be redeemed, so abandoned flows do not pile up. */
+function purgeExpired(): void {
+  for (const key of pendingKeys()) {
+    if (readAt(key) !== null) continue;
+    try {
+      localStorage.removeItem(key);
+    } catch {
+      // Nothing to do: the entry was unreadable anyway.
+    }
+  }
+}
+
+/** Park the pending flow so the callback page can finish it. */
+export function rememberPending(pending: PkcePending): void {
+  purgeExpired();
+  try {
+    localStorage.setItem(storageKey(pending.state), JSON.stringify(pending));
+  } catch {
+    // Blocked storage means the callback will have nothing to redeem with. The
+    // callback reports that as a plain failure rather than looping.
+  }
+}
+
+/**
+ * Read and consume the flow that `state` started.
+ *
+ * Always clears, even when the entry is stale or unparseable: a verifier that
+ * survives a failed exchange is a verifier waiting to be replayed. Only the
+ * entry for this `state` is touched, so a callback for one flow cannot discard
+ * another tab's.
+ */
+export function takePending(state: string): PkcePending | null {
+  let raw: string | null = null;
+  try {
+    raw = localStorage.getItem(storageKey(state));
+    localStorage.removeItem(storageKey(state));
+  } catch {
+    return null;
+  }
+  if (raw === null) return null;
+  const parsed = parsePending(raw);
+  // The key is the state, so this can only differ if something else wrote the
+  // entry. Refuse rather than trust it.
+  return parsed !== null && parsed.state === state ? parsed : null;
+}
+
+/**
+ * Whether any redeemable flow is still parked.
+ *
+ * Lets the callback tell "this response belongs to a request we did not make"
+ * apart from "there is nothing here at all" — a distinction the user acts on
+ * differently, and one a single-keyed store used to get by comparing the
+ * parked `state` against the returned one.
+ */
+export function hasPending(): boolean {
+  return pendingKeys().some((key) => readAt(key) !== null);
 }

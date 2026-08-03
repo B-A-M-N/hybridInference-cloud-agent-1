@@ -24,6 +24,7 @@ REPO = Path(__file__).resolve().parents[2]
 VERSIONS = REPO / "migrations/versions"
 HOST_POOL = VERSIONS / "0002_host_pool.py"
 ATTEMPT_HOST = VERSIONS / "0003_attempt_host.py"
+ENROLL_TOKEN_HOST = VERSIONS / "0004_enroll_token_host.py"
 
 
 def _literal_constants(path: Path) -> dict[str, object]:
@@ -42,7 +43,7 @@ def _literal_constants(path: Path) -> dict[str, object]:
     return values
 
 
-@pytest.mark.parametrize("path", [HOST_POOL, ATTEMPT_HOST])
+@pytest.mark.parametrize("path", [HOST_POOL, ATTEMPT_HOST, ENROLL_TOKEN_HOST])
 def test_the_migration_parses(path: Path) -> None:
     """A migration that does not import is found at deploy time, not review."""
     ast.parse(path.read_text(encoding="utf-8"))
@@ -105,6 +106,22 @@ def test_the_slot_counter_carries_a_non_negative_constraint() -> None:
     source = HOST_POOL.read_text(encoding="utf-8")
 
     assert "CHECK (slots_used >= 0)" in source
+
+
+def test_the_enroll_token_binding_is_nullable_and_reversible() -> None:
+    """Nullable, because the table may already hold pre-binding rows.
+
+    ``NOT NULL`` would fail the upgrade on any database with a live token in
+    it, and those rows are exactly the ones that must stop working —
+    ``consume_enroll_token`` compares the column, and ``NULL = $2`` is never
+    true, so a token that named no host is refused rather than grandfathered.
+    """
+    source = ENROLL_TOKEN_HOST.read_text(encoding="utf-8")
+    upgrade, downgrade = source.split("def downgrade()")
+
+    assert "ADD COLUMN IF NOT EXISTS host TEXT" in upgrade
+    assert not re.search(r"ADD COLUMN IF NOT EXISTS host TEXT NOT NULL", upgrade)
+    assert "DROP COLUMN IF EXISTS host" in downgrade
 
 
 def test_the_attempt_host_column_is_nullable_and_clears_on_delete() -> None:

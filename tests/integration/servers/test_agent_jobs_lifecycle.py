@@ -27,10 +27,10 @@ from cloud_agent.api.deps import (
     get_agent_app_credentials,
     get_agent_job_store,
     get_gateway_client,
+    get_grant_client,
     get_log_store,
 )
 from cloud_agent.storage.store import AgentJobStore
-from tests.support import e7_auth
 from tests.support.migrations import apply_migrations
 
 pytestmark = [pytest.mark.dbtest, pytest.mark.asyncio]
@@ -61,6 +61,19 @@ class _FakeGateway:
         return []
 
 
+class _FakeGrants:
+    """The gateway's grant contract. The claim asks for one now (E9)."""
+
+    async def mint(self, **kwargs: Any) -> dict[str, Any]:
+        return {"grant_id": f"agr_{kwargs['attempt_id']}", "token": "agr.token"}
+
+    async def renew(self, grant_id: str) -> dict[str, Any]:
+        return {"grant_id": grant_id}
+
+    async def revoke(self, grant_id: str) -> bool:
+        return True
+
+
 @pytest_asyncio.fixture()
 async def api(monkeypatch):
     """Mount the router over a real AgentJobStore with auth stubbed."""
@@ -70,7 +83,6 @@ async def api(monkeypatch):
     # The allowlist is empty unless a deployment sets it, and an unentitled
     # repo is refused at creation, so declare the one repo these tests use.
     monkeypatch.setenv("AGENT_REPO_ALLOWLIST", "owner/name")
-    e7_auth.install(monkeypatch)
 
     base_db_name = os.getenv("TEST_DB_NAME", "hybridinference_test_db")
     worker_id = os.environ.get("PYTEST_XDIST_WORKER", "master")
@@ -104,6 +116,7 @@ async def api(monkeypatch):
     app.include_router(agent_jobs_router.router)
     app.dependency_overrides[get_agent_job_store] = lambda: store
     app.dependency_overrides[get_gateway_client] = _FakeGateway
+    app.dependency_overrides[get_grant_client] = _FakeGrants
     app.dependency_overrides[get_agent_app_credentials] = lambda: None
     # No log store here either: the source's app had no services container,
     # so spend and usage were absent rather than a fabricated zero.

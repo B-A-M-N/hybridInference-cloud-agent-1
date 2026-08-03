@@ -84,7 +84,11 @@ describe('ProtectedRoute', () => {
 
     await waitFor(() => expect(assign).toHaveBeenCalledOnce());
     const url = new URL(assign.mock.calls[0][0] as string);
-    const pending = JSON.parse(localStorage.getItem('cloud-agent:pkce') ?? '{}');
+    // Parked under the state it sent — one entry per flow, so two tabs signing
+    // in at once do not overwrite each other's verifier.
+    const pending = JSON.parse(
+      localStorage.getItem(`cloud-agent:pkce:${url.searchParams.get('state')}`) ?? '{}',
+    );
 
     expect(pending.state).toBe(url.searchParams.get('state'));
     expect(pending.returnTo).toBe('/task-1?tab=diff');

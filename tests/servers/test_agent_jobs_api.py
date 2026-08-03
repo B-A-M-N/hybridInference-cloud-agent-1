@@ -10,10 +10,13 @@ longer holds are supplied by the test app instead of by an import:
 
 - **The model catalog and the MCP registry** arrive over HTTP now, so the
   route registry the source stubbed is a fake ``GatewayClient`` here.
-- **The auth dependencies** are still ``NotImplementedError`` placeholders
-  until E7 lands; ``tests.support.e7_auth`` stands in for them and documents
-  which assertions that leaves testing this repository and which now describe
-  E7's contract.
+- **The auth dependencies** are real as of E7, so nothing stands in for them
+  any more: ``get_current_user`` verifies this service's own session token,
+  ``verify_admin_access`` compares ``ADMIN_TOKEN``, and the API-key branch
+  resolves against whatever ``get_operational_store`` answers — ``None`` in
+  production, the fake below in these tests.
+- **The sandbox's credential** is a gateway grant since E9, not something the
+  claim mints, so the fake gateway client has a grant-minting sibling.
 
 One more redirection, this time to code that landed *after* the freeze: phase
 G5 replaced the router's module-level ``workspace_broker_from_env`` with a
@@ -39,7 +42,6 @@ from cloud_agent import broker_routing
 from cloud_agent.api import routes as agent_jobs_router
 from cloud_agent.api.deps import get_agent_job_store
 from cloud_agent.tokens import mint_worker_token
-from tests.support import e7_auth
 
 pytestmark = pytest.mark.asyncio
 
@@ -58,6 +60,7 @@ class FakeAgentJobStore:
         self.archived_threads: dict[str, datetime] = {}
         self.pinned_threads: dict[str, datetime] = {}
         self.live_fence: tuple[int, int] | None = None
+        self.attempt_grants: dict[int, str] = {}
         self.terminal_readiness: dict[int, bool] = {}
         self.released: list[tuple[str, int]] = []
         self.runner_hosts: dict[str, dict[str, Any]] = {}
@@ -540,6 +543,14 @@ class FakeAgentJobStore:
         self.terminal_readiness[100] = False
         return {**job, "attempt_id": 100, "attempt_no": 1, "lease_generation": 1}
 
+    async def record_attempt_grant(
+        self, *, attempt_id: int, lease_generation: int, grant_id: str
+    ) -> bool:
+        if self.live_fence != (attempt_id, lease_generation):
+            return False
+        self.attempt_grants[attempt_id] = grant_id
+        return True
+
     async def heartbeat(
         self, *, attempt_id: int, lease_generation: int, lease_ttl_seconds: float
     ) -> dict[str, Any]:
@@ -714,10 +725,6 @@ def _api_key_secret(monkeypatch):
     monkeypatch.setenv("AGENT_CONTROL_TOKEN_SECRET", "api-test-secret")
     monkeypatch.setenv("AGENT_SESSION_SECRET", "session-test-secret-32-bytes-minimum!")
     monkeypatch.setenv("AGENT_REPO_ALLOWLIST", "owner/name,o/n,private/repo")
-    # The router still calls the auth dependencies E7 has not migrated; the
-    # test app supplies them. See tests/support/e7_auth.py for what that
-    # leaves each assertion testing.
-    e7_auth.install(monkeypatch)
     yield
 
 
@@ -751,6 +758,31 @@ class _FakeGateway:
         return [dict(entry) for entry in type(self).mcp_servers]
 
 
+class _FakeGrants:
+    """The gateway's grant contract, answered in-process.
+
+    The claim asks for the sandbox's credential now instead of minting one, so
+    an app with no grant client cannot claim at all — the same shape as the
+    fake gateway above, and for the same reason.
+    """
+
+    def __init__(self) -> None:
+        self.minted: list[dict[str, Any]] = []
+
+    async def mint(self, **kwargs: Any) -> dict[str, Any]:
+        self.minted.append(kwargs)
+        return {
+            "grant_id": f"agr_{len(self.minted)}",
+            "token": f"agr.{kwargs['job_id']}.{kwargs['attempt_id']}",
+        }
+
+    async def renew(self, grant_id: str) -> dict[str, Any]:
+        return {"grant_id": grant_id}
+
+    async def revoke(self, grant_id: str) -> bool:
+        return True
+
+
 def _build_app(store, *, role: str = "internal", dispatcher: bool = True):
     """Build an app with the router mounted and auth stubbed to one identity.
 
@@ -761,6 +793,7 @@ def _build_app(store, *, role: str = "internal", dispatcher: bool = True):
     from cloud_agent.api.deps import (
         get_agent_app_credentials,
         get_gateway_client,
+        get_grant_client,
         get_log_store,
         get_operational_store,
     )
@@ -771,6 +804,9 @@ def _build_app(store, *, role: str = "internal", dispatcher: bool = True):
     # The create endpoints fail fast on models the deployment cannot serve, so
     # the gateway the test answers with must contain what the tests submit.
     app.dependency_overrides[get_gateway_client] = _FakeGateway
+    # The sandbox credential comes from the gateway (E9); without this the
+    # claim would correctly refuse, having no configured grant client.
+    app.dependency_overrides[get_grant_client] = _FakeGrants
     # verify_admin_access resolves an operational store; the bare test app has
     # no app.state, so supply it even when the gate is left real.
     app.dependency_overrides[get_operational_store] = lambda: None
@@ -2697,20 +2733,52 @@ async def test_terminal_stream_drains_beyond_one_page(
     assert tail["last_event_id"] == total
 
 
-async def test_claim_returns_a_separate_model_scoped_token(client: AsyncClient):
-    """The sandbox credential is distinct from the runner's."""
+# ``test_claim_returns_a_separate_model_scoped_token`` was here. It asserted
+# that the sandbox credential parsed as a ``SCOPE_MODEL`` worker token — which
+# is precisely the credential E9 removed, because it was signed with a root the
+# gateway does not know and therefore bought nothing. The property it protected
+# (the sandbox gets a *different*, weaker credential than the runner) is pinned
+# below against the credential that replaced it. Recorded in MIGRATION.md's
+# discarded-test register.
+
+
+async def test_the_claim_hands_over_a_gateway_grant_not_a_minted_token(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """The sandbox credential is distinct from the runner's — and is not ours.
+
+    Two separate claims, and the second is the point of E9: this service can
+    mint the runner's control token because it verifies it, and it must *not*
+    be able to mint the sandbox's, because the thing that credential buys is
+    inference the gateway meters. So the sandbox token deliberately does not
+    parse in this service's own namespace at all.
+    """
     await _create_job(client)
     body = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
     assert body["sandbox_token"]
     assert body["sandbox_token"] != body["worker_token"]
 
-    from cloud_agent.tokens import SCOPE_FULL, SCOPE_MODEL, parse_worker_token
+    from cloud_agent.tokens import SCOPE_FULL, InvalidAgentToken, parse_worker_token
 
     assert parse_worker_token(body["worker_token"])["scope"] == SCOPE_FULL
-    assert parse_worker_token(body["sandbox_token"])["scope"] == SCOPE_MODEL
+    with pytest.raises(InvalidAgentToken):
+        parse_worker_token(body["sandbox_token"])
+
+    # And the grant is linked to the attempt under its own fence, because
+    # renewal and revocation are both lookups through that link.
+    assert store.attempt_grants == {100: "agr_1"}
 
 
-async def test_sandbox_token_cannot_write_job_state(client: AsyncClient):
+# ``test_sandbox_token_cannot_write_job_state`` was here, asserting 403
+# ``insufficient_scope`` on every worker endpoint. The refusal is now a 401:
+# the sandbox holds a gateway grant, which is not a credential in this
+# service's namespace at all, so it does not reach the scope check — it fails
+# to parse. Same guarantee, one step earlier and one status code over.
+# Recorded in MIGRATION.md's discarded-test register; the case below is its
+# replacement, driving the same four endpoints with the same intent.
+
+
+async def test_the_sandbox_grant_cannot_write_job_state(client: AsyncClient):
     """A credential leaked from inside the sandbox cannot poison the job.
 
     This is the payoff of running the runner outside the sandbox: the only
@@ -2728,8 +2796,8 @@ async def test_sandbox_token_cannot_write_job_state(client: AsyncClient):
         (f"/v1/agent/worker/jobs/{job_id}/heartbeat", {}),
     ):
         response = await client.post(path, json=payload, headers=sandbox_auth)
-        assert response.status_code == 403, path
-        assert response.json()["detail"]["error"]["type"] == "insufficient_scope"
+        assert response.status_code == 401, path
+        assert response.json()["detail"]["error"]["type"] == "unauthorized"
 
     # The runner's own token still works.
     runner_auth = {"Authorization": f"Bearer {body['worker_token']}"}

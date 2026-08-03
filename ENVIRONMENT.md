@@ -53,6 +53,7 @@ need a gateway secret here, the design is wrong — stop and escalate.
 | `GATEWAY_BASE_URL` | **NEW** | Origin of the FreeInference gateway this deployment federates with, e.g. `https://gateway.example.org`. |
 | `GATEWAY_JWKS_URL` | **NEW** | `${GATEWAY_BASE_URL}/v1/identity/jwks` (task C1). Publishes the current signing key plus any retiring ones, so cache by `kid` and re-fetch on a miss rather than pinning a single key. |
 | `GATEWAY_GRANT_DISPATCH_TOKEN` | **NEW** | Bearer token authorizing this service to mint and revoke inference grants (task C5). Random 32 bytes, the same value on both sides, and distinct per environment — one shared across staging and production makes a staging compromise a production one. |
+| `GATEWAY_ISSUER` | **NEW** | Optional. The `iss` an identity token must carry, checked only when set. Left optional on purpose: a deployment may front the gateway at a different name than it mints under, and pinning it wrongly locks every user out. |
 | `AGENT_GATEWAY_URL` | existing | Gateway URL as seen *from inside the sandbox* — the relay address, not the public URL. Differs from `GATEWAY_BASE_URL` by design. |
 
 ### Own secrets
@@ -63,6 +64,14 @@ need a gateway secret here, the design is wrong — stop and escalate.
 | `AGENT_CONTROL_TOKEN_SECRET` | **NEW** | Signs host/worker control tokens. Replaces the old derivation from the gateway's `API_KEY_SECRET` (task E3). Generate random 32 bytes, unique per environment. |
 | `AGENT_SESSION_SECRET` | **NEW** | Signs the web session cookie (task E8). Generate random 32 bytes, unique per environment. |
 | `AGENT_DISPATCHER_TOKEN` | existing | Authenticates host agents claiming work. Existing deployments may hold this outside this service's own configuration; confirm where it is actually read from before cutover rather than assuming. |
+| `ADMIN_TOKEN` | existing | The machine-to-machine admin credential (task E7). **Unset opens nothing** — `verify_admin_access` refuses an empty configured value rather than matching an empty presented one — so a deployment that skips it has no token door, only the admin-session one. |
+
+### Behaviour switches read by the control plane
+
+| Variable | New? | Value / who provisions |
+|---|---|---|
+| `AGENT_SESSION_COOKIE_SECURE` | **NEW** | Defaults to on. Set to `false` **only** for a developer running the whole stack on plain `http://localhost`; a session cookie without `Secure` is one anyone on the path can take. |
+| `AGENT_TRUST_PROXY_HEADERS` | **NEW** | Defaults to off. Set to `true` only when a proxy this deployment controls overwrites `X-Forwarded-For`; otherwise the admin audit trail records whatever address the caller typed. |
 
 ### Source control
 
@@ -115,7 +124,7 @@ neither belongs in any unit file, `.env`, or image.
 | `AGENT_TERMINAL_HARD_TTL_SECONDS` | existing | |
 | `AGENT_TERMINAL_MAX_SESSIONS` | existing | |
 | `AGENT_GENERIC_COMMAND` | existing | |
-| `AGENT_ENROLL_TOKEN` | **NEW** | One-time host enrollment token (task G2). Minted at `POST /admin/agent/runner-hosts/enroll-token`, redeemed once at `POST /v1/agent/host/register`, then replaced by the returned host credential. 15-minute TTL, hashed at rest, and shown exactly once — losing it means issuing another, not looking it up. **The host-side client that reads this does not exist yet**; see MIGRATION.md's deferred register. |
+| `AGENT_ENROLL_TOKEN` | **NEW** | One-time host enrollment token (task G2). Minted at `POST /admin/agent/runner-hosts/enroll-token`, redeemed once at `POST /v1/agent/host/register`, then replaced by the returned host credential. 15-minute TTL, hashed at rest, and shown exactly once — losing it means issuing another, not looking it up. **The token names the host it may register**: the admin minting it supplies `host`, and registration under any other name is refused without spending the token, so a typo cannot revoke a live machine's credential. **The host-side client that reads this does not exist yet**; see MIGRATION.md's deferred register. |
 | `AGENT_LOG_LEVEL` | **NEW** | Host process log level (default INFO). Read by `configure_process_logging()` at the runner entrypoint; replaces the source repo's import-side-effect logging setup (task D6). |
 
 ## Sandbox isolation (host agent reads, sandbox inherits)

@@ -10,8 +10,15 @@ rollback path right up to that point (see
 [docs/cutover.md](cutover.md) § Rollback), and rollback stops existing the
 moment this list is executed.
 
-Every path below was read at the freeze commit `764a6f97`. Line numbers are
-that commit's.
+Every path below was read at the freeze commit `764a6f97`, and line numbers are
+that commit's — **with one marked exception**. §1.4's identity paths are C-phase
+work that landed *after* the freeze, so they do not exist at `764a6f97` at all;
+they are read on `origin/dev` and the section says so. Nothing else in this
+document is a `dev` path.
+
+Every path, line number and count here was re-verified against `764a6f97` on
+2026-08-04. `git cat-file -e 764a6f97:<path>` is the check for existence;
+`git show 764a6f97:<path> | sed -n '<n>p'` for a line.
 
 ---
 
@@ -45,10 +52,14 @@ acceptance" is the same edit seen from the other side.
 `serving.agent_jobs.tokens.mint_worker_token` — re-point it at whatever mints
 grants, or the retained test does not import.
 
-> ⚠️ **`agent_grants` does not exist yet.** `git grep agent_grants origin/dev`
-> returns nothing: phase C5–C8 has not started. Until it lands, `model_auth.py`
-> has nothing to relocate *onto*, and this whole section is a plan rather than
-> a checklist. Confirm before scheduling H4.
+> ⚠️ **`agent_grants` does not exist yet.**
+> `git grep agent_grants origin/dev -- apps/ tests/` returns nothing: phase
+> C5–C8 has not started. (A bare `git grep agent_grants origin/dev` *does* hit —
+> `docs/agents/plans/2026-08-03-cloud-agent-repo-split.md`, which specifies the
+> table rather than implementing it. Scope the grep to the code, or it looks
+> like the work is done.) Until it lands, `model_auth.py` has nothing to
+> relocate *onto*, and this whole section is a plan rather than a checklist.
+> Confirm before scheduling H4.
 
 ### 1.2 The MCP proxy
 
@@ -96,7 +107,7 @@ should go with the module rather than be kept alive by a shim.
 | `apps/backend/serving/storage/log_schema.py:88,143,245` | `api_logs.agent_job_id` column and its partial index. |
 | `apps/backend/serving/storage/postgres_log.py:310,324` | `get_agent_job_cost` / `get_agent_job_usage`. |
 | `apps/backend/serving/storage/database.py:835,897` | `agent_job_id` in the hand-duplicated `api_logs` INSERT. |
-| `servers/routers/completions.py:598-601`, `anthropic_messages.py:1075-1076`, `embeddings.py:172` | Propagate `agent_job_id` from the capability token into log metadata. |
+| `servers/routers/completions.py:597-601`, `anthropic_messages.py:1075-1076`, `embeddings.py:172` | Propagate `agent_job_id` from the capability token into log metadata. |
 
 This is the ledger that answers "what did that job spend". It never moves —
 monetary enforcement is the gateway's per-user quota and always was. **There is
@@ -104,19 +115,29 @@ no per-job budget**; do not re-add one on the way out.
 
 ### 1.4 Identity
 
+> **These are `dev` paths, not freeze paths — the one exception to the header.**
+> C1–C4 landed *after* `764a6f97`: `identity.py` arrived with #1177 on
+> 2026-08-03, hours after the freeze. `git cat-file -e 764a6f97:<path>` fails
+> for all four files below, so line numbers here are `origin/dev`'s and will
+> move as `dev` does. Re-read them when H4 is scheduled; treat the route
+> definitions, not the numbers, as the identifier.
+
 The endpoints this service authenticates against, added by C1–C4 and already on
-`dev`:
+`dev` (router prefix `/v1/identity`, declared at `identity.py:45`):
 
 ```text
-GET  /v1/identity/jwks     serving/servers/routers/identity.py:54
-POST /v1/identity/code                                       :144
-POST /v1/identity/token                                      :197
+GET  /v1/identity/jwks     serving/servers/routers/identity.py:54   (origin/dev)
+POST /v1/identity/code                                       :144   (origin/dev)
+POST /v1/identity/token                                      :197   (origin/dev)
 ```
 
-Plus `serving/utils/identity_keys.py`, `identity_tokens.py`, the authorization
-code storage, and the frontend's `/authorize` consent page and
-`lib/api/identity.ts`. None of it is agent code; it is the login contract, and
-the agent service is only its first consumer.
+Plus `apps/backend/serving/utils/identity_keys.py`,
+`apps/backend/serving/utils/identity_tokens.py`, the authorization code storage
+(`tests/integration/storage/test_identity_auth_codes.py` names it), and the
+frontend's consent page `apps/frontend/src/app/authorize/page.tsx` with its
+`page.test.tsx`, and `apps/frontend/src/lib/api/identity.ts`. None of it is
+agent code; it is the login contract, and the agent service is only its first
+consumer.
 
 ### 1.5 Not agent code at all
 
@@ -183,7 +204,7 @@ admin router.
 | Path | What goes |
 |---|---|
 | `servers/app.py:21,22,107,108` | `agent_jobs` and `agent_mcp` router imports and `include_router` calls. `agent_mcp` **stays** — re-point its import at the relocated module rather than deleting the line. |
-| `servers/bootstrap.py:796-890,1274-1299` | `AgentJobStore` init, the attempt reaper task, the publish loop, GitHub App and GitLab OAuth credential wiring, and the reaper's shutdown cancel. |
+| `servers/bootstrap.py:796-892,1274-1299` | `AgentJobStore` init, the attempt reaper task, the publish loop, GitHub App and GitLab OAuth credential wiring, and the reaper's shutdown cancel. The block starts at the four `agent_* = None` pre-declarations (796-799) and ends at the closing paren of its own `logger.info` (892). |
 | `servers/deps.py:73,110-113,175-193` | `AgentJobStore` import, the four service slots, `get_agent_job_store`, `get_agent_app_credentials`, `get_agent_gitlab_oauth`. |
 | `servers/auth.py:15` | The `serving.agent_jobs.model_auth` import → re-point at the relocated grants module. This is the original reverse dependency the whole split exists to remove; it does not disappear, it changes address. |
 

@@ -42,6 +42,7 @@ from cloud_agent.api.deps import (
     get_agent_job_store,
     get_current_user,
     get_gateway_client,
+    get_grant_client,
     get_log_store,
     get_operational_store,
     looks_like_agent_token,
@@ -58,6 +59,7 @@ from cloud_agent.entitlement import (
 from cloud_agent.gateway import GatewayError
 from cloud_agent.github_app import AppNotInstalled, GitHubAppError
 from cloud_agent.host_pool import hash_secret
+from cloud_agent.identity import SESSION_COOKIE
 from cloud_agent.logging_utils import get_logger
 from cloud_agent.schemas import (
     BASE_REF_METADATA_KEY,
@@ -120,7 +122,6 @@ from cloud_agent.storage.store import PUBLISHING, RUNNING, TERMINAL_STATES
 from cloud_agent.terminal_coordination import resume_settled_terminal
 from cloud_agent.tokens import (
     SCOPE_FULL,
-    SCOPE_MODEL,
     InvalidAgentToken,
     InvalidHostToken,
     mint_worker_token,
@@ -205,7 +206,7 @@ async def authenticate_agent_owner(
     log_store=Depends(get_log_store),
     agent_job_store=Depends(get_agent_job_store),
 ) -> dict[str, Any]:
-    """Authenticate an Agent owner from either web JWT or normal API key.
+    """Authenticate an Agent owner from either a session or a normal API key.
 
     The Agents web app sends the access JWT returned by ``/auth/login``. API
     clients send ``hyi-*`` keys. Passing both credential types to
@@ -216,9 +217,16 @@ async def authenticate_agent_owner(
     catching one validator and falling back to the other: an expired or forged
     JWT must remain a JWT authentication failure, not get reinterpreted as an
     API key.
+
+    **E8 added a third namespace, and it is now the first one checked.** The
+    web app holds no bearer at all: sign-in ends in an ``HttpOnly`` session
+    cookie, so a browser request arrives with an empty ``Authorization``
+    header. Without this branch every such request fell through to the API-key
+    path and 401'd — the same bug the JWT branch above was written to fix, one
+    credential later.
     """
-    if _looks_like_browser_jwt(authorization):
-        return await get_current_user(authorization=authorization, op_store=op_store)
+    if request.cookies.get(SESSION_COOKIE) or _looks_like_browser_jwt(authorization):
+        return await get_current_user(request=request, authorization=authorization)
 
     return await verify_api_key(
         request=request,
@@ -2174,8 +2182,11 @@ def _worker_claims(authorization: str | None) -> dict[str, Any]:
             detail={"error": {"type": "unauthorized", "message": f"Invalid worker token: {exc}"}},
         ) from exc
     if claims.get("scope") != SCOPE_FULL:
-        # A model-scoped token is what lives inside the sandbox. Reaching these
-        # endpoints with it means the credential escaped its intended use.
+        # Anything that is not the runner's full-scope control token. Since E9
+        # the sandbox carries a gateway grant instead of a ``model``-scoped
+        # worker token, so this no longer has a live minter — it is kept as the
+        # structural refusal for any narrower scope that reaches this surface,
+        # which is what an escaped credential would look like.
         raise HTTPException(
             status_code=403,
             detail={
@@ -2238,6 +2249,83 @@ async def _restore_terminal_suspension(
         )
 
 
+async def _mint_sandbox_grant(
+    job_store: AgentJobStore,
+    grants: Any,
+    claim: dict[str, Any],
+) -> str:
+    """Ask the gateway for the capability this attempt's sandbox runs with.
+
+    Scoped to exactly the model the job named and exactly the MCP servers it
+    was created with — not to everything the owner's role could reach. The
+    gateway may narrow that further, and what comes back is what is handed
+    over; the runner never sees what was asked for.
+
+    **Failure hands the job back.** A grant that could not be minted means the
+    sandbox has no way to call a model, so starting the attempt would burn one
+    of the job's three tries producing an agent that fails at its first
+    request. Releasing the claim costs nothing — a released claim is not a
+    spent attempt — and the runner idles until the gateway answers again. That
+    is the fail-closed direction: no grant, no run.
+
+    The grant id is recorded against the attempt under its own fence, because
+    renewal and revocation both need to find it later, and because the fence is
+    what makes "is this attempt still the current one" answerable at all.
+
+    Args:
+        job_store: The store holding the attempt.
+        grants: The grant client.
+        claim: The row ``claim_job`` returned.
+
+    Returns:
+        The grant's bearer token — the only credential that enters the sandbox.
+
+    Raises:
+        HTTPException: 503, after releasing the claim, if no grant could be got.
+    """
+    try:
+        grant = await grants.mint(
+            user_id=claim["user_id"],
+            job_id=claim["id"],
+            attempt_id=claim["attempt_id"],
+            models=[claim["model"]],
+            mcp_servers=list(claim.get("mcp_servers") or []),
+        )
+    except GatewayError as exc:
+        await job_store.release_claim(
+            job_id=claim["id"],
+            attempt_id=claim["attempt_id"],
+            lease_generation=claim["lease_generation"],
+        )
+        logger.warning(
+            "agent_job_grant_unavailable",
+            exc_info=True,
+            extra={"event": "agent_job_grant_unavailable", "job_id": claim["id"]},
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "type": "credential_unavailable",
+                    "message": (
+                        "Could not mint an inference grant for this job; it has been "
+                        "returned to the queue and no attempt was spent."
+                    ),
+                }
+            },
+        ) from exc
+
+    sandbox_token = str(grant.get("token") or "")
+    grant_id = str(grant.get("grant_id") or "")
+    if grant_id:
+        await job_store.record_attempt_grant(
+            attempt_id=claim["attempt_id"],
+            lease_generation=claim["lease_generation"],
+            grant_id=grant_id,
+        )
+    return sandbox_token
+
+
 @router.post("/worker/claim", response_model=WorkerClaimResponse | None)
 async def worker_claim(
     request: Request,
@@ -2245,6 +2333,7 @@ async def worker_claim(
     _dispatcher: str = Depends(verify_dispatcher_access),
     store: AgentJobStore | None = Depends(get_agent_job_store),
     app_credentials: Any | None = Depends(get_agent_app_credentials),
+    grants: Any = Depends(get_grant_client),
 ) -> WorkerClaimResponse | None:
     """Claim the next queued job and mint this attempt's capability token.
 
@@ -2293,11 +2382,19 @@ async def worker_claim(
         "lease_generation": claim["lease_generation"],
     }
     # Two credentials with different powers. The runner keeps the full one and
-    # passes only the model-scoped one into the sandbox, so a credential that
-    # leaks from inside the agent can spend the job's capped budget but cannot
-    # touch its event log, artifacts, or terminal state.
+    # passes only the sandbox one inside, so a credential that leaks from inside
+    # the agent can make model calls the gateway already meters but cannot touch
+    # this job's event log, artifacts, or terminal state.
+    #
+    # Only the first is ours to mint. ``SCOPE_FULL`` is this service's own
+    # control credential, signed with this service's own secret and verified by
+    # this service — correctly local. The sandbox's credential is not: it buys
+    # inference, which is the gateway's to authorize and the gateway's to meter,
+    # so it is asked for rather than minted. (E9. Before this, the claim minted
+    # a ``SCOPE_MODEL`` token signed with a root the gateway does not know —
+    # which bought nothing, and failed at the sandbox's first model call.)
     token = mint_worker_token(**fence, scope=SCOPE_FULL)
-    sandbox_token = mint_worker_token(**fence, scope=SCOPE_MODEL)
+    sandbox_token = await _mint_sandbox_grant(job_store, grants, claim)
     context = await job_store.follow_up_context(job_id=claim["id"])
 
     # A third credential, weaker than either: read-only, this repository only,

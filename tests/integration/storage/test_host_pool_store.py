@@ -6,9 +6,9 @@ single-use token is a statement about an UPDATE's predicate; "capabilities
 superset" is a jsonb containment operator. None of those can be tested against
 a fake without testing the fake.
 
-The fixture applies Alembic — including `0002_host_pool` and `0003_attempt_host`
-— exactly as a deploy does, so a migration that produces a nearly-right schema
-fails here rather than at cutover.
+The fixture applies Alembic — including `0002_host_pool`, `0003_attempt_host`
+and `0004_enroll_token_host` — exactly as a deploy does, so a migration that
+produces a nearly-right schema fails here rather than at cutover.
 """
 
 from __future__ import annotations
@@ -115,10 +115,11 @@ async def _enrol(store: AgentJobStore, host: str, **overrides) -> dict:
 
 
 async def test_an_enrollment_token_is_spendable_exactly_once(store):
-    await store.issue_enroll_token(token_hash=hash_secret("t"), ttl_seconds=900)
+    """Same name both times: the second refusal must be replay, not the binding."""
+    await store.issue_enroll_token(token_hash=hash_secret("t"), host="runner-a", ttl_seconds=900)
 
     first = await store.consume_enroll_token(token_hash=hash_secret("t"), host="runner-a")
-    second = await store.consume_enroll_token(token_hash=hash_secret("t"), host="runner-b")
+    second = await store.consume_enroll_token(token_hash=hash_secret("t"), host="runner-a")
 
     assert (first, second) == (True, False)
 
@@ -128,13 +129,15 @@ async def test_two_machines_racing_one_token_produce_one_winner(store):
 
     A token pasted into two consoles at once is exactly how a fleet gets
     enrolled from one credential, and a check-then-set would let both through.
+    Every racer claims the name the token names, so what is under test is the
+    predicate on ``consumed_at`` rather than the one on ``host``.
     """
-    await store.issue_enroll_token(token_hash=hash_secret("t"), ttl_seconds=900)
+    await store.issue_enroll_token(token_hash=hash_secret("t"), host="runner-a", ttl_seconds=900)
 
     results = await asyncio.gather(
         *(
-            store.consume_enroll_token(token_hash=hash_secret("t"), host=f"runner-{n}")
-            for n in range(8)
+            store.consume_enroll_token(token_hash=hash_secret("t"), host="runner-a")
+            for _ in range(8)
         )
     )
 
@@ -142,9 +145,46 @@ async def test_two_machines_racing_one_token_produce_one_winner(store):
 
 
 async def test_an_expired_token_cannot_be_spent(store):
-    await store.issue_enroll_token(token_hash=hash_secret("t"), ttl_seconds=-1)
+    await store.issue_enroll_token(token_hash=hash_secret("t"), host="runner-a", ttl_seconds=-1)
 
     assert not await store.consume_enroll_token(token_hash=hash_secret("t"), host="runner-a")
+
+
+async def test_a_token_is_spendable_only_under_the_name_it_names(store):
+    """The name is the token's, not the registering machine's.
+
+    ``register_host`` upserts, so spending a token under a live host's name
+    revokes that host's credential and resets its row — a typo during a setup
+    took a working machine out of the pool. The name therefore comes from the
+    token an admin issued.
+    """
+    await store.issue_enroll_token(token_hash=hash_secret("t"), host="runner-b", ttl_seconds=900)
+
+    assert not await store.consume_enroll_token(token_hash=hash_secret("t"), host="runner-a")
+
+
+async def test_a_mismatched_name_does_not_spend_the_token(store):
+    """A typo is retried, not re-issued: the name is a predicate, not a check."""
+    await store.issue_enroll_token(token_hash=hash_secret("t"), host="runner-b", ttl_seconds=900)
+    await store.consume_enroll_token(token_hash=hash_secret("t"), host="runner-a")
+
+    assert await store.consume_enroll_token(token_hash=hash_secret("t"), host="runner-b")
+
+
+async def test_a_typo_cannot_revoke_a_live_hosts_credential(store):
+    """The eviction the binding removes, end to end against the real schema."""
+    await _enrol(store, "runner-a", slots_total=4)
+    await store.issue_enroll_token(token_hash=hash_secret("t"), host="runner-b", ttl_seconds=900)
+
+    spent = await store.consume_enroll_token(token_hash=hash_secret("t"), host="runner-a")
+
+    assert spent is False
+    survivor = await store.get_host(host="runner-a")
+    assert survivor["status"] == HOST_ONLINE
+    assert survivor["enrolled"] is True
+    assert await store.authenticate_host(
+        host="runner-a", credential_hash=hash_secret("cred-runner-a")
+    )
 
 
 # ── G2/G3: registration, authentication, heartbeat ─────────────────────

@@ -27,7 +27,10 @@ it on the command line is not offered at all — argv is world-readable in
 ``ps``.
 
 Safe by default: without ``--apply`` nothing is written anywhere, and the
-source connection is opened read-only regardless.
+source connection is opened read-only regardless. With ``--apply`` the *schema*
+is written first — ``alembic upgrade head`` has to run before the target's
+tables can be read — so a run that is then refused has changed the target's
+schema and no rows, and the report says exactly that.
 
 Idempotent: a second run inserts nothing and reports every row as unchanged.
 Re-encryption is *not* deterministic — Fernet carries a random IV and a
@@ -250,6 +253,12 @@ class TablePlan:
     refresh: list[dict[str, Any]] = field(default_factory=list)
     unchanged: list[dict[str, Any]] = field(default_factory=list)
     conflict: list[dict[str, Any]] = field(default_factory=list)
+    #: How many rows the target holds, counted rather than derived. It is not
+    #: ``refresh + unchanged``: a target row the source has no counterpart for
+    #: — a connection made on the new stack during a rehearsal — is in the
+    #: table, is in the target checksum, and so has to be in the count the
+    #: checksum is read next to.
+    target_total: int = 0
     source_checksum: str = ""
     target_checksum: str = ""
 
@@ -278,7 +287,7 @@ def plan_table(
     - **conflict** — the id is absent but another row already holds the same
       unique key. Inserting would raise; reporting says which user to look at.
     """
-    plan = TablePlan(spec=spec)
+    plan = TablePlan(spec=spec, target_total=len(target_rows))
     by_id = {
         row["id"]: (row, text) for row, text in zip(target_rows, target_plaintext, strict=True)
     }
@@ -348,6 +357,11 @@ def upgrade_target(target_url: str) -> None:
     Run *before* the import for that reason. That ordering is only safe while
     the baseline is the only revision — a future revision that transforms data
     would have to run again afterwards, or the imported rows would miss it.
+
+    It also runs before the conflict and staleness checks, because those read
+    tables that may not exist yet. So a ``--apply`` run that is then refused
+    has still upgraded the target's schema, and the report says so rather than
+    claiming nothing was written.
     """
     from alembic import command
     from alembic.config import Config
@@ -497,8 +511,23 @@ def render_report(
     revision: str,
     missing: tuple[str, ...] = (),
     refused: bool = False,
+    schema_upgraded: bool = False,
 ) -> str:
-    """Render the row counts and checksums this run is judged on."""
+    """Render the row counts and checksums this run is judged on.
+
+    Args:
+        plans: One plan per migrating table.
+        applied: Whether rows were actually written.
+        revision: The Alembic revision the target is stamped at.
+        missing: Tables absent from the target (dry runs only).
+        refused: Whether ``--apply`` was asked for and then refused.
+        schema_upgraded: Whether ``alembic upgrade head`` ran against the
+            target during *this* invocation. It runs before the refusal checks
+            — the target's tables must exist to be read — so a refused run has
+            still changed the target's schema, and a report saying "nothing was
+            written" would be false about the one thing an operator would then
+            have to undo.
+    """
     lines = [
         "",
         f"{'table':<26}{'source':>8}{'target':>8}{'insert':>8}"
@@ -508,9 +537,8 @@ def render_report(
         source_count = (
             len(plan.insert) + len(plan.refresh) + len(plan.unchanged) + len(plan.conflict)
         )
-        target_count = len(plan.refresh) + len(plan.unchanged)
         lines.append(
-            f"{plan.spec.name:<26}{source_count:>8}{target_count:>8}{len(plan.insert):>8}"
+            f"{plan.spec.name:<26}{source_count:>8}{plan.target_total:>8}{len(plan.insert):>8}"
             f"{len(plan.refresh):>9}{len(plan.unchanged):>7}{len(plan.conflict):>10}"
         )
     lines.append("")
@@ -524,7 +552,17 @@ def render_report(
     if applied:
         lines.append("mode: applied")
     elif refused:
-        lines.append("mode: refused — nothing was written")
+        lines.append("mode: refused — no rows were written")
+        if schema_upgraded:
+            # The upgrade runs before the target can be read, so by the time a
+            # conflict or a stale row is found the schema has already moved.
+            # Saying "nothing was written" here would send an operator away
+            # believing the target is untouched.
+            lines.append(
+                "note: the schema WAS written — 'alembic upgrade head' ran against the "
+                f"target before the refusal and left it at {revision}. No rows were "
+                "inserted, updated or deleted."
+            )
     else:
         lines.append("mode: dry run — nothing was written")
     for table in missing:
@@ -596,6 +634,19 @@ async def run(args: argparse.Namespace) -> int:
     """Read, plan, optionally write, then verify. Returns the process exit code."""
     import asyncpg
 
+    # Said first, before any configuration check can end the run. An operator
+    # who set API_KEY_SECRET expecting it to be *used* is exactly the operator
+    # who then omits --old-key-file — so emitting this after that check meant
+    # the notice was unreachable in the one case it exists for.
+    present = [name for name in GATEWAY_SECRET_ENV_NAMES if os.environ.get(name)]
+    if present:
+        print(
+            f"note: {', '.join(present)} is set in this environment and is being ignored. "
+            "This service never reads a gateway secret from its environment; pass the old "
+            "key with --old-key-file instead.",
+            file=sys.stderr,
+        )
+
     source_url = os.environ.get(ENV_SOURCE_URL, "")
     target_url = os.environ.get(ENV_TARGET_URL, "")
     if not source_url or not target_url:
@@ -610,15 +661,6 @@ async def run(args: argparse.Namespace) -> int:
             "--old-key-file (or $" + ENV_OLD_KEY_FILE + ") is required: the stored "
             "credentials were written under the gateway's key and must be decrypted "
             "with it before they can be re-encrypted under this service's key"
-        )
-
-    present = [name for name in GATEWAY_SECRET_ENV_NAMES if os.environ.get(name)]
-    if present:
-        print(
-            f"note: {', '.join(present)} is set in this environment and is being ignored. "
-            "This service never reads a gateway secret from its environment; pass the old "
-            "key with --old-key-file instead.",
-            file=sys.stderr,
         )
 
     old_cipher = SourceControlCipher(read_key_material(args.old_key_file))
@@ -647,8 +689,12 @@ async def run(args: argparse.Namespace) -> int:
             for column, value in text.items():
                 row[f"_plain_{column}"] = value
 
+    schema_upgraded = False
     if args.apply and not args.skip_migrations:
         upgrade_target(target_url)
+        # Recorded because the report has to be able to say so: everything
+        # below can still refuse, and this has already changed the target.
+        schema_upgraded = True
 
     target = await asyncpg.connect(target_url)
     try:
@@ -713,6 +759,7 @@ async def run(args: argparse.Namespace) -> int:
             revision=revision,
             missing=tuple(missing),
             refused=bool(args.apply and (blocked or stale)),
+            schema_upgraded=schema_upgraded,
         )
     )
 

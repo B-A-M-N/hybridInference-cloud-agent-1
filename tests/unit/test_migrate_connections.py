@@ -382,3 +382,87 @@ def test_a_dry_run_says_so() -> None:
     assert "nothing was written" in mc.render_report(
         [plan], applied=False, revision="0001_baseline"
     )
+
+
+def test_a_refused_apply_admits_the_schema_was_written() -> None:
+    """`--apply` upgrades before it can refuse, so "nothing was written" is false.
+
+    The tables have to exist before the target can be read, so `alembic upgrade
+    head` runs first and a conflict found afterwards leaves a target whose
+    schema has moved. An operator told nothing was written does not think to
+    check it.
+    """
+    plan = mc.TablePlan(spec=mc.REPO_GRANTS)
+    plan.source_checksum, plan.target_checksum = "abc", "def"
+
+    report = mc.render_report(
+        [plan], applied=False, revision="0001_baseline", refused=True, schema_upgraded=True
+    )
+
+    assert "no rows were written" in report
+    assert "schema WAS written" in report
+    assert "0001_baseline" in report
+    assert "nothing was written" not in report
+
+
+def test_a_refusal_that_upgraded_nothing_does_not_claim_it_did() -> None:
+    """`--skip-migrations`, or a refusal before the upgrade: no schema note."""
+    plan = mc.TablePlan(spec=mc.REPO_GRANTS)
+    plan.source_checksum = plan.target_checksum = "abc"
+
+    report = mc.render_report(
+        [plan], applied=False, revision="0001_baseline", refused=True, schema_upgraded=False
+    )
+
+    assert "no rows were written" in report
+    assert "schema WAS written" not in report
+
+
+def test_the_target_column_is_the_targets_row_count() -> None:
+    """Not "source rows already present", which is a different number.
+
+    The checksum below it is taken over every row in the target, so a target
+    holding a row the source does not — a connection made on the new stack
+    during a rehearsal — reads as DIFFERS against a `target` column that had
+    not counted it. Two numbers describing different sets, one above the other.
+    """
+    spec = mc.REPO_GRANTS
+    source = [_grant(1, "u1", 10)]
+    target = [_grant(1, "u1", 10), _grant(2, "u2", 11)]
+
+    plan = mc.plan_table(spec, source, [{}], target, [{}, {}])
+
+    assert plan.target_total == 2
+    assert len(plan.unchanged) == 1
+    row = next(
+        line
+        for line in mc.render_report([plan], applied=False, revision="0001_baseline").splitlines()
+        if line.startswith(spec.name)
+    )
+    assert row.split() == [spec.name, "1", "2", "0", "0", "1", "0"]
+
+
+def test_the_ignored_gateway_secret_is_announced_before_anything_can_refuse(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The notice has to reach the operator who most needs it.
+
+    That operator set the gateway's secret in the environment believing this
+    script would use it, and therefore did *not* pass `--old-key-file` — so
+    printing the notice after the configuration checks meant it was unreachable
+    in exactly the case it was written for.
+    """
+    monkeypatch.setenv(mc.GATEWAY_SECRET_ENV_NAMES[0], OLD_MATERIAL)
+    monkeypatch.delenv(mc.ENV_SOURCE_URL, raising=False)
+    monkeypatch.delenv(mc.ENV_TARGET_URL, raising=False)
+    monkeypatch.delenv(mc.ENV_OLD_KEY_FILE, raising=False)
+
+    assert mc.main([]) == mc.EXIT_CONFIG
+
+    stderr = capsys.readouterr().err
+    notice, *_ = stderr.splitlines()
+    assert mc.GATEWAY_SECRET_ENV_NAMES[0] in notice
+    assert "is being ignored" in notice
+    # First line, ahead of the configuration error that ended the run — which
+    # is where the notice used to be unreachable.
+    assert "must both be set" in stderr

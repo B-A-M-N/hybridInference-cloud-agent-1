@@ -782,6 +782,19 @@ HOST_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
 class IssueHostEnrollTokenRequest(BaseModel):  # type: ignore[no-any-unimported]
     """Admin request for a one-time host enrollment token."""
 
+    host: str = Field(
+        ...,
+        max_length=253,
+        pattern=HOST_NAME_PATTERN,
+        description=(
+            "The name this token may register, chosen here rather than by the "
+            "machine that redeems it. Registration upserts, so a name already "
+            "in use has its credential revoked and its row reset to "
+            "'enrolling' — a typo on a machine being set up would otherwise "
+            "evict a live host from the pool. Naming an existing host is how a "
+            "rebuilt machine is deliberately re-enrolled."
+        ),
+    )
     ttl_seconds: float = Field(
         ENROLL_TOKEN_TTL_S,
         gt=0,
@@ -804,6 +817,13 @@ class IssueHostEnrollTokenResponse(BaseModel):  # type: ignore[no-any-unimported
             "recovered — issue another one rather than looking it up."
         ),
     )
+    host: str = Field(
+        ...,
+        description=(
+            "The only name this token can register. Echoed back so the value "
+            "the token was bound to is visible next to the token itself."
+        ),
+    )
     expires_at: datetime
 
 
@@ -811,7 +831,16 @@ class HostRegisterRequest(BaseModel):  # type: ignore[no-any-unimported]
     """A machine presenting an enrollment token to join the pool."""
 
     enroll_token: str = Field(..., min_length=1, max_length=512)
-    name: str = Field(..., max_length=253, pattern=HOST_NAME_PATTERN)
+    name: str = Field(
+        ...,
+        max_length=253,
+        pattern=HOST_NAME_PATTERN,
+        description=(
+            "This machine's name in the pool. It must be the name the token "
+            "was issued for — the token names its host, so a machine cannot "
+            "register under a name an admin did not choose for it."
+        ),
+    )
     capabilities: list[str] = Field(
         default_factory=list,
         max_length=64,
@@ -832,8 +861,14 @@ class HostRegisterRequest(BaseModel):  # type: ignore[no-any-unimported]
         max_length=2048,
         description=(
             "Where this host's workspace broker listens, as the control plane "
-            "reaches it. Omit on a deployment still using the global "
-            "AGENT_WORKSPACE_BROKER_URL."
+            "reaches it. Supply it on every enrolled host that runs jobs: once "
+            "an attempt records this host, the broker is resolved from this "
+            "row and the global AGENT_WORKSPACE_BROKER_URL is NOT consulted. "
+            "Omitting it means file, terminal and git requests for this host's "
+            "jobs answer 'no broker' (409) rather than being served from "
+            "another machine's disk, which is the one fallback that would be "
+            "actively wrong. The env var remains the answer only for attempts "
+            "that record no host at all."
         ),
     )
     runner_version: str | None = Field(None, max_length=128)
@@ -882,3 +917,32 @@ class HostHeartbeatResponse(BaseModel):  # type: ignore[no-any-unimported]
             "what moves a host to offline."
         ),
     )
+
+
+# ── Session (E8) ───────────────────────────────────────────────────────
+
+
+class SessionLoginRequest(BaseModel):  # type: ignore[no-any-unimported]
+    """The gateway identity token, traded once for a session cookie.
+
+    The browser holds this for exactly one call: the callback page redeems its
+    authorization code at the gateway and hands the result straight here. After
+    that the token is spent and the cookie is the only credential in play, so a
+    token intercepted afterwards buys nothing.
+    """
+
+    identity_token: str = Field(..., min_length=1, max_length=8192)
+
+
+class SessionUserResponse(BaseModel):  # type: ignore[no-any-unimported]
+    """Who the session says the caller is.
+
+    ``id`` rather than ``user_id``: this is the shape ``web/src/lib/api/
+    session.ts`` was written against, and it is the contract for all three
+    session routes.
+    """
+
+    id: str
+    email: str | None = None
+    role: str
+    user_name: str | None = None

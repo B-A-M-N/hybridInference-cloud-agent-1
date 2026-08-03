@@ -41,7 +41,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from cloud_agent.api.deps import (
     get_agent_job_store,
     get_client_ip,
-    get_operational_store,
     log_admin_action,
     verify_admin_access,
 )
@@ -136,7 +135,6 @@ async def set_active_agent_runner_host(
     payload: SetActiveAgentRunnerHostRequest,
     _admin_id: str = Depends(verify_admin_access),
     store: AgentJobStore | None = Depends(get_agent_job_store),
-    op_store=Depends(get_operational_store),
 ) -> ListAgentRunnerHostsResponse:
     """Pin agent jobs to one host, or unpin so any runner may claim.
 
@@ -162,7 +160,7 @@ async def set_active_agent_runner_host(
         )
 
     await log_admin_action(
-        op_store,
+        job_store,
         get_client_ip(request),
         "agent.runner_host.set_active",
         None,
@@ -177,7 +175,6 @@ async def forget_agent_runner_host(
     host: str,
     _admin_id: str = Depends(verify_admin_access),
     store: AgentJobStore | None = Depends(get_agent_job_store),
-    op_store=Depends(get_operational_store),
 ) -> ListAgentRunnerHostsResponse:
     """Drop a decommissioned host from the list.
 
@@ -202,7 +199,7 @@ async def forget_agent_runner_host(
         raise HTTPException(status_code=404, detail=f"Unknown runner host: {host}")
 
     await log_admin_action(
-        op_store,
+        job_store,
         get_client_ip(request),
         "agent.runner_host.forget",
         None,
@@ -217,39 +214,60 @@ async def forget_agent_runner_host(
 @router.post("/agent/runner-hosts/enroll-token", response_model=IssueHostEnrollTokenResponse)
 async def issue_host_enroll_token(
     request: Request,
-    payload: IssueHostEnrollTokenRequest | None = None,
+    payload: IssueHostEnrollTokenRequest,
     _admin_id: str = Depends(verify_admin_access),
     store: AgentJobStore | None = Depends(get_agent_job_store),
-    op_store=Depends(get_operational_store),
 ) -> IssueHostEnrollTokenResponse:
-    """Mint a one-time token that lets one machine join the pool.
+    """Mint a one-time token that lets one named machine join the pool.
 
     Returned in full here and **nowhere else** — only its hash is stored, so
     there is no endpoint that can show it again and no database read that can
     recover it. An operator who loses it issues another.
 
-    The token names no host. Which machine redeems it is decided by whoever
-    holds it, which is why the TTL is short: the window is one machine, once,
-    for as long as it takes to finish a setup that is already under way.
+    **The token names its host, and the caller here is the one who names it.**
+    It did not, once, and the name was therefore whatever the registering
+    machine typed — while registration upserts, so a name that already belongs
+    to a live host revokes that host's credential and drops it back to
+    ``enrolling``. A mistyped name evicted a working, busy machine from the
+    claim pool. Refusing names already in use was the other candidate, but it
+    breaks the case the upsert exists for (a rebuilt machine coming back under
+    its own name) and leaves the naming decision on the unauthenticated side
+    anyway. Registration always needs a freshly minted token, so binding the
+    name costs the operator nothing and moves the decision to the party this
+    endpoint has already authenticated.
+
+    The TTL stays short for the reason it always was: the window is one
+    machine, once, for as long as it takes to finish a setup already under way.
     """
     job_store = _require_store(store)
-    body = payload or IssueHostEnrollTokenRequest()
+    body = payload
+    # A body is now required: it carries the host name, and there is no
+    # sensible default for "which machine may this enrol".
     token = new_enroll_token()
     issued = await job_store.issue_enroll_token(
         token_hash=hash_secret(token),
+        host=body.host,
         ttl_seconds=body.ttl_seconds,
         issued_by=_admin_id,
     )
     await log_admin_action(
-        op_store,
+        job_store,
         get_client_ip(request),
         "agent.runner_host.enroll_token_issued",
         None,
         # The hash, never the token: this trail is read by more people than
-        # hold the credential it would otherwise contain.
-        {"expires_at": issued["expires_at"].isoformat(), "ttl_seconds": body.ttl_seconds},
+        # hold the credential it would otherwise contain. The host name is in
+        # it deliberately — "who authorized this name" is the question the
+        # binding exists to answer.
+        {
+            "host": body.host,
+            "expires_at": issued["expires_at"].isoformat(),
+            "ttl_seconds": body.ttl_seconds,
+        },
     )
-    return IssueHostEnrollTokenResponse(enroll_token=token, expires_at=issued["expires_at"])
+    return IssueHostEnrollTokenResponse(
+        enroll_token=token, host=body.host, expires_at=issued["expires_at"]
+    )
 
 
 async def _set_status(
@@ -259,7 +277,6 @@ async def _set_status(
     status: str,
     action: str,
     job_store: AgentJobStore,
-    op_store,
 ) -> ListAgentRunnerHostsResponse:
     """Apply one table-driven status change, or say why it was refused."""
     outcome = await job_store.set_host_status(host=host, status=status)
@@ -277,7 +294,7 @@ async def _set_status(
                 f"become {status!r}."
             ),
         )
-    await log_admin_action(op_store, get_client_ip(request), action, None, {"host": host})
+    await log_admin_action(job_store, get_client_ip(request), action, None, {"host": host})
     return await _snapshot(job_store)
 
 
@@ -287,7 +304,6 @@ async def drain_agent_runner_host(
     host: str,
     _admin_id: str = Depends(verify_admin_access),
     store: AgentJobStore | None = Depends(get_agent_job_store),
-    op_store=Depends(get_operational_store),
 ) -> ListAgentRunnerHostsResponse:
     """Stop this host taking new work; let what it has finish.
 
@@ -303,7 +319,6 @@ async def drain_agent_runner_host(
         status=HOST_DRAINING,
         action="agent.runner_host.drain",
         job_store=_require_store(store),
-        op_store=op_store,
     )
 
 
@@ -313,7 +328,6 @@ async def undrain_agent_runner_host(
     host: str,
     _admin_id: str = Depends(verify_admin_access),
     store: AgentJobStore | None = Depends(get_agent_job_store),
-    op_store=Depends(get_operational_store),
 ) -> ListAgentRunnerHostsResponse:
     """Put a drained host back to work.
 
@@ -327,7 +341,6 @@ async def undrain_agent_runner_host(
         status=HOST_ONLINE,
         action="agent.runner_host.undrain",
         job_store=_require_store(store),
-        op_store=op_store,
     )
 
 
@@ -345,7 +358,6 @@ async def remove_agent_runner_host(
     ),
     _admin_id: str = Depends(verify_admin_access),
     store: AgentJobStore | None = Depends(get_agent_job_store),
-    op_store=Depends(get_operational_store),
 ) -> ListAgentRunnerHostsResponse:
     """Revoke this host's credential and take it out of the pool.
 
@@ -378,7 +390,7 @@ async def remove_agent_runner_host(
             ),
         )
     await log_admin_action(
-        op_store,
+        job_store,
         get_client_ip(request),
         "agent.runner_host.remove",
         None,

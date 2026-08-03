@@ -70,6 +70,63 @@ async def _reconcile_settled_terminals(store: AgentJobStore) -> None:
             await store.mark_terminal_resume_complete(job_id=job_id)
 
 
+async def _revoke_dead_grants(store: AgentJobStore, grants: Any) -> None:
+    """Withdraw the grants of attempts that are no longer current.
+
+    Runs on the reaper's schedule rather than at the moment an attempt ends,
+    and covers every way an attempt can stop being current with one query: a
+    worker reporting a terminal state, the reaper superseding a lapsed lease,
+    or a control plane that was restarted between the two. A revoke call at
+    each of those call sites would have to be written three times, would put a
+    gateway round trip inside the fenced terminal transition, and would still
+    miss the restart.
+
+    Revocation is an acceleration of the TTL, never the mechanism — the store
+    detaches each grant as it hands it over, so a failure here costs lateness
+    and not a retry every pass. ``GrantClient.revoke`` reports rather than
+    raises for the same reason.
+    """
+    for row in await store.take_revocable_grants():
+        if not await grants.revoke(row["grant_id"]):
+            logger.warning(
+                "agent_grant_not_revoked",
+                extra={
+                    "event": "agent_grant_not_revoked",
+                    "job_id": row["job_id"],
+                    "attempt_id": row["attempt_id"],
+                },
+            )
+
+
+async def _renew_live_grants(store: AgentJobStore, grants: Any) -> None:
+    """Extend the grants of attempts that are still current — and only those.
+
+    **The store is consulted every pass, and that is the fence.** The gateway
+    holds no attempt state after the split, so it cannot tell a live attempt
+    from a superseded one; a renewal loop that remembered what it minted and
+    renewed on a timer would keep a zombie sandbox spending, and nothing
+    anywhere would notice. ``list_renewable_grants`` answers only for attempts
+    that are ``running`` with an unexpired lease, so a superseded attempt stops
+    being renewed on the very next pass and its capability dies at its own TTL.
+
+    A refused renewal is logged, not retried here: the next pass tries again if
+    the attempt is still live, and stops trying the moment it is not.
+    """
+    for row in await store.list_renewable_grants():
+        try:
+            await grants.renew(row["grant_id"])
+        except Exception:
+            logger.warning(
+                "agent_grant_renewal_failed",
+                exc_info=True,
+                extra={
+                    "event": "agent_grant_renewal_failed",
+                    "job_id": row["job_id"],
+                    "attempt_id": row["attempt_id"],
+                },
+            )
+
+
 async def _reap_offline_hosts(store: AgentJobStore) -> None:
     """Move hosts that stopped heartbeating to ``offline``.
 
@@ -95,6 +152,7 @@ async def reap_expired_attempts(
     *,
     interval_seconds: float = REAP_INTERVAL_S,
     max_attempts: int = MAX_ATTEMPTS,
+    grants: Any | None = None,
 ) -> None:
     """Periodically close attempts whose lease expired.
 
@@ -102,6 +160,9 @@ async def reap_expired_attempts(
         store: The agent store.
         interval_seconds: Delay between passes.
         max_attempts: How many attempts a job gets before it fails for good.
+        grants: The grant client, when this deployment mints grants. ``None``
+            skips both grant passes entirely — the capabilities then expire at
+            their own TTL, which is the same backstop revocation accelerates.
     """
     try:
         await _reconcile_settled_terminals(store)
@@ -141,6 +202,19 @@ async def reap_expired_attempts(
                 )
         except Exception:
             logger.warning("Agent attempt reaper pass failed", exc_info=True)
+        # After the reaper, so an attempt superseded in this very pass has its
+        # grant withdrawn in the same one — and in its own try for the reason
+        # the host reaper has one: a gateway having a bad minute must not stop
+        # attempts being recovered.
+        if grants is not None:
+            try:
+                await _revoke_dead_grants(store, grants)
+            except Exception:
+                logger.warning("Grant revocation pass failed", exc_info=True)
+            try:
+                await _renew_live_grants(store, grants)
+            except Exception:
+                logger.warning("Grant renewal pass failed", exc_info=True)
 
 
 def _build_source_control(app: FastAPI) -> None:
@@ -215,6 +289,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     import asyncpg
 
     from cloud_agent.gateway import GatewayClient
+    from cloud_agent.grants import GrantClient
     from cloud_agent.storage.store import AgentJobStore
 
     dsn = os.environ.get(ENV_DATABASE_URL, "")
@@ -229,9 +304,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.store = store
     app.state.gateway = GatewayClient()
+    # The sandbox's credential is minted at the gateway now (E9), so the claim
+    # path and the renewal/revocation passes share one client — and one
+    # connection pool — rather than each building their own per call.
+    app.state.grants = GrantClient()
     _build_source_control(app)
 
-    reaper = asyncio.create_task(reap_expired_attempts(store))
+    reaper = asyncio.create_task(reap_expired_attempts(store, grants=app.state.grants))
     _BACKGROUND_TASKS.add(reaper)
     reaper.add_done_callback(_BACKGROUND_TASKS.discard)
     app.state.reaper_task = reaper
@@ -254,7 +333,7 @@ def create_app() -> FastAPI:
     """Build the control plane application."""
     configure_process_logging()
 
-    from cloud_agent.api import admin_hosts, hosts, routes
+    from cloud_agent.api import admin_hosts, hosts, routes, session
 
     app = FastAPI(
         title="FreeInference Cloud Agent",
@@ -265,6 +344,10 @@ def create_app() -> FastAPI:
     app.include_router(routes.router)
     app.include_router(hosts.router)
     app.include_router(admin_hosts.router)
+    # The web app's way in. Mounted alongside the others rather than inside
+    # ``routes.py`` because it authenticates nothing on entry — it is the route
+    # that *creates* the credential every other route requires.
+    app.include_router(session.router)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
