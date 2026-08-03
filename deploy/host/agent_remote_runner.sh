@@ -113,6 +113,90 @@ require_env() {
      whatever answers on that address."
 }
 
+# ── Isolation ─────────────────────────────────────────────────────────
+#
+# Ported at H4 from the gateway's own runner script, which was deleted with the
+# rest of its agent tooling. The gateway had two runner scripts and only this
+# one migrated; the check lived in the other. Without this port the split would
+# have left **no runner script anywhere that verifies its own isolation
+# boundary** — while the sandbox image, the compose file and the docs all still
+# say Kata. `git log` in the source repository has the original.
+#
+# The default backend is a claim about what every job gets. These two checks
+# cover the ways that claim is false while everything still looks fine.
+
+KATA_RUNTIME="io.containerd.kata.v2"
+KATA_SETUP_SCRIPT="${KATA_SETUP_SCRIPT:-deploy/host/setup_kata_runtime.sh}"
+
+warn() { printf '[agent-remote-runner] WARNING: %s\n' "$*" >&2; }
+
+require_kata_host() {
+  # Gate before anything starts. The runner's own preflight would fail per job
+  # otherwise, which reads as "the queue is broken" rather than "this host was
+  # never provisioned" — and that misreading is precisely how staging ended up
+  # running every job on a shared kernel for months.
+  local backend
+  backend="$(env_or_dotenv AGENT_SANDBOX_BACKEND)"
+  backend="${backend:-kata}"
+
+  if [[ "$backend" != "kata" ]]; then
+    # Not silently tolerated: this is the deployment saying out loud that it
+    # has no kernel boundary, so nobody reads `AGENT_SANDBOX_BACKEND=container`
+    # in an .env six months from now and assumes it was reviewed.
+    warn "AGENT_SANDBOX_BACKEND=${backend}: sandboxes on this host share the host kernel."
+    warn "Repository code runs against the host's own syscall surface. Acceptable for"
+    warn "trusted repositories only. For untrusted or multi-tenant work, install Kata"
+    warn "(sudo ${KATA_SETUP_SCRIPT}) and drop the override."
+    return 0
+  fi
+
+  [[ -x "$KATA_SETUP_SCRIPT" ]] || die "missing ${KATA_SETUP_SCRIPT}; cannot verify this host's Kata runtime"
+  if ! "$KATA_SETUP_SCRIPT" --check; then
+    die "this host is not provisioned for Kata. Install it with:
+    sudo ${KATA_SETUP_SCRIPT}
+  Or accept a shared host kernel *explicitly* by setting AGENT_SANDBOX_BACKEND=container
+  in .env. There is deliberately no automatic fallback: silently downgrading the
+  isolation boundary is the one failure mode nobody would notice."
+  fi
+}
+
+kata_smoke_test() {
+  # The authoritative check, and the one nothing else can stand in for: start a
+  # real container under the real runtime and ask which kernel it is running.
+  # Under runc that is the host's own; under Kata it is the guest's. Every
+  # cheaper signal (the flag is accepted, the shim exists) has already passed on
+  # hosts where jobs were still sharing the host kernel.
+  local backend host_kernel guest_kernel
+  backend="$(env_or_dotenv AGENT_SANDBOX_BACKEND)"
+  backend="${backend:-kata}"
+  [[ "$backend" == "kata" ]] || return 0
+
+  host_kernel="$(uname -r)"
+  log "starting one container under ${KATA_RUNTIME} to confirm it gets its own kernel"
+  if ! guest_kernel="$(docker run --rm --runtime "$KATA_RUNTIME" --entrypoint /bin/sh \
+    "$SANDBOX_IMAGE" -c 'uname -r' 2>&1)"; then
+    die "could not start a container under ${KATA_RUNTIME}: ${guest_kernel}
+  The shim is installed but the runtime does not work. '${KATA_SETUP_SCRIPT} --check'
+  and 'kata-runtime check' will say more."
+  fi
+  guest_kernel="$(printf '%s' "$guest_kernel" | tail -1 | tr -d '[:space:]')"
+
+  if [[ "$guest_kernel" == "$host_kernel" ]]; then
+    die "the sandbox reported the host's own kernel (${host_kernel}), so it is NOT
+  VM-isolated even though the runtime was accepted. Refusing to start runners:
+  a deployment that believes it has a kernel boundary and does not is worse than
+  one that knows it does not."
+  fi
+  log "VM isolation confirmed: guest kernel ${guest_kernel}, host kernel ${host_kernel}"
+}
+
+cmd_preflight() {
+  command -v docker >/dev/null || die "docker is not installed on this host"
+  docker info >/dev/null 2>&1 || die "the Docker daemon is not running (or not accessible)"
+  require_kata_host
+  kata_smoke_test
+}
+
 cmd_up() {
   local replicas="${1:-$(env_or_dotenv AGENT_RUNNER_REPLICAS)}"
   replicas="${replicas:-3}"
@@ -120,6 +204,10 @@ cmd_up() {
   command -v docker >/dev/null || die "docker is not installed on this host"
   docker info >/dev/null 2>&1 || die "the Docker daemon is not running (or not accessible)"
   require_env
+  # Before the build, not after: a host that cannot isolate should not spend
+  # ten minutes building an image it must not run.
+  require_kata_host
+  kata_smoke_test
 
   # This machine's name in the admin host switch. Resolved here because the
   # script runs on the host: inside a container the hostname is a container id,
@@ -184,8 +272,9 @@ cmd_down() {
 
 case "${1:-}" in
   up) shift; cmd_up "$@" ;;
+  preflight) cmd_preflight ;;
   check) cmd_check ;;
   status) cmd_status ;;
   down) cmd_down ;;
-  *) die "usage: $0 {up [N]|check|status|down}" ;;
+  *) die "usage: $0 {up [N]|preflight|check|status|down}" ;;
 esac
