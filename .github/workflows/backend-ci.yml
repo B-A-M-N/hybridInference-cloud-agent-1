@@ -1,0 +1,84 @@
+name: Backend CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, dev]
+    paths-ignore:
+      - 'docs/**'
+      - 'web/**'
+      - '**/*.md'
+      - 'LICENSE'
+      - '.gitignore'
+  pull_request:
+    branches: [main, dev]
+    paths-ignore:
+      - 'docs/**'
+      - 'web/**'
+      - '**/*.md'
+      - 'LICENSE'
+      - '.gitignore'
+
+concurrency:
+  group: backend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  UV_VERSION: "0.9.7"
+
+jobs:
+  lint:
+    name: ${{ matrix.check.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        check:
+          - name: Ruff Format
+            command: uv run ruff format --check .
+          - name: Ruff Lint
+            command: uv run ruff check --no-fix .
+          - name: Pydocstyle
+            command: uv run pydocstyle backend host
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync dependencies
+        run: uv sync
+
+      - name: ${{ matrix.check.name }}
+        run: ${{ matrix.check.command }}
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync dependencies
+        run: uv sync
+
+      # -n 4 --dist loadfile, not a serial run: parallel workers isolate each
+      # test file into its own process, which is what surfaces environment
+      # leakage between files. A serial run silently passes on that class of bug.
+      - name: Pytest
+        run: uv run pytest -n 4 --dist loadfile -q -m "not external and not dbtest"

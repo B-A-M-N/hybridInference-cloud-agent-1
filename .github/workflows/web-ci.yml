@@ -1,0 +1,73 @@
+name: Web CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'web/**'
+      - '.github/workflows/web-ci.yml'
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'web/**'
+      - '.github/workflows/web-ci.yml'
+
+concurrency:
+  group: web-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+
+jobs:
+  check:
+    name: Web ${{ matrix.check.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        check:
+          - name: ESLint
+            command: npm run lint
+          - name: Prettier
+            command: npm run format:check
+          - name: TypeScript
+            command: npm run type-check
+          - name: Tests
+            command: npm run test
+          - name: Build
+            command: npm run build
+    steps:
+      - uses: actions/checkout@v4
+
+      # web/ is an empty placeholder until task F1 lands the Next.js app. Until
+      # then this workflow is a deliberate no-op rather than a red X: gating on
+      # the manifest keeps the required-check list stable across that boundary.
+      - name: Detect web app
+        id: detect
+        run: |
+          if [ -f web/package.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "web/package.json not present yet — skipping (task F1)"
+          fi
+
+      - name: Set up Node
+        if: steps.detect.outputs.present == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        if: steps.detect.outputs.present == 'true'
+        working-directory: ./web
+        run: npm ci
+
+      - name: ${{ matrix.check.name }}
+        if: steps.detect.outputs.present == 'true'
+        working-directory: ./web
+        run: ${{ matrix.check.command }}
