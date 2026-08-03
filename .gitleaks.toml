@@ -1,0 +1,26 @@
+# Secret-scanning config. Carried over from HybridInference, narrowed to what
+# this repository actually needs.
+#
+# Division of labour: gitleaks runs its default rules over the tree AND the
+# history (secret-scan.yml). Its one allowlist entry below is the exact fake
+# Slack token line in the patch gate's detector tests — never a path. That
+# precision matters for the history scan: a path exemption would also hide a
+# real credential committed to a test and removed in a later commit.
+# tests/unit/test_no_committed_credentials.py complements the default rules by
+# scanning every tracked file for credential formats this project and its
+# gateway issue but gitleaks may not know, including hyi- and ajt. tokens.
+#
+# The source repo learned this layout the hard way: a wholesale exemption on
+# docs paths hid a live key for months. Never add a directory-wide exemption
+# here. If another credential-shaped sample arrives, allowlist its exact known
+# fake value or line, with the backstop extended first where needed.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Known fake Slack token in the patch-gate detector test."
+regexTarget = "line"
+regexes = [
+  '''\("slack_token", "xoxb-123456789012-abcdefghijkl"\),''',
+]
