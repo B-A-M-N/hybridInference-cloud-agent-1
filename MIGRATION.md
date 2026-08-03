@@ -4,6 +4,21 @@ This repository is a **clean snapshot** of the cloud agent feature extracted
 from `HarvardMadSys/hybridInference`. It does not import that repository's git
 history.
 
+## Licence and provenance
+
+This repository is **MIT**, carrying the source repository's licence text and its
+copyright line — `Copyright (c) 2026 Harvard SEAS` — unchanged.
+
+It was briefly created as Apache-2.0. That was wrong twice over. Apache-2.0 can
+*contain* MIT code, but only while retaining the MIT notice, which a bare licence
+swap drops. More importantly the copyright holder is Harvard SEAS, so
+relicensing is not a decision this project can make on its own. Keeping MIT
+avoids the question entirely and is the least surprising outcome for anyone who
+already holds a copy of the original.
+
+If a future relicence is genuinely wanted, it needs the copyright holder's
+agreement first, not a change to this file.
+
 ## Why the history was not carried over
 
 The source repository is private and its history is not a publication artifact —

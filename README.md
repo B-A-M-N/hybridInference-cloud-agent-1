@@ -84,4 +84,6 @@ Branch off `dev` as `<user>/<scope>/<name>`; pull requests target `dev`.
 
 ## License
 
-[Apache-2.0](LICENSE)
+[MIT](LICENSE) — the same licence, and the same copyright holder, as the
+HybridInference repository this code is extracted from. See
+[MIGRATION.md](MIGRATION.md#licence-and-provenance).
