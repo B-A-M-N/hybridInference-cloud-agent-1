@@ -305,7 +305,9 @@ cmd_check() {
 
 case "${1:-install}" in
   --check | check) cmd_check ;;
-  --help | -h) sed -n '2,40p' "$0" ;;
+  # 32 is the last header line; 33 onwards is `set -Eeuo pipefail` and the
+  # version-pin rationale, which is not usage text.
+  --help | -h) sed -n '2,32p' "$0" ;;
   install) cmd_install ;;
   *) die "usage: $0 [install|--check]" ;;
 esac

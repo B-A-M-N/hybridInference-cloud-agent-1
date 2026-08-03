@@ -16,7 +16,11 @@
 # `cloud_agent_host.egress_proxy` into a volume this container reads at
 # start, because the allowlist is deployment configuration and rendering it
 # there is what runs the validation that keeps a hostile value out of a config
-# file. See docker-compose.agent-runner.yml.
+# file.
+#
+# No compose file in this repository starts this image yet: the render service
+# and the tiered networks lived in the gateway repo's co-located overlay, which
+# was not migrated. See MIGRATION.md, Open decisions.
 
 FROM debian:bookworm-slim
 

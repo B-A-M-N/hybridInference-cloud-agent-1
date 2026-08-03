@@ -64,7 +64,14 @@ env_or_dotenv() {
   # got away with it only because a failure inside `[[ ]]` is exempt from
   # `set -e`; that is luck, not a contract.
   [[ -f .env ]] || return 0
-  sed -n "s/^${name}=//p" .env 2>/dev/null | tail -1
+  local value
+  value="$(sed -n "s/^${name}=//p" .env 2>/dev/null | tail -1)"
+  # Compose strips one matched pair of surrounding quotes; a preflight that
+  # does not would reject a `.env` compose accepts, and reject it by reporting
+  # the variable as missing.
+  value="${value%\"}"; value="${value#\"}"
+  value="${value%\'}"; value="${value#\'}"
+  printf '%s' "$value"
 }
 
 # Read through env_or_dotenv, and therefore only after it exists. Taking these
@@ -78,6 +85,8 @@ GATEWAY_HOSTNAME="$(env_or_dotenv AGENT_GATEWAY_HOSTNAME)"
 GATEWAY_HOSTNAME="${GATEWAY_HOSTNAME:-agent-gateway}"
 TUNNEL_PORT="$(env_or_dotenv AGENT_TUNNEL_LISTEN_PORT)"
 TUNNEL_PORT="${TUNNEL_PORT:-8080}"
+EGRESS_NETWORK="$(env_or_dotenv AGENT_EGRESS_NETWORK_PLATFORM_ONLY)"
+EGRESS_NETWORK="${EGRESS_NETWORK:-agent-egress}"
 
 require_env() {
   # Named up front, because each of these fails much later and much less
@@ -105,7 +114,8 @@ require_env() {
 }
 
 cmd_up() {
-  local replicas="${1:-${AGENT_RUNNER_REPLICAS:-3}}"
+  local replicas="${1:-$(env_or_dotenv AGENT_RUNNER_REPLICAS)}"
+  replicas="${replicas:-3}"
   [[ "$replicas" =~ ^[0-9]+$ ]] || die "replicas must be a number, got '$replicas'"
   command -v docker >/dev/null || die "docker is not installed on this host"
   docker info >/dev/null 2>&1 || die "the Docker daemon is not running (or not accessible)"
@@ -132,7 +142,10 @@ cmd_up() {
   # tunnel, so a tunnel that came up without a working upstream fails here
   # rather than one job at a time. Give it a moment and surface the verdict.
   sleep 5
-  cmd_check || true
+  # In a subshell: `die` calls `exit`, which from a function ends the whole
+  # script — so `|| true` cannot catch it, and a failed probe would skip the
+  # runner logs that explain why it failed.
+  ( cmd_check ) || true
   "${COMPOSE[@]}" logs --tail 20 agent-runner
   log "done. 'deploy/host/agent_remote_runner.sh status' shows the live tail."
 }
@@ -141,7 +154,7 @@ cmd_check() {
   # Ask from inside the closed network, which is the only vantage point whose
   # answer means anything: reaching the gateway from this host's shell proves
   # nothing about what a sandbox can reach.
-  local network="${AGENT_EGRESS_NETWORK_PLATFORM_ONLY:-agent-egress}"
+  local network="$EGRESS_NETWORK"
   local url="http://${GATEWAY_HOSTNAME}:${TUNNEL_PORT}/health"
   log "probing ${url} from the ${network} network"
   if docker run --rm --network "$network" --entrypoint /bin/sh "$SANDBOX_IMAGE" \

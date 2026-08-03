@@ -103,7 +103,7 @@ if getent hosts "$host" >/dev/null 2>&1; then echo dns-only; else echo unresolve
 # same mechanism with a different isolation boundary underneath.
 KATA_RUNTIME = "io.containerd.kata.v2"
 
-# Must match `useradd --uid` in deploy/docker/Dockerfile.agent-sandbox. The
+# Must match `useradd --uid` in deploy/sandbox/Dockerfile.agent-sandbox. The
 # runner chowns each job worktree to this id before mounting it, so a drift
 # between the two means the agent cannot write to its own working tree.
 SANDBOX_UID = 10001

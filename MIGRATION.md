@@ -115,7 +115,28 @@ preflight) are **not currently covered here** — closing that gap is part of
 whichever option is chosen. `tests/unit/test_deploy_paths.py` covers the moved
 files' paths only, and says so.
 
-Until this is decided, H4 must not delete the source repo's copies.
+**Decided (2026-08-04): option 1.** The overlay is dropped; the standalone
+remote-runner compose is the only topology. The properties its tests pinned are
+re-asserted here — `tests/unit/test_deploy_security.py` (egress network
+internal, docker socket read-only for every holder, sandbox non-root, UID drift
+pin, no baked credentials, Codex MCP allowlist) and
+`tests/unit/test_setup_kata_runtime.py` (the Kata preflight, driving the real
+script). Two source assertions did not port because they keyed on the gateway's
+own `backend` service, which this repository does not have; a test records that
+so their absence reads as a decision. H4 deletes all four source files.
+
+**One functional gap that came with the decision.** The Trusted egress tier —
+the Squid allowlist proxy and the `agent-egress-trusted` / `agent-egress-uplink`
+networks — was declared **only** in the overlay. The standalone compose defaults
+`AGENT_EGRESS_NETWORK_TRUSTED/CUSTOM/FULL` to empty and both tiers to
+`platform_only`, so it never supported anything above `platform_only`; that was
+acceptable while the overlay existed for the co-located case, and is not now.
+`deploy/host/Dockerfile.agent-egress-proxy` therefore builds an image that no
+compose file in this repository starts. A deployment needing setup-phase
+registry access must add the proxy, its config-render service and the tiered
+networks to the standalone compose. Not scoped here — it is a feature, not a
+migration — but it is the reason the tier is currently unreachable rather than
+merely unused.
 
 ## Manifest corrections
 
