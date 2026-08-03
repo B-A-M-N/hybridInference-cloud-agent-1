@@ -1,0 +1,429 @@
+openapi: 3.1.0
+
+info:
+  title: FreeInference gateway — inference grants
+  version: "1.0.0"
+  x-source:
+    repo: HarvardMadSys/hybridInference
+    branch: murphy/claude/c7-grant-usage
+    files:
+      - apps/backend/serving/servers/routers/agent_grants.py
+      - apps/backend/serving/grants.py
+      - apps/backend/serving/agent_jobs/model_auth.py
+    tasks: [C5, C6, C7]
+  description: |
+    How a sandbox gets the right to call models, when the service running that
+    sandbox has no user table and no model registry. It asks; the gateway
+    decides; the answer is a short-lived bearer token the sandbox carries.
+
+    **Scope, never spend.** A grant says *what* an attempt may call. How much it
+    may spend is the account's existing daily quota, enforced on the inference
+    path for grant-authenticated calls exactly as it is for API keys. There is
+    deliberately **no per-task dollar budget** — an earlier design had one, and
+    removing it is only safe because the quota gate covers grant traffic too.
+
+    **Short TTL and renewal, not long TTL and revocation.** A grant lives 300
+    seconds by default (900 maximum) and the control plane renews it on a
+    30-second loop while the attempt is genuinely still running. Revocation is
+    an *acceleration* of that expiry, never the mechanism — which is why a
+    failed revoke needs no durable outbox and why a control plane that dies
+    mid-attempt leaks capability for at most one TTL.
+
+    **The fence is the control plane's, not the gateway's.** The gateway holds
+    no attempt or lease state after the split, so it cannot refuse a renewal on
+    the grounds that the attempt was superseded thirty seconds ago; it renews
+    what it is asked to renew. The consumer's renewal loop re-reads its own
+    store every pass, which is what stops a zombie sandbox.
+
+    Two clamps behave differently on purpose:
+
+    * **Models are clamped.** A request for more than the user's role can reach
+      comes back narrowed. A narrower agent still runs.
+    * **MCP servers are validated.** An unknown name is refused outright rather
+      than dropped, because dropping it returns a grant that looks fine and
+      produces an agent missing the one tool the task was written around — a
+      failure a long way from its cause.
+
+servers:
+  - url: https://freeinference.org
+    description: Production
+  - url: https://staging.freeinference.org
+    description: Staging
+
+tags:
+  - name: internal
+    description: |
+      Not public API. Behind a shared service credential, and absent entirely
+      on deployments that do not federate capability.
+
+paths:
+  /internal/agent-grants:
+    post:
+      tags: [internal]
+      operationId: mintGrant
+      summary: Mint (or return) the grant for one attempt
+      description: |
+        **Idempotent per attempt.** A retry for the same
+        `external_job_id` + `external_attempt_id` returns the existing grant
+        rather than a second one, so a control plane that retries a timed-out
+        mint does not leave a live orphan behind it that nothing renews and
+        nothing revokes.
+
+        The response carries the **effective** scope, which may be narrower
+        than the request. Build the job around what came back, not around what
+        was sent: an agent pointed at a model its grant does not carry fails at
+        its first call.
+      security:
+        - dispatchToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id, external_job_id, external_attempt_id]
+              properties:
+                user_id:
+                  type: string
+                  maxLength: 128
+                  description: The gateway user the capability belongs to.
+                external_job_id:
+                  type: string
+                  maxLength: 128
+                  description: The consumer's job id. Half the idempotency key.
+                external_attempt_id:
+                  type: string
+                  maxLength: 128
+                  description: The consumer's attempt id. The other half.
+                allowed_models:
+                  type: [array, "null"]
+                  items: { type: string }
+                  description: |
+                    Clamped to what the user's role can reach. `null` means
+                    "everything this role can reach".
+                allowed_mcp:
+                  type: [array, "null"]
+                  items: { type: string }
+                  description: |
+                    **Validated, not clamped** — an unknown name refuses the
+                    whole mint. `null` means the deployment's default servers.
+                ttl_seconds:
+                  type: [integer, "null"]
+                  description: |
+                    Clamped to 900. `null` means 300. **The clamp is silent**,
+                    so read `expires_at` rather than assuming what was asked
+                    for — a consumer sizing its renewal cadence against the
+                    number it sent will lose a capability mid-run.
+      responses:
+        "200":
+          description: The effective grant, with its bearer token.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Grant"
+                  - type: object
+                    required: [token]
+                    properties:
+                      token:
+                        type: string
+                        description: |
+                          The `agr.`-prefixed HMAC bearer token. **Returned
+                          only here** — renew does not re-issue it, because the
+                          caller already has it and a token that travels twice
+                          is a token logged twice. This is the only credential
+                          that enters a sandbox.
+        "400":
+          description: An MCP server that this deployment does not offer.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error: { type: unknown_mcp_server, message: "unknown MCP server(s): ghost" }
+        "401":
+          description: Wrong or missing dispatch token.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error: { type: unauthorized, message: Invalid dispatch token. }
+        "403":
+          description: |
+            The subject is unknown or not active. **One message for both**:
+            whether a given user id exists is not something an internal caller
+            needs, and answering differently enumerates accounts.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error:
+                  type: subject_unavailable
+                  message: That user cannot be granted capability.
+        "404":
+          description: |
+            This deployment does not expose internal capability endpoints (no
+            dispatch token set), or has no user database.
+
+            **404 rather than 401 for the unconfigured case**: "this gateway
+            does not federate capability" and "you got the password wrong" are
+            different facts, and an unconfigured deployment should not look
+            like a guarded one.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error:
+                  type: internal_api_not_configured
+                  message: This deployment does not expose internal capability endpoints.
+
+  /internal/agent-grants/{grant_id}/renew:
+    post:
+      tags: [internal]
+      operationId: renewGrant
+      summary: Extend a live grant by one step
+      description: |
+        Buys the gateway's own renewal step **from now**, whatever was asked
+        for at mint. After the first renewal it is that number, not the
+        consumer's, that its cadence has to stay inside.
+
+        The subject is re-checked on every renewal: a user suspended mid-job
+        must stop being able to spend, and renewal is the only recurring moment
+        the gateway gets to notice.
+
+        Carries no token: the caller already has it.
+      security:
+        - dispatchToken: []
+      parameters:
+        - $ref: "#/components/parameters/GrantId"
+      responses:
+        "200":
+          description: The renewed grant.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Grant" }
+        "401":
+          description: Wrong or missing dispatch token.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          description: |
+            The subject was suspended since the grant was minted.
+            **A verdict on this grant** — a consumer may stop the attempt on it.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error:
+                  type: subject_unavailable
+                  message: That user cannot be granted capability.
+        "404":
+          description: |
+            Three different facts share this status, and a consumer that reacts
+            destructively **must branch on `error.type`, not on the 404**:
+
+            * `unknown_grant` / `grant_not_live` — a verdict on this grant. It
+              is gone, revoked, or expired past renewal.
+            * `internal_api_not_configured` — a verdict on the *gateway's*
+              configuration, and true of every grant at once. Treating it as
+              the first would abandon an entire fleet of running attempts over
+              one unset environment variable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error:
+                  type: grant_not_live
+                  message: That grant is revoked or expired and cannot be renewed.
+
+  /internal/agent-grants/{grant_id}/revoke:
+    post:
+      tags: [internal]
+      operationId: revokeGrant
+      summary: Withdraw a grant now rather than at its TTL
+      description: |
+        An acceleration of the expiry, never the mechanism. A consumer that
+        cannot reach the gateway to revoke has lost lateness, not safety — the
+        TTL still retires the capability — which is why the reference consumer
+        reports a failed revoke rather than raising, and keeps no retry queue
+        for it.
+
+        Idempotent: revoking twice is not an error, and the second call says so.
+      security:
+        - dispatchToken: []
+      parameters:
+        - $ref: "#/components/parameters/GrantId"
+      responses:
+        "200":
+          description: The grant is revoked, whether or not this call did it.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [grant_id, revoked, already_revoked]
+                properties:
+                  grant_id: { type: string }
+                  revoked: { type: boolean, const: true }
+                  already_revoked:
+                    type: boolean
+                    description: True when a previous call had already done it.
+        "401":
+          description: Wrong or missing dispatch token.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: No such grant, or internal endpoints are not configured.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /internal/agent-grants/{grant_id}/usage:
+    get:
+      tags: [internal]
+      operationId: grantUsage
+      summary: What the grant's job has spent so far
+      description: |
+        **Informational attribution, not a limit.** Nothing consults this to
+        decide whether a call may proceed — that is the account's daily quota.
+        Reading it as a ceiling would reintroduce the per-job budget this
+        design removed, and would do so in a component that cannot enforce one.
+
+        Numbers come from the gateway's billing ledger, keyed by the grant's
+        `external_job_id`, so they are what was actually billed rather than
+        anything an agent reports about itself.
+
+        **Nothing in this repository calls it yet.** It is described because
+        C7 shipped it and because the job-cost display it exists for is
+        expected to land here; a reader should not infer from its presence
+        that a consumer is wired. `grants.py` has no `usage` method.
+      security:
+        - dispatchToken: []
+      parameters:
+        - $ref: "#/components/parameters/GrantId"
+      responses:
+        "200":
+          description: Spend and token totals for the grant's job.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  [grant_id, external_job_id, spent_usd, request_count, tokens_in, tokens_out]
+                properties:
+                  grant_id: { type: string }
+                  external_job_id: { type: string }
+                  spent_usd: { type: number }
+                  request_count: { type: integer }
+                  tokens_in: { type: integer }
+                  tokens_out: { type: integer }
+        "401":
+          description: Wrong or missing dispatch token.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: No such grant, or internal endpoints are not configured.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: |
+            No billing ledger is available. **Not an empty report** — "this job
+            spent nothing" is a different and much more reassuring claim than
+            "we cannot tell".
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error:
+                  type: ledger_unavailable
+                  message: Usage cannot be reported right now.
+
+components:
+  parameters:
+    GrantId:
+      name: grant_id
+      in: path
+      required: true
+      schema: { type: string }
+
+  securitySchemes:
+    dispatchToken:
+      type: http
+      scheme: bearer
+      description: |
+        `GATEWAY_GRANT_DISPATCH_TOKEN`, shared between the gateway and the
+        control plane and compared in constant time. A **service** credential:
+        it travels on this path only, and never toward a sandbox or a browser.
+
+        A deployment that has not set it offers no internal endpoints at all
+        and answers 404 to every path in this document.
+
+  schemas:
+    Grant:
+      type: object
+      required:
+        - grant_id
+        - user_id
+        - external_job_id
+        - external_attempt_id
+        - allowed_models
+        - allowed_mcp
+        - expires_at
+        - revoked_at
+      properties:
+        grant_id: { type: string }
+        user_id: { type: string }
+        external_job_id: { type: string }
+        external_attempt_id: { type: string }
+        allowed_models:
+          type: array
+          items: { type: string }
+          description: The **effective** models, after the role clamp.
+        allowed_mcp:
+          type: array
+          items: { type: string }
+          description: The resolved MCP servers.
+        expires_at:
+          type: string
+          format: date-time
+          description: |
+            The effective expiry after the TTL clamp. **The number to size a
+            renewal cadence against**, since a requested TTL above the maximum
+            is shortened without saying so.
+        revoked_at:
+          type: [string, "null"]
+          format: date-time
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [type, message]
+          properties:
+            type:
+              type: string
+              description: |
+                Machine-readable, and **the field to branch on**. Statuses here
+                are overloaded across causes — see the 404 on `/renew`.
+            message: { type: string }
+
+x-constants:
+  DEFAULT_GRANT_TTL_S: 300
+  MAX_GRANT_TTL_S: 900
+  token_prefix: "agr."
+  signing_context: "agent-inference-grant:v1"
+
+x-pinned-by:
+  gateway:
+    - tests/unit/test_agent_grants.py
+    - tests/unit/test_grant_model_auth.py
+    - tests/servers/test_agent_mcp_api.py
+  consumer:
+    - tests/unit/test_grant_client.py
+    - tests/unit/test_grant_lifecycle.py
+    - tests/servers/test_grant_at_claim.py
+    - tests/integration/storage/test_agent_grant_store.py

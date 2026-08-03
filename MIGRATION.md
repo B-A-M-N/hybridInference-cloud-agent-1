@@ -379,6 +379,30 @@ claimed, rather than either happening unauthorized.
 
 The paths were verified to match the gateway PRs exactly, not merely by name.
 
+**Those endpoints are now written down** — `contracts/`, task C8: three OpenAPI
+documents covering identity (C1–C3), inference grants (C5–C7) and the internal
+lookups (C9), hand-written from the gateway routers rather than generated from
+a running gateway, because the value of a contract is that it says what was
+*agreed*, so a gateway that stops honouring it produces a visible disagreement
+rather than a client that quietly breaks.
+
+Each document names the branch and files it was written from in `info.x-source`,
+because none of them had merged when they were written. **When those branches
+land, re-verify each document against the merge commit** — a review can change a
+contract, and these describe the version proposed rather than the version
+accepted.
+
+`tests/unit/test_contracts.py` goes past C8's stated acceptance ("YAMLs lint").
+It also checks every cited consumer test exists — two plausible-looking test
+paths were cited while writing these and neither existed, and an unfollowable
+citation reads as verification that did not happen — and that **every
+`/internal/` or `/v1/` path literal in `gateway.py` and `grants.py` appears in
+some document**, read out of the clients' own source rather than a hand-kept
+list. That last one catches the quiet failure: a gateway call added later with
+no contract, so the dependency exists in code and nowhere in the record. All six
+calls the service makes today are covered. `/internal/agent-grants/{id}/usage`
+is described but **called by nothing here**, and says so in its own description.
+
 ## Review findings
 
 Successive adversarial reviews of E7-E10 and F/G/H raised these. They are
