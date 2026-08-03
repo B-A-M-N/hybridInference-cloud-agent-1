@@ -86,6 +86,8 @@ forgotten.
 | The `model` token scope still exists in `tokens.py`, and is dead weight: it is signed by a root the gateway does not know, so it buys nothing. Kept so the moved tests run unmodified — which is what makes them evidence that re-keying changed nothing else. | **E9**: remove `SCOPE_MODEL` when the runner asks the gateway for a grant instead. | This row; `tests/unit/test_agent_job_tokens.py` still exercises both scopes, so deleting one fails loudly. |
 | Re-keying control tokens invalidates every token in flight. An attempt holding one signed by the gateway's root is an attempt from before the migration. | **H2** (cutover): drain running attempts before switching, rather than expecting them to survive. | This row. |
 
+| `apps/backend/serving/agent_jobs/patch_gate.py` | `move:host`, D4 | **shared** — host *and* control plane | At the freeze it is imported by `runner.py` and `workspace_snapshot.py` (host) **and** by `publisher.py`, `publish_worker.py` and the API router (control plane). E5 imports it from `cloud_agent_host`, which works in one repository but means a control-plane image must ship the host package. A shared third package is the eventual right answer; that is a deployment-layout decision, not something a migration task should make. Whoever writes `deploy/control-plane/` needs to know either way. |
+
 ## Discarded tests
 
 Migration moves test files whole. When an artifact is *rewritten* instead of
@@ -108,6 +110,8 @@ Replaced by `tests/unit/test_agent_visible_models.py` and
 `tests/unit/test_gateway_client.py`, which test what this service can now get
 wrong: faithfully reporting what the gateway said, and **failing closed** when
 it cannot answer.
+
+| Source-control credentials are encrypted with `AGENT_SOURCE_CONTROL_ENCRYPTION_KEY`, not the gateway-derived key they were written under. | **H1**: migrating `agent_repo_grants` and `agent_gitlab_connections` is a decrypt-with-old, encrypt-with-new step. Copying ciphertext yields a connection that looks present and fails at first use. | This row; `ENV_ENCRYPTION_KEY`'s docstring in `source_control.py`. |
 
 ## Open decisions
 
@@ -243,6 +247,7 @@ about *inference*, not about *agents*:
 | D | D3+D4 — workspace setup/paths/snapshot + patch gate | ✅ merged; D3 acceptance pending D6 | this repo #3; one PR because `workspace_snapshot` imports `patch_gate`; snapshot tests are owned by D6 above |
 | D | D5 — workspace broker + browser | 🔍 in review | this repo #4; `terminal_coordination` reclassified to Phase E (see manifest corrections) |
 | D | D6 — runner + broker client (+ logging entrypoint) | 🔍 in review | this repo #5, stacked on #4; closes both D6 register rows; D3's pending acceptance resolves here |
+| E | E5 — source control + publishing | 🔍 in review | this repo #10, stacked on #9; cipher re-keyed to `AGENT_SOURCE_CONTROL_ENCRYPTION_KEY` |
 | E | E4 — visible models over HTTP | 🔍 in review | this repo #9, stacked on #8; **rewritten, not moved** — see the discarded-test record below |
 | E | E2+E3 — schemas, entitlement, control tokens (re-keyed) | 🔍 in review | this repo #8, stacked on #7; `AGENT_CONTROL_TOKEN_SECRET` replaces the gateway's root |
 | E | E1 — store + Alembic baseline | 🔍 in review | this repo #7, stacked on #6; `initialize()` becomes a no-op, schema **and its five startup backfills** move to `0001_baseline` |
