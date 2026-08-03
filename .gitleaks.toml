@@ -1,0 +1,25 @@
+# Secret-scanning config. Carried over from HybridInference, narrowed to what
+# this repository actually needs.
+#
+# Division of labour: gitleaks runs its default rules over the tree AND the
+# history (secret-scan.yml), but test files are exempted wholesale below —
+# they legitimately carry credential-shaped fixtures, starting with the patch
+# gate's own detector tests. The gap that exemption opens is closed in the
+# repository's own language by tests/unit/test_no_committed_credentials.py,
+# which scans every tracked file for the credential formats this project and
+# its gateway actually issue, and exempts fixtures by literal value rather
+# than by directory.
+#
+# The source repo learned this layout the hard way: a wholesale exemption on
+# docs paths hid a live key for months. This file therefore exempts ONLY
+# tests/*.py. If docs with credential-shaped samples arrive, add the narrow
+# rule then — with the backstop extended first.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Test fixtures — intentionally credential-shaped values in test code, backstopped by test_no_committed_credentials.py."
+paths = [
+  '''^tests/.*\.py$''',
+]
