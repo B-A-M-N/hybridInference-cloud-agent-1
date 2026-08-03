@@ -78,6 +78,8 @@ forgotten.
 | Deferred | Owner | Tripwire |
 |---|---|---|
 | Host logging is unconfigured. The source's `get_logger` initialised root logging as a side effect; the shim (`host/cloud_agent_host/logging_utils.py`) deliberately does not, so INFO events from host modules (e.g. `agent_sandbox_spawn`) go nowhere until an entrypoint configures logging. | **D6** (runner move): acceptance includes entrypoint logging configuration **and a test that a host module INFO event reaches a handler**. | `tests/unit/test_logging_utils.py` pins the shim's no-side-effects contract; this row. |
+| `workspace_snapshot.py` moved in D3 **without its test file**: `test_agent_workspace_snapshot.py` imports `runner` (D6's module) and exercises the snapshot–runner integration, and tests move unmodified. Until D6, the module is lint-checked but not executed here. | **D6**: move `test_agent_workspace_snapshot.py` with the runner and count it in the ported-tests tally. | This row; D6's acceptance lists the file. |
+| `workspace_paths.py` moved in D3 without dedicated coverage: its tests live inside `test_agent_workspace_broker.py` (D5). | **D5**: the broker test file covers it on arrival. | This row. |
 
 ## Upstream provenance
 
@@ -127,8 +129,9 @@ about *inference*, not about *agents*:
 | C | C4 — /authorize consent page | ✅ merged | upstream #1179 |
 | C | C5–C8 — inference grants, usage, contracts | ⏳ not started | needs Murphy design review |
 | D | D1 — host package skeleton | ✅ done | landed with the B1 scaffold |
-| D | D2 — sandbox, runtimes, egress (+proxy) | 🔍 in review | this repo #2 |
-| D3–H | remaining moves, web, host pool, cutover | ⏳ not started | — |
+| D | D2 — sandbox, runtimes, egress (+proxy) | ✅ merged | this repo #2 |
+| D | D3+D4 — workspace setup/paths/snapshot + patch gate | 🔍 in review | this repo #3; one PR because `workspace_snapshot` imports `patch_gate` |
+| D5–H | remaining moves, web, host pool, cutover | ⏳ not started | — |
 
 Update this table as tasks land. It is the answer to "what is actually done" —
 the plan describes intent, this describes reality.
