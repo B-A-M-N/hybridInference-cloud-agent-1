@@ -38,8 +38,9 @@ Do not start until every one of these is true.
       `AGENT_SOURCE_CONTROL_ENCRYPTION_KEY` (**generated once, kept for good** —
       regenerating it after the migration orphans every credential this runbook
       re-encrypts).
-- [ ] The E11 smoke checklist passes against the new stack with a *fresh*
-      connection, i.e. before any migrated row is involved.
+- [ ] The E11 smoke checklist ([smoke.md](smoke.md)) passes against the new
+      stack with a *fresh* connection — i.e. before any migrated row is
+      involved.
 - [ ] The gateway's key material is available as a **file** on whatever machine
       runs step 5, and the machine has been decided (see
       [deploy/migrate/README.md](../deploy/migrate/README.md) § Where it runs).
@@ -224,8 +225,8 @@ something to fold in when the host half lands.
 
 ## 8. Smoke test
 
-Run the E11 checklist. At minimum, and in this order — each step is the
-precondition for the next:
+Run the E11 checklist ([smoke.md](smoke.md)). At minimum, and in this order —
+each step is the precondition for the next:
 
 - [ ] **A migrated connection still works.** Open Integrations as a user whose
       GitLab connection was migrated and list their projects. This is the
