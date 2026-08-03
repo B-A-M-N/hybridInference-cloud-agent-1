@@ -57,10 +57,13 @@ markers = [
 ]
 
 # Ruff config is inherited from HybridInference so that moved files pass
-# unchanged (migration rule: imports/paths only, never reformatting).
+# unchanged (migration rule: imports/paths only, never reformatting). That
+# includes target-version: py310 keeps the same rule set the source repo
+# checks these files with (py312 would enable e.g. UP042 against them).
+# Raise it after the migration completes, as its own PR.
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py310"
 src = ["backend", "host", "."]
 exclude = [
   ".venv",
@@ -125,5 +128,10 @@ dev = [
   "pytest-mock>=3.14.0",
   "pytest-timeout>=2.3.0",
   "pytest-xdist>=3.6.0",
-  "ruff>=0.5.0",
+  # Pinned, deliberately — the source repo's CI checks the files we migrate
+  # with this exact version, and "moved files pass unchanged" is only a
+  # meaningful acceptance criterion against a fixed formatter. Bump it as its
+  # own PR, never as a side effect of a migration task. (0.16 default-enables
+  # ISC004, which the migrated sandbox.py trips.)
+  "ruff==0.15.12",
 ]
