@@ -397,3 +397,81 @@ async def test_publishing_stops_when_the_entitlement_was_withdrawn(monkeypatch):
     assert minted == [], "no credential may be minted for a repo no longer entitled"
     assert store.failed is not None
     assert "entitled" in store.failed[1]
+
+
+@pytest.mark.parametrize(
+    ("payload", "why"),
+    [
+        ({}, "field absent"),
+        ({"html_url": ""}, "empty string"),
+        ({"html_url": "   "}, "whitespace"),
+        ({"html_url": None}, "null"),
+        ({"html_url": 7}, "not a string"),
+    ],
+)
+async def test_a_created_pr_with_no_usable_url_fails_instead_of_recording(
+    monkeypatch, payload, why
+):
+    """**A success this worker cannot record must not be recorded.**
+
+    GitHub answered 2xx, so the PR may well exist — but without a URL there is
+    nothing to hand the owner. The old code returned `""` and recorded it, which
+    set `published_pr_url` to empty: the job reads as published, and the query
+    this worker claims from selects on `published_pr_url IS NULL`, so it is
+    never retried. The owner gets no link, ever, and nothing anywhere says so.
+
+    Failing is recoverable — the job is retried and either succeeds or reports
+    a reason. Recording an empty URL is not.
+    """
+    store = FakeStore(dict(_JOB))
+    _patch_publish(
+        monkeypatch, PublishResult(branch="agent/ajob_1", commit_sha="s", changed_files=["x"])
+    )
+
+    async def _post(*_args, **_kwargs):
+        return httpx.Response(201, json=payload)
+
+    monkeypatch.setattr(publish_worker.httpx.AsyncClient, "post", _post)
+
+    await publish_one(store, credential=GitHubCredential("t"), base_branch="dev")
+
+    assert store.recorded is None, f"an unusable url was recorded ({why})"
+    assert store.failed is not None, f"the job was not failed ({why})"
+    assert "html_url" in store.failed[1]
+
+
+@pytest.mark.parametrize(
+    "base_ref",
+    ["deadbee-release", "abcdef1-release", "release/2026-01", "feature/abc1234"],
+)
+async def test_a_branch_name_that_merely_starts_like_a_sha_is_kept(monkeypatch, base_ref):
+    """A branch is only rejected when the *whole* name is a commit id.
+
+    These already passed before `fullmatch` — the pattern is anchored at both
+    ends, so `match` and `fullmatch` agree on every one of them. They are here
+    because the property is worth stating, not because they demonstrate the
+    change: the only input the two disagree on is one with a trailing newline,
+    which `.strip()` removes before either sees it.
+    """
+    store = FakeStore({**_JOB, "metadata": {"_agent_base_ref": base_ref}})
+    _patch_publish(
+        monkeypatch, PublishResult(branch="agent/ajob_1", commit_sha="s", changed_files=["x"])
+    )
+    captured = _patch_pr(monkeypatch)
+
+    await publish_one(store, credential=GitHubCredential("t"), base_branch="dev")
+
+    assert captured["base_branch"] == base_ref
+
+
+async def test_a_base_ref_that_is_only_a_commit_id_falls_back(monkeypatch):
+    """The case the check exists for: a commit cannot be a PR base."""
+    store = FakeStore({**_JOB, "metadata": {"_agent_base_ref": "abcdef1234567890"}})
+    _patch_publish(
+        monkeypatch, PublishResult(branch="agent/ajob_1", commit_sha="s", changed_files=["x"])
+    )
+    captured = _patch_pr(monkeypatch)
+
+    await publish_one(store, credential=GitHubCredential("t"), base_branch="dev")
+
+    assert captured["base_branch"] == "dev"

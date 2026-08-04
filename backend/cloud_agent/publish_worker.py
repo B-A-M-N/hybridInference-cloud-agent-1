@@ -56,6 +56,11 @@ _PUBLISH_SCOPE = {"contents": "write", "pull_requests": "write"}
 # A PR base has to be a branch. `base_ref` is normally one (the composer offers
 # a branch picker), but the API accepts any ref it can resolve, and a caller
 # who passed a commit would otherwise turn a publishable job into a 422.
+#
+# Matched with `fullmatch`. The anchors make it equivalent today, and that is
+# the point: `$` also matches before a trailing newline, so `match` would
+# accept `abcdef1\n` — reachable only if the `.strip()` above ever goes away.
+# A branch called `deadbee-release` is not affected either way.
 _LOOKS_LIKE_SHA = re.compile(r"^[0-9a-fA-F]{7,64}$")
 
 
@@ -78,7 +83,7 @@ def _pr_base_branch(job: dict[str, Any], fallback: str) -> str:
     if not isinstance(base_ref, str) or not base_ref.strip():
         return fallback
     base_ref = base_ref.strip()
-    if _LOOKS_LIKE_SHA.match(base_ref):
+    if _LOOKS_LIKE_SHA.fullmatch(base_ref):
         return fallback
     return base_ref
 
@@ -136,7 +141,17 @@ async def create_draft_pull_request(
         raise PublishError(
             f"GitHub refused the draft PR ({response.status_code}): {response.text[:300]}"
         )
-    return response.json().get("html_url", "")
+    url = response.json().get("html_url")
+    if not isinstance(url, str) or not url.strip():
+        # A 2xx with no usable URL is not a success this worker can record.
+        # Returning "" put an empty `published_pr_url` on the job, which marks
+        # it published — and the query this worker claims from selects on
+        # `published_pr_url IS NULL`, so the job would never be retried and the
+        # owner would never get a link. Failing is recoverable; that is not.
+        raise PublishError(
+            f"GitHub accepted the draft PR ({response.status_code}) but returned no html_url"
+        )
+    return url
 
 
 def _pr_body(job: dict[str, Any], changed_files: list[str]) -> str:
