@@ -641,7 +641,7 @@ topology this repository ships.
 | Variable | Notes |
 |---|---|
 | `AGENT_TUNNEL_SSH_DESTINATION` | `user@gateway-host`. The only address anything on this machine can reach through the tunnel |
-| `AGENT_TUNNEL_SSH_KEY` | Private key, mounted read-only. Give it its own key and restrict it on the gateway: `command="",restrict,permitopen="127.0.0.1:8080"` — a runner host needs one forwarded port, not a shell |
+| `AGENT_TUNNEL_SSH_KEY` | Private key, mounted read-only. Give it its own key and restrict it on the gateway: `command="",restrict,port-forwarding,permitopen="127.0.0.1:8080"` — a runner host needs one forwarded port, not a shell |
 | `AGENT_TUNNEL_SSH_KNOWN_HOSTS` | The gateway's host key. **Required**, and host checking is not disableable: an unverified hop would hand the dispatcher credential to whatever answers on that address, which is the attack encrypting it is meant to prevent |
 | `AGENT_TUNNEL_REMOTE_PORT` / `_HOST` | Where the gateway listens *on its own machine*; `127.0.0.1:8080` by default |
 | `AGENT_GATEWAY_HOSTNAME` | The name both the runner and the sandbox resolve the tunnel by, `agent-gateway` by default. **Do not override `AGENT_GATEWAY_URL` with the gateway's real address:** the runner would reach it and the sandbox, on the closed network, would not — jobs would be claimed and then die at their first model call |

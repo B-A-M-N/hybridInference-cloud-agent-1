@@ -180,7 +180,13 @@ def test_something_answers_on_the_sandbox_network(compose: dict):
         for name, svc in compose["services"].items()
         if "agent-egress" in (svc.get("networks") or {})
     }
-    assert on_egress == {"agent-gateway-tunnel"}
+    # **Exactly these two, named.** The sandbox has two narrow destinations
+    # now — the gateway for model calls, the relay for tools — and this is the
+    # assertion that keeps "narrow" true. Loosening it to "at least one" or "a
+    # non-empty set" is the natural way to make it pass after adding a service,
+    # and it would let the next addition put anything at all on the closed
+    # network without a word.
+    assert on_egress == {"agent-gateway-tunnel", "agent-mcp-tunnel"}
 
 
 def test_the_gateway_name_resolves_on_every_network_that_is_given_it(compose: dict):
@@ -1019,6 +1025,7 @@ def test_remote_compose_starts_no_gateway(remote_compose: dict):
     """
     assert set(remote_compose["services"]) == {
         "agent-gateway-tunnel",
+        "agent-mcp-tunnel",
         "agent-workspace-broker",
         "agent-runner",
     }
@@ -1031,14 +1038,21 @@ def test_remote_sandbox_network_is_still_closed(remote_compose: dict):
     assert remote_compose["networks"]["agent-egress"]["internal"] is True
 
 
-def test_the_tunnel_is_the_only_thing_on_both_networks(remote_compose: dict):
-    """Everything else is either closed in with the sandbox or outside it."""
+def test_only_the_two_relays_are_on_both_networks(remote_compose: dict):
+    """Everything else is either closed in with the sandbox or outside it.
+
+    Two now, not one: MCP moved to the cloud agent's own relay, so a sandbox
+    has two narrow destinations — the gateway for model calls, the relay for
+    tools. Named exactly, because the natural way to make this pass after
+    adding a service is to loosen it to "at least one", and that would let the
+    next addition sit on the closed network without a word.
+    """
     on_egress = {
         name
         for name, service in remote_compose["services"].items()
         if "agent-egress" in (service.get("networks") or {})
     }
-    assert on_egress == {"agent-gateway-tunnel"}
+    assert on_egress == {"agent-gateway-tunnel", "agent-mcp-tunnel"}
 
 
 def test_runner_and_sandbox_are_pointed_at_the_same_name(remote_compose: dict):
