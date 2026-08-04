@@ -440,7 +440,27 @@ class WorkerClaimResponse(BaseModel):
     worker_token: str
     sandbox_token: str = Field(
         "",
-        description="Model-scoped credential; the only one that enters the sandbox.",
+        description=(
+            "The inference credential that enters the sandbox: a gateway grant, "
+            "scoped to the models this attempt may call."
+        ),
+    )
+    mcp_token: str = Field(
+        "",
+        description=(
+            "The sandbox's *second* credential, for this service's MCP relay. "
+            "Scoped `mcp`, so it opens the relay and nothing else — not the "
+            "worker surface, and not the gateway. Empty when this deployment "
+            "serves no MCP."
+        ),
+    )
+    mcp_base_url: str = Field(
+        "",
+        description=(
+            "The relay as the sandbox reaches it. Empty means no MCP for this "
+            "run, which a runtime treats as a refusal rather than resolving "
+            "servers against the inference address."
+        ),
     )
     clone_token: str | None = Field(
         None,
