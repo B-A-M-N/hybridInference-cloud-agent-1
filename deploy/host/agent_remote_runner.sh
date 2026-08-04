@@ -31,7 +31,7 @@
 # Restrict the tunnel key on the gateway host — it needs one forwarded port and
 # no shell:
 #
-#   command="",restrict,permitopen="127.0.0.1:8080" ssh-ed25519 AAAA... agent-tunnel
+#   command="",restrict,port-forwarding,permitopen="127.0.0.1:8080" ssh-ed25519 AAAA... agent-tunnel
 
 set -Eeuo pipefail
 
@@ -142,11 +142,18 @@ cmd_up() {
   # tunnel, so a tunnel that came up without a working upstream fails here
   # rather than one job at a time. Give it a moment and surface the verdict.
   sleep 5
-  # In a subshell: `die` calls `exit`, which from a function ends the whole
-  # script — so `|| true` cannot catch it, and a failed probe would skip the
-  # runner logs that explain why it failed.
-  ( cmd_check ) || true
+  # In a subshell, because `die` calls `exit` and from a function that ends the
+  # whole script — the logs below are exactly what explains a failed probe, so
+  # they must still print. But the verdict is kept: swallowing it printed the
+  # tunnel diagnosis, then "done", and an operator reads the last line.
+  local probe_ok=0
+  ( cmd_check ) || probe_ok=$?
   "${COMPOSE[@]}" logs --tail 20 agent-runner
+  if [[ "$probe_ok" -ne 0 ]]; then
+    die "the runners are up but a sandbox cannot reach the gateway through the
+     tunnel (see the probe output above). Jobs will claim and then fail at
+     their first model call. Fix the tunnel, then re-run 'check'."
+  fi
   log "done. 'deploy/host/agent_remote_runner.sh status' shows the live tail."
 }
 

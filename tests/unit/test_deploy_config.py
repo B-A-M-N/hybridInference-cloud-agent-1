@@ -22,9 +22,8 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
 
 from cloud_agent_host.runner import build_parser
 
-_COMPOSE = (
-    Path(__file__).resolve().parents[2] / "deploy/host/docker-compose.agent-remote-runner.yml"
-)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+_COMPOSE = REPO_ROOT / "deploy/host/docker-compose.agent-remote-runner.yml"
 _DOCKERFILE = Path(__file__).resolve().parents[2] / "deploy/sandbox/Dockerfile.agent-sandbox"
 _CODEX_REQUIREMENTS = Path(__file__).resolve().parents[2] / "deploy/sandbox/codex-requirements.toml"
 
@@ -182,6 +181,99 @@ def test_something_answers_on_the_sandbox_network(compose: dict):
         if "agent-egress" in (svc.get("networks") or {})
     }
     assert on_egress == {"agent-gateway-tunnel"}
+
+
+def test_the_gateway_name_resolves_on_every_network_that_is_given_it(compose: dict):
+    """**The name is handed to two services on two different networks.**
+
+    The runner sits on `hybridinference` and the sandbox on `agent-egress`, and
+    both are handed the same `AGENT_GATEWAY_URL`. A Docker network alias is
+    per-network, so declaring it on one resolves for one of them and NXDOMAINs
+    for the other — the runner claims a job and then cannot reach the gateway
+    to report a single event.
+
+    Caught in review: the alias was on `agent-egress` only, while the comment
+    above it already claimed both. Nothing here compared the name a service is
+    *given* against the networks it can resolve it on, so both halves looked
+    right in isolation.
+    """
+    tunnel = compose["services"]["agent-gateway-tunnel"]
+    hostname = "${AGENT_GATEWAY_HOSTNAME:-agent-gateway}"
+
+    # Which networks can resolve the name.
+    resolves_on = {
+        network
+        for network, config in (tunnel.get("networks") or {}).items()
+        if hostname in ((config or {}).get("aliases") or [])
+    }
+
+    # Which networks a service that was handed the name actually sits on.
+    needs_it: set[str] = set()
+    for svc in compose["services"].values():
+        env = svc.get("environment") or {}
+        if not any(hostname in str(value) for value in env.values()):
+            continue
+        networks = svc.get("networks")
+        needs_it.update(networks if isinstance(networks, list) else (networks or {}).keys())
+
+    # The sandbox is not a compose service — the runner starts it on the egress
+    # network and passes the same URL down, so that network counts too.
+    needs_it.add(
+        compose["services"]["agent-runner"]["environment"]["AGENT_EGRESS_NETWORK_PLATFORM_ONLY"]
+        .split(":-")[-1]
+        .rstrip("}")
+    )
+
+    unresolvable = sorted(needs_it - resolves_on - {"agent-egress"})
+    assert not unresolvable, (
+        f"services on {unresolvable} are given {hostname} but cannot resolve it; "
+        f"the alias is declared only on {sorted(resolves_on)}"
+    )
+    assert "agent-egress" in resolves_on, "the sandbox network cannot resolve the gateway name"
+
+
+def test_the_tunnel_key_is_allowed_the_one_thing_it_exists_to_do(compose: dict):
+    """`restrict` disables port forwarding, and `permitopen` does not re-enable it.
+
+    The documented authorized_keys line is the whole security model for this
+    credential: one forwarded port, no shell. Written as `restrict,permitopen=`
+    it is not a tight rule — it is a *broken* one, and the tunnel simply never
+    comes up, which reads as a network problem rather than a typo in a doc.
+    """
+    # Whichever of these the branch has. `docs/operations.md` arrives later in
+    # the migration; a test that assumed the whole stack was present would fail
+    # on the very branch that owns the script.
+    candidates = [
+        REPO_ROOT / "deploy/host/agent_remote_runner.sh",
+        REPO_ROOT / "docs/operations.md",
+    ]
+    checked = 0
+    for path in (candidate for candidate in candidates if candidate.exists()):
+        rel = path.relative_to(REPO_ROOT)
+        for line in path.read_text().splitlines():
+            if "permitopen" not in line or "restrict" not in line:
+                continue
+            checked += 1
+            assert "port-forwarding" in line, (
+                f"{rel} documents `restrict` with `permitopen` and no "
+                "`port-forwarding`; ssh will refuse the forward this key exists for"
+            )
+    assert checked, "no authorized_keys example was found to check"
+
+
+def test_a_failed_tunnel_probe_is_not_reported_as_a_successful_start() -> None:
+    """`up` must not print "done" after the probe said a sandbox cannot reach
+    the gateway.
+
+    The subshell is deliberate — `die` exits, and the runner logs below it are
+    what explain the failure — but discarding its status meant the diagnosis
+    scrolled past and the last line said the deploy worked.
+    """
+    script = (REPO_ROOT / "deploy/host/agent_remote_runner.sh").read_text()
+    assert "( cmd_check ) || true" not in script, (
+        "the tunnel probe's verdict is discarded; a failed check still reports success"
+    )
+    assert "probe_ok" in script
 
 
 def test_job_worktrees_are_a_host_path_at_the_same_path_inside(compose: dict):
@@ -908,9 +1000,7 @@ def test_runner_derives_a_distinct_worker_id_per_container(monkeypatch):
 
 # ── Remote runner host (no gateway on this machine) ────────────────────
 
-_REMOTE_COMPOSE = (
-    Path(__file__).resolve().parents[2] / "deploy/host/docker-compose.agent-remote-runner.yml"
-)
+_REMOTE_COMPOSE = REPO_ROOT / "deploy/host/docker-compose.agent-remote-runner.yml"
 _TUNNEL_ENTRYPOINT = Path(__file__).resolve().parents[2] / "deploy/host/agent-gateway-tunnel.sh"
 
 

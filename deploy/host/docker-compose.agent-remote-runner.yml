@@ -44,7 +44,15 @@ services:
       - ${AGENT_TUNNEL_SSH_KEY:?path to the tunnel's ssh private key}:/etc/agent-tunnel/id:ro
       - ${AGENT_TUNNEL_SSH_KNOWN_HOSTS:?path to a known_hosts for the gateway host}:/etc/agent-tunnel/known_hosts:ro
     networks:
+      # The alias is declared on BOTH networks, and it has to be. The runner is
+      # only on `hybridinference` and is handed AGENT_GATEWAY_URL pointing at
+      # this name; the sandbox is only on `agent-egress` and is handed the same
+      # value. An alias on one network resolves for one of them and NXDOMAINs
+      # for the other — which is what this file did until it was caught in
+      # review, while the comment above already claimed both.
       hybridinference:
+        aliases:
+          - ${AGENT_GATEWAY_HOSTNAME:-agent-gateway}
       # On the closed network too — that is the whole trick. The sandbox can
       # reach this container and nothing else, exactly as it reaches a local
       # gateway and nothing else.
