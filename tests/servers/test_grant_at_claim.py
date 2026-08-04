@@ -181,7 +181,10 @@ async def test_the_grant_is_scoped_to_the_job(claim):
             "job_id": _JOB,
             "attempt_id": _ATTEMPT,
             "models": ["glm-5.1"],
-            "mcp_servers": ["docs"],
+            # No MCP scope. The claim still resolves servers for the sandbox —
+            # that is `mcp_servers` on the claim response — but it is not
+            # something the gateway is asked to scope, and this assertion said
+            # it was right up until the request stopped carrying it.
         }
     ]
 
