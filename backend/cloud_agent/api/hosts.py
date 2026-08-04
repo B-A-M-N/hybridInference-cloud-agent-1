@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, Depends, Header, HTTPException
 
 from cloud_agent.api.deps import get_agent_job_store
+from cloud_agent.broker_routing import BrokerUrlRefused, validate_broker_url
 from cloud_agent.host_pool import (
     HEARTBEAT_INTERVAL_S,
     hash_secret,
@@ -110,6 +111,24 @@ async def authenticate_host(
     return host
 
 
+def _checked_broker_url(url: str | None) -> str | None:
+    """Refuse a broker address this deployment will not send its token to.
+
+    The control plane sends the pool's shared workspace-broker token to
+    whatever address a host reports, so accepting one is handing over a
+    credential good for every broker in the pool. Refused with a 400 rather
+    than dropped: a host whose address was silently ignored looks enrolled and
+    then never serves a workspace.
+    """
+    try:
+        return validate_broker_url(url)
+    except BrokerUrlRefused as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"type": "invalid_broker_url", "message": str(exc)}},
+        ) from exc
+
+
 @router.post("/register", response_model=HostRegisterResponse)
 async def register_host(
     body: HostRegisterRequest,
@@ -158,7 +177,7 @@ async def register_host(
         credential_hash=hash_secret(credential),
         capabilities=body.capabilities,
         slots_total=body.slots_total,
-        broker_url=body.broker_url,
+        broker_url=_checked_broker_url(body.broker_url),
         runner_version=body.runner_version,
         labels=dict(body.labels),
     )
@@ -184,7 +203,7 @@ async def heartbeat_host(
         host=host["host"],
         slots_total=body.slots_total,
         runner_version=body.runner_version,
-        broker_url=body.broker_url,
+        broker_url=_checked_broker_url(body.broker_url),
         capabilities=body.capabilities,
     )
     if updated is None:

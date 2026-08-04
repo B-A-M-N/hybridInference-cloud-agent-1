@@ -100,6 +100,10 @@ DEAD_GRANT_REFUSALS = frozenset({"unknown_grant", "grant_not_live", "subject_una
 #: discovering its token dead mid-call. ``test_grant_lifecycle.py`` pins that.
 GRANT_RENEWAL_GIVE_UP_AFTER = 3
 
+#: Rows one renewal pass will take. Matches the store's own default; named
+#: here so the truncation warning cannot drift from the query's limit.
+GRANT_RENEWAL_PAGE = 200
+
 
 async def _reconcile_settled_terminals(store: AgentJobStore) -> None:
     """Replay durable settled-terminal recovery markers after restarts.
@@ -223,7 +227,17 @@ async def _renew_live_grants(
             still live, so a finished job leaves nothing behind.
     """
     seen: set[str] = set()
-    for row in await store.list_renewable_grants():
+    renewable = await store.list_renewable_grants()
+    if len(renewable) >= GRANT_RENEWAL_PAGE:
+        # The pass was capped, so some live attempt was not renewed this time
+        # round. The ordering makes the window rotate, but a pool this size
+        # needs a bigger cap or a faster loop — and the failure it produces is
+        # a job dying at a model call, which points nowhere near here.
+        logger.warning(
+            "agent_grant_renewal_truncated",
+            extra={"event": "agent_grant_renewal_truncated", "count": len(renewable)},
+        )
+    for row in renewable:
         grant_id = row["grant_id"]
         seen.add(grant_id)
         try:

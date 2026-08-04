@@ -24,6 +24,11 @@ from httpx import ASGITransport, AsyncClient
 
 from cloud_agent.api import admin_hosts, hosts
 from cloud_agent.api.deps import get_agent_job_store, verify_admin_access
+from cloud_agent.broker_routing import (
+    ENV_BROKER_HOSTS,
+    BrokerUrlRefused,
+    validate_broker_url,
+)
 from cloud_agent.host_pool import (
     HOST_DISABLED,
     HOST_DRAINING,
@@ -826,3 +831,37 @@ def test_a_row_without_any_pool_columns_still_renders(row):
     assert item.enrolled is False
     assert item.slots_used == 0
     assert item.slots_total is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["file:///etc/passwd", "gopher://x/", "not-a-url", "ftp://host-a/"],
+)
+def test_a_broker_url_that_is_not_http_is_refused(url: str) -> None:
+    """**The control plane sends the pool's shared token to this address.**
+
+    A host proposes its own broker URL and nothing checked it, so a compromised
+    host — or one with a typo — could name anything and be handed a credential
+    good for *every* broker in the pool. The scheme check is the structural
+    half: a `file:` URL is not a broker, and the client would do something
+    surprising with it.
+    """
+    with pytest.raises(BrokerUrlRefused):
+        validate_broker_url(url)
+
+
+def test_an_allowlist_confines_the_pool_to_named_machines(monkeypatch) -> None:
+    """Names, not patterns: a pattern is a thing to get subtly wrong, and the
+    set of machines in a pool is small and known.
+
+    Opt-in, because turning it on is a deployment's decision — unconfigured
+    behaves as it did, which is what keeps an upgrade from breaking every
+    existing pool.
+    """
+    monkeypatch.setenv(ENV_BROKER_HOSTS, "host-a,host-b")
+    assert validate_broker_url("http://host-b:8081") == "http://host-b:8081"
+    with pytest.raises(BrokerUrlRefused):
+        validate_broker_url("http://attacker.example:8081")
+
+    monkeypatch.delenv(ENV_BROKER_HOSTS)
+    assert validate_broker_url("http://anything:8081") == "http://anything:8081"
