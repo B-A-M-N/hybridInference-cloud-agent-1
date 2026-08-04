@@ -51,6 +51,19 @@ Do not start until every one of these is true.
 - [ ] Rollback (§ Rollback below) has been walked once on staging: flip back,
       confirm the old stack serves, flip forward again.
 
+### Check the gateway before scheduling anything
+
+    python deploy/preflight/check_gateway.py https://staging.freeinference.org
+
+Read-only — it fetches JWKS and reads a catalog, mints nothing. Exports
+`GATEWAY_GRANT_DISPATCH_TOKEN` first and it exercises the authorized path too;
+the token is read from the environment and never from `argv`, which is
+readable by every process on the host. Exit code is 0 only when everything
+passes, so it can gate a deploy step.
+
+It exists because all four preconditions fail as a 404 today, and reading the
+status code alone is how the routing gap was first misdiagnosed here.
+
 ### Blockers to check before scheduling
 
 Each will make the cutover fail in a specific, non-obvious way if it has not
@@ -60,7 +73,7 @@ blocker that vanishes without a record reads as one that was never real.
 | Blocker | Where | Why it stops this runbook |
 |---|---|---|
 | **Neither gateway has identity configured.** `GET /v1/identity/jwks` answers `identity_not_configured` on **both** `freeinference.org` and `staging.freeinference.org` (checked 2026-08-04). The code is deployed — that 404 is the "no key configured" answer, deliberately distinct from the 500 a broken key gives — but `IDENTITY_JWT_PRIVATE_KEY` is unset. | The gateway's own environment | **Step 3 cannot start.** Sign-in is the first thing the smoke does and the whole session flow hangs off it. Needs an RSA key generated *on the host* (`openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048`) in `IDENTITY_JWT_PRIVATE_KEY`, plus `IDENTITY_ALLOWED_REDIRECTS` containing this service's callback — matched exactly, not by prefix. |
-| **`GATEWAY_GRANT_DISPATCH_TOKEN` needs setting — status unverified.** The `/internal/*` routes answer 404, but the body is the **frontend's HTML 404**, not the gateway's JSON, so the probe reached the web app and never the API. It shows only that these paths are not routed to the backend at whatever fronts these domains; it does *not* show the dispatch token is unset. Check on the host. | Both sides' environments | Every lookup and every mint fails closed, so no models resolve and job creation is refused. The same random value (`openssl rand -hex 32`) must be set on the gateway *and* this service, and must differ between staging and production — one value shared across both makes a staging compromise a production one. |
+| **`GATEWAY_GRANT_DISPATCH_TOKEN` needs setting — still unverified from outside.** The routing half of this is now resolved: the gateway's #1202 added the `/internal/*` rewrites, and as of 2026-08-05 `staging.freeinference.org` answers the gateway's **JSON** at `/internal/model-catalog` while production still answers the frontend's **HTML** — production deploys by manual dispatch and has not carried it yet. Whether a token is set on either host cannot be told from outside without holding one; `deploy/preflight/check_gateway.py` reports it in one call when run with the token. | Both sides' environments | Every lookup and every mint fails closed, so no models resolve and job creation is refused. The same random value (`openssl rand -hex 32`) must be set on the gateway *and* this service, and must differ between staging and production — one value shared across both makes a staging compromise a production one. |
 | **`AGENT_MCP_CONFIG` has no file yet.** | The control-plane host | Jobs run without tools. Copy the gateway's registry file rather than moving it: the gateway's own MCP route keeps serving already-running agents until H4 lands. |
 | ~~The runner sends control-plane calls and the sandbox's inference calls to one base URL~~ | ~~`runner.py` `TODO(E9)`~~ | ✅ **resolved** — the sandbox now carries two addresses and two credentials (`AGENT_GATEWAY_URL` + `agr`, `AGENT_SANDBOX_MCP_URL` + an `mcp`-scoped token), and a runtime asked for MCP with no relay address refuses rather than resolving it against the inference host. |
 | ~~Inference grants (C5–C8) are not on the gateway~~ | ~~unmerged #1180~~ | ✅ **resolved** — #1180 through #1183, #1191 and #1195 are all on the gateway's `dev`. |
