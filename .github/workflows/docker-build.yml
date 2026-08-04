@@ -1,0 +1,125 @@
+name: Docker Build
+
+# The acceptance check for the deploy files. Their diff is mostly path edits,
+# and a `COPY` naming a path from the source repo's layout fails at build time
+# on a runner host — long after review, in the one place nobody is watching.
+# Building both images here is what turns "the paths look right" into a fact.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'deploy/**'
+      - 'host/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      # Dockerfile.agent-runner COPYs it alongside pyproject/uv.lock, so
+      # deleting or renaming it breaks the build and nothing else would notice.
+      - 'README.md'
+      - '.github/workflows/docker-build.yml'
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'deploy/**'
+      - 'host/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      # Dockerfile.agent-runner COPYs it alongside pyproject/uv.lock, so
+      # deleting or renaming it breaks the build and nothing else would notice.
+      - 'README.md'
+      - '.github/workflows/docker-build.yml'
+
+concurrency:
+  group: docker-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.image.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - name: runner
+            dockerfile: deploy/host/Dockerfile.agent-runner
+          - name: sandbox
+            dockerfile: deploy/sandbox/Dockerfile.agent-sandbox
+          - name: egress-proxy
+            dockerfile: deploy/host/Dockerfile.agent-egress-proxy
+          - name: gateway-tunnel
+            dockerfile: deploy/host/Dockerfile.agent-gateway-tunnel
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build only — never push. These images carry no credentials and this
+      # repository publishes none; the point is that the build resolves.
+      - name: Build ${{ matrix.image.name }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.image.dockerfile }}
+          push: false
+          load: false
+          cache-from: type=gha,scope=${{ matrix.image.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
+
+  compose:
+    name: Compose resolves
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The images building proves the Dockerfiles; it says nothing about the
+      # file that wires them together. `config` is Compose's own parser: it
+      # resolves every interpolation, build context and service reference, so a
+      # variable that no longer exists or a dockerfile path that moved fails
+      # here rather than on a runner host at deploy time.
+      - name: Render the standalone stack
+        run: |
+          set -euo pipefail
+          # Values are placeholders — `config` never starts anything. They exist
+          # because the compose file requires them (`:?`), which is itself the
+          # behaviour being checked: a required variable that stopped being
+          # required would silently weaken the deployment.
+          cat > .env <<'ENVFILE'
+          AGENT_DISPATCHER_TOKEN=ci-placeholder-token
+          AGENT_SANDBOX_IMAGE=cloud-agent-sandbox:ci
+          AGENT_GATEWAY_URL=http://agent-gateway:8080
+          AGENT_TUNNEL_SSH_DESTINATION=ci@gateway.invalid
+          AGENT_TUNNEL_SSH_KEY=/dev/null
+          AGENT_TUNNEL_SSH_KNOWN_HOSTS=/dev/null
+          ENVFILE
+          docker compose \
+            -f deploy/host/docker-compose.agent-remote-runner.yml \
+            --env-file .env \
+            config > /tmp/rendered.yml
+          echo "--- rendered services ---"
+          docker compose -f /tmp/rendered.yml config --services
+
+      - name: The rendered stack keeps its security properties
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys, yaml
+          stack = yaml.safe_load(open("/tmp/rendered.yml"))
+          failures = []
+
+          egress = stack["networks"].get("agent-egress", {})
+          if not egress.get("internal"):
+              failures.append("agent-egress is not internal — the sandbox would have a route out")
+
+          for name, svc in stack["services"].items():
+              for mount in svc.get("volumes") or []:
+                  target = mount.get("target") if isinstance(mount, dict) else str(mount)
+                  ro = mount.get("read_only") if isinstance(mount, dict) else ":ro" in str(mount)
+                  if "docker.sock" in str(target) and not ro:
+                      failures.append(f"{name} mounts the docker socket writable")
+
+          if failures:
+              print("\n".join(failures)); sys.exit(1)
+          print("rendered stack: egress internal, docker socket read-only")
+          PY

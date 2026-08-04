@@ -81,6 +81,76 @@ forgotten.
 | ~~`workspace_snapshot.py` moved in D3 without its test file.~~ | ~~**D6**~~ ✅ closed — `test_agent_workspace_snapshot.py` moved with the runner, unmodified. | — |
 | ~~`workspace_paths.py` moved in D3 without dedicated coverage: its tests live inside `test_agent_workspace_broker.py` (D5).~~ | ~~**D5**~~ ✅ closed — the broker test file arrived in D5 and covers it. | — |
 
+## Open decisions
+
+Things a migration task surfaced that are **design calls, not mechanical
+moves**, and so were deliberately not decided by the task that found them.
+
+### The co-located runner overlay (found in D7)
+
+`deploy/docker/docker-compose.agent-runner.yml` and `ops/deploy/agent_runner.sh`
+did **not** move. They are not standalone: the compose declares a `backend:`
+service and is composed *on top of* the gateway's own `docker-compose.yml`
+(`-f docker-compose.yml -f docker-compose.agent-runner.yml`). The remote-runner
+file says why in its own header — pointing the overlay at a machine with no
+gateway does not fail, it *starts a gateway there*.
+
+This repository has no `docker-compose.yml` base and no `backend` service, so
+moving the pair as-is would land files that cannot run, and adapting them into
+a standalone stack is a redesign that a migration task must not perform.
+
+The two options, for whoever decides:
+
+1. **Drop them.** A co-located runner becomes "the standalone remote-runner
+   compose, with the tunnel pointing at localhost" — a configuration, not a
+   second file. Cheapest, and it leaves one deployment shape to maintain.
+2. **Keep a co-located topology as a first-class file here**, written against
+   this repository's own services rather than the gateway's.
+
+Their tests stay with them: `tests/unit/test_agent_deploy_config.py` asserts on
+that compose, and `tests/unit/ops/test_agent_runner_preflight.py` executes
+`agent_runner.sh`. Both are still in the source repo. The behaviours they pin
+(internal egress network, read-only docker socket, non-root sandbox, kata
+preflight) are **not currently covered here** — closing that gap is part of
+whichever option is chosen. `tests/unit/test_deploy_paths.py` covers the moved
+files' paths only, and says so.
+
+**Decided (2026-08-04): option 1.** The overlay is dropped; the standalone
+remote-runner compose is the only topology, and a co-located runner is that
+compose with the tunnel pointing at localhost. H4 deletes all four source files.
+
+Its guarantees are kept by porting the source test file **whole** rather than
+by picking out the properties that seemed important:
+
+- `tests/unit/test_deploy_config.py` — all 50 source assertions, re-pointed at
+  the standalone compose. 45 pass unchanged; 3 are skipped with the Trusted-tier
+  reason below; 2 were adapted where they keyed on the gateway's `backend`
+  service, keeping the half that still exists.
+- `tests/unit/test_deploy_security.py` — only what the port could not carry.
+- `tests/unit/test_setup_kata_runtime.py` — the Kata preflight, driving the
+  real script. D7 had missed this file entirely.
+
+**Rule this produced: port test files whole, then adapt what fails.** A first
+attempt hand-picked "the four properties that matter" and produced 13
+assertions against the source's 50 — a 74% silent loss, in a file whose whole
+job is to catch silent failures. Reading the source list is not the same as
+porting it, and the compiler does not check prose. When a task drops an
+artifact, its tests move first and get deleted individually with reasons, never
+summarised.
+
+**One functional gap that came with the decision.** The Trusted egress tier —
+the Squid allowlist proxy and the `agent-egress-trusted` / `agent-egress-uplink`
+networks — was declared **only** in the overlay. The standalone compose defaults
+`AGENT_EGRESS_NETWORK_TRUSTED/CUSTOM/FULL` to empty and both tiers to
+`platform_only`, so it never supported anything above `platform_only`; that was
+acceptable while the overlay existed for the co-located case, and is not now.
+`deploy/host/Dockerfile.agent-egress-proxy` therefore builds an image that no
+compose file in this repository starts. A deployment needing setup-phase
+registry access must add the proxy, its config-render service and the tiered
+networks to the standalone compose. Not scoped here — it is a feature, not a
+migration — but it is the reason the tier is currently unreachable rather than
+merely unused.
+
 ## Manifest corrections
 
 Classification errors found while executing tasks. Fold these into the source
@@ -89,6 +159,8 @@ repo's manifest when it is next edited.
 | File | Manifest says | Actually | Why |
 |---|---|---|---|
 | `apps/backend/serving/agent_jobs/terminal_coordination.py` | `move:host`, D5 | `move:control`, E6 | Its docstring says "Gateway-owned recovery"; its consumers at the freeze are `servers/bootstrap.py` and `servers/routers/agent_jobs.py` — control-plane code. It imports the broker *client* (`workspace_broker_client`, the caller side), not the broker. The route cases move with `test_agent_jobs_api.py` in E10; E6 ports the settled-terminal reconciliation case from `test_bootstrap.py`. |
+| `deploy/docker/pi-freeinference`, `opencode-freeinference`, `kilo-freeinference`, `codex-requirements.toml` | absent from the manifest | `move:deploy`, D7 (moved to `deploy/sandbox/`) | `Dockerfile.agent-sandbox` `COPY`s all four. The manifest listed the Dockerfile but not its assets, so a literal reading of D7 would have produced an image that fails to build. |
+| `deploy/docker/docker-compose.agent-runner.yml`, `ops/deploy/agent_runner.sh` (+ their two test files) | `move:deploy`, D7 | **undecided** — see Open decisions | They are an overlay on the gateway's compose stack, not a standalone deployment. |
 
 ## Upstream provenance
 
@@ -143,7 +215,8 @@ about *inference*, not about *agents*:
 | D | D3+D4 — workspace setup/paths/snapshot + patch gate | ✅ merged; D3 acceptance pending D6 | this repo #3; one PR because `workspace_snapshot` imports `patch_gate`; snapshot tests are owned by D6 above |
 | D | D5 — workspace broker + browser | 🔍 in review | this repo #4; `terminal_coordination` reclassified to Phase E (see manifest corrections) |
 | D | D6 — runner + broker client (+ logging entrypoint) | 🔍 in review | this repo #5, stacked on #4; closes both D6 register rows; D3's pending acceptance resolves here |
-| D7–H | deploy files, web, host pool, cutover | ⏳ not started | — |
+| D | D7 — host deploy files | 🔍 in review | this repo #6; co-located overlay undecided (see Open decisions) |
+| E–H | control plane, web, host pool, cutover | ⏳ not started | — |
 
 Update this table as tasks land. It is the answer to "what is actually done" —
 the plan describes intent, this describes reality.
