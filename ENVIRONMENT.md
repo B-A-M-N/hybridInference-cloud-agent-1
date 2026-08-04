@@ -81,7 +81,7 @@ need a gateway secret here, the design is wrong — stop and escalate.
 | `AGENT_GITHUB_APP_CLIENT_ID` | existing | |
 | `AGENT_GITHUB_APP_CLIENT_SECRET` | existing | Rotate when the App's audience changes — moving to a new domain is a good moment to retire whatever the old value was exposed to. |
 | `AGENT_GITHUB_APP_PRIVATE_KEY_PATH` | existing | **Preferred.** Path to a read-only mounted key file. A private key in an environment variable is readable by anything that can list the process environment, and lands in `docker inspect`, crash dumps, and most log shippers. |
-| `AGENT_GITHUB_APP_PRIVATE_KEY` | existing | Inline PEM. Supported, but use the `_PATH` form where a file mount is possible. |
+| `AGENT_GITHUB_APP_PRIVATE_KEY` | existing | Inline PEM. Supported by the code, and **deliberately not offered by `deploy/control-plane/docker-compose.yml`** — that stack mounts the key as a read-only file, so setting this in its env file does nothing. Use the `_PATH` form there; the inline form is for deployments that do not use this compose stack. |
 | `AGENT_GITHUB_APP_INSTALL_URL` | existing | |
 | `AGENT_GITHUB_API` | existing | Defaults to `https://api.github.com`; override for GHE. |
 | `AGENT_GITLAB_OAUTH_CLIENT_ID` | existing | |
@@ -89,6 +89,8 @@ need a gateway secret here, the design is wrong — stop and escalate.
 | `AGENT_GITLAB_OAUTH_REDIRECT_URI` | existing | Must move to the new agent domain at F5. |
 | `AGENT_REPO_ALLOWLIST` | existing | |
 | `AGENT_GIT_AUTHOR_NAME` / `AGENT_GIT_AUTHOR_EMAIL` | existing | Commit identity for published work. |
+| `AGENT_GITHUB_TOKEN` | existing | Fallback git credential for deployments that publish without a GitHub App. The only component holding a git credential is this service — which is what keeps the sandbox credential-free. Unset means this deployment never publishes; it starts anyway. |
+| `AGENT_PUBLISH_BASE_BRANCH` | existing | Branch a published PR targets, default `dev`. **Never pass this as an empty string.** Compose treats a blank value as *set*, and `os.getenv(name, "dev")` then returns `""` rather than the default — a PR opened against a branch named `''`. The compose file writes `:-dev` for this reason. |
 
 ### MCP
 
@@ -102,6 +104,7 @@ gateway serves models and answers nothing about MCP.
 | `AGENT_SANDBOX_MCP_URL` | **NEW** | The MCP relay **as a sandbox reaches it** — a host-local relay alias, not this service's own bind address, which is why it is configured rather than derived. Handed to the runner at claim time and passed into the sandbox beside `AGENT_GATEWAY_URL`. Unset means jobs get no MCP, and a runtime asked for servers anyway refuses rather than resolving them against the inference gateway. |
 | `AGENT_MCP_TUNNEL_*` | **NEW** | The remote-runner host's second relay: `SSH_DESTINATION`, `SSH_KEY`, `SSH_KNOWN_HOSTS`, and the optional `SSH_PORT` / `REMOTE_HOST` / `REMOTE_PORT` / `LISTEN_PORT`. Its own key, restricted the same way as the gateway tunnel's — one key that opens both would make the two-destination split cosmetic. |
 | `AGENT_MCP_HOSTNAME` | **NEW** | The relay's alias on both container networks. Defaults to `agent-mcp`. |
+| `AGENT_MCP_TOKEN` | **NEW** | **Not operator-set — listed so nobody provisions it.** The name the generated sandbox runtime config *references* (`${AGENT_MCP_TOKEN}`) for the per-attempt relay credential the runner injects at launch. A value put here by hand would be a static tool credential shared by every job, which is the thing the per-attempt token exists to avoid. |
 
 ### Scheduling
 
@@ -129,6 +132,8 @@ neither belongs in any unit file, `.env`, or image.
 |---|---|---|
 | `AGENT_WORKSPACE_BROKER_URL` | existing | Single-host global. Phase G resolves this per host from the database; the env var stays as the fallback when an attempt has no `host_id`. |
 | `AGENT_WORKSPACE_BROKER_TOKEN` | existing | **Still global after phase G.** Host rows carry a broker *URL*, not a credential, so every broker in the pool authenticates this one value — a compromised host's broker token opens every other host's broker. Making it per-host is secret distribution (issue at enrollment, rotate, deliver), not routing, and is deliberately not done here. |
+| `AGENT_BROKER_URL_ALLOWED_HOSTS` | **NEW** | Comma-separated hostnames a registering machine may name as its broker. **Read by the control plane, not the host** — it is listed here because it is the other half of the token above: a host proposes its own broker address and is then sent the pool's shared credential, so an unfiltered address is that credential handed to anything a compromised or mistyped registration names. Names, not patterns; a pool's machines are few and known. Unset means any host, which is what this did before the check — opt-in so an upgrade does not break an existing pool. |
+| `AGENT_CONTROL_PLANE_URL` | **NEW** | Where this runner claims work. Split from `AGENT_GATEWAY_URL` because the two are the same origin only when control plane and gateway are co-located; a remote runner reaches the control plane directly and the gateway through a tunnel alias. Unset falls back to `AGENT_GATEWAY_URL`, which is the co-located shape and what every existing runner already sets. |
 | `AGENT_WORKER_ID` | existing | |
 | `AGENT_WORKDIR_ROOT` | existing | Workspace root. Reused as-is at cutover (H2) so in-flight checkouts survive. |
 | `AGENT_SNAPSHOT_ROOT` | existing | |
@@ -161,6 +166,9 @@ neither belongs in any unit file, `.env`, or image.
 | `AGENT_EGRESS_NETWORK_TRUSTED` | existing | |
 | `AGENT_EGRESS_NETWORK_CUSTOM` | existing | |
 | `AGENT_EGRESS_NETWORK_FULL` | existing | |
+| `AGENT_EGRESS_PROXY_URL_TRUSTED` | existing | The proxy a Trusted-tier sandbox is pointed at — the one enforcing the built-in registry list plus `AGENT_EGRESS_ALLOWLIST`. |
+| `AGENT_EGRESS_PROXY_URL_CUSTOM` | existing | Same for the Custom tier, which supplies its own proxy by definition; nothing here renders a config for it. |
+| `AGENT_EGRESS_PROXY_PORT` | existing | Port the rendered Squid config listens on. A non-numeric value is refused at render rather than defaulted, since a proxy silently on the wrong port is a sandbox with no egress filtering at all. |
 
 ## Web (`web/`)
 
