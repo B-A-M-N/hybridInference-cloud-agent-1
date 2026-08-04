@@ -120,6 +120,7 @@ jobs:
           AGENT_CONTROL_TOKEN_SECRET=ci-placeholder-value-not-a-real-secret
           AGENT_SOURCE_CONTROL_ENCRYPTION_KEY=ci-placeholder-value-not-real
           AGENT_POSTGRES_PASSWORD=ci-placeholder
+          AGENT_DISPATCHER_TOKEN=ci-placeholder
           ENVFILE
           docker compose \
             -f deploy/control-plane/docker-compose.yml \
@@ -133,14 +134,19 @@ jobs:
       - name: A missing secret still refuses to render
         run: |
           set -euo pipefail
-          grep -v AGENT_SESSION_SECRET .env.control-plane > .env.missing
-          if docker compose \
-               -f deploy/control-plane/docker-compose.yml \
-               --env-file .env.missing config >/dev/null 2>&1; then
-            echo "the control-plane stack rendered without AGENT_SESSION_SECRET" >&2
-            exit 1
-          fi
-          echo "a missing session secret still refuses to render"
+          # Both, because they fail for different reasons: a session secret
+          # left blank signs cookies with nothing, and a missing dispatcher
+          # token means every runner claim 401s and the queue never drains.
+          for required in AGENT_SESSION_SECRET AGENT_DISPATCHER_TOKEN; do
+            grep -v "$required" .env.control-plane > .env.missing
+            if docker compose \
+                 -f deploy/control-plane/docker-compose.yml \
+                 --env-file .env.missing config >/dev/null 2>&1; then
+              echo "the control-plane stack rendered without $required" >&2
+              exit 1
+            fi
+            echo "a missing $required still refuses to render"
+          done
 
       - name: The rendered stack keeps its security properties
         run: |
