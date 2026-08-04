@@ -94,6 +94,9 @@ jobs:
           AGENT_TUNNEL_SSH_DESTINATION=ci@gateway.invalid
           AGENT_TUNNEL_SSH_KEY=/dev/null
           AGENT_TUNNEL_SSH_KNOWN_HOSTS=/dev/null
+          AGENT_MCP_TUNNEL_SSH_DESTINATION=ci@control-plane.invalid
+          AGENT_MCP_TUNNEL_SSH_KEY=/dev/null
+          AGENT_MCP_TUNNEL_SSH_KNOWN_HOSTS=/dev/null
           ENVFILE
           docker compose \
             -f deploy/host/docker-compose.agent-remote-runner.yml \
@@ -150,6 +153,18 @@ jobs:
           egress = stack["networks"].get("agent-egress", {})
           if not egress.get("internal"):
               failures.append("agent-egress is not internal — the sandbox would have a route out")
+
+          # Named, not counted. The sandbox's whole permission is "these two
+          # destinations and nothing else"; a check that only counted them
+          # would pass on a stack where one had been swapped for something
+          # broader.
+          on_egress = {
+              name
+              for name, svc in stack["services"].items()
+              if "agent-egress" in (svc.get("networks") or {})
+          }
+          if on_egress != {"agent-gateway-tunnel", "agent-mcp-tunnel"}:
+              failures.append(f"unexpected services on the closed network: {sorted(on_egress)}")
 
           for name, svc in stack["services"].items():
               for mount in svc.get("volumes") or []:

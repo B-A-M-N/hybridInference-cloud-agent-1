@@ -107,6 +107,15 @@ services:
       AGENT_GITLAB_OAUTH_CLIENT_SECRET: ${AGENT_GITLAB_OAUTH_CLIENT_SECRET:-}
       AGENT_GITLAB_OAUTH_REDIRECT_URI: ${AGENT_GITLAB_OAUTH_REDIRECT_URI:-}
 
+      # --- MCP --------------------------------------------------------------
+      # A path, mounted read-only: the file carries each upstream's credential,
+      # and a credential in an environment variable is readable by anything
+      # that can list the process environment.
+      AGENT_MCP_CONFIG: ${AGENT_MCP_CONFIG:-}
+      # Where a *sandbox* reaches the relay — a host-local alias, not this
+      # container's own address, which is why it cannot be derived here.
+      AGENT_SANDBOX_MCP_URL: ${AGENT_SANDBOX_MCP_URL:-}
+
       # --- Workspaces -------------------------------------------------------
       # Authorizes this service to the hosts' workspace brokers. Per-host
       # broker addresses come from each host's registration row, not from here.

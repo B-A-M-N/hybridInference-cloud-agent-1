@@ -77,15 +77,30 @@ class RuntimeCapabilities:
 
 @dataclass(frozen=True)
 class RuntimeMCPConfig:
-    """Gateway-owned MCP server ids made available to one agent run.
+    """The MCP server ids made available to one agent run, and where to reach them.
 
-    This boundary deliberately has no endpoint, header, or credential fields.
-    A later broker implementation must resolve these opaque registry ids on
-    the trusted gateway and expose only gateway-local endpoints to the
-    sandbox; secrets must never become CLI arguments or runtime event data.
+    **A separate address and a separate credential from inference.** MCP is
+    served by the cloud agent's own relay, model calls by the FreeInference
+    gateway, and the two credentials are not interchangeable: a leaked MCP
+    token buys no inference, a leaked inference grant buys no tools. Carrying
+    them in one field, as this did while the gateway proxied MCP, would make
+    that separation impossible to express.
+
+    Still no endpoint or header for the *upstream*: the ids stay opaque, the
+    relay resolves them, and an upstream's credential never leaves it. What is
+    here is this deployment's own relay address and the token that opens it —
+    and the token is referenced by environment variable, never written into an
+    argument.
     """
 
     server_ids: tuple[str, ...] = ()
+    #: The cloud agent's MCP relay, as the sandbox can reach it. Empty means
+    #: MCP is unavailable to this run, which a runtime must treat as "refuse"
+    #: rather than "fall back to the inference address" — that address is a
+    #: different service that no longer answers for MCP at all.
+    base_url: str = ""
+    #: The ``mcp``-scoped token. Never the inference credential.
+    credential: str = ""
 
 
 EMPTY_RUNTIME_MCP_CONFIG = RuntimeMCPConfig()
@@ -134,14 +149,22 @@ class AgentRuntime:
         the header written this way and the variable exported, the proxy
         authenticates the request and the argv carries only the placeholder.
         """
-        base = gateway_base_url.rstrip("/").removesuffix("/v1")
+        if config.server_ids and not config.base_url:
+            # No relay address is not a reason to fall back to the inference
+            # one: that is a different service which does not answer for MCP.
+            # Silently pointing the sandbox at it would produce 404s from an
+            # unrelated host, which reads as "the tool is broken".
+            raise RuntimeMCPUnavailableError(
+                "MCP was requested but no relay address was configured for this run"
+            )
+        base = config.base_url.rstrip("/").removesuffix("/v1")
         return {
             server_id: {
                 "type": "http",
                 "url": f"{base}/v1/agent/mcp/{server_id}",
-                # The same credential the model calls use, so tools last
-                # exactly as long as inference does: one fence governs both,
-                # and a cancelled job loses them together.
+                # Referenced, never written in: the credential is expanded by
+                # the CLI from the environment, so it cannot reach the process
+                # table, an error tail, or an event payload the owner reads.
                 "headers": {"Authorization": f"Bearer ${{{MCP_TOKEN_ENV}}}"},
             }
             for server_id in config.server_ids
@@ -245,7 +268,9 @@ class ClaudeCodeRuntime(AgentRuntime):
             "ANTHROPIC_API_KEY": credential,
             # Referenced by the MCP config above rather than written into it,
             # so the job token never appears in a process argument.
-            MCP_TOKEN_ENV: credential,
+            # The MCP relay's token, which is *not* the inference credential
+            # above. Two services, two scopes, two blast radii.
+            MCP_TOKEN_ENV: mcp_config.credential,
             "ANTHROPIC_MODEL": model,
             "ANTHROPIC_SMALL_FAST_MODEL": model,
             # Telemetry and auto-update are refused explicitly rather than left

@@ -90,6 +90,19 @@ need a gateway secret here, the design is wrong — stop and escalate.
 | `AGENT_REPO_ALLOWLIST` | existing | |
 | `AGENT_GIT_AUTHOR_NAME` / `AGENT_GIT_AUTHOR_EMAIL` | existing | Commit identity for published work. |
 
+### MCP
+
+MCP belongs to this service: it owns the registry, each upstream's credential
+and the attempt fence, so it is the only place that can decide a tool call. The
+gateway serves models and answers nothing about MCP.
+
+| Variable | New? | Value / who provisions |
+|---|---|---|
+| `AGENT_MCP_CONFIG` | **NEW** | **Path** to the MCP registry file, mounted read-only. A path and not the servers themselves: the file carries each upstream's credential, and a credential in an environment variable is readable by anything that can list the process environment and lands in `docker inspect`, crash dumps and most log shippers. Unset means this deployment offers no MCP servers — a supported shape, distinct from a file that fails to parse. |
+| `AGENT_SANDBOX_MCP_URL` | **NEW** | The MCP relay **as a sandbox reaches it** — a host-local relay alias, not this service's own bind address, which is why it is configured rather than derived. Handed to the runner at claim time and passed into the sandbox beside `AGENT_GATEWAY_URL`. Unset means jobs get no MCP, and a runtime asked for servers anyway refuses rather than resolving them against the inference gateway. |
+| `AGENT_MCP_TUNNEL_*` | **NEW** | The remote-runner host's second relay: `SSH_DESTINATION`, `SSH_KEY`, `SSH_KNOWN_HOSTS`, and the optional `SSH_PORT` / `REMOTE_HOST` / `REMOTE_PORT` / `LISTEN_PORT`. Its own key, restricted the same way as the gateway tunnel's — one key that opens both would make the two-destination split cosmetic. |
+| `AGENT_MCP_HOSTNAME` | **NEW** | The relay's alias on both container networks. Defaults to `agent-mcp`. |
+
 ### Scheduling
 
 | Variable | New? | Notes |
