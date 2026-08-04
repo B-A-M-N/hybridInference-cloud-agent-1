@@ -63,6 +63,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from cloud_agent.storage.dsn import sync_sqlalchemy_url
+
 REPO = Path(__file__).resolve().parents[2]
 if str(REPO / "backend") not in sys.path:
     sys.path.insert(0, str(REPO / "backend"))
@@ -332,19 +334,12 @@ def plan_table(
 def sqlalchemy_url(dsn: str) -> str:
     """Rewrite an asyncpg DSN into the driver Alembic actually has.
 
-    ``AGENT_DATABASE_URL`` is consumed by the service through asyncpg, so it is
-    written as a bare ``postgresql://``. SQLAlchemy reads that as psycopg2,
-    which this project does not depend on — it ships psycopg 3. Left alone, the
-    upgrade fails on a missing module rather than on anything to do with the
-    database.
+    Re-exported from :mod:`cloud_agent.storage.dsn` rather than restated:
+    `migrations/env.py` needs the identical rule, and two copies of a
+    driver-rewriting table drift into a script that migrates one database and
+    an Alembic run that cannot open it.
     """
-    for prefix in ("postgresql+", "postgres+"):
-        if dsn.startswith(prefix):
-            return dsn
-    for prefix in ("postgresql://", "postgres://"):
-        if dsn.startswith(prefix):
-            return "postgresql+psycopg://" + dsn[len(prefix) :]
-    return dsn
+    return sync_sqlalchemy_url(dsn)
 
 
 def upgrade_target(target_url: str) -> None:
