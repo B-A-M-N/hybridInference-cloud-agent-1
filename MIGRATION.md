@@ -86,6 +86,29 @@ forgotten.
 | The `model` token scope still exists in `tokens.py`, and is dead weight: it is signed by a root the gateway does not know, so it buys nothing. Kept so the moved tests run unmodified — which is what makes them evidence that re-keying changed nothing else. | **E9**: remove `SCOPE_MODEL` when the runner asks the gateway for a grant instead. | This row; `tests/unit/test_agent_job_tokens.py` still exercises both scopes, so deleting one fails loudly. |
 | Re-keying control tokens invalidates every token in flight. An attempt holding one signed by the gateway's root is an attempt from before the migration. | **H2** (cutover): drain running attempts before switching, rather than expecting them to survive. | This row. |
 
+## Discarded tests
+
+Migration moves test files whole. When an artifact is *rewritten* instead of
+moved, its tests cannot come along unchanged — so they are recorded here case
+by case rather than quietly dropped, and each row says where the property went.
+
+### `tests/unit/test_agent_visible_models.py` (E4)
+
+The source walked the gateway's route registry. That registry does not exist in
+this service, so all four cases test behaviour that stayed behind:
+
+| Case | Where the property lives now |
+|---|---|
+| `test_role_gates_match_the_inference_path` | Gateway. Covered by `test_the_catalog_is_not_the_anonymous_one` in the source repo's `test_internal_lookups.py`, which pins that a `free` user sees strictly fewer models than a `pro` one. |
+| `test_aliases_resolve_but_are_not_listed_twice` | Gateway. **And a behaviour change here:** `agent_model_resolvable` compared against aliases because it held the registry; it now compares against canonical ids, so an alias reads as unresolvable. Teaching `/internal/model-catalog` to return aliases is the fix, and it is a change to that contract. Recorded in the module docstring. |
+| `test_unpublished_disabled_and_embedding_models_are_excluded` | Gateway — `agent_visible_models` there still applies published/role/disabled/chat-type filters before answering. |
+| `test_visibility_resolver_override_wins_both_ways` | Gateway — the resolver is a gateway service and the catalog endpoint passes it. |
+
+Replaced by `tests/unit/test_agent_visible_models.py` and
+`tests/unit/test_gateway_client.py`, which test what this service can now get
+wrong: faithfully reporting what the gateway said, and **failing closed** when
+it cannot answer.
+
 ## Open decisions
 
 Things a migration task surfaced that are **design calls, not mechanical
@@ -220,6 +243,7 @@ about *inference*, not about *agents*:
 | D | D3+D4 — workspace setup/paths/snapshot + patch gate | ✅ merged; D3 acceptance pending D6 | this repo #3; one PR because `workspace_snapshot` imports `patch_gate`; snapshot tests are owned by D6 above |
 | D | D5 — workspace broker + browser | 🔍 in review | this repo #4; `terminal_coordination` reclassified to Phase E (see manifest corrections) |
 | D | D6 — runner + broker client (+ logging entrypoint) | 🔍 in review | this repo #5, stacked on #4; closes both D6 register rows; D3's pending acceptance resolves here |
+| E | E4 — visible models over HTTP | 🔍 in review | this repo #9, stacked on #8; **rewritten, not moved** — see the discarded-test record below |
 | E | E2+E3 — schemas, entitlement, control tokens (re-keyed) | 🔍 in review | this repo #8, stacked on #7; `AGENT_CONTROL_TOKEN_SECRET` replaces the gateway's root |
 | E | E1 — store + Alembic baseline | 🔍 in review | this repo #7, stacked on #6; `initialize()` becomes a no-op, schema **and its five startup backfills** move to `0001_baseline` |
 | D | D7 — host deploy files | 🔍 in review | this repo #6; co-located overlay undecided (see Open decisions) |
