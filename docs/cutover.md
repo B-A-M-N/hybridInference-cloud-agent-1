@@ -53,15 +53,19 @@ Do not start until every one of these is true.
 
 ### Blockers to check before scheduling
 
-These are open in the code as of this writing. Each will make the cutover fail
-in a specific, non-obvious way if it has not landed.
+Each will make the cutover fail in a specific, non-obvious way if it has not
+been dealt with. Struck-through rows have landed; they are kept because a
+blocker that vanishes without a record reads as one that was never real.
 
 | Blocker | Where | Why it stops this runbook |
 |---|---|---|
-| The runner sends control-plane calls and the sandbox's inference calls to **one** base URL | `host/cloud_agent_host/runner.py:1081` (`TODO(E9)`) | After the split those are two different origins. Until the runner takes a separate control-plane URL, step 6 can point it at exactly one of them and the other breaks. |
-| Host enrollment exists on the control plane but **the runner does not use it** | `backend/cloud_agent/api/hosts.py::register_host` and `::heartbeat_host` serve `POST /v1/agent/host/register` and `/heartbeat` — named, not numbered, because the line numbers this row used to carry (105, 151) had already rotted (the routes are at 113 and 168 today) and would rot again; `grep -rn AGENT_ENROLL_TOKEN host/` returns nothing | Step 6 re-points the runner with the environment variables it actually reads today. Rewrite step 6 around enrollment once the host half lands. |
-| Inference grants (C5–C8) are not on the gateway | `POST /internal/agent-grants` is not in the gateway's deployed code — it exists only in unmerged PR #1180. This side is wired: E9 made the claim path call `backend/cloud_agent/grants.py`, so the row's old "has no caller" is stale | A job on the new stack cannot obtain a model credential. Smoke (step 8) fails at the first model call. |
-| `GET /internal/model-catalog`, `/internal/users/{id}/status`, `/internal/mcp-registry` do not exist upstream | `backend/cloud_agent/gateway.py:120,138,153` | The control plane fails closed on all three, which means *no* models resolve, so job creation is refused. |
+| **Neither gateway has identity configured.** `GET /v1/identity/jwks` answers `identity_not_configured` on **both** `freeinference.org` and `staging.freeinference.org` (checked 2026-08-04). The code is deployed — that 404 is the "no key configured" answer, deliberately distinct from the 500 a broken key gives — but `IDENTITY_SIGNING_KEY` is unset. | The gateway's own environment | **Step 3 cannot start.** Sign-in is the first thing the smoke does and the whole session flow hangs off it. Needs an RSA key generated *on the host* (`openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048`), plus `IDENTITY_ALLOWED_REDIRECTS` containing this service's callback — matched exactly, not by prefix. |
+| **`GATEWAY_GRANT_DISPATCH_TOKEN` is unset on the gateway.** All three `/internal/*` routes answer 404, which is the unconfigured answer rather than "no such route" — an unconfigured deployment deliberately does not look like a guarded one. | Both sides' environments | Every lookup and every mint fails closed, so no models resolve and job creation is refused. The same random value (`openssl rand -hex 32`) must be set on the gateway *and* this service, and must differ between staging and production — one value shared across both makes a staging compromise a production one. |
+| **`AGENT_MCP_CONFIG` has no file yet.** | The control-plane host | Jobs run without tools. Copy the gateway's registry file rather than moving it: the gateway's own MCP route keeps serving already-running agents until H4 lands. |
+| ~~The runner sends control-plane calls and the sandbox's inference calls to one base URL~~ | ~~`runner.py` `TODO(E9)`~~ | ✅ **resolved** — the sandbox now carries two addresses and two credentials (`AGENT_GATEWAY_URL` + `agr`, `AGENT_SANDBOX_MCP_URL` + an `mcp`-scoped token), and a runtime asked for MCP with no relay address refuses rather than resolving it against the inference host. |
+| ~~Inference grants (C5–C8) are not on the gateway~~ | ~~unmerged #1180~~ | ✅ **resolved** — #1180 through #1183, #1191 and #1195 are all on the gateway's `dev`. |
+| ~~`/internal/model-catalog`, `/internal/users/{id}/status`, `/internal/mcp-registry` do not exist upstream~~ | ~~`gateway.py`~~ | ✅ **resolved for two of the three, and the third was removed by design.** The catalog and user-status routes exist and carry an alias table; `/internal/mcp-registry` is gone — MCP belongs to this service now, so there is nothing to ask the gateway about. |
+| Host enrollment exists on the control plane but **the runner does not use it** | `backend/cloud_agent/api/hosts.py::register_host` and `::heartbeat_host`; `grep -rn AGENT_ENROLL_TOKEN host/` still returns nothing | Step 6 re-points the runner with the environment variables it reads today. Rewrite step 6 around enrolment once the host half lands. |
 
 ---
 
