@@ -92,10 +92,26 @@ POST /v1/agent/jobs/{job_id}/follow-ups  # next turn in a thread
 POST /v1/agent/jobs/{job_id}/fork        # branch a thread
 ```
 
+**And the source-control routes, which is easy to miss** — the freeze is about
+what step 5 copies, not only about jobs. These write the two tables the
+migration moves, so a connection made or removed after the snapshot is taken is
+a change that lands nowhere: the old row is exported, the new one is not, and
+the user arrives on the new stack with a connection they deleted or without one
+they just made.
+
+```text
+POST   /v1/agent/integrations/github/connect
+DELETE /v1/agent/integrations/github/connections/{installation_id}
+POST   /v1/agent/integrations/gitlab/connect
+DELETE /v1/agent/integrations/gitlab/connections/{connection_id}
+```
+
 - [ ] Return `503` with a message naming the new domain. Leave every `GET` and
       the `/v1/agent/worker/*` routes open — the drain in step 3 needs them.
 - [ ] Confirm with a real request that a create is refused and a job list still
       answers.
+- [ ] Confirm a connect is refused too, and that Integrations still *lists*
+      what a user already has — the freeze stops writes, not reading.
 - [ ] Record the time. Everything after this is inside the window.
 
 > If the deployment has no edge it can rule on, the fallback is to remove

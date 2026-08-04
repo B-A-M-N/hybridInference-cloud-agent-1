@@ -283,7 +283,11 @@ def plan_table(
     reason this is a planning step rather than an ``INSERT … ON CONFLICT DO
     NOTHING``:
 
-    - **refresh** — the id is present but its content differs. Silently
+    - **refresh** — the id is present, names the *same* owner, and its content
+      differs. An id that names a different owner is a **conflict**, not a
+      refresh: both databases assign ids of their own, so a collision is
+      ordinary, and refreshing across it would overwrite somebody's connection
+      with a stranger's. Silently
       skipping it is how a rehearsal import becomes a stale credential nobody
       notices until it fails.
     - **conflict** — the id is absent but another row already holds the same
@@ -306,6 +310,17 @@ def plan_table(
                 plan.insert.append(row)
             continue
         target_row, target_text = existing
+        source_key = tuple(row[column] for column in spec.unique_key)
+        target_key = tuple(target_row[column] for column in spec.unique_key)
+        if source_key != target_key:
+            # **Same id, different owner.** Both databases assign ids of their
+            # own, so a numeric collision is ordinary — and treating it as a
+            # refresh would overwrite one user's source-control connection with
+            # another's. A refusal costs a manual decision; the alternative
+            # costs somebody their repository access, silently, with the
+            # migration reporting success.
+            plan.conflict.append({**row, "_target_id": target_row["id"]})
+            continue
         if row_fingerprint(spec, row, text) == row_fingerprint(spec, target_row, target_text):
             plan.unchanged.append(row)
         else:
