@@ -112,7 +112,6 @@ class FakeAgentJobStore:
         prompt: str,
         runtime: str | None = None,
         model: str | None = None,
-        budget_usd: float | None = None,
     ) -> dict[str, Any] | None:
         requested = self.jobs.get(parent_job_id)
         if requested is None or requested["user_id"] != user_id:
@@ -140,7 +139,6 @@ class FakeAgentJobStore:
             "task_prompt": prompt,
             "runtime": runtime or parent["runtime"],
             "model": model or parent["model"],
-            "budget_usd": budget_usd if budget_usd is not None else parent.get("budget_usd"),
             "state": (
                 "queued"
                 if parent["state"] in {"failed", "cancelled"}

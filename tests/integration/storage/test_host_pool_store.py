@@ -96,7 +96,6 @@ async def _create_job(store: AgentJobStore, **overrides) -> dict:
         "task_prompt": "do the thing",
         "runtime": "claude-code",
         "model": "glm-5.1",
-        "budget_usd": 1.0,
     }
     params.update(overrides)
     return await store.create_job(**params)

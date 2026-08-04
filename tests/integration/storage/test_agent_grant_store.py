@@ -91,7 +91,6 @@ async def _claimed(store: AgentJobStore, *, prompt: str = "fix it") -> dict:
         task_prompt=prompt,
         runtime="claude-code",
         model="glm-5.1",
-        budget_usd=1.0,
     )
     claim = await store.claim_job(worker_id="w1", lease_ttl_seconds=300.0)
     assert claim is not None

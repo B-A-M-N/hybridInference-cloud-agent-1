@@ -173,7 +173,6 @@ async def _create_job(store: AgentJobStore) -> dict:
         task_prompt="fix the thing",
         runtime="claude-code",
         model="glm-5.1",
-        budget_usd=1.0,
         base_sha="a" * 40,
     )
 

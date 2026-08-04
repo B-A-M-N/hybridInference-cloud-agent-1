@@ -63,7 +63,6 @@ from cloud_agent.identity import SESSION_COOKIE
 from cloud_agent.logging_utils import get_logger
 from cloud_agent.schemas import (
     BASE_REF_METADATA_KEY,
-    DEFAULT_JOB_BUDGET_USD,
     EVENT_TYPE_PATTERN,
     AgentConfigResponse,
     AgentFollowUpRequest,
@@ -334,7 +333,6 @@ def _job_response(job: dict[str, Any], usage: dict[str, Any] | None = None) -> A
         published_pr_url=job["published_pr_url"],
         published_commit_sha=job.get("published_commit_sha"),
         detail=job["detail"],
-        budget_usd=job.get("budget_usd"),
         forked_from_job_id=job.get("fork_source_job_id"),
         metadata=metadata or None,
         mcp_servers=list(job.get("mcp_servers") or []),
@@ -409,7 +407,6 @@ async def get_agent_config(
         # will hit — not /v1/models, which answers for the *browsing* user and
         # offered models whose first agent call then 404ed.
         models=await agent_visible_models(gateway, user_id=user["user_id"]),
-        default_budget_usd=DEFAULT_JOB_BUDGET_USD,
         # Public fields only — McpServerSummary has nowhere to put a URL or a
         # credential, which is how it stays that way.
         mcp_servers=[McpServerSummary(**entry) for entry in await _mcp_registry(gateway)],
@@ -1010,7 +1007,6 @@ async def create_agent_job(
         model=body.model,
         base_sha=base_sha,
         setup_script=body.setup_script,
-        budget_usd=body.budget_usd,
         metadata=metadata or None,
         mcp_servers=mcp_servers,
     )
@@ -1239,7 +1235,6 @@ async def create_agent_follow_up(
         prompt=body.prompt,
         runtime=body.runtime,
         model=body.model,
-        budget_usd=body.budget_usd,
     )
     if job is None:
         raise HTTPException(
