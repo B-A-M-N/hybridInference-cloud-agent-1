@@ -137,6 +137,12 @@ services:
       # would not, so jobs would be claimed and then die at their first model
       # call.
       AGENT_GATEWAY_URL: http://${AGENT_GATEWAY_HOSTNAME:-agent-gateway}:${AGENT_TUNNEL_LISTEN_PORT:-8080}
+      # The control plane the runner claims against — a different service from
+      # the gateway above, reached through the same relay as MCP because they
+      # are the same host. Defaulted to the gateway's value so an unconfigured
+      # host behaves exactly as it did before the split rather than newly
+      # breaking.
+      AGENT_CONTROL_PLANE_URL: ${AGENT_CONTROL_PLANE_URL:-http://${AGENT_MCP_HOSTNAME:-agent-mcp}:${AGENT_MCP_TUNNEL_LISTEN_PORT:-8000}}
       # The sandbox's second destination, handed down with its own token. A
       # separate name and port from the gateway's, so "may call models" and
       # "may call tools" stay two permissions rather than one.
