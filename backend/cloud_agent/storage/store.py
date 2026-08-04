@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import json
 import secrets
-from decimal import Decimal
 from typing import Any
 
 import asyncpg
@@ -114,7 +113,6 @@ def _job_row_to_dict(row: Any) -> dict[str, Any]:
         "published_pr_url": row["published_pr_url"],
         "published_commit_sha": row["published_commit_sha"],
         "detail": row["detail"],
-        "budget_usd": float(row["budget_usd"]) if row["budget_usd"] is not None else None,
         "metadata": _load_json(row["metadata"]),
         "fork_source_job_id": row["fork_source_job_id"],
         # Resolved once, at creation, against the deployment registry — not
@@ -133,7 +131,7 @@ _JOB_COLUMNS = (
     "setup_script, runtime, model, state, "
     "cancel_requested, terminal_resume_pending, current_attempt_id, "
     "published_pr_url, published_commit_sha, detail, "
-    "budget_usd, metadata, fork_source_job_id, mcp_servers, "
+    "metadata, fork_source_job_id, mcp_servers, "
     "created_at, updated_at"
 )
 _QUALIFIED_JOB_COLUMNS = ", ".join(f"j.{column.strip()}" for column in _JOB_COLUMNS.split(","))
@@ -364,7 +362,6 @@ class AgentJobStore:
         model: str,
         base_sha: str | None = None,
         setup_script: str | None = None,
-        budget_usd: float | None = None,
         metadata: dict[str, Any] | None = None,
         mcp_servers: list[str] | None = None,
     ) -> dict[str, Any]:
@@ -386,8 +383,8 @@ class AgentJobStore:
                 f"""
                 INSERT INTO agent_jobs
                     (id, thread_id, turn_no, user_id, repo, base_sha, task_prompt,
-                     setup_script, runtime, model, budget_usd, metadata, mcp_servers)
-                VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12)
+                     setup_script, runtime, model, metadata, mcp_servers)
+                VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11)
                 RETURNING {_JOB_COLUMNS}
                 """,
                 job_id,
@@ -399,7 +396,6 @@ class AgentJobStore:
                 setup_script,
                 runtime,
                 model,
-                Decimal(str(budget_usd)) if budget_usd is not None else None,
                 json.dumps(metadata) if metadata is not None else None,
                 list(mcp_servers or []),
             )
@@ -484,7 +480,6 @@ class AgentJobStore:
         prompt: str,
         runtime: str | None = None,
         model: str | None = None,
-        budget_usd: float | None = None,
     ) -> dict[str, Any] | None:
         """Append a user turn and create the run that will answer it.
 
@@ -531,9 +526,9 @@ class AgentJobStore:
                 f"""
                 INSERT INTO agent_jobs
                     (id, thread_id, parent_job_id, turn_no, user_id, repo, base_sha,
-                     task_prompt, setup_script, runtime, model, state, budget_usd, metadata,
+                     task_prompt, setup_script, runtime, model, state, metadata,
                      mcp_servers)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14)
                 RETURNING {_JOB_COLUMNS}
                 """,
                 job_id,
@@ -548,9 +543,6 @@ class AgentJobStore:
                 runtime or parent["runtime"],
                 model or parent["model"],
                 state,
-                Decimal(str(budget_usd if budget_usd is not None else parent["budget_usd"]))
-                if (budget_usd is not None or parent["budget_usd"] is not None)
-                else None,
                 json.dumps(_load_json(parent["metadata"]))
                 if parent["metadata"] is not None
                 else None,
@@ -647,10 +639,10 @@ class AgentJobStore:
                     INSERT INTO agent_jobs
                         (id, thread_id, parent_job_id, turn_no, user_id, repo, base_sha,
                          task_prompt, setup_script, runtime, model, state,
-                         published_commit_sha, detail, budget_usd, metadata,
+                         published_commit_sha, detail, metadata,
                          fork_source_job_id, mcp_servers, created_at, updated_at)
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                            $13, $14, $15, $16::jsonb, $17, $18,
+                            $13, $14, $15::jsonb, $16, $17,
                             clock_timestamp(), clock_timestamp())
                     """,
                     copy_id,
@@ -670,7 +662,6 @@ class AgentJobStore:
                     turn["state"] if turn["state"] in TERMINAL_STATES else CANCELLED,
                     turn["published_commit_sha"],
                     turn["detail"],
-                    turn["budget_usd"],
                     json.dumps(_load_json(turn["metadata"]))
                     if turn["metadata"] is not None
                     else None,
@@ -823,8 +814,9 @@ class AgentJobStore:
         supersedes the attempt or the job reaches a terminal state, the token
         stops buying inference. There is no separate key to remember to revoke.
 
-        Returns ``{"user_id", "role", "job_id", "budget_usd", "model"}``; the
-        caller bills the job's owner and enforces the budget.
+        Returns ``{"user_id", "role", "job_id", "model"}``; the caller bills
+        the job's owner. There is no per-task budget: a grant scopes what may
+        be called, and the gateway's per-user daily quota governs how much.
 
         ``role`` is the owner's: the sandbox's model calls run with exactly the
         model access the owner has — they pay for them and could make them
@@ -837,7 +829,7 @@ class AgentJobStore:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT j.user_id, j.id AS job_id, j.budget_usd, j.model, j.state,
+                SELECT j.user_id, j.id AS job_id, j.model, j.state,
                        j.mcp_servers
                 FROM agent_attempts a
                 JOIN agent_jobs j ON j.id = a.job_id
@@ -876,7 +868,6 @@ class AgentJobStore:
             # the instant the token stops buying inference it also stops
             # reaching tools.
             "mcp_servers": list(row["mcp_servers"] or []),
-            "budget_usd": float(row["budget_usd"]) if row["budget_usd"] is not None else None,
             "model": row["model"],
         }
 

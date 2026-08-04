@@ -40,6 +40,23 @@ EXPECTED_TABLES = {
 }
 
 
+#: Columns the source schema had and this one deliberately does not.
+#:
+#: The design removed the per-task dollar budget: a grant scopes *what* an
+#: attempt may call, and the gateway's per-user daily quota governs *how much*.
+#: A column nothing reads is not harmless — it reads as a feature, and the API
+#: that accepted a value for it made the claim out loud.
+#:
+#: Dropped from the baseline rather than added and then dropped by a later
+#: migration, because this database has never been deployed: a baseline is a
+#: starting schema, not a historical record. There is no row anywhere carrying
+#: a value to preserve.
+#:
+#: Named here so the rest of the "reproduce the source exactly" guarantee keeps
+#: its teeth. A *second* divergence still fails the tests below.
+DELIBERATE_OMISSIONS = {"budget_usd"}
+
+
 def _statements() -> tuple[str, ...]:
     """Return the baseline's DDL, read as data rather than executed."""
     tree = ast.parse(BASELINE.read_text(encoding="utf-8"))
@@ -194,3 +211,73 @@ def test_the_store_docstring_does_not_claim_the_move_was_ddl_only() -> None:
     )
     doc = ast.get_docstring(initialize) or ""
     assert "backfill" in doc.lower()
+
+
+@pytest.mark.parametrize("column", sorted(DELIBERATE_OMISSIONS))
+def test_a_deliberately_omitted_column_is_absent_everywhere(column: str) -> None:
+    """Not in the CREATE TABLE, and not in the ADD COLUMN trail either.
+
+    The source carried both — the table was created with the column and a later
+    migration re-added it defensively — so removing one and not the other
+    leaves a schema that still grows it on the second run.
+    """
+    assert not [s for s in _statements() if column in s], (
+        f"{column} is still in the baseline; it was removed by design"
+    )
+
+
+def test_the_store_writes_no_deliberately_omitted_column() -> None:
+    """A column gone from the schema and still in an INSERT is a crash at the
+    first write, not a leftover."""
+    source = STORE.read_text(encoding="utf-8")
+    still_there = sorted(c for c in DELIBERATE_OMISSIONS if c in source)
+    assert not still_there, f"the store still references {still_there}"
+
+
+def _split_top_level(text: str) -> list[str]:
+    """Split on commas that are not inside parentheses.
+
+    A naive split miscounts `COALESCE(MAX(seq), 0)` as two values and reports a
+    healthy statement as broken — and a check with a false positive is one
+    people learn to skip past.
+    """
+    parts, depth, current = [], 0, ""
+    for char in text:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        if char == "," and depth == 0:
+            parts.append(current)
+            current = ""
+            continue
+        current += char
+    parts.append(current)
+    return [part for part in parts if part.strip()]
+
+
+def test_every_insert_names_as_many_values_as_columns() -> None:
+    """**The failure mode of removing a column from a hand-written INSERT.**
+
+    Dropping `budget_usd` shifted the positional parameters of three
+    statements. Two of them came out one placeholder long — and the symptom of
+    that is not a crash at import: asyncpg raises at runtime, on whichever code
+    path happens to run first, and a mismatch that *still counts* would write
+    each value into its neighbour's column instead.
+
+    This counts columns against value expressions for every INSERT in the
+    store, so the next removal is checked by something other than care.
+    """
+    source = STORE.read_text(encoding="utf-8")
+    pattern = re.compile(
+        r"INSERT INTO (\w+)\s*\(([^)]*)\)\s*VALUES\s*\(((?:[^()]|\([^()]*(?:\([^()]*\))?[^()]*\))*)\)",
+        re.S,
+    )
+    mismatches = [
+        f"{match.group(1)}: {len(_split_top_level(match.group(2)))} columns, "
+        f"{len(_split_top_level(match.group(3)))} values"
+        for match in pattern.finditer(source)
+        if len(_split_top_level(match.group(2))) != len(_split_top_level(match.group(3)))
+    ]
+    assert not mismatches, f"INSERT column/value count mismatch: {mismatches}"
+    assert pattern.search(source), "the pattern matched nothing; the check is vacuous"

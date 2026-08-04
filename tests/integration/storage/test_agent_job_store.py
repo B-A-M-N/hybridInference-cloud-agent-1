@@ -1081,7 +1081,7 @@ async def test_model_credential_follows_the_fence(store: AgentJobStore):
     no key to revoke, so the checks that matter are that a live fence resolves
     and that every way of losing the fence stops resolving.
     """
-    job = await _create_job(store, budget_usd=2.5)
+    job = await _create_job(store)
     claim = await store.claim_job(worker_id="w1", lease_ttl_seconds=60)
     fence = {
         "job_id": job["id"],
@@ -1092,7 +1092,9 @@ async def test_model_credential_follows_the_fence(store: AgentJobStore):
     identity = await store.resolve_model_credential(**fence)
     assert identity is not None
     assert identity["user_id"] == "user-1"
-    assert identity["budget_usd"] == 2.5
+    # The budget assertion that sat here went with the column: a grant scopes
+    # what may be called, and the per-user daily quota governs how much. Every
+    # fence assertion below — the subject of this test — is unchanged.
 
     # A different generation never resolves.
     assert (
