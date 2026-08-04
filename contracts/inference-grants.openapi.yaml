@@ -35,14 +35,13 @@ info:
     what it is asked to renew. The consumer's renewal loop re-reads its own
     store every pass, which is what stops a zombie sandbox.
 
-    Two clamps behave differently on purpose:
-
-    * **Models are clamped.** A request for more than the user's role can reach
-      comes back narrowed. A narrower agent still runs.
-    * **MCP servers are validated.** An unknown name is refused outright rather
-      than dropped, because dropping it returns a grant that looks fine and
-      produces an agent missing the one tool the task was written around — a
-      failure a long way from its cause.
+    **Models are clamped, and models are all of it.** A request for more than
+    the user's role can reach comes back narrowed; a narrower agent still runs.
+    A grant carried an MCP scope until the ownership amendment moved the
+    registry, its credentials and its proxy to the consumer — which is where
+    the job, its requested tools and the attempt fence already live. A sandbox
+    reaches tools with a separate credential this gateway neither mints nor
+    accepts, so a leaked grant buys models and no tools.
 
 servers:
   - url: https://freeinference.org
@@ -101,12 +100,6 @@ paths:
                   description: |
                     Clamped to what the user's role can reach. `null` means
                     "everything this role can reach".
-                allowed_mcp:
-                  type: [array, "null"]
-                  items: { type: string }
-                  description: |
-                    **Validated, not clamped** — an unknown name refuses the
-                    whole mint. `null` means the deployment's default servers.
                 ttl_seconds:
                   type: [integer, "null"]
                   description: |
@@ -133,13 +126,6 @@ paths:
                           caller already has it and a token that travels twice
                           is a token logged twice. This is the only credential
                           that enters a sandbox.
-        "400":
-          description: An MCP server that this deployment does not offer.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-              example:
-                error: { type: unknown_mcp_server, message: "unknown MCP server(s): ghost" }
         "401":
           description: Wrong or missing dispatch token.
           content:
@@ -369,7 +355,6 @@ components:
         - external_job_id
         - external_attempt_id
         - allowed_models
-        - allowed_mcp
         - expires_at
         - revoked_at
       properties:
@@ -381,10 +366,6 @@ components:
           type: array
           items: { type: string }
           description: The **effective** models, after the role clamp.
-        allowed_mcp:
-          type: array
-          items: { type: string }
-          description: The resolved MCP servers.
         expires_at:
           type: string
           format: date-time
@@ -421,7 +402,6 @@ x-pinned-by:
   gateway:
     - tests/unit/test_agent_grants.py
     - tests/unit/test_grant_model_auth.py
-    - tests/servers/test_agent_mcp_api.py
   consumer:
     - tests/unit/test_grant_client.py
     - tests/unit/test_grant_lifecycle.py

@@ -129,8 +129,9 @@ class GrantClient:
 
         if response.status_code != 200:
             # The gateway's refusal reason is worth surfacing: "that user
-            # cannot be granted capability" and "unknown MCP server" are
-            # different problems for whoever created the job.
+            # cannot be granted capability" and "this deployment does not
+            # federate capability" are different problems, and only one of
+            # them is about the job.
             detail = ""
             error_type = None
             try:
@@ -164,7 +165,6 @@ class GrantClient:
         job_id: str,
         attempt_id: str,
         models: list[str] | None = None,
-        mcp_servers: list[str] | None = None,
         ttl_seconds: int | None = GRANT_TTL_S,
     ) -> dict[str, Any]:
         """Ask for the capability one attempt runs with.
@@ -174,17 +174,11 @@ class GrantClient:
         reach. Use what comes back, not what was sent — a job built around a
         model the grant does not carry fails at its first call.
 
-        An unknown MCP server is refused outright rather than dropped, so a
-        failure here means the job asked for a tool surface this deployment
-        does not offer, and it should fail at creation rather than mid-run.
-
         Args:
             user_id: The gateway's user identifier.
             job_id: This service's job id, opaque to the gateway.
             attempt_id: This service's attempt id.
             models: Requested models; ``None`` means everything the role allows.
-            mcp_servers: Requested MCP servers; ``None`` means the deployment's
-                defaults.
             ttl_seconds: Requested lifetime, clamped by the gateway. Defaults to
                 :data:`GRANT_TTL_S`, which is derived from the renewal cadence —
                 see the invariant above. ``None`` is accepted and means "the
@@ -204,8 +198,11 @@ class GrantClient:
         }
         if models is not None:
             body["allowed_models"] = models
-        if mcp_servers is not None:
-            body["allowed_mcp"] = mcp_servers
+        # No `allowed_mcp`. It was sent on every mint until this was noticed,
+        # and the gateway had already stopped declaring the field — pydantic
+        # ignores what it does not know, so the request looked accepted and the
+        # scope it named was never requested of anything. MCP is decided here
+        # now, by the relay's scope check and the attempt fence.
         if ttl_seconds is not None:
             body["ttl_seconds"] = ttl_seconds
         return await self._post("/internal/agent-grants", body)

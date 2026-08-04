@@ -24,7 +24,6 @@ GRANT = {
     "external_job_id": "job_1",
     "external_attempt_id": "1",
     "allowed_models": ["glm-5.1"],
-    "allowed_mcp": ["deepwiki"],
     "expires_at": "2026-08-04T12:00:00+00:00",
     "revoked_at": None,
     "token": "agr.payload.signature",
@@ -93,8 +92,11 @@ async def test_omitted_scope_is_not_sent_as_null() -> None:
 
     await _client(handler).mint(user_id="user_1", job_id="job_1", attempt_id="1", ttl_seconds=None)
     assert "allowed_models" not in seen["body"]
-    assert "allowed_mcp" not in seen["body"]
     assert "ttl_seconds" not in seen["body"]
+    # `allowed_mcp` is not checked here any more. It cannot be sent at all now,
+    # so an assertion about its absence would pass whatever this method did —
+    # `test_grant_request_matches_contract.py` asserts the whole request
+    # against the gateway's declared fields instead.
 
 
 async def test_a_lifetime_is_always_asked_for() -> None:
@@ -132,16 +134,24 @@ async def test_an_attempt_id_is_sent_as_a_string() -> None:
 
 
 async def test_a_refused_mint_surfaces_the_gateway_reason() -> None:
-    """ "Unknown MCP server" and "that user cannot be granted" differ.
+    """ "That user cannot be granted" and "this gateway does not federate" differ.
 
     Whoever created the job needs to be able to tell them apart, so the
     gateway's message travels rather than being flattened into a status code.
+
+    The example used to be an unknown MCP server, which the gateway stopped
+    refusing when MCP moved here. The property is unchanged — a refusal still
+    has to arrive with its reason — so this is repointed at a refusal the
+    gateway still produces rather than deleted.
     """
-    payload = {"error": {"type": "unknown_mcp_server", "message": "unknown MCP server(s): ghost"}}
-    with pytest.raises(GatewayError, match="ghost"):
-        await _client(_serves(payload, 400)).mint(
-            user_id="user_1", job_id="job_1", attempt_id="1", mcp_servers=["ghost"]
-        )
+    payload = {
+        "error": {
+            "type": "subject_unavailable",
+            "message": "That user cannot be granted capability.",
+        }
+    }
+    with pytest.raises(GatewayError, match="cannot be granted"):
+        await _client(_serves(payload, 403)).mint(user_id="user_1", job_id="job_1", attempt_id="1")
 
 
 @pytest.mark.parametrize("status_code", [400, 401, 403, 404, 500, 503])

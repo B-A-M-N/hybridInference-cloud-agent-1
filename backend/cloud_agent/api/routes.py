@@ -2326,7 +2326,6 @@ async def _mint_sandbox_grant(
             job_id=claim["id"],
             attempt_id=claim["attempt_id"],
             models=[claim["model"]],
-            mcp_servers=list(claim.get("mcp_servers") or []),
         )
     except GatewayError as exc:
         await job_store.release_claim(
