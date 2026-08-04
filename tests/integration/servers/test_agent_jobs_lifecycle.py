@@ -57,8 +57,9 @@ class _FakeGateway:
     async def model_catalog(self, user_id: str) -> list[str]:
         return [_TEST_MODEL]
 
-    async def mcp_registry(self) -> list[dict[str, Any]]:
-        return []
+    # No `mcp_registry` here any more. A fake that answers a question the real
+    # client cannot ask is a test passing against an interface nothing has —
+    # and it would have kept this suite green through the whole amendment.
 
 
 class _FakeGrants:

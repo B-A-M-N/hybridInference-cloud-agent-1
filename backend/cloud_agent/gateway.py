@@ -220,21 +220,10 @@ class GatewayClient:
         """
         return await self._get(f"/internal/users/{user_id}/status")
 
-    async def mcp_registry(self) -> list[dict[str, Any]]:
-        """List the MCP servers this deployment offers.
-
-        Names and display metadata only — the gateway never returns a server's
-        address or credential, and this service never needs them: a sandbox
-        reaches MCP through the gateway's proxy.
-
-        Returns:
-            One record per configured server.
-
-        Raises:
-            GatewayError: If the registry cannot be read.
-        """
-        body = await self._get("/internal/mcp-registry")
-        servers = body.get("servers")
-        if not isinstance(servers, list):
-            raise GatewayError("gateway returned no server list")
-        return [server for server in servers if isinstance(server, dict)]
+    # There was an `mcp_registry()` here, calling `/internal/mcp-registry`.
+    # The ownership amendment moved the registry, its credentials and its proxy
+    # to this service, and the gateway's endpoint went with them — so the
+    # method could only ever 404, while its docstring still said a sandbox
+    # reaches MCP through the gateway's proxy. Read `get_registry()` from
+    # `cloud_agent.mcp_registry` instead; nothing here asks the gateway about
+    # tools, which is the whole point of the amendment.
