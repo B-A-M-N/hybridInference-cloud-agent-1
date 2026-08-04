@@ -713,15 +713,15 @@ class _FakeGateway:
     Replaces the source's ``_fake_route_exec``: the model catalog and the MCP
     registry are HTTP calls now, not registry objects the router holds.
 
-    ``mcp_servers`` is a *class* attribute so a test can install a registry
-    after the ``client`` fixture has already built its app — the same reason
-    the source monkeypatched ``agent_jobs_router.get_registry``.
+    No MCP here: the registry moved to this service with its credentials and
+    its relay, so a fake gateway that still offered one would suggest the
+    gateway is still asked — which is the call this change removed.
     """
-
-    mcp_servers: ClassVar[list[dict[str, Any]]] = []
 
     async def model_catalog(self, user_id: str) -> list[str]:
         return list(_TEST_MODELS)
+
+    aliases: ClassVar[dict[str, str]] = {}
 
     async def model_catalog_with_aliases(self, user_id: str) -> tuple[list[str], dict[str, str]]:
         """The catalog plus the gateway's alias translation table.
@@ -731,10 +731,7 @@ class _FakeGateway:
         answered only the older method sent every job-creation path down a
         `AttributeError` the moment the caller started asking for the table.
         """
-        return list(_TEST_MODELS), {}
-
-    async def mcp_registry(self) -> list[dict[str, Any]]:
-        return [dict(entry) for entry in type(self).mcp_servers]
+        return list(_TEST_MODELS), dict(self.aliases)
 
 
 class _FakeGrants:
@@ -833,13 +830,18 @@ async def client(store: FakeAgentJobStore):
         yield async_client
 
 
-async def _create_job(client: AsyncClient) -> str:
-    """Create a job through the API and return its id."""
-    response = await client.post(
+async def _create_job_raw(client: AsyncClient, *, model: str = "glm-5.1"):
+    """Post a job and hand back the raw response, refusals included."""
+    return await client.post(
         "/v1/agent/jobs",
-        json={"repo": "owner/name", "task_prompt": "fix it", "model": "glm-5.1"},
+        json={"repo": "owner/name", "task_prompt": "fix it", "model": model},
     )
-    assert response.status_code == 201
+
+
+async def _create_job(client: AsyncClient, *, model: str = "glm-5.1") -> str:
+    """Create a job through the API and return its id."""
+    response = await _create_job_raw(client, model=model)
+    assert response.status_code == 201, response.text
     return response.json()["id"]
 
 
@@ -3353,8 +3355,9 @@ async def test_branches_are_only_listed_for_an_entitled_repo(store: FakeAgentJob
 def _mcp_registry():
     """A registry with one default server and one opt-in server.
 
-    The registry object stayed on the gateway, so this is what
-    ``/internal/mcp-registry`` reports: name-ordered records, one per server.
+    The registry is this service's own now — the ownership amendment moved it
+    here with its credentials and its relay — so this is what
+    ``routes._mcp_registry()`` returns: name-ordered records, one per server.
 
     The URL and the credential are deliberately still in these records even
     though the real contract strips them. Nothing this service does *needs*
@@ -3387,7 +3390,7 @@ async def test_the_composer_is_told_which_servers_and_which_runtimes(
     client: AsyncClient, monkeypatch
 ):
     """A picker built from anything but the create endpoint's rules is decoration."""
-    monkeypatch.setattr(_FakeGateway, "mcp_servers", _mcp_registry())
+    monkeypatch.setattr(agent_jobs_router, "_mcp_registry", _mcp_registry)
     config = (await client.get("/v1/agent/config")).json()
 
     assert [entry["name"] for entry in config["mcp_servers"]] == ["deepwiki", "github"]
@@ -3399,7 +3402,7 @@ async def test_the_composer_is_told_which_servers_and_which_runtimes(
 
 async def test_omitting_servers_takes_the_deployment_defaults(client: AsyncClient, monkeypatch):
     """A dogfood deployment gets its issue tracker without asking each time."""
-    monkeypatch.setattr(_FakeGateway, "mcp_servers", _mcp_registry())
+    monkeypatch.setattr(agent_jobs_router, "_mcp_registry", _mcp_registry)
     created = await client.post(
         "/v1/agent/jobs",
         json={"repo": "owner/name", "task_prompt": "fix it", "model": "glm-5.1"},
@@ -3410,7 +3413,7 @@ async def test_omitting_servers_takes_the_deployment_defaults(client: AsyncClien
 
 async def test_an_explicit_empty_list_means_no_servers(client: AsyncClient, monkeypatch):
     """Choosing none is a real choice and must not be read as "unset"."""
-    monkeypatch.setattr(_FakeGateway, "mcp_servers", _mcp_registry())
+    monkeypatch.setattr(agent_jobs_router, "_mcp_registry", _mcp_registry)
     created = await client.post(
         "/v1/agent/jobs",
         json={
@@ -3426,7 +3429,7 @@ async def test_an_explicit_empty_list_means_no_servers(client: AsyncClient, monk
 
 async def test_an_unknown_server_is_refused_at_creation(client: AsyncClient, monkeypatch):
     """Better than discovering mid-run that the task's one tool is missing."""
-    monkeypatch.setattr(_FakeGateway, "mcp_servers", _mcp_registry())
+    monkeypatch.setattr(agent_jobs_router, "_mcp_registry", _mcp_registry)
     created = await client.post(
         "/v1/agent/jobs",
         json={
@@ -3442,7 +3445,7 @@ async def test_an_unknown_server_is_refused_at_creation(client: AsyncClient, mon
 
 async def test_a_runtime_that_cannot_load_mcp_refuses_the_job(client: AsyncClient, monkeypatch):
     """Silently dropping the tools would produce confidently wrong work."""
-    monkeypatch.setattr(_FakeGateway, "mcp_servers", _mcp_registry())
+    monkeypatch.setattr(agent_jobs_router, "_mcp_registry", _mcp_registry)
     created = await client.post(
         "/v1/agent/jobs",
         json={
@@ -3461,7 +3464,7 @@ async def test_the_claim_hands_the_runner_the_job_s_servers(
     client: AsyncClient, store: FakeAgentJobStore, monkeypatch
 ):
     """The runner passes names to the adapter; it never learns the addresses."""
-    monkeypatch.setattr(_FakeGateway, "mcp_servers", _mcp_registry())
+    monkeypatch.setattr(agent_jobs_router, "_mcp_registry", _mcp_registry)
     created = await client.post(
         "/v1/agent/jobs",
         json={
@@ -3582,3 +3585,77 @@ async def test_claim_rejects_a_host_that_is_not_a_hostname(client, store):
 
     assert response.status_code == 422
     assert store.runner_hosts == {}
+
+
+async def test_the_claim_hands_over_the_mcp_credential_too(client: AsyncClient, monkeypatch):
+    """**The whole MCP chain, measured across the claim boundary.**
+
+    This is where it broke and nothing noticed. `worker_claim` minted an
+    `mcp`-scoped token and computed the relay address, and
+    `WorkerClaimResponse` declared neither — so pydantic dropped both on the
+    way out and every sandbox got an empty MCP credential.
+
+    The relay's own tests all passed, because they construct a token and call
+    the endpoint directly. They never cross this boundary, which is exactly
+    where the two halves stopped agreeing: a field with a writer, a reader, and
+    a schema in between that knew about neither.
+    """
+    monkeypatch.setenv("AGENT_SANDBOX_MCP_URL", "http://agent-mcp:8000")
+    await _create_job(client)
+
+    body = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+
+    assert body["mcp_base_url"] == "http://agent-mcp:8000"
+    assert body["mcp_token"], "the sandbox was handed no MCP credential"
+
+    from cloud_agent.tokens import SCOPE_MCP, parse_worker_token
+
+    # Scoped, and not the same credential as either of the other two.
+    assert parse_worker_token(body["mcp_token"])["scope"] == SCOPE_MCP
+    assert body["mcp_token"] != body["worker_token"]
+    assert body["mcp_token"] != body["sandbox_token"]
+
+
+async def test_a_deployment_with_no_relay_hands_over_no_mcp_credential(
+    client: AsyncClient, monkeypatch
+):
+    """Empty address, and the runtime refuses rather than guessing.
+
+    Handing over a token with nowhere to spend it would point the sandbox at
+    whatever it fell back to — which is the inference gateway, a service that
+    does not answer for MCP.
+    """
+    monkeypatch.delenv("AGENT_SANDBOX_MCP_URL", raising=False)
+    await _create_job(client)
+
+    body = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+
+    assert body["mcp_base_url"] == ""
+
+
+async def test_a_job_created_with_an_alias_stores_the_canonical_id(
+    client: AsyncClient, store: FakeAgentJobStore, monkeypatch
+):
+    """**Validated as an alias, stored as an alias — the shape of the bug.**
+
+    The gateway mints a grant against canonical ids. A job that recorded
+    `legacy-name` produced a grant whose `allowed_models` matched nothing, so
+    the job was created successfully and died at its first inference call with
+    a 404 for a model that plainly exists.
+
+    Resolution translates once; everything after it works in canonical ids.
+    """
+    monkeypatch.setitem(_FakeGateway.aliases, "legacy-name", _TEST_MODELS[0])
+
+    await _create_job(client, model="legacy-name")
+
+    (job,) = list(store.jobs.values())
+    assert job["model"] == _TEST_MODELS[0], "the alias was stored instead of the canonical id"
+
+
+async def test_an_unknown_model_is_still_refused_at_creation(client: AsyncClient):
+    """The other half: resolution must not have turned refusal into a pass."""
+    response = await _create_job_raw(client, model="no-such-model")
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"]["type"] == "model_not_available"

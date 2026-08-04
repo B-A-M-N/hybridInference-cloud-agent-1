@@ -148,3 +148,56 @@ def test_the_compose_only_sets_variables_the_code_reads(control_plane_env: dict)
     )
     unread = [name for name in control_plane_env if f'"{name}"' not in sources]
     assert not unread, f"the control-plane service sets variables nothing reads: {unread}"
+
+
+def test_a_default_the_code_relies_on_is_not_blanked_out(control_plane_env: dict) -> None:
+    """**`:-` is not "leave it unset".**
+
+    Compose passes an empty string as a *set* variable, and
+    `os.getenv(name, "dev")` returns that empty string rather than the default.
+    So `${AGENT_PUBLISH_BASE_BRANCH:-}` silently means "open the PR against a
+    branch called `''`", and `${AGENT_GITHUB_API:-}` means "talk to an empty
+    API base" — both from a compose file that looks like it configured nothing.
+
+    Variables whose *code* carries a default must repeat it here or be omitted
+    entirely. Listed by name because the rule only applies to the ones with a
+    default behind them; a genuinely optional variable is right to be blank.
+    """
+    for name, default in (
+        ("AGENT_PUBLISH_BASE_BRANCH", "dev"),
+        ("AGENT_GITHUB_API", "https://api.github.com"),
+    ):
+        assert control_plane_env[name].endswith(f":-{default}}}"), (
+            f"{name} blanks out the default the code relies on"
+        )
+
+
+def test_the_runner_credential_is_required(control_plane_env: dict) -> None:
+    """Without it every claim is 401 and the queue never drains — with nothing
+    in this service's logs saying why, because the refusal is correct."""
+    assert ":?" in control_plane_env["AGENT_DISPATCHER_TOKEN"]
+
+
+def test_every_configured_file_path_is_actually_mounted(compose: dict) -> None:
+    """A path names a location *inside* the container.
+
+    Setting `AGENT_GITHUB_APP_PRIVATE_KEY_PATH` without mounting anything
+    produces a service that starts, offers Integrations, and fails at the first
+    publish; the same shape for `AGENT_MCP_CONFIG` produces a picker with no
+    servers. Both were exactly that until review caught them.
+    """
+    service = compose["services"]["control-plane"]
+    env = service["environment"]
+    # Split from the right: the host side is still `${VAR:-/dev/null}` in the
+    # unrendered file and carries a colon of its own, so counting from the left
+    # lands inside the interpolation.
+    mounted = set()
+    for mount in service.get("volumes") or []:
+        if isinstance(mount, dict):
+            mounted.add(mount.get("target"))
+            continue
+        parts = str(mount).rsplit(":", 2)
+        mounted.add(parts[1] if len(parts) == 3 else parts[-1])
+    for name in ("AGENT_GITHUB_APP_PRIVATE_KEY_PATH", "AGENT_MCP_CONFIG"):
+        default = env[name].split(":-", 1)[1].rstrip("}")
+        assert default in mounted, f"{name} defaults to {default}, which nothing mounts"

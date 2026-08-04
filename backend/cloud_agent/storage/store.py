@@ -2591,7 +2591,19 @@ class AgentJobStore:
                 WHERE grant_id IS NOT NULL
                   AND status = 'running'
                   AND lease_expires_at > NOW()
-                ORDER BY id
+                -- **Most urgent first, not lowest id.** `ORDER BY id` returns
+                -- the same first `limit` rows on every pass, so in a pool with
+                -- more live attempts than that, everything above the cut is
+                -- never renewed at all — its grants expire and its jobs die at
+                -- a model call, while the loop reports itself healthy.
+                --
+                -- Ordering by the lease also rotates: a heartbeat pushes an
+                -- attempt to the back, so the window moves. It is an
+                -- approximation — the grant's own expiry lives at the gateway
+                -- and this side cannot sort on it — which is why the caller
+                -- logs a truncated pass rather than trusting the ordering to
+                -- be sufficient on its own.
+                ORDER BY lease_expires_at ASC, id ASC
                 LIMIT $1
                 """,
                 limit,

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import os
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 from cloud_agent_host.workspace_broker_client import (
     WorkspaceBrokerClient,
@@ -44,6 +45,55 @@ from cloud_agent_host.workspace_broker_client import (
 
 if TYPE_CHECKING:
     from cloud_agent.storage.store import AgentJobStore
+
+#: Hosts a broker URL may name. Empty means "any", which is the shape a
+#: single-host deployment runs in and the shape this had before the check.
+ENV_BROKER_HOSTS = "AGENT_BROKER_URL_ALLOWED_HOSTS"
+
+
+class BrokerUrlRefused(ValueError):
+    """A host reported a broker address this deployment will not talk to."""
+
+
+def validate_broker_url(url: str | None) -> str | None:
+    """Return ``url`` if this deployment may send its broker token there.
+
+    **A host proposes its own broker address, and the control plane then sends
+    the pool's shared token to it.** So an address accepted here is an address
+    that receives a credential good for every broker in the pool — a
+    compromised host, or one with a typo, could name anything and be handed it.
+
+    Two checks, both structural:
+
+    * **Scheme.** `http`/`https` only. A `file:` or `gopher:` URL is not a
+      broker, and the client would do something surprising with it.
+    * **Host allowlist**, when configured. Names, not patterns: a pattern is a
+      thing to get subtly wrong, and the set of machines in a pool is small
+      and known. Unconfigured means any host, which is what this did before —
+      the check is opt-in so that turning it on is a deployment's decision
+      rather than something that breaks every existing pool on upgrade.
+
+    Raises:
+        BrokerUrlRefused: If the URL is unusable or names a host outside the
+            allowlist. Refused rather than dropped: a host whose address is
+            ignored looks enrolled and silently never serves a workspace.
+    """
+    if url is None or not url.strip():
+        return None
+    candidate = url.strip()
+    parsed = urlparse(candidate)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise BrokerUrlRefused(f"broker_url must be an http(s) URL, got {candidate!r}")
+
+    allowed = [
+        entry.strip()
+        for entry in (os.environ.get(ENV_BROKER_HOSTS) or "").split(",")
+        if entry.strip()
+    ]
+    if allowed and parsed.hostname not in allowed:
+        raise BrokerUrlRefused(f"broker_url host {parsed.hostname!r} is not in {ENV_BROKER_HOSTS}")
+    return candidate
+
 
 ENV_BROKER_TOKEN = "AGENT_WORKSPACE_BROKER_TOKEN"
 

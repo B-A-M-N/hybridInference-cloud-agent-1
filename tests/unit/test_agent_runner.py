@@ -708,3 +708,37 @@ def test_the_host_flag_defaults_from_the_environment(monkeypatch):
     args = runner_mod.build_parser().parse_args([])
 
     assert args.host == "runner-a"
+
+
+def test_the_control_plane_and_the_gateway_are_separate_destinations():
+    """**They were one value, and after the split they are two services.**
+
+    The runner claims work, reports events and renews its lease against the
+    control plane; the sandbox calls models against the gateway. Pointing a
+    single value at either one breaks whichever half it is not — the runner
+    claims nothing, or every job dies at its first model call.
+
+    `AGENT_CONTROL_PLANE_URL` falls back to the gateway's so a host that has
+    not been reconfigured keeps behaving exactly as before: wrong in the same
+    way, rather than newly broken, which is the only safe default while both
+    shapes are deployed.
+    """
+    import os
+    from unittest.mock import patch
+
+    from cloud_agent_host.runner import build_parser
+
+    with patch.dict(
+        os.environ,
+        {"AGENT_CONTROL_PLANE_URL": "http://control:8000", "AGENT_GATEWAY_URL": "http://gw:8080"},
+        clear=False,
+    ):
+        args = build_parser().parse_args([])
+    assert args.base_url == "http://control:8000"
+    assert args.gateway_url == "http://gw:8080"
+
+    # Unset control-plane URL: the old single-value shape, unchanged.
+    with patch.dict(os.environ, {"AGENT_GATEWAY_URL": "http://gw:8080"}, clear=True):
+        legacy = build_parser().parse_args([])
+    assert legacy.base_url == "http://gw:8080"
+    assert legacy.gateway_url == "http://gw:8080"

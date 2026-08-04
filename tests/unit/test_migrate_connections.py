@@ -466,3 +466,41 @@ def test_the_ignored_gateway_secret_is_announced_before_anything_can_refuse(
     # First line, ahead of the configuration error that ended the run — which
     # is where the notice used to be unreachable.
     assert "must both be set" in stderr
+
+
+def test_the_same_id_under_a_different_owner_is_a_conflict_not_a_refresh() -> None:
+    """**The one that would have handed a user somebody else's repositories.**
+
+    Both databases assign ids of their own, so a numeric collision between them
+    is ordinary rather than a sign of anything. The plan matched on `id` alone,
+    so a source row and an unrelated target row that happened to share a number
+    were read as the same connection needing a refresh — and the import would
+    overwrite one user's source-control credential with another's.
+
+    Silently, and with the migration reporting success: the row counts and the
+    checksums would all agree, because from the plan's point of view exactly
+    one row was updated.
+    """
+    spec = mc.REPO_GRANTS
+    source = [_grant(5, "u1", 10)]
+    target = [_grant(5, "u2", 20)]
+
+    plan = mc.plan_table(spec, source, [{}], target, [{}])
+
+    assert plan.blocked, "an id collision across owners was planned as an update"
+    assert plan.refresh == [] and plan.unchanged == []
+    assert plan.conflict[0]["id"] == 5
+    assert plan.conflict[0]["_target_id"] == 5
+
+
+def test_the_same_id_under_the_same_owner_still_refreshes() -> None:
+    """The other half: an id that names the same connection is exactly what a
+    re-run is for, and refusing it would make the import non-idempotent."""
+    spec = mc.REPO_GRANTS
+    source = [_grant(5, "u1", 10, login="acme-renamed")]
+    target = [_grant(5, "u1", 10, login="acme")]
+
+    plan = mc.plan_table(spec, source, [{}], target, [{}])
+
+    assert [row["id"] for row in plan.refresh] == [5]
+    assert not plan.blocked

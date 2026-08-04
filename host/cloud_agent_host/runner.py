@@ -347,7 +347,6 @@ def claim(
     if host:
         payload["host"] = host
     try:
-        # TODO(E9): point worker control traffic at AGENT_CONTROL_PLANE_URL;
         # this legacy base_url still also feeds sandbox gateway traffic below.
         response = httpx.post(
             f"{base_url.rstrip('/')}/v1/agent/worker/claim",
@@ -881,6 +880,7 @@ def run_agent(
 def run_once(
     *,
     base_url: str,
+    gateway_url: str = "",
     dispatcher_token: str,
     worker_id: str,
     workdir: str,
@@ -1087,9 +1087,11 @@ def run_once(
             runtime,
             job=job,
             workdir=workdir,
-            # TODO(E9): replace this shared legacy value with AGENT_GATEWAY_URL;
-            # claim/control calls above must use AGENT_CONTROL_PLANE_URL instead.
-            gateway_base_url=base_url,
+            # The gateway, not the control plane. Everything above this line
+            # spoke to the control plane over `base_url`; the sandbox's model
+            # calls go somewhere else entirely, and conflating the two is what
+            # this argument exists to stop.
+            gateway_base_url=gateway_url,
             control=control,
             heart=heart,
             timeout_s=agent_timeout_s,
@@ -1186,6 +1188,7 @@ def run_once(
 def run_forever(
     *,
     base_url: str,
+    gateway_url: str = "",
     dispatcher_token: str,
     worker_id: str,
     workdir_root: str,
@@ -1216,11 +1219,13 @@ def run_forever(
     # Pass the workdir root so a backend that bind-mounts it can prove the
     # mount works now, rather than failing every job with an opaque error.
     backend.preflight(workdir_root=str(root))
-    # The sandbox must be able to reach the gateway it will be handed. Checked
-    # once here rather than discovered per job as an opaque model failure.
+    # The sandbox must be able to reach the gateway it will be handed —
+    # `gateway_url`, not the control plane this runner claims against. Checking
+    # the wrong one proves the runner's own connectivity and says nothing about
+    # the sandbox's, which is the connection that actually fails per job.
     checker = getattr(backend, "check_gateway_reachable", None)
     if checker is not None:
-        checker(base_url)
+        checker(gateway_url or base_url)
     where = f" on host {host}" if host else " (no host reported)"
     print(
         f"agent runner {worker_id} started{where} (sandbox backend: {backend.name})",
@@ -1230,6 +1235,7 @@ def run_forever(
     while True:
         try:
             run_once(
+                gateway_url=gateway_url,
                 base_url=base_url,
                 dispatcher_token=dispatcher_token,
                 worker_id=worker_id,
@@ -1325,11 +1331,29 @@ def build_parser() -> argparse.ArgumentParser:
     a runner container crash-loops.
     """
     parser = argparse.ArgumentParser(description="Run queued agent jobs.")
-    # Keep the deployment's old variable as a fallback until its hosts have
-    # migrated. AGENT_GATEWAY_URL remains the public, preferred name.
+    # **Two origins, and after the split they are two services.** The runner
+    # claims work, reports events and renews its lease against this *control
+    # plane*; the sandbox calls models against the *gateway*. They were one
+    # value while the agent lived inside the gateway, and pointing that single
+    # value at either service after the split breaks whichever half it is not.
+    #
+    # `AGENT_CONTROL_PLANE_URL` falls back to the gateway URL so a host that
+    # has not been reconfigured keeps behaving exactly as it did — wrong in the
+    # same way as before rather than newly broken, which is the only safe
+    # default while both shapes are deployed.
     parser.add_argument(
         "--base-url",
+        default=(
+            os.environ.get("AGENT_CONTROL_PLANE_URL")
+            or os.environ.get("AGENT_GATEWAY_URL")
+            or os.environ.get("FREEINFERENCE_BASE_URL", "")
+        ),
+        help="Control plane: claim, heartbeat, events, artifacts, terminals.",
+    )
+    parser.add_argument(
+        "--gateway-url",
         default=os.environ.get("AGENT_GATEWAY_URL") or os.environ.get("FREEINFERENCE_BASE_URL", ""),
+        help="Inference gateway, as the sandbox reaches it. Model calls only.",
     )
     parser.add_argument("--worker-id", default=default_worker_id())
     parser.add_argument(
@@ -1388,11 +1412,14 @@ def main(argv: list[str] | None = None) -> int:
 
     dispatcher_token = os.environ.get("AGENT_DISPATCHER_TOKEN", "")
     if not args.base_url or not dispatcher_token:
-        parser.error("AGENT_GATEWAY_URL and AGENT_DISPATCHER_TOKEN are required")
+        parser.error(
+            "AGENT_CONTROL_PLANE_URL (or AGENT_GATEWAY_URL) and AGENT_DISPATCHER_TOKEN are required"
+        )
 
     if args.loop:
         return run_forever(
             base_url=args.base_url,
+            gateway_url=args.gateway_url or args.base_url,
             dispatcher_token=dispatcher_token,
             worker_id=args.worker_id,
             workdir_root=args.workdir_root,
@@ -1405,6 +1432,7 @@ def main(argv: list[str] | None = None) -> int:
 
     return run_once(
         base_url=args.base_url,
+        gateway_url=args.gateway_url or args.base_url,
         dispatcher_token=dispatcher_token,
         worker_id=args.worker_id,
         workdir=args.workdir,

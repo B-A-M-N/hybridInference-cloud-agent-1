@@ -61,6 +61,7 @@ from cloud_agent.github_app import AppNotInstalled, GitHubAppError
 from cloud_agent.host_pool import hash_secret
 from cloud_agent.identity import SESSION_COOKIE
 from cloud_agent.logging_utils import get_logger
+from cloud_agent.mcp_registry import get_registry
 from cloud_agent.schemas import (
     BASE_REF_METADATA_KEY,
     EVENT_TYPE_PATTERN,
@@ -128,7 +129,7 @@ from cloud_agent.tokens import (
     parse_host_token,
     parse_worker_token,
 )
-from cloud_agent.visible_models import agent_model_resolvable, agent_visible_models
+from cloud_agent.visible_models import agent_canonical_model, agent_visible_models
 from cloud_agent_host.egress import (
     EgressPolicyError,
     build_policy_from_env as build_egress_policy,
@@ -418,7 +419,7 @@ async def get_agent_config(
         models=await agent_visible_models(gateway, user_id=user["user_id"]),
         # Public fields only — McpServerSummary has nowhere to put a URL or a
         # credential, which is how it stays that way.
-        mcp_servers=[McpServerSummary(**entry) for entry in await _mcp_registry(gateway)],
+        mcp_servers=[McpServerSummary(**entry) for entry in _mcp_registry()],
         mcp_runtimes=runtimes_supporting_mcp(),
         setup_egress_tier=setup_tier,
         agent_egress_tier=agent_tier,
@@ -857,15 +858,24 @@ async def _require_resolvable_model(
     *,
     gateway: Any,
     user: dict[str, Any],
-) -> None:
-    """Fail-fast on a model the job's first call would 404 on.
+) -> str:
+    """Resolve the requested model to its canonical id, or refuse the job.
 
-    Rejecting here costs a 400. Accepting costs a claim, a clone, and an
-    attempt before the sandbox's first model call dies with an error that
-    reads like a broken model.
+    Fail-fast on a model the job's first call would 404 on: rejecting here
+    costs a 400, while accepting costs a claim, a clone and an attempt before
+    the sandbox's first model call dies with an error that reads like a broken
+    model.
+
+    **Returns the canonical id, and the caller stores that.** Validating an
+    alias and then recording the alias was the bug this signature exists to
+    prevent: the gateway mints a grant against canonical ids, so a job carrying
+    `claude-3-opus-latest` produced a grant whose `allowed_models` matched
+    nothing. The job was created, and died at its first inference call with a
+    404 from a model that plainly exists.
     """
-    if await agent_model_resolvable(model, gateway, user_id=user["user_id"]):
-        return
+    canonical = await agent_canonical_model(model, gateway, user_id=user["user_id"])
+    if canonical is not None:
+        return canonical
     visible = await agent_visible_models(gateway, user_id=user["user_id"])
     raise HTTPException(
         status_code=400,
@@ -881,22 +891,35 @@ async def _require_resolvable_model(
     )
 
 
-async def _mcp_registry(gateway: Any) -> list[dict[str, Any]]:
-    """The MCP servers this deployment offers, as the gateway reports them.
+def _mcp_registry() -> list[dict[str, Any]]:
+    """The MCP servers this deployment offers, read from its own registry.
 
-    The registry itself stayed on the gateway, because it holds each server's
-    address and credential and keeping those off this side is the entire point
-    of the indirection. So a cached in-process load became one HTTP call, and
-    its degradation is kept unchanged: a registry that cannot be read means *no
-    servers*, never a failed request. That is also the safe direction — fewer
-    tools, not more — and it is visible, because a composer offering nothing is
-    obviously wrong while a composer offering a tool the job will not get is not.
+    This asked the *gateway* until the ownership amendment moved MCP here. The
+    endpoint it called no longer exists, so the call returned nothing and the
+    composer offered no servers at all — a feature that stopped working with a
+    log line and no error.
+
+    Names and display metadata only. A server's URL and headers never leave
+    this process: the sandbox reaches an upstream through the relay, which is
+    the entire reason the registry lives beside the relay rather than beside
+    the picker.
     """
-    try:
-        return await gateway.mcp_registry()
-    except GatewayError:
-        logger.error("agent_mcp_registry_unavailable", exc_info=True)
-        return []
+    registry = get_registry()
+    servers: list[dict[str, Any]] = []
+    for name in registry.names:
+        server = registry.get(name)
+        if server is None:  # pragma: no cover - names() is derived from servers
+            continue
+        servers.append(
+            {
+                "name": server.name,
+                "description": server.description,
+                "default": server.default,
+                "tools": sorted(server.tools),
+                "unfiltered": server.unfiltered,
+            }
+        )
+    return servers
 
 
 async def _resolve_mcp_servers(
@@ -909,7 +932,7 @@ async def _resolve_mcp_servers(
     written around a tool the agent turns out not to have does not fail — it
     quietly produces the wrong work, having spent the budget.
     """
-    configured = await _mcp_registry(gateway)
+    configured = _mcp_registry()
     names = sorted(str(entry.get("name") or "") for entry in configured)
     if requested is None:
         # ``None`` means the job did not choose and takes the deployment's
@@ -963,7 +986,10 @@ async def create_agent_job(
 ) -> AgentJobResponse:
     """Queue a new agent job for the authenticated user."""
     job_store = _require_store(store)
-    await _require_resolvable_model(body.model, gateway=gateway, user=user)
+    # Canonical from here on. The grant the gateway mints names canonical
+    # ids, so a job that stored the alias would carry a scope matching
+    # nothing — created successfully, dead at its first inference call.
+    model = await _require_resolvable_model(body.model, gateway=gateway, user=user)
     # The requester chooses the repository and the platform later mints a real
     # installation token for it. Without this the two combine into a confused
     # deputy: name any repository the App reaches, and read it back through
@@ -1013,7 +1039,7 @@ async def create_agent_job(
         repo=body.repo,
         task_prompt=body.task_prompt,
         runtime=body.runtime,
-        model=body.model,
+        model=model,
         base_sha=base_sha,
         setup_script=body.setup_script,
         metadata=metadata or None,
@@ -1216,8 +1242,9 @@ async def create_agent_follow_up(
     # A follow-up may switch models; the switched-to model gets the same
     # fail-fast as a fresh job. An omitted model inherits the parent's, which
     # was validated when it was chosen.
+    model = None
     if body.model:
-        await _require_resolvable_model(body.model, gateway=gateway, user=user)
+        model = await _require_resolvable_model(body.model, gateway=gateway, user=user)
     try:
         await require_entitled_repo(
             parent["repo"],
@@ -1243,7 +1270,9 @@ async def create_agent_follow_up(
         user_id=user["user_id"],
         prompt=body.prompt,
         runtime=body.runtime,
-        model=body.model,
+        # Canonical, or the parent's when omitted — never the alias the caller
+        # typed, which the gateway's grant would not match.
+        model=model if body.model else None,
     )
     if job is None:
         raise HTTPException(
