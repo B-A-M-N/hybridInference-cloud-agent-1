@@ -55,13 +55,13 @@ async def test_a_trailing_slash_does_not_produce_a_double_slash() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen["path"] = request.url.path
-        return httpx.Response(200, json={"servers": []})
+        return httpx.Response(200, json={"user_id": "user_1", "exists": True, "active": True})
 
     client = GatewayClient(
         f"{BASE}/", TOKEN, client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
     )
-    await client.mcp_registry()
-    assert seen["path"] == "/internal/mcp-registry"
+    await client.user_status("user_1")
+    assert seen["path"] == "/internal/users/user_1/status"
 
 
 # ---------------------------------------------------------------------------
@@ -112,12 +112,14 @@ async def test_user_status_returns_the_record_verbatim() -> None:
     assert await _client(_serves(record)).user_status("user_1") == record
 
 
-async def test_mcp_registry_drops_non_object_entries() -> None:
-    """A malformed entry must not become a server name the picker offers."""
-    servers = await _client(_serves({"servers": [{"name": "github"}, "junk", 7]})).mcp_registry()
-    assert servers == [{"name": "github"}]
-
-
-async def test_mcp_registry_raises_when_the_list_is_missing() -> None:
-    with pytest.raises(GatewayError):
-        await _client(_serves({"oops": True})).mcp_registry()
+# Two `mcp_registry` tests stood here — one dropping malformed entries, one
+# refusing a response with no list. Both went with the method: the gateway no
+# longer serves `/internal/mcp-registry`.
+#
+# What they guarded is covered more strictly where the registry now lives.
+# `test_mcp_registry_and_proxy.py` refuses a malformed entry rather than
+# dropping it (`test_invalid_server_names_are_refused`, `_stdio_servers_`,
+# `_plaintext_endpoints_`, `_reserved_headers_`), and an absent file means no
+# servers (`test_missing_file_means_no_servers`) — checked case by case rather
+# than assumed, because "the other file covers it" is how coverage disappears
+# during a move.
