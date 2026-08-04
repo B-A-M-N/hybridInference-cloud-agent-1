@@ -483,7 +483,7 @@ def create_app() -> FastAPI:
     """Build the control plane application."""
     configure_process_logging()
 
-    from cloud_agent.api import admin_hosts, hosts, routes, session
+    from cloud_agent.api import admin_hosts, hosts, mcp_relay, routes, session
 
     app = FastAPI(
         title="FreeInference Cloud Agent",
@@ -492,6 +492,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     app.include_router(routes.router)
+    app.include_router(mcp_relay.router)
     app.include_router(hosts.router)
     app.include_router(admin_hosts.router)
     # The web app's way in. Mounted alongside the others rather than inside

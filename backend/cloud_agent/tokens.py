@@ -89,21 +89,28 @@ def _b64decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + padding)
 
 
-# Two scopes, because the runner and the sandbox need different powers.
+# Three scopes, because the runner and the sandbox need different powers — and
+# the sandbox's two powers come from two different services.
 #
 # ``full`` is held by the runner (a trusted process outside the sandbox): it
 # reports events, uploads artifacts, renews the lease and drives terminal
 # transitions.
 #
-# ``model`` is the narrow credential a sandbox may hold. It buys model calls
-# and nothing else — so an agent that leaks it, or a hostile repo that steals
-# it, cannot poison the event log, overwrite the patch, or force a terminal
-# state. What it *can* spend is no longer capped per task: the grant that
-# replaces it names the models an attempt may call, and the gateway's per-user
-# daily quota governs how much.
+# ``mcp`` is what a sandbox carries to reach tools, and it is minted and
+# verified **here** — this service owns the MCP registry, its upstream
+# credentials and the attempt fence, so it is the only place that can decide a
+# tool call. Model calls are a different credential entirely: the gateway's
+# ``agr`` grant, which this service never mints and the relay never accepts.
+# The two are deliberately not interchangeable, so a leaked MCP token buys no
+# inference and a leaked grant buys no tools.
+#
+# ``model`` is the sandbox's *previous* inference credential, kept while jobs
+# started before the cutover are still running. New attempts get a grant
+# instead. It is removed with the gateway's legacy MCP route at H4.
 SCOPE_FULL = "full"
 SCOPE_MODEL = "model"
-_VALID_SCOPES = (SCOPE_FULL, SCOPE_MODEL)
+SCOPE_MCP = "mcp"
+_VALID_SCOPES = (SCOPE_FULL, SCOPE_MODEL, SCOPE_MCP)
 
 # ``host`` is the third scope, and it is deliberately *not* in the tuple above.
 #

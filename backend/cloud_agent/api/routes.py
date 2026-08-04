@@ -2167,11 +2167,16 @@ def _worker_claims(authorization: str | None) -> dict[str, Any]:
             detail={"error": {"type": "unauthorized", "message": f"Invalid worker token: {exc}"}},
         ) from exc
     if claims.get("scope") != SCOPE_FULL:
-        # Anything that is not the runner's full-scope control token. Since E9
-        # the sandbox carries a gateway grant instead of a ``model``-scoped
-        # worker token, so this no longer has a live minter — it is kept as the
-        # structural refusal for any narrower scope that reaches this surface,
-        # which is what an escaped credential would look like.
+        # Anything that is not the runner's full-scope control token. Two
+        # narrower scopes exist and neither belongs here: ``mcp``, which the
+        # sandbox carries to reach this service's MCP relay, and ``model``,
+        # which predates the gateway grant and is kept only for jobs started
+        # before the cutover.
+        #
+        # This is the structural refusal for both — and the reason the relay's
+        # own check is written positively rather than as "not full". A sandbox
+        # credential arriving on the worker surface is what an escaped
+        # credential looks like.
         raise HTTPException(
             status_code=403,
             detail={
