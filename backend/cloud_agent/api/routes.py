@@ -121,6 +121,7 @@ from cloud_agent.storage.store import PUBLISHING, RUNNING, TERMINAL_STATES
 from cloud_agent.terminal_coordination import resume_settled_terminal
 from cloud_agent.tokens import (
     SCOPE_FULL,
+    SCOPE_MCP,
     InvalidAgentToken,
     InvalidHostToken,
     mint_worker_token,
@@ -153,6 +154,14 @@ if TYPE_CHECKING:
     from cloud_agent.storage.store import AgentJobStore
 
 logger = get_logger(__name__)
+#: The MCP relay's address **as a sandbox can reach it** — a host-local relay,
+#: not this process's own bind address, which is why it is configured rather
+#: than derived. Unset means this deployment offers no MCP: the claim carries
+#: no address, and a runtime asked for servers anyway refuses rather than
+#: resolving them against the inference gateway, which does not answer for MCP.
+ENV_SANDBOX_MCP_URL = "AGENT_SANDBOX_MCP_URL"
+
+
 router = APIRouter(prefix="/v1/agent")
 
 # Same anti-buffering headers the completions SSE path uses: `no-transform`
@@ -2425,6 +2434,16 @@ async def worker_claim(
     # which bought nothing, and failed at the sandbox's first model call.)
     token = mint_worker_token(**fence, scope=SCOPE_FULL)
     sandbox_token = await _mint_sandbox_grant(job_store, grants, claim)
+
+    # The sandbox's *second* credential, and this one is ours to mint: MCP is
+    # served by this service's relay, against this service's registry and this
+    # service's attempt fence. Scoped `mcp` so it opens the relay and nothing
+    # else — not the worker surface, and certainly not the gateway.
+    #
+    # Two credentials rather than one because they authorize at two services
+    # now. A leak is bounded by whichever it was: the grant buys models it
+    # names, this buys tools the job asked for, and neither buys the other.
+    mcp_token = mint_worker_token(**fence, scope=SCOPE_MCP)
     context = await job_store.follow_up_context(job_id=claim["id"])
 
     # A third credential, weaker than either: read-only, this repository only,
@@ -2526,6 +2545,11 @@ async def worker_claim(
         model=claim["model"],
         worker_token=token,
         sandbox_token=sandbox_token,
+        mcp_token=mcp_token,
+        # Where the sandbox reaches the relay. Configured rather than derived:
+        # the runner sees this service through a host-local relay whose address
+        # is nothing this process can work out for itself.
+        mcp_base_url=os.environ.get(ENV_SANDBOX_MCP_URL, ""),
         clone_token=clone_token,
         context_messages=context["messages"],
         context_patch=context["patch"],

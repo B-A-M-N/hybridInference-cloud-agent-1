@@ -162,8 +162,15 @@ class ClaimedJob:
     runtime: str
     model: str
     worker_token: str
-    # Model-scoped credential: the only one that enters the sandbox.
+    # The inference credential that enters the sandbox: a gateway grant.
     sandbox_token: str
+    # The MCP credential, and the relay it opens. A *second* pair, because
+    # tools and inference are two services now: a leaked MCP token buys no
+    # inference and a leaked grant buys no tools. Empty means this run has no
+    # MCP, which the runtime refuses rather than resolving against the
+    # inference address.
+    mcp_token: str = ""
+    mcp_base_url: str = ""
     # Shell run before the agent, under the setup egress tier. Optional, so it
     # carries a default rather than forcing every caller to pass one.
     setup_script: str | None = None
@@ -205,6 +212,8 @@ class ClaimedJob:
             # Older gateways return only worker_token; fall back so a
             # runner can still talk to one that predates scoped tokens.
             sandbox_token=body.get("sandbox_token") or body["worker_token"],
+            mcp_token=body.get("mcp_token") or "",
+            mcp_base_url=body.get("mcp_base_url") or "",
             clone_token=body.get("clone_token") or None,
             context_messages=list(body.get("context_messages") or []),
             context_patch=body.get("context_patch") or None,
@@ -1085,11 +1094,16 @@ def run_once(
             heart=heart,
             timeout_s=agent_timeout_s,
             backend=backend,
-            # Opaque ids, straight from the claim. The runner deliberately
-            # never learns where these servers are or what credential reaches
-            # them — the gateway resolves both, which is what keeps the sandbox
-            # able to use them without any egress of its own.
-            mcp_config=RuntimeMCPConfig(server_ids=tuple(job.mcp_servers)),
+            # Opaque ids, straight from the claim. The runner still never
+            # learns where an upstream server is or what credential reaches it
+            # — the relay resolves both. What it does carry now is the relay's
+            # own address and token, which are this deployment's, not an
+            # upstream's.
+            mcp_config=RuntimeMCPConfig(
+                server_ids=tuple(job.mcp_servers),
+                base_url=job.mcp_base_url,
+                credential=job.mcp_token,
+            ),
         )
 
         # Freeze both interactive input and already-running terminal process

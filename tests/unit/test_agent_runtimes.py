@@ -302,27 +302,39 @@ def test_mcp_config_fails_closed_without_a_gateway_broker(runtime):
     assert "mcp-secret-must-not-leak" not in str(raised.value)
 
 
-def test_a_brokered_runtime_emits_only_gateway_endpoints_and_no_credential():
+def test_a_brokered_runtime_emits_only_relay_endpoints_and_no_credential():
     """The same rule, for the adapter that does resolve servers.
 
     "Fails closed" was only ever a stand-in for this: a requested server must
-    not become direct MCP, and the credential must not become a CLI argument.
-    An adapter that gained a broker has to keep both, not inherit an exemption.
+    not become direct MCP, and neither credential must become a CLI argument.
+
+    **Two addresses and two credentials.** MCP is the cloud agent's relay, not
+    the inference gateway — a sandbox pointed at the gateway for tools reaches
+    a service that no longer answers for them. This case is where the two are
+    kept apart, so it asserts that the inference credential is *not* what opens
+    MCP.
     """
     argv, env = ClaudeCodeRuntime().prepare(
         workdir="/tmp/x",
         task_prompt="do it",
         model="glm-5.1",
         gateway_base_url="http://backend:8080",
-        credential="mcp-secret-must-not-leak",
-        mcp_config=RuntimeMCPConfig(server_ids=("github",)),
+        credential="agr-inference-grant-must-not-leak",
+        mcp_config=RuntimeMCPConfig(
+            server_ids=("github",),
+            base_url="http://agent-mcp:8000",
+            credential="mcp-token-must-not-leak",
+        ),
     )
     rendered = " ".join(argv)
 
-    assert "mcp-secret-must-not-leak" not in rendered
-    assert env["AGENT_MCP_TOKEN"] == "mcp-secret-must-not-leak"
+    assert "mcp-token-must-not-leak" not in rendered
+    assert "agr-inference-grant-must-not-leak" not in rendered
+    assert env["AGENT_MCP_TOKEN"] == "mcp-token-must-not-leak"
+    assert env["ANTHROPIC_API_KEY"] == "agr-inference-grant-must-not-leak"
+    assert env["AGENT_MCP_TOKEN"] != env["ANTHROPIC_API_KEY"]
     servers = json.loads(argv[argv.index("--mcp-config") + 1])["mcpServers"]
-    assert servers["github"]["url"] == "http://backend:8080/v1/agent/mcp/github"
+    assert servers["github"]["url"] == "http://agent-mcp:8000/v1/agent/mcp/github"
     assert "--strict-mcp-config" in argv
 
 
@@ -519,18 +531,40 @@ def test_repository_supplied_mcp_config_is_shut_out_even_with_no_servers():
     assert _mcp_config_of(argv) == {"mcpServers": {}}
 
 
-def test_the_gateway_base_url_is_normalized_once():
-    """A base url already ending in /v1 must not produce /v1/v1."""
+def test_the_relay_base_url_is_normalized_once():
+    """A relay url already ending in /v1 must not produce /v1/v1."""
     argv, _env = ClaudeCodeRuntime().prepare(
         workdir="/tmp/x",
         task_prompt="do it",
         model="glm-5.1",
-        gateway_base_url=f"{_MCP_GATEWAY}/v1",
-        credential="mcp-secret-must-not-leak",
-        mcp_config=RuntimeMCPConfig(server_ids=("github",)),
+        gateway_base_url=_MCP_GATEWAY,
+        credential="inference-credential",
+        mcp_config=RuntimeMCPConfig(
+            server_ids=("github",),
+            base_url=f"{_MCP_GATEWAY}/v1",
+            credential="mcp-token",
+        ),
     )
     servers = _mcp_config_of(argv)["mcpServers"]
     assert servers["github"]["url"] == f"{_MCP_GATEWAY}/v1/agent/mcp/github"
+
+
+def test_requesting_mcp_with_no_relay_address_refuses_rather_than_guessing():
+    """**The failure this separation makes possible, refused explicitly.**
+
+    Falling back to the inference address would point the sandbox at a service
+    that does not answer for MCP — 404s from an unrelated host, which reads as
+    "the tool is broken" rather than "this run has no relay".
+    """
+    with pytest.raises(RuntimeMCPUnavailableError):
+        ClaudeCodeRuntime().prepare(
+            workdir="/tmp/x",
+            task_prompt="do it",
+            model="glm-5.1",
+            gateway_base_url=_MCP_GATEWAY,
+            credential="inference-credential",
+            mcp_config=RuntimeMCPConfig(server_ids=("github",)),
+        )
 
 
 def test_only_runtimes_that_can_also_shut_out_repo_config_report_mcp():

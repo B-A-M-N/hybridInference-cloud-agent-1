@@ -18,14 +18,6 @@ from cloud_agent.mcp_registry import (
     McpServer,
     load_registry,
 )
-from cloud_agent_host.runtimes import (
-    MCP_TOKEN_ENV,
-    ClaudeCodeRuntime,
-    CodexRuntime,
-    RuntimeMCPConfig,
-    RuntimeMCPUnavailableError,
-    runtimes_supporting_mcp,
-)
 
 _GATEWAY = "https://gateway.example.com"
 _TOKEN = "ajt.job.attempt.signature"
@@ -286,96 +278,15 @@ def test_sse_passes_through_frames_that_are_not_catalogues():
     assert sse.feed(frame) + sse.flush() == frame
 
 
-# ── runtime wiring ────────────────────────────────────────────────────
-
-
-def _prepare(*server_ids: str) -> tuple[list[str], dict[str, str]]:
-    """Build the Claude Code invocation for a job."""
-    return ClaudeCodeRuntime().prepare(
-        workdir="/w",
-        task_prompt="do it",
-        model="glm-5.1",
-        gateway_base_url=_GATEWAY,
-        credential=_TOKEN,
-        mcp_config=RuntimeMCPConfig(server_ids=server_ids),
-    )
-
-
-def _argv(*server_ids: str) -> list[str]:
-    """Build only the argv."""
-    return _prepare(*server_ids)[0]
-
-
-def _mcp_config(argv: list[str]) -> dict:
-    """Return the MCP config the invocation carries."""
-    return json.loads(argv[argv.index("--mcp-config") + 1])
-
-
-def test_repository_supplied_mcp_config_is_shut_out_even_with_no_servers():
-    """The repository is untrusted input and may not add its own servers.
-
-    Reproduced against the real CLI in a job's exact configuration (headless,
-    ``bypassPermissions``, cwd = a checkout carrying a ``.mcp.json``): without
-    this flag the CLI reports the repository's server alongside the platform's,
-    with no approval step — the permission mode the sandbox needs for its own
-    work is what removes the gate. Hence unconditional, rather than paired with
-    having servers: a job with no MCP at all is where an injected one would be
-    least expected.
-    """
-    argv = _argv()
-    assert "--strict-mcp-config" in argv
-    assert _mcp_config(argv) == {"mcpServers": {}}
-
-
-def test_granted_servers_point_at_the_gateway_and_never_upstream():
-    """The sandbox is given our proxy, and learns nothing about who answers."""
-    config = _mcp_config(_argv("github"))["mcpServers"]
-    assert config["github"]["url"] == f"{_GATEWAY}/v1/agent/mcp/github"
-    assert config["github"]["type"] == "http"
-
-
-def test_the_job_token_is_referenced_by_name_never_written_into_argv():
-    """A secret in argv is readable from the process table and leaks into tails.
-
-    The CLI expands ``${AGENT_MCP_TOKEN}`` from the environment, verified
-    against the real binary: the proxy authenticates a request configured this
-    way while the command line carries only the placeholder.
-    """
-    argv, env = _prepare("github")
-    config = _mcp_config(argv)["mcpServers"]
-    assert config["github"]["headers"] == {"Authorization": f"Bearer ${{{MCP_TOKEN_ENV}}}"}
-    assert _TOKEN not in " ".join(argv)
-    assert env[MCP_TOKEN_ENV] == _TOKEN
-
-
-def test_the_gateway_base_url_is_normalized_once():
-    """A base url already ending in /v1 must not produce /v1/v1."""
-    argv, _ = ClaudeCodeRuntime().prepare(
-        workdir="/w",
-        task_prompt="do it",
-        model="glm-5.1",
-        gateway_base_url=f"{_GATEWAY}/v1",
-        credential=_TOKEN,
-        mcp_config=RuntimeMCPConfig(server_ids=("github",)),
-    )
-    assert _mcp_config(argv)["mcpServers"]["github"]["url"] == f"{_GATEWAY}/v1/agent/mcp/github"
-
-
-def test_only_runtimes_that_can_also_shut_out_repo_config_report_mcp():
-    """Codex is not wired up, and says so rather than dropping tools."""
-    assert runtimes_supporting_mcp() == ["claude-code"]
-    assert ClaudeCodeRuntime().capabilities().mcp is True
-    assert CodexRuntime().capabilities().mcp is False
-
-
-def test_a_runtime_without_a_mediated_path_refuses_rather_than_drops():
-    """Codex fails closed, so nothing can hand it servers it would ignore."""
-    with pytest.raises(RuntimeMCPUnavailableError):
-        CodexRuntime().prepare(
-            workdir="/w",
-            task_prompt="do it",
-            model="glm-5.1",
-            gateway_base_url=_GATEWAY,
-            credential=_TOKEN,
-            mcp_config=RuntimeMCPConfig(server_ids=("github",)),
-        )
+# The runtime-wiring half of this file did not come across. It tests
+# `cloud_agent_host.runtimes` — how a CLI invocation is built — not the
+# registry or the proxy filters, and it already lives in
+# `test_agent_runtimes.py`, ported there when the gateway's copy was removed at
+# H4. Six cases, all covered: the strict-config flag, the endpoints and
+# credential a brokered runtime emits, base-url normalisation, which runtimes
+# may claim MCP, and the two fail-closed paths.
+#
+# Keeping a second copy here would have been worse than duplication. Those
+# cases assert the *relay* address and the *MCP* credential now, and the copy
+# here still asserted the gateway's — two files disagreeing about which service
+# serves tools, with the stale one passing until somebody changed the contract.
