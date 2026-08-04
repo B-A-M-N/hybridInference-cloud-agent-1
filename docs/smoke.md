@@ -235,6 +235,34 @@ was documented but never exercised against a real verifier.
 exchange, no database, no session cookie — the token contract holds, which is
 necessary for section 3 and not sufficient for it.
 
+### The lookup contract, against real responses (same day)
+
+The identity run above compared real code on both sides. This does the same for
+the two internal lookups, and for a different reason: the grant contract's
+transcription had gone stale in the same direction as the client, so comparing
+the two records proved nothing. A response from the gateway's own route
+function is a second *source*.
+
+Called `internal_lookups.user_status` and `internal_lookups.model_catalog`
+directly, with stub stores, and fed what came back to this service's readers.
+
+| Case | Result |
+|---|---|
+| active user | `_may_sign_in` → yes |
+| suspended user | refused |
+| unknown user — the response omits `status`, `role` and `email` | refused, and the later `.get()` reads return the defaults rather than raising |
+| catalog `models` / `aliases` | parsed as expected |
+
+**Two drifts found in `contracts/internal-lookups.openapi.yaml`**, both fixed:
+
+- `/internal/mcp-registry` was still a documented path. The gateway stopped
+  serving it at the ownership amendment.
+- The catalog's `aliases` field was not declared at all, though the endpoint
+  has returned it since the alias work.
+
+The status endpoint's schema was already exact, including the three fields the
+unknown-user branch omits.
+
 **Not covered, and why**
 
 | Step | Needs |
