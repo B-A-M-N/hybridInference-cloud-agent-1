@@ -4,7 +4,12 @@ Bring up the control plane and one runner host on a single machine, point them
 at a **staging** gateway, and drive one real job from an empty workspace to a
 pull request on a scratch repository.
 
-> **This runbook has not been executed.** It was written from the code and the
+> **Partly executed: sections 1–2, without containers.** The rest has not been
+> run. See the log at the bottom for exactly what was and was not covered — the
+> short version is that the control plane starts, migrates and serves on its
+> own, and everything involving a sandbox, a gateway or a host is untouched.
+>
+> **The original note, still true of the rest.** It was written from the code and the
 > deployment files, and E11's acceptance is a runbook *written from what was
 > actually executed*. Until someone runs it and fills in the log at the bottom,
 > treat every step as a claim to be checked rather than a route known to work
@@ -165,13 +170,42 @@ the thing this file exists to replace.
 |---|---|---|---|
 | 0. Preconditions | | | |
 | 1. Configure | | | |
-| 2. Control plane up | | | |
+| 2. Control plane up | 2026-08-04 | **pass, without Docker** | See below. |
 | 3. Sign in | | | |
 | 4. Host enrolled | | | |
 | 5. Job → PR | | | |
 | 6. Renewal / revoke / fail-closed | | | |
 | 7. Tear down | | | |
 
-**Corrections made to this runbook during the run:**
+## Partial run, 2026-08-04
 
-_(none yet — it has not been run)_
+Run **without a container runtime** — no Docker daemon was available — so the
+service was started directly against a local Postgres instead of through
+`deploy/control-plane/docker-compose.yml`. That covers the process and the
+schema; it does not cover the image, the compose wiring, or anything with a
+sandbox in it.
+
+**Verified**
+
+- `alembic upgrade head` against an empty database reaches `0005_grants_and_audit`
+  and creates 14 tables. The bare `postgresql://` DSN the compose file produces
+  is the one that was used, which is what the driver rewrite exists for.
+- The process starts and `GET /healthz` answers 200.
+- **It stays up with the gateway completely unreachable** — `GATEWAY_BASE_URL`
+  pointed at a closed port for the whole run. The reaper's renewal pass runs on
+  a 30-second loop and had several passes; nothing crashed, and health stayed
+  200. This is the fail-closed behaviour asserted in unit tests, seen end to
+  end for the first time.
+- `GET /v1/session/me` answers 401 rather than resolving a session, which is
+  the same property from the outside: no gateway, no identity, no access.
+
+**Not covered, and why**
+
+| Step | Needs |
+|---|---|
+| The control-plane image | A Docker daemon. CI's `Build control-plane` job passes, which proves the Dockerfile but not the compose wiring. |
+| Sections 3–7 | A staging gateway serving the identity and grant contracts, a host, and a scratch repository. |
+| The two-relay egress topology | Two machines and the tunnels between them. `docker compose config` renders it and the network assertions hold, which is not the same as traffic flowing. |
+
+**Corrections made to this runbook during the run:** none. Sections 1 and 2
+were accurate as written.
