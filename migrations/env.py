@@ -13,6 +13,8 @@ import os
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+from cloud_agent.storage.dsn import sync_sqlalchemy_url
+
 config = context.config
 
 ENV_DATABASE_URL = "AGENT_DATABASE_URL"
@@ -28,7 +30,10 @@ def _database_url() -> str:
     url = os.environ.get(ENV_DATABASE_URL) or config.get_main_option("sqlalchemy.url")
     if not url:
         raise RuntimeError(f"{ENV_DATABASE_URL} must be set to run migrations")
-    return url
+    # The service reads this same variable through asyncpg, so it is written as
+    # a bare `postgresql://` — which SQLAlchemy resolves to psycopg2, a driver
+    # this project does not ship. See `cloud_agent.storage.dsn`.
+    return sync_sqlalchemy_url(url)
 
 
 def run_migrations_offline() -> None:
