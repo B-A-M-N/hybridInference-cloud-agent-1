@@ -126,6 +126,10 @@ dev = [
   "pytest-asyncio>=0.23.0",
   "pytest-cov>=5.0.0",
   "pytest-mock>=3.14.0",
+  # Validates contracts/*.yaml. A dev dependency and not a runtime one: nothing
+  # in this service loads those documents — they record what the gateway agreed
+  # to, and a wire-level validator would fail closed on a compatible change.
+  "openapi-spec-validator>=0.7.1",
   # Alembic's driver. The service itself talks asyncpg; migrations run through
   # SQLAlchemy, which needs a sync DBAPI, and only the dbtest tier and a deploy
   # ever invoke them.

@@ -1,0 +1,118 @@
+'use client';
+
+// Session state for the app.
+//
+// Recreated rather than moved: the source provider drove the gateway's own
+// email/password login and its token refresh. This service has neither. Sign-in
+// happens at the gateway and lands as an HttpOnly cookie, so the only question
+// this provider can answer is "does the cookie still work", which it asks by
+// calling `/v1/session/me`.
+//
+// `hasRole` is carried over unchanged — the layout's internal-only gate depends
+// on its exact ordering.
+
+import { createContext, useCallback, useContext, useEffect, useState } from 'react';
+import { AUTH_EXPIRED_EVENT } from '@/lib/api/client';
+import { endSession, getSessionUser } from '@/lib/api/session';
+
+interface User {
+  id: string;
+  email: string | null;
+  user_name?: string | null;
+  role: string;
+  is_admin: boolean;
+}
+
+interface AuthState {
+  isAuthenticated: boolean;
+  loading: boolean;
+  user: User | null;
+}
+
+interface AuthContextValue {
+  state: AuthState;
+  logout: () => Promise<void>;
+  refreshUser: () => Promise<void>;
+}
+
+const ROLE_RANK: Record<string, number> = {
+  free: 0,
+  pro: 1,
+  internal: 2,
+  admin: 3,
+};
+
+export function hasRole(userRole: string | undefined, required: string): boolean {
+  if (!(required in ROLE_RANK)) return false;
+  return (ROLE_RANK[userRole ?? 'free'] ?? 0) >= ROLE_RANK[required];
+}
+
+const AuthContext = createContext<AuthContextValue | null>(null);
+
+const SIGNED_OUT: AuthState = { isAuthenticated: false, loading: false, user: null };
+
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [state, setState] = useState<AuthState>({
+    isAuthenticated: false,
+    loading: true,
+    user: null,
+  });
+
+  const refreshUser = useCallback(async () => {
+    try {
+      const me = await getSessionUser();
+      if (!me) {
+        setState(SIGNED_OUT);
+        return;
+      }
+      setState({
+        isAuthenticated: true,
+        loading: false,
+        user: {
+          id: me.id,
+          email: me.email ?? null,
+          user_name: me.user_name,
+          role: me.role || 'free',
+          is_admin: hasRole(me.role, 'admin'),
+        },
+      });
+    } catch {
+      // An unreachable control plane is not a signed-in user. Failing closed
+      // here costs a redirect through sign-in; failing open would render the
+      // app to someone who may have no session at all.
+      setState(SIGNED_OUT);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshUser().catch((error) => {
+      console.error('Failed to refresh user:', error);
+    });
+  }, [refreshUser]);
+
+  useEffect(() => {
+    const handleAuthExpired = () => setState(SIGNED_OUT);
+    window.addEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
+    return () => window.removeEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
+  }, []);
+
+  const logout = useCallback(async () => {
+    try {
+      await endSession();
+    } finally {
+      setState(SIGNED_OUT);
+    }
+  }, []);
+
+  const value: AuthContextValue = { state, logout, refreshUser };
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
+
+export function useAuth(): AuthContextValue {
+  const context = useContext(AuthContext);
+  if (!context) {
+    throw new Error('useAuth must be used within AuthProvider');
+  }
+  return context;
+}

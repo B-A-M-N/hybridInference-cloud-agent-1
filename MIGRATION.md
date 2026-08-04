@@ -60,8 +60,8 @@ Two files have drifted since — both formatting-only, verified by
 
 | File | Drift | Consumer task |
 |---|---|---|
-| `apps/frontend/src/components/features/agents/IntegrationsView.tsx` | Prettier prose re-wrap, 2 lines | F2 |
-| `tests/servers/test_agent_jobs_api.py` | two blank lines restored between test sections (the ruff fix that rode in with upstream #1177's merge) | E10 |
+| ~~`apps/frontend/src/components/features/agents/IntegrationsView.tsx`~~ | ~~Prettier prose re-wrap, 2 lines~~ ✅ reconciled in F2 — copied from the freeze, formatted with this repo's Prettier, and the result is byte-identical to `origin/dev`. Formatting-only confirmed. | — |
+| ~~`tests/servers/test_agent_jobs_api.py`~~ | ~~two blank lines restored between test sections (the ruff fix that rode in with upstream #1177's merge)~~ ✅ reconciled in E10 — the freeze copy run through this repo's `ruff format` (0.15.12) is byte-identical to `origin/dev`'s copy. Formatting-only confirmed. | — |
 
 Rule for those tasks: copy from the freeze commit as usual, then run this
 repo's formatter and confirm the result matches dev's copy — the diff against
@@ -81,18 +81,54 @@ forgotten.
 | ~~`workspace_snapshot.py` moved in D3 without its test file.~~ | ~~**D6**~~ ✅ closed — `test_agent_workspace_snapshot.py` moved with the runner, unmodified. | — |
 | ~~`workspace_paths.py` moved in D3 without dedicated coverage: its tests live inside `test_agent_workspace_broker.py` (D5).~~ | ~~**D5**~~ ✅ closed — the broker test file arrived in D5 and covers it. | — |
 
-| The store's `initialize()` is a no-op. It used to create the schema **and run five data backfills** (threads and thread messages for jobs predating them, the singleton runner-policy row, `thread_id`/`turn_no` on legacy jobs) on every boot. All forty statements moved verbatim to `migrations/versions/0001_baseline.py`. | **E6** must not restore startup DDL when it moves the bootstrap call site; **H1** must run `alembic upgrade head` against the imported database, or the backfills never touch the migrated rows. | `tests/unit/test_migration_baseline.py` pins the statement inventory, the backfill count, and that the store executes no DDL. |
+| The store's `initialize()` is a no-op. It used to create the schema **and run five data backfills** (threads and thread messages for jobs predating them, the singleton runner-policy row, `thread_id`/`turn_no` on legacy jobs) on every boot. All forty statements moved verbatim to `migrations/versions/0001_baseline.py`. | **E6** must not restore startup DDL when it moves the bootstrap call site; **H1** must run `alembic upgrade head` against the imported database. ✅ it does — `migrate_connections.py` runs it before the import, because the store no longer creates these tables and nothing else would. **Correction to this row's reasoning:** the five backfills write `agent_threads`, `agent_thread_messages`, `agent_jobs` and `agent_runner_policy`, and H1 migrates *none* of those (DR5 leaves history behind). They are no-ops on the imported data. The upgrade is required for the schema, not for the backfills. | `tests/unit/test_migration_baseline.py` pins the statement inventory, the backfill count, and that the store executes no DDL. |
 
-| The `model` token scope still exists in `tokens.py`, and is dead weight: it is signed by a root the gateway does not know, so it buys nothing. Kept so the moved tests run unmodified — which is what makes them evidence that re-keying changed nothing else. | **E9**: remove `SCOPE_MODEL` when the runner asks the gateway for a grant instead. | This row; `tests/unit/test_agent_job_tokens.py` still exercises both scopes, so deleting one fails loudly. |
-| Re-keying control tokens invalidates every token in flight. An attempt holding one signed by the gateway's root is an attempt from before the migration. | **H2** (cutover): drain running attempts before switching, rather than expecting them to survive. | This row. |
+| The `model` token scope still exists in `tokens.py`. It no longer has a **minter** — E9 landed, and the claim asks the gateway for a grant instead — but it is still *used*: `parse_worker_token` accepts it and `_worker_claims` turns it into the 403 `insufficient_scope` that keeps any narrower credential off the worker surface. | ~~**E9**~~ — E9 deliberately did **not** remove it. The register row's condition was "if nothing uses it any more", and something does. Removing it also changes three ported test files' outcomes (`test_agent_job_tokens.py` mints both scopes; `test_agent_jobs_api.py` mints one by hand in `test_sandbox_token_stays_out_of_owner_routes`), which is a parity break migration rule 3 forbids a task from taking on its own. **Whoever prunes the token module post-cutover**, together with those assertions, deliberately. | This row; `tests/unit/test_agent_job_tokens.py` still exercises both scopes, so deleting one fails loudly. |
+| Re-keying control tokens invalidates every token in flight. An attempt holding one signed by the gateway's root is an attempt from before the migration. | ~~**H2**~~ ✅ written into the runbook — `docs/cutover.md` step 3 drains by *waiting*, because the runner has no drain mode: `run_forever` exits only on `KeyboardInterrupt`, and stopping it mid-job leaves the lease to expire and the attempt to be requeued into a queue nothing will serve. Still owed: executing it. | This row; `docs/cutover.md` § 3. |
+| `test_agent_jobs_lifecycle.py::test_full_lifecycle_create_to_published_pr` is `xfail(strict=True)`. It posts to `/worker/jobs/{id}/publish/begin` and `/publish/complete`, which upstream commit `6de7248f` (PR #1098, 2026-07-29) **deleted** — a full-scope worker token could set `published_pr_url` from an arbitrary string, mark the job succeeded, and make the real publisher skip it forever. The test was never updated, because the `dbtest` tier does not run in CI on either side. It arrived here already red; E10 recorded it rather than repairing it, since restoring the routes restores the hole and rewriting the test to drive the publish worker is a rewrite a migration must not make. | **Whoever owns the publish path.** Rewrite the case against `publish_worker`, or delete it and say so. | `strict=True`: the moment anyone makes it pass, the suite fails. `test_agent_jobs_api.py::test_a_worker_cannot_write_the_publish_record` covers the property #1098 actually added, and passes. |
 
 | `apps/backend/serving/agent_jobs/patch_gate.py` | `move:host`, D4 | **shared** — host *and* control plane | At the freeze it is imported by `runner.py` and `workspace_snapshot.py` (host) **and** by `publisher.py`, `publish_worker.py` and the API router (control plane). E5 imports it from `cloud_agent_host`, which works in one repository but means a control-plane image must ship the host package. A shared third package is the eventual right answer; that is a deployment-layout decision, not something a migration task should make. Whoever writes `deploy/control-plane/` needs to know either way. |
+
+| `apps/backend/serving/servers/routers/agent_jobs.py` | "2,257 lines" | **2,550 lines** at the freeze commit | The count predates the five PRs that landed 2026-08-03. Anyone sizing E6 from the manifest would have under-estimated it by 13%. |
+| `apps/backend/serving/schemas_admin.py` | absent from the manifest | `move:control`, E6 | `admin_hosts.py` cannot import without `AgentRunnerHost`, `ListAgentRunnerHostsResponse` and `SetActiveAgentRunnerHostRequest`. The three classes were copied verbatim into `cloud_agent/schemas.py`. Same shape of omission as D7's sandbox assets: the manifest listed a module but not what it imports. |
+
+| **The host agent cannot enrol itself.** G2 ships both server halves — the admin endpoint that mints a one-time token and `POST /v1/agent/host/register` that redeems it — and the store, tokens and tests behind them. What is missing is the twenty lines in the *runner* that read `AGENT_ENROLL_TOKEN` at boot, POST it once under the name the token was issued for (the token names its host — see the enrolment finding below), persist the returned credential, and heartbeat on a timer. It was left out because `runner.py` is a D6 file still in review, and because nothing breaks without it: a runner that only sets `AGENT_RUNNER_HOST` keeps claiming exactly as it did, unmetered and online. Until it exists, capacity limits, capability matching and revocation are reachable only by an operator calling the endpoints by hand. | **Whoever owns the host agent**, before a second machine is added in anger. | This row; `ENVIRONMENT.md` marks `AGENT_ENROLL_TOKEN` and `AGENT_HOST_CREDENTIAL` as unread; `grep AGENT_ENROLL_TOKEN host/` returns nothing. |
+
+| **One broker token for the whole pool.** G5 routes each request to the broker on the host that ran the attempt, but host rows carry a URL and no credential — every broker still authenticates the single `AGENT_WORKSPACE_BROKER_TOKEN`. So a compromised host's broker token opens every other host's broker. Doing half of it here would have looked like the problem was solved. | **Whoever adds per-host secrets** — it is a distribution problem (issue at enrollment, rotate, deliver), not a routing one. | `test_every_broker_shares_the_one_token_today` in `tests/unit/test_broker_routing.py` asserts the current state, so the day it changes it changes visibly. |
 
 ## Discarded tests
 
 Migration moves test files whole. When an artifact is *rewritten* instead of
 moved, its tests cannot come along unchanged — so they are recorded here case
 by case rather than quietly dropped, and each row says where the property went.
+
+### `tests/servers/test_agent_jobs_api.py` — the API-key case (2026-08-04)
+
+One ported case, deleted with the branch it covered. The ruling is in the
+deferred register above: `authenticate_agent_owner`'s API-key branch had no
+producer in this repository and never will, so it was removed rather than left
+looking implemented. This is the sanctioned path for a removed artifact — the
+same one E4's `visible_models` rewrite used — not a silent deletion.
+
+| Case | What it asserted | Why it cannot hold here | Where the property lives now |
+|---|---|---|---|
+| `test_normal_api_key_still_authenticates_agent_owner` | That a bearer that is neither a session JWT nor an `ajt.*` worker token — the case minted `hyi-programmatic-client` — reaches the API-key authenticator, returns **200** on `GET /v1/agent/jobs`, and that `update_key_last_used` was called with the resolved key's id. | Both halves depend on an operational store that resolves a key hash to a user. The gateway kept `users` and `api_keys`; nothing in this repository sets `app.state.operational_store`, and `GatewayClient` has no method that answers "who owns this key". The case passed only because it *injected* `FakeOwnerAuthStore` — production reached 503 on the same request. With the branch deleted the request is a 401, and there is no store shape left to fake. | **The gateway**, which still authenticates API keys for its own surfaces — including `update_key_last_used` against the `api_keys` table that never moved. Nothing about key authentication changed there. On this side the replacement is `tests/unit/test_owner_auth_dispatch.py` (6 cases), which pins what this service can now get wrong: an `hyi-*` key authenticates **nobody** and says so as 401 rather than 503 (the tripwire against reinstating the branch), `X-API-Key` is not read at all, the session authenticates by cookie *and* by bearer, and the worker-token 403 `insufficient_scope` that `verify_api_key` used to own survived the function. |
+
+Two things that are **not** discards, recorded so a reviewer diffing the ported
+file against the freeze has the whole list:
+
+- `test_sandbox_token_stays_out_of_owner_routes`, `test_browser_jwt_can_list_agent_jobs`
+  and `test_expired_browser_jwt_is_not_reinterpreted_as_api_key` each dropped a
+  `get_operational_store` override. **No assertion changed** and all three still
+  pass: they drove the session path and the sandbox refusal, and installed the
+  store only because the dispatch resolved it before choosing a branch.
+- `test_dedicated_dispatcher_token_opens_exactly_one_door` lost its `_NoSuchKey`
+  store subclass, which existed so the dispatcher token would read as an
+  *unknown* API key rather than being validated by the permissive base fake. Its
+  assertion — the dispatcher token is 401/403 on the owner surface — is
+  unchanged and still passes; the refusal now comes from the session verifier,
+  the only owner authenticator left. `FakeOwnerAuthStore` itself is deleted: it
+  is a fixture, not coverage, and nothing else used it.
 
 ### `tests/unit/test_agent_visible_models.py` (E4)
 
@@ -111,12 +147,337 @@ Replaced by `tests/unit/test_agent_visible_models.py` and
 wrong: faithfully reporting what the gateway said, and **failing closed** when
 it cannot answer.
 
-| Source-control credentials are encrypted with `AGENT_SOURCE_CONTROL_ENCRYPTION_KEY`, not the gateway-derived key they were written under. | **H1**: migrating `agent_repo_grants` and `agent_gitlab_connections` is a decrypt-with-old, encrypt-with-new step. Copying ciphertext yields a connection that looks present and fails at first use. | This row; `ENV_ENCRYPTION_KEY`'s docstring in `source_control.py`. |
+### `apps/frontend/src/lib/api/__tests__/client.test.ts` (F2)
+
+`lib/api/client.ts` is the one file F2 rewrites rather than moves — F2's own
+acceptance criterion forces it, because the `sessionStorage` access token lives
+there and not in `agents.ts`. Its 260 lines of token/refresh machinery are gone,
+so its test file cannot come along: every case drives `setAccessToken`,
+`getAccessToken`, expiry-peeking, or the refresh-and-replay a cookie session has
+no equivalent for.
+
+Replaced by `web/src/lib/api/client.test.ts` (10 cases), which pins what the
+rewrite is now responsible for: the request carries the cookie and **no**
+`Authorization` header, a 401 announces the expired session **once** and is
+**not** retried, an ordinary 5xx says nothing about the session, and
+`jsonOrThrow` — carried over verbatim — still classifies errors the same way.
+
+`jsonOrThrow`'s gateway-login branches (password reset, email verification,
+duplicate signup) are unreachable here. They were kept rather than pruned: a
+migration that edits logic is a migration that cannot be diffed, and the whole
+point of moving the function untouched is that error classification is
+demonstrably unchanged for every call `agents.ts` makes. Pruning is a
+post-cutover PR.
+
+### `mock.test.ts::never spends past the budget cap` (F2)
+
+One case, deleted with the field it asserted on. `expect(job.spentUsd)
+.toBeLessThanOrEqual(job.budgetUsd)` cannot survive `budgetUsd` being removed
+from `types.ts`, and there is nothing left for it to mean: no per-task budget
+exists to be exceeded. The sibling case in `adapt.test.ts` lost its budget
+assertion and kept its PR-label one, and was renamed to match.
+
+Actual spend is **not** affected and is still displayed and still tested —
+`JobDetail`'s Spend / Input tokens / Output tokens / Model calls panel is
+untouched, including the `hasLedger === false` case that says "Ledger
+unavailable" rather than implying a job was free.
+
+### `budget_usd`: every moved test the removal touched (F2)
+
+The paragraph above named one case and mentioned a second in passing. That was
+not enough: the removal reached **six** moved test files, and a reviewer
+diffing them against the freeze had no list to check them off against. Here it
+is, whole.
+
+The two rows marked **discarded** were restored verbatim from the freeze and
+re-run before being recorded, so the claim "cannot hold" is an observation and
+not an assumption. `npx tsc --noEmit` refuses both — `error TS2339: Property
+'budgetUsd' does not exist on type 'AgentJob'` — and with the type error
+ignored the runtime failures are `expected undefined to be 5` and
+`expected value must be number or bigint, received "undefined"`.
+
+| File | Case | What changed | What it asserted, and why it cannot hold |
+|---|---|---|---|
+| `mock.test.ts` | `never spends past the budget cap` | **discarded** — whole case | `job.spentUsd <= job.budgetUsd` over every mock fixture. `budgetUsd` is gone from `DisplayJob`, so there is no cap to compare against and no per-task budget for one to mean. Nothing survives to re-point it at. |
+| `adapt.test.ts` | `carries the budget and the PR label through` → `carries the PR label through` | **discarded** — one assertion of two, plus the rename that follows from it | `expect(job.budgetUsd).toBe(5)` — that `toDisplayJob` copies `budget_usd` from the record onto the display job. `AgentJobRecord.budget_usd` is gone, so `toDisplayJob` has nothing to read and nothing to write. The other half, `expect(job.prLabel).toBe('draft PR 44')`, still applies and is **kept**; the title was narrowed to match what the case now proves. |
+| `AgentArchiveViews.test.tsx` | — | fixture key `budgetUsd: 1` removed | **Not a discard.** No assertion changed. Forced by the type: leaving the key produces `error TS2353: Object literal may only specify known properties`. Verified by putting it back. |
+| `AgentsSidebar.test.ts` | — | fixture key `budgetUsd: 1` removed | as above |
+| `JobDetail.test.tsx` | — | fixture keys `default_budget_usd: 2` and `budgetUsd: 2` removed | as above |
+| `TaskComposer.test.tsx` | — | fixture key `default_budget_usd: 2` removed | as above |
+
+Two consequences worth stating rather than leaving to be discovered:
+
+- **`mock.ts` still narrates a budget it no longer has.** Two moved fixture
+  strings — `stateNote: 'budget exceeded · $2.00 cap'` and a lifecycle line
+  reading `Job stopped: budget cap reached ($2.00)` — describe a cap that no
+  longer exists as a field. Editing them would be a second logic edit to a
+  moved file, so they stay. The deleted case is what used to keep that mock
+  dataset honest about itself.
+- **The removal's production half is 5 files** (`lib/api/agents.ts`,
+  `types.ts`, `adapt.ts`, `mock.ts`, `JobDetail.tsx`) and cascades from one
+  decision: dropping `budget_usd` from `AgentJobRecord`, which the manifest
+  asks F2 to do. Everything downstream follows by the compiler — `adapt.ts`
+  has nothing to read, so `DisplayJob.budgetUsd` cannot be populated, so the
+  field cannot stay required, so the fixtures and the `JobDetail` stat go too.
+  Reinstating the field in `types.ts` or `mock.ts` on its own does **not**
+  typecheck; only reinstating the record field first makes the rest possible.
+
+### `components/providers/SiteConfigProvider.test.tsx` (F2)
+
+Found by the sweep that fixed the two dropped test files above, and dropped in
+the same way — silently. Unlike those two it is **not** a port: its subject is
+one of the files F2 recreated, so the test could not have come along unchanged.
+It is recorded here rather than ported.
+
+| Case | What it asserted | Why it cannot hold |
+|---|---|---|
+| `loads and publishes the runtime document from the configured API base` | That the provider `fetch`es `/site-config` from the build-time API base with `cache: 'no-store'`, and publishes `branding.appName`, `branding.contactEmail`, `features.publicSignup` and `features.rag` from the response. | `/site-config` is a gateway endpoint and is in neither contract this service consumes, so the recreated provider makes **no network call at all** — the document is assembled from build-time environment. Two of the four fields it probes, `branding.contactEmail` and `features.publicSignup`, do not exist in the recreated `RuntimeSiteConfig`; the other two exist but are read from `process.env`, never from a response. There is no request to assert on and no async state to await. |
+
+**Nothing replaced it**, and that should be said plainly rather than implied:
+`SiteConfigProvider.tsx` and `buildTimeSiteConfig` have **no test in `web/`**.
+`layout.test.tsx` `vi.mock`s `useSiteConfig`, so it pins the moved layout's
+*consumption* of the shape, not the provider that produces it. The shape itself
+is held by the compiler — `layout.tsx` destructures `RuntimeSiteConfig`, so
+`npm run type-check` fails on a shape change — but which environment variable
+lands in which field is currently unasserted. Writing that test is a small
+post-cutover PR, not a migration task, which is why this row exists.
+
+| Source-control credentials are encrypted with `AGENT_SOURCE_CONTROL_ENCRYPTION_KEY`, not the gateway-derived key they were written under. | ~~**H1**~~ ✅ **tooling written** — `deploy/migrate/migrate_connections.py` decrypts with the old material and re-encrypts with the new one. Still owed: *running* it (H2 step 5), and deciding which machine holds both keys for that one run. **Precision correction:** only `agent_gitlab_connections` has ciphertext (`access_token_ciphertext`, `refresh_token_ciphertext`, both `NOT NULL`). `agent_repo_grants` has no encrypted column at all and is a plain id-preserving copy. The third ciphertext column in the schema, `agent_oauth_states.code_verifier_ciphertext`, is correctly excluded — ten-minute TTL, single-use. | This row; `ENV_ENCRYPTION_KEY`'s docstring in `source_control.py`; `tests/unit/test_migrate_connections.py::test_copying_the_ciphertext_would_produce_a_broken_connection`, which fails if anyone turns the re-key back into a copy. |
+
+| ~~**The web app calls three session routes that do not exist yet.**~~ | ~~**E8**~~ ✅ closed — `backend/cloud_agent/api/session.py`, mounted in `app.py`. Login takes `{identity_token}`, verifies it against the gateway's JWKS, **asks `user_status` before minting** (a suspended account must not walk away with a seven-day cookie, and an unreachable gateway mints nothing), and sets `HttpOnly; SameSite=Lax; Secure; Path=/`. `me` returns `{id, email, role, user_name}` and 401s plainly. `tests/servers/test_session_api.py` drives all three against a real RS256 identity token. **One thing E8 did not add: CORS.** The web app sends `credentials: 'include'`, so a deployment serving it from a different origin than the API needs `Access-Control-Allow-Origin` (exact, not `*`) and `Allow-Credentials` in front of this service. Same-origin and reverse-proxied deployments work as shipped. | This row; `web/src/app/callback/page.test.tsx` and `ProtectedRoute.test.tsx` pin the browser side against a mocked BFF, so a mismatched server shape shows up as a red integration rather than a silent one. |
+| **`sessionStorage` is still used in `web/`, and F2's acceptance criterion cannot be met literally.** The criterion is `rg sessionStorage web/` → no hits, standing in for "the access token is gone". The token *is* gone — `client.ts` was rewritten around the cookie and holds no credential. But `JobDetail.tsx` independently uses `sessionStorage` to carry a **draft prompt** across the navigation a rewind/fork performs (lines ~957, ~1070), and four cases in `JobDetail.test.tsx` assert on it. Removing it would be a logic edit to a moved file and would need those assertions weakened — migration rules 1 and 3. | **Whoever signs off F2.** Either accept the criterion as "no *credential* in web storage", which is satisfied, or schedule the draft-prompt change as its own post-cutover PR with its tests updated deliberately. | This row. `grep -rn sessionStorage web/src` returns exactly: `JobDetail.tsx` (draft prompt), `JobDetail.test.tsx` (its tests), and comments in `client.ts` explaining the removal. No credential among them. (It said `client.ts`/`pkce.ts` until the PKCE finding below was fixed — `pkce.ts` no longer mentions the API at all, since its comment was about working around this criterion rather than about the token.) |
+| **`budget_usd` is now inert.** The create API still accepts it, the store still writes it, and job records still return it — but **nothing in this repository checks it**, because enforcement was the per-task budget C5/C6 deliberately removed in favour of the gateway's per-user quota. A caller setting `budget_usd: 5` would reasonably believe it caps the job. It does not. Kept by E6 because removing a field is a logic change a migration task must not make. | **Whoever owns the API surface**, before this service takes real traffic. Either drop the field from `AgentJobCreateRequest`/`create_job`/the store column, or make it mean something again. F2 already omits it from the web client, which closes the UI half only. | This row; `grep budget backend/` returns storage and plumbing but zero comparisons. |
+| ~~**The router's API-key branch has no store behind it, on this side.** `verify_api_key` resolves a key through `get_operational_store`, which reads `app.state.operational_store` — and **nothing in this repository sets it**, because the gateway kept `users` and `api_keys`. So a programmatic caller presenting `hyi-*` gets a 503 in every real deployment.~~ | ~~**Whoever owns the API surface.**~~ ✅ **decided 2026-08-04: the branch is deleted**, which was the first of the two ways out this row listed. The reasoning is the row's own: the branch has no producer and never will. `GatewayClient` answers "may this user sign in" (`user_status`), never "who owns this key", so nothing in this repository can populate the store the branch reads — a dependency that cannot succeed in any deployment is dead code that looks alive, and leaving it invites a later reader to "fix" it by reaching back into the gateway's database, which is the coupling this split removes. Deleted with it: `verify_api_key`, `hash_api_key`, `get_operational_store`, the `X-API-Key` header parameter, and `_looks_like_browser_jwt` (with one authenticator left there is no namespace left to select). `verify_admin_access` and `verify_dispatcher_access` lost the `op_store` parameter they accepted and ignored. **The session is now the only owner credential**, and restoring a programmatic one means the row's *other* way out — a gateway contract in `contracts/` that resolves a key to a user — not resurrecting this. The ported case that covered the branch is in the discarded register below. | ~~This row~~ `tests/unit/test_owner_auth_dispatch.py::test_an_api_key_authenticates_nobody` asserts **401**, and a reinstated branch with no store answers **503**, so it fails the day the branch comes back without the contract. `grep -rn "operational_store\|verify_api_key" backend/` returns two lines, both inside `deps.py`'s module docstring recording the deletion, and nothing else. |
+| **`/v1/session/*` has no CORS.** The web app calls it with `credentials: 'include'`; a browser will refuse that cross-origin without `Access-Control-Allow-Origin` naming the exact origin plus `Access-Control-Allow-Credentials`. E8 did not add middleware for it because which origins are allowed is a deployment fact, and a wrong default here is either an outage or an open door. | **Whoever writes `deploy/control-plane/`.** Either front both on one origin (or one reverse proxy), or configure CORS explicitly there. | This row; `grep -rn CORS backend/` returns nothing. |
+
+### `test_agent_jobs_api.py` — two cases E9 replaced in place (E7/E8/E9)
+
+**Ratified 2026-08-04.** Both replacements stand: each asserts a strictly
+stronger property than the case it replaces, and both still prove the thing the
+originals existed to prove. This section is the whole record — the freeze text
+of both originals is quoted below, so a reviewer does not have to open the diff
+to check the claim.
+
+Both originals asserted on **the credential the claim used to mint for the
+sandbox**: a `SCOPE_MODEL` worker token, signed with what is now
+`AGENT_CONTROL_TOKEN_SECRET`. E9's whole point is that the gateway does not know
+that root, so the token bought nothing — the sandbox's first model call was
+going to be refused whatever happened at the claim. That credential no longer
+exists, so preserving the originals' assertions would have meant preserving a
+credential the split deliberately removed. They were **replaced in place**, not
+dropped: each replacement drives the same endpoints with the same intent, and a
+comment at the old site points here.
+
+#### Case 1 — `test_claim_returns_a_separate_model_scoped_token`
+
+| | |
+|---|---|
+| **Replaced by** | `test_the_claim_hands_over_a_gateway_grant_not_a_minted_token` |
+| **The original asserted** | that the claim response carries a `sandbox_token`; that it differs from `worker_token`; that `parse_worker_token(worker_token)["scope"] == SCOPE_FULL`; and — the case's name and point — that `parse_worker_token(sandbox_token)["scope"] == SCOPE_MODEL`. |
+| **The replacement asserts** | the first three **verbatim**, then `pytest.raises(InvalidAgentToken)` on `parse_worker_token(sandbox_token)`, and additionally `store.attempt_grants == {100: "agr_1"}`. |
+| **Why it is stronger** | "Parses, with a narrow scope" says the sandbox credential is one of ours and is held off the worker surface by a scope *comparison*. "Does not parse" says it is not one of ours at all: it is refused by the signature check, before any scope logic runs, which is the same statement as *this service cannot mint it*. Three of four original assertions survive untouched; the fourth is replaced by one that implies everything the fourth was protecting and more. The original would still pass if this service went back to minting the sandbox's credential itself — the replacement fails the moment it does. The `attempt_grants` assertion has no counterpart in the original: it pins the attempt↔grant link that renewal and revocation are both looked up through. |
+
+#### Case 2 — `test_sandbox_token_cannot_write_job_state`
+
+| | |
+|---|---|
+| **Replaced by** | `test_the_sandbox_grant_cannot_write_job_state` |
+| **The original asserted** | that the sandbox credential is refused on all four worker write endpoints — `POST …/events`, `…/artifacts`, `…/finish`, `…/heartbeat` — with `403` and `detail.error.type == "insufficient_scope"`; and, as a positive control, that the runner's own `worker_token` still writes an event (`201`). |
+| **The replacement asserts** | the identical loop over the identical four endpoints, and the identical positive control, with `401` and `detail.error.type == "unauthorized"`. Nothing else differs — the two bodies are line-for-line the same otherwise. |
+| **Why it is stronger** | The refusal moved one step earlier in the pipeline. `403 insufficient_scope` was `_worker_claims` **accepting** the credential's signature and then rejecting its scope; `401 unauthorized` is `parse_worker_token` raising `InvalidAgentToken` before the scope branch is reached at all. The replacement therefore depends on strictly less code being correct — a bug in the scope comparison cannot open it — while proving the same guarantee: a credential leaked out of the sandbox cannot write job state. Coverage is identical (same four endpoints, same positive control); only the identity of the credential being refused changed, which is the change E9 made. |
+
+**One thing case 2's replacement no longer reaches, and nothing else does.**
+`_worker_claims`' `403 insufficient_scope` branch — the "anything that is not
+`SCOPE_FULL`" refusal on the *worker* surface — was exercised only by case 2's
+original. Nothing drives a narrower-scope worker token at a worker endpoint
+now: `test_sandbox_token_stays_out_of_owner_routes` mints a `SCOPE_MODEL` token
+by hand but drives `/v1/agent/jobs`, whose 403 comes from
+`routes.authenticate_agent_owner` (it came from `deps.verify_api_key` until that
+function was deleted on 2026-08-04; the refusal moved into the dispatch rather
+than going with it), a different function; `tests/unit/test_agent_job_tokens.py`
+mints and parses both scopes but touches no route. The branch is live code and
+the drift register's "the `model` token scope still exists" row rests on it, so
+it wants either a one-case test or deliberate deletion **together with the
+scope**, by whoever prunes the token module post-cutover. This is not a
+weakness in the replacement — the replacement is about a different credential —
+but it is a consequence of the credential change, and it is written down here
+so it is found by a reader rather than by an incident.
+
+**Not** discarded, and worth saying so: `test_sandbox_token_stays_out_of_owner_routes`
+mints its `SCOPE_MODEL` token by hand rather than getting it from a claim, so it
+is untouched and still passing — as is all of `tests/unit/test_agent_job_tokens.py`.
+
+## The web app: what moved, what was recreated (F1–F3)
+
+The plan sizes F2/F3 as a move of 39 files. It is, for the agent trees
+themselves — but those files import eight things from outside them, and the
+support surface had to come along or be re-authored. Recording the split
+because "moved" and "rewritten" carry very different review obligations.
+
+**Moved verbatim** (only route paths and the `budget_usd` removal differ; every
+other byte matches `764a6f97`, and `IntegrationsView.tsx` additionally matches
+`origin/dev`):
+
+| From | To | Files |
+|---|---|---|
+| `apps/frontend/src/components/features/agents/` | `web/src/components/features/agents/` | 30 |
+| `apps/frontend/src/app/agents/` | `web/src/app/(agents)/` | 8 |
+| `apps/frontend/src/lib/api/agents.ts` + its test | `web/src/lib/api/` | 2 |
+| `apps/frontend/src/lib/utils/errors.ts` + its test | `web/src/lib/utils/errors.{ts,test.ts}` | 2 |
+| `apps/frontend/src/components/ui/Markdown.tsx` + its test | same paths | 2 |
+| `apps/frontend/src/components/providers/ToastProvider.tsx` | same path | 1 |
+| `apps/frontend/src/styles/globals.css` | same path | 1 |
+| the frontend's `.eslintrc.json`, `.eslintignore`, `.prettierrc`, `.prettierignore`, `postcss.config.js`, `tailwind.config.ts`, `tsconfig.json`, `vitest.config.ts`, `vitest.setup.ts` | `web/` | 9 |
+
+**Recreated**, because moving would have dragged in gateway concerns this
+service does not have:
+
+| File | Why not a move |
+|---|---|
+| `lib/api/client.ts` | The `sessionStorage` access token and its refresh loop are exactly what F2 removes. `jsonOrThrow` and `safeFetch` are carried over verbatim inside it. See the discarded-test record. |
+| `config/env.ts` | The source read `NEXT_PUBLIC_API_BASE` and a deploy-target table for the gateway. Replaced by `NEXT_PUBLIC_AGENT_API_URL` plus the authorize URL, and the gateway's token endpoint is derived from the latter. |
+| `components/providers/AuthProvider.tsx` | The source drove email/password login and token refresh. Sign-in happens at the gateway now; this asks `/v1/session/me` and nothing else. `hasRole` is carried over unchanged — the layout's internal-only gate depends on its exact ordering. |
+| `components/providers/SiteConfigProvider.tsx` | The source fetched `/site-config` from the gateway. Build-time environment instead; the shape (`branding` + `features`) is unchanged because the moved layout destructures it. |
+| `components/providers/index.tsx` | Same stack minus `QueryProvider` — no moved file uses TanStack Query, so shipping it would be a dependency with no caller. |
+| `components/features/auth/ProtectedRoute.tsx` | The source pushed at its own `/login`. There is no login page here; an unauthenticated visitor goes to the gateway's `/authorize` with a PKCE challenge. |
+| `app/layout.tsx`, `app/callback/page.tsx`, `lib/auth/{pkce,signin}.ts`, `lib/api/session.ts` | New. The document shell, the return leg of sign-in, and the PKCE machinery. |
+| `next.config.js` | The source proxied a dozen gateway paths through Next rewrites. Nothing to rewrite here. |
+
+**Not brought across:** `config/branding.ts` (137 lines of gateway branding —
+the four values the layout actually reads became environment variables),
+`lib/api/{auth,user}.ts`, `config/site-config.ts`, `QueryProvider`, and
+`components/ui/{Header,SiteFooter,ErrorBoundary,Button,Card}`.
+
+**Route re-rooting.** `/agents/*` became `/*`, as F3 requires. The moved pages
+live in a `(agents)` route group so the moved `layout.tsx` stays a *nested*
+layout with the shape its own test renders, while `app/layout.tsx` supplies the
+`<html>`/`<body>` document Next requires at the root. Route groups do not appear
+in URLs: the built routes are `/`, `/[jobId]`, `/archived`, `/connected`,
+`/integrations`, plus `/callback` deliberately **outside** the group so it is
+not behind `ProtectedRoute`.
+
+The 22 route-string edits are a path change, not an assertion change — six test
+expectations moved with the routes they name (`'/agents/ajob_1'` →
+`'/ajob_1'`). The one place a *destination* genuinely changed is the header's
+Docs Assistant and Dashboard links: they are gateway pages, so they became
+absolute links to `branding.gatewayUrl` and disappear on a deployment that has
+not been told where the gateway is. Leaving them as `<Link href="/dashboard">`
+would have shipped two 404s.
+
+## Cross-repo readiness
+
+The control plane calls four gateway endpoints: `/internal/agent-grants` (mint,
+renew, revoke), `/internal/mcp-registry`, `/internal/model-catalog` and
+`/internal/users/{id}/status`. **All four exist — in unmerged pull requests on
+the gateway** (#1180 C5, #1183 C9), not in its deployed code.
+
+A review of the wiring flagged this as "endpoints that do not exist", which is
+true of today's production gateway and false of the contract. Recording it here
+so the next reader does not re-diagnose it: **both sides land together**, and
+until they do this service fails closed — nobody signs in and no job is
+claimed, rather than either happening unauthorized.
+
+The paths were verified to match the gateway PRs exactly, not merely by name.
+
+**Those endpoints are now written down** — `contracts/`, task C8: three OpenAPI
+documents covering identity (C1–C3), inference grants (C5–C7) and the internal
+lookups (C9), hand-written from the gateway routers rather than generated from
+a running gateway, because the value of a contract is that it says what was
+*agreed*, so a gateway that stops honouring it produces a visible disagreement
+rather than a client that quietly breaks.
+
+Each document names the branch and files it was written from in `info.x-source`,
+because none of them had merged when they were written. **When those branches
+land, re-verify each document against the merge commit** — a review can change a
+contract, and these describe the version proposed rather than the version
+accepted.
+
+`tests/unit/test_contracts.py` goes past C8's stated acceptance ("YAMLs lint").
+It also checks every cited consumer test exists — two plausible-looking test
+paths were cited while writing these and neither existed, and an unfollowable
+citation reads as verification that did not happen — and that **every
+`/internal/` or `/v1/` path literal in `gateway.py` and `grants.py` appears in
+some document**, read out of the clients' own source rather than a hand-kept
+list. That last one catches the quiet failure: a gateway call added later with
+no contract, so the dependency exists in code and nowhere in the record. All six
+calls the service makes today are covered. `/internal/agent-grants/{id}/usage`
+is described but **called by nothing here**, and says so in its own description.
+
+## Review findings
+
+Successive adversarial reviews of E7-E10 and F/G/H raised these. They are
+recorded so they are decisions rather than discoveries, and struck through as
+they are resolved — each row says how, and a row resolved by a decision rather
+than by a code change says which decision. Severities are the reviewer's.
+
+**All 18 are resolved.** The heading is kept because the register is the point:
+a finding that was fixed and then forgotten is a finding that comes back, and
+two rows here exist only to correct claims made by earlier rows.
+
+| Sev | Where | Finding |
+|---|---|---|
+| ~~P1~~ | `storage/store.py` | ~~A drained host silently returned to service: the reaper moved `draining → offline` and a heartbeat moved `offline → online`, so drain undid itself whenever the machine went quiet and came back.~~ ✅ **fixed** — `draining` is no longer a reaper candidate, pinned by `test_a_drained_host_stays_drained_when_it_goes_quiet_and_returns`. |
+| ~~P3~~ | `app.py` | ~~Host reaping shared a `try` with lease reaping, so a host-reap failure skipped attempt recovery and stalled publishes for that pass.~~ ✅ **fixed** — separate `try`, since the shared one turned a reporting failure into a strictly worse outage. |
+| ~~P2~~ | `storage/store.py` | ~~Registering under an existing host's name revokes the incumbent's credential and resets it to `enrolling`, taking a live busy host out of the pool. The enrol token names no host, so the name is the registering machine's to choose. Needs a decision: refuse a name in use, or make the token name its host.~~ ✅ **fixed — the token names its host.** `POST /admin/agent/runner-hosts/enroll-token` now requires `host`; it is stored on the token row (`0004_enroll_token_host`) and is part of `consume_enroll_token`'s UPDATE predicate, so a machine cannot register under a name an admin did not choose for it and a mismatch does not even *spend* the token — a typo is retried, not re-issued. **Refusing a name already in use was the other candidate and was rejected:** it breaks the case the upsert exists for (a rebuilt machine re-enrolling under its own name — `test_a_superseded_credential_stops_working` would have had to be weakened, which rule 3 forbids), and it would have left the naming decision on the unauthenticated side anyway. Registration already required a freshly minted token, so binding the name costs the operator nothing and moves the decision to the party the admin endpoint has authenticated. Pinned by `test_a_typo_cannot_evict_a_live_host` and `test_a_token_admits_only_the_name_it_was_issued_for` (unit), `test_a_typo_cannot_revoke_a_live_hosts_credential` and `test_a_mismatched_name_does_not_spend_the_token` (`dbtest`), with `test_a_rebuilt_machine_re_enrols_under_its_own_name` holding the door open for the legitimate case. Token rows written before the binding have a NULL `host` and match nothing: `NULL = $2` is never true, so they fail closed rather than staying redeemable under any name. |
+| ~~P2~~ | `web/` (F2) | ~~**Two moved files' test files were not brought across — 14 cases silently dropped**, and not recorded.~~ ✅ **fixed** — `web/src/lib/utils/errors.test.ts` (12 cases) and `web/src/components/ui/Markdown.test.tsx` (2 cases) were copied from the freeze **byte-identical** and pass with no change at all, not even an import: both use relative imports (`./errors`, `./Markdown`) that survive the move, and `react-markdown`, `remark-gfm`, `@testing-library/*` and `jsdom` were already in `web/package.json`. The same sweep over every `.ts`/`.tsx` in `web/src` found one further dropped file, `SiteConfigProvider.test.tsx` — its subject was *rewritten*, not moved, so it is a recorded discard rather than a port. See "Discarded tests". |
+| ~~P2~~ | `web/` (F2) | ~~The `budget_usd` removal is a **logic edit to 11 moved files** that also **deleted a test case and an assertion**.~~ ✅ **recorded, not repaired** — the case and the assertion were put back and re-run to establish whether they could hold. They cannot: `tsc` rejects `budgetUsd` on `AgentJob` (TS2339) and, with types ignored, both assertions fail on `undefined`. They are therefore discarded **with reasons, case by case**, in "Discarded tests" above, together with the four sibling files that lost fixture keys only. The production half of the edit (5 files) stands on the manifest's F2 instruction; the test half is now accounted for rather than silent. |
+| ~~P2~~ | `schemas.py` | ~~`HostRegisterRequest.broker_url` documents an env fallback that `broker_for_attempt` does not perform once a host row exists. Doc and code disagree; the doc is wrong.~~ ✅ **fixed — the description, not the code.** `broker_routing.py` refuses the fallback deliberately and says why in its own docstring: routing host B's request to host A's broker is not an error, it is a plausible answer about the wrong machine's disk. `test_a_host_without_a_broker_url_does_not_fall_back` pins it, so "fix the code instead" would have meant deleting a test that exists for a silent-corruption bug. The field now says what actually happens: supply it on every enrolled host that runs jobs, because once an attempt records this host the env var is not consulted, and omitting it makes workspace requests answer 409. The env var is still the answer for attempts that record no host at all — E11's single-host shape, pinned by `test_an_attempt_with_no_host_falls_back_to_the_single_host_env`. |
+| ~~P3~~ | `deploy/migrate/` | ~~A `--apply` run that is then refused has already run `alembic upgrade head`, but reports "nothing was written". Schema *was* written.~~ ✅ **fixed — the report tells the truth; the upgrade stays where it is.** Moving it after the refusal checks was the alternative and is not available: those checks read the target's tables, which the upgrade is what creates. So a refused `--apply` now prints `mode: refused — no rows were written` plus a note that the schema *was* written and which revision the target now sits at, and `--skip-migrations` is documented as the way to make a refusal leave the target byte-for-byte unchanged. Pinned by `test_a_refused_apply_admits_the_schema_was_written` and `test_a_refusal_that_upgraded_nothing_does_not_claim_it_did`. **The two related P3s went with it.** The report's `target` column was `refresh + unchanged` — source rows found in the target, not the target's row count — while the checksum printed under it covers every target row; it is now `len(target_rows)`, so the two numbers describe the same set (`test_the_target_column_is_the_targets_row_count`). And the "`API_KEY_SECRET` is ignored" notice was emitted *after* the configuration checks, which made it unreachable for the one operator it is written for: the one who set that variable expecting it to be used and therefore did not pass `--old-key-file`. It is now the first thing the run does, and `test_the_ignored_gateway_secret_is_announced_before_anything_can_refuse` holds it there. |
+| ~~P3~~ | `docs/gateway-removal.md` | ~~Two accuracy breaks: a stated command result that is false in the repo the document is about, and a §1.4 path that does not exist at the freeze commit despite the header claiming every path was read there.~~ ✅ **fixed, and every other path, line number and count in the document re-verified against `764a6f97` on 2026-08-04.** `git grep agent_grants origin/dev` does *not* return nothing — it hits the split plan, which specifies the table rather than implementing it — so the claim is now the scoped `git grep agent_grants origin/dev -- apps/ tests/`, which genuinely returns nothing, with the unscoped result called out so nobody reads the plan's own text as evidence the work is done. §1.4's identity paths landed *after* the freeze (`identity.py` with #1177, hours later); they are now marked as `origin/dev` paths — the document's one exception, stated in the header and again in the section — with the router prefix and the full frontend paths named, because line numbers on a moving branch are the part that will rot. Two further line references were off and were corrected: `bootstrap.py:796-890` → `796-892` (the block ends at its own `logger.info`'s closing paren) and `completions.py:598-601` → `597-601`. Everything else checked out: the 20-file `agent_jobs/` deletion list, the eleven tables, 2,550 lines, 29 manifest paths under `tests/`, 8 + 30 frontend files, `agent_name_from_prompt`'s single consumer, and every `§2.5` destination in this repository. **Two of that sweep's own claims were wrong and one was ambiguous, all corrected below** — `agents.test.ts` is 27 cases and not 25, §1.4's callout says four files over a section naming seven, and "314 lines/30 cases" counted test functions where the file runs 60; see the last row of this table. |
+| ~~P3~~ | `web/src/lib/auth/pkce.ts` | ~~The PKCE verifier uses one fixed `localStorage` key, which breaks concurrent sign-ins. The file's own comment says the key was chosen to dodge a `rg sessionStorage` grep — a guard worked around rather than satisfied.~~ ✅ **fixed.** Each pending flow is stored under `cloud-agent:pkce:<state>`, so two tabs signing in at once no longer overwrite each other's verifier; `takePending(state)` consumes only its own entry, and entries that can no longer be redeemed — unreadable, or past `MAX_AGE_MS` — are swept when a new flow starts. (This row said "abandoned entries are swept"; `purgeExpired()` sweeps by *redeemability*, not by abandonment, and the difference is deliberate — see the correction row below.) The callback looks the flow up *by* the returned state, which is the state check, and `hasPending()` keeps "this response belongs to a request we did not make" distinguishable from "nothing is parked" — the two messages `callback/page.test.tsx` already pinned. The comment about dodging the grep is gone: `localStorage` is now justified on its merits (per-origin, so the flow survives the browser returning into a different tab), and no code here mentions `sessionStorage` at all. Pinned by the new `web/src/lib/auth/pkce.test.ts` (8 cases) and `leaves a sign-in running in another tab alone`. **No guard was evaded and none needed to be:** F2's `rg sessionStorage web/` criterion is still literally unmet, but only by `JobDetail.tsx`'s draft prompt — recorded above as its own open row, unchanged by this. |
+| ~~P3~~ | `web/package.json` | ~~The "pinned" Prettier is `^3.8.3`, a caret range. Only the lockfile holds 3.8.3, and 3.9.6 reformats a moved file, so a lockfile regeneration turns web CI red.~~ ✅ **fixed** — `"prettier": "3.8.3"`, exact, in `package.json` *and* in the lockfile's own dependency spec (`npm ci` refuses a lock that disagrees with the manifest, so both had to move). Same reason as `ruff==0.15.12` in `pyproject.toml`, stated there in a comment: "moved files pass unchanged" is only a meaningful acceptance criterion against a fixed formatter, and the bump is its own pull request rather than a side effect of a lockfile regeneration. `npm ci --dry-run` and `npm run format:check` both pass on the pinned pair. Unlike the ruff pin, the reason cannot live next to the version — `package.json` admits no comments — so it lives here. |
+| ~~P2~~ | `app.py`, `grants.py` | ~~**Renewal cadence and grant TTL are unrelated and nothing asserts they are compatible.** Renewal runs on the reaper's 30 s pass; mint requested no `ttl_seconds`, so the gateway's default applied — a number this service does not hold. A TTL shorter than the cadence loses a live attempt its capability mid-run, and the only symptom is a refused model call inside a sandbox.~~ ✅ **fixed — the relationship is now one number and six assertions.** `grants.RENEWAL_INTERVAL_S` is the cadence and `app.REAP_INTERVAL_S` **is** that constant rather than a second copy; `GRANT_TTL_S = RENEWAL_INTERVAL_S * RENEWAL_HEADROOM_PASSES` (30 × 4 = 120 s) is derived, never typed, and is `mint`'s default so the claim path cannot forget it. The gateway's own clamps are mirrored beside it (`MAX_GRANT_TTL_S` 900, renewal step 300, read from C5 at `71cc77a9`) because both would shorten our TTL *silently*: asking for more than the max is clamped down, and every renewal re-times the grant to the gateway's step whatever we asked at mint — so it is that 300 s, not our 120 s, that the cadence has to stay inside once a job is running. Pinned by six cases in `test_grant_lifecycle.py` (cadence is the reaper's pass; TTL ≥ 3 passes and equals its own derivation; TTL ≤ the gateway max; cadence × headroom ≤ the gateway's step; give-up lands before either expiry; `mint`'s default is the derived value) plus `test_a_lifetime_is_always_asked_for` on the wire. Changing either constant alone now fails a test rather than a sandbox. |
+| ~~P2~~ | `api/session.py`, `api/deps.py` | ~~**The two session routes disagreed.** `/login` returned the gateway's `user_name`; `/me` returned `null` for it always, because `get_current_user`'s dict has no such key. One contract, two answers, for seven days per cookie.~~ ✅ **fixed — the session is the answer, and login now mints what it reports.** `/me` can only prove what the cookie carries, so `mint_session` takes `user_name`, `get_current_user` returns it from the claims, and login sources it, mints it, and returns the same value it minted. The alternative — deleting the field from login's response — would also have made them agree, and was rejected because it agrees at `null` only for as long as no gateway contract carries a name: the plumbing has to be right *before* the field exists, or it arrives and one route reports it. **Today the value is `null` on every deployment either way**, and truthfully so: neither the identity token (`mint_identity_token`: `sub`, `email`, `role`) nor `/internal/users/{id}/status` (`user_id`, `exists`, `active`, `status`, `role`) carries a display name — checked at `e4165d3e` and `4182535d`. Pinned by `test_login_and_me_answer_the_same_thing` (equal payloads, not equal nulls) and `test_a_display_name_survives_into_me` against a gateway that reports one. |
+| ~~P2~~ | `api/routes.py` | ~~**A grant that could not be linked was handed over anyway.** `_mint_sandbox_grant` returned the token when the gateway sent no `grant_id`, and when the fenced UPDATE matched nothing. An unlinked grant is one nothing renews and nothing revokes: live to its TTL, owned by no attempt, findable from neither side.~~ ✅ **fixed — link or withdraw.** The link is now the condition: a grant that is not recorded against its attempt is revoked immediately (when there is an id to revoke), the claim is released so no attempt is spent, and the claim answers 503 `credential_unavailable` — the same shape the unmintable case already answered, because a runner has no different useful behaviour for the two. The id-less case cannot be revoked at all, which is exactly why it must not be used. Pinned by `test_a_grant_that_cannot_be_linked_is_revoked_not_handed_over` and `test_a_grant_with_no_id_is_refused_rather_than_used`. |
+| ~~P2~~ | `app.py` | ~~**Renewal retried a dead grant forever.** `_renew_live_grants` had no give-up, so a grant the gateway has permanently refused was asked about every pass for the life of the attempt — and the attempt ran on toward the moment its capability expired with nothing saying so. Revocation detaches as it hands over; renewal had no equivalent.~~ ✅ **fixed — it gives up, and giving up ends the attempt.** After `GRANT_RENEWAL_GIVE_UP_AFTER` (3) *consecutive* refusals of the same grant — consecutive, so a gateway with a bad minute every hour cannot accumulate a job to death — the attempt is abandoned via `release_claim`: aborted, the worker's next heartbeat says stop, and the job returns to the queue **without spending a retry**, where the next claim asks for a fresh grant rather than nursing a dead one. Nothing revokes inline; the release makes the attempt non-current, which is precisely what `take_revocable_grants` selects, so the revocation pass takes it exactly once. Three passes is 90 s, inside both the gateway's 300 s renewal step and our own 120 s TTL, so the give-up lands while the capability is still alive. The counter is owned by the reaper loop (not the module), so a restart forgets — the right way round: a fresh process should ask again before abandoning anyone's attempt. `list_renewable_grants` now carries `lease_generation` so the release is fenced; a `dbtest` pins that the fence it hands out is the one `release_claim` accepts. Pinned by five unit cases and `test_a_renewable_row_carries_the_fence_that_can_end_it`. **This row's "consecutive refusals" was too loose and the next row corrects it:** every failure counted, including ones the gateway never made. |
+| ~~P3~~ | `api/deps.py` | ~~**One misconfiguration, two diagnoses.** An unset `AGENT_SESSION_SECRET` made `get_current_user` answer 503 and `verify_admin_access` answer 401, because the latter caught the base `IdentityError`. The 401 sends an operator hunting for a credential problem that does not exist.~~ ✅ **fixed — both answer 503.** `verify_admin_access` catches `IdentityNotConfigured` before `IdentityError` and reports it as the deployment problem it is. The `ADMIN_TOKEN` door is compared first and is unaffected, so a deployment that authenticates machines only keeps working with no session secret at all. Pinned by `test_the_admin_door_diagnoses_a_missing_secret_the_same_way` and `test_the_admin_token_still_opens_without_a_session_secret`. |
+| ~~P3~~ | docs (four count errors) | ~~Four counted claims a reader would trust, each wrong: `agents.test.ts` as "526 lines, 25 cases"; §1.4's callout saying `git cat-file` "fails for all four files below" over a section naming seven paths; `docs/cutover.md`'s `hosts.py:105,151`; and this table's PKCE row claiming "abandoned entries are swept when a new flow starts".~~ ✅ **fixed, each counted at the freeze rather than re-copied.** (1) `agents.test.ts` is **526 lines, 27 cases** — 526 confirmed, but the file holds 26 `it` blocks of which one is an `it.each` of two, and `vitest` runs 27; corrected in `docs/gateway-removal.md` §2.4 and in the manifest-corrections table below. The neighbouring `test_agent_name_from_prompt.py` count was ambiguous the same way and is now "30 test functions, 60 executed cases" rather than "30 cases". (2) §1.4 names **seven** paths, not four; all seven fail `git cat-file -e 764a6f97:<path>` and all seven exist on `origin/dev` (re-checked 2026-08-04), and the section now lists them so the number is countable. (3) `hosts.py:105,151` had rotted to 113 and 168; replaced with `::register_host` and `::heartbeat_host`, which cannot rot — and the stale "`grants.py` has no caller" in the row below it went with it, since E9 gave it one. (4) **The claim was made to match the code, not the other way round.** `purgeExpired()` sweeps by *redeemability* — unreadable, or past `MAX_AGE_MS` — never by abandonment, and it must: an entry younger than `MAX_AGE_MS` is indistinguishable from a sign-in running in another tab, which is the case the per-`state` keying exists for. The row above, `pkce.ts`'s header, `purgeExpired`'s docstring and the test's own name now all say that. |
+| ~~P2~~ | `app.py`, `gateway.py`, `grants.py` | ~~**The give-up could not tell a refused grant from an unreachable gateway**, so ~90 s of gateway downtime abandoned every running attempt in the fleet and discarded work that was nearly done.~~ ✅ **fixed — a give-up now requires the gateway to have named the grant.** `_renew_live_grants` caught bare `Exception` and `GatewayError` carried no status, so `ConnectTimeout` and "that grant is revoked" were the same object; three passes of either destroyed the attempt. `GatewayError` now carries `status_code` and `error_type`, `definitive` distinguishes *an answer* from *no answer* (4xx excluding 408/429), and only `DEAD_GRANT_REFUSALS` — `unknown_grant`, `grant_not_live`, `subject_unavailable` — advances the counter. **The status code alone was not enough and that is the sharp part:** the gateway answers 404 for both `unknown_grant` and `internal_api_not_configured`, and 401 for a rotated dispatch token, so a reader of status classes destroys the fleet on one missing environment variable exactly as readily as on real downtime. A non-verdict now leaves the count *untouched* — neither advancing (the abort) nor resetting (which would let a grant refused every other pass be renewed forever) — so only a successful renewal clears it. An unrecognised type is not definitive, and that direction is deliberate: not giving up costs a few doomed renewals against a capability the TTL retires anyway, while giving up wrongly costs a user's work. Pinned by ten cases — a fleet-wide outage releasing nothing, six parametrised non-verdicts (401, the 404 that is *not* a dead grant, 500, 502, 429, 408), an outage that neither advances nor forgives, `subject_unavailable` still giving up, and the `DEAD_GRANT_REFUSALS` set pinned literally because adding to it is a decision to destroy work — plus four on the client, that a refusal carries its type and an unreachable gateway carries none. **Verified by mutation:** restoring `definitive = True` fails eight of them. |
+| ~~P3~~ | `api/deps.py` | ~~`log_admin_action`'s docstring credits migration `0004` for the audit table; `0004_enroll_token_host` is the enrol-token binding and the table arrives in `0005_grants_and_audit`.~~ ✅ **fixed** — the docstring names `0005_grants_and_audit`, in full rather than by number, since a bare ordinal is what rotted. |
 
 ## Open decisions
 
 Things a migration task surfaced that are **design calls, not mechanical
 moves**, and so were deliberately not decided by the task that found them.
+
+### Two host registries, or one (found in G1)
+
+The plan's G1 says to create `agent_hosts(host_id ulid pk, name unique, …)`
+beside the `agent_runner_hosts` table upstream #1158 already shipped. It never
+says what becomes of the old one, and G4's slot scheduler supersedes a claim
+gate — the pin — whose behaviour E10 pins with ten ported tests.
+
+Taken literally that produces two answers to "which hosts exist": two admin
+surfaces, two lists an operator has to know to reconcile, and a claim gate
+reading one while somebody edits the other. It also breaks the ten tests, which
+under rule 3 is a parity break rather than a design change.
+
+**Decided (2026-08-04): one registry.** `agent_runner_hosts` gains the pool
+columns — status, labels, capabilities, slots, version, broker URL, heartbeat,
+credential hash — and keeps its primary key. `agent_attempts.host_id` therefore
+references `agent_runner_hosts(host)`.
+
+What that buys, and what it costs:
+
+- #1158's pin, its three endpoints and its ten tests keep meaning what they
+  meant. The pin and the pool **compose**: the pin decides *which* host may
+  claim, the pool decides *whether* that host is in a state to. Both gates run,
+  both fail closed, and neither can silently undo the other.
+- A host that joined by polling defaults to `online` with a null `slots_total`
+  (unmetered) and empty capabilities, which is exactly the pre-G behaviour. No
+  existing deployment has to enrol anything to keep working.
+- The cost is one table holding two kinds of row — a *sighting*, whose name is
+  a scheduling label anything with the dispatcher token can invent, and an
+  *enrollment*, whose name is a credentialed identity. They are told apart by
+  the `enrolled` flag, and `admin_hosts.py`'s docstring says which guarantee
+  applies to which. A reviewer who dislikes that is disliking the right thing;
+  the alternative was two tables that mean the same thing.
+- The name `host_id` on `agent_attempts` is the plan's word for a column that
+  holds a host *name*. Kept because the plan names it, and because renaming a
+  foreign key later is cheaper than reconciling two registries.
+
+If a ulid identity is genuinely wanted later, it is an added column plus a
+backfill, not a second table.
 
 ### The co-located runner overlay (found in D7)
 
@@ -183,6 +544,38 @@ networks to the standalone compose. Not scoped here — it is a feature, not a
 migration — but it is the reason the tier is currently unreachable rather than
 merely unused.
 
+### Which machine runs the connection migration (found in H1)
+
+`deploy/migrate/migrate_connections.py` must hold **both** keys at once for the
+length of one run: the gateway's, to decrypt, and this service's, to
+re-encrypt. That is not an implementation choice — nothing else can read the
+old rows — and it is the one place this repository brushes against AGENTS.md
+rule 4.
+
+What the code decides, and does not leave to cutover day:
+
+- the old key is read from a **file** (or stdin), never from the environment
+  and never from `argv`;
+- `API_KEY_SECRET` in the script's own environment is **ignored**, with a note
+  on stderr saying so, so it cannot become configuration by accident;
+- nothing is persisted: no cache, no state table, no log line carrying key
+  material or plaintext, and the source database is opened
+  `default_transaction_read_only`.
+
+What is **not decided**, and is an operator call rather than a coding one:
+
+1. **On the gateway host**, with `AGENT_DATABASE_URL` pointing at the new
+   database over the network. The old secret never leaves the machine that
+   already holds it; the new key travels there for one run.
+2. **On an operator workstation** with a route to both databases, both keys as
+   files on a `tmpfs`, deleted afterwards.
+
+Either satisfies rule 4's actual property — the gateway's secret must not end
+up in the agent host's persistent configuration. Deciding it under a runbook
+clock is how it ends up in an `.env`, so it is written down here now and
+recorded in `deploy/migrate/README.md` § Where it runs. Whoever schedules H2
+puts the answer in the cutover ticket.
+
 ## Manifest corrections
 
 Classification errors found while executing tasks. Fold these into the source
@@ -193,6 +586,10 @@ repo's manifest when it is next edited.
 | `apps/backend/serving/agent_jobs/terminal_coordination.py` | `move:host`, D5 | `move:control`, E6 | Its docstring says "Gateway-owned recovery"; its consumers at the freeze are `servers/bootstrap.py` and `servers/routers/agent_jobs.py` — control-plane code. It imports the broker *client* (`workspace_broker_client`, the caller side), not the broker. The route cases move with `test_agent_jobs_api.py` in E10; E6 ports the settled-terminal reconciliation case from `test_bootstrap.py`. |
 | `deploy/docker/pi-freeinference`, `opencode-freeinference`, `kilo-freeinference`, `codex-requirements.toml` | absent from the manifest | `move:deploy`, D7 (moved to `deploy/sandbox/`) | `Dockerfile.agent-sandbox` `COPY`s all four. The manifest listed the Dockerfile but not its assets, so a literal reading of D7 would have produced an image that fails to build. |
 | `deploy/docker/docker-compose.agent-runner.yml`, `ops/deploy/agent_runner.sh` (+ their two test files) | `move:deploy`, D7 | **undecided** — see Open decisions | They are an overlay on the gateway's compose stack, not a standalone deployment. |
+| `ops/setup/setup_kata_runtime.sh` | absent from the manifest | `move:deploy`, D7 (here as `deploy/host/setup_kata_runtime.sh`) | Found while writing H4's deletion list. It carries no "agent" in its name, so the A3 grep never matched it and **no regeneration of the manifest ever will** — same for its test, `tests/unit/ops/test_setup_kata_runtime.py`, which MIGRATION.md already caught by hand. Both must be deleted from the source repo at H4 off this row rather than off the manifest. |
+| `ops/release/public_export.py:36` **and** `tests/unit/release/test_public_export_audit.py:161` | the manifest's coordination note names only the first | both hard-reference `apps/backend/serving/agent_jobs/patch_gate.py` | The audit test loads the gate by path to assert the export tool reuses its credential shapes. H4 breaks both, not one. Recorded in `docs/gateway-removal.md` § 3. |
+| `apps/frontend/src/lib/api/__tests__/agents.test.ts` | absent from the manifest and from the plan's Appendix inventory | `move:web`, F2 | Same shape of omission as `schemas_admin.py` and D7's sandbox assets: the manifest lists `agents.ts` but not its test. 526 lines, 27 cases (26 `it` blocks, one of them an `it.each` of two), and the **only** coverage of the SSE stream reader — frame parsing across chunk boundaries, cursor tracking, reconnect-without-a-gap. Ported whole, **byte-identical to the freeze** — re-verified by `diff`. A literal reading of F2 would have shipped the streaming client uncovered. |
+| `apps/frontend/src/lib/utils/errors.test.ts`, `apps/frontend/src/components/ui/Markdown.test.tsx`, `apps/frontend/src/components/providers/SiteConfigProvider.test.tsx` | absent from the manifest — as are the three files they test, which F2 had to pull in as support surface | `move:web`, F2 (the first two); recorded discard (the third) | The same omission again, and it did land: the first two were dropped, 14 cases with them, and were not noticed until an adversarial review. **The manifest names no web support file and therefore no web support test**, so a regeneration will not catch this class — the only reliable check is the one this repair used: for every `.ts`/`.tsx` in `web/src`, ask whether a sibling test existed at the freeze. That sweep has now been run over all 39 non-test `.ts`/`.tsx` files in `web/src` and is complete: these three are the entire remainder, alongside `client.test.ts`, which F2 had already recorded. Every other freeze test file whose subject is present in `web/` came across. |
 
 ## Upstream provenance
 
@@ -212,6 +609,86 @@ requests.
 Plus the pre-freeze set listed above: #1147, #1148, #1167, #1168, #1170.
 
 </details>
+
+### `tests/servers/test_agent_jobs_api.py::test_sandbox_token_is_refused_on_owner_routes` (E10)
+
+The only case of the 103 that did not port. It imports
+`serving.servers.auth._is_inference_path` and asserts on it directly — no
+request, no router, no client. The function classifies the gateway's *inference*
+routes (`/v1/chat/completions`, `/v1/messages`, `/v1/embeddings`), and this
+service serves none of them, so there is nothing here to point it at.
+Re-implementing the predicate to give the test something to assert on would be
+authoring production code inside a migration task.
+
+| Property | Where it lives now |
+|---|---|
+| A model-scoped sandbox token cannot act as an owner on `/v1/agent/jobs` | **Ported and passing** — `test_sandbox_token_stays_out_of_owner_routes` drives it over the wire and asserts 403 `insufficient_scope`. |
+| The same token cannot write job state on the worker surface | **Ported, then replaced in place by E9** — `test_the_sandbox_grant_cannot_write_job_state` drives the same four worker endpoints against the credential the sandbox actually carries now, and asserts 401. The `SCOPE_MODEL` token's own refusal on that surface is currently uncovered; both facts are recorded under "two cases E9 replaced in place" above (ratified 2026-08-04). |
+| Which URL prefixes count as billed inference | Gateway. It is a property of the gateway's route table, and the source file that owns it did not move. |
+
+## E10's auth stand-ins
+
+*This section describes the state at E10 and is superseded twice below — first
+by E7 landing, then by the 2026-08-04 API-key ruling, which deleted
+`verify_api_key` outright. Read it as history.*
+
+The router moved unmodified, so it still calls `get_current_user`,
+`verify_api_key`, `verify_admin_access`, `has_role`, `looks_like_agent_token`,
+`get_client_ip` and `log_admin_action` — all E7 placeholders that raise. The
+ported tests supply them from `tests/support/e7_auth.py`, whose docstring is the
+long version of this note.
+
+Most of the suite is unaffected: 96 of the 102 ported cases stub
+`authenticate_agent_owner` exactly as the source did, so the stand-ins only have
+to make `require_agent_owner`'s role gate work. Six cases pop that override on
+purpose and exercise the real dispatch, and for those it is worth being precise
+about what a green run now means:
+
+| Case | Still real coverage of this repo | Now pinning E7's contract instead |
+|---|---|---|
+| `test_browser_jwt_can_list_agent_jobs` | ~~`_looks_like_browser_jwt` routes a compact JWT to the JWT verifier~~ (that function was deleted with the API-key branch on 2026-08-04 — with one authenticator left there is no namespace to select), and the route answers 200 | — (the token is minted by this repo's own `identity.mint_session`) |
+| `test_expired_browser_jwt_is_not_reinterpreted_as_api_key` | 401, **not** a fallback to the API-key path — the regression the test exists for; since 2026-08-04 there is no API-key path to fall back to, and the case now pins that the expiry message survives | the `"Token has expired…"` detail string, which the stand-in reproduces |
+| ~~`test_normal_api_key_still_authenticates_agent_owner`~~ | ~~a non-JWT bearer reaches the API-key path~~ | ~~`update_key_last_used` — the `api_keys` table stayed on the gateway~~ **Discarded 2026-08-04** with the branch it covered; see the discarded register. |
+| `test_sandbox_token_stays_out_of_owner_routes` | `looks_like_agent_token` keeps a worker token out of the JWT branch; 403 on the wire | the refusal is now flat ("no inference route here") rather than path-based |
+| `test_claim_requires_the_dispatcher_credential` | the claim gate is closed to an ordinary caller | — |
+| `test_dedicated_dispatcher_token_opens_exactly_one_door` | `verify_dispatcher_access`'s `AGENT_DISPATCHER_TOKEN` fast path, which is this repo's code | the fallback's refusal, via the stand-in |
+
+**Tripwire.** When E7 lands, delete `tests/support/e7_auth.py` and let these
+tests run against the real dependencies. The three right-hand entries above are
+the acceptance list for that task: if E7 ships and the file is still here, the
+port is pinning a stub.
+
+### ✅ E7 landed; the stand-ins are gone
+
+`tests/support/e7_auth.py` is **deleted**, and all six cases above now run
+against `cloud_agent.api.deps`. What became of the three right-hand entries:
+
+| Entry | Answer |
+|---|---|
+| the `"Token has expired…"` detail string | **Real.** `get_current_user` produces it, from `identity.verify_session`'s own `ExpiredSignatureError`. `tests/unit/test_api_auth_deps.py::test_an_expired_session_says_so` pins it independently of the ported case. |
+| `update_key_last_used` — the `api_keys` table stayed on the gateway | **Never answerable here, and answered on 2026-08-04 by deletion.** `get_operational_store` read `app.state.operational_store`, which *nothing in this repository sets* — so the API-key branch answered 503 in every real deployment, and the ported case passed only because it injected a fake. E7 recorded that as the one finding that was a decision rather than an implementation; the decision is now made and the branch, `verify_api_key`, `hash_api_key` and `get_operational_store` are gone. See the deferred register row and the discarded-test row. |
+| the flat refusal for a sandbox credential | **Real, and it outlived its function.** It was `verify_api_key` raising 403 `insufficient_scope` for anything in the `ajt.` namespace before it looked at a store — which is why it never depended on the branch above being reachable, and why deleting that branch could keep it. It now lives in `authenticate_agent_owner` itself, pinned both on the wire (`test_sandbox_token_stays_out_of_owner_routes`) and at the dependency (`test_owner_auth_dispatch.py::test_a_worker_token_is_refused_as_insufficient_scope`). |
+
+One dependency was **not** deleted despite naming a gateway-side table:
+deleting `get_log_store` means deleting `_job_usage`, which would take ported
+test cases with it. It answers `None` instead, which is what the code path
+behind it was already written to handle — *absent* spend rather than a
+fabricated zero.
+
+Its sibling `get_operational_store` went the other way on 2026-08-04. The same
+argument did not hold for it: what it fed was not a degraded feature but a
+whole authenticator that could not succeed in any deployment, and the ported
+case blocking its removal was passing only on an injected fake. Deleted
+deliberately, with that case recorded in the discarded register — which is the
+difference between this and a silent drop.
+
+`log_admin_action` and `get_client_ip` went the other way and became real:
+migration `0005` adds `agent_admin_audit_log`, the store gained
+`record_admin_action`, and `admin_hosts.py` passes the agent store where it
+used to pass an operational store it never had. A documented no-op was the
+alternative and was rejected — this service's admin surface revokes a machine's
+credential, retargets every future claim and removes hosts from the pool, and
+those are exactly the actions an incident asks about afterwards.
 
 ## What stays in HybridInference
 
@@ -247,12 +724,22 @@ about *inference*, not about *agents*:
 | D | D3+D4 — workspace setup/paths/snapshot + patch gate | ✅ merged; D3 acceptance pending D6 | this repo #3; one PR because `workspace_snapshot` imports `patch_gate`; snapshot tests are owned by D6 above |
 | D | D5 — workspace broker + browser | 🔍 in review | this repo #4; `terminal_coordination` reclassified to Phase E (see manifest corrections) |
 | D | D6 — runner + broker client (+ logging entrypoint) | 🔍 in review | this repo #5, stacked on #4; closes both D6 register rows; D3's pending acceptance resolves here |
+| E | E10 — control-plane parity tests | 🔍 in review | 102 of 103 cases ported and passing at E10 (`test_agent_jobs_api.py` 102, `test_admin_agent_runner_hosts.py` 10) plus the `dbtest` lifecycle; 1 discarded and 1 `xfail(strict)` — both recorded above and both pre-existing upstream, not caused by the move. **101 in `test_agent_jobs_api.py` since 2026-08-04**: the API-key ruling discarded one more, recorded in the discarded register and replaced by `tests/unit/test_owner_auth_dispatch.py` |
+| E | E6 — API router and app shell | 🔍 in review | this repo #11, stacked on #10; the control plane boots and serves 45 operations |
+| E | E7+E8+E9 — auth dependencies, session endpoints, grants in the request path | 🔍 in review | one PR because they are one path: the cookie E8 mints is what E7 verifies, and the claim E9 rewrites is the only route that was still minting a credential of its own. `deps.py`'s placeholders are implemented, `tests/support/e7_auth.py` is **deleted** (its tripwire), `/v1/session/*` exists, the sandbox carries a gateway grant, and `0005_grants_and_audit` adds `agent_attempts.grant_id` plus `agent_admin_audit_log`. Two ported cases could not survive E9 — see the discarded register — and one gateway-side contract is still owed; see the deferred register |
 | E | E5 — source control + publishing | 🔍 in review | this repo #10, stacked on #9; cipher re-keyed to `AGENT_SOURCE_CONTROL_ENCRYPTION_KEY` |
 | E | E4 — visible models over HTTP | 🔍 in review | this repo #9, stacked on #8; **rewritten, not moved** — see the discarded-test record below |
 | E | E2+E3 — schemas, entitlement, control tokens (re-keyed) | 🔍 in review | this repo #8, stacked on #7; `AGENT_CONTROL_TOKEN_SECRET` replaces the gateway's root |
 | E | E1 — store + Alembic baseline | 🔍 in review | this repo #7, stacked on #6; `initialize()` becomes a no-op, schema **and its five startup backfills** move to `0001_baseline` |
 | D | D7 — host deploy files | 🔍 in review | this repo #6; co-located overlay undecided (see Open decisions) |
-| E–H | control plane, web, host pool, cutover | ⏳ not started | — |
+| F | F1+F2+F3 — Next.js scaffold, API client + components, pages as the root app | 🔍 in review | this repo; one PR because the moved pages do not type-check without the components and the components do not run without the scaffold. See "The web app: what moved, what was recreated" above. |
+| H | H1 — connection migration tooling | 🔍 in review | `deploy/migrate/` — the two tables, re-keyed rather than copied, id-preserving, idempotent, row counts + a plaintext-derived checksum. 24 unit cases and 8 `dbtest` cases against two real databases. **Written, not run**: H2 step 5 runs it. |
+| H | H2 — staging cutover runbook | 🔍 in review | `docs/cutover.md`. Written against the code, so it names the three creation routes to block at the edge (there is no feature flag) and says the runner has no drain mode. Four blockers listed that must land before it can be executed. |
+| H | H4 — gateway removal checklist | 🔍 in review | `docs/gateway-removal.md`. Executed in the **source** repo after H3, not here. |
+| H | H5 — operations doc | 🔍 in review | `docs/operations.md`, moved from the source repo's `docs/developer/agent-sandbox-operations.md`; deviations listed in its own closing section. |
+| H | H3 — production cutover | ⏳ not started | human-led, Murphy's approval gate |
+| G | G1–G7 — dynamic host pool | 🔍 in review | `0002_host_pool` + `0003_attempt_host`; enrollment, heartbeat, the status machine, host-aware claiming with atomic slots, per-host broker routing, drain/remove/revoke, and the host-loss chaos test. **Extends** `agent_runner_hosts` rather than adding the plan's second `agent_hosts` table — see Open decisions. The host-side client that would redeem an enrollment token is **not** written; see the deferred register. |
+| E–H | remaining control plane | ⏳ not started | — |
 
 Update this table as tasks land. It is the answer to "what is actually done" —
 the plan describes intent, this describes reality.

@@ -1,0 +1,201 @@
+"""The two endpoints a host agent calls about itself: register and heartbeat.
+
+Kept out of ``routes.py``. That file is the moved gateway router and is held to
+a move-as-is diff; these are net-new phase-G surface, and mixing them in would
+make the one file nobody should be editing the file everybody edits.
+
+**Why enrollment exists at all.** Before it, a machine joined the pool by
+polling with the dispatcher credential, and the pool list was therefore a list
+of names anything holding that credential could invent — which #1158's own
+module docstring says plainly, and accepts, because the switch it was built for
+decides where *our* machines run *our* jobs. A pool that grows and shrinks
+needs more than that: a host must be something the platform issued a credential
+to, so that revoking it means something and so that a heartbeat is evidence
+rather than an assertion.
+
+The credential is deliberately **not** the dispatcher token. That token opens
+the claim door for every host; a host credential opens it for exactly one, and
+carries the machine's identity with it, so a compromised host cannot claim as
+its neighbour.
+
+Registration is unauthenticated *except* for the enrollment token, and that is
+the point: a machine being set up has no credential yet. The token is
+one-time, short-lived, hashed at rest, and **names the host it may register**,
+so the window it opens is one machine, under one name, once, for fifteen
+minutes.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+from fastapi import APIRouter, Depends, Header, HTTPException
+
+from cloud_agent.api.deps import get_agent_job_store
+from cloud_agent.host_pool import (
+    HEARTBEAT_INTERVAL_S,
+    hash_secret,
+)
+from cloud_agent.schemas import (
+    HostHeartbeatRequest,
+    HostHeartbeatResponse,
+    HostRegisterRequest,
+    HostRegisterResponse,
+)
+from cloud_agent.tokens import InvalidHostToken, mint_host_token, parse_host_token
+
+if TYPE_CHECKING:
+    from cloud_agent.storage.store import AgentJobStore
+
+router = APIRouter(prefix="/v1/agent/host", tags=["agent-hosts"])
+
+
+def _require_store(store: AgentJobStore | None) -> AgentJobStore:
+    """Return the store or 503 — agent jobs are an optional deployment part."""
+    if store is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Agent jobs are not configured for this deployment.",
+        )
+    return store
+
+
+def _unauthorized(message: str) -> HTTPException:
+    """The single refusal every host-credential failure produces.
+
+    One message for an unknown host, a revoked credential, a superseded one and
+    a disabled row, because distinguishing them tells an attacker which of
+    those they achieved.
+    """
+    return HTTPException(
+        status_code=401,
+        detail={"error": {"type": "unauthorized", "message": message}},
+    )
+
+
+async def authenticate_host(
+    authorization: str | None = Header(None),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+) -> dict[str, Any]:
+    """Resolve the host behind a host credential, or refuse.
+
+    Two checks, and both are needed. The signature proves this service minted
+    the token — but a token this service minted last month for a machine that
+    has since been revoked is still perfectly signed, so the hash comparison
+    against the live row is what revocation actually acts on. Fails closed on
+    every branch.
+    """
+    job_store = _require_store(store)
+    token = (
+        authorization[7:].strip() if authorization and authorization.startswith("Bearer ") else ""
+    )
+    if not token:
+        raise _unauthorized("Missing host credential.")
+    try:
+        claims = parse_host_token(token)
+    except InvalidHostToken as exc:
+        raise _unauthorized(f"Invalid host credential: {exc}") from exc
+    except ValueError as exc:
+        # ``AGENT_CONTROL_TOKEN_SECRET`` is unset, so nothing this service ever
+        # minted can be verified. 401 rather than the 500 the raise would
+        # produce: the credential genuinely does not authenticate here, and the
+        # operator's signal is the boot-time failure to mint, not a stack trace
+        # per heartbeat.
+        raise _unauthorized("Host credentials cannot be verified by this deployment.") from exc
+    host = await job_store.authenticate_host(
+        host=claims["host"], credential_hash=hash_secret(token)
+    )
+    if host is None:
+        raise _unauthorized("This host credential is no longer valid.")
+    return host
+
+
+@router.post("/register", response_model=HostRegisterResponse)
+async def register_host(
+    body: HostRegisterRequest,
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+) -> HostRegisterResponse:
+    """Spend a one-time enrollment token and receive a host credential.
+
+    The token is consumed before the credential is minted, and both happen
+    before the response is written — so a machine that crashes mid-registration
+    has burnt its token and needs a new one. That is the right way round: the
+    alternative leaves a token that looks unused but may have already produced
+    a credential.
+
+    The host starts at ``enrolling`` and claims nothing until it heartbeats.
+    A machine that registers and never comes up therefore never receives work,
+    which is the difference between a pool entry and a promise.
+
+    ``name`` is checked against the name the token was issued for, inside the
+    same statement that spends it. Registration upserts, so a name already held
+    by a live host loses its credential and drops back to ``enrolling``; before
+    the binding, one typo here evicted a working machine from the pool. A
+    mismatch does not consume the token, so a typo is retried rather than
+    re-issued.
+    """
+    job_store = _require_store(store)
+    if not await job_store.consume_enroll_token(
+        token_hash=hash_secret(body.enroll_token), host=body.name
+    ):
+        # One answer for expired, already-spent, never-issued and issued-for-
+        # another-host: they are the same fact from the presenter's side — this
+        # token is not usable here — and separating them says which happened.
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": {
+                    "type": "unauthorized",
+                    "message": (
+                        "This enrollment token is not valid for this host name. Issue a new one."
+                    ),
+                }
+            },
+        )
+    credential = mint_host_token(host=body.name)
+    host = await job_store.register_host(
+        host=body.name,
+        credential_hash=hash_secret(credential),
+        capabilities=body.capabilities,
+        slots_total=body.slots_total,
+        broker_url=body.broker_url,
+        runner_version=body.runner_version,
+        labels=dict(body.labels),
+    )
+    return HostRegisterResponse(host=host["host"], credential=credential, status=host["status"])
+
+
+@router.post("/heartbeat", response_model=HostHeartbeatResponse)
+async def heartbeat_host(
+    body: HostHeartbeatRequest,
+    host: dict[str, Any] = Depends(authenticate_host),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+) -> HostHeartbeatResponse:
+    """Report liveness, and whatever about this machine has changed.
+
+    Promotes ``enrolling`` and ``offline`` hosts to ``online``: a machine that
+    comes back from a partition needs no operator to put it back to work.
+    Deliberately does **not** promote a ``draining`` one — a heartbeat says "I
+    am here", not "I should be taking work" — and a ``disabled`` host cannot
+    get this far, because its credential no longer authenticates.
+    """
+    job_store = _require_store(store)
+    updated = await job_store.record_host_heartbeat(
+        host=host["host"],
+        slots_total=body.slots_total,
+        runner_version=body.runner_version,
+        broker_url=body.broker_url,
+        capabilities=body.capabilities,
+    )
+    if updated is None:
+        # The row vanished between authentication and the write — a forget
+        # landing mid-request. Refusing is right: this credential now names
+        # nothing.
+        raise _unauthorized("This host credential is no longer valid.")
+    return HostHeartbeatResponse(
+        host=updated["host"],
+        status=updated["status"],
+        slots_total=updated["slots_total"],
+        slots_used=updated["slots_used"],
+        heartbeat_interval_seconds=HEARTBEAT_INTERVAL_S,
+    )

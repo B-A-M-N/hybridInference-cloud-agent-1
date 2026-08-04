@@ -1,0 +1,218 @@
+"""The grant link's SQL predicates, against a real database (task E9).
+
+``tests/unit/test_grant_lifecycle.py`` pins the *loops* — that they re-read the
+store every pass and act only on what it returns. What it cannot pin is the
+queries themselves, and those are where the fence actually lives: one wrong
+predicate and ``list_renewable_grants`` starts returning superseded attempts,
+with every unit test still green.
+
+So these three properties are checked against Postgres:
+
+- a superseded attempt's grant is **not** renewable and **is** revocable;
+- an attempt whose lease lapsed behaves the same way, before any reaper has
+  run — expiry is immediate, not "once the reaper notices";
+- ``take_revocable_grants`` detaches as it hands over, so two callers cannot
+  both be handed the same grant;
+- the fence ``list_renewable_grants`` hands out is the one that will be
+  presented back, when a grant the gateway keeps refusing makes the renewal
+  pass end the attempt. A wrong column there is a give-up that silently does
+  nothing, and the unit tests supply their own row.
+"""
+
+from __future__ import annotations
+
+import os
+
+import pytest
+import pytest_asyncio
+
+from cloud_agent.storage.store import AgentJobStore
+from tests.support.migrations import apply_migrations
+
+pytestmark = [pytest.mark.dbtest, pytest.mark.asyncio]
+
+_ALLOWED_TEST_DB_PATTERN = "_test_"
+_TABLES_IN_FK_ORDER = (
+    "agent_thread_messages",
+    "agent_job_artifacts",
+    "agent_job_events",
+    "agent_attempts",
+    "agent_jobs",
+    "agent_threads",
+    "agent_runner_hosts",
+)
+
+
+@pytest_asyncio.fixture
+async def store():
+    """Provide a clean AgentJobStore over the shared test database."""
+    import asyncpg
+
+    base_db_name = os.getenv("TEST_DB_NAME", "hybridinference_test_db")
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER", "master")
+    test_db_name = base_db_name if worker_id == "master" else f"{base_db_name}_{worker_id}"
+    if _ALLOWED_TEST_DB_PATTERN not in (test_db_name or ""):
+        pytest.fail(f"SAFETY: TEST_DB_NAME='{test_db_name}' is not a test database.")
+
+    db_config = {
+        "host": os.getenv("TEST_DB_HOST", "localhost"),
+        "port": int(os.getenv("TEST_DB_PORT", "5432")),
+        "database": test_db_name,
+        "user": os.getenv("TEST_DB_USER", "postgres"),
+        "password": os.getenv("TEST_DB_PASSWORD", "postgres"),
+    }
+    try:
+        pool = await asyncpg.create_pool(**db_config, min_size=1, max_size=5)
+    except Exception as exc:
+        pytest.skip(f"PostgreSQL not available: {exc}")
+        return  # unreachable
+
+    job_store = AgentJobStore(pool)
+    apply_migrations(db_config)
+    async with pool.acquire() as conn:
+        for table in _TABLES_IN_FK_ORDER:
+            await conn.execute(f"DELETE FROM {table}")
+        await conn.execute("UPDATE agent_runner_policy SET active_host = NULL")
+    try:
+        yield job_store
+    finally:
+        async with pool.acquire() as conn:
+            for table in _TABLES_IN_FK_ORDER:
+                await conn.execute(f"DELETE FROM {table}")
+            await conn.execute("UPDATE agent_runner_policy SET active_host = NULL")
+        await pool.close()
+
+
+async def _claimed(store: AgentJobStore, *, prompt: str = "fix it") -> dict:
+    """Create a job and claim it, returning the claim."""
+    await store.create_job(
+        user_id="user-owner",
+        repo="owner/name",
+        task_prompt=prompt,
+        runtime="claude-code",
+        model="glm-5.1",
+    )
+    claim = await store.claim_job(worker_id="w1", lease_ttl_seconds=300.0)
+    assert claim is not None
+    return claim
+
+
+async def test_a_live_attempts_grant_is_renewable(store: AgentJobStore) -> None:
+    claim = await _claimed(store)
+
+    assert await store.record_attempt_grant(
+        attempt_id=claim["attempt_id"],
+        lease_generation=claim["lease_generation"],
+        grant_id="agr_1",
+    )
+
+    renewable = await store.list_renewable_grants()
+    assert [row["grant_id"] for row in renewable] == ["agr_1"]
+    assert await store.take_revocable_grants() == []
+
+
+async def test_a_renewable_row_carries_the_fence_that_can_end_it(store: AgentJobStore) -> None:
+    """The give-up path, end to end in SQL.
+
+    ``_renew_live_grants`` abandons an attempt whose grant the gateway keeps
+    refusing, and every write that ends an attempt is fenced. If the row's
+    ``lease_generation`` were the wrong column — or absent — the release would
+    match nothing and the give-up would be a log line: the attempt would run on
+    with a capability about to expire, which is the failure the give-up exists
+    to prevent.
+    """
+    claim = await _claimed(store)
+    await store.record_attempt_grant(
+        attempt_id=claim["attempt_id"],
+        lease_generation=claim["lease_generation"],
+        grant_id="agr_1",
+    )
+
+    row = (await store.list_renewable_grants())[0]
+    assert await store.release_claim(
+        job_id=row["job_id"],
+        attempt_id=row["attempt_id"],
+        lease_generation=row["lease_generation"],
+    )
+
+    # And the abandoned attempt's grant is now the revocation pass's problem,
+    # exactly once — nothing had to revoke it inline.
+    assert await store.list_renewable_grants() == []
+    assert [taken["grant_id"] for taken in await store.take_revocable_grants()] == ["agr_1"]
+    assert await store.take_revocable_grants() == []
+
+
+async def test_a_superseded_attempts_grant_flips_sides(store: AgentJobStore) -> None:
+    """The fence, in SQL. One reaper pass moves the grant from one set to the
+    other, and nothing else has to be told."""
+    claim = await _claimed(store)
+    await store.record_attempt_grant(
+        attempt_id=claim["attempt_id"],
+        lease_generation=claim["lease_generation"],
+        grant_id="agr_1",
+    )
+
+    async with store._pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_attempts SET lease_expires_at = NOW() - INTERVAL '1 second' "
+            "WHERE id = $1",
+            claim["attempt_id"],
+        )
+
+    # Immediately, before any reaper pass: an expired lease is dead now.
+    assert await store.list_renewable_grants() == []
+
+    await store.reap_expired()
+    assert await store.list_renewable_grants() == []
+    assert [row["grant_id"] for row in await store.take_revocable_grants()] == ["agr_1"]
+
+
+async def test_a_grant_is_handed_over_exactly_once(store: AgentJobStore) -> None:
+    """``take_`` detaches as it returns, so a second pass — or a second control
+    plane — is not handed the same grant to revoke again."""
+    claim = await _claimed(store)
+    await store.record_attempt_grant(
+        attempt_id=claim["attempt_id"],
+        lease_generation=claim["lease_generation"],
+        grant_id="agr_1",
+    )
+    async with store._pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_attempts SET status = 'superseded' WHERE id = $1", claim["attempt_id"]
+        )
+
+    assert len(await store.take_revocable_grants()) == 1
+    assert await store.take_revocable_grants() == []
+
+
+async def test_recording_against_a_stale_fence_is_refused(store: AgentJobStore) -> None:
+    """A grant minted for an attempt that was superseded meanwhile must not be
+    attached to it: it would then be renewed for as long as the row lived."""
+    claim = await _claimed(store)
+
+    assert not await store.record_attempt_grant(
+        attempt_id=claim["attempt_id"],
+        lease_generation=claim["lease_generation"] + 1,
+        grant_id="agr_1",
+    )
+    assert await store.list_renewable_grants() == []
+
+
+async def test_an_admin_action_is_recorded(store: AgentJobStore) -> None:
+    """The audit trail migration 0005 added, written through the store."""
+    row_id = await store.record_admin_action(
+        action="agent.runner_host.drain",
+        admin_ip="203.0.113.9",
+        details={"host": "runner-a"},
+    )
+
+    async with store._pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT action, admin_ip, details, success FROM agent_admin_audit_log WHERE id = $1",
+            row_id,
+        )
+        await conn.execute("DELETE FROM agent_admin_audit_log WHERE id = $1", row_id)
+
+    assert row["action"] == "agent.runner_host.drain"
+    assert row["admin_ip"] == "203.0.113.9"
+    assert row["success"] is True

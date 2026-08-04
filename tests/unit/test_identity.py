@@ -1,0 +1,234 @@
+"""Identity verification and sessions.
+
+Every test here is about a refusal. The service's job in this area is to be
+hard to fool, and the failures that matter are the ones where a token *nearly*
+qualifies: right shape, wrong audience; right issuer, wrong key; valid once,
+replayed after expiry.
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Any
+
+import jwt
+import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+from cloud_agent import identity
+from cloud_agent.identity import (
+    AUDIENCE,
+    ENV_JWKS_URL,
+    ENV_SESSION_SECRET,
+    IdentityError,
+    IdentityNotConfigured,
+    mint_session,
+    verify_identity_token,
+    verify_session,
+)
+
+ISSUER = "https://gateway.example"
+# 32+ bytes: the module refuses anything shorter, and a fixture that did not
+# meet its own minimum would test a path deployments cannot use.
+SESSION_SECRET = "session-signing-secret-long-enough-for-hs256"
+
+
+@pytest.fixture(scope="module")
+def keypair():
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    return key, pem
+
+
+@pytest.fixture(autouse=True)
+def _clean(monkeypatch):
+    identity.reset_jwks_cache()
+    monkeypatch.delenv(ENV_JWKS_URL, raising=False)
+    monkeypatch.delenv(ENV_SESSION_SECRET, raising=False)
+    yield
+    identity.reset_jwks_cache()
+
+
+def _token(key, *, aud: str = AUDIENCE, iss: str = ISSUER, exp_delta: int = 600, **extra) -> str:
+    now = int(time.time())
+    claims: dict[str, Any] = {
+        "sub": "user_1",
+        "aud": aud,
+        "iss": iss,
+        "iat": now,
+        "exp": now + exp_delta,
+        "role": "pro",
+        **extra,
+    }
+    return jwt.encode(claims, key, algorithm="RS256")
+
+
+class _FakeSigningKey:
+    def __init__(self, key) -> None:
+        self.key = key
+
+
+def _serve_key(monkeypatch, key) -> None:
+    """Stand in for the JWKS fetch with the public half of `key`."""
+    monkeypatch.setenv(ENV_JWKS_URL, "https://gateway.example/v1/identity/jwks")
+
+    class _Client:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def get_signing_key_from_jwt(self, token: str):
+            return _FakeSigningKey(key.public_key())
+
+    monkeypatch.setattr(identity, "PyJWKClient", _Client)
+
+
+# ---------------------------------------------------------------------------
+# Identity tokens
+# ---------------------------------------------------------------------------
+
+
+def test_a_valid_token_verifies(monkeypatch, keypair) -> None:
+    key, _ = keypair
+    _serve_key(monkeypatch, key)
+    claims = verify_identity_token(_token(key))
+    assert claims["sub"] == "user_1"
+    assert claims["role"] == "pro"
+
+
+def test_a_token_for_another_audience_is_refused(monkeypatch, keypair) -> None:
+    """A credential for a different consumer must not act as ours."""
+    key, _ = keypair
+    _serve_key(monkeypatch, key)
+    with pytest.raises(IdentityError):
+        verify_identity_token(_token(key, aud="some-other-service"))
+
+
+def test_an_expired_token_is_refused(monkeypatch, keypair) -> None:
+    key, _ = keypair
+    _serve_key(monkeypatch, key)
+    with pytest.raises(IdentityError):
+        verify_identity_token(_token(key, exp_delta=-1))
+
+
+def test_a_token_signed_by_another_key_is_refused(monkeypatch, keypair) -> None:
+    key, _ = keypair
+    other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    _serve_key(monkeypatch, key)
+    with pytest.raises(IdentityError):
+        verify_identity_token(_token(other))
+
+
+def test_a_token_without_a_subject_is_refused(monkeypatch, keypair) -> None:
+    """`sub` is the only thing this service stores about a person."""
+    key, _ = keypair
+    _serve_key(monkeypatch, key)
+    now = int(time.time())
+    token = jwt.encode({"aud": AUDIENCE, "iss": ISSUER, "exp": now + 600}, key, algorithm="RS256")
+    with pytest.raises(IdentityError):
+        verify_identity_token(token)
+
+
+def test_an_unfetchable_key_refuses_rather_than_passing(monkeypatch, keypair) -> None:
+    """Failing open here would accept any token during a gateway outage."""
+    key, _ = keypair
+    monkeypatch.setenv(ENV_JWKS_URL, "https://gateway.example/v1/identity/jwks")
+
+    class _Broken:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def get_signing_key_from_jwt(self, token: str):
+            raise RuntimeError("jwks unreachable")
+
+    monkeypatch.setattr(identity, "PyJWKClient", _Broken)
+    with pytest.raises(IdentityError):
+        verify_identity_token(_token(key))
+
+
+def test_no_jwks_url_is_not_configured(keypair) -> None:
+    key, _ = keypair
+    with pytest.raises(IdentityNotConfigured):
+        verify_identity_token(_token(key))
+
+
+def test_an_empty_token_is_refused() -> None:
+    with pytest.raises(IdentityError):
+        verify_identity_token("")
+
+
+def test_the_issuer_is_checked_when_configured(monkeypatch, keypair) -> None:
+    key, _ = keypair
+    _serve_key(monkeypatch, key)
+    monkeypatch.setenv("GATEWAY_ISSUER", ISSUER)
+    assert verify_identity_token(_token(key))["sub"] == "user_1"
+    with pytest.raises(IdentityError):
+        verify_identity_token(_token(key, iss="https://impostor.example"))
+
+
+# ---------------------------------------------------------------------------
+# Sessions
+# ---------------------------------------------------------------------------
+
+
+def test_a_session_round_trips(monkeypatch) -> None:
+    monkeypatch.setenv(ENV_SESSION_SECRET, SESSION_SECRET)
+    claims = verify_session(mint_session(user_id="user_1", email="a@b.test", role="pro"))
+    assert claims["sub"] == "user_1"
+    assert claims["email"] == "a@b.test"
+    assert claims["role"] == "pro"
+
+
+def test_a_session_omits_an_unknown_email(monkeypatch) -> None:
+    monkeypatch.setenv(ENV_SESSION_SECRET, SESSION_SECRET)
+    assert "email" not in verify_session(mint_session(user_id="user_1", email=None, role="free"))
+
+
+def test_a_session_signed_with_another_secret_is_refused(monkeypatch) -> None:
+    monkeypatch.setenv(ENV_SESSION_SECRET, SESSION_SECRET)
+    token = mint_session(user_id="user_1", email=None, role="pro")
+    monkeypatch.setenv(ENV_SESSION_SECRET, "a-different-secret-also-long-enough-x")
+    with pytest.raises(IdentityError):
+        verify_session(token)
+
+
+def test_an_expired_session_is_refused(monkeypatch) -> None:
+    monkeypatch.setenv(ENV_SESSION_SECRET, SESSION_SECRET)
+    now = int(time.time())
+    token = jwt.encode({"sub": "user_1", "exp": now - 1}, SESSION_SECRET, algorithm="HS256")
+    with pytest.raises(IdentityError):
+        verify_session(token)
+
+
+def test_no_session_secret_is_not_configured() -> None:
+    """Refusing beats defaulting: a shared default forges every deployment."""
+    with pytest.raises(IdentityNotConfigured):
+        mint_session(user_id="user_1", email=None, role="pro")
+
+
+def test_a_short_session_secret_is_refused(monkeypatch) -> None:
+    """The JWT library only warns about this, and a warning is not a control.
+
+    A secret below the HS256 minimum is brute-forceable, and every session it
+    signs is forgeable — so the refusal happens here rather than in a log line
+    nobody reads.
+    """
+    monkeypatch.setenv(ENV_SESSION_SECRET, "too-short")
+    with pytest.raises(IdentityNotConfigured, match="at least"):
+        mint_session(user_id="user_1", email=None, role="pro")
+
+
+def test_an_identity_token_is_not_accepted_as_a_session(monkeypatch, keypair) -> None:
+    """Different algorithms and different secrets, deliberately.
+
+    An RS256 identity token presented as a session must not verify — otherwise
+    the short-lived credential meant to be spent once would work for a week.
+    """
+    key, _ = keypair
+    monkeypatch.setenv(ENV_SESSION_SECRET, SESSION_SECRET)
+    with pytest.raises(IdentityError):
+        verify_session(_token(key))

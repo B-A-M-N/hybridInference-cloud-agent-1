@@ -1,0 +1,258 @@
+openapi: 3.1.0
+
+info:
+  title: FreeInference gateway — internal lookups
+  version: "1.0.0"
+  x-source:
+    repo: HarvardMadSys/hybridInference
+    branch: murphy/claude/c9-internal-lookups
+    files:
+      - apps/backend/serving/servers/routers/internal_lookups.py
+      - apps/backend/serving/servers/routers/internal_auth.py
+    tasks: [C9]
+  description: |
+    The three questions the control plane can no longer answer by importing.
+
+    Before the split, cloud agent code ran inside the gateway process and read
+    the model registry, the MCP registry and the users table directly. Each of
+    those reads needed an endpoint *before* the task that moved its caller, or
+    that task either fails to import or silently degrades — and a silent
+    degrade here looks like a feature that stopped working for no reason.
+
+    | Endpoint | Replaces |
+    |---|---|
+    | `GET /internal/mcp-registry` | `mcp_registry.get_registry()` |
+    | `GET /internal/model-catalog` | the `visible_models` catalog read |
+    | `GET /internal/users/{id}/status` | the gateway `users` row read |
+
+    **Every consumer of this document must fail closed.** An unreachable
+    catalog resolves to *no* models, not every model; an unreadable user status
+    resolves to "cannot use the service", not "fine". The opposite direction
+    widens permission at exactly the moment nobody is watching.
+
+servers:
+  - url: https://freeinference.org
+    description: Production
+  - url: https://staging.freeinference.org
+    description: Staging
+
+tags:
+  - name: internal
+    description: Not public API. Behind the shared dispatch token.
+
+paths:
+  /internal/mcp-registry:
+    get:
+      tags: [internal]
+      operationId: mcpRegistry
+      summary: The MCP servers this deployment offers
+      description: |
+        **Names and display metadata only.** A server's `url` and `headers` are
+        exactly what the split keeps on the gateway side — the headers carry
+        the deployment's upstream credential. The control plane needs to know
+        *which* servers exist, so it can populate a picker and reject an
+        unknown name; it never needs to reach them, because a sandbox reaches
+        MCP through the gateway's own proxy.
+
+        A consumer that finds itself wanting the address should assume it has
+        the architecture wrong rather than that the field was forgotten.
+      security:
+        - dispatchToken: []
+      responses:
+        "200":
+          description: One record per configured server.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [servers]
+                properties:
+                  servers:
+                    type: array
+                    items:
+                      type: object
+                      required: [name, description, default, tools, unfiltered]
+                      properties:
+                        name: { type: string }
+                        description: { type: [string, "null"] }
+                        default:
+                          type: boolean
+                          description: |
+                            Whether this server is included when a job requests
+                            no MCP servers at all. The defaults are derived
+                            from this flag; there is no separate defaults list.
+                        tools:
+                          type: array
+                          items: { type: string }
+                          description: Sorted. Empty when the server is unfiltered.
+                        unfiltered:
+                          type: boolean
+                          description: Whether every tool the server exposes is allowed.
+        "401":
+          description: Wrong or missing dispatch token.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: Internal endpoints are not configured on this deployment.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /internal/model-catalog:
+    get:
+      tags: [internal]
+      operationId: modelCatalog
+      summary: The chat models one user's agent jobs may call
+      description: |
+        **Deliberately not `GET /v1/models`**, and that is not a preference.
+        That route authenticates with `optional_verify_api_key`, which does not
+        recognise an identity JWT or a service credential — a control plane
+        calling it would be handed the **anonymous** catalog, and every
+        pro/internal/admin user would silently lose the models their role can
+        actually reach. The failure would look like a shrunken model picker
+        with no error anywhere.
+
+        Resolved through the same visibility rules the inference path uses, so
+        this answer and "may this call proceed" agree.
+
+        Returns **canonical ids only** — aliases are not resolved here, so a
+        consumer that used to accept an alias no longer does.
+      security:
+        - dispatchToken: []
+      parameters:
+        - name: user_id
+          in: query
+          required: true
+          schema: { type: string, maxLength: 128 }
+          description: Whose role to resolve the catalog for.
+      responses:
+        "200":
+          description: The user's catalog, in registry order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user_id, role, models]
+                properties:
+                  user_id: { type: string }
+                  role: { type: string }
+                  models:
+                    type: array
+                    items: { type: string }
+        "401":
+          description: Wrong or missing dispatch token.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          description: |
+            The account is unknown or not active. A refusal, not an empty
+            catalog: the caller is asking what a user may do, and "nothing"
+            and "no such user" want different handling.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error: { type: subject_unavailable, message: That user cannot be resolved. }
+        "404":
+          description: Internal endpoints are not configured on this deployment.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /internal/users/{user_id}/status:
+    get:
+      tags: [internal]
+      operationId: userStatus
+      summary: Whether a user exists, may sign in, and with what role
+      description: |
+        The control plane keeps only an external user id; everything else about
+        an account stays with the gateway. This is how it answers "may this
+        person still use the service" without holding a copy of the users
+        table.
+
+        **Unlike the other two, an unknown user is a 200 with `exists: false`
+        rather than a 403.** The caller is asking a question *about* an
+        account, not trying to act *as* one, and it needs to tell "gone" from
+        "suspended" to decide whether to archive a thread or show a message.
+      security:
+        - dispatchToken: []
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: |
+            The account's status. When `exists` is false, only `user_id`,
+            `exists` and `active` are present — there is nothing else to report.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user_id, exists, active]
+                properties:
+                  user_id: { type: string }
+                  exists: { type: boolean }
+                  active:
+                    type: boolean
+                    description: True only for status `active`.
+                  status: { type: [string, "null"] }
+                  role: { type: string }
+                  email:
+                    type: [string, "null"]
+                    description: |
+                      The account's email. **Not a display name** — no gateway
+                      contract carries one, so a consumer with a "name" field
+                      reports null rather than inventing one from this.
+              examples:
+                active:
+                  value:
+                    user_id: usr_123
+                    exists: true
+                    active: true
+                    status: active
+                    role: pro
+                    email: someone@example.com
+                unknown:
+                  value: { user_id: usr_gone, exists: false, active: false }
+        "401":
+          description: Wrong or missing dispatch token.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: Internal endpoints are not configured on this deployment.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+components:
+  securitySchemes:
+    dispatchToken:
+      type: http
+      scheme: bearer
+      description: |
+        `GATEWAY_GRANT_DISPATCH_TOKEN` — the same service credential the grant
+        endpoints use. Never travels toward a sandbox or a browser.
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [type, message]
+          properties:
+            type: { type: string }
+            message: { type: string }
+
+x-pinned-by:
+  gateway:
+    - tests/unit/test_internal_lookups.py
+  consumer:
+    - tests/unit/test_gateway_client.py
+    - tests/unit/test_agent_visible_models.py

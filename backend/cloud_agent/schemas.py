@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import base64
 import binascii
+
+# Runtime import, and it has to be: this module has `from __future__ import
+# annotations`, but pydantic still resolves every annotation when it builds the
+# model, so hiding this one behind TYPE_CHECKING leaves `AgentRunnerHost`
+# silently unbuilt and raises at the first request instead of at import.
+from datetime import datetime  # noqa: TC003
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
 from cloud_agent.entitlement import REPO_PATTERN
+from cloud_agent.host_pool import ENROLL_TOKEN_TTL_S
 
 # A lease is the only thing that lets the reaper take a job back from a stuck
 # or malicious worker. If the worker could pick the TTL, it could pick one long
@@ -679,3 +686,263 @@ class RepoBranchesResponse(BaseModel):
 
     default: str | None = None
     branches: list[str] = Field(default_factory=list)
+
+
+# The runner-host pool. These three lived in the gateway's `schemas_admin.py`
+# alongside its own admin schemas; the pool is this service's to schedule, so
+# they move here rather than leaving `api/admin_hosts.py` importing across the
+# split. Copied unchanged.
+
+
+class AgentRunnerHost(BaseModel):  # type: ignore[no-any-unimported]
+    """One machine in the agent runner pool.
+
+    Everything below ``seconds_since_seen`` arrived with the dynamic pool
+    (phase G) and every one of those fields has a default. A host that joined
+    by polling — the only way in before enrollment existed — has none of them
+    set, and it must still render on the admin page rather than 500 it.
+    """
+
+    host: str
+    active: bool
+    last_worker_id: str | None
+    first_seen_at: datetime
+    last_seen_at: datetime
+    seconds_since_seen: float = Field(
+        ...,
+        description=(
+            "Age of the last claim poll, by the server's clock. A runner polls "
+            "only between jobs, so a busy machine can look quiet for as long as "
+            "its longest job."
+        ),
+    )
+    status: str = Field(
+        "online",
+        description=(
+            "Pool lifecycle state: enrolling, online, draining, disabled or "
+            "offline. Only an online host takes new claims."
+        ),
+    )
+    enrolled: bool = Field(
+        False,
+        description=(
+            "Whether this host holds a credential issued by enrollment. False "
+            "means it joined by polling and is not expected to heartbeat, so "
+            "the offline reaper leaves it alone."
+        ),
+    )
+    labels: dict[str, Any] = Field(default_factory=dict)
+    capabilities: list[str] = Field(
+        default_factory=list,
+        description="What this machine can run. A job may only go to a host declaring all of it.",
+    )
+    slots_total: int | None = Field(
+        None,
+        description="Concurrent attempts this host accepts. Null means unmetered.",
+    )
+    slots_used: int = Field(0, description="Attempts currently holding one of this host's slots.")
+    runner_version: str | None = None
+    broker_url: str | None = Field(
+        None,
+        description="Where this host's workspace broker listens, as the control plane reaches it.",
+    )
+    last_heartbeat_at: datetime | None = None
+
+
+class ListAgentRunnerHostsResponse(BaseModel):  # type: ignore[no-any-unimported]
+    """The runner pool and which member currently takes jobs."""
+
+    hosts: list[AgentRunnerHost]
+    active_host: str | None = Field(
+        None,
+        description="Pinned host, or null when any runner may claim.",
+    )
+
+
+class SetActiveAgentRunnerHostRequest(BaseModel):  # type: ignore[no-any-unimported]
+    """Pin agent jobs to one host, or unpin with ``null``."""
+
+    host: str | None = Field(
+        None,
+        max_length=253,
+        description="A host that has polled at least once, or null to unpin.",
+    )
+
+
+# ── Host pool: enrollment and heartbeat ────────────────────────────────
+#
+# The host name is charset-checked in the same shape and for the same reason
+# as ``WorkerClaimRequest.host``: it is a primary key an operator reads off a
+# page and clicks, and it is interpolated into nothing but parameters — but a
+# machine that can write arbitrary bytes into the pool list can make the list
+# unreadable, which is a denial of the one tool for fixing a bad host.
+HOST_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
+
+
+class IssueHostEnrollTokenRequest(BaseModel):  # type: ignore[no-any-unimported]
+    """Admin request for a one-time host enrollment token."""
+
+    host: str = Field(
+        ...,
+        max_length=253,
+        pattern=HOST_NAME_PATTERN,
+        description=(
+            "The name this token may register, chosen here rather than by the "
+            "machine that redeems it. Registration upserts, so a name already "
+            "in use has its credential revoked and its row reset to "
+            "'enrolling' — a typo on a machine being set up would otherwise "
+            "evict a live host from the pool. Naming an existing host is how a "
+            "rebuilt machine is deliberately re-enrolled."
+        ),
+    )
+    ttl_seconds: float = Field(
+        ENROLL_TOKEN_TTL_S,
+        gt=0,
+        le=86400.0,
+        description=(
+            "How long the token may be redeemed for. Short by default: it is "
+            "pasted into a machine being set up right now, and a token still "
+            "live tomorrow is a credential nobody is tracking."
+        ),
+    )
+
+
+class IssueHostEnrollTokenResponse(BaseModel):  # type: ignore[no-any-unimported]
+    """The enrollment token, shown exactly once."""
+
+    enroll_token: str = Field(
+        ...,
+        description=(
+            "Single-use. Only its hash is stored, so this value cannot be "
+            "recovered — issue another one rather than looking it up."
+        ),
+    )
+    host: str = Field(
+        ...,
+        description=(
+            "The only name this token can register. Echoed back so the value "
+            "the token was bound to is visible next to the token itself."
+        ),
+    )
+    expires_at: datetime
+
+
+class HostRegisterRequest(BaseModel):  # type: ignore[no-any-unimported]
+    """A machine presenting an enrollment token to join the pool."""
+
+    enroll_token: str = Field(..., min_length=1, max_length=512)
+    name: str = Field(
+        ...,
+        max_length=253,
+        pattern=HOST_NAME_PATTERN,
+        description=(
+            "This machine's name in the pool. It must be the name the token "
+            "was issued for — the token names its host, so a machine cannot "
+            "register under a name an admin did not choose for it."
+        ),
+    )
+    capabilities: list[str] = Field(
+        default_factory=list,
+        max_length=64,
+        description=(
+            "What this machine can run — runtime tiers, sandbox backends, "
+            "whatever a job may ask for. A job goes to a host only when the "
+            "host declares everything the job requires."
+        ),
+    )
+    slots_total: int | None = Field(
+        None,
+        gt=0,
+        le=1024,
+        description="Concurrent attempts to accept. Omit for unmetered (the pre-pool behaviour).",
+    )
+    broker_url: str | None = Field(
+        None,
+        max_length=2048,
+        description=(
+            "Where this host's workspace broker listens, as the control plane "
+            "reaches it. Supply it on every enrolled host that runs jobs: once "
+            "an attempt records this host, the broker is resolved from this "
+            "row and the global AGENT_WORKSPACE_BROKER_URL is NOT consulted. "
+            "Omitting it means file, terminal and git requests for this host's "
+            "jobs answer 'no broker' (409) rather than being served from "
+            "another machine's disk, which is the one fallback that would be "
+            "actively wrong. The env var remains the answer only for attempts "
+            "that record no host at all."
+        ),
+    )
+    runner_version: str | None = Field(None, max_length=128)
+    labels: dict[str, str] = Field(default_factory=dict)
+
+
+class HostRegisterResponse(BaseModel):  # type: ignore[no-any-unimported]
+    """The host's identity and the credential it authenticates with."""
+
+    host: str
+    credential: str = Field(
+        ...,
+        description=(
+            "Long-lived host credential. Shown once; only its hash is stored. "
+            "Revoking the host clears that hash and the credential dies."
+        ),
+    )
+    status: str
+
+
+class HostHeartbeatRequest(BaseModel):  # type: ignore[no-any-unimported]
+    """A host reporting that it is still there, and what it now looks like.
+
+    Every field is optional and only overwrites when present, so a heartbeat
+    that carries nothing but liveness does not blank out what enrollment
+    declared.
+    """
+
+    slots_total: int | None = Field(None, gt=0, le=1024)
+    runner_version: str | None = Field(None, max_length=128)
+    broker_url: str | None = Field(None, max_length=2048)
+    capabilities: list[str] | None = Field(None, max_length=64)
+
+
+class HostHeartbeatResponse(BaseModel):  # type: ignore[no-any-unimported]
+    """What the control plane thinks of this host after the heartbeat."""
+
+    host: str
+    status: str
+    slots_total: int | None = None
+    slots_used: int = 0
+    heartbeat_interval_seconds: float = Field(
+        ...,
+        description=(
+            "How often to report in. Missing three consecutive intervals is "
+            "what moves a host to offline."
+        ),
+    )
+
+
+# ── Session (E8) ───────────────────────────────────────────────────────
+
+
+class SessionLoginRequest(BaseModel):  # type: ignore[no-any-unimported]
+    """The gateway identity token, traded once for a session cookie.
+
+    The browser holds this for exactly one call: the callback page redeems its
+    authorization code at the gateway and hands the result straight here. After
+    that the token is spent and the cookie is the only credential in play, so a
+    token intercepted afterwards buys nothing.
+    """
+
+    identity_token: str = Field(..., min_length=1, max_length=8192)
+
+
+class SessionUserResponse(BaseModel):  # type: ignore[no-any-unimported]
+    """Who the session says the caller is.
+
+    ``id`` rather than ``user_id``: this is the shape ``web/src/lib/api/
+    session.ts`` was written against, and it is the contract for all three
+    session routes.
+    """
+
+    id: str
+    email: str | None = None
+    role: str
+    user_name: str | None = None

@@ -23,6 +23,7 @@ from cloud_agent_host.runtimes import (
     RuntimeMCPConfig,
     RuntimeMCPUnavailableError,
     get_runtime,
+    runtimes_supporting_mcp,
 )
 
 _FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "agent_runtime_streams"
@@ -466,3 +467,74 @@ def test_suppression_does_not_leak_between_jobs():
     line = json.dumps({"type": "system", "subtype": "thinking_tokens"})
     assert ClaudeCodeRuntime().parse_event(line) is not None
     assert ClaudeCodeRuntime().parse_event(line) is not None
+
+
+# ── MCP wiring ported from the gateway at H4 ──────────────────────────
+#
+# These three lived in the gateway's ``test_agent_mcp.py``, whose *other* half
+# — the registry and the proxy filters — stays there because that half is the
+# gateway's code. Splitting a file is how a case gets dropped, and a sweep at
+# H4 found these three pin properties nothing here covered: the flag that shuts
+# out a repository's own servers when a job requests none, the one-normalisation
+# of the gateway base url, and which runtimes may claim MCP at all. The other
+# three cases in that section were already covered here under different names
+# (``test_a_brokered_runtime_emits_only_gateway_endpoints_and_no_credential``,
+# ``test_runtime_credentials_stay_out_of_process_arguments``,
+# ``test_mcp_config_fails_closed_without_a_gateway_broker``) and were not
+# duplicated.
+
+_MCP_GATEWAY = "http://backend:8080"
+
+
+def _mcp_argv(*server_ids: str) -> list[str]:
+    """Build the Claude Code invocation for a job with these servers."""
+    argv, _env = ClaudeCodeRuntime().prepare(
+        workdir="/tmp/x",
+        task_prompt="do it",
+        model="glm-5.1",
+        gateway_base_url=_MCP_GATEWAY,
+        credential="mcp-secret-must-not-leak",
+        mcp_config=RuntimeMCPConfig(server_ids=server_ids),
+    )
+    return argv
+
+
+def _mcp_config_of(argv: list[str]) -> dict:
+    return json.loads(argv[argv.index("--mcp-config") + 1])
+
+
+def test_repository_supplied_mcp_config_is_shut_out_even_with_no_servers():
+    """The repository is untrusted input and may not add its own servers.
+
+    Reproduced against the real CLI in a job's exact configuration (headless,
+    ``bypassPermissions``, cwd = a checkout carrying a ``.mcp.json``): without
+    this flag the CLI reports the repository's server alongside the platform's,
+    with no approval step — the permission mode the sandbox needs for its own
+    work is what removes the gate. Hence unconditional, rather than paired with
+    having servers: a job with no MCP at all is where an injected one would be
+    least expected.
+    """
+    argv = _mcp_argv()
+    assert "--strict-mcp-config" in argv
+    assert _mcp_config_of(argv) == {"mcpServers": {}}
+
+
+def test_the_gateway_base_url_is_normalized_once():
+    """A base url already ending in /v1 must not produce /v1/v1."""
+    argv, _env = ClaudeCodeRuntime().prepare(
+        workdir="/tmp/x",
+        task_prompt="do it",
+        model="glm-5.1",
+        gateway_base_url=f"{_MCP_GATEWAY}/v1",
+        credential="mcp-secret-must-not-leak",
+        mcp_config=RuntimeMCPConfig(server_ids=("github",)),
+    )
+    servers = _mcp_config_of(argv)["mcpServers"]
+    assert servers["github"]["url"] == f"{_MCP_GATEWAY}/v1/agent/mcp/github"
+
+
+def test_only_runtimes_that_can_also_shut_out_repo_config_report_mcp():
+    """Codex is not wired up, and says so rather than dropping tools."""
+    assert runtimes_supporting_mcp() == ["claude-code"]
+    assert ClaudeCodeRuntime().capabilities().mcp is True
+    assert CodexRuntime().capabilities().mcp is False

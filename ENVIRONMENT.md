@@ -53,6 +53,7 @@ need a gateway secret here, the design is wrong — stop and escalate.
 | `GATEWAY_BASE_URL` | **NEW** | Origin of the FreeInference gateway this deployment federates with, e.g. `https://gateway.example.org`. |
 | `GATEWAY_JWKS_URL` | **NEW** | `${GATEWAY_BASE_URL}/v1/identity/jwks` (task C1). Publishes the current signing key plus any retiring ones, so cache by `kid` and re-fetch on a miss rather than pinning a single key. |
 | `GATEWAY_GRANT_DISPATCH_TOKEN` | **NEW** | Bearer token authorizing this service to mint and revoke inference grants (task C5). Random 32 bytes, the same value on both sides, and distinct per environment — one shared across staging and production makes a staging compromise a production one. |
+| `GATEWAY_ISSUER` | **NEW** | Optional. The `iss` an identity token must carry, checked only when set. Left optional on purpose: a deployment may front the gateway at a different name than it mints under, and pinning it wrongly locks every user out. |
 | `AGENT_GATEWAY_URL` | existing | Gateway URL as seen *from inside the sandbox* — the relay address, not the public URL. Differs from `GATEWAY_BASE_URL` by design. |
 
 ### Own secrets
@@ -63,6 +64,14 @@ need a gateway secret here, the design is wrong — stop and escalate.
 | `AGENT_CONTROL_TOKEN_SECRET` | **NEW** | Signs host/worker control tokens. Replaces the old derivation from the gateway's `API_KEY_SECRET` (task E3). Generate random 32 bytes, unique per environment. |
 | `AGENT_SESSION_SECRET` | **NEW** | Signs the web session cookie (task E8). Generate random 32 bytes, unique per environment. |
 | `AGENT_DISPATCHER_TOKEN` | existing | Authenticates host agents claiming work. Existing deployments may hold this outside this service's own configuration; confirm where it is actually read from before cutover rather than assuming. |
+| `ADMIN_TOKEN` | existing | The machine-to-machine admin credential (task E7). **Unset opens nothing** — `verify_admin_access` refuses an empty configured value rather than matching an empty presented one — so a deployment that skips it has no token door, only the admin-session one. |
+
+### Behaviour switches read by the control plane
+
+| Variable | New? | Value / who provisions |
+|---|---|---|
+| `AGENT_SESSION_COOKIE_SECURE` | **NEW** | Defaults to on. Set to `false` **only** for a developer running the whole stack on plain `http://localhost`; a session cookie without `Secure` is one anyone on the path can take. |
+| `AGENT_TRUST_PROXY_HEADERS` | **NEW** | Defaults to off. Set to `true` only when a proxy this deployment controls overwrites `X-Forwarded-For`; otherwise the admin audit trail records whatever address the caller typed. |
 
 ### Source control
 
@@ -85,16 +94,28 @@ need a gateway secret here, the design is wrong — stop and escalate.
 
 | Variable | New? | Notes |
 |---|---|---|
+| `AGENT_HOST_CREDENTIAL` | **NEW** | What `/v1/agent/host/register` hands back (task G2). Authenticates this machine's heartbeats and its claims, and names it — unlike the shared `AGENT_DISPATCHER_TOKEN`, which says "a runner" and not "which". Revoked by removing the host. Read by the same not-yet-written host client as `AGENT_ENROLL_TOKEN`. |
 | `AGENT_LEASE_TTL` | existing | Attempt lease horizon. Grant TTL is derived from this (task E9) — changing one without the other creates either dead grants or grants outliving their attempt. |
 | `AGENT_TIMEOUT_S` | existing | |
-| `AGENT_RUNNER_HOST` | existing | Single-host fallback. Superseded by the `agent_hosts` table in phase G; kept working for single-host deployments. |
+| `AGENT_RUNNER_HOST` | existing | The name this runner reports at claim time. Phase G extends the `agent_runner_hosts` row it creates with status, capacity and capabilities rather than replacing it with a second table, so a runner that only sets this keeps working exactly as before — unmetered, online, and claimable. |
+
+### Cutover migration (`deploy/migrate/`, read once and never again)
+
+Set only for the length of one run of `migrate_connections.py` (task H1), and
+by a human at a shell. **Nothing in the deployed service reads these**, and
+neither belongs in any unit file, `.env`, or image.
+
+| Variable | New? | Value / who provisions |
+|---|---|---|
+| `AGENT_MIGRATION_SOURCE_URL` | **NEW** | DSN of the *gateway's* database, read-only for the length of the import. Env rather than a flag because a DSN carries a password and `argv` is readable by every process on the host. |
+| `AGENT_MIGRATION_OLD_KEY_FILE` | **NEW** | **Path**, not a value: the file holding the gateway's old key material, which the script reads once to decrypt credentials before re-encrypting them under `AGENT_SOURCE_CONTROL_ENCRYPTION_KEY`. Deleted immediately afterwards. The script deliberately refuses to read `API_KEY_SECRET` from its own environment — see [the one rule](#the-one-rule); this is the narrowest shape that still lets a re-key happen at all, and MIGRATION.md's open-decisions register says which machine may run it. |
 
 ## Host agent (`host/cloud_agent_host`)
 
 | Variable | New? | Notes |
 |---|---|---|
 | `AGENT_WORKSPACE_BROKER_URL` | existing | Single-host global. Phase G resolves this per host from the database; the env var stays as the fallback when an attempt has no `host_id`. |
-| `AGENT_WORKSPACE_BROKER_TOKEN` | existing | |
+| `AGENT_WORKSPACE_BROKER_TOKEN` | existing | **Still global after phase G.** Host rows carry a broker *URL*, not a credential, so every broker in the pool authenticates this one value — a compromised host's broker token opens every other host's broker. Making it per-host is secret distribution (issue at enrollment, rotate, deliver), not routing, and is deliberately not done here. |
 | `AGENT_WORKER_ID` | existing | |
 | `AGENT_WORKDIR_ROOT` | existing | Workspace root. Reused as-is at cutover (H2) so in-flight checkouts survive. |
 | `AGENT_SNAPSHOT_ROOT` | existing | |
@@ -103,7 +124,7 @@ need a gateway secret here, the design is wrong — stop and escalate.
 | `AGENT_TERMINAL_HARD_TTL_SECONDS` | existing | |
 | `AGENT_TERMINAL_MAX_SESSIONS` | existing | |
 | `AGENT_GENERIC_COMMAND` | existing | |
-| `AGENT_ENROLL_TOKEN` | **NEW** | One-time host enrollment token (task G2). Issued from the admin dashboard, consumed once at first boot, then replaced by a stored host credential. |
+| `AGENT_ENROLL_TOKEN` | **NEW** | One-time host enrollment token (task G2). Minted at `POST /admin/agent/runner-hosts/enroll-token`, redeemed once at `POST /v1/agent/host/register`, then replaced by the returned host credential. 15-minute TTL, hashed at rest, and shown exactly once — losing it means issuing another, not looking it up. **The token names the host it may register**: the admin minting it supplies `host`, and registration under any other name is refused without spending the token, so a typo cannot revoke a live machine's credential. **The host-side client that reads this does not exist yet**; see MIGRATION.md's deferred register. |
 | `AGENT_LOG_LEVEL` | **NEW** | Host process log level (default INFO). Read by `configure_process_logging()` at the runner entrypoint; replaces the source repo's import-side-effect logging setup (task D6). |
 
 ## Sandbox isolation (host agent reads, sandbox inherits)
@@ -130,10 +151,26 @@ need a gateway secret here, the design is wrong — stop and escalate.
 
 ## Web (`web/`)
 
+Every one of these is baked into the bundle at build time and is therefore
+**public**. Nothing secret may appear here — a `NEXT_PUBLIC_` variable is
+readable by anyone who loads the page.
+
 | Variable | New? | Notes |
 |---|---|---|
-| `NEXT_PUBLIC_AGENT_API_URL` | **NEW** | Control plane base URL. |
-| `NEXT_PUBLIC_GATEWAY_AUTHORIZE_URL` | **NEW** | `${GATEWAY_BASE_URL}/authorize` (task C4). |
+| `NEXT_PUBLIC_AGENT_API_URL` | **NEW** | Control plane base URL. Empty means same-origin, which is the DR4 shape (one host, API under `/api`). A cross-origin value additionally needs CORS-with-credentials on the control plane, because the session is a cookie. |
+| `NEXT_PUBLIC_GATEWAY_AUTHORIZE_URL` | **NEW** | `${GATEWAY_BASE_URL}/authorize` (task C4). Unset means this deployment cannot sign anyone in, and says so instead of redirecting to a half-built URL. The gateway's token endpoint is **derived** from this URL's origin rather than configured separately — one variable, nothing to get out of step. |
+| `NEXT_PUBLIC_APP_NAME` | **NEW** | Product name in the header and the document title. Defaults to `FreeInference Cloud Agent`. |
+| `NEXT_PUBLIC_ORG_NAME` | **NEW** | Optional organisation name beside the product name. Empty hides it. |
+| `NEXT_PUBLIC_ORG_URL` | **NEW** | Link target for `NEXT_PUBLIC_ORG_NAME`. |
+| `NEXT_PUBLIC_STATUS_URL` | **NEW** | Status page link in the header. |
+| `NEXT_PUBLIC_FEATURE_RAG` | **NEW** | `true` shows the gateway's Docs Assistant link. Off by default; the page belongs to the gateway, not to this service. |
+| `NEXT_PUBLIC_BUILD_SHA` | **NEW** | Optional build identity, baked in by the deploy script. |
+| `NEXT_PUBLIC_BUILD_TIMESTAMP` | **NEW** | Optional build identity. |
+
+The source repo's frontend fetched `/site-config` from the gateway at runtime so
+one bundle could serve several deployments. That endpoint is the gateway's and
+is not part of either contract this service consumes, so the four branding
+variables above replace it at build time.
 
 ## Set on the HybridInference side — not here
 

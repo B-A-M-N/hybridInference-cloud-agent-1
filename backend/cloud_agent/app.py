@@ -1,0 +1,512 @@
+"""The control plane as its own service.
+
+In the gateway this was forty lines inside a much larger ``bootstrap`` that
+also built routers, adapters and observability. Here it is the whole process,
+and the lifecycle is the same three things it always was: a store, a reaper,
+and a publisher.
+
+**The reaper is what makes a vanished sandbox recoverable.** It supersedes
+attempts whose lease expired and requeues, fails or cancels the job per the
+store's policy. It never dies on an error, because a transient database blip
+must not permanently stop reaping — a stopped reaper is invisible until jobs
+start hanging.
+
+**The publisher is the only component holding a git credential**, which is
+precisely what keeps the sandbox credential-free. A deployment without one
+simply never publishes, rather than failing to start.
+
+Both are background tasks held in a module-level set: a task the loop can
+garbage-collect mid-run is a task that stops silently.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import os
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Any
+
+from fastapi import FastAPI
+
+from cloud_agent.gateway import GatewayError
+from cloud_agent.grants import RENEWAL_INTERVAL_S
+from cloud_agent.host_pool import HEARTBEAT_INTERVAL_S, MISSED_HEARTBEATS_BEFORE_OFFLINE
+from cloud_agent.logging_utils import configure_process_logging, get_logger
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from cloud_agent.storage.store import AgentJobStore
+
+logger = get_logger(__name__)
+
+ENV_DATABASE_URL = "AGENT_DATABASE_URL"
+ENV_PUBLISH_BASE_BRANCH = "AGENT_PUBLISH_BASE_BRANCH"
+ENV_GITHUB_TOKEN = "AGENT_GITHUB_TOKEN"
+
+#: Held so the event loop cannot collect a running background task. Without
+#: this the reaper and publisher are eligible for garbage collection the moment
+#: nothing else references them, and they stop without a word.
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+
+#: How often the reaper looks for expired leases and stalled publishes — and,
+#: because the grant passes ride on the same loop, how often a live grant is
+#: renewed. It is :data:`cloud_agent.grants.RENEWAL_INTERVAL_S` rather than a
+#: number of its own precisely so it cannot drift from the grant TTL that is
+#: derived from it; the invariant is stated where those constants live.
+REAP_INTERVAL_S = RENEWAL_INTERVAL_S
+MAX_ATTEMPTS = 3
+
+#: The gateway refusals that are a verdict on the grant itself.
+#:
+#: Everything else it can say — a wrong dispatch token, an internal API it was
+#: never configured to expose, a 500, a connection it never accepted — is a
+#: statement about the gateway or about this service, and abandoning a user's
+#: running job over it would be answering our own outage by destroying their
+#: work. Only these three name the grant or its subject:
+#:
+#: * ``unknown_grant`` — the gateway has no record of it.
+#: * ``grant_not_live`` — revoked out of band, or expired past renewal.
+#: * ``subject_unavailable`` — the user was suspended mid-job.
+#:
+#: An unrecognised type is therefore *not* definitive, and that direction is
+#: deliberate: the cost of not giving up is a few more renewal attempts against
+#: a capability the TTL will retire anyway, while the cost of giving up wrongly
+#: is a destroyed attempt. Adding a type here is a decision to destroy work on
+#: it. Mirrored from the gateway's ``routers/agent_grants.py``.
+DEAD_GRANT_REFUSALS = frozenset({"unknown_grant", "grant_not_live", "subject_unavailable"})
+
+#: Consecutive *definitive* refusals of one grant before the control plane
+#: stops asking.
+#:
+#: Renewal needs a give-up for the same reason revocation detaches as it hands
+#: over: a grant the gateway has permanently refused — revoked out of band, its
+#: subject suspended — would otherwise be retried every pass for the life of the
+#: attempt, and the attempt would run on toward the moment its capability dies
+#: with nothing anywhere saying so.
+#:
+#: Definitive is the whole of it. A refusal that names *this grant* counts; a
+#: gateway that is unreachable, timing out, or 500ing has said nothing about
+#: this grant and must count for nothing. Conflating the two makes this
+#: threshold a fleet-wide demolition charge: at three passes, a gateway
+#: restart lasting ``GRANT_RENEWAL_GIVE_UP_AFTER * REAP_INTERVAL_S`` seconds
+#: would abandon every running attempt at once and throw away work that was
+#: about to finish. See :meth:`GatewayError.definitive`.
+#:
+#: Small on purpose. ``GRANT_RENEWAL_GIVE_UP_AFTER * REAP_INTERVAL_S`` must stay
+#: below the gateway's renewal step, so that giving up happens while the
+#: capability is still alive and the attempt can be stopped cleanly instead of
+#: discovering its token dead mid-call. ``test_grant_lifecycle.py`` pins that.
+GRANT_RENEWAL_GIVE_UP_AFTER = 3
+
+
+async def _reconcile_settled_terminals(store: AgentJobStore) -> None:
+    """Replay durable settled-terminal recovery markers after restarts.
+
+    The broker is resolved per job, because with a host pool there is no
+    "the" broker: each job's retained terminal lives on the machine that ran
+    it. A single env-configured client here would resume one host's terminals
+    and quietly report success for every other host's.
+    """
+    from cloud_agent.broker_routing import broker_for_job
+    from cloud_agent.terminal_coordination import resume_settled_terminal
+
+    for job_id in await store.list_terminal_resumes_pending():
+        broker = await broker_for_job(store, job_id)
+        if await resume_settled_terminal(job_id, broker=broker):
+            await store.mark_terminal_resume_complete(job_id=job_id)
+
+
+async def _revoke_dead_grants(store: AgentJobStore, grants: Any) -> None:
+    """Withdraw the grants of attempts that are no longer current.
+
+    Runs on the reaper's schedule rather than at the moment an attempt ends,
+    and covers every way an attempt can stop being current with one query: a
+    worker reporting a terminal state, the reaper superseding a lapsed lease,
+    or a control plane that was restarted between the two. A revoke call at
+    each of those call sites would have to be written three times, would put a
+    gateway round trip inside the fenced terminal transition, and would still
+    miss the restart.
+
+    Revocation is an acceleration of the TTL, never the mechanism — the store
+    detaches each grant as it hands it over, so a failure here costs lateness
+    and not a retry every pass. ``GrantClient.revoke`` reports rather than
+    raises for the same reason.
+    """
+    for row in await store.take_revocable_grants():
+        if not await grants.revoke(row["grant_id"]):
+            logger.warning(
+                "agent_grant_not_revoked",
+                extra={
+                    "event": "agent_grant_not_revoked",
+                    "job_id": row["job_id"],
+                    "attempt_id": row["attempt_id"],
+                },
+            )
+
+
+async def _abandon_unrenewable_attempt(store: AgentJobStore, row: dict[str, Any]) -> None:
+    """Stop an attempt whose grant the gateway will not renew.
+
+    **Giving up has to be something the attempt notices.** Simply stopping the
+    renewal calls would leave the sandbox running until its capability expired
+    and then failing at a model call, with the cause several minutes and one
+    process away. Releasing the claim is the same answer the claim path already
+    gives when a grant cannot be minted at all: the attempt is aborted, the
+    worker's next heartbeat says ``ok: False`` — stop immediately — and the job
+    goes back to the queue **without spending a retry**, where the next claim
+    asks for a fresh grant rather than nursing a dead one.
+
+    Nothing revokes the grant here. The release makes the attempt non-current,
+    which is exactly what ``take_revocable_grants`` selects, so the revocation
+    pass picks it up once and detaches it. Revoking inline would be a second
+    call to the gateway that just refused us, on a path that has already
+    decided the TTL is the backstop.
+
+    Args:
+        store: The agent store.
+        row: A ``list_renewable_grants`` row, carrying the attempt's fence.
+    """
+    released = await store.release_claim(
+        job_id=row["job_id"],
+        attempt_id=row["attempt_id"],
+        lease_generation=row["lease_generation"],
+    )
+    logger.warning(
+        "agent_grant_renewal_given_up",
+        extra={
+            "event": "agent_grant_renewal_given_up",
+            "job_id": row["job_id"],
+            "attempt_id": row["attempt_id"],
+            "requeued": released,
+        },
+    )
+
+
+async def _renew_live_grants(
+    store: AgentJobStore, grants: Any, *, failures: dict[str, int]
+) -> None:
+    """Extend the grants of attempts that are still current — and only those.
+
+    **The store is consulted every pass, and that is the fence.** The gateway
+    holds no attempt state after the split, so it cannot tell a live attempt
+    from a superseded one; a renewal loop that remembered what it minted and
+    renewed on a timer would keep a zombie sandbox spending, and nothing
+    anywhere would notice. ``list_renewable_grants`` answers only for attempts
+    that are ``running`` with an unexpired lease, so a superseded attempt stops
+    being renewed on the very next pass and its capability dies at its own TTL.
+
+    A failed renewal is retried on the next pass — one bad minute at the
+    gateway must not end a job — but a *definitively refused* one is not
+    retried forever. After :data:`GRANT_RENEWAL_GIVE_UP_AFTER` consecutive
+    definitive refusals of the same grant the attempt is abandoned rather than
+    left running toward a capability that is about to expire; see
+    :func:`_abandon_unrenewable_attempt`.
+
+    **Only a refusal that names this grant counts toward that** — see
+    :data:`DEAD_GRANT_REFUSALS`. An unreachable gateway, a rotated dispatch
+    token and a revoked grant all arrive as the same exception type, and
+    treating them alike would mean a brief outage or one bad environment
+    variable abandoned every running attempt in the fleet at once: the failure
+    modes where giving up is most expensive and least justified. Anything
+    other than a verdict on the grant therefore leaves the count untouched. It
+    is neither evidence against the grant nor evidence for it, so it neither
+    advances the give-up nor forgives refusals already counted; only a
+    successful renewal clears those.
+
+    Args:
+        store: The agent store.
+        grants: The grant client.
+        failures: Consecutive definitive refusals per grant id, owned by the
+            caller so it survives between passes. Pruned here to the grants
+            still live, so a finished job leaves nothing behind.
+    """
+    seen: set[str] = set()
+    for row in await store.list_renewable_grants():
+        grant_id = row["grant_id"]
+        seen.add(grant_id)
+        try:
+            await grants.renew(grant_id)
+        except Exception as exc:
+            definitive = (
+                isinstance(exc, GatewayError)
+                and exc.definitive
+                and exc.error_type in DEAD_GRANT_REFUSALS
+            )
+            refusals = failures.get(grant_id, 0) + (1 if definitive else 0)
+            if definitive:
+                failures[grant_id] = refusals
+            logger.warning(
+                "agent_grant_renewal_failed",
+                exc_info=True,
+                extra={
+                    "event": "agent_grant_renewal_failed",
+                    "job_id": row["job_id"],
+                    "attempt_id": row["attempt_id"],
+                    "definitive": definitive,
+                    "consecutive_refusals": refusals,
+                },
+            )
+            if definitive and refusals >= GRANT_RENEWAL_GIVE_UP_AFTER:
+                try:
+                    await _abandon_unrenewable_attempt(store, row)
+                except Exception:
+                    # Leave the count at or above the threshold, so the next
+                    # pass that is again definitively refused retries the
+                    # release rather than resuming renewals this one has
+                    # already decided are hopeless. A pass that merely cannot
+                    # reach the gateway retries neither: releasing an attempt
+                    # requires the gateway too, and there is nothing to gain by
+                    # asking a second time in the same outage.
+                    logger.warning("Abandoning an unrenewable attempt failed", exc_info=True)
+                else:
+                    seen.discard(grant_id)
+            continue
+        # Consecutive, not cumulative: one refused pass followed by a good one
+        # is a gateway blip, and must not accumulate toward a give-up over the
+        # hours a long job runs.
+        failures.pop(grant_id, None)
+    for grant_id in [known for known in failures if known not in seen]:
+        del failures[grant_id]
+
+
+async def _reap_offline_hosts(store: AgentJobStore) -> None:
+    """Move hosts that stopped heartbeating to ``offline``.
+
+    Runs on the same loop as the attempt reaper rather than on its own, because
+    the two are one recovery story told in order: a host disappears, it stops
+    being claimable, and then the work it was holding comes back. Splitting
+    them into two schedules would make the interval between them a race that
+    only shows up under load.
+    """
+    offline = await store.reap_offline_hosts(
+        interval_seconds=HEARTBEAT_INTERVAL_S,
+        missed_intervals=MISSED_HEARTBEATS_BEFORE_OFFLINE,
+    )
+    if offline:
+        logger.warning(
+            "agent_hosts_offline",
+            extra={"event": "agent_hosts_offline", "hosts": offline},
+        )
+
+
+async def reap_expired_attempts(
+    store: AgentJobStore,
+    *,
+    interval_seconds: float = REAP_INTERVAL_S,
+    max_attempts: int = MAX_ATTEMPTS,
+    grants: Any | None = None,
+) -> None:
+    """Periodically close attempts whose lease expired.
+
+    Args:
+        store: The agent store.
+        interval_seconds: Delay between passes.
+        max_attempts: How many attempts a job gets before it fails for good.
+        grants: The grant client, when this deployment mints grants. ``None``
+            skips both grant passes entirely — the capabilities then expire at
+            their own TTL, which is the same backstop revocation accelerates.
+    """
+    try:
+        await _reconcile_settled_terminals(store)
+    except Exception:
+        logger.warning("Initial settled terminal reconciliation failed", exc_info=True)
+    # Consecutive renewal refusals, per grant. Held by the loop rather than by
+    # the module, so two reapers (a test's and a running app's) cannot count
+    # each other's failures toward a give-up — and so a restart forgets, which
+    # is the right way round: a fresh process should ask the gateway again
+    # before abandoning anyone's attempt.
+    renewal_failures: dict[str, int] = {}
+    while True:
+        await asyncio.sleep(interval_seconds)
+        # Hosts first. A machine that stopped heartbeating should be out of the
+        # claim gate before the pass that requeues its work, otherwise the
+        # requeued job can be handed straight back to the host that just lost
+        # it — the retry budget burns down while nothing moves.
+        #
+        # In its own try, though. Sharing one with the attempt reaper below
+        # would let a host-reaping failure skip lease reaping and stalled
+        # publishes for that pass, which is a strictly worse outage than the
+        # one it was reporting: jobs stop being recovered at all.
+        try:
+            await _reap_offline_hosts(store)
+        except Exception:
+            logger.warning("Host reaper pass failed", exc_info=True)
+        try:
+            actions = await store.reap_expired(max_attempts=max_attempts)
+            await _reconcile_settled_terminals(store)
+            if actions:
+                logger.info(
+                    "agent_attempts_reaped",
+                    extra={"event": "agent_attempts_reaped", "count": len(actions)},
+                )
+            # A job the publisher took and never finished is invisible to the
+            # pass above: that scans running attempts, and this job's attempt
+            # finished before publishing began.
+            stalled = await store.reap_stalled_publishes()
+            if stalled:
+                logger.warning(
+                    "agent_publishes_stalled",
+                    extra={"event": "agent_publishes_stalled", "job_ids": stalled},
+                )
+        except Exception:
+            logger.warning("Agent attempt reaper pass failed", exc_info=True)
+        # After the reaper, so an attempt superseded in this very pass has its
+        # grant withdrawn in the same one — and in its own try for the reason
+        # the host reaper has one: a gateway having a bad minute must not stop
+        # attempts being recovered.
+        if grants is not None:
+            try:
+                await _revoke_dead_grants(store, grants)
+            except Exception:
+                logger.warning("Grant revocation pass failed", exc_info=True)
+            try:
+                await _renew_live_grants(store, grants, failures=renewal_failures)
+            except Exception:
+                logger.warning("Grant renewal pass failed", exc_info=True)
+
+
+def _build_source_control(app: FastAPI) -> None:
+    """Attach GitHub App and GitLab OAuth clients, where configured.
+
+    Each is optional and each failure is contained: a partial config disables
+    that provider rather than booting with a credential path that cannot be
+    secured.
+    """
+    app.state.app_credentials = None
+    app.state.gitlab_oauth = None
+
+    try:
+        from cloud_agent.github_app import AppConfig, GitHubAppCredentials
+
+        app_config = AppConfig.from_env(dict(os.environ))
+        if app_config is not None:
+            app.state.app_credentials = GitHubAppCredentials(app_config)
+    except Exception:
+        logger.warning("GitHub App config present but unusable", exc_info=True)
+
+    try:
+        from cloud_agent.source_control import (
+            GitLabOAuthClient,
+            GitLabOAuthConfig,
+            SourceControlCipher,
+        )
+
+        gitlab_config = GitLabOAuthConfig.from_env(dict(os.environ))
+        if gitlab_config is not None:
+            app.state.gitlab_oauth = GitLabOAuthClient(gitlab_config, cipher=SourceControlCipher())
+    except Exception:
+        logger.warning("GitLab OAuth config present but unusable", exc_info=True)
+
+
+def _start_publisher(app: FastAPI, store: AgentJobStore) -> None:
+    """Start the publish loop, idle if no git credential is configured."""
+    from cloud_agent.publish_worker import GitHubCredential, publish_loop
+
+    static_token = os.getenv(ENV_GITHUB_TOKEN, "")
+
+    def credential_provider() -> GitHubCredential | None:
+        """Mint the credential for one publish, or None if unconfigured.
+
+        Read per call rather than captured, so rotating the token does not
+        need a restart.
+        """
+        token = os.getenv(ENV_GITHUB_TOKEN, static_token)
+        return GitHubCredential(token) if token else None
+
+    task = asyncio.create_task(
+        publish_loop(
+            store,
+            credential_provider=credential_provider,
+            app_credentials=app.state.app_credentials,
+            base_branch=os.getenv(ENV_PUBLISH_BASE_BRANCH, "dev"),
+        )
+    )
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    app.state.publish_task = task
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Open the store, start the reaper and publisher, and tear them down.
+
+    The database is required. A control plane without one cannot claim, fence
+    or record anything, so it refuses to start rather than serving an API that
+    fails at every call.
+    """
+    import asyncpg
+
+    from cloud_agent.gateway import GatewayClient
+    from cloud_agent.grants import GrantClient
+    from cloud_agent.storage.store import AgentJobStore
+
+    dsn = os.environ.get(ENV_DATABASE_URL, "")
+    if not dsn:
+        raise RuntimeError(f"{ENV_DATABASE_URL} must be set")
+
+    pool = await asyncpg.create_pool(dsn)
+    store = AgentJobStore(pool)
+    # Schema is Alembic's; this is a no-op kept so the call site is honest
+    # about when the store becomes usable.
+    await store.initialize()
+
+    app.state.store = store
+    app.state.gateway = GatewayClient()
+    # The sandbox's credential is minted at the gateway now (E9), so the claim
+    # path and the renewal/revocation passes share one client — and one
+    # connection pool — rather than each building their own per call.
+    app.state.grants = GrantClient()
+    _build_source_control(app)
+
+    reaper = asyncio.create_task(reap_expired_attempts(store, grants=app.state.grants))
+    _BACKGROUND_TASKS.add(reaper)
+    reaper.add_done_callback(_BACKGROUND_TASKS.discard)
+    app.state.reaper_task = reaper
+
+    _start_publisher(app, store)
+    logger.info("cloud agent control plane started")
+
+    try:
+        yield
+    finally:
+        for task in (app.state.reaper_task, app.state.publish_task):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        await pool.close()
+        logger.info("cloud agent control plane stopped")
+
+
+def create_app() -> FastAPI:
+    """Build the control plane application."""
+    configure_process_logging()
+
+    from cloud_agent.api import admin_hosts, hosts, routes, session
+
+    app = FastAPI(
+        title="FreeInference Cloud Agent",
+        description="Cloud coding agents on sandboxed hosts",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
+    app.include_router(routes.router)
+    app.include_router(hosts.router)
+    app.include_router(admin_hosts.router)
+    # The web app's way in. Mounted alongside the others rather than inside
+    # ``routes.py`` because it authenticates nothing on entry — it is the route
+    # that *creates* the credential every other route requires.
+    app.include_router(session.router)
+
+    @app.get("/healthz")
+    async def healthz() -> dict[str, str]:
+        """Liveness only — deliberately not readiness.
+
+        A readiness probe here would have to decide what a degraded control
+        plane is (no gateway? no git credential?), and every answer to that
+        belongs to whoever operates it.
+        """
+        return {"status": "ok"}
+
+    return app

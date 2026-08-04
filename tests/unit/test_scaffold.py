@@ -89,3 +89,38 @@ def test_no_source_file_reads_a_gateway_signing_secret() -> None:
                 if secret in names or any(secret in text for text in literals):
                     offenders.append(f"{path.relative_to(_REPO_ROOT)} -> {secret}")
     assert not offenders, f"gateway signing secret used in {offenders}"
+
+
+def test_no_deployment_file_sets_a_gateway_signing_secret() -> None:
+    """The same rule, on the files that actually configure a machine.
+
+    Python was only ever half of it. A compose file, a Dockerfile or an env
+    example is where this rule is most easily broken — by someone debugging at
+    2am who has both repositories open — and a gateway signing secret present
+    on this side would let the control plane mint gateway credentials for
+    itself, which is precisely the coupling the split removes.
+
+    Assignments only. These files are also where the rule gets *explained*, and
+    a prohibition that cannot name what it prohibits is not much of one.
+
+    Lives here, beside the Python check, so ``_GATEWAY_SECRETS`` has exactly
+    one definition in the repository. A second copy in a deploy-specific test
+    would be a list that can drift from the one the guard enforces — and would
+    itself trip the check above.
+    """
+    assignment = re.compile(
+        rf"^[^#\n]*\b(?:{'|'.join(_GATEWAY_SECRETS)})\s*[:=]",
+        re.MULTILINE,
+    )
+    offenders: list[str] = []
+    for path in (_REPO_ROOT / "deploy").rglob("*"):
+        if not path.is_file() or path.suffix not in {".yml", ".yaml", ".sh", ".env", ""}:
+            continue
+        if path.name.startswith("Dockerfile") or path.suffix in {".yml", ".yaml", ".sh", ".env"}:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            if assignment.search(text):
+                offenders.append(str(path.relative_to(_REPO_ROOT)))
+    assert not offenders, (
+        f"a deployment file sets a gateway signing secret: {offenders}. "
+        "The gateway's keys stay with the gateway (AGENTS.md rule 4)."
+    )
