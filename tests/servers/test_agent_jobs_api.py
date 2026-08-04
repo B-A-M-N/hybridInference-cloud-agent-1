@@ -723,6 +723,16 @@ class _FakeGateway:
     async def model_catalog(self, user_id: str) -> list[str]:
         return list(_TEST_MODELS)
 
+    async def model_catalog_with_aliases(self, user_id: str) -> tuple[list[str], dict[str, str]]:
+        """The catalog plus the gateway's alias translation table.
+
+        No aliases here: these tests name canonical ids, and resolution has its
+        own file. What matters is that the shape is the real one — a fake that
+        answered only the older method sent every job-creation path down a
+        `AttributeError` the moment the caller started asking for the table.
+        """
+        return list(_TEST_MODELS), {}
+
     async def mcp_registry(self) -> list[dict[str, Any]]:
         return [dict(entry) for entry in type(self).mcp_servers]
 
