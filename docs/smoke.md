@@ -171,7 +171,7 @@ the thing this file exists to replace.
 | 0. Preconditions | | | |
 | 1. Configure | | | |
 | 2. Control plane up | 2026-08-04 | **pass, without Docker** | See below. |
-| 3. Sign in | | | |
+| 3. Sign in | | partial | Token/JWKS contract verified with real code on both sides; browser flow not run. See below. |
 | 4. Host enrolled | | | |
 | 5. Job → PR | | | |
 | 6. Renewal / revoke / fail-closed | | | |
@@ -198,6 +198,42 @@ sandbox in it.
   end for the first time.
 - `GET /v1/session/me` answers 401 rather than resolving a session, which is
   the same property from the outside: no gateway, no identity, no access.
+
+### The identity contract, both halves real (same day)
+
+Section 3 needs a browser, a database and a deployed control plane. The part of
+it that a cutover most depends on — that a token this gateway mints is one this
+service will accept — does not: it needs only the two repositories' real code
+and an HTTP hop between them.
+
+Run with the gateway's `mint_identity_token` and `public_jwks` on one side and
+this service's `verify_identity_token` on the other, the JWKS fetched over
+loopback HTTP rather than handed across in-process. Throwaway RSA keys,
+generated in a scratch directory and deleted afterwards; nothing was written to
+any host.
+
+| Case | Result |
+|---|---|
+| a token the gateway signed | accepted, `sub` intact |
+| signed by a key absent from JWKS | refused — cannot resolve the signing key |
+| empty token | refused |
+| signature altered | refused |
+| `GATEWAY_ISSUER` not the minted `iss` | refused |
+| **rotation:** token minted before the swap, verified after | accepted via the retiring key |
+| **rotation:** token minted after the swap | accepted via the new key |
+
+`aud` agrees by inspection as well as by test: the gateway stamps
+`CLOUD_AGENT_CLIENT_ID = "cloud-agent"` and this service requires
+`AUDIENCE = "cloud-agent"`. Each repository tested its own half of that string
+and neither compared them.
+
+The rotation rows are the ones worth having. Rotation is the operation that
+happens under time pressure, and until now `IDENTITY_JWT_RETIRING_PUBLIC_KEYS`
+was documented but never exercised against a real verifier.
+
+**What this does not show.** No browser, no `/authorize` page, no PKCE code
+exchange, no database, no session cookie — the token contract holds, which is
+necessary for section 3 and not sufficient for it.
 
 **Not covered, and why**
 
