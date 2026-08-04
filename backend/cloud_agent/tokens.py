@@ -91,10 +91,12 @@ def _b64decode(value: str) -> bytes:
 # reports events, uploads artifacts, renews the lease and drives terminal
 # transitions.
 #
-# ``model`` is the only credential that enters the sandbox. It buys model calls
-# against the job's budget and nothing else — so an agent that leaks it, or a
-# hostile repo that steals it, can spend the job's capped budget but cannot
-# poison the event log, overwrite the patch, or force a terminal state.
+# ``model`` is the narrow credential a sandbox may hold. It buys model calls
+# and nothing else — so an agent that leaks it, or a hostile repo that steals
+# it, cannot poison the event log, overwrite the patch, or force a terminal
+# state. What it *can* spend is no longer capped per task: the grant that
+# replaces it names the models an attempt may call, and the gateway's per-user
+# daily quota governs how much.
 SCOPE_FULL = "full"
 SCOPE_MODEL = "model"
 _VALID_SCOPES = (SCOPE_FULL, SCOPE_MODEL)

@@ -18,12 +18,6 @@ from cloud_agent.entitlement import REPO_PATTERN
 # between heartbeats.
 MAX_LEASE_TTL_SECONDS = 900.0
 
-# Every job carries a spending cap. The default is small enough that a
-# misconfigured or runaway job is an annoyance rather than a bill, and the
-# ceiling stops a typo (or a hostile caller) from requesting an unbounded one.
-DEFAULT_JOB_BUDGET_USD = 5.0
-MAX_JOB_BUDGET_USD = 500.0
-
 # Normalized event kinds (issue #1041) plus the control events the platform
 # appends. The pattern is the security-relevant part: an event type is
 # interpolated into the SSE ``event:`` field, so anything containing a newline
@@ -84,14 +78,6 @@ class AgentJobCreate(BaseModel):
         pattern=r"^[0-9a-fA-F]{7,64}$",
         description="Commit SHA to work from.",
     )
-    budget_usd: float = Field(
-        DEFAULT_JOB_BUDGET_USD,
-        gt=0,
-        le=MAX_JOB_BUDGET_USD,
-        # Always present and bounded: an absent budget would mean a live
-        # sandbox credential with no spending limit at all.
-        description="Cap on this job's model spend, in USD.",
-    )
     mcp_servers: list[str] | None = Field(
         None,
         max_length=16,
@@ -124,7 +110,6 @@ class AgentJobResponse(BaseModel):
     published_pr_url: str | None = None
     published_commit_sha: str | None = None
     detail: str | None = None
-    budget_usd: float | None = None
     # Set on turns created by a fork: the original turn this row copies.
     forked_from_job_id: str | None = None
     metadata: dict[str, Any] | None = None
@@ -134,8 +119,9 @@ class AgentJobResponse(BaseModel):
     created_at: str | None = None
     updated_at: str | None = None
     pinned_at: str | None = None
-    # Read from the billing ledger, never from anything the agent reports about
-    # itself — the same rule the budget check already follows.
+    # Read from the billing ledger, never from anything the agent reports
+    # about itself. Attribution only: there is no per-task cap to compare it
+    # against, and the account's daily quota is what actually governs spend.
     spent_usd: float | None = None
     tokens_in: int | None = None
     tokens_out: int | None = None
@@ -225,7 +211,6 @@ class AgentFollowUpRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=100_000)
     runtime: str | None = Field(None, description="Optional harness override for this turn.")
     model: str | None = Field(None, description="Optional model override for this turn.")
-    budget_usd: float | None = Field(None, gt=0, le=MAX_JOB_BUDGET_USD)
 
     @field_validator("prompt")
     @classmethod
@@ -609,9 +594,6 @@ class AgentConfigResponse(BaseModel):
             "Model ids an agent job can actually call for this user — the same "
             "predicate the create endpoint enforces, not the /v1/models list."
         ),
-    )
-    default_budget_usd: float = Field(
-        DEFAULT_JOB_BUDGET_USD, description="Per-job spend cap applied when none is given."
     )
     mcp_servers: list[McpServerSummary] = Field(
         default_factory=list,

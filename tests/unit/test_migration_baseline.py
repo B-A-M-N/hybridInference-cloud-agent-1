@@ -281,3 +281,19 @@ def test_every_insert_names_as_many_values_as_columns() -> None:
     ]
     assert not mismatches, f"INSERT column/value count mismatch: {mismatches}"
     assert pattern.search(source), "the pattern matched nothing; the check is vacuous"
+
+
+def test_no_public_schema_field_offers_a_per_task_budget() -> None:
+    """The API is where a removed feature is loudest.
+
+    A column nobody reads is invisible; a request field named `budget_usd` is a
+    promise, and one the service cannot keep — nothing enforces it. It survived
+    the first removal pass in five places: two constants, a create parameter, a
+    follow-up parameter, a response field and a config default.
+
+    Named `budget_usd` rather than "budget" so the *retry* budget — attempts
+    per job, alive and enforced — does not trip it.
+    """
+    schemas = (REPO / "backend/cloud_agent/schemas.py").read_text(encoding="utf-8")
+    assert "budget_usd" not in schemas
+    assert "BUDGET_USD" not in schemas
