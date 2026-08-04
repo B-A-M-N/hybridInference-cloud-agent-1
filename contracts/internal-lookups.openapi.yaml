@@ -21,7 +21,6 @@ info:
 
     | Endpoint | Replaces |
     |---|---|
-    | `GET /internal/mcp-registry` | `mcp_registry.get_registry()` |
     | `GET /internal/model-catalog` | the `visible_models` catalog read |
     | `GET /internal/users/{id}/status` | the gateway `users` row read |
 
@@ -41,64 +40,6 @@ tags:
     description: Not public API. Behind the shared dispatch token.
 
 paths:
-  /internal/mcp-registry:
-    get:
-      tags: [internal]
-      operationId: mcpRegistry
-      summary: The MCP servers this deployment offers
-      description: |
-        **Names and display metadata only.** A server's `url` and `headers` are
-        exactly what the split keeps on the gateway side — the headers carry
-        the deployment's upstream credential. The control plane needs to know
-        *which* servers exist, so it can populate a picker and reject an
-        unknown name; it never needs to reach them, because a sandbox reaches
-        MCP through the gateway's own proxy.
-
-        A consumer that finds itself wanting the address should assume it has
-        the architecture wrong rather than that the field was forgotten.
-      security:
-        - dispatchToken: []
-      responses:
-        "200":
-          description: One record per configured server.
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [servers]
-                properties:
-                  servers:
-                    type: array
-                    items:
-                      type: object
-                      required: [name, description, default, tools, unfiltered]
-                      properties:
-                        name: { type: string }
-                        description: { type: [string, "null"] }
-                        default:
-                          type: boolean
-                          description: |
-                            Whether this server is included when a job requests
-                            no MCP servers at all. The defaults are derived
-                            from this flag; there is no separate defaults list.
-                        tools:
-                          type: array
-                          items: { type: string }
-                          description: Sorted. Empty when the server is unfiltered.
-                        unfiltered:
-                          type: boolean
-                          description: Whether every tool the server exposes is allowed.
-        "401":
-          description: Wrong or missing dispatch token.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-        "404":
-          description: Internal endpoints are not configured on this deployment.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-
   /internal/model-catalog:
     get:
       tags: [internal]
@@ -116,8 +57,9 @@ paths:
         Resolved through the same visibility rules the inference path uses, so
         this answer and "may this call proceed" agree.
 
-        Returns **canonical ids only** — aliases are not resolved here, so a
-        consumer that used to accept an alias no longer does.
+        `models` is **canonical ids only**; `aliases` beside it is the
+        translation table, so a consumer can still accept a name a user typed
+        without holding a copy of this registry.
       security:
         - dispatchToken: []
       parameters:
@@ -133,13 +75,28 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [user_id, role, models]
+                required: [user_id, role, models, aliases]
                 properties:
                   user_id: { type: string }
                   role: { type: string }
                   models:
                     type: array
                     items: { type: string }
+                  aliases:
+                    type: object
+                    additionalProperties: { type: string }
+                    description: |
+                      Alias to canonical id, for the models above. Present so
+                      the consumer resolves a name the way it used to when it
+                      could read this registry in-process; it resolves once and
+                      works in canonical ids from there, so nothing downstream
+                      — the grant, the store, the scope check — ever sees an
+                      alias.
+
+                      Every value is an id in `models`, and no key is one: an
+                      alias that shadowed a real model, or pointed outside the
+                      caller's catalog, is dropped here rather than sent for
+                      the consumer to puzzle over.
         "401":
           description: Wrong or missing dispatch token.
           content:
