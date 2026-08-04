@@ -117,11 +117,49 @@ class GatewayClient:
                 fail hard should use :func:`agent_visible_models`, which
                 converts this into an empty catalog.
         """
+        models, _aliases = await self.model_catalog_with_aliases(user_id)
+        return models
+
+    async def model_catalog_with_aliases(self, user_id: str) -> tuple[list[str], dict[str, str]]:
+        """Return the catalog and the gateway's alias translation table.
+
+        The table is how this service resolves an alias without reimplementing
+        the gateway's rules: it maps a name a user may type to the canonical id
+        the gateway routes it to.
+
+        An **older gateway sends no `aliases` field**, and that reads as an
+        empty table rather than an error — the catalog is still correct, and a
+        deployment mid-rollout should narrow to canonical-only rather than stop
+        creating jobs.
+
+        Args:
+            user_id: The gateway's user identifier.
+
+        Returns:
+            ``(models, aliases)``, both empty-safe. Entries whose target is not
+            in ``models`` are dropped: the gateway already filters them, and
+            trusting an unfiltered one would resolve to a model this user
+            cannot reach — refused a moment later with nothing to explain it.
+
+        Raises:
+            GatewayError: If the catalog cannot be read.
+        """
         body = await self._get("/internal/model-catalog", {"user_id": user_id})
-        models = body.get("models")
-        if not isinstance(models, list):
+        raw_models = body.get("models")
+        if not isinstance(raw_models, list):
             raise GatewayError("gateway returned no model list")
-        return [str(model) for model in models]
+        models = [str(model) for model in raw_models]
+
+        raw_aliases = body.get("aliases")
+        if not isinstance(raw_aliases, dict):
+            return models, {}
+        visible = set(models)
+        aliases = {
+            str(alias): str(canonical)
+            for alias, canonical in raw_aliases.items()
+            if str(canonical) in visible and str(alias) not in visible
+        }
+        return models, aliases
 
     async def user_status(self, user_id: str) -> dict[str, Any]:
         """Report whether a user exists, may sign in, and with what role.

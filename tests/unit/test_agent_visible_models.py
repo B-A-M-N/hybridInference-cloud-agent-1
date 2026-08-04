@@ -20,7 +20,11 @@ import httpx
 import pytest
 
 from cloud_agent.gateway import GatewayClient, GatewayError
-from cloud_agent.visible_models import agent_model_resolvable, agent_visible_models
+from cloud_agent.visible_models import (
+    agent_canonical_model,
+    agent_model_resolvable,
+    agent_visible_models,
+)
 
 BASE = "https://gateway.example"
 TOKEN = "dispatch-token"
@@ -136,3 +140,120 @@ async def test_an_unconfigured_deployment_raises_rather_than_guessing() -> None:
     """At the client level the error is loud; only the caller softens it."""
     with pytest.raises(GatewayError):
         await GatewayClient("", "").model_catalog("user_1")
+
+
+# ---------------------------------------------------------------------------
+# Aliases: translate once, then work in canonical ids
+# ---------------------------------------------------------------------------
+#
+# Before the split this service held the gateway's registry and resolved an
+# alias for free. Afterwards it asks over HTTP, and a catalog of canonical ids
+# alone silently stopped accepting every alias a user had been typing. The
+# gateway now hands over its translation table; this is the one place that
+# reads it, and nothing downstream — the store, the grant, the gateway's own
+# scope check — ever sees an alias again.
+
+_ALIASED = {"models": CATALOG, "aliases": {"legacy-name": CATALOG[0]}}
+
+
+async def test_an_alias_resolves_to_the_canonical_id() -> None:
+    gateway = _client(_serves(_ALIASED))
+
+    assert await agent_canonical_model("legacy-name", gateway, user_id="user_1") == CATALOG[0]
+
+
+async def test_a_canonical_id_resolves_to_itself() -> None:
+    gateway = _client(_serves(_ALIASED))
+
+    assert await agent_canonical_model(CATALOG[0], gateway, user_id="user_1") == CATALOG[0]
+
+
+async def test_an_unknown_name_is_refused_rather_than_passed_through() -> None:
+    """Returning the input unchanged would send an unknown model to the store
+    and the grant, and fail at the sandbox's first call instead of at create."""
+    gateway = _client(_serves(_ALIASED))
+
+    assert await agent_canonical_model("no-such-model", gateway, user_id="user_1") is None
+
+
+async def test_the_client_drops_an_alias_for_a_model_outside_the_catalog() -> None:
+    """First of two layers: the client refuses to carry it inward."""
+    gateway = _client(_serves({"models": CATALOG, "aliases": {"sneaky": "admin-only-model"}}))
+
+    _models, aliases = await gateway.model_catalog_with_aliases("user_1")
+    assert aliases == {}
+
+
+async def test_the_client_drops_an_alias_spelled_like_a_real_model() -> None:
+    """Same layer, the shadowing case."""
+    gateway = _client(_serves({"models": CATALOG, "aliases": {CATALOG[0]: CATALOG[1]}}))
+
+    _models, aliases = await gateway.model_catalog_with_aliases("user_1")
+    assert aliases == {}
+
+
+class _UnfilteredGateway:
+    """A gateway whose table was *not* cleaned — the second layer's subject.
+
+    `model_catalog_with_aliases` filters, so the checks in
+    `agent_canonical_model` are unreachable through the real client and a
+    mutation test cannot see them. That is precisely the argument for testing
+    them directly rather than deleting them: this is a trust boundary, the
+    table crosses a network from another service, and a guard that only holds
+    because of what the layer above it happens to do is a guard nobody can
+    verify.
+    """
+
+    def __init__(self, models: list[str], aliases: dict[str, str]) -> None:
+        self._models = models
+        self._aliases = aliases
+
+    async def model_catalog_with_aliases(self, user_id: str) -> tuple[list[str], dict[str, str]]:
+        return self._models, self._aliases
+
+
+async def test_an_alias_for_a_model_outside_the_catalog_is_refused() -> None:
+    """Even handed one directly, resolution refuses it."""
+    gateway = _UnfilteredGateway(CATALOG, {"sneaky": "admin-only-model"})
+
+    assert await agent_canonical_model("sneaky", gateway, user_id="user_1") is None
+
+
+async def test_an_alias_cannot_shadow_a_real_model() -> None:
+    """An exact catalog entry wins outright, whatever the table claims.
+
+    A table that maps a real model's id somewhere else would otherwise redirect
+    every request for it — and look valid at both ends. Driven past the
+    client's filter, so this measures the resolution order and not the layer
+    above it.
+    """
+    gateway = _UnfilteredGateway(CATALOG, {CATALOG[0]: CATALOG[1]})
+
+    assert await agent_canonical_model(CATALOG[0], gateway, user_id="user_1") == CATALOG[0]
+
+
+async def test_an_older_gateway_without_the_table_still_resolves_canonicals() -> None:
+    """**Rollout order.** The gateway ships first, but a control plane that met
+    an older one must narrow to canonical-only rather than stop creating jobs.
+    """
+    gateway = _client(_serves({"models": CATALOG}))
+
+    assert await agent_canonical_model(CATALOG[0], gateway, user_id="user_1") == CATALOG[0]
+    assert await agent_canonical_model("legacy-name", gateway, user_id="user_1") is None
+
+
+async def test_an_unreachable_gateway_resolves_nothing() -> None:
+    """Fail closed, as everywhere else: no catalog is no permission."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    assert await agent_canonical_model(CATALOG[0], _client(handler), user_id="user_1") is None
+
+
+async def test_resolvable_accepts_an_alias_again() -> None:
+    """The create-time fail-fast has to agree with what resolution accepts, or
+    a job is refused at creation for a name that would have worked."""
+    gateway = _client(_serves(_ALIASED))
+
+    assert await agent_model_resolvable("legacy-name", gateway, user_id="user_1") is True

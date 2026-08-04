@@ -49,6 +49,50 @@ async def agent_visible_models(gateway: GatewayClient, *, user_id: str) -> list[
         return []
 
 
+async def agent_canonical_model(model: str, gateway: GatewayClient, *, user_id: str) -> str | None:
+    """Resolve a requested model name to the canonical id, or refuse it.
+
+    **Translate once, then work in canonical ids.** The gateway owns alias
+    resolution and hands over its table; this service looks the name up and
+    never mentions an alias again — not to the store, not in a grant, not in
+    the scope check the gateway applies to the resulting token. A grant that
+    stored an alias would be compared against canonical ids and silently match
+    nothing.
+
+    Args:
+        model: What the user typed. Either a canonical id or an alias.
+        gateway: Client for the gateway's internal contracts.
+        user_id: The gateway's user identifier.
+
+    Returns:
+        The canonical id, or ``None`` when this user cannot reach the model.
+        ``None`` covers an unknown name, an alias for a model outside this
+        user's catalog, and a gateway that could not be read — refusing in all
+        three, because the alternative to "no" here is a job that dies at its
+        first model call, far from the cause.
+    """
+    try:
+        models, aliases = await gateway.model_catalog_with_aliases(user_id)
+    except GatewayError:
+        logger.warning(
+            "agent_model_catalog_unavailable",
+            exc_info=True,
+            extra={"event": "agent_model_catalog_unavailable", "user_id": user_id},
+        )
+        return None
+
+    # An exact catalog entry wins outright. Checking it first means an alias
+    # can never shadow a real model, whatever the table says.
+    if model in models:
+        return model
+    canonical = aliases.get(model)
+    if canonical is not None and canonical in models:
+        return canonical
+    # Refused, never dropped: narrowing a requested scope silently is how a job
+    # ends up running against models nobody asked for.
+    return None
+
+
 async def agent_model_resolvable(model: str, gateway: GatewayClient, *, user_id: str) -> bool:
     """Whether one requested model would resolve for this user.
 
@@ -56,19 +100,16 @@ async def agent_model_resolvable(model: str, gateway: GatewayClient, *, user_id:
     an unknown model costs a 400, while accepting it costs a claim, a clone and
     an attempt before the first model call dies.
 
-    One behavioural difference, and it is not avoidable here: the source
-    resolved **aliases** because it held the registry, so a job could be created
-    naming an alias. This compares against canonical ids, so an alias now reads
-    as unresolvable. The gateway is where alias resolution lives; teaching the
-    catalog endpoint to return aliases is the fix, and it is a change to that
-    contract rather than something this module can decide.
+    Aliases resolve again, as they did before the split — see
+    :func:`agent_canonical_model`. Callers that need the resolved id should use
+    that directly; this stays for the places that only ask yes or no.
 
     Args:
-        model: The requested model id.
+        model: The requested model id, canonical or alias.
         gateway: Client for the gateway's internal contracts.
         user_id: The gateway's user identifier.
 
     Returns:
-        Whether the model is in this user's catalog.
+        Whether the model resolves in this user's catalog.
     """
-    return model in await agent_visible_models(gateway, user_id=user_id)
+    return await agent_canonical_model(model, gateway, user_id=user_id) is not None
