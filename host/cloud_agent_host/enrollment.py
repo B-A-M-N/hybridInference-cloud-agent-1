@@ -62,6 +62,30 @@ DEFAULT_HEARTBEAT_INTERVAL_S = 30.0
 #: A heartbeat is a small write; something is wrong long before this expires.
 _TIMEOUT_S = 15.0
 
+#: The one status in which this runner may ask for work — a **mirror** of
+#: ``cloud_agent.host_pool.CLAIMABLE_STATUSES``, which the control plane
+#: enforces and the schema's CHECK constraint bounds.
+#:
+#: Mirrored rather than imported because this package runs on the runner host,
+#: which has no control-plane code and no database. That makes drift possible,
+#: so ``test_host_enrollment.py`` asserts the two agree — and it exists because
+#: this constant was once ``"active"``, a status the schema forbids outright.
+#: Nothing caught it: every test built its own ``HostIdentity`` with that same
+#: invented value, so the fixtures agreed with the bug rather than with the
+#: server.
+CLAIMABLE_STATUSES: tuple[str, ...] = ("online",)
+
+#: What a host with a stored credential assumes about itself before its first
+#: heartbeat answers. ``online`` matches the schema's column default, so the
+#: assumption agrees with what the control plane will say about a row that
+#: predates enrollment.
+#:
+#: Optimistic on purpose, and safe because the control plane gates claims on
+#: the same status independently (``AgentJobStore.claim_job``): the worst a
+#: wrong guess costs is one refused claim, while guessing ``enrolling`` would
+#: idle every restarted host for a whole heartbeat interval.
+DEFAULT_STATUS = "online"
+
 
 class EnrollmentError(RuntimeError):
     """This machine cannot join, or cannot stay in, the pool."""
@@ -82,7 +106,7 @@ class HostIdentity:
 
     host: str
     credential: str
-    status: str = "active"
+    status: str = DEFAULT_STATUS
     #: Seconds between heartbeats, as the control plane last reported them.
     interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S
     slots_total: int | None = None
@@ -310,9 +334,11 @@ class HostHeartbeat:
 
         `draining` is an operator saying "finish what you have and stop", so
         it is not an error and nothing is interrupted — but a runner that kept
-        claiming through it would make draining mean nothing.
+        claiming through it would make draining mean nothing. `enrolling` and
+        `offline` have not proved the machine is there, and `disabled` has had
+        its credential taken away.
         """
-        return not self.removed.is_set() and self._identity.status == "active"
+        return not self.removed.is_set() and self._identity.status in CLAIMABLE_STATUSES
 
     def start(self) -> None:
         """Begin heartbeating."""
