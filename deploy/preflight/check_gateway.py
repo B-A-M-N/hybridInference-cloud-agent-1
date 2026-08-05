@@ -81,24 +81,24 @@ def _error_type(body: str) -> str:
     return str(error.get("type") or "")
 
 
-def judge_jwks(status: int, body: str) -> Verdict:
+def judge_jwks(answer: Answer) -> Verdict:
     """Whether this gateway can sign identity tokens."""
-    if status == 200:
+    if answer.status == 200:
         try:
-            keys = json.loads(body).get("keys")
+            keys = json.loads(answer.body).get("keys")
         except ValueError:
             return Verdict(FAIL, "JWKS is not JSON", "check what is fronting this origin")
         if not isinstance(keys, list) or not keys:
             return Verdict(FAIL, "JWKS is empty", "IDENTITY_JWT_PRIVATE_KEY is set but has no key")
         return Verdict(OK, f"{len(keys)} signing key(s) published")
-    if _error_type(body) == "identity_not_configured":
+    if _error_type(answer.body) == "identity_not_configured":
         return Verdict(
             FAIL,
             "identity is not configured",
             "set IDENTITY_JWT_PRIVATE_KEY, IDENTITY_ISSUER and "
             "IDENTITY_ALLOWED_REDIRECTS on the gateway",
         )
-    if status == 500:
+    if answer.status == 500:
         return Verdict(
             FAIL,
             "the configured key cannot be used",
@@ -106,34 +106,59 @@ def judge_jwks(status: int, body: str) -> Verdict:
             "reports this as a server error on purpose, so it is not mistaken "
             "for 'not configured'",
         )
-    if _looks_like_html(body):
-        return Verdict(FAIL, f"HTML at {status}", "this origin is not serving the gateway's API")
-    return Verdict(FAIL, f"unexpected {status}", body[:120])
+    if _looks_like_html(answer.body):
+        return Verdict(
+            FAIL, f"HTML at {answer.status}", "this origin is not serving the gateway's API"
+        )
+    return Verdict(FAIL, f"unexpected {answer.status}", answer.body[:120])
 
 
-def judge_routing(status: int, body: str) -> Verdict:
+def judge_routing(answer: Answer) -> Verdict:
     """Whether `/internal/*` reaches the backend at all.
 
     Answered without a token on purpose: an unauthorized *JSON* refusal is the
     proof, because only the backend produces one.
     """
-    if _looks_like_html(body):
+    if answer.redirected:
         return Verdict(
             FAIL,
-            f"the frontend answered ({status}, HTML)",
+            f"redirected ({answer.status})",
+            "the origin bounced this request instead of serving it; whatever "
+            "answers after the redirect is not what a control plane will call",
+        )
+    if _looks_like_html(answer.body):
+        return Verdict(
+            FAIL,
+            f"the frontend answered ({answer.status}, HTML)",
             "/internal/model-catalog is not forwarded to the backend — the "
             "rewrites in the gateway's #1202 are not on this deployment yet",
         )
-    kind = _error_type(body)
-    if kind in ("unauthorized", "internal_api_not_configured") or status in (200, 401, 403, 404):
-        return Verdict(OK, f"the backend answered ({status}, JSON)")
-    return Verdict(FAIL, f"unexpected {status}", body[:120])
+    if not answer.is_json:
+        return Verdict(
+            FAIL,
+            f"{answer.status} with content-type {answer.content_type or 'none'!r}",
+            "the backend answers this path in JSON; something else is serving it",
+        )
+    # **The gateway's own error envelope, not merely JSON.** Any proxy, CDN or
+    # error page can answer `{"error": "not found"}` with a 404 — accepting
+    # that as proof of reaching the backend is how this check passed against
+    # the frontend for a whole afternoon. Only these shapes are ours.
+    kind = _error_type(answer.body)
+    if kind in ("unauthorized", "internal_api_not_configured"):
+        return Verdict(OK, f"the backend answered ({answer.status}, {kind})")
+    if answer.status == 200:
+        return Verdict(OK, "the catalog answered")
+    return Verdict(
+        FAIL,
+        f"{answer.status}, JSON, but not the gateway's error envelope",
+        answer.body[:120],
+    )
 
 
-def judge_internal_api(status: int, body: str) -> Verdict:
+def judge_internal_api(answer: Answer) -> Verdict:
     """Whether the dispatch token this environment holds is the gateway's."""
-    kind = _error_type(body)
-    if status == 200:
+    kind = _error_type(answer.body)
+    if answer.status == 200:
         return Verdict(OK, "the catalog answered")
     if kind == "internal_api_not_configured":
         return Verdict(
@@ -142,38 +167,70 @@ def judge_internal_api(status: int, body: str) -> Verdict:
             f"set {ENV_TOKEN} on the gateway to the same value used here, and "
             "to a different value in every environment",
         )
-    if status == 401:
+    if answer.status == 401:
         return Verdict(
             FAIL,
             "the dispatch token does not match",
             "the gateway has one set; it is not this one",
         )
-    if status == 403:
+    if answer.status == 403:
         # The token was accepted. The user id is a probe value.
         return Verdict(OK, "authorized (the probe user is unknown, which is expected)")
-    if _looks_like_html(body):
-        return Verdict(FAIL, f"the frontend answered ({status})", "see the routing check above")
-    return Verdict(FAIL, f"unexpected {status}", body[:120])
+    if _looks_like_html(answer.body):
+        return Verdict(
+            FAIL, f"the frontend answered ({answer.status})", "see the routing check above"
+        )
+    return Verdict(FAIL, f"unexpected {answer.status}", answer.body[:120])
 
 
-def _get(client: httpx.Client, url: str, **kwargs: Any) -> tuple[int, str]:
+class Answer(NamedTuple):
+    """What one request came back as.
+
+    Carries the content type and whether the response redirected, because both
+    are how a check tells "the backend refused me" from "something else
+    answered instead" — and both were being thrown away.
+    """
+
+    status: int
+    body: str
+    content_type: str = ""
+    redirected: bool = False
+
+    @property
+    def is_json(self) -> bool:
+        return self.content_type.split(";")[0].strip().lower() == "application/json"
+
+
+def _get(client: httpx.Client, url: str, **kwargs: Any) -> Answer:
     try:
         response = client.get(url, **kwargs)
     except httpx.HTTPError as exc:
-        return 0, f"unreachable: {exc}"
-    return response.status_code, response.text
+        return Answer(0, f"unreachable: {exc}")
+    return Answer(
+        response.status_code,
+        response.text,
+        response.headers.get("content-type", ""),
+        # `follow_redirects` is off, so this is a bounce we did not take. Where
+        # it points is not the question: a check that has to follow a redirect
+        # to succeed is no longer asking about the origin it was given.
+        redirected=300 <= response.status_code < 400,
+    )
 
 
 def run(origin: str, token: str) -> list[tuple[str, Verdict]]:
     """Run every check against one gateway origin."""
     origin = origin.rstrip("/")
     results: list[tuple[str, Verdict]] = []
-    with httpx.Client(timeout=15.0, follow_redirects=True) as client:
-        status, body = _get(client, f"{origin}/v1/identity/jwks")
-        results.append(("identity signing key", judge_jwks(status, body)))
+    # **Redirects are not followed.** A check that lands somewhere else and
+    # likes what it finds has stopped asking about the origin it was given —
+    # and a gateway that bounces `/internal/*` to a login page is exactly the
+    # misconfiguration this exists to catch.
+    with httpx.Client(timeout=15.0, follow_redirects=False) as client:
+        answer = _get(client, f"{origin}/v1/identity/jwks")
+        results.append(("identity signing key", judge_jwks(answer)))
 
-        status, body = _get(client, f"{origin}/internal/model-catalog")
-        results.append(("/internal/* reaches the backend", judge_routing(status, body)))
+        answer = _get(client, f"{origin}/internal/model-catalog")
+        results.append(("/internal/* reaches the backend", judge_routing(answer)))
 
         if not token:
             results.append(
@@ -183,13 +240,13 @@ def run(origin: str, token: str) -> list[tuple[str, Verdict]]:
                 )
             )
         else:
-            status, body = _get(
+            answer = _get(
                 client,
                 f"{origin}/internal/model-catalog",
                 params={"user_id": "preflight-probe"},
                 headers={"Authorization": f"Bearer {token}"},
             )
-            results.append(("internal API authorization", judge_internal_api(status, body)))
+            results.append(("internal API authorization", judge_internal_api(answer)))
     return results
 
 
@@ -220,11 +277,37 @@ def main(argv: list[str] | None = None) -> int:
     print()
     if failed:
         print(f"not ready: {len(failed)} check(s) failed")
-    elif skipped:
-        print("everything checked passed; some checks were skipped")
-    else:
-        print("ready for section 3 of docs/smoke.md")
-    return 1 if failed else 0
+        return 1
+    if skipped:
+        # **A skipped check is not a passed one.** This gates a cutover, and
+        # the thing most likely to be missing is the credential that makes the
+        # authorized checks runnable at all — so exiting 0 here meant the gate
+        # opened widest exactly when least had been verified. The docstring
+        # promised "0 only when every check passes" while the code returned 0
+        # for a run that checked two things out of four.
+        print(f"not ready: {len(skipped)} check(s) could not run")
+        for name in skipped:
+            print(f"  - {name}")
+        return 3
+    print("ready for section 3 of docs/smoke.md")
+    # **Said out loud, because a green run reads as "everything is set".**
+    # `IDENTITY_ISSUER` and `IDENTITY_ALLOWED_REDIRECTS` cannot be checked from
+    # outside: the consent page is served by the frontend, and the endpoint
+    # that would refuse a bad redirect (`POST /v1/identity/code`) requires a
+    # signed-in session, so an unauthenticated probe is turned away before
+    # reaching the configuration. A gateway can publish a key here and still
+    # be unable to issue anything.
+    #
+    # A check was written for this and removed: it read the consent page's
+    # ordinary HTML as a misconfiguration and told operators to go and inspect
+    # a variable that was fine. A probe that cannot tell those apart is worse
+    # than the gap it was covering.
+    print(
+        "\nnot checked: IDENTITY_ISSUER and IDENTITY_ALLOWED_REDIRECTS —\n"
+        "  not observable without a signed-in session. Section 3 of\n"
+        "  docs/smoke.md exercises them by signing in for real."
+    )
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover - entry point

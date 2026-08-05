@@ -109,12 +109,23 @@ jobs:
 
       - name: Preflight (fail closed)
         env:
-          BASE_URL: ${{ vars.FREEINFERENCE_BASE_URL }}
+          # Both, resolved the same way as the run step below — checking one
+          # variable while the run uses two is a preflight that passes on a
+          # configuration the job cannot use.
+          CONTROL_PLANE_URL: ${{ vars.AGENT_CONTROL_PLANE_URL || vars.FREEINFERENCE_BASE_URL }}
+          GATEWAY_URL: ${{ vars.AGENT_GATEWAY_URL || vars.FREEINFERENCE_BASE_URL }}
         run: |
           set -euo pipefail
           # A write-capable agent must never start on a half-configured runner.
           # Every one of these is a hard failure, not a warning.
-          test -n "$BASE_URL" || { echo "::error::FREEINFERENCE_BASE_URL is not set"; exit 1; }
+          test -n "$CONTROL_PLANE_URL" || {
+            echo "::error::set AGENT_CONTROL_PLANE_URL (or FREEINFERENCE_BASE_URL for a co-located deployment)"
+            exit 1
+          }
+          test -n "$GATEWAY_URL" || {
+            echo "::error::set AGENT_GATEWAY_URL (or FREEINFERENCE_BASE_URL for a co-located deployment)"
+            exit 1
+          }
           command -v claude >/dev/null || { echo "::error::claude runtime missing"; exit 1; }
           command -v codex >/dev/null || { echo "::error::codex runtime missing"; exit 1; }
           command -v git >/dev/null || { echo "::error::git missing"; exit 1; }
@@ -129,7 +140,14 @@ jobs:
           # claim; the per-attempt capability token the claim returns is what
           # the agent itself gets, and it never appears in this file.
           AGENT_DISPATCHER_TOKEN: ${{ secrets.AGENT_DISPATCHER_TOKEN }}
-          FREEINFERENCE_BASE_URL: ${{ vars.FREEINFERENCE_BASE_URL }}
+          # Two services, two URLs. This runner claims work from the control
+          # plane and calls models on the gateway; they are the same origin
+          # only where the two are co-located, which this deployment is not.
+          # `AGENT_CONTROL_PLANE_URL` falls back to the old single variable so
+          # an existing repository variable keeps working — as the co-located
+          # shape it always described.
+          AGENT_CONTROL_PLANE_URL: ${{ vars.AGENT_CONTROL_PLANE_URL || vars.FREEINFERENCE_BASE_URL }}
+          AGENT_GATEWAY_URL: ${{ vars.AGENT_GATEWAY_URL || vars.FREEINFERENCE_BASE_URL }}
           # This runner IS the sandbox: the agent runs as the same user as the
           # runner, on a VM GitHub throws away afterwards. The backend refuses
           # that arrangement unless it is acknowledged, and the acknowledgement
@@ -147,7 +165,8 @@ jobs:
           set -euo pipefail
           WORKER_ID="${WORKER_ID_INPUT:-actions-${GITHUB_RUN_ID}}"
           PYTHONPATH=host python -m cloud_agent_host.runner \
-            --base-url "$FREEINFERENCE_BASE_URL" \
+            --base-url "$AGENT_CONTROL_PLANE_URL" \
+            --gateway-url "$AGENT_GATEWAY_URL" \
             --worker-id "$WORKER_ID" \
             --workdir "$GITHUB_WORKSPACE" \
             --agent-timeout 2700

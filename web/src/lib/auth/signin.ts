@@ -5,14 +5,30 @@
 // listed verbatim in `IDENTITY_ALLOWED_REDIRECTS`), how long a code lives. All
 // this side does is generate the PKCE pair, park the verifier, and navigate.
 
-import { gatewayAuthorizeUrl, OAUTH_CLIENT_ID } from '@/config/env';
+import { basePath, gatewayAuthorizeUrl, OAUTH_CLIENT_ID } from '@/config/env';
 import { challengeFor, createState, createVerifier, rememberPending } from './pkce';
 
-/** The one path the gateway is allowed to send the browser back to. */
+/**
+ * The one path the gateway is allowed to send the browser back to, as the app
+ * knows it internally. Mounted under a `basePath` the browser sees it prefixed
+ * — see {@link callbackUri}.
+ */
 export const CALLBACK_PATH = '/callback';
 
+/**
+ * The redirect URI to hand the gateway, absolute and including any base path.
+ *
+ * **`basePath` is applied here by hand and has to be.** Next.js prefixes the
+ * routes and links it generates; it does not rewrite a string we concatenate.
+ * Under `basePath=/agents` the page really is served at `/agents/callback`,
+ * so a URI built without the prefix names a path that does not exist — and
+ * the gateway matches `IDENTITY_ALLOWED_REDIRECTS` as an exact string, so the
+ * failure is a refusal at `/authorize` before the user ever reaches consent.
+ *
+ * Whatever this returns must appear verbatim in the gateway's allowlist.
+ */
 export function callbackUri(): string {
-  return `${window.location.origin}${CALLBACK_PATH}`;
+  return `${window.location.origin}${basePath}${CALLBACK_PATH}`;
 }
 
 /** Thrown when this deployment has no gateway to sign in against. */

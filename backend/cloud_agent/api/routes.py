@@ -2353,6 +2353,53 @@ async def _mint_sandbox_grant(
 
     sandbox_token = str(grant.get("token") or "")
     grant_id = str(grant.get("grant_id") or "")
+
+    # **What was asked for is not what was granted.** The gateway clamps the
+    # requested models against the role the user has *now*, and a job can sit
+    # in the queue for a long time — long enough for a downgrade, a tier
+    # change, or a model being withdrawn from that tier. The clamp is not an
+    # error there: the request was satisfiable, just not on the caller's terms,
+    # and the response reports the effective list.
+    #
+    # Unchecked, that lands as a sandbox that starts, spends an attempt, and
+    # fails on its first inference call with an authorization error the user
+    # cannot act on. Checked here, the job goes back to the queue with nothing
+    # spent, which is the same shape as every other credential failure above.
+    #
+    # Absence is refusal too. The contract says this field is returned; if it
+    # is not, the scope cannot be verified, and "cannot verify" is not a reason
+    # to proceed with a capability.
+    granted_models = grant.get("allowed_models")
+    if not isinstance(granted_models, list) or claim["model"] not in granted_models:
+        if grant_id:
+            await grants.revoke(grant_id)
+        await job_store.release_claim(
+            job_id=claim["id"],
+            attempt_id=claim["attempt_id"],
+            lease_generation=claim["lease_generation"],
+        )
+        logger.warning(
+            "agent_job_grant_scope_insufficient",
+            extra={
+                "event": "agent_job_grant_scope_insufficient",
+                "job_id": claim["id"],
+                "model": claim["model"],
+                "granted": granted_models if isinstance(granted_models, list) else None,
+            },
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "type": "model_not_granted",
+                    "message": (
+                        "The gateway did not grant this job's model; it has been "
+                        "returned to the queue and no attempt was spent."
+                    ),
+                }
+            },
+        )
+
     linked = bool(grant_id) and await job_store.record_attempt_grant(
         attempt_id=claim["attempt_id"],
         lease_generation=claim["lease_generation"],

@@ -2540,6 +2540,16 @@ class AgentJobStore:
         it, so the renewal pass never picks it up and the capability dies at its
         own TTL.
 
+        **The same three predicates as ``list_renewable_grants``, deliberately.**
+        That query is the fence, and this write is what puts a row inside it —
+        so a row this accepts and that rejects is a grant nothing will ever
+        renew, bound to an attempt whose lease another runner may already have
+        taken. The expiry check was missing here while being present there,
+        which is exactly the pair that produces two live sandboxes for one job:
+        a lease can lapse between the claim and this call without the
+        generation changing, because nothing bumps a generation on expiry
+        alone.
+
         Args:
             attempt_id: The attempt the grant belongs to.
             lease_generation: The fence the claim returned.
@@ -2552,7 +2562,10 @@ class AgentJobStore:
             result = await conn.execute(
                 """
                 UPDATE agent_attempts SET grant_id = $3
-                WHERE id = $1 AND lease_generation = $2 AND status = 'running'
+                WHERE id = $1
+                  AND lease_generation = $2
+                  AND status = 'running'
+                  AND lease_expires_at > NOW()
                 """,
                 attempt_id,
                 lease_generation,

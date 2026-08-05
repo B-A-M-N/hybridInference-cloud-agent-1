@@ -151,6 +151,77 @@ services:
         condition: service_healthy
     networks: [control-plane]
 
+  # The one surface a sandbox may reach. Same image, same database, same
+  # lifespan — a second listener rather than a second service.
+  #
+  # It exists because the sandbox's tunnel has to terminate *somewhere*, and
+  # terminating it on the control plane's own port put jobs, sessions, host
+  # registration and admin one authorization bug away from code nobody here
+  # wrote. Those routes all refuse an `mcp`-scoped token; this application
+  # simply does not contain them, which is the difference between a policy and
+  # a fact.
+  mcp-relay:
+    build:
+      context: ../..
+      dockerfile: deploy/control-plane/Dockerfile
+    command:
+      - uvicorn
+      - cloud_agent.app:create_mcp_app
+      - --factory
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8001"
+    restart: unless-stopped
+    ports:
+      # Loopback. The remote host's tunnel forwards to this, and nothing else
+      # should be able to.
+      - "${AGENT_MCP_RELAY_BIND:-127.0.0.1}:${AGENT_MCP_RELAY_PORT:-8001}:8001"
+    environment:
+      AGENT_DATABASE_URL: ${AGENT_DATABASE_URL:?Postgres DSN for the agent-owned database}
+      AGENT_CONTROL_TOKEN_SECRET: ${AGENT_CONTROL_TOKEN_SECRET:?32+ random bytes, unique per environment}
+      # The registry it proxies to, and the credentials in it.
+      AGENT_MCP_CONFIG: ${AGENT_MCP_CONFIG:-/etc/cloud-agent/mcp.yaml}
+      AGENT_LOG_LEVEL: ${AGENT_LOG_LEVEL:-INFO}
+    volumes:
+      - ${AGENT_MCP_CONFIG_FILE:-/dev/null}:/etc/cloud-agent/mcp.yaml:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    networks: [control-plane]
+
+  # The browser-facing app. Built, not run from source: `basePath` and every
+  # `NEXT_PUBLIC_*` value below are resolved when the bundle is compiled, so
+  # they are build arguments and a change to any of them is a rebuild.
+  web:
+    build:
+      context: ../..
+      dockerfile: deploy/control-plane/Dockerfile.web
+      args:
+        # Where this app is mounted. `/agents` serves it under the gateway's
+        # own hostname, which keeps the session cookie same-origin and takes
+        # CORS out of the deployment entirely. Empty for a deployment that
+        # owns its own hostname.
+        NEXT_PUBLIC_BASE_PATH: ${AGENT_WEB_BASE_PATH:-}
+        # Relative on purpose when mounted under a prefix: a same-origin path
+        # means the cookie is sent without `SameSite=None`, and no absolute
+        # host has to be known at build time.
+        NEXT_PUBLIC_AGENT_API_URL: ${AGENT_WEB_API_URL:-}
+        NEXT_PUBLIC_GATEWAY_AUTHORIZE_URL: ${AGENT_WEB_GATEWAY_AUTHORIZE_URL:-}
+        NEXT_PUBLIC_APP_NAME: ${AGENT_WEB_APP_NAME:-}
+        NEXT_PUBLIC_BUILD_SHA: ${BUILD_SHA:-}
+    restart: unless-stopped
+    ports:
+      # Loopback, like the API: the reverse proxy in front of the host is what
+      # terminates TLS and decides who may reach this.
+      - "${AGENT_WEB_BIND:-127.0.0.1}:${AGENT_WEB_PORT:-3002}:3000"
+    depends_on:
+      control-plane:
+        condition: service_started
+    networks: [control-plane]
+
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped

@@ -744,6 +744,7 @@ class KiloRuntime(GenericRuntime):
         model: str,
         gateway_base_url: str,
         credential: str,
+        provides_isolation: bool = False,
         mcp_config: RuntimeMCPConfig = EMPTY_RUNTIME_MCP_CONFIG,
     ) -> tuple[list[str], dict[str, str]]:
         """Add the model id the wrapper declares in Kilo's config."""
@@ -753,6 +754,7 @@ class KiloRuntime(GenericRuntime):
             model=model,
             gateway_base_url=gateway_base_url,
             credential=credential,
+            provides_isolation=provides_isolation,
             mcp_config=mcp_config,
         )
         env["KILO_GATEWAY_MODEL"] = model

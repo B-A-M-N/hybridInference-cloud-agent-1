@@ -750,6 +750,10 @@ class _FakeGrants:
         return {
             "grant_id": f"agr_{len(self.minted)}",
             "token": f"agr.{kwargs['job_id']}.{kwargs['attempt_id']}",
+            # The gateway returns the *effective* scope, and the claim refuses
+            # a grant that does not cover the job's model. A fake omitting it
+            # models a gateway that does not exist.
+            "allowed_models": list(kwargs.get("models") or []),
         }
 
     async def renew(self, grant_id: str) -> dict[str, Any]:

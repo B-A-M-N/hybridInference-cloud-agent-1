@@ -143,6 +143,9 @@ neither belongs in any unit file, `.env`, or image.
 | `AGENT_TERMINAL_MAX_SESSIONS` | existing | |
 | `AGENT_GENERIC_COMMAND` | existing | |
 | `AGENT_ENROLL_TOKEN` | **NEW** | One-time host enrollment token (task G2). Minted at `POST /admin/agent/runner-hosts/enroll-token`, redeemed once at `POST /v1/agent/host/register`, then replaced by the returned host credential. 15-minute TTL, hashed at rest, and shown exactly once — losing it means issuing another, not looking it up. **The token names the host it may register**: the admin minting it supplies `host`, and registration under any other name is refused without spending the token, so a typo cannot revoke a live machine's credential. **The host-side client that reads this does not exist yet**; see MIGRATION.md's deferred register. |
+| `AGENT_HOST_CREDENTIAL_FILE` | **NEW** | Where the host credential is kept between restarts. Default `/var/lib/hybridinference/agent-host-credential`, written mode 0600 before any byte reaches it — this machine runs untrusted repository code next door. `AGENT_HOST_CREDENTIAL` in the environment wins over the file, for deployments that inject it another way. |
+| `AGENT_HOST_SLOTS` | **NEW** | Concurrent attempts this machine accepts, reported at registration and on every heartbeat. Unset means unmetered, which is the pre-pool behaviour. |
+| `AGENT_RUNNER_VERSION` | **NEW** | Free-text version for the pool listing. Operator-facing only — never a compatibility gate, and a missing value must not stop a host enrolling. |
 | `AGENT_LOG_LEVEL` | **NEW** | Host process log level (default INFO). Read by `configure_process_logging()` at the runner entrypoint; replaces the source repo's import-side-effect logging setup (task D6). |
 
 ## Sandbox isolation (host agent reads, sandbox inherits)
@@ -178,7 +181,8 @@ readable by anyone who loads the page.
 
 | Variable | New? | Notes |
 |---|---|---|
-| `NEXT_PUBLIC_AGENT_API_URL` | **NEW** | Control plane base URL. Empty means same-origin, which is the DR4 shape (one host, API under `/api`). A cross-origin value additionally needs CORS-with-credentials on the control plane, because the session is a cookie. |
+| `NEXT_PUBLIC_BASE_PATH` | **NEW** | Prefix the app is mounted under. `/agents` serves it inside the gateway's own hostname — same origin, so the session cookie needs no CORS and no DNS record is involved, and a rollback is a reverse-proxy edit rather than a DNS change waiting out a TTL. Empty for a deployment that owns its hostname. **Whatever this is, `IDENTITY_ALLOWED_REDIRECTS` on the gateway must contain `<origin><base path>/callback` verbatim** — that allowlist is matched as an exact string, and Next does not prefix a URL the code concatenates, so `callbackUri()` applies this by hand. Set as the compose build argument `AGENT_WEB_BASE_PATH`. |
+| `NEXT_PUBLIC_AGENT_API_URL` | **NEW** | Control plane base URL. Empty means same-origin, which is the DR4 shape (one host, API under `/api`). Under a base path, the same-origin value is a relative prefix — `/agents/api` — which the reverse proxy strips before forwarding. A cross-origin value additionally needs CORS-with-credentials on the control plane, because the session is a cookie. |
 | `NEXT_PUBLIC_GATEWAY_AUTHORIZE_URL` | **NEW** | `${GATEWAY_BASE_URL}/authorize` (task C4). Unset means this deployment cannot sign anyone in, and says so instead of redirecting to a half-built URL. The gateway's token endpoint is **derived** from this URL's origin rather than configured separately — one variable, nothing to get out of step. |
 | `NEXT_PUBLIC_APP_NAME` | **NEW** | Product name in the header and the document title. Defaults to `FreeInference Cloud Agent`. |
 | `NEXT_PUBLIC_ORG_NAME` | **NEW** | Optional organisation name beside the product name. Empty hides it. |

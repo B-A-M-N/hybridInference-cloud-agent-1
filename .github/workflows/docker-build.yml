@@ -89,6 +89,11 @@ jobs:
           # required would silently weaken the deployment.
           cat > .env <<'ENVFILE'
           AGENT_DISPATCHER_TOKEN=ci-placeholder-token
+          # Distinct from the dispatcher token above, and distinct here on
+          # purpose: the stack refuses to render when they are one value, and
+          # a placeholder that reused it would make this check pass on the
+          # arrangement it exists to forbid.
+          AGENT_WORKSPACE_BROKER_TOKEN=ci-placeholder-broker-token
           AGENT_SANDBOX_IMAGE=cloud-agent-sandbox:ci
           AGENT_GATEWAY_URL=http://agent-gateway:8080
           AGENT_TUNNEL_SSH_DESTINATION=ci@gateway.invalid
@@ -134,18 +139,28 @@ jobs:
       - name: A missing secret still refuses to render
         run: |
           set -euo pipefail
-          # Both, because they fail for different reasons: a session secret
-          # left blank signs cookies with nothing, and a missing dispatcher
-          # token means every runner claim 401s and the queue never drains.
-          for required in AGENT_SESSION_SECRET AGENT_DISPATCHER_TOKEN; do
-            grep -v "$required" .env.control-plane > .env.missing
-            if docker compose \
-                 -f deploy/control-plane/docker-compose.yml \
-                 --env-file .env.missing config >/dev/null 2>&1; then
-              echo "the control-plane stack rendered without $required" >&2
+          # Each fails for its own reason: a session secret left blank signs
+          # cookies with nothing; a missing dispatcher token means every claim
+          # 401s and the queue never drains; a missing broker token used to
+          # fall back to the dispatcher token, which handed one secret two
+          # permissions.
+          check() {
+            local stack="$1" envfile="$2" required="$3"
+            grep -v "^${required}=" "$envfile" > .env.missing
+            if docker compose -f "$stack" --env-file .env.missing config >/dev/null 2>&1; then
+              echo "$stack rendered without $required" >&2
               exit 1
             fi
-            echo "a missing $required still refuses to render"
+            echo "a missing $required still refuses to render ($stack)"
+          }
+
+          CP=deploy/control-plane/docker-compose.yml
+          HOST=deploy/host/docker-compose.agent-remote-runner.yml
+          for required in AGENT_SESSION_SECRET AGENT_DISPATCHER_TOKEN; do
+            check "$CP" .env.control-plane "$required"
+          done
+          for required in AGENT_DISPATCHER_TOKEN AGENT_WORKSPACE_BROKER_TOKEN; do
+            check "$HOST" .env "$required"
           done
 
       - name: The rendered stack keeps its security properties

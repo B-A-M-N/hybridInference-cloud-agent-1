@@ -78,7 +78,13 @@ services:
       # for the same reason the gateway's is: the service need not be exposed
       # to the network at all.
       TUNNEL_REMOTE_HOST: ${AGENT_MCP_TUNNEL_REMOTE_HOST:-127.0.0.1}
-      TUNNEL_REMOTE_PORT: ${AGENT_MCP_TUNNEL_REMOTE_PORT:-8000}
+      # **8001, the MCP-only listener — never 8000.** A sandbox reaches the far
+      # end of this tunnel; 8000 serves jobs, sessions, host registration and
+      # admin as well as the relay. Those refuse an `mcp`-scoped token, so
+      # pointing here was not exploitable — it put the entire trusted control
+      # plane one authorization bug away from untrusted code, which is a
+      # reachability decision and should not rest on an authorization one.
+      TUNNEL_REMOTE_PORT: ${AGENT_MCP_TUNNEL_REMOTE_PORT:-8001}
       TUNNEL_LISTEN_PORT: ${AGENT_MCP_TUNNEL_LISTEN_PORT:-8000}
     volumes:
       # Its own key, restricted the same way. A key that can open both tunnels
@@ -102,7 +108,13 @@ services:
       dockerfile: deploy/host/Dockerfile.agent-runner
     restart: unless-stopped
     environment:
-      AGENT_WORKSPACE_BROKER_TOKEN: ${AGENT_DISPATCHER_TOKEN:?dispatcher credential is required}
+      # Its own secret, never the dispatcher token. These two authorize
+      # different things — the broker serves workspace files and terminals,
+      # the dispatcher token claims jobs — and setting them to one value means
+      # anything that reaches the broker's credential can also claim work as
+      # this host. Required rather than defaulted for the same reason: a
+      # fallback to the dispatcher token is the bug written as a default.
+      AGENT_WORKSPACE_BROKER_TOKEN: ${AGENT_WORKSPACE_BROKER_TOKEN:?a secret for this host's workspace broker, distinct from AGENT_DISPATCHER_TOKEN}
       AGENT_WORKDIR_ROOT: ${AGENT_WORKDIR_ROOT:-/var/lib/hybridinference/agent-jobs}
       AGENT_SANDBOX_BACKEND: ${AGENT_SANDBOX_BACKEND:-kata}
       AGENT_SANDBOX_IMAGE: ${AGENT_SANDBOX_IMAGE:?name the sandbox image this deployment runs}
@@ -149,7 +161,9 @@ services:
       AGENT_SANDBOX_MCP_URL: http://${AGENT_MCP_HOSTNAME:-agent-mcp}:${AGENT_MCP_TUNNEL_LISTEN_PORT:-8000}
       AGENT_DISPATCHER_TOKEN: ${AGENT_DISPATCHER_TOKEN:?dispatcher credential is required}
       AGENT_WORKSPACE_BROKER_URL: http://agent-workspace-broker:8092
-      AGENT_WORKSPACE_BROKER_TOKEN: ${AGENT_DISPATCHER_TOKEN:?dispatcher credential is required}
+      # Must match the broker service above, and must differ from the
+      # dispatcher token beside it. Two credentials for two permissions.
+      AGENT_WORKSPACE_BROKER_TOKEN: ${AGENT_WORKSPACE_BROKER_TOKEN:?a secret for this host's workspace broker, distinct from AGENT_DISPATCHER_TOKEN}
 
       AGENT_SANDBOX_BACKEND: ${AGENT_SANDBOX_BACKEND:-kata}
       AGENT_SANDBOX_IMAGE: ${AGENT_SANDBOX_IMAGE:?name the sandbox image this deployment runs}

@@ -1,0 +1,229 @@
+"""Joining the pool, staying in it, and being told to leave.
+
+The control plane has had `/v1/agent/host/register` and `/heartbeat` since
+phase G; nothing on the host side called either. Everything hanging off a host
+row was therefore inert — capacity unreported, `drain` unread, `offline`
+meaningless, and the `broker_url` from which files and terminals are served
+never supplied.
+
+What is checked here is the part that decides whether work is taken, because
+that is where a wrong answer costs an attempt:
+
+* draining stops claims and does not exit — the operator may undrain;
+* a rejected credential stops claims permanently, and is distinguished from
+  an unreachable control plane, which must not;
+* a deployment with no pool keeps working exactly as before.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+import pytest
+
+from cloud_agent_host import enrollment
+
+
+class _Response:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = json.dumps(payload).encode()
+
+    def read(self) -> bytes:
+        return self._payload
+
+    def __enter__(self) -> _Response:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+@pytest.fixture()
+def credential_file(tmp_path, monkeypatch):
+    path = tmp_path / "credential"
+    monkeypatch.setenv(enrollment.ENV_CREDENTIAL_FILE, str(path))
+    monkeypatch.delenv(enrollment.ENV_HOST_CREDENTIAL, raising=False)
+    monkeypatch.delenv(enrollment.ENV_ENROLL_TOKEN, raising=False)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Enrolling
+# ---------------------------------------------------------------------------
+
+
+def test_a_deployment_with_no_pool_is_left_alone(credential_file) -> None:
+    """No credential and no token means the single-host shape, not an error.
+
+    This predates the pool and is still the supported way to run one machine.
+    A runner that refused to start without enrolling would break every
+    existing deployment on upgrade.
+    """
+    assert enrollment.ensure_enrolled(base_url="http://cp", host="h1") is None
+
+
+def test_a_token_is_spent_for_a_credential(credential_file, monkeypatch) -> None:
+    monkeypatch.setenv(enrollment.ENV_ENROLL_TOKEN, "enroll-once")
+    sent: dict[str, Any] = {}
+
+    def fake_urlopen(request, timeout=None):
+        sent["url"] = request.full_url
+        sent["body"] = json.loads(request.data)
+        return _Response({"host": "h1", "credential": "hc_secret", "status": "active"})
+
+    monkeypatch.setattr(enrollment.urllib.request, "urlopen", fake_urlopen)
+
+    identity = enrollment.ensure_enrolled(base_url="http://cp", host="h1", slots_total=4)
+
+    assert identity is not None
+    assert identity.credential == "hc_secret"
+    assert sent["body"]["enroll_token"] == "enroll-once"
+    assert sent["body"]["slots_total"] == 4
+    assert sent["url"].endswith("/v1/agent/host/register")
+
+
+def test_the_credential_is_stored_unreadable_to_others(credential_file, monkeypatch) -> None:
+    """This machine runs untrusted repository code next door."""
+    monkeypatch.setenv(enrollment.ENV_ENROLL_TOKEN, "enroll-once")
+    monkeypatch.setattr(
+        enrollment.urllib.request,
+        "urlopen",
+        lambda request, timeout=None: _Response({"host": "h1", "credential": "hc_secret"}),
+    )
+
+    enrollment.ensure_enrolled(base_url="http://cp", host="h1")
+
+    assert credential_file.read_text() == "hc_secret"
+    assert credential_file.stat().st_mode & 0o077 == 0, "the credential is readable by others"
+
+
+def test_a_stored_credential_is_not_spent_again(credential_file, monkeypatch) -> None:
+    """Restarting must not consume a second enrollment token."""
+    credential_file.write_text("hc_existing")
+    monkeypatch.setenv(enrollment.ENV_ENROLL_TOKEN, "enroll-once")
+
+    def refuse(request, timeout=None):  # pragma: no cover - must not be called
+        raise AssertionError("registered again despite holding a credential")
+
+    monkeypatch.setattr(enrollment.urllib.request, "urlopen", refuse)
+
+    identity = enrollment.ensure_enrolled(base_url="http://cp", host="h1")
+    assert identity is not None
+    assert identity.credential == "hc_existing"
+
+
+def test_registration_without_a_credential_in_the_answer_is_an_error(
+    credential_file, monkeypatch
+) -> None:
+    """Returning `None` here would look like the no-pool shape and run on."""
+    monkeypatch.setenv(enrollment.ENV_ENROLL_TOKEN, "enroll-once")
+    monkeypatch.setattr(
+        enrollment.urllib.request,
+        "urlopen",
+        lambda request, timeout=None: _Response({"host": "h1", "status": "active"}),
+    )
+
+    with pytest.raises(enrollment.EnrollmentError):
+        enrollment.ensure_enrolled(base_url="http://cp", host="h1")
+
+
+# ---------------------------------------------------------------------------
+# Staying in, and being told to leave
+# ---------------------------------------------------------------------------
+
+
+def test_the_pool_decides_whether_to_claim() -> None:
+    """`draining` is an operator saying "finish what you have"."""
+    identity = enrollment.HostIdentity(host="h1", credential="c", status="active")
+    beat = enrollment.HostHeartbeat(base_url="http://cp", identity=identity)
+
+    assert beat.claimable
+
+    identity.status = "draining"
+    assert not beat.claimable, "a draining host that keeps claiming makes drain mean nothing"
+
+
+def test_a_rejected_credential_stops_claims_for_good(monkeypatch) -> None:
+    """401 and 403 name *this host*; there is nothing to retry."""
+    identity = enrollment.HostIdentity(host="h1", credential="c")
+    beat = enrollment.HostHeartbeat(base_url="http://cp", identity=identity)
+
+    def rejected(url, body, bearer=""):
+        raise enrollment.HostRemoved("403")
+
+    monkeypatch.setattr(enrollment, "_post", rejected)
+
+    # No stop needed: a rejected credential returns out of the loop, which is
+    # the behaviour being asserted.
+    beat._run()
+
+    assert beat.removed.is_set()
+    assert not beat.claimable
+
+
+def test_an_unreachable_control_plane_does_not_remove_the_host(monkeypatch) -> None:
+    """The distinction that matters.
+
+    A control plane restarting is not a host being retired, and treating them
+    alike would empty the pool during every deploy. The control plane's own
+    reaper decides when silence has gone on too long — duplicating that
+    judgement here would give two components a vote on the same fact.
+    """
+    identity = enrollment.HostIdentity(host="h1", credential="c")
+    beat = enrollment.HostHeartbeat(base_url="http://cp", identity=identity)
+    calls = {"n": 0}
+
+    def unreachable(url, body, bearer=""):
+        calls["n"] += 1
+        # Stop the loop from inside, after it has been seen to retry. Patching
+        # `wait`'s return value does not end it — the loop exits on
+        # `is_set()`, so a fake that only returns True spins forever. It did,
+        # for five minutes, before this was written the other way round.
+        if calls["n"] >= 2:
+            beat._stop.set()
+        raise enrollment.EnrollmentError("connection refused")
+
+    monkeypatch.setattr(enrollment, "_post", unreachable)
+    # No real sleeping between passes; the retry behaviour is the subject, not
+    # the interval.
+    monkeypatch.setattr(beat._identity, "interval_s", 0.0)
+
+    beat._run()
+
+    assert calls["n"] >= 2, "gave up after one unreachable heartbeat"
+    assert not beat.removed.is_set()
+    assert beat.claimable
+
+
+def test_the_interval_follows_the_control_plane(monkeypatch) -> None:
+    """Both sides must agree on what a missed heartbeat is.
+
+    The reaper counts missed intervals; a runner beating to its own constant
+    would be marked offline by arithmetic rather than by absence.
+    """
+    identity = enrollment.HostIdentity(host="h1", credential="c")
+    monkeypatch.setattr(
+        enrollment,
+        "_post",
+        lambda url, body, bearer="": {"status": "active", "heartbeat_interval_seconds": 7.5},
+    )
+
+    enrollment.heartbeat(base_url="http://cp", identity=identity)
+
+    assert identity.interval_s == 7.5
+
+
+def test_a_nonsense_interval_is_ignored(monkeypatch) -> None:
+    """Zero or negative would busy-loop against the control plane."""
+    identity = enrollment.HostIdentity(host="h1", credential="c")
+    before = identity.interval_s
+    monkeypatch.setattr(
+        enrollment,
+        "_post",
+        lambda url, body, bearer="": {"status": "active", "heartbeat_interval_seconds": 0},
+    )
+
+    enrollment.heartbeat(base_url="http://cp", identity=identity)
+
+    assert identity.interval_s == before

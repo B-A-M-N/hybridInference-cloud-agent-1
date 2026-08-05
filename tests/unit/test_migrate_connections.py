@@ -504,3 +504,54 @@ def test_the_same_id_under_the_same_owner_still_refreshes() -> None:
 
     assert [row["id"] for row in plan.refresh] == [5]
     assert not plan.blocked
+
+
+# ---------------------------------------------------------------------------
+# The window between reading and writing
+# ---------------------------------------------------------------------------
+
+
+def test_both_source_tables_are_read_in_one_snapshot() -> None:
+    """A user who connects between the two reads lands in one export.
+
+    asyncpg commits each statement on its own, so two sequential `read_table`
+    calls read the source at two different moments. The cutover window is
+    exactly when that is most likely, because the old stack is still serving.
+    """
+    import inspect
+
+    source = inspect.getsource(mc.run)
+    assert "repeatable_read" in source, (
+        "the two source tables are read outside a shared snapshot; a "
+        "connection made between them appears in one export and not the other"
+    )
+
+
+def test_the_written_plan_is_computed_under_a_lock() -> None:
+    """A plan made before the transaction is a prediction, not a decision.
+
+    The dangerous case is not a primary-key clash — that aborts loudly. It is
+    the same user connecting on the *new* stack in between: they get a fresh
+    id, the migration inserts the old one, and that user ends up with two
+    connection rows which no conflict check ever saw, because the check ran
+    against a snapshot taken before theirs existed.
+    """
+    import inspect
+
+    source = inspect.getsource(mc.run)
+    write = source[source.index("if args.apply and not blocked and not stale:") :]
+
+    # Asserted before the indices are taken. `str.index` raises rather than
+    # failing, and an ERROR reads as a broken test rather than as the missing
+    # lock it actually is.
+    assert "LOCK TABLE" in write, "the write path takes no lock on the tables it plans against"
+    assert "async with target.transaction():" in write
+
+    transaction = write.index("async with target.transaction():")
+    replan = write.index("plan_table(")
+    lock = write.index("LOCK TABLE")
+
+    assert transaction < lock < replan, (
+        "the plan that gets written must be built inside the write "
+        "transaction, after the tables are locked"
+    )

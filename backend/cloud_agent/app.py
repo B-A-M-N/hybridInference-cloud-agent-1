@@ -104,6 +104,14 @@ GRANT_RENEWAL_GIVE_UP_AFTER = 3
 #: here so the truncation warning cannot drift from the query's limit.
 GRANT_RENEWAL_PAGE = 200
 
+#: Renewals in flight at once. The pass has to finish well inside a grant's
+#: lifetime, and serially it cost the sum of every round trip — so at the page
+#: cap a merely slow gateway let the last grants expire waiting their turn.
+#: Bounded rather than unlimited: a full page arriving at once, every interval,
+#: is a burst the gateway has to absorb, and fixing our latency by overwhelming
+#: a dependency moves the problem instead of solving it.
+GRANT_RENEWAL_CONCURRENCY = 16
+
 
 async def _reconcile_settled_terminals(store: AgentJobStore) -> None:
     """Replay durable settled-terminal recovery markers after restarts.
@@ -237,7 +245,8 @@ async def _renew_live_grants(
             "agent_grant_renewal_truncated",
             extra={"event": "agent_grant_renewal_truncated", "count": len(renewable)},
         )
-    for row in renewable:
+
+    async def _renew_one(row: dict[str, Any]) -> None:
         grant_id = row["grant_id"]
         seen.add(grant_id)
         try:
@@ -276,11 +285,36 @@ async def _renew_live_grants(
                     logger.warning("Abandoning an unrenewable attempt failed", exc_info=True)
                 else:
                     seen.discard(grant_id)
-            continue
+            return
         # Consecutive, not cumulative: one refused pass followed by a good one
         # is a gateway blip, and must not accumulate toward a give-up over the
         # hours a long job runs.
         failures.pop(grant_id, None)
+
+    # **Concurrently, because a pass must finish inside a grant's lifetime.**
+    # Serially, one pass cost the sum of every renewal's round trip: at the
+    # page cap, with a gateway answering slowly but not failing, the last
+    # grants in the list expired waiting their turn — and the symptom was a
+    # sandbox losing authorization mid-run, which points nowhere near here.
+    # Ordering by soonest expiry made the starvation rotate; it did not make
+    # the pass fit.
+    #
+    # Bounded, though. Two hundred simultaneous renewals is a burst the
+    # gateway would have to absorb every interval, and a control plane that
+    # fixes its own latency by overwhelming its dependency has moved the
+    # problem rather than solved it.
+    #
+    # Each coroutine touches only its own grant's entry in `failures` and its
+    # own id in `seen`, so the shared state needs no lock — the rows come from
+    # one query and a grant id appears once.
+    limit = asyncio.Semaphore(GRANT_RENEWAL_CONCURRENCY)
+
+    async def _renew_bounded(row: dict[str, Any]) -> None:
+        async with limit:
+            await _renew_one(row)
+
+    await asyncio.gather(*(_renew_bounded(row) for row in renewable))
+
     for grant_id in [known for known in failures if known not in seen]:
         del failures[grant_id]
 
@@ -443,8 +477,14 @@ def _start_publisher(app: FastAPI, store: AgentJobStore) -> None:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Open the store, start the reaper and publisher, and tear them down.
+async def lifespan(app: FastAPI, *, background: bool = True) -> AsyncIterator[None]:
+    """Open the store, optionally start the reaper and publisher, tear down.
+
+    Args:
+        app: The application whose state is being built.
+        background: Whether this process owns the reaper and the publisher.
+            False for a second listener sharing the database — see the comment
+            below for why that is not merely wasteful.
 
     The database is required. A control plane without one cannot claim, fence
     or record anything, so it refuses to start rather than serving an API that
@@ -474,18 +514,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.grants = GrantClient()
     _build_source_control(app)
 
-    reaper = asyncio.create_task(reap_expired_attempts(store, grants=app.state.grants))
-    _BACKGROUND_TASKS.add(reaper)
-    reaper.add_done_callback(_BACKGROUND_TASKS.discard)
-    app.state.reaper_task = reaper
-
-    _start_publisher(app, store)
-    logger.info("cloud agent control plane started")
+    # **The background work belongs to exactly one process.** The reaper
+    # renews and revokes grants and supersedes lapsed attempts; the publisher
+    # opens pull requests. A second listener on this same database — the MCP
+    # relay is one — running its own copies would renew every grant twice per
+    # interval, double the load it puts on the gateway, and have two workers
+    # racing for the same publish.
+    #
+    # So this is a parameter of the lifespan rather than a property of it, and
+    # `create_mcp_app` says no.
+    if background:
+        reaper = asyncio.create_task(reap_expired_attempts(store, grants=app.state.grants))
+        _BACKGROUND_TASKS.add(reaper)
+        reaper.add_done_callback(_BACKGROUND_TASKS.discard)
+        app.state.reaper_task = reaper
+        _start_publisher(app, store)
+        logger.info("cloud agent control plane started")
+    else:
+        app.state.reaper_task = None
+        app.state.publish_task = None
+        logger.info("cloud agent relay listener started")
 
     try:
         yield
     finally:
         for task in (app.state.reaper_task, app.state.publish_task):
+            if task is None:
+                continue
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
@@ -522,6 +577,52 @@ def create_app() -> FastAPI:
         plane is (no gateway? no git credential?), and every answer to that
         belongs to whoever operates it.
         """
+        return {"status": "ok"}
+
+    return app
+
+
+def create_mcp_app() -> FastAPI:
+    """Build a listener that serves the MCP relay and nothing else.
+
+    **A sandbox is the least trusted thing in this system, and the relay is the
+    one endpoint it is meant to reach.** Pointed at the main application, its
+    tunnel also reaches jobs, sessions, host registration and admin — every
+    route the control plane has. Those refuse an ``mcp``-scoped token, so
+    nothing was exploitable through them today; but the entire trusted control
+    plane sat one authorization bug away from code nobody in this repository
+    wrote, and that is a reachability decision rather than an authorization
+    one.
+
+    So the separation is structural. This application does not *contain* the
+    other routes, which is a stronger statement than any of them refusing:
+    there is no path prefix to get wrong in a proxy, no rule to leave off a new
+    router, and a route added to ``create_app`` tomorrow is not silently
+    exposed here.
+
+    Same process image, same database, same lifespan — it is a second
+    listener, not a second service. The cost is one more port; the alternative
+    was a path-restricted proxy, which is the same policy written where it can
+    be misconfigured and where nothing tests it.
+    """
+    configure_process_logging()
+
+    from cloud_agent.api import mcp_relay
+
+    app = FastAPI(
+        title="FreeInference Cloud Agent — MCP relay",
+        description="The only surface a sandbox may reach",
+        version="0.1.0",
+        # No reaper and no publisher: they belong to the control-plane process,
+        # and a second copy would renew every grant twice and race the same
+        # publish. This listener needs the store, and nothing else.
+        lifespan=lambda app: lifespan(app, background=False),
+    )
+    app.include_router(mcp_relay.router)
+
+    @app.get("/healthz")
+    async def healthz() -> dict[str, str]:
+        """Liveness, so the tunnel's health check has something to ask."""
         return {"status": "ok"}
 
     return app

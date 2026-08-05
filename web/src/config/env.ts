@@ -22,6 +22,30 @@
 export const agentApiBase = (process.env.NEXT_PUBLIC_AGENT_API_URL || '').replace(/\/+$/, '');
 
 /**
+ * The prefix this app is served under (`NEXT_PUBLIC_BASE_PATH`).
+ *
+ * Empty for a deployment that owns its own hostname. Set to `/agents` to
+ * mount the app inside the gateway's existing origin, which is what makes the
+ * session cookie same-origin and removes CORS from the problem entirely.
+ *
+ * **Next.js prefixes what it generates, not what we write.** `<Link>`, router
+ * navigations and asset URLs pick `basePath` up automatically; a path built by
+ * string concatenation does not. So anything that hands a URL to another
+ * service — above all the OAuth redirect, which the gateway matches as an
+ * exact string — has to apply this itself.
+ *
+ * Normalized rather than trusted: a trailing slash makes every derived path
+ * contain `//`, and a missing leading slash makes them relative.
+ */
+export const basePath = normalizeBasePath(process.env.NEXT_PUBLIC_BASE_PATH);
+
+export function normalizeBasePath(raw: string | undefined): string {
+  const trimmed = (raw || '').trim().replace(/\/+$/, '');
+  if (!trimmed) return '';
+  return trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+}
+
+/**
  * The gateway's consent page (`NEXT_PUBLIC_GATEWAY_AUTHORIZE_URL`).
  *
  * Unset means this deployment cannot sign anyone in. That is surfaced as a
