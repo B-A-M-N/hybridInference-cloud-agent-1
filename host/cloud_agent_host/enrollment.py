@@ -31,17 +31,22 @@ repository code next door.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from cloud_agent_host.logging_utils import get_logger
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 logger = get_logger(__name__)
 
@@ -275,7 +280,63 @@ def ensure_enrolled(
     credential nor an enrollment token — which is the single-host shape that
     worked before phase G and must keep working. Enrolment is opt-in; a runner
     that has never heard of it is not broken.
+
+    **Under a lock, because a host runs several runner processes.** The compose
+    file starts three replicas from one machine, sharing one credential file,
+    one host name and one enrollment token. Unlocked, all three read no
+    credential and all three register: the control plane spends the token for
+    exactly one of them (the `consumed_at IS NULL` predicate in
+    ``consume_enroll_token``), so the other two fail and crash-loop until one
+    of the restarts happens to read the file the winner wrote. It settles, but
+    "a new host crash-loops on first start" is not something to make an
+    operator recognise. The losers wait here and find the credential instead.
     """
+    with _enrollment_lock():
+        return _enroll_once(
+            base_url=base_url,
+            host=host,
+            broker_url=broker_url,
+            slots_total=slots_total,
+            capabilities=capabilities,
+            runner_version=runner_version,
+        )
+
+
+@contextmanager
+def _enrollment_lock() -> Iterator[None]:
+    """Serialize load-or-register across every runner process on this machine.
+
+    On the credential's own directory, which is the volume all replicas share
+    — a lock anywhere else would be per-container and would serialize nothing.
+    A deployment whose lock file cannot be created (a read-only path, an
+    unusual mount) proceeds unlocked rather than refusing to start: the
+    unlocked path is what this code did before, and the control plane still
+    settles the race correctly.
+    """
+    path = credential_path().parent / ".enroll.lock"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("w")
+    except OSError:
+        yield
+        return
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+    finally:
+        handle.close()
+
+
+def _enroll_once(
+    *,
+    base_url: str,
+    host: str,
+    broker_url: str | None,
+    slots_total: int | None,
+    capabilities: list[str] | None,
+    runner_version: str | None,
+) -> HostIdentity | None:
+    """The body of :func:`ensure_enrolled`, run holding the lock."""
     credential = load_credential()
     if credential:
         return HostIdentity(host=host, credential=credential)
@@ -332,6 +393,18 @@ class HostHeartbeat:
     def status(self) -> str:
         """What the pool last said about this host."""
         return self._identity.status
+
+    @property
+    def credential(self) -> str:
+        """This host's own claim credential, naming the machine.
+
+        What the runner presents instead of the pool-wide dispatcher token
+        once enrolled. The control plane reads the host from this rather than
+        from the request body, so a compromised machine can drain the queue
+        but cannot claim as its neighbour — which is the whole reason drain,
+        pin and revoke are per-host decisions.
+        """
+        return self._identity.credential
 
     @property
     def claimable(self) -> bool:

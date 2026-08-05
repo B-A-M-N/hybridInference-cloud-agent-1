@@ -1329,7 +1329,15 @@ def run_forever(
             run_once(
                 gateway_url=gateway_url,
                 base_url=base_url,
-                dispatcher_token=dispatcher_token,
+                # **The host's own credential when it has one.** The dispatcher
+                # token is shared by the whole pool, so it says "a runner" and
+                # not "which"; the control plane reads the host from the
+                # credential rather than from the request body, and that is
+                # what makes draining, pinning and revoking mean anything
+                # against a machine that has been taken over. Enrolling a host
+                # and then claiming with the shared token would leave every
+                # per-host control decorative.
+                dispatcher_token=(pool.credential if pool is not None else dispatcher_token),
                 worker_id=worker_id,
                 workdir=str(root),
                 lease_ttl=lease_ttl,

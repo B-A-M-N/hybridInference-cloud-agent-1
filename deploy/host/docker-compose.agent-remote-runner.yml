@@ -193,6 +193,27 @@ services:
       # "may call tools" stay two permissions rather than one.
       AGENT_SANDBOX_MCP_URL: http://${AGENT_MCP_HOSTNAME:-agent-mcp}:${AGENT_MCP_TUNNEL_LISTEN_PORT:-8000}
       AGENT_DISPATCHER_TOKEN: ${AGENT_DISPATCHER_TOKEN:?dispatcher credential is required}
+
+      # --- Pool membership (optional; unset is the single-host shape) ---
+      # A one-time token, spent at first start for a lasting per-host
+      # credential. Once that credential exists the runner claims with it
+      # instead of the dispatcher token above, and the control plane reads the
+      # host from the credential rather than from the request body — which is
+      # what makes drain, pin and revoke per-host decisions rather than
+      # suggestions.
+      #
+      # Leave it unset and nothing enrolls: the runner behaves exactly as a
+      # single-host deployment always has. That shape predates the pool and
+      # stays supported.
+      AGENT_ENROLL_TOKEN: ${AGENT_ENROLL_TOKEN:-}
+      # Where that credential is kept. **On the persisted volume below**, not
+      # in the container's own filesystem: a credential that dies with the
+      # container spends a fresh enrollment token on every restart, and
+      # enrollment tokens are single-use.
+      AGENT_HOST_CREDENTIAL_FILE: ${AGENT_HOST_STATE_ROOT:-/var/lib/hybridinference/agent-host}/credential
+      # How many jobs this machine will hold at once. Unset means unmetered,
+      # which is what every host that predates the pool is.
+      AGENT_HOST_SLOTS: ${AGENT_HOST_SLOTS:-}
       AGENT_WORKSPACE_BROKER_URL: http://agent-workspace-broker:8092
       # Must match the broker service above, and must differ from the
       # dispatcher token beside it. Two credentials for two permissions.
@@ -235,6 +256,12 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ${AGENT_WORKDIR_ROOT:-/var/lib/hybridinference/agent-jobs}:${AGENT_WORKDIR_ROOT:-/var/lib/hybridinference/agent-jobs}
       - ${AGENT_SNAPSHOT_ROOT:-/var/lib/hybridinference/agent-snapshots}:${AGENT_SNAPSHOT_ROOT:-/var/lib/hybridinference/agent-snapshots}
+      # The host credential, and the lock the replicas enroll under. On the
+      # machine, not in a container: an enrollment token is single-use, so a
+      # credential that dies with the container needs a new token on every
+      # restart. Shared by all three replicas, which is also what makes the
+      # lock work — it is taken on this directory.
+      - ${AGENT_HOST_STATE_ROOT:-/var/lib/hybridinference/agent-host}:${AGENT_HOST_STATE_ROOT:-/var/lib/hybridinference/agent-host}
     networks:
       - hybridinference
     depends_on:

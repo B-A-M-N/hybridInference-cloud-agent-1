@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 import pathlib
 import re
+import threading
+import time
 from typing import Any
 
 import pytest
@@ -132,6 +134,53 @@ def test_registration_without_a_credential_in_the_answer_is_an_error(
 
     with pytest.raises(enrollment.EnrollmentError):
         enrollment.ensure_enrolled(base_url="http://cp", host="h1")
+
+
+def test_replicas_sharing_a_token_enroll_once(credential_file, monkeypatch) -> None:
+    """Three runner processes, one machine, one single-use token.
+
+    The compose file starts three replicas sharing a credential file, a host
+    name and an enrollment token. The control plane spends that token for
+    exactly one of them, so unlocked the other two fail and crash-loop until a
+    restart happens to read the file the winner wrote. It settles — and "a new
+    host crash-loops on first start" is not a thing to make an operator learn
+    to recognise.
+
+    Threads rather than processes because the lock is on a shared file either
+    way, and the assertion is about how many registrations reach the control
+    plane.
+    """
+    monkeypatch.setenv(enrollment.ENV_ENROLL_TOKEN, "enroll-once")
+    registrations = []
+    lock = threading.Lock()
+
+    def fake_urlopen(request, timeout=None):
+        with lock:
+            registrations.append(request.full_url)
+            spent = len(registrations) > 1
+        if spent:
+            raise AssertionError("the enrollment token was presented twice")
+        time.sleep(0.05)  # widen the window the lock has to close
+        return _Response({"host": "h1", "credential": "hc_secret", "status": "enrolling"})
+
+    monkeypatch.setattr(enrollment.urllib.request, "urlopen", fake_urlopen)
+
+    results: list[object] = []
+    threads = [
+        threading.Thread(
+            target=lambda: results.append(
+                enrollment.ensure_enrolled(base_url="http://cp", host="h1")
+            )
+        )
+        for _ in range(3)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(registrations) == 1, f"{len(registrations)} replicas spent the token"
+    assert all(r is not None and r.credential == "hc_secret" for r in results), results
 
 
 # ---------------------------------------------------------------------------
