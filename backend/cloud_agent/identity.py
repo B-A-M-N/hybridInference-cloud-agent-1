@@ -42,6 +42,14 @@ ENV_SESSION_SECRET = "AGENT_SESSION_SECRET"
 #: credential act as another's.
 AUDIENCE = "cloud-agent"
 
+#: How this service identifies itself on outbound HTTP.
+#:
+#: Named rather than left to each library's default because the defaults
+#: differ: `httpx` announces itself in a shape CDNs accept, `urllib` announces
+#: `Python-urllib/3.x`, which they routinely refuse. Two clients in one service
+#: reaching one host and getting different answers is the bug this prevents.
+USER_AGENT = "freeinference-cloud-agent"
+
 #: Our own session. Long enough to be useful, short enough that a stolen cookie
 #: expires without anyone having to notice.
 SESSION_TTL_S = 7 * 24 * 60 * 60
@@ -74,7 +82,20 @@ def _jwks_client() -> PyJWKClient:
     if _jwk_client is None or _jwk_client_url != url:
         # PyJWKClient caches keys and re-fetches on an unknown kid, which is
         # exactly the rotation behaviour wanted here.
-        _jwk_client = PyJWKClient(url, cache_keys=True)
+        #
+        # **The User-Agent is not decoration.** PyJWKClient fetches with
+        # `urllib`, which announces itself as `Python-urllib/3.x` — and a
+        # gateway behind a CDN or WAF is entitled to refuse that. Cloudflare
+        # does: on staging this exact request answered 403 while the same URL
+        # answered 200 to `httpx` from the same container, which is what every
+        # other gateway call in this service uses.
+        #
+        # The failure that produced is worth remembering. Sign-in returned 401
+        # "Invalid or expired token" — the token was fine and had just been
+        # minted; the key to check it against could not be fetched. Nothing in
+        # either service's logs named a CDN, because from here it was a 403 on
+        # an internal call and from there it was a request that never arrived.
+        _jwk_client = PyJWKClient(url, cache_keys=True, headers={"User-Agent": USER_AGENT})
         _jwk_client_url = url
     return _jwk_client
 

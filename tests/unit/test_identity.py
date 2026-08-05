@@ -232,3 +232,41 @@ def test_an_identity_token_is_not_accepted_as_a_session(monkeypatch, keypair) ->
     monkeypatch.setenv(ENV_SESSION_SECRET, SESSION_SECRET)
     with pytest.raises(IdentityError):
         verify_session(_token(key))
+
+
+def test_the_jwks_fetch_identifies_itself(monkeypatch) -> None:
+    """`Python-urllib/3.x` is a User-Agent CDNs refuse, and a gateway is behind one.
+
+    PyJWKClient fetches with `urllib`, whose default UA Cloudflare answers 403
+    — while the same URL answered 200 to `httpx` from the same container, and
+    `httpx` is what every other gateway call in this service uses. Two clients,
+    one host, different answers.
+
+    What that cost, on staging: sign-in returned 401 "Invalid or expired token"
+    against a token that had just been minted and was entirely valid. The key
+    to check it against could not be fetched, and this module's caller does not
+    echo the reason on purpose — so nothing in either service's logs named the
+    cause.
+    """
+    captured: dict[str, object] = {}
+
+    class _Client:
+        def __init__(self, uri, **kwargs):
+            captured["uri"] = uri
+            captured.update(kwargs)
+
+    monkeypatch.setattr(identity, "PyJWKClient", _Client)
+    monkeypatch.setenv(identity.ENV_JWKS_URL, "https://gateway.example/v1/identity/jwks")
+    identity.reset_jwks_cache()
+    try:
+        identity._jwks_client()
+    finally:
+        identity.reset_jwks_cache()
+
+    agent = str((captured.get("headers") or {}).get("User-Agent", ""))
+    assert agent, "the JWKS fetch sends no User-Agent, so urllib's default is used"
+    assert "urllib" not in agent.lower(), agent
+    assert "cloud-agent" in agent.lower(), (
+        "the User-Agent should name this service, so an operator reading a "
+        f"gateway's access log can tell who was refused; got {agent!r}"
+    )
