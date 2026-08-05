@@ -132,6 +132,14 @@ jobs:
           AGENT_SOURCE_CONTROL_ENCRYPTION_KEY=ci-placeholder-value-not-real
           AGENT_POSTGRES_PASSWORD=ci-placeholder
           AGENT_DISPATCHER_TOKEN=ci-placeholder
+          # The web build arguments are required rather than defaulted to
+          # empty: empty is a real answer for a deployment that owns its
+          # hostname and silently wrong for one mounted under a prefix, and
+          # the difference does not show at start. Their presence here is
+          # part of what this step checks.
+          AGENT_WEB_BASE_PATH=/agents
+          AGENT_WEB_API_URL=/agents/api
+          AGENT_WEB_GATEWAY_AUTHORIZE_URL=https://gateway.invalid/authorize
           ENVFILE
           docker compose \
             -f deploy/control-plane/docker-compose.yml \

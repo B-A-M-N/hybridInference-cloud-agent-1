@@ -200,17 +200,24 @@ services:
       context: ../..
       dockerfile: deploy/control-plane/Dockerfile.web
       args:
-        # Empty, and that is the deployed shape: this stack serves from the
-        # root of its own origin (the gateway's hostname, its own port). Set
-        # it only for a deployment that really does mount this app under a
-        # prefix. See `deploy/reverse-proxy/agents-own-origin.conf`.
-        NEXT_PUBLIC_BASE_PATH: ${AGENT_WEB_BASE_PATH:-}
-        # Relative on purpose. The web app and the control plane share this
-        # origin — the proxy sends `/api/*` to one and everything else to the
-        # other — so the session cookie needs neither CORS nor
-        # `SameSite=None`, and no absolute host has to be known at build time.
-        NEXT_PUBLIC_AGENT_API_URL: ${AGENT_WEB_API_URL:-/api}
-        NEXT_PUBLIC_GATEWAY_AUTHORIZE_URL: ${AGENT_WEB_GATEWAY_AUTHORIZE_URL:-}
+        # Where this app is mounted. `/agents` serves it under the gateway's
+        # own hostname, which keeps the session cookie same-origin and takes
+        # CORS out of the deployment entirely. Empty for a deployment that
+        # owns its own hostname.
+        #
+        # **Required, not defaulted to empty**, and the three below with it.
+        # Empty is a real answer for one deployment shape and silently wrong
+        # for the other, and the wrongness does not show at start: the stack
+        # comes up healthy with the app mounted at the wrong path, calling the
+        # gateway instead of the control plane, and unable to sign anyone in.
+        # A `:?` makes the deployment say which shape it is.
+        NEXT_PUBLIC_BASE_PATH: ${AGENT_WEB_BASE_PATH:?the prefix this app is mounted under; empty string for a deployment that owns its own hostname}
+        # Relative on purpose when mounted under a prefix: a same-origin path
+        # means the cookie is sent without `SameSite=None`, and no absolute
+        # host has to be known at build time. Under a base path this is that
+        # base path plus `/api`, which the reverse proxy strips.
+        NEXT_PUBLIC_AGENT_API_URL: ${AGENT_WEB_API_URL:?control-plane base URL as the browser calls it, e.g. /agents/api}
+        NEXT_PUBLIC_GATEWAY_AUTHORIZE_URL: ${AGENT_WEB_GATEWAY_AUTHORIZE_URL:?the gateway's consent page; without it this deployment cannot sign anyone in}
         NEXT_PUBLIC_APP_NAME: ${AGENT_WEB_APP_NAME:-}
         NEXT_PUBLIC_BUILD_SHA: ${BUILD_SHA:-}
     restart: unless-stopped
