@@ -102,6 +102,38 @@ services:
         aliases:
           - ${AGENT_MCP_HOSTNAME:-agent-mcp}
 
+  # The third destination, and the one no sandbox may reach. The runner claims
+  # jobs, registers this host and heartbeats against the control plane's main
+  # listener — the same 8000 the MCP tunnel deliberately stopped pointing at.
+  #
+  # **Not on `agent-egress`, and that is the entire point.** Splitting the MCP
+  # relay onto 8001 was worth nothing if a second alias put 8000 back on the
+  # closed network under a different name. A sandbox reaches the gateway and
+  # the MCP relay; the machine that runs it reaches the control plane; those
+  # are three permissions and three tunnels.
+  agent-control-plane-tunnel:
+    build:
+      context: ../..
+      dockerfile: deploy/host/Dockerfile.agent-gateway-tunnel
+    restart: unless-stopped
+    environment:
+      TUNNEL_SSH_DESTINATION: ${AGENT_CONTROL_PLANE_TUNNEL_SSH_DESTINATION:?user@control-plane-host for the control-plane tunnel}
+      TUNNEL_SSH_PORT: ${AGENT_CONTROL_PLANE_TUNNEL_SSH_PORT:-22}
+      TUNNEL_REMOTE_HOST: ${AGENT_CONTROL_PLANE_TUNNEL_REMOTE_HOST:-127.0.0.1}
+      # 8000 — jobs, host registration, sessions and admin. The listener the
+      # MCP tunnel must never reach.
+      TUNNEL_REMOTE_PORT: ${AGENT_CONTROL_PLANE_TUNNEL_REMOTE_PORT:-8000}
+      TUNNEL_LISTEN_PORT: ${AGENT_CONTROL_PLANE_TUNNEL_LISTEN_PORT:-8000}
+    volumes:
+      # Its own key again. One key that opens both this and the MCP tunnel
+      # would let anything holding it reach 8000 from the sandbox's side.
+      - ${AGENT_CONTROL_PLANE_TUNNEL_SSH_KEY:?path to the control-plane tunnel's ssh private key}:/etc/agent-tunnel/id:ro
+      - ${AGENT_CONTROL_PLANE_TUNNEL_SSH_KNOWN_HOSTS:?path to a known_hosts for the control-plane host}:/etc/agent-tunnel/known_hosts:ro
+    networks:
+      hybridinference:
+        aliases:
+          - ${AGENT_CONTROL_PLANE_HOSTNAME:-agent-control-plane}
+
   agent-workspace-broker:
     build:
       context: ../..
@@ -149,12 +181,13 @@ services:
       # would not, so jobs would be claimed and then die at their first model
       # call.
       AGENT_GATEWAY_URL: http://${AGENT_GATEWAY_HOSTNAME:-agent-gateway}:${AGENT_TUNNEL_LISTEN_PORT:-8080}
-      # The control plane the runner claims against — a different service from
-      # the gateway above, reached through the same relay as MCP because they
-      # are the same host. Defaulted to the gateway's value so an unconfigured
-      # host behaves exactly as it did before the split rather than newly
-      # breaking.
-      AGENT_CONTROL_PLANE_URL: ${AGENT_CONTROL_PLANE_URL:-http://${AGENT_MCP_HOSTNAME:-agent-mcp}:${AGENT_MCP_TUNNEL_LISTEN_PORT:-8000}}
+      # The control plane the runner claims against — its own tunnel, not the
+      # MCP one. They were the same relay until MCP moved to the control
+      # plane's 8001 listener; the default was left pointing at it, which sent
+      # every claim, registration and heartbeat to a listener that serves only
+      # MCP. Jobs would simply never start, and the 404 names a path rather
+      # than a port, so it reads as a routing bug in the control plane.
+      AGENT_CONTROL_PLANE_URL: ${AGENT_CONTROL_PLANE_URL:-http://${AGENT_CONTROL_PLANE_HOSTNAME:-agent-control-plane}:${AGENT_CONTROL_PLANE_TUNNEL_LISTEN_PORT:-8000}}
       # The sandbox's second destination, handed down with its own token. A
       # separate name and port from the gateway's, so "may call models" and
       # "may call tools" stay two permissions rather than one.
