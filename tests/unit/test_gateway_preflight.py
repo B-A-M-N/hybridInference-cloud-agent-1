@@ -111,7 +111,11 @@ def test_html_from_the_jwks_path_is_not_read_as_a_key_problem() -> None:
 @pytest.mark.parametrize(
     ("status", "body", "expected", "phrase"),
     [
-        (200, "{}", check.OK, ""),
+        # A 200 has to carry the catalog. `{}` was a pass here until the
+        # success case got the same scepticism as the error envelope: any
+        # proxy or placeholder can answer 200 with JSON.
+        (200, json.dumps({"models": ["glm-5.1"]}), check.OK, ""),
+        (200, "{}", check.FAIL, "not the model catalog"),
         (403, _gateway_error("subject_unavailable"), check.OK, ""),
         (401, _gateway_error("unauthorized"), check.FAIL, "does not match"),
         (
@@ -232,3 +236,57 @@ def test_the_client_does_not_follow_redirects() -> None:
 
     source = inspect.getsource(check.run)
     assert "follow_redirects=False" in source
+
+
+# ---------------------------------------------------------------------------
+# A 200 is not by itself the catalog
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("judge", ["judge_routing", "judge_internal_api"])
+def test_a_200_that_is_not_the_catalog_fails(judge: str) -> None:
+    """The success case deserves the scepticism the error case already gets.
+
+    Both judgements read the error *envelope* rather than trusting a status,
+    for exactly the reason in this file's header — and then accepted any 200
+    without looking. A cache, a proxy, a placeholder app or a half-deployed
+    frontend route can all answer `200 {"ok": true}`, and this check exists to
+    gate a cutover on the gateway being there.
+    """
+    verdict = getattr(check, judge)(_answer(200, json.dumps({"ok": True})))
+    assert verdict.state is check.FAIL, verdict
+    assert "not the model catalog" in verdict.detail
+
+
+@pytest.mark.parametrize("judge", ["judge_routing", "judge_internal_api"])
+def test_a_200_carrying_models_passes(judge: str) -> None:
+    """`models` is the field the control plane actually reads.
+
+    `GatewayClient.visible_models` raises without it, so checking that rather
+    than a shape heuristic keeps the check and the caller agreeing about what
+    a usable answer is.
+    """
+    body = json.dumps({"models": ["glm-5.1", "qwen3.6-35b"], "aliases": {}})
+    verdict = getattr(check, judge)(_answer(200, body))
+    assert verdict.state is check.OK, verdict
+    assert "2 models" in verdict.detail
+
+
+@pytest.mark.parametrize("judge", ["judge_routing", "judge_internal_api"])
+def test_an_empty_catalog_passes_but_says_so(judge: str) -> None:
+    """A gateway serving nothing to the probe user is configured, not absent.
+
+    Failing here would conflate "this is not the gateway" with "this user can
+    reach no model" — two different problems with two different fixes, and the
+    second one is not what this check is for.
+    """
+    verdict = getattr(check, judge)(_answer(200, json.dumps({"models": []})))
+    assert verdict.state is check.OK, verdict
+    assert "no models" in verdict.detail
+
+
+@pytest.mark.parametrize("judge", ["judge_routing", "judge_internal_api"])
+def test_a_200_with_a_json_content_type_but_no_json_fails(judge: str) -> None:
+    """Content type is a claim; the body is the evidence."""
+    verdict = getattr(check, judge)(_answer(200, "not json at all"))
+    assert verdict.state is check.FAIL, verdict
