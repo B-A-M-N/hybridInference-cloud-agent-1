@@ -78,7 +78,13 @@ services:
       # for the same reason the gateway's is: the service need not be exposed
       # to the network at all.
       TUNNEL_REMOTE_HOST: ${AGENT_MCP_TUNNEL_REMOTE_HOST:-127.0.0.1}
-      TUNNEL_REMOTE_PORT: ${AGENT_MCP_TUNNEL_REMOTE_PORT:-8000}
+      # **8001, the MCP-only listener — never 8000.** A sandbox reaches the far
+      # end of this tunnel; 8000 serves jobs, sessions, host registration and
+      # admin as well as the relay. Those refuse an `mcp`-scoped token, so
+      # pointing here was not exploitable — it put the entire trusted control
+      # plane one authorization bug away from untrusted code, which is a
+      # reachability decision and should not rest on an authorization one.
+      TUNNEL_REMOTE_PORT: ${AGENT_MCP_TUNNEL_REMOTE_PORT:-8001}
       TUNNEL_LISTEN_PORT: ${AGENT_MCP_TUNNEL_LISTEN_PORT:-8000}
     volumes:
       # Its own key, restricted the same way. A key that can open both tunnels

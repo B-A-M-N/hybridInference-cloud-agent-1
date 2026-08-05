@@ -151,6 +151,47 @@ services:
         condition: service_healthy
     networks: [control-plane]
 
+  # The one surface a sandbox may reach. Same image, same database, same
+  # lifespan — a second listener rather than a second service.
+  #
+  # It exists because the sandbox's tunnel has to terminate *somewhere*, and
+  # terminating it on the control plane's own port put jobs, sessions, host
+  # registration and admin one authorization bug away from code nobody here
+  # wrote. Those routes all refuse an `mcp`-scoped token; this application
+  # simply does not contain them, which is the difference between a policy and
+  # a fact.
+  mcp-relay:
+    build:
+      context: ../..
+      dockerfile: deploy/control-plane/Dockerfile
+    command:
+      - uvicorn
+      - cloud_agent.app:create_mcp_app
+      - --factory
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8001"
+    restart: unless-stopped
+    ports:
+      # Loopback. The remote host's tunnel forwards to this, and nothing else
+      # should be able to.
+      - "${AGENT_MCP_RELAY_BIND:-127.0.0.1}:${AGENT_MCP_RELAY_PORT:-8001}:8001"
+    environment:
+      AGENT_DATABASE_URL: ${AGENT_DATABASE_URL:?Postgres DSN for the agent-owned database}
+      AGENT_CONTROL_TOKEN_SECRET: ${AGENT_CONTROL_TOKEN_SECRET:?32+ random bytes, unique per environment}
+      # The registry it proxies to, and the credentials in it.
+      AGENT_MCP_CONFIG: ${AGENT_MCP_CONFIG:-/etc/cloud-agent/mcp.yaml}
+      AGENT_LOG_LEVEL: ${AGENT_LOG_LEVEL:-INFO}
+    volumes:
+      - ${AGENT_MCP_CONFIG_FILE:-/dev/null}:/etc/cloud-agent/mcp.yaml:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    networks: [control-plane]
+
   # The browser-facing app. Built, not run from source: `basePath` and every
   # `NEXT_PUBLIC_*` value below are resolved when the bundle is compiled, so
   # they are build arguments and a change to any of them is a rebuild.

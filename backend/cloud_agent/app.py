@@ -559,3 +559,46 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     return app
+
+
+def create_mcp_app() -> FastAPI:
+    """Build a listener that serves the MCP relay and nothing else.
+
+    **A sandbox is the least trusted thing in this system, and the relay is the
+    one endpoint it is meant to reach.** Pointed at the main application, its
+    tunnel also reaches jobs, sessions, host registration and admin — every
+    route the control plane has. Those refuse an ``mcp``-scoped token, so
+    nothing was exploitable through them today; but the entire trusted control
+    plane sat one authorization bug away from code nobody in this repository
+    wrote, and that is a reachability decision rather than an authorization
+    one.
+
+    So the separation is structural. This application does not *contain* the
+    other routes, which is a stronger statement than any of them refusing:
+    there is no path prefix to get wrong in a proxy, no rule to leave off a new
+    router, and a route added to ``create_app`` tomorrow is not silently
+    exposed here.
+
+    Same process image, same database, same lifespan — it is a second
+    listener, not a second service. The cost is one more port; the alternative
+    was a path-restricted proxy, which is the same policy written where it can
+    be misconfigured and where nothing tests it.
+    """
+    configure_process_logging()
+
+    from cloud_agent.api import mcp_relay
+
+    app = FastAPI(
+        title="FreeInference Cloud Agent — MCP relay",
+        description="The only surface a sandbox may reach",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
+    app.include_router(mcp_relay.router)
+
+    @app.get("/healthz")
+    async def healthz() -> dict[str, str]:
+        """Liveness, so the tunnel's health check has something to ask."""
+        return {"status": "ok"}
+
+    return app

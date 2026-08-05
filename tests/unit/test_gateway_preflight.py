@@ -6,8 +6,12 @@ answered 404 with the frontend's HTML, and that was written up as evidence
 about the dispatch token. It was evidence the request never reached the
 backend.
 
-So the judgements are pure functions over `(status, body)` and tested here.
-The network part is a thin wrapper with nothing to decide.
+So the judgements are pure functions over one `Answer` — status, body,
+content type, and whether the origin redirected — and tested here. The network
+part is a thin wrapper with nothing to decide.
+
+Content type and redirect joined that tuple because status and body alone let
+a JSON 404 from any proxy or CDN count as proof that the backend answered.
 """
 
 from __future__ import annotations
@@ -31,6 +35,16 @@ def _gateway_error(kind: str) -> str:
     return json.dumps({"error": {"type": kind, "message": "..."}})
 
 
+def _answer(status: int, body: str, *, json_ct: bool = True, redirected: bool = False):
+    """One response, shaped the way the network wrapper produces them."""
+    return check.Answer(
+        status,
+        body,
+        "application/json" if json_ct else "text/html; charset=utf-8",
+        redirected,
+    )
+
+
 # ---------------------------------------------------------------------------
 # The distinction the first probe missed
 # ---------------------------------------------------------------------------
@@ -38,8 +52,8 @@ def _gateway_error(kind: str) -> str:
 
 def test_the_frontends_404_is_not_the_gateways() -> None:
     """Same status, opposite meanings, and only the body says which."""
-    frontend = check.judge_routing(404, HTML_404)
-    backend = check.judge_routing(404, _gateway_error("internal_api_not_configured"))
+    frontend = check.judge_routing(_answer(404, HTML_404, json_ct=False))
+    backend = check.judge_routing(_answer(404, _gateway_error("internal_api_not_configured")))
     assert frontend.state == check.FAIL
     assert "not forwarded" in frontend.remedy
     assert backend.state == check.OK
@@ -52,7 +66,7 @@ def test_an_unauthorized_json_refusal_proves_the_backend_answered() -> None:
     purpose — needing a credential to find out whether a path is routed would
     conflate two questions.
     """
-    assert check.judge_routing(401, _gateway_error("unauthorized")).state == check.OK
+    assert check.judge_routing(_answer(401, _gateway_error("unauthorized"))).state == check.OK
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +75,7 @@ def test_an_unauthorized_json_refusal_proves_the_backend_answered() -> None:
 
 
 def test_an_unconfigured_key_is_named_as_such() -> None:
-    verdict = check.judge_jwks(404, _gateway_error("identity_not_configured"))
+    verdict = check.judge_jwks(_answer(404, _gateway_error("identity_not_configured")))
     assert verdict.state == check.FAIL
     assert "IDENTITY_JWT_PRIVATE_KEY" in verdict.remedy
 
@@ -73,19 +87,19 @@ def test_a_broken_key_is_not_reported_as_a_missing_one() -> None:
     PEM, and telling an operator to set a variable they already set is how an
     afternoon goes.
     """
-    verdict = check.judge_jwks(500, "")
+    verdict = check.judge_jwks(_answer(500, ""))
     assert verdict.state == check.FAIL
     assert "cannot be used" in verdict.detail
 
 
 def test_a_published_key_passes_and_an_empty_set_does_not() -> None:
-    assert check.judge_jwks(200, json.dumps({"keys": [{"kid": "a"}]})).state == check.OK
-    assert check.judge_jwks(200, json.dumps({"keys": []})).state == check.FAIL
+    assert check.judge_jwks(_answer(200, json.dumps({"keys": [{"kid": "a"}]}))).state == check.OK
+    assert check.judge_jwks(_answer(200, json.dumps({"keys": []}))).state == check.FAIL
 
 
 def test_html_from_the_jwks_path_is_not_read_as_a_key_problem() -> None:
     """Wrong origin entirely — say that rather than blame the key."""
-    verdict = check.judge_jwks(404, HTML_404)
+    verdict = check.judge_jwks(_answer(404, HTML_404, json_ct=False))
     assert "not serving the gateway's API" in verdict.remedy
 
 
@@ -110,7 +124,7 @@ def test_html_from_the_jwks_path_is_not_read_as_a_key_problem() -> None:
 )
 def test_authorization_outcomes(status: int, body: str, expected: str, phrase: str) -> None:
     """403 is a pass: the token was accepted and the probe user is not real."""
-    verdict = check.judge_internal_api(status, body)
+    verdict = check.judge_internal_api(_answer(status, body))
     assert verdict.state == expected
     assert phrase in (verdict.detail + verdict.remedy)
 
@@ -131,8 +145,20 @@ def test_a_failure_exits_non_zero(monkeypatch, capsys) -> None:
     assert "not ready" in capsys.readouterr().out
 
 
-def test_skips_alone_do_not_fail(monkeypatch, capsys) -> None:
-    """An unset token here is a gap in the check, not a fault in the gateway."""
+def test_a_skipped_check_does_not_open_the_gate(monkeypatch, capsys) -> None:
+    """A check that could not run is not a check that passed.
+
+    This asserted the opposite, on the reasoning that an unset token is a gap
+    in the *check* rather than a fault in the gateway. True, and beside the
+    point for something whose exit code gates a cutover: the credential most
+    likely to be missing is the one that makes the authorized checks runnable
+    at all, so exiting 0 meant the gate opened widest exactly when least had
+    been verified. The module docstring already promised "0 only when every
+    check passes".
+
+    Distinct from a failure — 3, not 1 — so a caller can tell "the gateway is
+    wrong" from "you did not give me enough to look".
+    """
     monkeypatch.setattr(
         check,
         "run",
@@ -141,8 +167,12 @@ def test_skips_alone_do_not_fail(monkeypatch, capsys) -> None:
             ("b", check.Verdict(check.SKIP, "d", "r")),
         ],
     )
-    assert check.main(["https://gw.test"]) == 0
-    assert "were skipped" in capsys.readouterr().out
+
+    assert check.main(["https://gw.test"]) == 3
+    output = capsys.readouterr().out
+    assert "could not run" in output
+    # Named, so the operator knows which credential to go and set.
+    assert "- b" in output
 
 
 def test_the_token_is_never_taken_from_argv(monkeypatch) -> None:
@@ -158,3 +188,47 @@ def test_the_token_is_never_taken_from_argv(monkeypatch) -> None:
     assert seen["token"] == "from-the-environment"
     # Two arguments is a usage error, not a second way to pass the token.
     assert check.main(["https://gw.test", "a-token"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# What "the backend answered" is allowed to mean
+# ---------------------------------------------------------------------------
+
+
+def test_json_alone_is_not_proof_the_backend_answered() -> None:
+    """Any proxy or CDN can produce a JSON 404.
+
+    The check accepted `status in (200, 401, 403, 404)` with a non-HTML body,
+    which is a description of almost every error page on the internet. Only
+    the gateway's own error envelope counts.
+    """
+    generic = _answer(404, json.dumps({"error": "not found"}))
+    assert check.judge_routing(generic).state == check.FAIL
+
+    ours = _answer(404, _gateway_error("internal_api_not_configured"))
+    assert check.judge_routing(ours).state == check.OK
+
+
+def test_a_json_body_served_as_html_is_refused() -> None:
+    """The content type is part of the answer, not decoration."""
+    mislabelled = check.Answer(401, _gateway_error("unauthorized"), "text/html")
+    assert check.judge_routing(mislabelled).state == check.FAIL
+
+
+def test_a_redirect_is_never_a_pass() -> None:
+    """A check that follows a bounce has stopped asking about this origin.
+
+    A gateway that sends `/internal/*` to a login page is precisely the
+    misconfiguration being looked for; following the redirect and judging
+    whatever answers there would report it as healthy.
+    """
+    bounced = check.Answer(302, "", "text/html", redirected=True)
+    assert check.judge_routing(bounced).state == check.FAIL
+
+
+def test_the_client_does_not_follow_redirects() -> None:
+    """The judgement above only means anything if the wrapper agrees."""
+    import inspect
+
+    source = inspect.getsource(check.run)
+    assert "follow_redirects=False" in source
