@@ -66,7 +66,11 @@ class _FakeGrants:
     """The gateway's grant contract. The claim asks for one now (E9)."""
 
     async def mint(self, **kwargs: Any) -> dict[str, Any]:
-        return {"grant_id": f"agr_{kwargs['attempt_id']}", "token": "agr.token"}
+        return {
+            "grant_id": f"agr_{kwargs['attempt_id']}",
+            "token": "agr.token",
+            "allowed_models": list(kwargs.get("models") or []),
+        }
 
     async def renew(self, grant_id: str) -> dict[str, Any]:
         return {"grant_id": grant_id}

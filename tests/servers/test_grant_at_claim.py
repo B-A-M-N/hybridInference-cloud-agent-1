@@ -106,9 +106,20 @@ class _ClaimStore:
 class _Grants:
     """The grant client, answering or refusing on demand."""
 
-    def __init__(self, *, fail: bool = False, grant_id: str | None = "agr_7") -> None:
+    def __init__(
+        self,
+        *,
+        fail: bool = False,
+        grant_id: str | None = "agr_7",
+        granted_models: list[str] | None = None,
+    ) -> None:
         self.fail = fail
         self.grant_id = grant_id
+        #: What the gateway *actually* granted, when that differs from what was
+        #: asked. ``None`` means "everything requested", which is the ordinary
+        #: case; a narrower list models the user's role changing while the job
+        #: sat in the queue, which is the whole reason the claim checks.
+        self.granted_models = granted_models
         self.calls: list[dict[str, Any]] = []
         self.revoked: list[str] = []
 
@@ -116,7 +127,16 @@ class _Grants:
         self.calls.append(kwargs)
         if self.fail:
             raise GatewayError("gateway answered 503 for /internal/agent-grants")
-        minted: dict[str, Any] = {"token": "agr.header.signature"}
+        minted: dict[str, Any] = {
+            "token": "agr.header.signature",
+            # Default: the gateway granted what was asked. `granted_models`
+            # overrides it, which is how a role change mid-queue is modelled.
+            "allowed_models": (
+                list(kwargs.get("models") or [])
+                if self.granted_models is None
+                else list(self.granted_models)
+            ),
+        }
         if self.grant_id is not None:
             minted["grant_id"] = self.grant_id
         return minted
@@ -255,3 +275,45 @@ async def test_an_empty_queue_never_asks_for_a_grant(claim):
     assert response.status_code == 200
     assert response.json() is None
     assert grants.calls == []
+
+
+async def test_a_grant_that_omits_the_job_model_is_refused(claim):
+    """Asked for is not granted.
+
+    The gateway clamps the requested models against the role the user has
+    *now*, and a job can sit in the queue long enough for a downgrade or for a
+    model to leave that tier. The clamp is not an error there — the response
+    reports the effective list and the request was satisfiable, just not on
+    the caller's terms.
+
+    Taken at face value, that produces a sandbox which starts, spends an
+    attempt, and fails on its first inference call with an authorization error
+    the user cannot act on. The claim has the effective list in its hand; the
+    only question was whether it read it.
+    """
+    store, grants = _ClaimStore(), _Grants(granted_models=["some-other-model"])
+
+    response = await claim(store, grants)
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["error"]["type"] == "model_not_granted"
+    # Withdrawn, not left live: nothing will ever renew a grant whose claim
+    # failed, but its TTL would otherwise keep it usable for minutes.
+    assert grants.revoked == ["agr_7"]
+    assert store.released == [(_JOB, _ATTEMPT)]
+
+
+async def test_a_grant_with_no_scope_at_all_is_refused(claim):
+    """Absence is refusal.
+
+    The contract says the gateway returns this field. If it does not, the
+    scope cannot be verified — and "cannot verify" is not a reason to hand a
+    capability to a sandbox running someone else's repository.
+    """
+    store, grants = _ClaimStore(), _Grants(granted_models=[])
+
+    response = await claim(store, grants)
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["error"]["type"] == "model_not_granted"
+    assert grants.revoked == ["agr_7"]

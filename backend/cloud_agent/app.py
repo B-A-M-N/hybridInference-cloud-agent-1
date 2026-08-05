@@ -104,6 +104,14 @@ GRANT_RENEWAL_GIVE_UP_AFTER = 3
 #: here so the truncation warning cannot drift from the query's limit.
 GRANT_RENEWAL_PAGE = 200
 
+#: Renewals in flight at once. The pass has to finish well inside a grant's
+#: lifetime, and serially it cost the sum of every round trip — so at the page
+#: cap a merely slow gateway let the last grants expire waiting their turn.
+#: Bounded rather than unlimited: a full page arriving at once, every interval,
+#: is a burst the gateway has to absorb, and fixing our latency by overwhelming
+#: a dependency moves the problem instead of solving it.
+GRANT_RENEWAL_CONCURRENCY = 16
+
 
 async def _reconcile_settled_terminals(store: AgentJobStore) -> None:
     """Replay durable settled-terminal recovery markers after restarts.
@@ -237,7 +245,8 @@ async def _renew_live_grants(
             "agent_grant_renewal_truncated",
             extra={"event": "agent_grant_renewal_truncated", "count": len(renewable)},
         )
-    for row in renewable:
+
+    async def _renew_one(row: dict[str, Any]) -> None:
         grant_id = row["grant_id"]
         seen.add(grant_id)
         try:
@@ -276,11 +285,36 @@ async def _renew_live_grants(
                     logger.warning("Abandoning an unrenewable attempt failed", exc_info=True)
                 else:
                     seen.discard(grant_id)
-            continue
+            return
         # Consecutive, not cumulative: one refused pass followed by a good one
         # is a gateway blip, and must not accumulate toward a give-up over the
         # hours a long job runs.
         failures.pop(grant_id, None)
+
+    # **Concurrently, because a pass must finish inside a grant's lifetime.**
+    # Serially, one pass cost the sum of every renewal's round trip: at the
+    # page cap, with a gateway answering slowly but not failing, the last
+    # grants in the list expired waiting their turn — and the symptom was a
+    # sandbox losing authorization mid-run, which points nowhere near here.
+    # Ordering by soonest expiry made the starvation rotate; it did not make
+    # the pass fit.
+    #
+    # Bounded, though. Two hundred simultaneous renewals is a burst the
+    # gateway would have to absorb every interval, and a control plane that
+    # fixes its own latency by overwhelming its dependency has moved the
+    # problem rather than solved it.
+    #
+    # Each coroutine touches only its own grant's entry in `failures` and its
+    # own id in `seen`, so the shared state needs no lock — the rows come from
+    # one query and a grant id appears once.
+    limit = asyncio.Semaphore(GRANT_RENEWAL_CONCURRENCY)
+
+    async def _renew_bounded(row: dict[str, Any]) -> None:
+        async with limit:
+            await _renew_one(row)
+
+    await asyncio.gather(*(_renew_bounded(row) for row in renewable))
+
     for grant_id in [known for known in failures if known not in seen]:
         del failures[grant_id]
 
