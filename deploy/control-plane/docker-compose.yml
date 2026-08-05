@@ -151,6 +151,36 @@ services:
         condition: service_healthy
     networks: [control-plane]
 
+  # The browser-facing app. Built, not run from source: `basePath` and every
+  # `NEXT_PUBLIC_*` value below are resolved when the bundle is compiled, so
+  # they are build arguments and a change to any of them is a rebuild.
+  web:
+    build:
+      context: ../..
+      dockerfile: deploy/control-plane/Dockerfile.web
+      args:
+        # Where this app is mounted. `/agents` serves it under the gateway's
+        # own hostname, which keeps the session cookie same-origin and takes
+        # CORS out of the deployment entirely. Empty for a deployment that
+        # owns its own hostname.
+        NEXT_PUBLIC_BASE_PATH: ${AGENT_WEB_BASE_PATH:-}
+        # Relative on purpose when mounted under a prefix: a same-origin path
+        # means the cookie is sent without `SameSite=None`, and no absolute
+        # host has to be known at build time.
+        NEXT_PUBLIC_AGENT_API_URL: ${AGENT_WEB_API_URL:-}
+        NEXT_PUBLIC_GATEWAY_AUTHORIZE_URL: ${AGENT_WEB_GATEWAY_AUTHORIZE_URL:-}
+        NEXT_PUBLIC_APP_NAME: ${AGENT_WEB_APP_NAME:-}
+        NEXT_PUBLIC_BUILD_SHA: ${BUILD_SHA:-}
+    restart: unless-stopped
+    ports:
+      # Loopback, like the API: the reverse proxy in front of the host is what
+      # terminates TLS and decides who may reach this.
+      - "${AGENT_WEB_BIND:-127.0.0.1}:${AGENT_WEB_PORT:-3002}:3000"
+    depends_on:
+      control-plane:
+        condition: service_started
+    networks: [control-plane]
+
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped

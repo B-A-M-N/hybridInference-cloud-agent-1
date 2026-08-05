@@ -1,0 +1,67 @@
+# The cloud agent's web app.
+#
+# Next.js in `standalone` output mode, which emits a self-contained server
+# under `.next/standalone` — so the runtime image carries neither the source
+# nor the dev dependencies.
+#
+# **Every value the browser needs is baked in here, not injected at run time.**
+# `NEXT_PUBLIC_*` variables are substituted into the bundle during
+# `next build`, and `basePath` is resolved by `next.config.js` at the same
+# moment. Setting any of them on the running container does nothing at all,
+# which is a quiet enough failure to be worth stating twice: changing where
+# this app is mounted, or which gateway it signs in against, means rebuilding
+# the image.
+
+FROM node:20-alpine AS builder
+WORKDIR /app
+
+# Dependencies first, so a source-only change does not reinstall them.
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+
+COPY web/ ./
+
+# Declared here because Docker only passes a build argument to the stage that
+# names it. Empty defaults so a plain `docker build` still produces a working
+# image — one that owns its hostname and signs nobody in, which is the honest
+# result of configuring nothing.
+ARG NEXT_PUBLIC_BASE_PATH=
+ARG NEXT_PUBLIC_AGENT_API_URL=
+ARG NEXT_PUBLIC_GATEWAY_AUTHORIZE_URL=
+ARG NEXT_PUBLIC_APP_NAME=
+ARG NEXT_PUBLIC_BUILD_SHA=
+ENV NEXT_PUBLIC_BASE_PATH=$NEXT_PUBLIC_BASE_PATH \
+    NEXT_PUBLIC_AGENT_API_URL=$NEXT_PUBLIC_AGENT_API_URL \
+    NEXT_PUBLIC_GATEWAY_AUTHORIZE_URL=$NEXT_PUBLIC_GATEWAY_AUTHORIZE_URL \
+    NEXT_PUBLIC_APP_NAME=$NEXT_PUBLIC_APP_NAME \
+    NEXT_PUBLIC_BUILD_SHA=$NEXT_PUBLIC_BUILD_SHA \
+    NEXT_TELEMETRY_DISABLED=1
+
+RUN npm run build
+
+FROM node:20-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0
+
+# Not root. This process is reachable from a reverse proxy that is reachable
+# from the internet.
+RUN addgroup -g 1001 -S nodejs && adduser -u 1001 -S nextjs -G nodejs
+
+# `standalone` carries its own minimal node_modules and server.js. Static
+# assets are emitted outside it and have to be copied alongside, or every
+# stylesheet and script 404s while the HTML renders fine — a page that loads
+# unstyled and inert.
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+
+# No `public/` copy. This app has no such directory, and `COPY` of a missing
+# path fails the build rather than skipping it — the usual boilerplate line
+# would make this Dockerfile unbuildable from the first `docker build`. Add it
+# back the day something is put there.
+
+USER nextjs
+EXPOSE 3000
+CMD ["node", "server.js"]

@@ -11,11 +11,13 @@ import '@testing-library/jest-dom/vitest';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('@/config/env', () => ({
-  agentApiBase: '',
+// Spread the real module and override only what this test decides. A factory
+// that lists exports goes stale the moment one is added — `basePath` arrived
+// and six tests failed here with a rendering error that named none of this.
+vi.mock('@/config/env', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/config/env')>()),
   gatewayAuthorizeUrl: 'https://gateway.example.org/authorize',
   gatewayTokenUrl: () => 'https://gateway.example.org/v1/identity/token',
-  OAUTH_CLIENT_ID: 'cloud-agent',
   config: { apiBase: '', appName: 'Cloud Agent' },
 }));
 
