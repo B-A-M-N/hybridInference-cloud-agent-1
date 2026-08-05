@@ -190,3 +190,36 @@ def test_the_dropped_assertions_stay_dropped_deliberately(compose: dict) -> None
     those assertions need rewriting rather than staying dropped.
     """
     assert "backend" not in compose["services"]
+
+
+# ---------------------------------------------------------------------------
+# The egress proxy's logs
+# ---------------------------------------------------------------------------
+
+
+def test_the_egress_proxy_hands_its_log_pipes_to_the_user_it_becomes() -> None:
+    """A cheap guard in front of an expensive lesson.
+
+    Squid opens its logs after dropping to `cache_effective_user`, and a
+    container's `/dev/stdout` is a `prw-------` pipe owned by root — so the
+    open fails and squid treats it as fatal. It exited on every start, 2814
+    times on staging, and took every agent job with it: the runner's isolation
+    preflight refuses to start without a reachable proxy.
+
+    **The real check is `egress-proxy-starts` in docker-build.yml**, which
+    starts the image, because nothing textual catches this — the broken config
+    parsed, and so did the first attempted fix. This only stops the `chown`
+    disappearing from the CMD in an edit that never runs CI.
+    """
+    dockerfile = (REPO / "deploy/host/Dockerfile.agent-egress-proxy").read_text()
+    config = (REPO / "host/cloud_agent_host/egress_proxy.py").read_text()
+
+    logs_to_pipes = "stdio:/dev/stdout" in config or "stdio:/dev/stderr" in config
+    if not logs_to_pipes:
+        pytest.skip("the proxy no longer logs to the container's pipes")
+
+    assert "chown proxy /dev/stdout /dev/stderr" in dockerfile, (
+        "squid drops to `proxy` before opening these pipes, and they are "
+        "root-owned — without the chown it exits on every start and the "
+        "runner's preflight takes the whole host down with it"
+    )
