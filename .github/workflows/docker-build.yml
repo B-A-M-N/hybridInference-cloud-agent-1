@@ -102,6 +102,12 @@ jobs:
           AGENT_MCP_TUNNEL_SSH_DESTINATION=ci@control-plane.invalid
           AGENT_MCP_TUNNEL_SSH_KEY=/dev/null
           AGENT_MCP_TUNNEL_SSH_KNOWN_HOSTS=/dev/null
+          # The third tunnel: the runner's own path to the control plane's main
+          # listener. Its own key, like the other two — one key opening both
+          # this and the MCP tunnel would make the 8000/8001 split cosmetic.
+          AGENT_CONTROL_PLANE_TUNNEL_SSH_DESTINATION=ci@control-plane.invalid
+          AGENT_CONTROL_PLANE_TUNNEL_SSH_KEY=/dev/null
+          AGENT_CONTROL_PLANE_TUNNEL_SSH_KNOWN_HOSTS=/dev/null
           ENVFILE
           docker compose \
             -f deploy/host/docker-compose.agent-remote-runner.yml \

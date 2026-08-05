@@ -11,6 +11,7 @@ real script.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,100 @@ def _mounts(service: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 # The network boundary
 # ---------------------------------------------------------------------------
+
+_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::([-?])([^{}]*))?\}")
+
+
+def _defaults(value: str) -> str:
+    """Expand `${VAR:-default}` taking every default — the unconfigured host.
+
+    Innermost-first and repeated, because these nest: a URL's default is built
+    from two more defaulted variables. A required `${VAR:?...}` has no value to
+    take, so it becomes a marker no assertion here will mistake for an address.
+    """
+    seen = set()
+    while (
+        expanded := _VAR.sub(lambda m: m.group(3) or f"<required:{m.group(1)}>", value)
+    ) != value:
+        assert value not in seen, f"cycle expanding {value}"
+        seen.add(value)
+        value = expanded
+    return value
+
+
+def _tunnels(compose: dict) -> dict[str, dict]:
+    """Every tunnel by the `host:port` a consumer would dial it at.
+
+    Keyed by address rather than by service name because that is the join a
+    consumer actually makes: it is handed a URL, and what answers is whichever
+    tunnel claimed that alias and that listening port.
+    """
+    out = {}
+    for name, svc in compose["services"].items():
+        env = svc.get("environment") or {}
+        if "TUNNEL_REMOTE_PORT" not in env:
+            continue
+        listen = _defaults(str(env["TUNNEL_LISTEN_PORT"]))
+        networks = svc.get("networks") or {}
+        for network, cfg in networks.items():
+            for alias in (cfg or {}).get("aliases") or []:
+                out[f"{_defaults(alias)}:{listen}"] = {
+                    "service": name,
+                    "remote_port": _defaults(str(env["TUNNEL_REMOTE_PORT"])),
+                    "network": network,
+                }
+    return out
+
+
+@pytest.mark.parametrize(
+    ("variable", "remote_port", "why"),
+    [
+        ("AGENT_CONTROL_PLANE_URL", "8000", "claim, register and heartbeat"),
+        ("AGENT_SANDBOX_MCP_URL", "8001", "the MCP relay, and nothing else"),
+        ("AGENT_GATEWAY_URL", "8080", "model calls"),
+    ],
+)
+def test_each_address_reaches_the_listener_it_names(
+    compose: dict, variable: str, remote_port: str, why: str
+) -> None:
+    """An unconfigured host must dial the right far end, not merely a live one.
+
+    This is the assertion the MCP split needed and did not have. Moving the
+    relay to the control plane's 8001 listener left `AGENT_CONTROL_PLANE_URL`
+    defaulted at the MCP tunnel, so every claim, registration and heartbeat
+    arrived at a listener that serves only MCP. Nothing failed to start: jobs
+    were simply never taken, and the 404 named a path rather than a port.
+
+    Resolving the *defaults* is the point — a deployment that sets every
+    variable by hand would have papered over it.
+    """
+    env = compose["services"]["agent-runner"]["environment"]
+    address = _defaults(env[variable]).removeprefix("http://").removeprefix("https://")
+    tunnel = _tunnels(compose).get(address)
+    assert tunnel is not None, f"{variable} defaults to {address}, which no tunnel answers"
+    assert tunnel["remote_port"] == remote_port, (
+        f"{variable} reaches {tunnel['service']} → port {tunnel['remote_port']}, "
+        f"but it is for {why} on {remote_port}"
+    )
+
+
+def test_nothing_on_the_closed_network_reaches_the_control_plane(compose: dict) -> None:
+    """What splitting the MCP listener onto 8001 actually bought.
+
+    The sandbox network exists so untrusted code reaches the gateway and the
+    MCP relay and nothing else. A second tunnel aliased onto it whose far end
+    is the control plane's 8000 would hand back everything the split removed —
+    jobs are created and cancelled there — without changing a line of the code
+    that reasons about it.
+    """
+    exposed = {
+        t["service"]: t["remote_port"]
+        for t in _tunnels(compose).values()
+        if t["network"] == "agent-egress"
+    }
+    assert "8000" not in exposed.values(), (
+        f"the control plane's main listener is on the sandbox network: {exposed}"
+    )
 
 
 # ---------------------------------------------------------------------------

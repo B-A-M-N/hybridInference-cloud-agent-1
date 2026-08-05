@@ -1024,8 +1024,13 @@ def test_remote_compose_starts_no_gateway(remote_compose: dict):
     starts one there — on a box meant only to run jobs.
     """
     assert set(remote_compose["services"]) == {
+        # Three tunnels, one per destination: the gateway for model calls, the
+        # MCP relay for tools, the control plane for claims. Splitting them is
+        # what keeps "may call models" and "may create jobs" separate
+        # permissions; see `test_deploy_security.py` for which reaches what.
         "agent-gateway-tunnel",
         "agent-mcp-tunnel",
+        "agent-control-plane-tunnel",
         "agent-workspace-broker",
         "agent-runner",
     }

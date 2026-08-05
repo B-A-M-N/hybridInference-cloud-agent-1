@@ -147,7 +147,7 @@ def judge_routing(answer: Answer) -> Verdict:
     if kind in ("unauthorized", "internal_api_not_configured"):
         return Verdict(OK, f"the backend answered ({answer.status}, {kind})")
     if answer.status == 200:
-        return Verdict(OK, "the catalog answered")
+        return _judge_catalog_body(answer)
     return Verdict(
         FAIL,
         f"{answer.status}, JSON, but not the gateway's error envelope",
@@ -155,11 +155,48 @@ def judge_routing(answer: Answer) -> Verdict:
     )
 
 
+def _judge_catalog_body(answer: Answer) -> Verdict:
+    """Whether a 200 is the model catalog, or merely a 200.
+
+    The same reasoning the error envelope already gets, applied to the success
+    case: any proxy, cache or placeholder can answer 200 with JSON, and reading
+    only the status is how this check first passed against the frontend. What
+    the control plane needs from this route is a `models` list
+    (`GatewayClient.visible_models` raises without one), so that is what is
+    checked — the field the caller actually reads, not a heuristic about the
+    body looking about right.
+
+    An empty list is a pass with a warning rather than a failure: a gateway
+    that serves no model to the probe user is correctly configured and
+    unhelpful, which is a different problem from one that is not the gateway.
+    """
+    try:
+        body = json.loads(answer.body)
+    except ValueError:
+        return Verdict(FAIL, "200, but the body is not JSON", answer.body[:120])
+    if not isinstance(body, dict) or not isinstance(body.get("models"), list):
+        return Verdict(
+            FAIL,
+            "200, JSON, but not the model catalog",
+            "no `models` list — something is answering this path that is not "
+            f"the gateway: {answer.body[:120]}",
+        )
+    count = len(body["models"])
+    if count == 0:
+        return Verdict(
+            OK,
+            "the catalog answered, with no models for the probe user",
+            "the route is right; whether the user can reach a model is a "
+            "separate question this check does not settle",
+        )
+    return Verdict(OK, f"the catalog answered ({count} models)")
+
+
 def judge_internal_api(answer: Answer) -> Verdict:
     """Whether the dispatch token this environment holds is the gateway's."""
     kind = _error_type(answer.body)
     if answer.status == 200:
-        return Verdict(OK, "the catalog answered")
+        return _judge_catalog_body(answer)
     if kind == "internal_api_not_configured":
         return Verdict(
             FAIL,

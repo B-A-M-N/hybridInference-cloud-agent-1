@@ -104,6 +104,8 @@ gateway serves models and answers nothing about MCP.
 | `AGENT_SANDBOX_MCP_URL` | **NEW** | The MCP relay **as a sandbox reaches it** — a host-local relay alias, not this service's own bind address, which is why it is configured rather than derived. Handed to the runner at claim time and passed into the sandbox beside `AGENT_GATEWAY_URL`. Unset means jobs get no MCP, and a runtime asked for servers anyway refuses rather than resolving them against the inference gateway. |
 | `AGENT_MCP_TUNNEL_*` | **NEW** | The remote-runner host's second relay: `SSH_DESTINATION`, `SSH_KEY`, `SSH_KNOWN_HOSTS`, and the optional `SSH_PORT` / `REMOTE_HOST` / `REMOTE_PORT` / `LISTEN_PORT`. Its own key, restricted the same way as the gateway tunnel's — one key that opens both would make the two-destination split cosmetic. |
 | `AGENT_MCP_HOSTNAME` | **NEW** | The relay's alias on both container networks. Defaults to `agent-mcp`. |
+| `AGENT_CONTROL_PLANE_TUNNEL_*` | **NEW** | The remote-runner host's **third** relay, and the only one the sandbox cannot reach: `SSH_DESTINATION`, `SSH_KEY`, `SSH_KNOWN_HOSTS`, plus the optional `SSH_PORT` / `REMOTE_HOST` / `REMOTE_PORT` / `LISTEN_PORT`. Its far end is the control plane's main listener (8000) — jobs, host registration, sessions, admin — which is why it is aliased on the runner's network only. Its own key again: a key that also opened the MCP tunnel would put 8000 one compromise away from the closed network. |
+| `AGENT_CONTROL_PLANE_HOSTNAME` | **NEW** | That tunnel's alias, on the runner network only. Defaults to `agent-control-plane`. |
 | `AGENT_MCP_TOKEN` | **NEW** | **Not operator-set — listed so nobody provisions it.** The name the generated sandbox runtime config *references* (`${AGENT_MCP_TOKEN}`) for the per-attempt relay credential the runner injects at launch. A value put here by hand would be a static tool credential shared by every job, which is the thing the per-attempt token exists to avoid. |
 
 ### Scheduling
@@ -133,7 +135,7 @@ neither belongs in any unit file, `.env`, or image.
 | `AGENT_WORKSPACE_BROKER_URL` | existing | Single-host global. Phase G resolves this per host from the database; the env var stays as the fallback when an attempt has no `host_id`. |
 | `AGENT_WORKSPACE_BROKER_TOKEN` | existing | **Still global after phase G.** Host rows carry a broker *URL*, not a credential, so every broker in the pool authenticates this one value — a compromised host's broker token opens every other host's broker. Making it per-host is secret distribution (issue at enrollment, rotate, deliver), not routing, and is deliberately not done here. |
 | `AGENT_BROKER_URL_ALLOWED_HOSTS` | **NEW** | Comma-separated hostnames a registering machine may name as its broker. **Read by the control plane, not the host** — it is listed here because it is the other half of the token above: a host proposes its own broker address and is then sent the pool's shared credential, so an unfiltered address is that credential handed to anything a compromised or mistyped registration names. Names, not patterns; a pool's machines are few and known. Unset means any host, which is what this did before the check — opt-in so an upgrade does not break an existing pool. |
-| `AGENT_CONTROL_PLANE_URL` | **NEW** | Where this runner claims work. Split from `AGENT_GATEWAY_URL` because the two are the same origin only when control plane and gateway are co-located; a remote runner reaches the control plane directly and the gateway through a tunnel alias. Unset falls back to `AGENT_GATEWAY_URL`, which is the co-located shape and what every existing runner already sets. |
+| `AGENT_CONTROL_PLANE_URL` | **NEW** | Where this runner claims work, registers this host and heartbeats. Split from `AGENT_GATEWAY_URL` because the two are the same origin only when control plane and gateway are co-located; a remote runner reaches each through its own tunnel alias. On the standalone stack it defaults to the control-plane tunnel (`AGENT_CONTROL_PLANE_HOSTNAME`), **not** the MCP one — those were briefly the same relay, and pointing here at MCP sends every claim to a listener that serves only MCP, so jobs are never taken and the 404 names a path rather than a port. |
 | `AGENT_WORKER_ID` | existing | |
 | `AGENT_WORKDIR_ROOT` | existing | Workspace root. Reused as-is at cutover (H2) so in-flight checkouts survive. |
 | `AGENT_SNAPSHOT_ROOT` | existing | |
@@ -181,8 +183,8 @@ readable by anyone who loads the page.
 
 | Variable | New? | Notes |
 |---|---|---|
-| `NEXT_PUBLIC_BASE_PATH` | **NEW** | Prefix the app is mounted under. `/agents` serves it inside the gateway's own hostname — same origin, so the session cookie needs no CORS and no DNS record is involved, and a rollback is a reverse-proxy edit rather than a DNS change waiting out a TTL. Empty for a deployment that owns its hostname. **Whatever this is, `IDENTITY_ALLOWED_REDIRECTS` on the gateway must contain `<origin><base path>/callback` verbatim** — that allowlist is matched as an exact string, and Next does not prefix a URL the code concatenates, so `callbackUri()` applies this by hand. Set as the compose build argument `AGENT_WEB_BASE_PATH`. |
-| `NEXT_PUBLIC_AGENT_API_URL` | **NEW** | Control plane base URL. Empty means same-origin, which is the DR4 shape (one host, API under `/api`). Under a base path, the same-origin value is a relative prefix — `/agents/api` — which the reverse proxy strips before forwarding. A cross-origin value additionally needs CORS-with-credentials on the control plane, because the session is a cookie. |
+| `NEXT_PUBLIC_BASE_PATH` | **NEW** | Prefix the app is mounted under. **Empty in the deployed shape**: this stack takes its own origin — the gateway's hostname on its own port (8443) — and serves from the root of it. A prefix on the gateway's own port was the earlier arrangement and is not safe, because an origin is scheme + host + port: it left this app, whose normal input is model output and terminal contents, able to read the gateway's `sessionStorage` access token. **Whatever this is, `IDENTITY_ALLOWED_REDIRECTS` on the gateway must contain `<origin><base path>/callback` verbatim** — that allowlist is matched as an exact string, and Next does not prefix a URL the code concatenates, so `callbackUri()` applies this by hand. For staging that string is `https://staging.freeinference.org:8443/callback`, port included. Set as the compose build argument `AGENT_WEB_BASE_PATH`. |
+| `NEXT_PUBLIC_AGENT_API_URL` | **NEW** | Control plane base URL. Defaults to the relative `/api`, which the reverse proxy strips before forwarding: the web app and the control plane share this origin, so the session cookie needs neither CORS nor `SameSite=None`. A cross-origin value additionally needs CORS-with-credentials on the control plane, because the session is a cookie. |
 | `NEXT_PUBLIC_GATEWAY_AUTHORIZE_URL` | **NEW** | `${GATEWAY_BASE_URL}/authorize` (task C4). Unset means this deployment cannot sign anyone in, and says so instead of redirecting to a half-built URL. The gateway's token endpoint is **derived** from this URL's origin rather than configured separately — one variable, nothing to get out of step. |
 | `NEXT_PUBLIC_APP_NAME` | **NEW** | Product name in the header and the document title. Defaults to `FreeInference Cloud Agent`. |
 | `NEXT_PUBLIC_ORG_NAME` | **NEW** | Optional organisation name beside the product name. Empty hides it. |
@@ -215,10 +217,22 @@ one place to be read from end to end.
 
 Recorded here as *what has to be decided*, not as anyone's actual answer.
 
-- **Domains** (DR4): one host for the web app and the control-plane API, the API
-  under `/api` — e.g. `agents.example.org` and a staging sibling. The exact names
-  go in the overlay, and must match `IDENTITY_ALLOWED_REDIRECTS` on the gateway
-  exactly.
+- **Origin** (DR4, amended): one origin for the web app and the control-plane
+  API, the API under `/api`. DR4 said a dedicated subdomain
+  (`agents.example.org`); this deployment has no subdomain to give, so the
+  origin is the gateway's hostname on **its own port** — `:8443` on staging.
+  A port is part of an origin, so `sessionStorage` and DOM access are separated
+  from the gateway exactly as a subdomain would separate them, and no DNS
+  record or new certificate is involved.
+
+  **Cookies are the exception**: they are not isolated by port (RFC 6265), so
+  the gateway's `Path=/` refresh cookie still reaches this origin. It is
+  `HttpOnly` and unreadable here, but the control plane receives it. Narrowing
+  that cookie's `Path` on the gateway is the fix, and it is a gateway-side
+  change tracked separately.
+
+  Whatever origin is chosen, it must match `IDENTITY_ALLOWED_REDIRECTS` on the
+  gateway exactly — **including the port**.
 - **Reaching the gateway**: the control plane needs a route to `GATEWAY_BASE_URL`.
   The sandbox needs one to the relay and, during the setup phase only, one to
   the allowlist proxy — nothing else, in either phase. If a deployment fronts

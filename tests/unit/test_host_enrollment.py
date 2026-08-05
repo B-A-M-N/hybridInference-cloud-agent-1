@@ -18,10 +18,15 @@ that is where a wrong answer costs an attempt:
 from __future__ import annotations
 
 import json
+import pathlib
+import re
+import threading
+import time
 from typing import Any
 
 import pytest
 
+from cloud_agent import host_pool
 from cloud_agent_host import enrollment
 
 
@@ -70,7 +75,10 @@ def test_a_token_is_spent_for_a_credential(credential_file, monkeypatch) -> None
     def fake_urlopen(request, timeout=None):
         sent["url"] = request.full_url
         sent["body"] = json.loads(request.data)
-        return _Response({"host": "h1", "credential": "hc_secret", "status": "active"})
+        # `enrolling`, which is what the control plane actually answers a
+        # registration with: the credential is issued, but the machine has not
+        # heartbeated yet. See `AgentJobStore.register_host`.
+        return _Response({"host": "h1", "credential": "hc_secret", "status": "enrolling"})
 
     monkeypatch.setattr(enrollment.urllib.request, "urlopen", fake_urlopen)
 
@@ -121,11 +129,129 @@ def test_registration_without_a_credential_in_the_answer_is_an_error(
     monkeypatch.setattr(
         enrollment.urllib.request,
         "urlopen",
-        lambda request, timeout=None: _Response({"host": "h1", "status": "active"}),
+        lambda request, timeout=None: _Response({"host": "h1", "status": "online"}),
     )
 
     with pytest.raises(enrollment.EnrollmentError):
         enrollment.ensure_enrolled(base_url="http://cp", host="h1")
+
+
+def test_replicas_sharing_a_token_enroll_once(credential_file, monkeypatch) -> None:
+    """Three runner processes, one machine, one single-use token.
+
+    The compose file starts three replicas sharing a credential file, a host
+    name and an enrollment token. The control plane spends that token for
+    exactly one of them, so unlocked the other two fail and crash-loop until a
+    restart happens to read the file the winner wrote. It settles — and "a new
+    host crash-loops on first start" is not a thing to make an operator learn
+    to recognise.
+
+    Threads rather than processes because the lock is on a shared file either
+    way, and the assertion is about how many registrations reach the control
+    plane.
+    """
+    monkeypatch.setenv(enrollment.ENV_ENROLL_TOKEN, "enroll-once")
+    registrations = []
+    lock = threading.Lock()
+
+    def fake_urlopen(request, timeout=None):
+        with lock:
+            registrations.append(request.full_url)
+            spent = len(registrations) > 1
+        if spent:
+            raise AssertionError("the enrollment token was presented twice")
+        time.sleep(0.05)  # widen the window the lock has to close
+        return _Response({"host": "h1", "credential": "hc_secret", "status": "enrolling"})
+
+    monkeypatch.setattr(enrollment.urllib.request, "urlopen", fake_urlopen)
+
+    results: list[object] = []
+    threads = [
+        threading.Thread(
+            target=lambda: results.append(
+                enrollment.ensure_enrolled(base_url="http://cp", host="h1")
+            )
+        )
+        for _ in range(3)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(registrations) == 1, f"{len(registrations)} replicas spent the token"
+    assert all(r is not None and r.credential == "hc_secret" for r in results), results
+
+
+# ---------------------------------------------------------------------------
+# Speaking the control plane's language
+# ---------------------------------------------------------------------------
+
+
+def test_the_runner_and_the_control_plane_mean_the_same_statuses() -> None:
+    """The mirror this package cannot import.
+
+    `cloud_agent_host` runs on the runner host, which has neither the control
+    plane nor its database, so the status vocabulary is copied rather than
+    imported — and a copy is a thing that drifts. This is the assertion that
+    makes the drift a failing test instead of a silent host.
+
+    It exists because the copy said `active`, which is not one of the five
+    statuses and is rejected outright by the schema's CHECK constraint. Every
+    test built its own identity with that same invented value, so the suite
+    agreed with the bug.
+    """
+    assert enrollment.CLAIMABLE_STATUSES == host_pool.CLAIMABLE_STATUSES
+    assert enrollment.DEFAULT_STATUS in host_pool.HOST_STATUSES
+    for status in enrollment.CLAIMABLE_STATUSES:
+        assert status in host_pool.HOST_STATUSES, f"{status} is not a status the schema allows"
+
+
+def test_every_status_this_module_writes_is_one_the_schema_allows() -> None:
+    """The whole vocabulary, not just the constant.
+
+    Fixing `CLAIMABLE_STATUSES` alone left a third `"active"` behind, in the
+    fallback `register` uses when an older control plane answers without a
+    status — a path no fake exercised, because every fake supplied one. This
+    reads the module's own source so a fourth cannot be added quietly.
+    """
+    source = pathlib.Path(enrollment.__file__).read_text()
+    # A word-literal following `status` on the same line, excluding the ones
+    # that are dict keys or lookups (`"status":`, `.get("status")`) — those are
+    # the name of the field, not a value it could take.
+    written = set(re.findall(r'status[^\n]*?["\'](\w+)["\'](?![:)\]])', source))
+    unknown = written - set(host_pool.HOST_STATUSES)
+    assert not unknown, f"statuses no schema row can carry: {sorted(unknown)}"
+
+
+def test_a_registration_without_a_status_claims_nothing_yet(credential_file, monkeypatch) -> None:
+    """An older control plane must not talk this runner into the pool."""
+    monkeypatch.setenv(enrollment.ENV_ENROLL_TOKEN, "enroll-once")
+    monkeypatch.setattr(
+        enrollment.urllib.request,
+        "urlopen",
+        lambda request, timeout=None: _Response({"host": "h1", "credential": "hc_secret"}),
+    )
+
+    identity = enrollment.ensure_enrolled(base_url="http://cp", host="h1")
+
+    assert identity is not None
+    assert identity.status in host_pool.HOST_STATUSES
+    beat = enrollment.HostHeartbeat(base_url="http://cp", identity=identity)
+    assert not beat.claimable, "assumed itself into the pool without a heartbeat"
+
+
+def test_no_status_the_control_plane_can_send_is_unknown_here() -> None:
+    """Every real status has an answer, and none of them raises.
+
+    A status this side does not recognise must read as "do not claim" rather
+    than as an error: the control plane is free to add one, and a runner that
+    crashed on an unfamiliar word would turn a rollout into an outage.
+    """
+    for status in host_pool.HOST_STATUSES:
+        identity = enrollment.HostIdentity(host="h1", credential="c", status=status)
+        beat = enrollment.HostHeartbeat(base_url="http://cp", identity=identity)
+        assert beat.claimable is (status in host_pool.CLAIMABLE_STATUSES)
 
 
 # ---------------------------------------------------------------------------
@@ -135,13 +261,37 @@ def test_registration_without_a_credential_in_the_answer_is_an_error(
 
 def test_the_pool_decides_whether_to_claim() -> None:
     """`draining` is an operator saying "finish what you have"."""
-    identity = enrollment.HostIdentity(host="h1", credential="c", status="active")
+    identity = enrollment.HostIdentity(host="h1", credential="c", status="online")
     beat = enrollment.HostHeartbeat(base_url="http://cp", identity=identity)
 
     assert beat.claimable
 
     identity.status = "draining"
     assert not beat.claimable, "a draining host that keeps claiming makes drain mean nothing"
+
+
+def test_a_heartbeat_does_not_silence_a_healthy_host(monkeypatch) -> None:
+    """The shape the `active` bug actually had.
+
+    A stored credential starts the runner at its default status, and the first
+    heartbeat overwrites that with whatever the control plane says. If the two
+    disagree the host claims for one interval and then stops for good — which
+    reads as "the queue is broken", not as "this constant is wrong", and is
+    why the default and the claimable set are pinned to the same vocabulary.
+    """
+    identity = enrollment.HostIdentity(host="h1", credential="c")
+    beat = enrollment.HostHeartbeat(base_url="http://cp", identity=identity)
+
+    assert beat.claimable, "a restarted host with a credential must take work"
+
+    monkeypatch.setattr(
+        enrollment,
+        "_post",
+        lambda url, body, bearer="": {"status": "online"},
+    )
+    enrollment.heartbeat(base_url="http://cp", identity=identity)
+
+    assert beat.claimable, "the host stopped claiming the moment the pool answered"
 
 
 def test_a_rejected_credential_stops_claims_for_good(monkeypatch) -> None:
@@ -206,7 +356,7 @@ def test_the_interval_follows_the_control_plane(monkeypatch) -> None:
     monkeypatch.setattr(
         enrollment,
         "_post",
-        lambda url, body, bearer="": {"status": "active", "heartbeat_interval_seconds": 7.5},
+        lambda url, body, bearer="": {"status": "online", "heartbeat_interval_seconds": 7.5},
     )
 
     enrollment.heartbeat(base_url="http://cp", identity=identity)
@@ -221,7 +371,7 @@ def test_a_nonsense_interval_is_ignored(monkeypatch) -> None:
     monkeypatch.setattr(
         enrollment,
         "_post",
-        lambda url, body, bearer="": {"status": "active", "heartbeat_interval_seconds": 0},
+        lambda url, body, bearer="": {"status": "online", "heartbeat_interval_seconds": 0},
     )
 
     enrollment.heartbeat(base_url="http://cp", identity=identity)

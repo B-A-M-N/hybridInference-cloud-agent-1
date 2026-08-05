@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from cloud_agent_host import runner as runner_mod
+from cloud_agent_host import enrollment, runner as runner_mod
 from cloud_agent_host.runner import (
     ClaimedJob,
     LeaseLost,
@@ -742,3 +742,83 @@ def test_the_control_plane_and_the_gateway_are_separate_destinations():
         legacy = build_parser().parse_args([])
     assert legacy.base_url == "http://gw:8080"
     assert legacy.gateway_url == "http://gw:8080"
+
+
+# ---------------------------------------------------------------------------
+# Which credential the loop claims with
+# ---------------------------------------------------------------------------
+
+
+def _drive_loop(monkeypatch, tmp_path, *, identity):
+    """Run `run_forever` for exactly one pass and return the token it claimed with."""
+    monkeypatch.setattr(runner_mod, "ensure_enrolled", lambda **kw: identity)
+    monkeypatch.setattr(runner_mod, "_housekeeping", lambda *a, **kw: None)
+
+    class _Beat:
+        def __init__(self, **kw):
+            self._identity = kw["identity"]
+            self.removed = __import__("threading").Event()
+
+        credential = property(lambda self: self._identity.credential)
+        claimable = True
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+    monkeypatch.setattr(runner_mod, "HostHeartbeat", _Beat)
+
+    seen: dict[str, str] = {}
+
+    def _run_once(**kwargs):
+        seen["token"] = kwargs["dispatcher_token"]
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(runner_mod, "run_once", _run_once)
+
+    class _Backend:
+        name = "process"
+
+        def preflight(self, workdir_root):
+            return None
+
+        def check_gateway_reachable(self, url):
+            return None
+
+    runner_mod.run_forever(
+        gateway_url="http://gw",
+        base_url="http://cp",
+        dispatcher_token="pool-wide-dispatcher-token",
+        worker_id="w1",
+        workdir_root=str(tmp_path),
+        backend=_Backend(),
+        host="h1",
+    )
+    return seen["token"]
+
+
+def test_an_enrolled_host_claims_with_its_own_credential(monkeypatch, tmp_path) -> None:
+    """The whole point of enrolling, and it was not wired.
+
+    The dispatcher token is shared by every machine in the pool, so a claim
+    carrying it says "a runner" and not "which". The control plane reads the
+    host from a host credential rather than from the request body — so with
+    the shared token, drain, pin and revoke are decisions about a machine that
+    cannot be told apart from its neighbours. Enrolling and then claiming with
+    the shared token buys nothing at all.
+    """
+    identity = enrollment.HostIdentity(host="h1", credential="aht.h1.secret")
+
+    token = _drive_loop(monkeypatch, tmp_path, identity=identity)
+
+    assert token == "aht.h1.secret", (
+        "an enrolled host claimed with the pool-wide dispatcher token, which "
+        "makes every per-host control decorative"
+    )
+
+
+def test_a_host_with_no_pool_still_claims_with_the_dispatcher_token(monkeypatch, tmp_path) -> None:
+    """The single-host shape predates the pool and must keep working."""
+    assert _drive_loop(monkeypatch, tmp_path, identity=None) == "pool-wide-dispatcher-token"

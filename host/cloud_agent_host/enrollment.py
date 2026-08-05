@@ -31,17 +31,22 @@ repository code next door.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from cloud_agent_host.logging_utils import get_logger
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 logger = get_logger(__name__)
 
@@ -61,6 +66,30 @@ DEFAULT_HEARTBEAT_INTERVAL_S = 30.0
 
 #: A heartbeat is a small write; something is wrong long before this expires.
 _TIMEOUT_S = 15.0
+
+#: The one status in which this runner may ask for work — a **mirror** of
+#: ``cloud_agent.host_pool.CLAIMABLE_STATUSES``, which the control plane
+#: enforces and the schema's CHECK constraint bounds.
+#:
+#: Mirrored rather than imported because this package runs on the runner host,
+#: which has no control-plane code and no database. That makes drift possible,
+#: so ``test_host_enrollment.py`` asserts the two agree — and it exists because
+#: this constant was once ``"active"``, a status the schema forbids outright.
+#: Nothing caught it: every test built its own ``HostIdentity`` with that same
+#: invented value, so the fixtures agreed with the bug rather than with the
+#: server.
+CLAIMABLE_STATUSES: tuple[str, ...] = ("online",)
+
+#: What a host with a stored credential assumes about itself before its first
+#: heartbeat answers. ``online`` matches the schema's column default, so the
+#: assumption agrees with what the control plane will say about a row that
+#: predates enrollment.
+#:
+#: Optimistic on purpose, and safe because the control plane gates claims on
+#: the same status independently (``AgentJobStore.claim_job``): the worst a
+#: wrong guess costs is one refused claim, while guessing ``enrolling`` would
+#: idle every restarted host for a whole heartbeat interval.
+DEFAULT_STATUS = "online"
 
 
 class EnrollmentError(RuntimeError):
@@ -82,7 +111,7 @@ class HostIdentity:
 
     host: str
     credential: str
-    status: str = "active"
+    status: str = DEFAULT_STATUS
     #: Seconds between heartbeats, as the control plane last reported them.
     interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S
     slots_total: int | None = None
@@ -187,7 +216,12 @@ def register(
     identity = HostIdentity(
         host=str(answer.get("host") or host),
         credential=credential,
-        status=str(answer.get("status") or "active"),
+        # A registration that answers without a status is a control plane
+        # older than this runner. `enrolling` is what it would have said —
+        # registration issues the credential, the first heartbeat is what
+        # promotes the host — so the fallback claims nothing until that
+        # heartbeat confirms it, rather than assuming its way into the pool.
+        status=str(answer.get("status") or "enrolling"),
     )
     store_credential(credential)
     logger.info(
@@ -246,7 +280,63 @@ def ensure_enrolled(
     credential nor an enrollment token — which is the single-host shape that
     worked before phase G and must keep working. Enrolment is opt-in; a runner
     that has never heard of it is not broken.
+
+    **Under a lock, because a host runs several runner processes.** The compose
+    file starts three replicas from one machine, sharing one credential file,
+    one host name and one enrollment token. Unlocked, all three read no
+    credential and all three register: the control plane spends the token for
+    exactly one of them (the `consumed_at IS NULL` predicate in
+    ``consume_enroll_token``), so the other two fail and crash-loop until one
+    of the restarts happens to read the file the winner wrote. It settles, but
+    "a new host crash-loops on first start" is not something to make an
+    operator recognise. The losers wait here and find the credential instead.
     """
+    with _enrollment_lock():
+        return _enroll_once(
+            base_url=base_url,
+            host=host,
+            broker_url=broker_url,
+            slots_total=slots_total,
+            capabilities=capabilities,
+            runner_version=runner_version,
+        )
+
+
+@contextmanager
+def _enrollment_lock() -> Iterator[None]:
+    """Serialize load-or-register across every runner process on this machine.
+
+    On the credential's own directory, which is the volume all replicas share
+    — a lock anywhere else would be per-container and would serialize nothing.
+    A deployment whose lock file cannot be created (a read-only path, an
+    unusual mount) proceeds unlocked rather than refusing to start: the
+    unlocked path is what this code did before, and the control plane still
+    settles the race correctly.
+    """
+    path = credential_path().parent / ".enroll.lock"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("w")
+    except OSError:
+        yield
+        return
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+    finally:
+        handle.close()
+
+
+def _enroll_once(
+    *,
+    base_url: str,
+    host: str,
+    broker_url: str | None,
+    slots_total: int | None,
+    capabilities: list[str] | None,
+    runner_version: str | None,
+) -> HostIdentity | None:
+    """The body of :func:`ensure_enrolled`, run holding the lock."""
     credential = load_credential()
     if credential:
         return HostIdentity(host=host, credential=credential)
@@ -305,14 +395,28 @@ class HostHeartbeat:
         return self._identity.status
 
     @property
+    def credential(self) -> str:
+        """This host's own claim credential, naming the machine.
+
+        What the runner presents instead of the pool-wide dispatcher token
+        once enrolled. The control plane reads the host from this rather than
+        from the request body, so a compromised machine can drain the queue
+        but cannot claim as its neighbour — which is the whole reason drain,
+        pin and revoke are per-host decisions.
+        """
+        return self._identity.credential
+
+    @property
     def claimable(self) -> bool:
         """Whether this runner should ask for more work.
 
         `draining` is an operator saying "finish what you have and stop", so
         it is not an error and nothing is interrupted — but a runner that kept
-        claiming through it would make draining mean nothing.
+        claiming through it would make draining mean nothing. `enrolling` and
+        `offline` have not proved the machine is there, and `disabled` has had
+        its credential taken away.
         """
-        return not self.removed.is_set() and self._identity.status == "active"
+        return not self.removed.is_set() and self._identity.status in CLAIMABLE_STATUSES
 
     def start(self) -> None:
         """Begin heartbeating."""
