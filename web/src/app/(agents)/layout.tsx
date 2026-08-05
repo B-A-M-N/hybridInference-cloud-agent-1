@@ -22,7 +22,7 @@ function AgentsHeader({
   onToggleSidebar: () => void;
 }) {
   const router = useRouter();
-  const { logout } = useAuth();
+  const { state, logout } = useAuth();
   const { branding, features } = useSiteConfig();
 
   const handleLogout = async () => {
@@ -98,6 +98,18 @@ function AgentsHeader({
         <span className="rounded-md bg-crimson/[0.06] px-2.5 py-1.5 text-crimson ring-1 ring-inset ring-crimson/10">
           Agents
         </span>
+        {/* This service's own operations page, so it is a route rather than a
+            link back to the gateway. Admin-only, matching the endpoints it
+            calls — the guard on the page is the one that counts; hiding the
+            link only keeps it out of the way of everyone else. */}
+        {hasRole(state.user?.role, 'admin') && (
+          <Link
+            href="/admin/hosts"
+            className="rounded-md px-2.5 py-1.5 transition-colors hover:bg-gray-100 hover:text-gray-900"
+          >
+            Hosts
+          </Link>
+        )}
         {branding.gatewayUrl && (
           <a
             href={`${branding.gatewayUrl}/dashboard`}
