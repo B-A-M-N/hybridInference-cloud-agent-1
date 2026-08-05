@@ -18,6 +18,8 @@ that is where a wrong answer costs an attempt:
 from __future__ import annotations
 
 import json
+import pathlib
+import re
 from typing import Any
 
 import pytest
@@ -154,6 +156,40 @@ def test_the_runner_and_the_control_plane_mean_the_same_statuses() -> None:
     assert enrollment.DEFAULT_STATUS in host_pool.HOST_STATUSES
     for status in enrollment.CLAIMABLE_STATUSES:
         assert status in host_pool.HOST_STATUSES, f"{status} is not a status the schema allows"
+
+
+def test_every_status_this_module_writes_is_one_the_schema_allows() -> None:
+    """The whole vocabulary, not just the constant.
+
+    Fixing `CLAIMABLE_STATUSES` alone left a third `"active"` behind, in the
+    fallback `register` uses when an older control plane answers without a
+    status — a path no fake exercised, because every fake supplied one. This
+    reads the module's own source so a fourth cannot be added quietly.
+    """
+    source = pathlib.Path(enrollment.__file__).read_text()
+    # A word-literal following `status` on the same line, excluding the ones
+    # that are dict keys or lookups (`"status":`, `.get("status")`) — those are
+    # the name of the field, not a value it could take.
+    written = set(re.findall(r'status[^\n]*?["\'](\w+)["\'](?![:)\]])', source))
+    unknown = written - set(host_pool.HOST_STATUSES)
+    assert not unknown, f"statuses no schema row can carry: {sorted(unknown)}"
+
+
+def test_a_registration_without_a_status_claims_nothing_yet(credential_file, monkeypatch) -> None:
+    """An older control plane must not talk this runner into the pool."""
+    monkeypatch.setenv(enrollment.ENV_ENROLL_TOKEN, "enroll-once")
+    monkeypatch.setattr(
+        enrollment.urllib.request,
+        "urlopen",
+        lambda request, timeout=None: _Response({"host": "h1", "credential": "hc_secret"}),
+    )
+
+    identity = enrollment.ensure_enrolled(base_url="http://cp", host="h1")
+
+    assert identity is not None
+    assert identity.status in host_pool.HOST_STATUSES
+    beat = enrollment.HostHeartbeat(base_url="http://cp", identity=identity)
+    assert not beat.claimable, "assumed itself into the pool without a heartbeat"
 
 
 def test_no_status_the_control_plane_can_send_is_unknown_here() -> None:

@@ -211,7 +211,12 @@ def register(
     identity = HostIdentity(
         host=str(answer.get("host") or host),
         credential=credential,
-        status=str(answer.get("status") or "active"),
+        # A registration that answers without a status is a control plane
+        # older than this runner. `enrolling` is what it would have said —
+        # registration issues the credential, the first heartbeat is what
+        # promotes the host — so the fallback claims nothing until that
+        # heartbeat confirms it, rather than assuming its way into the pool.
+        status=str(answer.get("status") or "enrolling"),
     )
     store_credential(credential)
     logger.info(
