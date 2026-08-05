@@ -1206,6 +1206,25 @@ def _runner_version() -> str:
     return (os.environ.get("AGENT_RUNNER_VERSION") or "").strip()
 
 
+def _housekeeping(root: pathlib.Path, workspace_ttl_s: float) -> None:
+    """Reclaim disk between jobs.
+
+    A snapshot cache on the same host as every job worktree must not be the
+    thing that fills the disk. Called from both the working path and the
+    draining one — a drained machine is often drained *because* something is
+    wrong with it, and it is the state a host sits in for hours.
+
+    Every step suppresses its own failure: housekeeping must never be what
+    stops a runner serving.
+    """
+    cache = build_cache_from_env()
+    if cache is not None:
+        with contextlib.suppress(Exception):
+            cache.purge_expired()
+    with contextlib.suppress(Exception):
+        purge_stale_workspaces(root, ttl_seconds=workspace_ttl_s)
+
+
 def run_forever(
     *,
     base_url: str,
@@ -1297,6 +1316,13 @@ def run_forever(
                 return 0
             # Draining. Idle rather than exit: the operator may undrain, and a
             # process that exited would need starting again by hand.
+            #
+            # Housekeeping still runs. `continue` would skip the snapshot-cache
+            # purge and the stale-workspace sweep at the bottom of this loop,
+            # and a machine is most often drained *because* something is wrong
+            # with it — leaving the one state where nothing reclaims disk to be
+            # the state a machine sits in for hours.
+            _housekeeping(root, workspace_ttl_s)
             time.sleep(idle_sleep_s)
             continue
         try:
@@ -1314,6 +1340,13 @@ def run_forever(
                 host=host,
             )
         except KeyboardInterrupt:
+            # Stop reporting before returning. The heartbeat is a daemon
+            # thread, so the process exits either way — but a machine that
+            # keeps saying "still here" while its runner shuts down stays
+            # `active` in the pool until the reaper's timeout, and jobs are
+            # dispatched to it in the meantime.
+            if pool is not None:
+                pool.stop()
             return 0
         except ClaimUnreachable as exc:
             # Raised only by the claim call, so this really does mean no job was
@@ -1328,14 +1361,7 @@ def run_forever(
             # Keep serving: the store owns this job's outcome, and one bad
             # repository must not stop every other queued job.
             print(f"agent runner: job failed unexpectedly: {exc}", file=sys.stderr, flush=True)
-        # Housekeeping on the idle tick: a snapshot cache on the same host as
-        # every job worktree must not be the thing that fills the disk.
-        cache = build_cache_from_env()
-        if cache is not None:
-            with contextlib.suppress(Exception):
-                cache.purge_expired()
-        with contextlib.suppress(Exception):
-            purge_stale_workspaces(root, ttl_seconds=workspace_ttl_s)
+        _housekeeping(root, workspace_ttl_s)
 
         # `run_once` returns 0 with nothing claimed too; sleeping only when the
         # queue was empty would need a separate signal, and a short sleep after

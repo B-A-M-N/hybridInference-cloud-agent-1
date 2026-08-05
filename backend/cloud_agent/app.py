@@ -477,8 +477,14 @@ def _start_publisher(app: FastAPI, store: AgentJobStore) -> None:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Open the store, start the reaper and publisher, and tear them down.
+async def lifespan(app: FastAPI, *, background: bool = True) -> AsyncIterator[None]:
+    """Open the store, optionally start the reaper and publisher, tear down.
+
+    Args:
+        app: The application whose state is being built.
+        background: Whether this process owns the reaper and the publisher.
+            False for a second listener sharing the database — see the comment
+            below for why that is not merely wasteful.
 
     The database is required. A control plane without one cannot claim, fence
     or record anything, so it refuses to start rather than serving an API that
@@ -508,18 +514,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.grants = GrantClient()
     _build_source_control(app)
 
-    reaper = asyncio.create_task(reap_expired_attempts(store, grants=app.state.grants))
-    _BACKGROUND_TASKS.add(reaper)
-    reaper.add_done_callback(_BACKGROUND_TASKS.discard)
-    app.state.reaper_task = reaper
-
-    _start_publisher(app, store)
-    logger.info("cloud agent control plane started")
+    # **The background work belongs to exactly one process.** The reaper
+    # renews and revokes grants and supersedes lapsed attempts; the publisher
+    # opens pull requests. A second listener on this same database — the MCP
+    # relay is one — running its own copies would renew every grant twice per
+    # interval, double the load it puts on the gateway, and have two workers
+    # racing for the same publish.
+    #
+    # So this is a parameter of the lifespan rather than a property of it, and
+    # `create_mcp_app` says no.
+    if background:
+        reaper = asyncio.create_task(reap_expired_attempts(store, grants=app.state.grants))
+        _BACKGROUND_TASKS.add(reaper)
+        reaper.add_done_callback(_BACKGROUND_TASKS.discard)
+        app.state.reaper_task = reaper
+        _start_publisher(app, store)
+        logger.info("cloud agent control plane started")
+    else:
+        app.state.reaper_task = None
+        app.state.publish_task = None
+        logger.info("cloud agent relay listener started")
 
     try:
         yield
     finally:
         for task in (app.state.reaper_task, app.state.publish_task):
+            if task is None:
+                continue
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
@@ -592,7 +613,10 @@ def create_mcp_app() -> FastAPI:
         title="FreeInference Cloud Agent — MCP relay",
         description="The only surface a sandbox may reach",
         version="0.1.0",
-        lifespan=lifespan,
+        # No reaper and no publisher: they belong to the control-plane process,
+        # and a second copy would renew every grant twice and race the same
+        # publish. This listener needs the store, and nothing else.
+        lifespan=lambda app: lifespan(app, background=False),
     )
     app.include_router(mcp_relay.router)
 

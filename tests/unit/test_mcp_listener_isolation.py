@@ -131,3 +131,31 @@ def test_the_sandbox_tunnel_lands_on_the_relay_listener() -> None:
         f"the sandbox's tunnel forwards to port {default.group(1)}, which is not "
         f"the port the MCP-only listener serves ({served})"
     )
+
+
+def test_the_relay_listener_runs_no_background_work() -> None:
+    """The reaper and the publisher belong to exactly one process.
+
+    Only visible once this is deployed as a second container against the same
+    database — which is precisely how it is deployed. Two copies of the reaper
+    renew every live grant twice per interval, doubling the load this service
+    puts on the gateway, and two publishers race for the same job.
+
+    Checked at the lifespan the application was *built with*, because that is
+    the decision: `create_mcp_app` passing `background=True` would be invisible
+    in the route table, which is all the other tests here look at.
+    """
+    import inspect
+
+    source = inspect.getsource(create_mcp_app)
+    assert "background=False" in source, (
+        "the relay listener shares the control plane's lifespan and would "
+        "start a second reaper and publisher against the same database"
+    )
+
+    # And the parameter is real rather than accepted and ignored.
+    from cloud_agent.app import lifespan
+
+    assert "background" in inspect.signature(lifespan).parameters
+    body = inspect.getsource(lifespan)
+    assert "if background:" in body, "the flag is taken but never consulted"
