@@ -69,6 +69,60 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.image.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
 
+  egress-proxy-starts:
+    name: The egress proxy stays up
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # **Building it proves nothing about whether it runs**, and this is the
+      # job that exists because of what that cost.
+      #
+      # Squid opens its logs *after* dropping to `cache_effective_user`, and in
+      # a container `/dev/stdout` is a root-owned `prw-------` pipe — so the
+      # open failed and squid treated it as fatal. The image built fine. The
+      # config passed `squid -k parse` fine. It exited on every start, 2814
+      # times on staging from 2026-08-03, and because the runner's isolation
+      # preflight correctly refuses to start without a reachable proxy, three
+      # runners and the workspace broker crash-looped behind it. No agent job
+      # ran for two days.
+      #
+      # Nothing textual would have caught it: the broken config parsed, and so
+      # did a first attempted fix (`cache_effective_user root`, which squid
+      # rejects outright). Only starting the thing does.
+      - name: Build the image
+        run: docker build -f deploy/host/Dockerfile.agent-egress-proxy -t egress-proxy:ci .
+
+      - name: Render a config the way the runner does
+        run: |
+          set -euo pipefail
+          pipx install uv 2>/dev/null || pip install uv
+          uv run --with-editable . python -c "
+          from cloud_agent_host.egress_proxy import build_config_from_env
+          import pathlib
+          pathlib.Path('/tmp/squid.conf').write_text(
+              build_config_from_env({'AGENT_EGRESS_ALLOWLIST': 'registry.npmjs.org'})
+          )"
+
+      - name: It must still be running, and serving
+        run: |
+          set -euo pipefail
+          cid=$(docker run -d -v /tmp/squid.conf:/etc/squid/generated/squid.conf:ro egress-proxy:ci)
+          sleep 10
+          state=$(docker inspect "$cid" --format '{{.State.Status}}')
+          docker logs "$cid" 2>&1 | tail -30
+          if [ "$state" != "running" ]; then
+            echo "::error::the egress proxy exited (state=$state) — the sandbox has no door, and every agent job will fail its isolation preflight"
+            exit 1
+          fi
+          # Up is not the same as listening: a squid that started and then
+          # failed to bind would still read as `running` for a moment.
+          docker logs "$cid" 2>&1 | grep -q "Accepting HTTP Socket connections" || {
+            echo "::error::the proxy is up but never accepted connections"
+            exit 1
+          }
+          docker rm -f "$cid" >/dev/null
+
   compose:
     name: Compose resolves
     runs-on: ubuntu-latest

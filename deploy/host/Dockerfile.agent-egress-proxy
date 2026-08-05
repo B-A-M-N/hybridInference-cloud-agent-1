@@ -32,7 +32,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# `-k parse` first: a config Squid rejects should say so on the first line of
+# **`chown` first, and this container does not start without it.**
+#
+# Squid switches to `cache_effective_user` (Debian: `proxy`) during startup and
+# opens its log destinations *after* the switch. In a container `/dev/stdout`
+# is a symlink to `/proc/self/fd/1` — a `prw-------` pipe owned by `root` —
+# so the open fails, and squid treats an unwritable log as fatal:
+#
+#     FATAL: Cannot open '/dev/stdout' for writing.
+#
+# It exits, `restart: unless-stopped` restarts it, and it exits again. That
+# loop ran 2814 times on staging from 2026-08-03 without one successful start,
+# and it took every agent job with it: the runner's isolation preflight
+# correctly refuses to start when the proxy is unreachable, so three runners
+# and the workspace broker crash-looped behind a proxy that had never once come
+# up.
+#
+# Two fixes were rejected. `cache_effective_user root` does not work at all —
+# squid refuses with "Don't run Squid as root". Logging to a file `proxy` can
+# write gives up the only reason these logs exist: a closed network drops a
+# refused connection silently, so this proxy is the single place a denied
+# egress attempt is observable, and a log that never reaches `docker logs` is
+# a refusal nobody sees.
+#
+# `|| true` because a container run with a TTY has a different stdout that may
+# not need (or accept) this. If the chown was needed and did not happen, squid
+# still says so on its first line — this is a fix, not a silencer.
+#
+# `-k parse` next: a config Squid rejects should say so on the first line of
 # this container's logs, not present as "the proxy is unreachable" three layers
 # away in a runner's preflight. `&&` means a rejected config never reaches the
 # run step.
@@ -44,4 +71,4 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # No fallback to /etc/squid/squid.conf if the generated file is missing: this
 # must fail rather than quietly start an allow-by-default proxy on the
 # sandbox's network.
-CMD ["/bin/sh", "-c", "squid -k parse -f /etc/squid/generated/squid.conf && exec squid -N -f /etc/squid/generated/squid.conf"]
+CMD ["/bin/sh", "-c", "chown proxy /dev/stdout /dev/stderr 2>/dev/null || true; squid -k parse -f /etc/squid/generated/squid.conf && exec squid -N -f /etc/squid/generated/squid.conf"]

@@ -89,6 +89,13 @@ http_port {port}
 logformat agent ts=%ts.%03tu src=%>a verdict=%Ss/%03>Hs method=%rm target="%>ru" bytes=%<st
 access_log stdio:/dev/stdout agent
 cache_log stdio:/dev/stderr
+# **These two lines need the image's help to work.** Squid drops to
+# `cache_effective_user` (Debian: `proxy`) during startup and opens its logs
+# afterwards, and in a container `/dev/stdout` is a `prw-------` pipe owned by
+# root — so the open fails and squid treats an unwritable log as fatal. The
+# image's CMD hands those two pipes to `proxy` before starting; see
+# `deploy/host/Dockerfile.agent-egress-proxy`, which explains why the fix is
+# there and not here.
 pid_filename none
 
 # No caching, ever. One cache shared by every job is a channel between tenants:
