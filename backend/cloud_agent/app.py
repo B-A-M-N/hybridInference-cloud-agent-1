@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import FastAPI
 
 from cloud_agent.gateway import GatewayError
-from cloud_agent.grants import RENEWAL_INTERVAL_S
+from cloud_agent.grants import GRANT_TTL_S, RENEWAL_INTERVAL_S
 from cloud_agent.host_pool import HEARTBEAT_INTERVAL_S, MISSED_HEARTBEATS_BEFORE_OFFLINE
 from cloud_agent.logging_utils import configure_process_logging, get_logger
 
@@ -111,6 +111,29 @@ GRANT_RENEWAL_PAGE = 200
 #: is a burst the gateway has to absorb, and fixing our latency by overwhelming
 #: a dependency moves the problem instead of solving it.
 GRANT_RENEWAL_CONCURRENCY = 16
+
+#: How long one renewal pass may take before what is left of it is abandoned
+#: to the next one. **Derived, never typed**, for the same reason
+#: :data:`cloud_agent.grants.GRANT_TTL_S` is.
+#:
+#: Concurrency alone does not bound this. A full page at
+#: ``GRANT_RENEWAL_CONCURRENCY`` is ``ceil(200/16) = 13`` waves, and a gateway
+#: that answers slowly rather than failing makes each wave cost the full
+#: request timeout — so a pass could still run past the lifetime of the grants
+#: it was renewing, which is the exact failure the concurrency was added to
+#: fix, just further out.
+#:
+#: The bound: a grant renewed at the end of one pass is next reached at the end
+#: of the following one, so the worst gap between two renewals of the same
+#: grant is ``duration + interval + duration``. Keeping that under the TTL
+#: gives ``duration < (TTL - interval) / 2`` — 45s at today's numbers.
+#:
+#: Cutting the pass short is safe and self-correcting: the rows come back
+#: ordered by soonest expiry, so what gets dropped is the least urgent, and it
+#: is retried a whole interval before it could expire. A pass that keeps
+#: hitting this says the page is too large or the gateway too slow, which is
+#: why it logs rather than passing quietly.
+GRANT_RENEWAL_PASS_DEADLINE_S = (GRANT_TTL_S - RENEWAL_INTERVAL_S) / 2
 
 
 async def _reconcile_settled_terminals(store: AgentJobStore) -> None:
@@ -235,6 +258,7 @@ async def _renew_live_grants(
             still live, so a finished job leaves nothing behind.
     """
     seen: set[str] = set()
+    renewed: list[str] = []
     renewable = await store.list_renewable_grants()
     if len(renewable) >= GRANT_RENEWAL_PAGE:
         # The pass was capped, so some live attempt was not renewed this time
@@ -312,8 +336,36 @@ async def _renew_live_grants(
     async def _renew_bounded(row: dict[str, Any]) -> None:
         async with limit:
             await _renew_one(row)
+            renewed.append(row["grant_id"])
 
-    await asyncio.gather(*(_renew_bounded(row) for row in renewable))
+    # **And time-boxed**, because bounded concurrency is not the same as a
+    # bounded pass: thirteen waves of a slow-but-not-failing gateway still
+    # outruns the lifetime being renewed. What is cut is the tail of a list
+    # ordered by soonest expiry — the least urgent rows — and it is retried a
+    # full interval before it could expire.
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(_renew_bounded(row) for row in renewable)),
+            timeout=GRANT_RENEWAL_PASS_DEADLINE_S,
+        )
+    except (TimeoutError, asyncio.TimeoutError):
+        # Loud, and with both numbers. A pass that keeps running out of time is
+        # a page too large or a gateway too slow, and the failure it eventually
+        # produces — a sandbox losing authorization mid-run — points nowhere
+        # near this loop.
+        logger.warning(
+            "agent_grant_renewal_pass_timed_out",
+            extra={
+                "event": "agent_grant_renewal_pass_timed_out",
+                "renewed": len(renewed),
+                "outstanding": len(renewable) - len(renewed),
+                "deadline_seconds": GRANT_RENEWAL_PASS_DEADLINE_S,
+            },
+        )
+        # `seen` is what prunes `failures`, and a grant whose renewal was
+        # cancelled is still live — dropping it here would delete a refusal
+        # count that the give-up rule depends on being consecutive.
+        seen.update(row["grant_id"] for row in renewable)
 
     for grant_id in [known for known in failures if known not in seen]:
         del failures[grant_id]

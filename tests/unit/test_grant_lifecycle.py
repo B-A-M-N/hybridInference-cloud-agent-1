@@ -36,7 +36,14 @@ from typing import Any
 import pytest
 
 from cloud_agent import app as control_plane, grants as grant_client
+import asyncio
+import logging
+import math
+
+from cloud_agent import app
+from cloud_agent import grants as grants_mod
 from cloud_agent.app import _renew_live_grants, _revoke_dead_grants
+from cloud_agent.grants import GRANT_TTL_S, RENEWAL_INTERVAL_S
 from cloud_agent.gateway import GatewayError
 
 pytestmark = pytest.mark.asyncio
@@ -541,3 +548,97 @@ async def test_a_revoked_grant_is_not_then_renewed() -> None:
 
     assert grants.revoked == ["agr_1"]
     assert grants.renewed == []
+
+
+# ── The pass has to fit, not merely be parallel ────────────────────────
+
+
+async def test_the_pass_deadline_leaves_room_for_two_of_them() -> None:
+    """The arithmetic, stated where a change to either number breaks it.
+
+    A grant renewed at the end of one pass is next reached at the end of the
+    following one, so the worst gap between two renewals of one grant is
+    ``duration + interval + duration``. That has to stay under the TTL, or a
+    capability dies under a running sandbox — the failure the concurrency
+    limit was added for and did not fully close.
+    """
+    worst_gap = 2 * app.GRANT_RENEWAL_PASS_DEADLINE_S + RENEWAL_INTERVAL_S
+    assert worst_gap <= GRANT_TTL_S, (
+        f"two passes plus an interval is {worst_gap}s against a {GRANT_TTL_S}s "
+        "TTL: a grant can expire under a running attempt"
+    )
+
+
+async def test_a_full_page_of_slow_renewals_cannot_outrun_the_ttl() -> None:
+    """Concurrency alone never bounded this, which is why the deadline exists.
+
+    A full page at the concurrency limit is `ceil(page/concurrency)` waves, and
+    a gateway answering slowly rather than failing makes every wave cost the
+    full request timeout. Without a deadline that product is what one pass
+    takes — and at today's numbers it exceeds the lifetime being renewed.
+    """
+    waves = math.ceil(app.GRANT_RENEWAL_PAGE / app.GRANT_RENEWAL_CONCURRENCY)
+    unbounded = waves * grants_mod._TIMEOUT_S
+    assert unbounded > GRANT_TTL_S, (
+        "the numbers no longer describe the problem this deadline solves; "
+        "re-derive it rather than deleting the test"
+    )
+    assert app.GRANT_RENEWAL_PASS_DEADLINE_S < unbounded
+
+
+async def test_a_pass_that_runs_long_gives_up_its_tail_and_says_so(monkeypatch, caplog) -> None:
+    """What is cut is the least urgent, and it is not cut quietly.
+
+    `list_renewable_grants` returns soonest-expiry first, so the rows that lose
+    their turn are the ones with the most life left, and they are retried a
+    whole interval before they could expire. Silence would be the problem: a
+    pass that keeps timing out means the page is too large or the gateway too
+    slow, and the failure it eventually produces points nowhere near here.
+    """
+    store = _AttemptStore()
+    for attempt_id in range(1, 4):
+        store.add(attempt_id, f"grant_{attempt_id}")
+
+    class _SlowGrants(_Grants):
+        async def renew(self, grant_id: str) -> dict[str, Any]:
+            if grant_id != "grant_1":
+                await asyncio.sleep(10)
+            return await super().renew(grant_id)
+
+    monkeypatch.setattr(app, "GRANT_RENEWAL_PASS_DEADLINE_S", 0.05)
+    grants = _SlowGrants()
+
+    with caplog.at_level(logging.WARNING):
+        await _renew_live_grants(store, grants, failures={})
+
+    assert grants.renewed == ["grant_1"], grants.renewed
+    timed_out = [r for r in caplog.records if "timed_out" in getattr(r, "event", "")]
+    assert timed_out, "the pass dropped renewals without saying so"
+    assert timed_out[0].outstanding == 2
+
+
+async def test_a_cancelled_renewal_does_not_forget_its_refusal_count(monkeypatch) -> None:
+    """Give-up is consecutive, and a cancelled pass said nothing either way.
+
+    `failures` is pruned to the grants still live at the end of each pass. A
+    grant whose renewal the deadline cancelled is still live, so dropping its
+    entry would reset a count that the give-up rule depends on being
+    consecutive — and a genuinely dead grant would then be retried forever.
+    """
+    store = _AttemptStore()
+    store.add(1, "grant_1")
+    store.add(2, "grant_2")
+
+    class _SlowGrants(_Grants):
+        async def renew(self, grant_id: str) -> dict[str, Any]:
+            await asyncio.sleep(10)
+            return await super().renew(grant_id)
+
+    monkeypatch.setattr(app, "GRANT_RENEWAL_PASS_DEADLINE_S", 0.05)
+    failures = {"grant_1": 2, "grant_2": 1}
+
+    await _renew_live_grants(store, _SlowGrants(), failures=failures)
+
+    assert failures == {"grant_1": 2, "grant_2": 1}, (
+        "a cancelled renewal reset a refusal count the give-up rule needs"
+    )
