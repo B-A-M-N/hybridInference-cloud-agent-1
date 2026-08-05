@@ -31,20 +31,17 @@ Two further properties are pinned here because nothing else can see them:
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import math
 from typing import Any
 
 import pytest
 
-from cloud_agent import app as control_plane, grants as grant_client
-import asyncio
-import logging
-import math
-
-from cloud_agent import app
-from cloud_agent import grants as grants_mod
+from cloud_agent import app, app as control_plane, grants as grant_client, grants as grants_mod
 from cloud_agent.app import _renew_live_grants, _revoke_dead_grants
-from cloud_agent.grants import GRANT_TTL_S, RENEWAL_INTERVAL_S
 from cloud_agent.gateway import GatewayError
+from cloud_agent.grants import GRANT_TTL_S, RENEWAL_INTERVAL_S
 
 pytestmark = pytest.mark.asyncio
 
@@ -583,7 +580,7 @@ async def test_a_full_page_of_slow_renewals_cannot_outrun_the_ttl() -> None:
         "the numbers no longer describe the problem this deadline solves; "
         "re-derive it rather than deleting the test"
     )
-    assert app.GRANT_RENEWAL_PASS_DEADLINE_S < unbounded
+    assert unbounded > app.GRANT_RENEWAL_PASS_DEADLINE_S
 
 
 async def test_a_pass_that_runs_long_gives_up_its_tail_and_says_so(monkeypatch, caplog) -> None:

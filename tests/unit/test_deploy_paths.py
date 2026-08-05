@@ -23,9 +23,15 @@ import yaml
 REPO = Path(__file__).resolve().parents[2]
 HOST = REPO / "deploy/host"
 SANDBOX = REPO / "deploy/sandbox"
+CONTROL_PLANE = REPO / "deploy/control-plane"
 
+#: `deploy/control-plane/` was outside this guard until its `.env.example`
+#: arrived — so the control plane's compose and Dockerfiles were the one part
+#: of the deployment whose paths nothing checked.
 DEPLOY_FILES = sorted(
-    p for p in (*HOST.iterdir(), *SANDBOX.iterdir()) if p.is_file() and p.name != ".gitkeep"
+    p
+    for p in (*HOST.iterdir(), *SANDBOX.iterdir(), *CONTROL_PLANE.iterdir())
+    if p.is_file() and p.name != ".gitkeep"
 )
 
 # `COPY <src> <dst>` / `COPY --from=x <src> <dst>` — src is repo-relative.
@@ -55,6 +61,12 @@ _NOT_OUR_PATHS = {
     # intended behaviour, not a stale path.
     "web/package.json",
     "web/package-lock.json",
+    # The files an operator creates by copying the examples beside them. They
+    # cannot exist here — `.gitignore` forbids committing either, which is the
+    # point — and the `cp` line naming both is the instruction, not a stale
+    # reference.
+    "deploy/host/.env",
+    "deploy/control-plane/.env",
 }
 
 _PATH_TAIL = r"/[A-Za-z0-9._/*-]*[A-Za-z0-9_/*-]"

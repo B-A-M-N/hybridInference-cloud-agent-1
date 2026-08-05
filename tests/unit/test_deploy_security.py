@@ -56,7 +56,9 @@ def _defaults(value: str) -> str:
     take, so it becomes a marker no assertion here will mistake for an address.
     """
     seen = set()
-    while (expanded := _VAR.sub(lambda m: m.group(3) or f"<required:{m.group(1)}>", value)) != value:
+    while (
+        expanded := _VAR.sub(lambda m: m.group(3) or f"<required:{m.group(1)}>", value)
+    ) != value:
         assert value not in seen, f"cycle expanding {value}"
         seen.add(value)
         value = expanded

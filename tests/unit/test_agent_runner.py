@@ -14,8 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from cloud_agent_host import enrollment
-from cloud_agent_host import runner as runner_mod
+from cloud_agent_host import enrollment, runner as runner_mod
 from cloud_agent_host.runner import (
     ClaimedJob,
     LeaseLost,
@@ -822,6 +821,4 @@ def test_an_enrolled_host_claims_with_its_own_credential(monkeypatch, tmp_path) 
 
 def test_a_host_with_no_pool_still_claims_with_the_dispatcher_token(monkeypatch, tmp_path) -> None:
     """The single-host shape predates the pool and must keep working."""
-    assert (
-        _drive_loop(monkeypatch, tmp_path, identity=None) == "pool-wide-dispatcher-token"
-    )
+    assert _drive_loop(monkeypatch, tmp_path, identity=None) == "pool-wide-dispatcher-token"
