@@ -40,6 +40,7 @@ from typing import Any
 
 import httpx
 
+from cloud_agent_host.enrollment import HostHeartbeat, ensure_enrolled
 from cloud_agent_host.logging_utils import configure_process_logging
 from cloud_agent_host.patch_gate import branch_name_for, validate_patch
 from cloud_agent_host.runtimes import (
@@ -1185,6 +1186,26 @@ def run_once(
         control.close()
 
 
+def _broker_url_from_env() -> str | None:
+    """This host's broker address, as the control plane will reach it.
+
+    Read from the same variable `workspace_broker_client` uses, so the address
+    a host *reports* cannot drift from the one it *serves* — a row pointing at
+    a broker this machine is not running answers 409 for every file and
+    terminal request on its jobs.
+    """
+    return (os.environ.get("AGENT_WORKSPACE_BROKER_URL") or "").strip() or None
+
+
+def _runner_version() -> str:
+    """This runner's version, for the pool listing. Empty if unknown.
+
+    Best effort: it is an operator-facing label, not a compatibility gate, and
+    a missing version must never stop a host enrolling.
+    """
+    return (os.environ.get("AGENT_RUNNER_VERSION") or "").strip()
+
+
 def run_forever(
     *,
     base_url: str,
@@ -1227,12 +1248,57 @@ def run_forever(
     if checker is not None:
         checker(gateway_url or base_url)
     where = f" on host {host}" if host else " (no host reported)"
+
+    # Join the pool, if this deployment uses one. `None` means it does not —
+    # neither a stored credential nor an enrollment token — which is the
+    # single-host shape that predates the pool and has to keep working.
+    #
+    # The heartbeat runs whether or not jobs do. A host with nothing to do
+    # must still report, or the reaper marks it offline and stops sending it
+    # work: a pool that empties whenever it is idle.
+    identity = ensure_enrolled(
+        base_url=base_url,
+        host=host or worker_id,
+        broker_url=_broker_url_from_env(),
+        slots_total=int(os.environ.get("AGENT_HOST_SLOTS") or 0) or None,
+        runner_version=_runner_version(),
+    )
+    pool: HostHeartbeat | None = None
+    if identity is not None:
+        pool = HostHeartbeat(
+            base_url=base_url,
+            identity=identity,
+            broker_url=_broker_url_from_env(),
+            slots_total=int(os.environ.get("AGENT_HOST_SLOTS") or 0) or None,
+            runner_version=_runner_version(),
+        )
+        pool.start()
+        where = f" on host {identity.host} (enrolled)"
+
     print(
         f"agent runner {worker_id} started{where} (sandbox backend: {backend.name})",
         flush=True,
     )
 
     while True:
+        # **Read the pool's answer before asking for work, not after.** A
+        # runner that claims first and checks second spends an attempt the
+        # operator has already said should not start. `draining` is a human
+        # saying "finish what you have"; a removed credential is the pool
+        # saying this machine is gone.
+        if pool is not None and not pool.claimable:
+            if pool.removed.is_set():
+                print(
+                    "agent runner: this host's credential was rejected; not claiming further work",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                pool.stop()
+                return 0
+            # Draining. Idle rather than exit: the operator may undrain, and a
+            # process that exited would need starting again by hand.
+            time.sleep(idle_sleep_s)
+            continue
         try:
             run_once(
                 gateway_url=gateway_url,

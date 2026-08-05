@@ -143,6 +143,9 @@ neither belongs in any unit file, `.env`, or image.
 | `AGENT_TERMINAL_MAX_SESSIONS` | existing | |
 | `AGENT_GENERIC_COMMAND` | existing | |
 | `AGENT_ENROLL_TOKEN` | **NEW** | One-time host enrollment token (task G2). Minted at `POST /admin/agent/runner-hosts/enroll-token`, redeemed once at `POST /v1/agent/host/register`, then replaced by the returned host credential. 15-minute TTL, hashed at rest, and shown exactly once — losing it means issuing another, not looking it up. **The token names the host it may register**: the admin minting it supplies `host`, and registration under any other name is refused without spending the token, so a typo cannot revoke a live machine's credential. **The host-side client that reads this does not exist yet**; see MIGRATION.md's deferred register. |
+| `AGENT_HOST_CREDENTIAL_FILE` | **NEW** | Where the host credential is kept between restarts. Default `/var/lib/hybridinference/agent-host-credential`, written mode 0600 before any byte reaches it — this machine runs untrusted repository code next door. `AGENT_HOST_CREDENTIAL` in the environment wins over the file, for deployments that inject it another way. |
+| `AGENT_HOST_SLOTS` | **NEW** | Concurrent attempts this machine accepts, reported at registration and on every heartbeat. Unset means unmetered, which is the pre-pool behaviour. |
+| `AGENT_RUNNER_VERSION` | **NEW** | Free-text version for the pool listing. Operator-facing only — never a compatibility gate, and a missing value must not stop a host enrolling. |
 | `AGENT_LOG_LEVEL` | **NEW** | Host process log level (default INFO). Read by `configure_process_logging()` at the runner entrypoint; replaces the source repo's import-side-effect logging setup (task D6). |
 
 ## Sandbox isolation (host agent reads, sandbox inherits)
