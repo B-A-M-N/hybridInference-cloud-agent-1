@@ -7,16 +7,21 @@
 // there is nothing to rewrite. Deployments that split the two must arrange
 // CORS with credentials on the control plane rather than proxy through here.
 //
-// `basePath` mounts the whole app under a prefix, which is how it shares the
-// gateway's hostname instead of taking one of its own:
+// `basePath` mounts the whole app under a prefix. **The deployed shape does
+// not use it**: this stack gets its own origin, on the gateway's hostname but
+// its own port, and serves from the root of it —
 //
-//   staging.freeinference.org/agents/*     → this app
-//   staging.freeinference.org/agents/api/* → the control plane
-//   everything else                        → the gateway
+//   staging.freeinference.org:8443/*     → this app
+//   staging.freeinference.org:8443/api/* → the control plane
 //
-// Same origin, so the session cookie needs no CORS and no DNS record is
-// involved — and a rollback is a reverse-proxy edit rather than a DNS change
-// waiting out a TTL.
+// — because an origin is scheme + host + port, and a path prefix is not a
+// boundary. Mounting under the gateway's `/agents` was the earlier shape and
+// it let this app read the gateway's `sessionStorage` access token, which
+// matters when the app's normal input is model output and terminal contents.
+// See `deploy/reverse-proxy/agents-own-origin.conf`.
+//
+// The prefix support stays for a deployment that wants it. If you use it, the
+// caveat below about hand-written URLs is the thing that bites.
 //
 // Baked in at build time: Next resolves this when the bundle is built, so a
 // deployment that changes it rebuilds the image. That is why it is a build

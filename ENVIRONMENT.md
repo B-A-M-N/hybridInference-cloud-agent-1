@@ -183,8 +183,8 @@ readable by anyone who loads the page.
 
 | Variable | New? | Notes |
 |---|---|---|
-| `NEXT_PUBLIC_BASE_PATH` | **NEW** | Prefix the app is mounted under. `/agents` serves it inside the gateway's own hostname — same origin, so the session cookie needs no CORS and no DNS record is involved, and a rollback is a reverse-proxy edit rather than a DNS change waiting out a TTL. Empty for a deployment that owns its hostname. **Whatever this is, `IDENTITY_ALLOWED_REDIRECTS` on the gateway must contain `<origin><base path>/callback` verbatim** — that allowlist is matched as an exact string, and Next does not prefix a URL the code concatenates, so `callbackUri()` applies this by hand. Set as the compose build argument `AGENT_WEB_BASE_PATH`. |
-| `NEXT_PUBLIC_AGENT_API_URL` | **NEW** | Control plane base URL. Empty means same-origin, which is the DR4 shape (one host, API under `/api`). Under a base path, the same-origin value is a relative prefix — `/agents/api` — which the reverse proxy strips before forwarding. A cross-origin value additionally needs CORS-with-credentials on the control plane, because the session is a cookie. |
+| `NEXT_PUBLIC_BASE_PATH` | **NEW** | Prefix the app is mounted under. **Empty in the deployed shape**: this stack takes its own origin — the gateway's hostname on its own port (8443) — and serves from the root of it. A prefix on the gateway's own port was the earlier arrangement and is not safe, because an origin is scheme + host + port: it left this app, whose normal input is model output and terminal contents, able to read the gateway's `sessionStorage` access token. **Whatever this is, `IDENTITY_ALLOWED_REDIRECTS` on the gateway must contain `<origin><base path>/callback` verbatim** — that allowlist is matched as an exact string, and Next does not prefix a URL the code concatenates, so `callbackUri()` applies this by hand. For staging that string is `https://staging.freeinference.org:8443/callback`, port included. Set as the compose build argument `AGENT_WEB_BASE_PATH`. |
+| `NEXT_PUBLIC_AGENT_API_URL` | **NEW** | Control plane base URL. Defaults to the relative `/api`, which the reverse proxy strips before forwarding: the web app and the control plane share this origin, so the session cookie needs neither CORS nor `SameSite=None`. A cross-origin value additionally needs CORS-with-credentials on the control plane, because the session is a cookie. |
 | `NEXT_PUBLIC_GATEWAY_AUTHORIZE_URL` | **NEW** | `${GATEWAY_BASE_URL}/authorize` (task C4). Unset means this deployment cannot sign anyone in, and says so instead of redirecting to a half-built URL. The gateway's token endpoint is **derived** from this URL's origin rather than configured separately — one variable, nothing to get out of step. |
 | `NEXT_PUBLIC_APP_NAME` | **NEW** | Product name in the header and the document title. Defaults to `FreeInference Cloud Agent`. |
 | `NEXT_PUBLIC_ORG_NAME` | **NEW** | Optional organisation name beside the product name. Empty hides it. |
@@ -217,10 +217,22 @@ one place to be read from end to end.
 
 Recorded here as *what has to be decided*, not as anyone's actual answer.
 
-- **Domains** (DR4): one host for the web app and the control-plane API, the API
-  under `/api` — e.g. `agents.example.org` and a staging sibling. The exact names
-  go in the overlay, and must match `IDENTITY_ALLOWED_REDIRECTS` on the gateway
-  exactly.
+- **Origin** (DR4, amended): one origin for the web app and the control-plane
+  API, the API under `/api`. DR4 said a dedicated subdomain
+  (`agents.example.org`); this deployment has no subdomain to give, so the
+  origin is the gateway's hostname on **its own port** — `:8443` on staging.
+  A port is part of an origin, so `sessionStorage` and DOM access are separated
+  from the gateway exactly as a subdomain would separate them, and no DNS
+  record or new certificate is involved.
+
+  **Cookies are the exception**: they are not isolated by port (RFC 6265), so
+  the gateway's `Path=/` refresh cookie still reaches this origin. It is
+  `HttpOnly` and unreadable here, but the control plane receives it. Narrowing
+  that cookie's `Path` on the gateway is the fix, and it is a gateway-side
+  change tracked separately.
+
+  Whatever origin is chosen, it must match `IDENTITY_ALLOWED_REDIRECTS` on the
+  gateway exactly — **including the port**.
 - **Reaching the gateway**: the control plane needs a route to `GATEWAY_BASE_URL`.
   The sandbox needs one to the relay and, during the setup phase only, one to
   the allowlist proxy — nothing else, in either phase. If a deployment fronts

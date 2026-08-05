@@ -24,9 +24,14 @@ export const agentApiBase = (process.env.NEXT_PUBLIC_AGENT_API_URL || '').replac
 /**
  * The prefix this app is served under (`NEXT_PUBLIC_BASE_PATH`).
  *
- * Empty for a deployment that owns its own hostname. Set to `/agents` to
- * mount the app inside the gateway's existing origin, which is what makes the
- * session cookie same-origin and removes CORS from the problem entirely.
+ * **Empty in the deployed shape**, which serves this app from the root of its
+ * own origin — the gateway's hostname on a different port. Mounting it inside
+ * the gateway's origin under a prefix was the earlier arrangement and is not
+ * safe: an origin is scheme + host + port, so a prefix left this app able to
+ * read the gateway's `sessionStorage` access token.
+ *
+ * Set it for a deployment that genuinely serves this app under a prefix on a
+ * host it already controls.
  *
  * **Next.js prefixes what it generates, not what we write.** `<Link>`, router
  * navigations and asset URLs pick `basePath` up automatically; a path built by
