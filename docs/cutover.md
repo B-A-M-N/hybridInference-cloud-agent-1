@@ -121,6 +121,20 @@ POST   /v1/agent/integrations/github/connect
 DELETE /v1/agent/integrations/github/connections/{installation_id}
 POST   /v1/agent/integrations/gitlab/connect
 DELETE /v1/agent/integrations/gitlab/connections/{connection_id}
+
+# The older aliases, which write the same table. Freezing only the four
+# above leaves a second door into `agent_repo_grants` open — and the UI is
+# not the only caller: anything holding a gateway session can post here.
+POST   /v1/agent/github/connect
+DELETE /v1/agent/github/connect/{installation_id}
+```
+
+Verify the list against the deployment rather than against this file. It was
+written from one reading of the router and missed the aliases above:
+
+```bash
+curl -s https://<gateway>/openapi.json \
+  | python3 -c "import json,sys; [print(p) for p in sorted(json.load(sys.stdin)['paths']) if 'connect' in p]"
 ```
 
 - [ ] Return `503` with a message naming the new domain. Leave every `GET` and

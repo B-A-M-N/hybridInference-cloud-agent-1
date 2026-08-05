@@ -685,7 +685,18 @@ async def run(args: argparse.Namespace) -> int:
         # Belt and braces: this script has no UPDATE against the source, and
         # the session refuses one anyway.
         await source.execute("SET default_transaction_read_only = on")
-        source_data = {spec.name: await read_table(source, spec) for spec in TABLES}
+        # **One snapshot for every table.** asyncpg commits each statement on
+        # its own, so reading two tables in sequence reads them at two
+        # different moments — and a user who connects GitHub between them
+        # lands in one export and not the other. The cutover window is exactly
+        # when that is most likely, because the old stack is still serving.
+        #
+        # `REPEATABLE READ` rather than a lock: this must not block the
+        # gateway it is reading from, and a consistent view is all that is
+        # wanted. Postgres gives every statement in the transaction the same
+        # snapshot, which is the guarantee — not an ordering, a *moment*.
+        async with source.transaction(isolation="repeatable_read", readonly=True):
+            source_data = {spec.name: await read_table(source, spec) for spec in TABLES}
     finally:
         await source.close()
 
@@ -738,12 +749,60 @@ async def run(args: argparse.Namespace) -> int:
         stale = [plan for plan in plans if plan.refresh and not args.refresh]
 
         if args.apply and not blocked and not stale:
+            # **The plan is recomputed inside the transaction that writes it.**
+            # The one above was read without a lock and is a prediction; acting
+            # on it means writing against a database that may have moved. The
+            # case that matters is not a primary-key clash — that aborts loudly
+            # — but the same user connecting on the *new* stack in between:
+            # they get a fresh id, this inserts the old one, and the user ends
+            # up with two connection rows that no conflict check ever saw,
+            # because the check ran against a snapshot taken before theirs
+            # existed.
+            #
+            # `EXCLUSIVE` blocks writers and allows readers, which is the right
+            # trade for a cutover: the new stack should not be accepting
+            # connections yet, and if it is, waiting is the correct behaviour.
             async with target.transaction():
+                for spec in TABLES:
+                    await target.execute(f"LOCK TABLE {spec.name} IN EXCLUSIVE MODE")
+
+                plans = []
+                for spec in TABLES:
+                    target_rows = await read_table(target, spec)
+                    plans.append(
+                        plan_table(
+                            spec,
+                            source_data[spec.name],
+                            source_plain[spec.name],
+                            target_rows,
+                            decrypt_rows(spec, target_rows, new_cipher),
+                        )
+                    )
+
+                # Re-checked under the lock. A conflict that appeared between
+                # the preview and now must stop the write, not be carried
+                # through it — and rolling back is the whole reason this is
+                # decided inside the transaction rather than before it.
+                blocked = [plan for plan in plans if plan.blocked]
+                stale = [plan for plan in plans if plan.refresh and not args.refresh]
+                if blocked or stale:
+                    raise MigrationError(
+                        "the target changed between the preview and the write: "
+                        + ", ".join(
+                            sorted(
+                                {plan.spec.name for plan in blocked}
+                                | {plan.spec.name for plan in stale}
+                            )
+                        )
+                        + ". Nothing was written; re-run to see the new plan."
+                    )
+
                 for plan in plans:
                     await insert_rows(target, plan.spec, plan.insert, new_cipher)
                     if args.refresh:
                         await refresh_rows(target, plan.spec, plan.refresh, new_cipher)
                     await resync_sequence(target, plan.spec)
+
             # Re-read and re-plan, so the reported checksums describe the
             # database as it now stands rather than as it was predicted to be.
             plans = []
