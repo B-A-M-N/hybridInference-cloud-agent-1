@@ -266,17 +266,8 @@ something to fold in when the host half lands.
 
 ## 7. Bring the new stack into service
 
-- [ ] Add the agent origin's `server` block to the proxy in front of this host,
-      from [agents-own-origin.conf](../deploy/reverse-proxy/agents-own-origin.conf).
-      It listens on its own port and reuses the gateway's existing certificate
-      and hostname, so there is no DNS record and no new cert to obtain.
-- [ ] Confirm the port is reachable from outside. A firewall that allows 443
-      and nothing else is the failure to expect here, and it presents as the
-      sign-in redirect hanging rather than as anything naming the port.
-- [ ] Confirm `IDENTITY_ALLOWED_REDIRECTS` on the gateway contains the callback
-      **with its port** — `https://<host>:8443/callback`. Matched as an exact
-      string, so a missing port is a refusal at `/authorize`.
-- [ ] Confirm the identity round trip: sign in on the new origin, land back
+- [ ] Point the agent domain at the new web app and API (DR4).
+- [ ] Confirm the identity round trip: sign in on the new domain, land back
       with a session.
 
 ## 8. Smoke test
