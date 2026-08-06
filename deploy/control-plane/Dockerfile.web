@@ -25,16 +25,32 @@ COPY web/ ./
 # names it. Empty defaults so a plain `docker build` still produces a working
 # image — one that owns its hostname and signs nobody in, which is the honest
 # result of configuring nothing.
+#
+# Every `NEXT_PUBLIC_*` the app reads belongs here. One that ENVIRONMENT.md
+# documents and this list omits is a knob no deployment can turn: the bundle is
+# built with the code's fallback and setting the variable anywhere — compose,
+# the host, the running container — changes nothing. `NEXT_PUBLIC_STATUS_URL`
+# was exactly that, and the header's Status link pointed at the empty string.
 ARG NEXT_PUBLIC_BASE_PATH=
 ARG NEXT_PUBLIC_AGENT_API_URL=
 ARG NEXT_PUBLIC_GATEWAY_AUTHORIZE_URL=
 ARG NEXT_PUBLIC_APP_NAME=
+ARG NEXT_PUBLIC_ORG_NAME=
+ARG NEXT_PUBLIC_ORG_URL=
+ARG NEXT_PUBLIC_STATUS_URL=
+ARG NEXT_PUBLIC_FEATURE_RAG=
 ARG NEXT_PUBLIC_BUILD_SHA=
+ARG NEXT_PUBLIC_BUILD_TIMESTAMP=
 ENV NEXT_PUBLIC_BASE_PATH=$NEXT_PUBLIC_BASE_PATH \
     NEXT_PUBLIC_AGENT_API_URL=$NEXT_PUBLIC_AGENT_API_URL \
     NEXT_PUBLIC_GATEWAY_AUTHORIZE_URL=$NEXT_PUBLIC_GATEWAY_AUTHORIZE_URL \
     NEXT_PUBLIC_APP_NAME=$NEXT_PUBLIC_APP_NAME \
+    NEXT_PUBLIC_ORG_NAME=$NEXT_PUBLIC_ORG_NAME \
+    NEXT_PUBLIC_ORG_URL=$NEXT_PUBLIC_ORG_URL \
+    NEXT_PUBLIC_STATUS_URL=$NEXT_PUBLIC_STATUS_URL \
+    NEXT_PUBLIC_FEATURE_RAG=$NEXT_PUBLIC_FEATURE_RAG \
     NEXT_PUBLIC_BUILD_SHA=$NEXT_PUBLIC_BUILD_SHA \
+    NEXT_PUBLIC_BUILD_TIMESTAMP=$NEXT_PUBLIC_BUILD_TIMESTAMP \
     NEXT_TELEMETRY_DISABLED=1
 
 RUN npm run build

@@ -8,7 +8,7 @@ the pool's shared broker token, and it was never wired into the control-plane
 compose file at all. The deployed stack could not turn it on. A checklist the
 author ticks for themselves is not a control over the author.
 
-Two invariants, and the second is the one that bites:
+Three invariants, and the first is the only cheap one:
 
 * **Documented.** A variable read anywhere must appear in ENVIRONMENT.md.
   Cheap, and it is how an operator learns the variable exists.
@@ -17,6 +17,11 @@ Two invariants, and the second is the one that bites:
   code's fallback is the only behaviour the deployment can ever have — and for
   a security control, the fallback is "off" while the code, the tests and the
   review all say the control exists.
+* **Baked in.** A `NEXT_PUBLIC_*` the web bundle reads must be an `ARG` in
+  `Dockerfile.web` *and* a build argument of the `web` service. These are
+  substituted at `next build`, so an unwired one is not a variable that
+  defaults — it is a variable nothing can change, including setting it on the
+  running container.
 
 Only the control plane gets the compose check. Host variables are set by an
 operator on the machine, migration variables are set at a shell for one run and
@@ -33,12 +38,24 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONTROL_PLANE_COMPOSE = REPO_ROOT / "deploy" / "control-plane" / "docker-compose.yml"
+WEB_DOCKERFILE = REPO_ROOT / "deploy" / "control-plane" / "Dockerfile.web"
 INVENTORY = REPO_ROOT / "ENVIRONMENT.md"
 
 #: The prefixes this project owns. A bare `PATH` or `HOME` read is not ours to
 #: document, and listing every variable any dependency might read would make
 #: the check noise that people learn to silence.
 _VAR = re.compile(r'["\'](AGENT_[A-Z0-9_]+|GATEWAY_[A-Z0-9_]+|IDENTITY_[A-Z0-9_]+)["\']')
+
+#: `process.env.NEXT_PUBLIC_FOO`. Property access rather than a quoted name,
+#: which is how the bundler recognises them too — the substitution is textual,
+#: so `process.env[name]` would not work in the app either.
+_PUBLIC_VAR = re.compile(r"process\.env\.(NEXT_PUBLIC_[A-Z0-9_]+)")
+
+#: `ARG NEXT_PUBLIC_FOO=`, declared in the builder stage.
+_DOCKERFILE_ARG = re.compile(r"^ARG\s+(NEXT_PUBLIC_[A-Z0-9_]+)", re.MULTILINE)
+
+#: `next.config.js` reads them too, and it is not under `src/`.
+_WEB_SOURCES = ("web/src/**/*.ts", "web/src/**/*.tsx", "web/*.js")
 
 #: Read by the control plane, and correctly absent from its compose file.
 #: Each entry needs a reason, because "add it to the exemption list" is the
@@ -66,10 +83,10 @@ def _sources(*globs: str) -> list[Path]:
     return found
 
 
-def _vars_read(paths: list[Path]) -> set[str]:
+def _vars_read(paths: list[Path], pattern: re.Pattern[str] = _VAR) -> set[str]:
     names: set[str] = set()
     for path in paths:
-        names |= set(_VAR.findall(path.read_text()))
+        names |= set(pattern.findall(path.read_text()))
     return names
 
 
@@ -99,6 +116,46 @@ def test_control_plane_variables_are_wired_into_compose() -> None:
     )
 
 
+def _web_build_args() -> set[str]:
+    """Build arguments of the `web` service — the only way in for these.
+
+    Under `build.args`, not `environment:`: the two look alike in the file and
+    mean opposite things here. A `NEXT_PUBLIC_*` under `environment:` would be
+    set on a container that has already been built with the value missing.
+    """
+    document = yaml.safe_load(CONTROL_PLANE_COMPOSE.read_text())
+    build = ((document.get("services") or {}).get("web") or {}).get("build") or {}
+    args = build.get("args") or {}
+    return set(args if isinstance(args, dict) else ())
+
+
+def test_web_build_arguments_are_wired() -> None:
+    """A `NEXT_PUBLIC_*` the bundle reads can be set by the deployment.
+
+    `NEXT_PUBLIC_STATUS_URL` had a row in ENVIRONMENT.md and a reader in the
+    header, and appeared in no Dockerfile and no compose file. It was not a
+    knob left at its default — it was a knob wired to nothing, and the header
+    rendered `<a href="">Status</a>` on every deployment: an empty href
+    resolves to the current document, so the link reopened the page you were
+    already on.
+    """
+    read = _vars_read(_sources(*_WEB_SOURCES), _PUBLIC_VAR)
+    assert read, "no NEXT_PUBLIC_* reads found under web/ — regex drift?"
+
+    undeclared = sorted(read - set(_DOCKERFILE_ARG.findall(WEB_DOCKERFILE.read_text())))
+    assert not undeclared, (
+        "the web bundle reads these, but they are not declared `ARG` in "
+        f"{WEB_DOCKERFILE.relative_to(REPO_ROOT)}, so `docker build` drops them: {undeclared}"
+    )
+
+    unpassed = sorted(read - _web_build_args())
+    assert not unpassed, (
+        "the web bundle reads these, but the `web` service in "
+        f"{CONTROL_PLANE_COMPOSE.relative_to(REPO_ROOT)} passes no `build.args` entry for "
+        f"them, so this stack builds an image that can never carry them: {unpassed}"
+    )
+
+
 def test_every_variable_read_has_an_inventory_row() -> None:
     """A variable an operator might need to set is written down."""
     read = _vars_read(
@@ -108,7 +165,7 @@ def test_every_variable_read_has_an_inventory_row() -> None:
             "migrations/**/*.py",
             "deploy/migrate/*.py",
         )
-    )
+    ) | _vars_read(_sources(*_WEB_SOURCES), _PUBLIC_VAR)
     inventory = INVENTORY.read_text()
     # Backticked, which is how every row writes them — and how a grouped row
     # like ``AGENT_SANDBOX_UID`` / ``AGENT_SANDBOX_GID`` still matches both.

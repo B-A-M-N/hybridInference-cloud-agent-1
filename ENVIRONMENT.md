@@ -181,18 +181,25 @@ Every one of these is baked into the bundle at build time and is therefore
 **public**. Nothing secret may appear here — a `NEXT_PUBLIC_` variable is
 readable by anyone who loads the page.
 
-| Variable | New? | Notes |
-|---|---|---|
-| `NEXT_PUBLIC_BASE_PATH` | **NEW** | Prefix the app is mounted under. `/agents` serves it inside the gateway's own hostname — same origin, so the session cookie needs no CORS and no DNS record is involved, and a rollback is a reverse-proxy edit rather than a DNS change waiting out a TTL. Empty for a deployment that owns its hostname. **Whatever this is, `IDENTITY_ALLOWED_REDIRECTS` on the gateway must contain `<origin><base path>/callback` verbatim** — that allowlist is matched as an exact string, and Next does not prefix a URL the code concatenates, so `callbackUri()` applies this by hand. Set as the compose build argument `AGENT_WEB_BASE_PATH`. |
-| `NEXT_PUBLIC_AGENT_API_URL` | **NEW** | Control plane base URL. Empty means same-origin, which is the DR4 shape (one host, API under `/api`). Under a base path, the same-origin value is a relative prefix — `/agents/api` — which the reverse proxy strips before forwarding. A cross-origin value additionally needs CORS-with-credentials on the control plane, because the session is a cookie. |
-| `NEXT_PUBLIC_GATEWAY_AUTHORIZE_URL` | **NEW** | `${GATEWAY_BASE_URL}/authorize` (task C4). Unset means this deployment cannot sign anyone in, and says so instead of redirecting to a half-built URL. The gateway's token endpoint is **derived** from this URL's origin rather than configured separately — one variable, nothing to get out of step. |
-| `NEXT_PUBLIC_APP_NAME` | **NEW** | Product name in the header and the document title. Defaults to `FreeInference Cloud Agent`. |
-| `NEXT_PUBLIC_ORG_NAME` | **NEW** | Optional organisation name beside the product name. Empty hides it. |
-| `NEXT_PUBLIC_ORG_URL` | **NEW** | Link target for `NEXT_PUBLIC_ORG_NAME`. |
-| `NEXT_PUBLIC_STATUS_URL` | **NEW** | Status page link in the header. |
-| `NEXT_PUBLIC_FEATURE_RAG` | **NEW** | `true` shows the gateway's Docs Assistant link. Off by default; the page belongs to the gateway, not to this service. |
-| `NEXT_PUBLIC_BUILD_SHA` | **NEW** | Optional build identity, baked in by the deploy script. |
-| `NEXT_PUBLIC_BUILD_TIMESTAMP` | **NEW** | Optional build identity. |
+Baked in means each one reaches the app as a **build argument** and no other
+way: a row here without an `ARG` in `deploy/control-plane/Dockerfile.web` and a
+matching key under the `web` service's `build.args` is a variable an operator
+can set everywhere and change nothing. Every row therefore names its compose
+argument, and `test_web_build_arguments_are_wired` fails on a row that has
+none.
+
+| Variable | New? | Compose build argument | Notes |
+|---|---|---|---|
+| `NEXT_PUBLIC_BASE_PATH` | **NEW** | `AGENT_WEB_BASE_PATH` | Prefix the app is mounted under. `/agents` serves it inside the gateway's own hostname — same origin, so the session cookie needs no CORS and no DNS record is involved, and a rollback is a reverse-proxy edit rather than a DNS change waiting out a TTL. Empty for a deployment that owns its hostname. **Whatever this is, `IDENTITY_ALLOWED_REDIRECTS` on the gateway must contain `<origin><base path>/callback` verbatim** — that allowlist is matched as an exact string, and Next does not prefix a URL the code concatenates, so `callbackUri()` applies this by hand. |
+| `NEXT_PUBLIC_AGENT_API_URL` | **NEW** | `AGENT_WEB_API_URL` | Control plane base URL. Empty means same-origin, which is the DR4 shape (one host, API under `/api`). Under a base path, the same-origin value is a relative prefix — `/agents/api` — which the reverse proxy strips before forwarding. A cross-origin value additionally needs CORS-with-credentials on the control plane, because the session is a cookie. |
+| `NEXT_PUBLIC_GATEWAY_AUTHORIZE_URL` | **NEW** | `AGENT_WEB_GATEWAY_AUTHORIZE_URL` | `${GATEWAY_BASE_URL}/authorize` (task C4). Unset means this deployment cannot sign anyone in, and says so instead of redirecting to a half-built URL. The gateway's token endpoint is **derived** from this URL's origin rather than configured separately — one variable, nothing to get out of step. |
+| `NEXT_PUBLIC_APP_NAME` | **NEW** | `AGENT_WEB_APP_NAME` | Product name in the header and the document title. Defaults to `FreeInference Cloud Agent`. |
+| `NEXT_PUBLIC_ORG_NAME` | **NEW** | `AGENT_WEB_ORG_NAME` | Optional organisation name beside the product name. Empty hides it. |
+| `NEXT_PUBLIC_ORG_URL` | **NEW** | `AGENT_WEB_ORG_URL` | Link target for `NEXT_PUBLIC_ORG_NAME`. |
+| `NEXT_PUBLIC_STATUS_URL` | **NEW** | `AGENT_WEB_STATUS_URL` | Status page, opened in a new tab from the header. Empty hides the link — an empty `href` resolves to the current page, so a Status link that is rendered anyway reopens the page the user is standing on. |
+| `NEXT_PUBLIC_FEATURE_RAG` | **NEW** | `AGENT_WEB_FEATURE_RAG` | `true` shows the gateway's Docs Assistant link. Off by default; the page belongs to the gateway, not to this service. |
+| `NEXT_PUBLIC_BUILD_SHA` | **NEW** | `BUILD_SHA` | Optional build identity, baked in by the deploy script. |
+| `NEXT_PUBLIC_BUILD_TIMESTAMP` | **NEW** | `BUILD_TIMESTAMP` | Optional build identity. |
 
 The source repo's frontend fetched `/site-config` from the gateway at runtime so
 one bundle could serve several deployments. That endpoint is the gateway's and
