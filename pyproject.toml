@@ -13,6 +13,19 @@ authors = [{ name = "HarvardMadSys" }]
 dependencies = [
     "alembic>=1.13.0",
     "asyncpg>=0.28.0",
+    # Alembic's driver, and a runtime dependency because a deploy runs
+    # migrations. The service itself talks asyncpg; alembic goes through
+    # SQLAlchemy, which needs a sync DBAPI.
+    #
+    # This was in the `dev` group, whose comment said "only the dbtest tier and
+    # a deploy ever invoke them" — but the deploy runs in an image built with
+    # `pip install .`, which does not install that group. So the compose file's
+    # `migrate` service could never have worked from a clean build, and did not:
+    # `alembic upgrade head` exits 1 on `ModuleNotFoundError: No module named
+    # 'psycopg'`, taking control-plane and mcp-relay down with it because they
+    # wait on `service_completed_successfully`. Found the first time a deploy
+    # ran the whole compose file instead of `up -d web`.
+    "psycopg[binary]>=3.2.0",
     "cryptography>=48.0.1",
     "fastapi>=0.110.0",
     "httpx>=0.28.1",
@@ -130,10 +143,6 @@ dev = [
   # in this service loads those documents — they record what the gateway agreed
   # to, and a wire-level validator would fail closed on a compatible change.
   "openapi-spec-validator>=0.7.1",
-  # Alembic's driver. The service itself talks asyncpg; migrations run through
-  # SQLAlchemy, which needs a sync DBAPI, and only the dbtest tier and a deploy
-  # ever invoke them.
-  "psycopg[binary]>=3.2.0",
   "pytest-timeout>=2.3.0",
   "pytest-xdist>=3.6.0",
   # Pinned, deliberately — the source repo's CI checks the files we migrate
