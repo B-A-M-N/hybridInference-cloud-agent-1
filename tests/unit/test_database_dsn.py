@@ -17,9 +17,15 @@ overrides a driver somebody chose on purpose.
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
+import tomllib
 
 from cloud_agent.storage.dsn import SYNC_DRIVER, sync_sqlalchemy_url
+
+REPO = Path(__file__).resolve().parents[2]
 
 _TAIL = "user:pw@db.example:5432/cloudagent"
 
@@ -104,3 +110,32 @@ def test_alembic_env_normalises_what_the_environment_gives_it(monkeypatch) -> No
     spec.loader.exec_module(module)
 
     assert module._database_url() == f"{SYNC_DRIVER}://{_TAIL}"
+
+
+def test_the_driver_the_rewrite_names_is_a_runtime_dependency() -> None:
+    """The rewrite is only half of it; the package has to ship.
+
+    `sync_sqlalchemy_url` exists because a bare `postgresql://` resolves to
+    psycopg2, which this project does not depend on. It rewrites to psycopg 3
+    — and psycopg 3 then sat in the **dev** dependency group, so it was
+    present for every test here and absent from the image the `migrate`
+    service runs. The same failure as the one this module was written for,
+    one layer down: `ModuleNotFoundError: No module named 'psycopg'`, and no
+    table was ever created.
+
+    A runtime check cannot catch this, because the test environment installs
+    the dev group. So this reads the manifest instead: whatever driver the
+    rewrite names must be declared where the deployed image will get it.
+    """
+    manifest = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
+    runtime = manifest["project"]["dependencies"]
+
+    driver = SYNC_DRIVER.partition("+")[2]
+    assert driver, f"{SYNC_DRIVER!r} names no driver after the `+`"
+
+    declared = {re.split(r"[<>=!\[ ]", spec, maxsplit=1)[0].lower() for spec in runtime}
+    assert driver.lower() in declared, (
+        f"migrations run through {SYNC_DRIVER}, but {driver!r} is not a "
+        f"runtime dependency — it is installed for tests and missing from the "
+        f"image `migrate` runs. Declared: {sorted(declared)}"
+    )
