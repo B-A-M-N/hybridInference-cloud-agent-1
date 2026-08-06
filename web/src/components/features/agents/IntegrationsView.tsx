@@ -6,6 +6,16 @@ import type { AgentIntegrationProvider, AgentIntegrationProviderApi } from '@/li
 
 const PROVIDERS: AgentIntegrationProvider[] = ['github', 'gitlab'];
 
+/** Providers shown, but not yet offered to connect.
+ *
+ * GitLab's OAuth half works and would list projects — but agent jobs and merge
+ * requests do not, so connecting it buys a user nothing they came here for and
+ * costs them a token grant to a source-control account. "Coming soon" is the
+ * honest state; the alternative was a Connect button whose result was a
+ * sentence explaining what it could not do.
+ */
+const COMING_SOON: AgentIntegrationProvider[] = ['gitlab'];
+
 const PROVIDER_COPY: Record<AgentIntegrationProvider, { name: string; description: string }> = {
   github: {
     name: 'GitHub',
@@ -13,8 +23,7 @@ const PROVIDER_COPY: Record<AgentIntegrationProvider, { name: string; descriptio
   },
   gitlab: {
     name: 'GitLab',
-    description:
-      'Connect GitLab to discover accessible projects. Agent jobs and merge requests are not supported yet.',
+    description: 'Agent jobs and merge requests on GitLab are not supported yet.',
   },
 };
 
@@ -76,6 +85,16 @@ function ProviderActions({
   const copy = PROVIDER_COPY[integration.provider];
 
   if (!integration.connected) {
+    // Before the `configured` check: whether an operator has set the OAuth app
+    // up is not something a user can act on while the feature is not offered,
+    // and "Admin setup required" reads as "ask someone and you can have it".
+    if (COMING_SOON.includes(integration.provider)) {
+      return (
+        <span className="rounded-full bg-gray-100 px-2.5 py-1 text-xs font-medium text-gray-500">
+          Coming soon
+        </span>
+      );
+    }
     if (!integration.configured) {
       return <span className="text-sm text-gray-500">Admin setup required</span>;
     }

@@ -59,10 +59,11 @@ describe('IntegrationsView', () => {
       await screen.findByText('Connected as HarvardMadSys · 2 repositories'),
     ).toBeInTheDocument();
     expect(screen.getByRole('status')).toHaveTextContent('GitHub connected.');
-    expect(screen.getByRole('link', { name: /Connect/ })).toHaveAttribute(
-      'href',
-      'https://gitlab.com/oauth/authorize?state=signed',
-    );
+    // GitLab is behind "Coming soon", so its connect_url is deliberately not
+    // offered even though the API still returns one.
+    expect(screen.queryByRole('link', { name: /Connect/ })).not.toBeInTheDocument();
+    // Two: GitLab's, and the MCP Servers section's own long-standing one.
+    expect(screen.getAllByText('Coming soon')).toHaveLength(2);
     expect(screen.getByText('Your own MCP servers')).toBeInTheDocument();
   });
 
@@ -71,7 +72,10 @@ describe('IntegrationsView', () => {
 
     render(<IntegrationsView />);
 
-    expect(await screen.findAllByText('Admin setup required')).toHaveLength(2);
+    // GitHub only: a provider that is not offered yet does not tell a user to
+    // go and ask an admin for it.
+    expect(await screen.findAllByText('Admin setup required')).toHaveLength(1);
+    expect(screen.getAllByText('Coming soon')).toHaveLength(2);
   });
 
   it('does not trust the callback query string as connection status', async () => {
@@ -86,7 +90,7 @@ describe('IntegrationsView', () => {
 
     render(<IntegrationsView connectedProvider="github" />);
 
-    await screen.findAllByRole('link', { name: /Connect/ });
+    await screen.findByRole('link', { name: /Connect/ });
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 
@@ -99,7 +103,9 @@ describe('IntegrationsView', () => {
 
     await screen.findByText('Connected as HarvardMadSys · 2 repositories');
     expect(screen.getByText('Manage')).toBeInTheDocument();
-    expect(screen.getAllByText('Admin setup required')).toHaveLength(1);
+    // Was 1, from the GitLab row this response omits — that row now reads
+    // "Coming soon" instead, and GitHub's is the connected one.
+    expect(screen.queryAllByText('Admin setup required')).toHaveLength(0);
   });
 
   it('offers a repository configuration link for a connected installation', async () => {
@@ -152,5 +158,26 @@ describe('IntegrationsView', () => {
     await waitFor(() => expect(mockedDisconnect).toHaveBeenCalledWith('github', 'gh-42'));
     expect(await screen.findByRole('status')).toHaveTextContent('HarvardMadSys disconnected.');
     expect(mockedGetIntegrations).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps a connected GitLab account manageable', async () => {
+    // "Coming soon" replaces the invitation to connect, not the way out of a
+    // connection somebody already has. Hiding Manage here would strand them
+    // with a token grant they cannot revoke from this page.
+    mockedGetIntegrations.mockResolvedValue({
+      providers: [
+        {
+          ...integrations.providers[1],
+          connected: true,
+          accounts: [{ id: 'gl-7', label: 'murphy' }],
+        },
+      ],
+    });
+
+    render(<IntegrationsView />);
+
+    expect(await screen.findByText('Manage')).toBeInTheDocument();
+    // One left: the MCP Servers pill. GitLab's is gone because it is connected.
+    expect(screen.getAllByText('Coming soon')).toHaveLength(1);
   });
 });
