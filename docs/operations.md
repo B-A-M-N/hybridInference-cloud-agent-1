@@ -39,9 +39,14 @@ Two properties are load-bearing and easy to break by accident:
   the credential travels in git's environment rather than its argv, and the
   runner refuses to start the agent if it finds the token anywhere under
   `.git/`.
-- **The sandbox's only credential is model-scoped.** It buys inference against
-  the job's capped budget. It cannot write the event log, overwrite the patch,
-  or move the job to a terminal state; the runner holds the token that can.
+- **The sandbox's only credential is model-scoped.** It buys inference as the
+  job's owner: the grant names the models it may reach, it dies on a short TTL
+  unless the control plane keeps renewing it, and what it spends lands against
+  that owner's gateway daily quota. **There is no per-job spend cap** — C5/C6
+  removed it deliberately, so do not quote one as the bound on a leaked
+  credential; the bound is the grant's scope plus its TTL. It cannot write the
+  event log, overwrite the patch, or move the job to a terminal state; the
+  runner holds the token that can.
 
 ## Verified
 
@@ -51,7 +56,7 @@ Against real components on a developer machine:
 |---|---|
 | Store: fencing, reaper, one-shot publish | dbtests against Postgres |
 | Job API, SSE resume, worker endpoints | live gateway |
-| Per-job credential: auto-revoke, budget 429 | live gateway |
+| Per-job credential: auto-revoke ~~, budget 429~~ | live gateway. The struck half exercised a per-job spend cap that no longer exists: C5/C6 replaced it with the owner's gateway daily quota, which this service does not enforce and so cannot verify here |
 | Runner + runtime adapter | real Claude Code CLI, end to end |
 | Publish: patch → branch → draft PR | real `git push` to a local bare repo |
 | **A real job on a real model** | live Claude Code CLI × `deepseek-v4-flash` through the production gateway: docstring landed on disk, patch produced, 3 calls / 74,523 tokens / $0.0075 attributed to the job in `api_logs` |
