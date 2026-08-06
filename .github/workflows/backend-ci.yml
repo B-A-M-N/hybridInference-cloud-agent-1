@@ -30,7 +30,7 @@ env:
 jobs:
   lint:
     name: ${{ matrix.check.name }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, ci-general]
     strategy:
       fail-fast: false
       matrix:
@@ -42,13 +42,37 @@ jobs:
           - name: Pydocstyle
             command: uv run pydocstyle backend host
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          # Full fetch: GitHub intermittently serves shallow-clone packs with
+          # missing delta bases ("pack has N unresolved deltas"), which fails
+          # random jobs at checkout on this pool. A full fetch is immune.
+          fetch-depth: 0
+
+      - name: Isolate uv cache dir
+        # Set via GITHUB_ENV because job-level env cannot use the runner
+        # context. The default ~/.cache/uv is shared by every runner process on
+        # the machine, and an entry disappearing mid-install fails the job with
+        # ENOENT while uv hardlinks into the venv. RUNNER_TEMP belongs to one
+        # runner process, which runs one job at a time — that is the whole
+        # isolation, so the path carries nothing else.
+        #
+        # In particular it must NOT carry GITHUB_RUN_ID. The cache service
+        # derives an entry's version from the paths being cached, so a
+        # per-run path misses on every restore and uploads a fresh copy every
+        # time, which is both no cache at all and a fast way through the 10 GB
+        # per-repository limit.
+        run: |
+          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache" >> "${GITHUB_ENV}"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v8.1.0
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
+          # Even with UV_CACHE_DIR off the shared default, prune --ci is
+          # unnecessary on self-hosted and has raced with concurrent installs.
+          prune-cache: false
 
       - name: Set up Python
         run: uv python install ${{ env.PYTHON_VERSION }}
@@ -61,15 +85,22 @@ jobs:
 
   test:
     name: Tests
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, ci-general]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Isolate uv cache dir
+        run: |
+          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache" >> "${GITHUB_ENV}"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v8.1.0
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
+          prune-cache: false
 
       - name: Set up Python
         run: uv python install ${{ env.PYTHON_VERSION }}

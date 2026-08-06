@@ -23,7 +23,7 @@ env:
 jobs:
   check:
     name: Web ${{ matrix.check.name }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, ci-general]
     strategy:
       fail-fast: false
       matrix:
@@ -39,7 +39,11 @@ jobs:
           - name: Build
             command: npm run build
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          # Full fetch: shallow-clone packs with missing delta bases have been
+          # failing random checkouts on this pool.
+          fetch-depth: 0
 
       # web/ is an empty placeholder until task F1 lands the Next.js app. Until
       # then this workflow is a deliberate no-op rather than a red X: gating on
@@ -54,9 +58,22 @@ jobs:
             echo "web/package.json not present yet — skipping (task F1)"
           fi
 
+      - name: Isolate the npm cache dir
+        # Off the shared ~/.npm and onto this runner process's own temp, which
+        # runs one job at a time. Set before setup-node, which reads
+        # `npm config get cache` to decide where to restore into.
+        #
+        # Stable, with no run id in it: the cache service versions an entry by
+        # the paths it covers, so a per-run path would never restore and would
+        # upload a new copy of node_modules' cache on all five cells, every
+        # run. Same reasoning as UV_CACHE_DIR in backend-ci.
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          echo "npm_config_cache=${RUNNER_TEMP}/npm-cache" >> "${GITHUB_ENV}"
+
       - name: Set up Node
         if: steps.detect.outputs.present == 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
