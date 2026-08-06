@@ -377,3 +377,52 @@ def test_a_nonsense_interval_is_ignored(monkeypatch) -> None:
     enrollment.heartbeat(base_url="http://cp", identity=identity)
 
     assert identity.interval_s == before
+
+
+def test_a_reset_connection_is_an_enrollment_error(monkeypatch) -> None:
+    """The gap that killed the heartbeat thread on 2026-08-06.
+
+    `_post` wrapped `urllib.error.URLError`, which covers a connection that
+    could not be *made*. A control plane restarting mid-request resets one that
+    already exists, and http.client raises `ConnectionResetError` from under
+    urlopen — an OSError, not a URLError. It escaped this wrapper and therefore
+    escaped `_HostHeartbeat._run`'s `except EnrollmentError`, ending the thread.
+
+    The existing retry test could not have caught it: it patches `_post`, which
+    is the layer the gap was in.
+    """
+
+    def reset(request, timeout=None):
+        raise ConnectionResetError(104, "Connection reset by peer")
+
+    monkeypatch.setattr(enrollment.urllib.request, "urlopen", reset)
+
+    with pytest.raises(enrollment.EnrollmentError):
+        enrollment._post("http://cp/v1/agent/host/heartbeat", {}, bearer="c")
+
+
+def test_the_heartbeat_thread_survives_an_unexpected_exception(monkeypatch) -> None:
+    """A dead heartbeat thread is silent and permanent.
+
+    Threads are not restarted, so an escaping exception means the host reports
+    offline for the life of the process — while claiming work normally, because
+    that loop catches its own errors. An operator sees a machine that looks
+    dead and is not.
+    """
+    identity = enrollment.HostIdentity(host="h1", credential="c")
+    beat = enrollment.HostHeartbeat(base_url="http://cp", identity=identity)
+    calls = {"n": 0}
+
+    def boom(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            beat._stop.set()
+        raise RuntimeError("something nobody wrote an `except` for")
+
+    monkeypatch.setattr(enrollment, "heartbeat", boom)
+    monkeypatch.setattr(beat._identity, "interval_s", 0.0)
+
+    beat._run()
+
+    assert calls["n"] >= 2, "an unexpected exception ended the heartbeat thread"
+    assert not beat.removed.is_set(), "an unexpected exception must not look like removal"

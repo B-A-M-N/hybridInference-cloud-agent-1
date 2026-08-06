@@ -184,7 +184,22 @@ def _post(url: str, body: dict[str, Any], *, bearer: str = "") -> dict[str, Any]
         if exc.code in (401, 403):
             raise HostRemoved(f"{exc.code} from {url}: {detail}") from exc
         raise EnrollmentError(f"{exc.code} from {url}: {detail}") from exc
-    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+    # `OSError`, not `urllib.error.URLError`. urlopen wraps failures it meets
+    # while *establishing* a connection, but a peer that resets an already-open
+    # socket surfaces raw from http.client while the response status line is
+    # being read:
+    #
+    #     File ".../http/client.py", line 297, in _read_status
+    #     ConnectionResetError: [Errno 104] Connection reset by peer
+    #
+    # which is an OSError and is not a URLError. It escaped this wrapper, and
+    # therefore escaped the caller's `except EnrollmentError` — killing the
+    # heartbeat thread outright on 2026-08-06, the moment a deploy restarted the
+    # control plane. The runner went on claiming work perfectly well while the
+    # admin page showed the host offline for as long as the process lived.
+    # URLError and TimeoutError are both OSError subclasses, so this is wider
+    # than what it replaces rather than different from it.
+    except (OSError, ValueError) as exc:
         raise EnrollmentError(f"{url} unreachable: {exc}") from exc
 
 
@@ -462,6 +477,21 @@ class HostHeartbeat:
                     "agent_host_heartbeat_failed",
                     exc_info=True,
                     extra={"event": "agent_host_heartbeat_failed", "host": self._identity.host},
+                )
+            except Exception:
+                # Nothing gets to kill this thread. The `EnrollmentError` arm
+                # above is the intended path and stays the documented one; this
+                # exists because an exception type nobody anticipated reaching
+                # here already did, and the cost was silent and lasting: a
+                # thread that dies is never restarted, so the host reports
+                # offline for the life of the process while claiming work
+                # normally the whole time. An operator reading that page sees a
+                # dead machine that is not dead, which is worse than an error.
+                #
+                # Deliberately after `HostRemoved`, which must still stop.
+                logger.exception(
+                    "agent_host_heartbeat_crashed",
+                    extra={"event": "agent_host_heartbeat_crashed", "host": self._identity.host},
                 )
             self._stop.wait(self._identity.interval_s)
 
