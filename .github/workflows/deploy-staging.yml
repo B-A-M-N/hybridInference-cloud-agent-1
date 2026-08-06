@@ -1,0 +1,81 @@
+name: Deploy Staging
+
+# Merging to dev deploys. Until now "deployed" and "merged" were unrelated
+# facts about this repository — #29 recovered two real fixes from a host whose
+# tree had drifted from every commit GitHub had ever seen, and `.deployed-sha`
+# named a commit that 404s. This is the thing that stops that recurring.
+#
+# It runs *on* spark2, because the CI runners are installed there and that is
+# also the deployment target, owned by the same user. So there is no SSH key,
+# no known_hosts secret and no sudo here. The gateway's equivalent carries
+# sixty lines of host-key handling for the sole reason that its runners are on
+# a different machine from its target.
+#
+# **To roll back**, dispatch this workflow with `sha` set to the commit to go
+# back to. Rollback is a deploy of an older commit; it is not a separate
+# mechanism, and inventing one would mean the emergency path is the one that
+# has never been exercised.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    branches: [dev]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit to deploy (defaults to this branch's head). Set it to roll back.
+        required: false
+
+concurrency:
+  group: cloud-agent-staging-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy control plane + web
+    # `CI` is one workflow with a `CI Gate` job precisely so this condition can
+    # be a single conclusion. It was four workflows until #31; gating on one of
+    # four would have meant treating "that workflow was filtered out" and "that
+    # workflow has not started" as the same thing, and deploying on the second.
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success') }}
+    runs-on: [self-hosted, Linux, deploy-cloud-agent]
+    timeout-minutes: 30
+
+    steps:
+      - name: Resolve the commit to deploy
+        id: target
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          sha="${INPUT_SHA:-${RUN_SHA:-${GITHUB_SHA}}}"
+          echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
+          echo "deploying ${sha}"
+
+      # Checked out at the target commit so the script that runs is the one
+      # being shipped: a change to deploy.sh takes effect in the deploy that
+      # carries it, rather than one deploy later.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Deploy
+        run: bash deploy/control-plane/deploy.sh "${{ steps.target.outputs.sha }}"
+
+      - name: What is running now
+        if: always()
+        run: |
+          echo "deployed sha on host: $(cat /srv/freeinference-cloud-agent/.deployed-sha 2>/dev/null || echo unknown)"
+          docker compose -p cloudagent \
+            --env-file /srv/freeinference-cloud-agent/.env \
+            -f /srv/freeinference-cloud-agent/deploy/control-plane/docker-compose.yml \
+            ps 2>/dev/null || true

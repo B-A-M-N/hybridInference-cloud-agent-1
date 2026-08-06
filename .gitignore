@@ -37,3 +37,6 @@ out/
 # Local agent workspaces
 /workspaces/
 next-env.d.ts
+
+# Written by deploy.sh on the deployment host: which commit is actually running.
+.deployed-sha
