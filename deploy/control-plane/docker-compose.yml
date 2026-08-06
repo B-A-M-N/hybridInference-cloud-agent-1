@@ -253,6 +253,15 @@ services:
 
 networks:
   control-plane:
+    # **Named, so another stack can join it.** The gateway's frontend proxies
+    # `/agents/*` here (its `next.config.js` rewrites are this deployment's
+    # routing table), which means it has to resolve `web` and `control-plane`
+    # by name — and a compose-derived name like `cloudagent_control-plane`
+    # depends on the project name whoever ran `up` happened to use.
+    #
+    # The gateway's own overlay names its networks the same way and for the
+    # same reason; this is that pattern, pointed the other direction.
+    name: ${AGENT_NETWORK_NAME:-cloud-agent}
     driver: bridge
 
 volumes:
