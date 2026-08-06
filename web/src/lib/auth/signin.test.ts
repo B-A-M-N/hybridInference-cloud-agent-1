@@ -70,3 +70,52 @@ describe('callbackUri', () => {
     expect(url.searchParams.get('redirect_uri')).toBe(`${ORIGIN}/agents/callback`);
   });
 });
+
+// The other direction, and the reason both live in this module.
+//
+// `callbackUri()` *adds* the prefix because it hands a URL to the gateway.
+// `safeReturnTo()` *strips* it because it hands a path to Next's router, which
+// prefixes what it is given. Get that backwards and the prefix is applied
+// twice: signing in at `/agents` returned to `/agents/agents`, which the app
+// resolved as a job whose id was `agents` and rendered as "No such agent job:
+// agents". A page that loads, and is wrong.
+describe('safeReturnTo', () => {
+  const original = process.env.NEXT_PUBLIC_BASE_PATH;
+
+  afterEach(() => {
+    if (original === undefined) delete process.env.NEXT_PUBLIC_BASE_PATH;
+    else process.env.NEXT_PUBLIC_BASE_PATH = original;
+    vi.resetModules();
+  });
+
+  it('strips the base path the browser reported', async () => {
+    const { safeReturnTo } = await loadSignin('/agents');
+    expect(safeReturnTo('/agents')).toBe('/');
+    expect(safeReturnTo('/agents/ajob_123')).toBe('/ajob_123');
+    expect(safeReturnTo('/agents/archived?x=1')).toBe('/archived?x=1');
+  });
+
+  it('leaves a path that is already internal alone', async () => {
+    const { safeReturnTo } = await loadSignin('/agents');
+    // Not `/agents`-prefixed, so nothing to strip — and stripping a bare
+    // prefix match would turn `/agentsomething` into `omething`.
+    expect(safeReturnTo('/agentsomething')).toBe('/agentsomething');
+    expect(safeReturnTo('/archived')).toBe('/archived');
+  });
+
+  it('is a no-op when the app owns its origin', async () => {
+    const { safeReturnTo } = await loadSignin('');
+    expect(safeReturnTo('/agents/ajob_1')).toBe('/agents/ajob_1');
+    expect(safeReturnTo('/archived')).toBe('/archived');
+  });
+
+  it('refuses anything that is not a same-site path', async () => {
+    const { safeReturnTo } = await loadSignin('/agents');
+    // A returnTo survives a round trip through another origin, so it is
+    // attacker-influenced by construction.
+    expect(safeReturnTo('//evil.example/x')).toBe('/');
+    expect(safeReturnTo('https://evil.example/x')).toBe('/');
+    expect(safeReturnTo(undefined)).toBe('/');
+    expect(safeReturnTo('')).toBe('/');
+  });
+});

@@ -31,6 +31,31 @@ export function callbackUri(): string {
   return `${window.location.origin}${basePath}${CALLBACK_PATH}`;
 }
 
+/**
+ * Only same-site paths, expressed the way the router speaks them.
+ *
+ * Two jobs, and the second one is not obvious.
+ *
+ * **Same-site.** A `returnTo` is attacker-influenced — it survives a round trip
+ * through another origin — so anything that is not a single-slash-rooted path
+ * goes to `/`.
+ *
+ * **Strip `basePath`.** Next's router prefixes what it is given, and a path
+ * captured from `window.location.pathname` already carries the prefix. Handed
+ * back unchanged it is applied twice: signing in at `/agents` returned to
+ * `/agents/agents`, which the app resolved as a job whose id was `agents` and
+ * rendered as "No such agent job". The mirror of {@link callbackUri}, which has
+ * to *add* the prefix because it hands a URL to the gateway rather than to the
+ * router.
+ */
+export function safeReturnTo(candidate: string | undefined): string {
+  if (!candidate || !candidate.startsWith('/') || candidate.startsWith('//')) return '/';
+  if (!basePath) return candidate;
+  if (candidate === basePath) return '/';
+  if (candidate.startsWith(`${basePath}/`)) return candidate.slice(basePath.length);
+  return candidate;
+}
+
 /** Thrown when this deployment has no gateway to sign in against. */
 export class SignInNotConfigured extends Error {}
 

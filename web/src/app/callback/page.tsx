@@ -21,15 +21,9 @@ import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useAuth } from '@/components/providers';
 import { exchangeAuthorizationCode, startSession } from '@/lib/api/session';
-import { callbackUri } from '@/lib/auth/signin';
+import { callbackUri, safeReturnTo } from '@/lib/auth/signin';
 import { hasPending, takePending } from '@/lib/auth/pkce';
 import { getErrorMessage } from '@/lib/utils/errors';
-
-/** Only same-site paths. A returnTo from the query string is never trusted. */
-function safeReturnTo(candidate: string | undefined): string {
-  if (!candidate || !candidate.startsWith('/') || candidate.startsWith('//')) return '/';
-  return candidate;
-}
 
 function CallbackContent() {
   const router = useRouter();
