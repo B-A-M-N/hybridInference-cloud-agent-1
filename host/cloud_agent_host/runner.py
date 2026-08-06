@@ -1187,13 +1187,34 @@ def run_once(
 
 
 def _broker_url_from_env() -> str | None:
-    """This host's broker address, as the control plane will reach it.
+    """This host's broker address, **as the control plane will reach it**.
 
-    Read from the same variable `workspace_broker_client` uses, so the address
-    a host *reports* cannot drift from the one it *serves* — a row pointing at
-    a broker this machine is not running answers 409 for every file and
-    terminal request on its jobs.
+    Defaults to the same variable `workspace_broker_client` uses, so the
+    address a host *reports* cannot drift from the one it *serves* — a row
+    pointing at a broker this machine is not running answers 409 for every file
+    and terminal request on its jobs. That is right whenever both readers sit
+    on the same network, which is every co-located deployment.
+
+    It stops being right the moment the control plane is on another machine.
+    `AGENT_WORKSPACE_BROKER_URL` is a compose service name; it resolves here and
+    nowhere else. Reported verbatim, the control plane stores an address it
+    cannot resolve, and the first call that needs the broker — a terminal
+    suspend, a file listing — fails with a DNS error surfaced as 503. Every
+    attempt then dies at the same point until the job runs out of them, which
+    is what happened to the first real job on this deployment.
+
+    So the two questions are separated, and only when a deployment says so:
+
+    * `AGENT_WORKSPACE_BROKER_URL` — how *this runner* reaches its own broker.
+    * `AGENT_WORKSPACE_BROKER_ADVERTISE_URL` — how *the control plane* reaches
+      it, when that is a different address (a reverse tunnel's far end).
+
+    Unset, the second is the first, and the drift the original comment warns
+    about remains impossible without somebody explicitly asking for it.
     """
+    advertised = (os.environ.get("AGENT_WORKSPACE_BROKER_ADVERTISE_URL") or "").strip()
+    if advertised:
+        return advertised
     return (os.environ.get("AGENT_WORKSPACE_BROKER_URL") or "").strip() or None
 
 
