@@ -37,7 +37,18 @@ concurrency:
 jobs:
   build:
     name: Build ${{ matrix.image.name }}
-    runs-on: ubuntu-latest
+    # ARM64 because spark2 — where the control plane and web run — is ARM64,
+    # so `control-plane` is built for the machine that will run it.
+    #
+    # It is NOT the architecture of the runner host, which is a different
+    # machine and not necessarily ARM: `runner`, `sandbox`, `egress-proxy` and
+    # `gateway-tunnel` are therefore verified to *build*, on an architecture
+    # that may not be where they are deployed. That is what this job has always
+    # claimed (`push: false` — the point is that the build resolves), and it is
+    # not a regression from ubuntu-latest, which matched neither host. Closing
+    # the gap needs an x86 runner in the CI pool and is worth doing once the
+    # runner host's own deployment target is settled.
+    runs-on: [self-hosted, Linux, ARM64, image-verify-arm64]
     strategy:
       fail-fast: false
       matrix:
@@ -53,13 +64,34 @@ jobs:
           - name: control-plane
             dockerfile: deploy/control-plane/Dockerfile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: docker/setup-buildx-action@v3
 
       # Build only — never push. These images carry no credentials and this
       # repository publishes none; the point is that the build resolves.
       - name: Build ${{ matrix.image.name }}
+        id: build
+        # A transient buildkit/runner recycle surfaces as graceful_stop on this
+        # pool. Recreate the builder and retry once before failing the cell.
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.image.dockerfile }}
+          push: false
+          load: false
+          cache-from: type=gha,scope=${{ matrix.image.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
+
+      - name: Set up Docker Buildx (retry)
+        if: steps.build.outcome == 'failure'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.image.name }} (retry)
+        if: steps.build.outcome == 'failure'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -71,9 +103,11 @@ jobs:
 
   egress-proxy-starts:
     name: The egress proxy stays up
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, ARM64, image-verify-arm64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       # **Building it proves nothing about whether it runs**, and this is the
       # job that exists because of what that cost.
@@ -90,24 +124,48 @@ jobs:
       # Nothing textual would have caught it: the broken config parsed, and so
       # did a first attempted fix (`cache_effective_user root`, which squid
       # rejects outright). Only starting the thing does.
+      #
+      # A self-hosted runner shares its machine, its /tmp and its image store
+      # with every other job on it, so the tag and the rendered config are
+      # per-run. Two runs colliding on `egress-proxy:ci` would have one testing
+      # the other's image.
+      - name: Name this run's artifacts
+        run: |
+          echo "IMAGE_TAG=egress-proxy:ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "${GITHUB_ENV}"
+          echo "SQUID_CONF=${RUNNER_TEMP}/squid.conf" >> "${GITHUB_ENV}"
+
       - name: Build the image
-        run: docker build -f deploy/host/Dockerfile.agent-egress-proxy -t egress-proxy:ci .
+        run: docker build -f deploy/host/Dockerfile.agent-egress-proxy -t "${IMAGE_TAG}" .
+
+      - name: Isolate uv cache dir
+        run: |
+          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-${GITHUB_RUN_ID}-${GITHUB_JOB}" >> "${GITHUB_ENV}"
+
+      # setup-uv rather than `pipx install uv || pip install uv`: on a
+      # self-hosted runner that second branch installs into the machine's
+      # system Python, where a modern Debian/Ubuntu refuses it outright
+      # (externally-managed-environment) and an older one silently mutates a
+      # shared interpreter every other job also uses.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+          prune-cache: false
 
       - name: Render a config the way the runner does
         run: |
           set -euo pipefail
-          pipx install uv 2>/dev/null || pip install uv
           uv run --with-editable . python -c "
           from cloud_agent_host.egress_proxy import build_config_from_env
-          import pathlib
-          pathlib.Path('/tmp/squid.conf').write_text(
+          import os, pathlib
+          pathlib.Path(os.environ['SQUID_CONF']).write_text(
               build_config_from_env({'AGENT_EGRESS_ALLOWLIST': 'registry.npmjs.org'})
           )"
 
       - name: It must still be running, and serving
         run: |
           set -euo pipefail
-          cid=$(docker run -d -v /tmp/squid.conf:/etc/squid/generated/squid.conf:ro egress-proxy:ci)
+          cid=$(docker run -d -v "${SQUID_CONF}":/etc/squid/generated/squid.conf:ro "${IMAGE_TAG}")
           sleep 10
           state=$(docker inspect "$cid" --format '{{.State.Status}}')
           docker logs "$cid" 2>&1 | tail -30
@@ -123,11 +181,30 @@ jobs:
           }
           docker rm -f "$cid" >/dev/null
 
+      # A hosted runner is discarded; this one is not. Without this the image
+      # store grows by one squid image per run until the disk fills, and the
+      # symptom lands on whatever job happens to be running at the time.
+      - name: Drop this run's image
+        if: always()
+        run: docker image rm -f "${IMAGE_TAG}" >/dev/null 2>&1 || true
+
   compose:
     name: Compose resolves
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, ARM64, image-verify-arm64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Isolate uv cache dir
+        run: |
+          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-${GITHUB_RUN_ID}-${GITHUB_JOB}" >> "${GITHUB_ENV}"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+          prune-cache: false
 
       # The images building proves the Dockerfiles; it says nothing about the
       # file that wires them together. `config` is Compose's own parser: it
@@ -166,9 +243,9 @@ jobs:
           docker compose \
             -f deploy/host/docker-compose.agent-remote-runner.yml \
             --env-file .env \
-            config > /tmp/rendered.yml
+            config > ${RUNNER_TEMP}/rendered.yml
           echo "--- rendered services ---"
-          docker compose -f /tmp/rendered.yml config --services
+          docker compose -f ${RUNNER_TEMP}/rendered.yml config --services
 
       # The other machine. Same reasoning, different failure: a required
       # secret that quietly became optional, or a variable renamed in code and
@@ -198,8 +275,8 @@ jobs:
           docker compose \
             -f deploy/control-plane/docker-compose.yml \
             --env-file .env.control-plane \
-            config > /tmp/control-plane.yml
-          docker compose -f /tmp/control-plane.yml config --services
+            config > ${RUNNER_TEMP}/control-plane.yml
+          docker compose -f ${RUNNER_TEMP}/control-plane.yml config --services
 
       # The `:?` markers are the deployment's only defence against a service
       # that starts with a signing key somebody left blank. This asserts they
@@ -234,9 +311,13 @@ jobs:
       - name: The rendered stack keeps its security properties
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import sys, yaml
-          stack = yaml.safe_load(open("/tmp/rendered.yml"))
+          # `uv run --with pyyaml`, not a bare python3: a self-hosted runner is
+          # whatever the machine has, and PyYAML is preinstalled on a hosted
+          # image rather than guaranteed. The heredoc is quoted, so the path
+          # comes through the environment rather than shell interpolation.
+          uv run --no-project --with pyyaml python - <<'PY'
+          import os, sys, yaml
+          stack = yaml.safe_load(open(os.environ["RUNNER_TEMP"] + "/rendered.yml"))
           failures = []
 
           egress = stack["networks"].get("agent-egress", {})
