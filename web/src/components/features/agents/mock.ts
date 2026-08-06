@@ -211,7 +211,7 @@ export const AGENT_JOBS: AgentJob[] = [
     id: 'job-1d5f',
     title: 'Migrate api_logs export to Parquet',
     state: 'failed',
-    stateNote: 'budget exceeded · $2.00 cap',
+    stateNote: "owner's daily quota exhausted · gateway 429",
     repo: 'hybridInference',
     baseSha: 'd966a24',
     branch: 'agent/job-1d5f',
@@ -226,7 +226,10 @@ export const AGENT_JOBS: AgentJob[] = [
     attempts: [{ no: 1, status: 'finished' }],
     events: [
       { kind: 'lifecycle', text: 'Sandbox provisioned · setup ran from lockfile (2m 48s)' },
-      { kind: 'lifecycle', text: 'Job stopped: budget cap reached ($2.00) — no patch published' },
+      {
+        kind: 'lifecycle',
+        text: "Job stopped: the gateway refused a model call — the owner's daily quota is exhausted — no patch published",
+      },
     ],
     eventCount: 302,
     diffFiles: [],

@@ -57,7 +57,6 @@ class FakeJobStore:
             "role": "internal",
             "job_id": job_id,
             "mcp_servers": list(self.granted),
-            "budget_usd": 5.0,
             "model": "glm-5.1",
         }
 
