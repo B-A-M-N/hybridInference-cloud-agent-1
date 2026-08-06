@@ -1,42 +1,355 @@
-name: Docker Build
+name: CI
 
-# The acceptance check for the deploy files. Their diff is mostly path edits,
-# and a `COPY` naming a path from the source repo's layout fails at build time
-# on a runner host — long after review, in the one place nobody is watching.
-# Building both images here is what turns "the paths look right" into a fact.
+# One workflow, because the deployment hangs off it.
+#
+# This was four — Backend CI, Web CI, Secret Scan, Docker Build — each with its
+# own `paths:` filter. That arrangement cannot produce a trustworthy "this
+# commit is good" signal, which is exactly what a deploy needs to gate on. A
+# backend-only change does not run Web CI at all, and over the API a workflow
+# that was filtered out is indistinguishable from one that has not started yet:
+# both are simply absent. A deploy reading that has to treat "absent" as "fine",
+# and the first time it is wrong it ships unverified code to a live host.
+#
+# Inside one workflow the same condition is a *state*: a job whose paths did not
+# match is `skipped`, which is reported, not missing. `CI Gate` can then assert
+# that every job either succeeded or was skipped, and `deploy-staging.yml`
+# hangs off this workflow alone.
+#
+# The path filters keep their meaning — they moved from four `on:` blocks into
+# the `changes` job below, which is also the only place they now have to agree
+# with each other.
 
 on:
   workflow_dispatch:
   push:
     branches: [main, dev]
-    paths:
-      - 'deploy/**'
-      - 'host/**'
-      - 'pyproject.toml'
-      - 'uv.lock'
-      # Dockerfile.agent-runner COPYs it alongside pyproject/uv.lock, so
-      # deleting or renaming it breaks the build and nothing else would notice.
-      - 'README.md'
-      - '.github/workflows/docker-build.yml'
   pull_request:
     branches: [main, dev]
-    paths:
-      - 'deploy/**'
-      - 'host/**'
-      - 'pyproject.toml'
-      - 'uv.lock'
-      # Dockerfile.agent-runner COPYs it alongside pyproject/uv.lock, so
-      # deleting or renaming it breaks the build and nothing else would notice.
-      - 'README.md'
-      - '.github/workflows/docker-build.yml'
 
 concurrency:
-  group: docker-build-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  PYTHON_VERSION: "3.12"
+  UV_VERSION: "0.9.7"
+  NODE_VERSION: "22"
+  GITLEAKS_VERSION: "8.30.1"
+
 jobs:
+  changes:
+    name: Classify Changes
+    runs-on: [self-hosted, Linux, ci-general]
+    outputs:
+      backend: ${{ steps.classify.outputs.backend }}
+      web: ${{ steps.classify.outputs.web }}
+      docker: ${{ steps.classify.outputs.docker }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Full fetch: the diff below needs both endpoints, and shallow-clone
+          # packs with missing delta bases have been failing random checkouts
+          # on this pool.
+          fetch-depth: 0
+
+      - name: Classify changed paths
+        id: classify
+        env:
+          BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          # Fails open: anything this cannot resolve — a dispatch, a first push
+          # to a new branch, a base commit the runner does not have — runs
+          # everything. A misclassification that skips is a job that silently
+          # did not check; one that over-runs costs a minute.
+          files=""
+          resolved=false
+          case "${GITHUB_EVENT_NAME}" in
+            pull_request)
+              if [ -n "${PR_BASE_SHA:-}" ] && git cat-file -e "${PR_BASE_SHA}^{commit}" 2>/dev/null; then
+                files="$(git diff --name-only "${PR_BASE_SHA}" "${GITHUB_SHA}")"
+                resolved=true
+              fi
+              ;;
+            push)
+              if [ -n "${BEFORE:-}" ] \
+                 && [ "${BEFORE}" != "0000000000000000000000000000000000000000" ] \
+                 && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+                files="$(git diff --name-only "${BEFORE}" "${GITHUB_SHA}")"
+                resolved=true
+              fi
+              ;;
+          esac
+
+          if [ "${resolved}" != "true" ]; then
+            echo "could not resolve a diff range (${GITHUB_EVENT_NAME}) — running everything"
+            {
+              echo "backend=true"
+              echo "web=true"
+              echo "docker=true"
+            } >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "--- changed files ---"
+          printf '%s\n' "${files}"
+          echo "---------------------"
+
+          matches() { printf '%s\n' "${files}" | grep -qE "$1"; }
+
+          # Backend: everything that is not purely docs or the web app. This is
+          # the old `paths-ignore` inverted, so it stays true by default — a new
+          # top-level directory runs the backend checks rather than skipping
+          # them unnoticed.
+          if printf '%s\n' "${files}" \
+             | grep -vE '^(docs/|web/)' \
+             | grep -vE '(\.md|LICENSE|\.gitignore)$' \
+             | grep -q .; then
+            backend=true
+          else
+            backend=false
+          fi
+
+          # Web: the app itself.
+          if matches '^web/'; then web=true; else web=false; fi
+
+          # Docker: the deploy files and what they COPY. README.md is here
+          # because Dockerfile.agent-runner COPYs it alongside pyproject/uv.lock,
+          # so deleting or renaming it breaks the build and nothing else notices.
+          if matches '^(deploy/|host/)' || matches '^(pyproject\.toml|uv\.lock|README\.md)$'; then
+            docker=true
+          else
+            docker=false
+          fi
+
+          # A change to CI itself runs all of it: the thing being changed is the
+          # checking, and a filtered CI edit is checked by nothing.
+          if matches '^\.github/workflows/'; then
+            backend=true; web=true; docker=true
+          fi
+
+          {
+            echo "backend=${backend}"
+            echo "web=${web}"
+            echo "docker=${docker}"
+          } | tee -a "${GITHUB_OUTPUT}"
+
+  # ---------------------------------------------------------------- backend
+  lint:
+    name: ${{ matrix.check.name }}
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: [self-hosted, Linux, ci-general]
+    strategy:
+      fail-fast: false
+      matrix:
+        check:
+          - name: Ruff Format
+            command: uv run ruff format --check .
+          - name: Ruff Lint
+            command: uv run ruff check --no-fix .
+          - name: Pydocstyle
+            command: uv run pydocstyle backend host
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Full fetch: GitHub intermittently serves shallow-clone packs with
+          # missing delta bases ("pack has N unresolved deltas"), which fails
+          # random jobs at checkout on this pool. A full fetch is immune.
+          fetch-depth: 0
+
+      - name: Isolate uv cache dir
+        # Set via GITHUB_ENV because job-level env cannot use the runner
+        # context. The default ~/.cache/uv is shared by every runner process on
+        # the machine, and an entry disappearing mid-install fails the job with
+        # ENOENT while uv hardlinks into the venv. RUNNER_TEMP belongs to one
+        # runner process, which runs one job at a time — that is the whole
+        # isolation, so the path carries nothing else.
+        #
+        # In particular it must NOT carry GITHUB_RUN_ID. The cache service
+        # derives an entry's version from the paths being cached, so a
+        # per-run path misses on every restore and uploads a fresh copy every
+        # time, which is both no cache at all and a fast way through the 10 GB
+        # per-repository limit.
+        run: |
+          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache" >> "${GITHUB_ENV}"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          # Even with UV_CACHE_DIR off the shared default, prune --ci is
+          # unnecessary on self-hosted and has raced with concurrent installs.
+          prune-cache: false
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync dependencies
+        run: uv sync
+
+      - name: ${{ matrix.check.name }}
+        run: ${{ matrix.check.command }}
+
+  test:
+    name: Tests
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: [self-hosted, Linux, ci-general]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Isolate uv cache dir
+        run: |
+          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache" >> "${GITHUB_ENV}"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          prune-cache: false
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync dependencies
+        run: uv sync
+
+      # -n 4 --dist loadfile, not a serial run: parallel workers isolate each
+      # test file into its own process, which is what surfaces environment
+      # leakage between files. A serial run silently passes on that class of bug.
+      - name: Pytest
+        run: uv run pytest -n 4 --dist loadfile -q -m "not external and not dbtest"
+  # -------------------------------------------------------------------- web
+  check:
+    name: Web ${{ matrix.check.name }}
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: [self-hosted, Linux, ci-general]
+    strategy:
+      fail-fast: false
+      matrix:
+        check:
+          - name: ESLint
+            command: npm run lint
+          - name: Prettier
+            command: npm run format:check
+          - name: TypeScript
+            command: npm run type-check
+          - name: Tests
+            command: npm run test
+          - name: Build
+            command: npm run build
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Full fetch: shallow-clone packs with missing delta bases have been
+          # failing random checkouts on this pool.
+          fetch-depth: 0
+
+      # web/ is an empty placeholder until task F1 lands the Next.js app. Until
+      # then this workflow is a deliberate no-op rather than a red X: gating on
+      # the manifest keeps the required-check list stable across that boundary.
+      - name: Detect web app
+        id: detect
+        run: |
+          if [ -f web/package.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "web/package.json not present yet — skipping (task F1)"
+          fi
+
+      - name: Isolate the npm cache dir
+        # Off the shared ~/.npm and onto this runner process's own temp, which
+        # runs one job at a time. Set before setup-node, which reads
+        # `npm config get cache` to decide where to restore into.
+        #
+        # Stable, with no run id in it: the cache service versions an entry by
+        # the paths it covers, so a per-run path would never restore and would
+        # upload a new copy of node_modules' cache on all five cells, every
+        # run. Same reasoning as UV_CACHE_DIR in backend-ci.
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          echo "npm_config_cache=${RUNNER_TEMP}/npm-cache" >> "${GITHUB_ENV}"
+
+      - name: Set up Node
+        if: steps.detect.outputs.present == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        if: steps.detect.outputs.present == 'true'
+        working-directory: ./web
+        run: npm ci
+
+      - name: ${{ matrix.check.name }}
+        if: steps.detect.outputs.present == 'true'
+        working-directory: ./web
+        run: ${{ matrix.check.command }}
+  # ------------------------------------------------------------------ secret
+  gitleaks:
+    name: Gitleaks
+    runs-on: [self-hosted, Linux, ci-general]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # Installing the release binary rather than using gitleaks-action, which
+      # requires a paid license for organization repositories.
+      #
+      # Into RUNNER_TEMP and onto GITHUB_PATH, not `sudo install` into
+      # /usr/local/bin: this runner's machine outlives the job and is shared.
+      # A system-wide write means the gateway's CI and this one overwrite each
+      # other's binary — today at the same version, silently at different ones
+      # the moment either bumps GITLEAKS_VERSION, and the scan that runs is
+      # then whichever job installed last. Unpacking outside the workspace also
+      # keeps the tarball out of the tree the next step scans.
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) arch="x64" ;;
+            aarch64|arm64) arch="arm64" ;;
+            *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
+          esac
+          asset="gitleaks_${GITLEAKS_VERSION}_linux_${arch}.tar.gz"
+          base_url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          bindir="${RUNNER_TEMP}/bin"
+          mkdir -p "${bindir}"
+          cd "${RUNNER_TEMP}"
+          curl -fsSLO "${base_url}/${asset}"
+          curl -fsSLO "${base_url}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep "  ${asset}$" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" > gitleaks.sha256
+          sha256sum -c gitleaks.sha256
+          tar -xzf "${asset}" gitleaks
+          install -m 0755 gitleaks "${bindir}/gitleaks"
+          echo "${bindir}" >> "${GITHUB_PATH}"
+          "${bindir}/gitleaks" version
+
+      - name: Scan working tree
+        run: gitleaks detect --source . --no-git --redact --verbose --no-banner
+
+      # This repository is intended to be open-sourced with its history intact,
+      # so history is scanned too — a secret removed in a later commit is still
+      # published by the commit that introduced it.
+      - name: Scan history
+        run: gitleaks detect --source . --redact --verbose --no-banner
+  # ------------------------------------------------------------------ docker
   build:
     name: Build ${{ matrix.image.name }}
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
     # ARM64 because spark2 — where the control plane and web run — is ARM64,
     # so `control-plane` is built for the machine that will run it.
     #
@@ -103,6 +416,8 @@ jobs:
 
   egress-proxy-starts:
     name: The egress proxy stays up
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
     runs-on: [self-hosted, Linux, ARM64, image-verify-arm64]
     steps:
       - uses: actions/checkout@v6
@@ -201,6 +516,8 @@ jobs:
 
   compose:
     name: Compose resolves
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
     runs-on: [self-hosted, Linux, ARM64, image-verify-arm64]
     steps:
       - uses: actions/checkout@v6
@@ -358,3 +675,59 @@ jobs:
               print("\n".join(failures)); sys.exit(1)
           print("rendered stack: egress internal, docker socket read-only")
           PY
+
+  # -------------------------------------------------------------------- gate
+  ci-gate:
+    name: CI Gate
+    # The single job that says whether this commit is good. `deploy-staging.yml`
+    # keys on this workflow's conclusion, so this is what stands between a merge
+    # to dev and a rebuild of the staging stack.
+    if: always()
+    runs-on: [self-hosted, Linux, ci-general]
+    needs:
+      - changes
+      - lint
+      - test
+      - check
+      - gitleaks
+      - build
+      - egress-proxy-starts
+      - compose
+    steps:
+      - name: Every job succeeded or was deliberately skipped
+        env:
+          RESULTS: >-
+            changes=${{ needs.changes.result }}
+            lint=${{ needs.lint.result }}
+            test=${{ needs.test.result }}
+            web=${{ needs.check.result }}
+            gitleaks=${{ needs.gitleaks.result }}
+            build=${{ needs.build.result }}
+            egress=${{ needs.egress-proxy-starts.result }}
+            compose=${{ needs.compose.result }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+        run: |
+          set -euo pipefail
+          echo "${RESULTS}" | tr ' ' '\n' | sed '/^$/d'
+
+          # `skipped` is ambiguous on its own: a job skipped by its `if` and a
+          # job skipped because something it needed failed report the same
+          # word. The classifier is the only thing every other job needs, so
+          # requiring it to have succeeded is what makes the rest of the
+          # skipped/success test meaningful.
+          if [ "${CHANGES_RESULT}" != "success" ]; then
+            echo "::error title=CI Gate::the change classifier did not succeed (${CHANGES_RESULT}); every downstream skip is unexplained"
+            exit 1
+          fi
+
+          failed=0
+          for entry in ${RESULTS}; do
+            name="${entry%%=*}"
+            result="${entry#*=}"
+            case "${result}" in
+              success|skipped) ;;
+              *) echo "::error title=CI Gate::${name} is ${result}"; failed=1 ;;
+            esac
+          done
+          [ "${failed}" -eq 0 ] || exit 1
+          echo "CI Gate: green"
