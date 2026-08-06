@@ -79,3 +79,54 @@ jobs:
             --env-file /srv/freeinference-cloud-agent/.env \
             -f /srv/freeinference-cloud-agent/deploy/control-plane/docker-compose.yml \
             ps 2>/dev/null || true
+
+  deploy-host:
+    name: Deploy runner host
+    # The other machine. Independent of the job above and deliberately not
+    # `needs:`-ed to it: they are separate hosts, and a control plane that fails
+    # to come up is not a reason to leave the runner host on an older commit —
+    # nor the reverse. Both gate on the same CI conclusion.
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success') }}
+    runs-on: [self-hosted, Linux, deploy-agent-host]
+    timeout-minutes: 45
+    concurrency:
+      group: cloud-agent-host-deploy
+      cancel-in-progress: false
+
+    steps:
+      - name: Resolve the commit to deploy
+        id: target
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          sha="${INPUT_SHA:-${RUN_SHA:-${GITHUB_SHA}}}"
+          echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
+          echo "deploying ${sha}"
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Deploy
+        env:
+          # A repository variable rather than a literal: this path differs per
+          # machine (the host user has no write access to /srv there) and a
+          # deployment path does not belong in a repository that is going to be
+          # public.
+          DEPLOY_ROOT: ${{ vars.AGENT_HOST_DEPLOY_ROOT }}
+        run: bash deploy/host/deploy.sh "${{ steps.target.outputs.sha }}"
+
+      - name: What is running now
+        if: always()
+        env:
+          DEPLOY_ROOT: ${{ vars.AGENT_HOST_DEPLOY_ROOT }}
+        run: |
+          echo "deployed sha on host: $(cat "${DEPLOY_ROOT}/.deployed-sha" 2>/dev/null || echo unknown)"
+          docker ps --filter label=com.docker.compose.project=hybridinference-agent-remote \
+            --format '  {{.Names}}  {{.Status}}' 2>/dev/null || true

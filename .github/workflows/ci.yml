@@ -350,32 +350,35 @@ jobs:
     name: Build ${{ matrix.image.name }}
     needs: changes
     if: needs.changes.outputs.docker == 'true'
-    # ARM64 because spark2 — where the control plane and web run — is ARM64,
-    # so `control-plane` is built for the machine that will run it.
+    # **Each image builds on the architecture it is deployed to.** These five do
+    # not all run in the same place: `control-plane` runs on spark2 (ARM64) with
+    # the web app, and the other four run on the runner host (x86_64), which is
+    # a different machine. Building them all in one place verified four of them
+    # against an architecture they never see — the build resolving on aarch64
+    # says nothing about a base image without an amd64 layer, or the reverse.
     #
-    # It is NOT the architecture of the runner host, which is a different
-    # machine and not necessarily ARM: `runner`, `sandbox`, `egress-proxy` and
-    # `gateway-tunnel` are therefore verified to *build*, on an architecture
-    # that may not be where they are deployed. That is what this job has always
-    # claimed (`push: false` — the point is that the build resolves), and it is
-    # not a regression from ubuntu-latest, which matched neither host. Closing
-    # the gap needs an x86 runner in the CI pool and is worth doing once the
-    # runner host's own deployment target is settled.
-    runs-on: [self-hosted, Linux, ARM64, image-verify-arm64]
+    # `push: false` still: nothing here publishes. The point is that the build
+    # resolves *where it matters*.
+    runs-on: ${{ fromJSON(matrix.image.runner) }}
     strategy:
       fail-fast: false
       matrix:
         image:
           - name: runner
             dockerfile: deploy/host/Dockerfile.agent-runner
+            runner: '["self-hosted","Linux","X64","image-verify-x64"]'
           - name: sandbox
             dockerfile: deploy/sandbox/Dockerfile.agent-sandbox
+            runner: '["self-hosted","Linux","X64","image-verify-x64"]'
           - name: egress-proxy
             dockerfile: deploy/host/Dockerfile.agent-egress-proxy
+            runner: '["self-hosted","Linux","X64","image-verify-x64"]'
           - name: gateway-tunnel
             dockerfile: deploy/host/Dockerfile.agent-gateway-tunnel
+            runner: '["self-hosted","Linux","X64","image-verify-x64"]'
           - name: control-plane
             dockerfile: deploy/control-plane/Dockerfile
+            runner: '["self-hosted","Linux","ARM64","image-verify-arm64"]'
     steps:
       - uses: actions/checkout@v6
         with:
@@ -418,7 +421,12 @@ jobs:
     name: The egress proxy stays up
     needs: changes
     if: needs.changes.outputs.docker == 'true'
-    runs-on: [self-hosted, Linux, ARM64, image-verify-arm64]
+    # x86_64, because this job's whole point is that starting the thing proves
+    # what building it cannot — and the thing starts on the runner host. Squid
+    # opening its logs is exactly the kind of failure that could differ by base
+    # image layer, so proving it on the other architecture would prove the
+    # wrong one.
+    runs-on: [self-hosted, Linux, X64, image-verify-x64]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -518,6 +526,9 @@ jobs:
     name: Compose resolves
     needs: changes
     if: needs.changes.outputs.docker == 'true'
+    # The one docker job with no architecture to match: `docker compose config`
+    # parses and interpolates, it does not build or start anything. Left on the
+    # larger pool so it does not queue behind the x86 image builds.
     runs-on: [self-hosted, Linux, ARM64, image-verify-arm64]
     steps:
       - uses: actions/checkout@v6
