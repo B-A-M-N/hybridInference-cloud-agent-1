@@ -126,12 +126,14 @@ jobs:
       # rejects outright). Only starting the thing does.
       #
       # A self-hosted runner shares its machine, its /tmp and its image store
-      # with every other job on it, so the tag and the rendered config are
-      # per-run. Two runs colliding on `egress-proxy:ci` would have one testing
-      # the other's image.
+      # with every other job on it, so the tag, the container and the rendered
+      # config are per-run. Two runs colliding on `egress-proxy:ci` would have
+      # one testing the other's image.
       - name: Name this run's artifacts
         run: |
-          echo "IMAGE_TAG=egress-proxy:ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "${GITHUB_ENV}"
+          suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "IMAGE_TAG=egress-proxy:ci-${suffix}" >> "${GITHUB_ENV}"
+          echo "CONTAINER_NAME=egress-proxy-ci-${suffix}" >> "${GITHUB_ENV}"
           echo "SQUID_CONF=${RUNNER_TEMP}/squid.conf" >> "${GITHUB_ENV}"
 
       - name: Build the image
@@ -139,7 +141,7 @@ jobs:
 
       - name: Isolate uv cache dir
         run: |
-          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-${GITHUB_RUN_ID}-${GITHUB_JOB}" >> "${GITHUB_ENV}"
+          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache" >> "${GITHUB_ENV}"
 
       # setup-uv rather than `pipx install uv || pip install uv`: on a
       # self-hosted runner that second branch installs into the machine's
@@ -165,7 +167,10 @@ jobs:
       - name: It must still be running, and serving
         run: |
           set -euo pipefail
-          cid=$(docker run -d -v "${SQUID_CONF}":/etc/squid/generated/squid.conf:ro "${IMAGE_TAG}")
+          # Named, not just captured in `cid`: every branch below exits
+          # non-zero under `set -e` before any inline removal could run, so the
+          # container has to be reachable by the always() cleanup step instead.
+          cid=$(docker run -d --name "${CONTAINER_NAME}" -v "${SQUID_CONF}":/etc/squid/generated/squid.conf:ro "${IMAGE_TAG}")
           sleep 10
           state=$(docker inspect "$cid" --format '{{.State.Status}}')
           docker logs "$cid" 2>&1 | tail -30
@@ -179,14 +184,20 @@ jobs:
             echo "::error::the proxy is up but never accepted connections"
             exit 1
           }
-          docker rm -f "$cid" >/dev/null
 
-      # A hosted runner is discarded; this one is not. Without this the image
-      # store grows by one squid image per run until the disk fills, and the
-      # symptom lands on whatever job happens to be running at the time.
-      - name: Drop this run's image
+      # A hosted runner is discarded; this one is not. Without this the machine
+      # accumulates a squid container and image per run until the disk fills,
+      # and the symptom lands on whatever job happens to be running then.
+      #
+      # Container first: an image with a container still referencing it will
+      # not be removed, not even with `-f`, so cleaning up in the other order
+      # silently leaves both behind. Both failure branches above exit before
+      # any inline cleanup, which is exactly when this matters.
+      - name: Drop this run's container and image
         if: always()
-        run: docker image rm -f "${IMAGE_TAG}" >/dev/null 2>&1 || true
+        run: |
+          docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+          docker image rm -f "${IMAGE_TAG}" >/dev/null 2>&1 || true
 
   compose:
     name: Compose resolves
@@ -198,7 +209,7 @@ jobs:
 
       - name: Isolate uv cache dir
         run: |
-          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-${GITHUB_RUN_ID}-${GITHUB_JOB}" >> "${GITHUB_ENV}"
+          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache" >> "${GITHUB_ENV}"
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0

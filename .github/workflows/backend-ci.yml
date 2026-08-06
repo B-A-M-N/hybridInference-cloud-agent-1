@@ -50,21 +50,28 @@ jobs:
           fetch-depth: 0
 
       - name: Isolate uv cache dir
-        # Per-job UV_CACHE_DIR via GITHUB_ENV: job-level env cannot use the
-        # runner context. Concurrent self-hosted jobs otherwise share
-        # ~/.cache/uv; when a cache entry disappears mid-install, uv fails
-        # with ENOENT while hardlinking into the venv. The matrix cells all
-        # report the same GITHUB_JOB, so the cell index is part of the path.
+        # Set via GITHUB_ENV because job-level env cannot use the runner
+        # context. The default ~/.cache/uv is shared by every runner process on
+        # the machine, and an entry disappearing mid-install fails the job with
+        # ENOENT while uv hardlinks into the venv. RUNNER_TEMP belongs to one
+        # runner process, which runs one job at a time — that is the whole
+        # isolation, so the path carries nothing else.
+        #
+        # In particular it must NOT carry GITHUB_RUN_ID. The cache service
+        # derives an entry's version from the paths being cached, so a
+        # per-run path misses on every restore and uploads a fresh copy every
+        # time, which is both no cache at all and a fast way through the 10 GB
+        # per-repository limit.
         run: |
-          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-${GITHUB_RUN_ID}-${GITHUB_JOB}-${{ strategy.job-index }}" >> "${GITHUB_ENV}"
+          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache" >> "${GITHUB_ENV}"
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
-          # Even with a per-job UV_CACHE_DIR, prune --ci is unnecessary on
-          # self-hosted and has raced with concurrent installs.
+          # Even with UV_CACHE_DIR off the shared default, prune --ci is
+          # unnecessary on self-hosted and has raced with concurrent installs.
           prune-cache: false
 
       - name: Set up Python
@@ -86,7 +93,7 @@ jobs:
 
       - name: Isolate uv cache dir
         run: |
-          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-${GITHUB_RUN_ID}-${GITHUB_JOB}" >> "${GITHUB_ENV}"
+          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache" >> "${GITHUB_ENV}"
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
