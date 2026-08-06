@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
+import { usePathname, useRouter } from 'next/navigation';
 import { useEffect, useState } from 'react';
 import { ProtectedRoute } from '@/components/features/auth/ProtectedRoute';
 import { AgentsSidebar } from '@/components/features/agents/AgentsSidebar';
@@ -10,6 +10,10 @@ import { hasRole } from '@/components/providers/AuthProvider';
 import { useSiteConfig } from '@/components/providers/SiteConfigProvider';
 
 export const SIDEBAR_COLLAPSED_STORAGE_KEY = 'agents.sidebar.collapsed';
+
+const NAV_ITEM = 'rounded-md px-2.5 py-1.5 transition-colors hover:bg-gray-100 hover:text-gray-900';
+const NAV_ITEM_CURRENT =
+  'rounded-md bg-crimson/[0.06] px-2.5 py-1.5 text-crimson ring-1 ring-inset ring-crimson/10';
 
 // App-mode shell (same fixed-overlay pattern as the playground): slim header +
 // repo/task sidebar + main pane. Deep links keep working — /agents/* are real
@@ -22,8 +26,19 @@ function AgentsHeader({
   onToggleSidebar: () => void;
 }) {
   const router = useRouter();
+  const pathname = usePathname() ?? '/';
   const { state, logout } = useAuth();
   const { branding, features } = useSiteConfig();
+
+  // Which nav item is lit has to follow the route. The highlight used to be
+  // painted on `Agents` unconditionally — a leftover from when this app had one
+  // destination — so standing on the Hosts page read as "you are on Agents".
+  //
+  // Split by section rather than by exact path: a job page is still the task
+  // app, and an `/admin/*` page added later without a nav entry of its own
+  // lights neither item instead of wrongly lighting `Agents`.
+  const onHosts = pathname.startsWith('/admin/hosts');
+  const onTasks = !pathname.startsWith('/admin');
 
   const handleLogout = async () => {
     await logout();
@@ -75,29 +90,37 @@ function AgentsHeader({
         aria-label="Product navigation"
         className="flex items-center gap-0.5 text-[13px] font-medium text-gray-600"
       >
-        <a
-          href={branding.statusUrl}
-          className="rounded-md px-2.5 py-1.5 transition-colors hover:bg-gray-100 hover:text-gray-900"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          Status
-        </a>
+        {/* Guarded like every other external link here, and for a sharper
+            reason than tidiness: an anchor with an empty `href` resolves to the
+            current document, so with `target="_blank"` an unconfigured status
+            URL opened a second tab showing the page you were already on. A
+            deployment with no status page should have no Status link. */}
+        {branding.statusUrl && (
+          <a
+            href={branding.statusUrl}
+            className={NAV_ITEM}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Status
+          </a>
+        )}
         {/* Docs Assistant and Dashboard are the gateway's pages, not ours. In
             the monorepo they were same-origin routes; here they are absolute
             links to the gateway, and they disappear on a deployment that has
             not been told where the gateway is. */}
         {features.rag && branding.gatewayUrl && (
-          <a
-            href={`${branding.gatewayUrl}/chat`}
-            className="rounded-md px-2.5 py-1.5 transition-colors hover:bg-gray-100 hover:text-gray-900"
-          >
+          <a href={`${branding.gatewayUrl}/chat`} className={NAV_ITEM}>
             Docs Assistant
           </a>
         )}
-        <span className="rounded-md bg-crimson/[0.06] px-2.5 py-1.5 text-crimson ring-1 ring-inset ring-crimson/10">
+        <Link
+          href="/"
+          className={onTasks ? NAV_ITEM_CURRENT : NAV_ITEM}
+          aria-current={onTasks ? 'page' : undefined}
+        >
           Agents
-        </span>
+        </Link>
         {/* This service's own operations page, so it is a route rather than a
             link back to the gateway. Admin-only, matching the endpoints it
             calls — the guard on the page is the one that counts; hiding the
@@ -105,24 +128,18 @@ function AgentsHeader({
         {hasRole(state.user?.role, 'admin') && (
           <Link
             href="/admin/hosts"
-            className="rounded-md px-2.5 py-1.5 transition-colors hover:bg-gray-100 hover:text-gray-900"
+            className={onHosts ? NAV_ITEM_CURRENT : NAV_ITEM}
+            aria-current={onHosts ? 'page' : undefined}
           >
             Hosts
           </Link>
         )}
         {branding.gatewayUrl && (
-          <a
-            href={`${branding.gatewayUrl}/dashboard`}
-            className="rounded-md px-2.5 py-1.5 transition-colors hover:bg-gray-100 hover:text-gray-900"
-          >
+          <a href={`${branding.gatewayUrl}/dashboard`} className={NAV_ITEM}>
             Dashboard
           </a>
         )}
-        <button
-          type="button"
-          onClick={handleLogout}
-          className="rounded-md px-2.5 py-1.5 transition-colors hover:bg-gray-100 hover:text-gray-900"
-        >
+        <button type="button" onClick={handleLogout} className={NAV_ITEM}>
           Log out
         </button>
       </nav>

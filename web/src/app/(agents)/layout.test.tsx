@@ -4,8 +4,12 @@ import '@testing-library/jest-dom/vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+let pathname = '/';
+let statusUrl = '/status';
+
 vi.mock('next/navigation', () => ({
   useRouter: () => ({ replace: vi.fn(), push: vi.fn() }),
+  usePathname: () => pathname,
 }));
 
 vi.mock('@/components/features/auth/ProtectedRoute', () => ({
@@ -25,7 +29,7 @@ vi.mock('@/components/providers/AuthProvider', () => ({
 
 vi.mock('@/components/providers/SiteConfigProvider', () => ({
   useSiteConfig: () => ({
-    branding: { appName: 'FreeInference', orgName: '', orgUrl: '', statusUrl: '/status' },
+    branding: { appName: 'FreeInference', orgName: '', orgUrl: '', statusUrl },
     features: { rag: false },
   }),
 }));
@@ -81,5 +85,71 @@ describe('AgentsLayout sidebar collapse', () => {
 
     expect(screen.queryByTestId('sidebar-stub')).not.toBeInTheDocument();
     expect(toggle()).toHaveAccessibleName('Expand task list');
+  });
+});
+
+describe('AgentsLayout product navigation', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    pathname = '/';
+    statusUrl = '/status';
+  });
+  afterEach(() => cleanup());
+
+  function nav(): HTMLElement {
+    return screen.getByRole('navigation', { name: 'Product navigation' });
+  }
+
+  function renderLayout() {
+    render(
+      <AgentsLayout>
+        <p>job</p>
+      </AgentsLayout>,
+    );
+  }
+
+  it('links Status at the configured status page', () => {
+    statusUrl = 'https://status.example.test/';
+
+    renderLayout();
+
+    expect(screen.getByRole('link', { name: 'Status' })).toHaveAttribute(
+      'href',
+      'https://status.example.test/',
+    );
+  });
+
+  it('omits Status when no status page is configured', () => {
+    // An empty `href` resolves to the current document, so rendering the link
+    // anyway gave `target="_blank"` a second tab of the page you were on.
+    statusUrl = '';
+
+    renderLayout();
+
+    expect(screen.queryByRole('link', { name: 'Status' })).not.toBeInTheDocument();
+    expect(nav().querySelector('a[href=""]')).toBeNull();
+  });
+
+  it('marks Agents as the current page inside the task app', () => {
+    pathname = '/job-1';
+
+    renderLayout();
+
+    expect(screen.getByRole('link', { name: 'Agents' })).toHaveAttribute('aria-current', 'page');
+    expect(screen.getByRole('link', { name: 'Hosts' })).not.toHaveAttribute('aria-current');
+  });
+
+  it('moves the highlight to Hosts on the host pool page', () => {
+    pathname = '/admin/hosts';
+
+    renderLayout();
+
+    expect(screen.getByRole('link', { name: 'Hosts' })).toHaveAttribute('aria-current', 'page');
+
+    // And Agents is a way back rather than a label: it was a bare <span>, so
+    // the only route off this page was the browser's back button.
+    const agents = screen.getByRole('link', { name: 'Agents' });
+    expect(agents).not.toHaveAttribute('aria-current');
+    expect(agents).toHaveAttribute('href', '/');
   });
 });
