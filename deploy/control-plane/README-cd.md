@@ -1,4 +1,16 @@
-# Continuous deployment — staging
+# Continuous deployment
+
+Two branches, two environments, and they federate with the matching gateway:
+
+| Branch | Environment | Deploys | Gateway it talks to |
+|---|---|---|---|
+| `dev` | staging | automatically, on green CI | the gateway's own `dev`, i.e. its staging deployment |
+| `main` | production | only when dispatched | the gateway's `main`, i.e. its production deployment |
+
+`main` is not a branch anyone commits to: `sync-main.yml` fast-forwards it to
+`dev` on request, and that is the only way it moves.
+
+## Staging
 
 Merging to `dev` deploys. `.github/workflows/deploy-staging.yml` waits for
 `CI` to conclude green on `dev`, then runs a deploy script on each target.
@@ -89,6 +101,44 @@ assuming a rollback is just a redeploy.
 - Write `.deployed-sha` before the health checks pass. That file answers "what
   is actually running here", and writing it early answers it wrongly for every
   failed deploy.
+
+## Production — what is still missing
+
+`.github/workflows/deploy-production.yml` exists and runs nothing yet, by
+construction: its jobs ask for runner labels no machine carries, so a dispatch
+queues instead of deploying. Borrowing staging's labels in the meantime would
+have made the first production dispatch redeploy staging.
+
+To finish it:
+
+1. **Two production hosts**, as on staging — one for the control plane and web
+   app, one for the runners. Install a repository runner on each, labelled
+   `deploy-cloud-agent-prod` and `deploy-agent-host-prod` respectively.
+2. **Convert each deploy root to a git checkout** and place its `.env`, exactly
+   as in *One-time setup on a new host* above.
+3. **Set the repository variables** the workflow refuses to run without:
+   `AGENT_PROD_DEPLOY_ROOT`, `AGENT_PROD_HOST_DEPLOY_ROOT`, and
+   `AGENT_PROD_COMPOSE_PROJECT` only if that machine runs another stack.
+4. **Configure the production gateway first** — `IDENTITY_JWT_PRIVATE_KEY`,
+   `IDENTITY_ALLOWED_REDIRECTS`, and a `GATEWAY_GRANT_DISPATCH_TOKEN` that is
+   *not* staging's — then confirm it from outside:
+
+   ```bash
+   GATEWAY_GRANT_DISPATCH_TOKEN=... python deploy/preflight/check_gateway.py https://<production gateway>
+   ```
+
+5. **Then** the gateway's own frontend can point `/agents` at this deployment
+   (`AGENT_WEB_INTERNAL_URL` and `AGENT_CONTROL_PLANE_INTERNAL_URL`). That
+   rewrite is the user-visible cutover, and it must come last: set before this
+   service exists, it hands `/agents` to nothing.
+
+Order matters throughout, and in one direction. This service calls the
+gateway's identity and `/internal/*` routes; the gateway calls nothing here. A
+control plane deployed ahead of the gateway that serves it is one calling
+routes that answer 404.
+
+Rollback is the same as staging's: dispatch **Deploy Production** with `sha`
+set to the commit to go back to.
 
 ## Health checks
 
