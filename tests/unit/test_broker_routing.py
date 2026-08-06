@@ -152,3 +152,47 @@ async def test_every_broker_shares_the_one_token_today():
     second = await broker_for_attempt(store, 2)
 
     assert first._headers == second._headers
+
+
+class TestAdvertisedBrokerUrl:
+    """What a runner *reports* is not always what it *uses*.
+
+    Both readings are of one address until the control plane moves to another
+    machine. Then the compose service name the runner dials is unresolvable
+    from there, and reporting it verbatim stores an address the control plane
+    cannot reach — 503 on every terminal, file listing and git status, and jobs
+    that die at the first one. The first real job on staging failed three
+    times, once per attempt, on exactly this.
+    """
+
+    def test_it_reports_the_url_it_uses_when_nothing_says_otherwise(self, monkeypatch) -> None:
+        """The co-located shape, and the default: one address, no drift."""
+        from cloud_agent_host import runner
+
+        monkeypatch.delenv("AGENT_WORKSPACE_BROKER_ADVERTISE_URL", raising=False)
+        monkeypatch.setenv("AGENT_WORKSPACE_BROKER_URL", "http://agent-workspace-broker:8092")
+
+        assert runner._broker_url_from_env() == "http://agent-workspace-broker:8092"
+
+    def test_an_advertised_url_wins(self, monkeypatch) -> None:
+        """The remote shape: dial locally, advertise the tunnel's far end."""
+        from cloud_agent_host import runner
+
+        monkeypatch.setenv("AGENT_WORKSPACE_BROKER_URL", "http://agent-workspace-broker:8092")
+        monkeypatch.setenv("AGENT_WORKSPACE_BROKER_ADVERTISE_URL", "http://172.24.0.1:18092")
+
+        assert runner._broker_url_from_env() == "http://172.24.0.1:18092"
+
+    def test_a_blank_advertised_url_is_not_an_override(self, monkeypatch) -> None:
+        """Compose passes the empty string when the variable is unset.
+
+        `${AGENT_WORKSPACE_BROKER_ADVERTISE_URL:-}` reaches the container as a
+        defined, empty variable rather than an absent one. Treating that as an
+        override would report no broker at all on every co-located deployment.
+        """
+        from cloud_agent_host import runner
+
+        monkeypatch.setenv("AGENT_WORKSPACE_BROKER_URL", "http://agent-workspace-broker:8092")
+        monkeypatch.setenv("AGENT_WORKSPACE_BROKER_ADVERTISE_URL", "   ")
+
+        assert runner._broker_url_from_env() == "http://agent-workspace-broker:8092"

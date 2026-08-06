@@ -665,6 +665,65 @@ own shell proves nothing about what a sandbox can reach.
 Once it is up, the machine appears in **Admin → Settings → Cloud Agent Host**
 and can be selected there.
 
+#### The way back: the control plane reaching this host's broker
+
+The tunnels above all point one way — out of this machine. One thing needs to
+come the other way.
+
+Every file listing, terminal keystroke and `git status` for a job goes **control
+plane → workspace broker**, and the broker runs here, beside the runner that
+owns the worktree. The control plane resolves which broker from the host row,
+which holds whatever the runner reported at enrolment. On a co-located
+deployment that report is `http://agent-workspace-broker:8092` and it works,
+because the control plane is on this network too.
+
+On a separate machine it is a name that resolves nowhere. The control plane
+stores it, dials it, and gets a DNS failure it surfaces as **503** — including
+on `terminals/suspend`, which the runner calls during a normal job. The job
+fails there, the lease expires, the next attempt fails at the same point, and
+the job runs out of attempts. That is not a hypothetical; it is what the first
+real job on this deployment did, three times.
+
+The route cannot be opened from the other side: the control plane's machine
+generally cannot reach this one at all. So it rides the connection this machine
+already opens — a reverse forward on the control-plane tunnel:
+
+```text
+  runner host                                control plane host
+┌──────────────────────────┐              ┌──────────────────────────┐
+│ agent-workspace-broker   │◀─── -R ──────│ 172.24.0.1:18092         │
+│        :8092             │              │  (docker bridge gateway) │
+│                          │              │        ▲                 │
+│ control-plane-tunnel ────┼──── ssh ────▶│        │ control-plane   │
+└──────────────────────────┘              └────────┴─────────────────┘
+```
+
+| variable | |
+|---|---|
+| `AGENT_BROKER_REVERSE_BIND` | The **control plane host's docker bridge gateway**. Not `127.0.0.1`, which its containers cannot see; not `0.0.0.0`, which publishes the broker to that machine's whole network behind one shared token. Find it with `docker network inspect <net> --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}'` |
+| `AGENT_BROKER_REVERSE_PORT` | A free port on that host |
+| `AGENT_WORKSPACE_BROKER_ADVERTISE_URL` | `http://<bind>:<port>` — what the runner reports, and what the control plane will dial |
+
+A non-loopback remote bind requires `GatewayPorts yes` or `clientspecified` in
+the **control plane host's** sshd. Without it the bind is refused and, because
+the tunnel runs with `ExitOnForwardFailure`, ssh exits and the container
+restarts rather than sitting there having bound nothing.
+
+Set all three or none. An advertise URL with no tunnel behind it is an address
+nothing answers on, which is the same 503 with a longer explanation.
+
+Check it from the control plane's side, which is the only side whose answer
+means anything:
+
+```bash
+docker exec <control-plane-container> \
+  python -c "import urllib.request; print(urllib.request.urlopen('http://<bind>:<port>/health', timeout=5).status)"
+```
+
+**401 is the good answer.** It means the broker replied and refused an
+unauthenticated request; the route is what was being tested. A DNS error or a
+timeout is the failure this section exists for.
+
 ### Three things about this topology that look like details and are not
 
 **The runner is not the gateway image.** It builds from
