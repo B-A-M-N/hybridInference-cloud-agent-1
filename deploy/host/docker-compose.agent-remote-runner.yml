@@ -188,6 +188,16 @@ services:
       - hybridinference
 
   agent-runner:
+    # How long docker waits after SIGTERM before SIGKILL, and therefore how
+    # long a job gets to finish when this container is replaced. The runner
+    # stops claiming on SIGTERM and exits after the job in hand.
+    #
+    # Bounded on purpose. A job may run up to AGENT_TIMEOUT_S (an hour by
+    # default) and a deploy cannot wait that long, so past this the container
+    # is killed, the lease expires and the control plane supersedes the
+    # attempt — the behaviour every job through a deploy used to get, now
+    # narrowed to the jobs that genuinely outlast the window.
+    stop_grace_period: ${AGENT_RUNNER_STOP_GRACE:-5m}
     deploy:
       replicas: ${AGENT_RUNNER_REPLICAS:-3}
     build:
