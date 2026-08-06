@@ -1,7 +1,35 @@
 # Continuous deployment — staging
 
 Merging to `dev` deploys. `.github/workflows/deploy-staging.yml` waits for
-`CI` to conclude green on `dev`, then runs `deploy.sh` on the target machine.
+`CI` to conclude green on `dev`, then runs a deploy script on each target.
+
+**Two machines, two jobs, neither waiting on the other.** The control plane and
+web app run on spark2 (ARM64); the runners, workspace broker, egress proxy and
+tunnels run on the runner host (x86_64). They are deployed by
+`deploy/control-plane/deploy.sh` and `deploy/host/deploy.sh` respectively, each
+by a runner installed on the machine it deploys. A control plane that fails to
+come up is not a reason to leave the runner host on an older commit, nor the
+reverse.
+
+The host script is thin on purpose: `agent_remote_runner.sh up` already checks
+the daemon, requires the environment, runs the isolation preflight **fail
+closed**, builds the sandbox image, starts the stack, and probes the gateway
+from inside the closed network. Re-implementing any of that in the deploy would
+give it a second opinion about whether the host may run untrusted code.
+
+## One stack per host
+
+`deploy/host/deploy.sh` refuses to start when containers from a *different*
+compose project are already running this stack. That is not a hypothetical:
+this host was first brought up by hand as project `agenthost` while the script
+uses `hybridinference-agent-remote`, and deploying produced two complete stacks
+— six runners claiming instead of three, and **two workspace brokers**.
+
+The brokers are the dangerous half. The control plane stores one `broker_url`
+per host, so whichever stack heartbeats last wins it, and a job claimed by a
+runner in one stack has its files and terminal served from the other. The
+symptom is "the workspace is empty", which is nobody's idea of "there are two
+of me". `ALLOW_STRAY_STACK=1` overrides.
 
 ## Why there is no SSH in any of this
 
