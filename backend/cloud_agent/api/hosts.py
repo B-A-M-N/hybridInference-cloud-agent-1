@@ -244,7 +244,7 @@ async def _probed_broker_error(
 
     Two audiences, because they notice different things. The log is where an
     operator looks after something is already wrong. The response is what the
-    runner prints on the machine being deployed — which `agent_remote_runner.sh
+    runner prints on the machine being deployed — which `sandbox_host.sh
     up` tails, so a misconfigured deploy says so while somebody is still
     watching it.
 

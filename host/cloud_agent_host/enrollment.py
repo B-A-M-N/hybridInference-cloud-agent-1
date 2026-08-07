@@ -254,7 +254,7 @@ def _warn_broker_error(answer: dict[str, Any], host: str) -> None:
     It is the only party that can answer "is this address usable", because it
     is the one that will dial it — and it is on another machine, which is
     exactly when the answer stops being obvious. Printed to stderr as well as
-    logged because `agent_remote_runner.sh up` tails these logs after starting
+    logged because `sandbox_host.sh up` tails these logs after starting
     the stack: a deploy that misconfigured the reverse tunnel or the shared
     broker token says so while somebody is still watching, instead of at the
     first terminal request of the first job.

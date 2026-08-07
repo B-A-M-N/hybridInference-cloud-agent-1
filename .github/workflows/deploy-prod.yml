@@ -1,4 +1,4 @@
-name: Deploy Production
+name: Deploy Prod
 
 # Production deploys by hand, and only by hand.
 #
@@ -10,12 +10,13 @@ name: Deploy Production
 # ships it, and the two stay separate acts.
 #
 # **The machines do not exist yet.** Both jobs ask for runner labels that
-# nothing carries (`deploy-cloud-agent-prod`, `deploy-agent-host-prod`), so a
-# dispatch today queues and deploys nothing. That is deliberate: the
-# alternative — borrowing staging's labels until the real hosts arrive — is a
-# workflow that ships the production commit onto staging's boxes the first time
-# anyone tries it. Register runners carrying these labels on the production
-# hosts, set the two repository variables below, and this starts working.
+# nothing carries (`deploy-cloud-agent-control-prod`,
+# `deploy-cloud-agent-sandbox-prod`), so a dispatch today queues and deploys
+# nothing. That is deliberate: the alternative — borrowing staging's labels
+# until the production hosts arrive — is a workflow that ships the production
+# commit onto staging's boxes the first time anyone tries it. Register runners
+# carrying these labels, set the repository variables below, and this starts
+# working.
 #
 # **Deploy the gateway first, this second.** The contract runs one way: this
 # service calls the gateway's identity and `/internal/*` routes, and the gateway
@@ -45,7 +46,7 @@ on:
         required: false
 
 concurrency:
-  group: cloud-agent-production-deploy
+  group: cloud-agent-prod-deploy
   cancel-in-progress: false
 
 permissions:
@@ -54,7 +55,7 @@ permissions:
 jobs:
   deploy:
     name: Deploy control plane + web
-    runs-on: [self-hosted, Linux, deploy-cloud-agent-prod]
+    runs-on: [self-hosted, Linux, deploy-cloud-agent-control-prod]
     # Records the deployment and gives protection rules somewhere to live.
     # Required-reviewer rules need a public repository or a paid plan, so on
     # this repository today the environment gates nothing by itself — the gate
@@ -65,17 +66,17 @@ jobs:
     steps:
       # Fail before touching anything if this deployment has not been told where
       # it lives. `deploy/control-plane/deploy.sh` defaults `DEPLOY_ROOT` to
-      # /srv/freeinference-cloud-agent, which is *staging's* path: letting that
-      # default apply here means a mislabelled runner deploys the production
-      # commit into the staging checkout, and the first sign of it is staging
-      # restarting on a commit nobody sent there.
+      # /srv/freeinference-cloud-agent, which is also *staging's* path: letting
+      # that default apply here means a mislabelled runner deploys the
+      # production commit into the staging checkout, and the first sign of it is
+      # staging restarting on a commit nobody sent there.
       - name: Require this deployment's paths
         env:
-          DEPLOY_ROOT: ${{ vars.AGENT_PROD_DEPLOY_ROOT }}
+          DEPLOY_ROOT: ${{ vars.PROD_CONTROL_DEPLOY_ROOT }}
         run: |
           set -euo pipefail
           if [ -z "${DEPLOY_ROOT}" ]; then
-            echo "::error::Repository variable AGENT_PROD_DEPLOY_ROOT is unset. Set it to the production control-plane checkout path (see deploy/control-plane/README-cd.md) before deploying."
+            echo "::error::Repository variable PROD_CONTROL_DEPLOY_ROOT is unset. Set it to the production control-plane checkout path (see deploy/control-plane/README-cd.md) before deploying."
             exit 1
           fi
           echo "deploy root: ${DEPLOY_ROOT}"
@@ -100,18 +101,19 @@ jobs:
 
       - name: Deploy
         env:
-          DEPLOY_ROOT: ${{ vars.AGENT_PROD_DEPLOY_ROOT }}
+          DEPLOY_ROOT: ${{ vars.PROD_CONTROL_DEPLOY_ROOT }}
           # Unset is fine — deploy.sh falls back to its own default. It matters
-          # only where production shares a machine with another stack, in which
-          # case two deploys under one project name are one deploy.
-          COMPOSE_PROJECT: ${{ vars.AGENT_PROD_COMPOSE_PROJECT }}
+          # only where production shares a machine with another stack of this
+          # service, in which case two deploys under one project name are one
+          # deploy.
+          COMPOSE_PROJECT: ${{ vars.PROD_CONTROL_COMPOSE_PROJECT }}
         run: bash deploy/control-plane/deploy.sh "${{ steps.target.outputs.sha }}"
 
       - name: What is running now
         if: always()
         env:
-          DEPLOY_ROOT: ${{ vars.AGENT_PROD_DEPLOY_ROOT }}
-          COMPOSE_PROJECT: ${{ vars.AGENT_PROD_COMPOSE_PROJECT }}
+          DEPLOY_ROOT: ${{ vars.PROD_CONTROL_DEPLOY_ROOT }}
+          COMPOSE_PROJECT: ${{ vars.PROD_CONTROL_COMPOSE_PROJECT }}
         run: |
           [ -n "${DEPLOY_ROOT}" ] || exit 0
           echo "deployed sha on host: $(cat "${DEPLOY_ROOT}/.deployed-sha" 2>/dev/null || echo unknown)"
@@ -121,32 +123,38 @@ jobs:
             ps 2>/dev/null || true
 
   deploy-host:
-    name: Deploy runner host
+    name: Deploy sandbox host
     # The other machine, and deliberately not `needs:`-ed to the job above: they
     # are separate hosts, and a control plane that fails to come up is not a
-    # reason to leave the runner host on an older commit — nor the reverse.
-    runs-on: [self-hosted, Linux, deploy-agent-host-prod]
+    # reason to leave the sandbox host on an older commit — nor the reverse.
+    runs-on: [self-hosted, Linux, deploy-cloud-agent-sandbox-prod]
     environment: production
     timeout-minutes: 45
     concurrency:
-      group: cloud-agent-production-host-deploy
+      group: cloud-agent-prod-host-deploy
       cancel-in-progress: false
 
     steps:
-      # Required, not defaulted: this path differs per machine (the host user
-      # has no write access to /srv there), and `deploy/host/deploy.sh` refuses
-      # to run without it anyway. Its own variable rather than staging's, so
-      # that pointing production at staging's host takes a deliberate edit.
+      # Both are required, and for different reasons. The path differs per
+      # machine and `deploy/host/deploy.sh` refuses to run without it. The
+      # project name is what keeps this stack apart from staging's on a host
+      # that runs both — and sharing it is silent, since compose adopts the
+      # other environment's containers rather than refusing them.
       - name: Require this deployment's paths
         env:
-          DEPLOY_ROOT: ${{ vars.AGENT_PROD_HOST_DEPLOY_ROOT }}
+          DEPLOY_ROOT: ${{ vars.PROD_SANDBOX_DEPLOY_ROOT }}
+          COMPOSE_PROJECT: ${{ vars.PROD_SANDBOX_COMPOSE_PROJECT }}
         run: |
           set -euo pipefail
           if [ -z "${DEPLOY_ROOT}" ]; then
-            echo "::error::Repository variable AGENT_PROD_HOST_DEPLOY_ROOT is unset. Set it to the production runner host's checkout path (see deploy/control-plane/README-cd.md) before deploying."
+            echo "::error::Repository variable PROD_SANDBOX_DEPLOY_ROOT is unset. Set it to the production sandbox host's checkout path (see deploy/control-plane/README-cd.md) before deploying."
             exit 1
           fi
-          echo "deploy root: ${DEPLOY_ROOT}"
+          if [ -z "${COMPOSE_PROJECT}" ]; then
+            echo "::error::Repository variable PROD_SANDBOX_COMPOSE_PROJECT is unset. Set it to this stack's compose project (e.g. freeinference-cloud-agent-sandbox-prod)."
+            exit 1
+          fi
+          echo "deploy root: ${DEPLOY_ROOT}  project: ${COMPOSE_PROJECT}"
 
       - name: Resolve the commit to deploy
         id: target
@@ -165,15 +173,21 @@ jobs:
 
       - name: Deploy
         env:
-          DEPLOY_ROOT: ${{ vars.AGENT_PROD_HOST_DEPLOY_ROOT }}
+          DEPLOY_ROOT: ${{ vars.PROD_SANDBOX_DEPLOY_ROOT }}
+          COMPOSE_PROJECT: ${{ vars.PROD_SANDBOX_COMPOSE_PROJECT }}
+          # Staging's stack on this same machine is expected company, not a
+          # stray. Naming it keeps the guard pointed at what it is actually for:
+          # a second copy of *this* stack under a name nobody meant.
+          SIBLING_COMPOSE_PROJECTS: ${{ vars.STAGING_SANDBOX_COMPOSE_PROJECT }}
         run: bash deploy/host/deploy.sh "${{ steps.target.outputs.sha }}"
 
       - name: What is running now
         if: always()
         env:
-          DEPLOY_ROOT: ${{ vars.AGENT_PROD_HOST_DEPLOY_ROOT }}
+          DEPLOY_ROOT: ${{ vars.PROD_SANDBOX_DEPLOY_ROOT }}
+          COMPOSE_PROJECT: ${{ vars.PROD_SANDBOX_COMPOSE_PROJECT }}
         run: |
           [ -n "${DEPLOY_ROOT}" ] || exit 0
           echo "deployed sha on host: $(cat "${DEPLOY_ROOT}/.deployed-sha" 2>/dev/null || echo unknown)"
-          docker ps --filter label=com.docker.compose.project=hybridinference-agent-remote \
+          docker ps --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" \
             --format '  {{.Names}}  {{.Status}}' 2>/dev/null || true

@@ -15,13 +15,14 @@
 #
 # Usage, from the repository root on the runner host:
 #
-#   deploy/host/agent_remote_runner.sh up [N]   # build, start the tunnel + N runners
-#   deploy/host/agent_remote_runner.sh status   # what is running, and the log tails
-#   deploy/host/agent_remote_runner.sh check    # prove the tunnel reaches the gateway
-#   deploy/host/agent_remote_runner.sh down     # stop everything this file started
+#   deploy/host/sandbox_host.sh up [N]   # build, start the tunnel + N runners
+#   deploy/host/sandbox_host.sh status   # what is running, and the log tails
+#   deploy/host/sandbox_host.sh check    # prove the tunnel reaches the gateway
+#   deploy/host/sandbox_host.sh down     # stop everything this file started
 #
 # Required in .env on this host:
 #
+#   COMPOSE_PROJECT                this stack's compose project, unique on this machine
 #   AGENT_DISPATCHER_TOKEN         same value as on the gateway
 #   AGENT_SANDBOX_IMAGE            image the sandboxes run
 #   AGENT_TUNNEL_SSH_DESTINATION   user@gateway-host
@@ -38,16 +39,8 @@ set -Eeuo pipefail
 APP_DIR="${APP_DIR:-$(pwd)}"
 cd "$APP_DIR"
 
-# `.env` is the whole configuration surface here. The source repo also layered
-# per-deployment env files from `distributions/`, which is that repository's
-# overlay mechanism and does not exist in this one.
-COMPOSE=(docker compose
-  -p hybridinference-agent-remote
-  -f deploy/host/docker-compose.agent-remote-runner.yml
-  --env-file .env)
-
-log() { printf '[agent-remote-runner] %s\n' "$*"; }
-die() { printf '[agent-remote-runner] ERROR: %s\n' "$*" >&2; exit 1; }
+log() { printf '[sandbox-host] %s\n' "$*"; }
+die() { printf '[sandbox-host] ERROR: %s\n' "$*" >&2; exit 1; }
 
 env_or_dotenv() {
   # A value may come from the environment or from .env; compose reads both, so
@@ -79,8 +72,36 @@ env_or_dotenv() {
 # script's own header tells you to configure — so `up` built and ran the
 # default image while `require_env`, which *does* read `.env`, reported the
 # configuration complete. The two disagreed, and the one that acted was wrong.
+# `.env` is the whole configuration surface here. The source repo also layered
+# per-deployment env files from `distributions/`, which is that repository's
+# overlay mechanism and does not exist in this one.
+#
+# **COMPOSE_PROJECT is required and has no default.** It prefixes every
+# container, image and network this stack creates, so it is what keeps two
+# deployments on one machine apart — and the failure when they share it is
+# silent rather than loud: the second `up` does not refuse, it adopts the
+# first's containers and recreates them with its own configuration. Staging and
+# production share the runner host, so that is the normal case here, not an
+# exotic one. A default would be a value somebody forgets to override exactly
+# once.
+COMPOSE_PROJECT="$(env_or_dotenv COMPOSE_PROJECT)"
+
+# A function rather than an array, so the check happens when a compose command
+# actually runs. `preflight` and `check` answer questions about this machine and
+# touch no stack; making them fail for a missing project name would be refusing
+# to answer "can this host isolate a sandbox" because of how the containers are
+# to be labelled.
+compose() {
+  [[ -n "$COMPOSE_PROJECT" ]] || die \
+    "COMPOSE_PROJECT is not set — put it in .env (e.g. freeinference-cloud-agent-sandbox-staging). It is what keeps this stack apart from the other environment on this machine."
+  docker compose \
+    -p "$COMPOSE_PROJECT" \
+    -f deploy/host/docker-compose.sandbox.yml \
+    --env-file .env "$@"
+}
+
 SANDBOX_IMAGE="$(env_or_dotenv AGENT_SANDBOX_IMAGE)"
-SANDBOX_IMAGE="${SANDBOX_IMAGE:-hybridinference-agent-sandbox:latest}"
+SANDBOX_IMAGE="${SANDBOX_IMAGE:-freeinference-cloud-agent-job:latest}"
 GATEWAY_HOSTNAME="$(env_or_dotenv AGENT_GATEWAY_HOSTNAME)"
 GATEWAY_HOSTNAME="${GATEWAY_HOSTNAME:-agent-gateway}"
 TUNNEL_PORT="$(env_or_dotenv AGENT_TUNNEL_LISTEN_PORT)"
@@ -128,7 +149,7 @@ require_env() {
 KATA_RUNTIME="io.containerd.kata.v2"
 KATA_SETUP_SCRIPT="${KATA_SETUP_SCRIPT:-deploy/host/setup_kata_runtime.sh}"
 
-warn() { printf '[agent-remote-runner] WARNING: %s\n' "$*" >&2; }
+warn() { printf '[sandbox-host] WARNING: %s\n' "$*" >&2; }
 
 require_kata_host() {
   # Gate before anything starts. The runner's own preflight would fail per job
@@ -224,7 +245,11 @@ cmd_up() {
 
   log "starting the gateway tunnel and ${replicas} runner(s)"
   AGENT_SANDBOX_IMAGE="$SANDBOX_IMAGE" AGENT_RUNNER_REPLICAS="$replicas" \
-    "${COMPOSE[@]}" up -d --build
+    # `--remove-orphans` because a renamed service leaves its old container
+  # running otherwise: compose only replaces containers for services the file
+  # still declares, so `agent-runner` outliving `runner` would mean two sets of
+  # runners claiming from one host, which is the two-brokers incident again.
+  compose up -d --build --remove-orphans
 
   # The runner's preflight now makes a real request to the gateway through the
   # tunnel, so a tunnel that came up without a working upstream fails here
@@ -236,13 +261,13 @@ cmd_up() {
   # tunnel diagnosis, then "done", and an operator reads the last line.
   local probe_ok=0
   ( cmd_check ) || probe_ok=$?
-  "${COMPOSE[@]}" logs --tail 20 agent-runner
+  compose logs --tail 20 runner
   if [[ "$probe_ok" -ne 0 ]]; then
     die "the runners are up but a sandbox cannot reach the gateway through the
      tunnel (see the probe output above). Jobs will claim and then fail at
      their first model call. Fix the tunnel, then re-run 'check'."
   fi
-  log "done. 'deploy/host/agent_remote_runner.sh status' shows the live tail."
+  log "done. 'deploy/host/sandbox_host.sh status' shows the live tail."
 }
 
 cmd_check() {
@@ -260,19 +285,19 @@ cmd_check() {
   fi
   printf '\n'
   die "a sandbox on ${network} cannot reach ${url}.
-     Check 'docker logs' for the agent-gateway-tunnel container: an ssh that
+     Check 'docker logs' for the gateway-tunnel container: an ssh that
      cannot authenticate or cannot bind its forward exits, and the container
      restarts. Resolving the name is not enough — the forward has to be up."
 }
 
 cmd_status() {
-  "${COMPOSE[@]}" ps
+  compose ps
   printf '\n'
-  "${COMPOSE[@]}" logs --tail 20 agent-gateway-tunnel agent-runner
+  compose logs --tail 20 gateway-tunnel runner
 }
 
 cmd_down() {
-  "${COMPOSE[@]}" down
+  compose down
   log "stopped. Jobs that were running were interrupted; they are retried when"
   log "their lease expires."
 }

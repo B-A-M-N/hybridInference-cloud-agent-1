@@ -172,15 +172,15 @@ class TestAdvertisedBrokerUrl:
         from cloud_agent_host import runner
 
         monkeypatch.delenv("AGENT_WORKSPACE_BROKER_ADVERTISE_URL", raising=False)
-        monkeypatch.setenv("AGENT_WORKSPACE_BROKER_URL", "http://agent-workspace-broker:8092")
+        monkeypatch.setenv("AGENT_WORKSPACE_BROKER_URL", "http://workspace-broker:8092")
 
-        assert runner._broker_url_from_env() == "http://agent-workspace-broker:8092"
+        assert runner._broker_url_from_env() == "http://workspace-broker:8092"
 
     def test_an_advertised_url_wins(self, monkeypatch) -> None:
         """The remote shape: dial locally, advertise the tunnel's far end."""
         from cloud_agent_host import runner
 
-        monkeypatch.setenv("AGENT_WORKSPACE_BROKER_URL", "http://agent-workspace-broker:8092")
+        monkeypatch.setenv("AGENT_WORKSPACE_BROKER_URL", "http://workspace-broker:8092")
         monkeypatch.setenv("AGENT_WORKSPACE_BROKER_ADVERTISE_URL", "http://172.24.0.1:18092")
 
         assert runner._broker_url_from_env() == "http://172.24.0.1:18092"
@@ -194,10 +194,10 @@ class TestAdvertisedBrokerUrl:
         """
         from cloud_agent_host import runner
 
-        monkeypatch.setenv("AGENT_WORKSPACE_BROKER_URL", "http://agent-workspace-broker:8092")
+        monkeypatch.setenv("AGENT_WORKSPACE_BROKER_URL", "http://workspace-broker:8092")
         monkeypatch.setenv("AGENT_WORKSPACE_BROKER_ADVERTISE_URL", "   ")
 
-        assert runner._broker_url_from_env() == "http://agent-workspace-broker:8092"
+        assert runner._broker_url_from_env() == "http://workspace-broker:8092"
 
 
 class TestBrokerProbe:
@@ -238,10 +238,10 @@ class TestBrokerProbe:
         """The address is in the message because the address is the mistake."""
         self._health(monkeypatch, WorkspaceBrokerError(503, "unreachable: [Errno -3] no DNS"))
 
-        error = await broker_routing.probe_broker("h1", "http://agent-workspace-broker:8092")
+        error = await broker_routing.probe_broker("h1", "http://workspace-broker:8092")
 
         assert error is not None
-        assert "agent-workspace-broker" in error
+        assert "workspace-broker" in error
 
     @pytest.mark.asyncio
     async def test_a_refused_credential_is_reported_too(self, monkeypatch) -> None:
