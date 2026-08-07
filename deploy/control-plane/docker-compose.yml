@@ -1,6 +1,6 @@
 # The control plane and its database — one machine, no runners.
 #
-# Runners live in `deploy/host/docker-compose.agent-remote-runner.yml` and are
+# Runners live in `deploy/host/docker-compose.sandbox.yml` and are
 # deliberately not here. They are a different trust tier (they execute
 # untrusted code and mount a docker socket) and a different scaling unit; a
 # single file that started both would make "add a runner host" mean "add a
