@@ -672,7 +672,7 @@ jobs:
               for name, svc in stack["services"].items()
               if "agent-egress" in (svc.get("networks") or {})
           }
-          if on_egress != {"agent-gateway-tunnel", "agent-mcp-tunnel"}:
+          if on_egress != {"gateway-tunnel", "mcp-tunnel"}:
               failures.append(f"unexpected services on the closed network: {sorted(on_egress)}")
 
           for name, svc in stack["services"].items():

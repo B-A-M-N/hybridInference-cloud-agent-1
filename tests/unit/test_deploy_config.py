@@ -972,7 +972,7 @@ def test_concurrency_is_declared_not_typed_at_deploy_time(compose: dict):
     """
     runner = compose["services"]["runner"]
     replicas = (runner.get("deploy") or {}).get("replicas")
-    assert replicas, "agent-runner declares no replica count, so a deploy resets concurrency to 1"
+    assert replicas, "runner declares no replica count, so a deploy resets concurrency to 1"
     assert "AGENT_RUNNER_REPLICAS" in str(replicas), "the replica count is not operator-tunable"
 
 
