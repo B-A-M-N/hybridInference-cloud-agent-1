@@ -135,7 +135,7 @@ each control plane is alone on its box, so nothing there does.
 | sandbox deploy root | `…/freeinference-cloud-agent-staging` | `…/freeinference-cloud-agent-prod` |
 | sandbox image | `freeinference-cloud-agent-job:staging` | `freeinference-cloud-agent-job:prod` |
 | egress network | `freeinference-cloud-agent-egress-staging` | `freeinference-cloud-agent-egress-prod` |
-| host name it reports | `<machine>-staging` | `<machine>-prod` |
+| state roots | `/var/lib/freeinference-cloud-agent-staging/…` | `/var/lib/freeinference-cloud-agent-prod/…` |
 | runner labels | `deploy-cloud-agent-control-staging`<br>`deploy-cloud-agent-sandbox-staging` | `deploy-cloud-agent-control-prod`<br>`deploy-cloud-agent-sandbox-prod` |
 
 The two words that do the work: **control** is the plane that schedules — API,
@@ -143,6 +143,15 @@ web app, its own Postgres; **sandbox** is the machine that runs user code —
 runners, workspace broker, egress proxy, tunnels. The image a job runs inside is
 `-job`, deliberately not `-sandbox`, so it cannot be confused with
 `…-sandbox-<env>-runner`, the image the runner container itself is built from.
+
+**The host name is not one of these.** `AGENT_RUNNER_HOST` names the machine
+only until it enrols; after that the control plane reads the host from the
+credential the runner holds, so editing the variable renames nothing. Two stacks
+on one machine therefore stay apart by having **their own state roots** — the
+credential lives under `AGENT_HOST_STATE_ROOT`, and sharing that directory means
+the second stack claims as whichever host enrolled first. `sandbox_host.sh`
+requires all three roots once `SIBLING_COMPOSE_PROJECTS` is set, because that is
+the moment the defaults stop being safe.
 
 `cloudagent` on spark2 is the one name left alone. It is alone on that machine,
 so it needs no suffix, and renaming a compose project renames its **named
