@@ -123,6 +123,31 @@ require_env() {
     die "missing in .env: ${missing[*]} (see ENVIRONMENT.md)"
   fi
 
+  # On a machine running two environments, the three state roots must be said
+  # out loud. They are host paths bind-mounted into the containers, and they
+  # default to the same three directories for every stack — so two stacks that
+  # accept the defaults do not merely sit beside each other, they share:
+  #
+  #   AGENT_HOST_STATE_ROOT   the enrolment credential. The control plane reads
+  #                           the host *from the credential*, not from the claim
+  #                           body, so the second stack registers as the first
+  #                           one — `AGENT_RUNNER_HOST` cannot correct it.
+  #   AGENT_WORKDIR_ROOT      every job's checkout, patch and workspace.
+  #   AGENT_SNAPSHOT_ROOT     the same, kept for a week.
+  #
+  # Required only when a sibling is named, because that is exactly when the
+  # defaults stop being safe — a single-stack host has nothing to collide with
+  # and should not have to configure paths it does not care about.
+  if [[ -n "$(env_or_dotenv SIBLING_COMPOSE_PROJECTS)" ]]; then
+    local shared=() path
+    for name in AGENT_HOST_STATE_ROOT AGENT_WORKDIR_ROOT AGENT_SNAPSHOT_ROOT; do
+      [[ -n "$(env_or_dotenv "$name")" ]] || shared+=("$name")
+    done
+    if [[ ${#shared[@]} -gt 0 ]]; then
+      die "this host runs another environment (SIBLING_COMPOSE_PROJECTS is set), so ${shared[*]} must name paths of this stack's own — unset they default to /var/lib/hybridinference/*, which both stacks would then share: one environment's jobs reading the other's workspaces, and both claiming as whichever host enrolled first."
+    fi
+  fi
+
   local key known
   key="$(env_or_dotenv AGENT_TUNNEL_SSH_KEY)"
   known="$(env_or_dotenv AGENT_TUNNEL_SSH_KNOWN_HOSTS)"

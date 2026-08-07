@@ -130,6 +130,56 @@ def test_a_named_sibling_environment_is_not_a_stray_stack() -> None:
     assert "from_env SIBLING_COMPOSE_PROJECTS" in deploy
 
 
+_SHARED_HOST_ENV = "\n".join(
+    [
+        "COMPOSE_PROJECT=freeinference-cloud-agent-sandbox-prod",
+        "SIBLING_COMPOSE_PROJECTS=freeinference-cloud-agent-sandbox-staging",
+        "AGENT_DISPATCHER_TOKEN=t",
+        "AGENT_SANDBOX_IMAGE=freeinference-cloud-agent-job:prod",
+        "AGENT_TUNNEL_SSH_DESTINATION=user@gateway",
+        "AGENT_TUNNEL_SSH_KEY=/dev/null",
+        "AGENT_TUNNEL_SSH_KNOWN_HOSTS=/etc/hosts",
+        "",
+    ]
+)
+
+
+def test_a_shared_machine_must_name_its_own_state_roots(tmp_path: Path) -> None:
+    """Two stacks accepting the default paths do not sit beside each other.
+
+    The three roots are host directories bind-mounted into the containers, and
+    they default to the same `/var/lib/hybridinference/*` for every stack. The
+    dangerous one is the enrolment credential: the control plane reads a host
+    from the credential rather than from the claim body, so a shared state root
+    means the second stack registers as the first — and `AGENT_RUNNER_HOST`
+    cannot correct it, because nothing consults it after enrolment.
+    """
+    result = _run(_host(tmp_path, dotenv=_SHARED_HOST_ENV), "up")
+
+    assert result.returncode != 0
+    assert "AGENT_HOST_STATE_ROOT" in result.stderr
+    assert "AGENT_WORKDIR_ROOT" in result.stderr
+    assert "AGENT_SNAPSHOT_ROOT" in result.stderr
+
+
+def test_a_lone_stack_needs_no_such_thing(tmp_path: Path) -> None:
+    """A host running one environment has nothing to collide with.
+
+    The requirement is tied to `SIBLING_COMPOSE_PROJECTS` rather than applied
+    always, so the single-stack deployments that predate co-location keep
+    working without configuring paths they do not care about. This gets past
+    `require_env` — it fails later, in the isolation preflight, which is a
+    different check and the point here.
+    """
+    alone = _SHARED_HOST_ENV.replace(
+        "SIBLING_COMPOSE_PROJECTS=freeinference-cloud-agent-sandbox-staging", ""
+    )
+
+    result = _run(_host(tmp_path, dotenv=alone), "up")
+
+    assert "AGENT_WORKDIR_ROOT" not in result.stderr
+
+
 def test_the_stray_matcher_still_recognises_this_stack(tmp_path: Path) -> None:
     """The container-name pattern has to survive the service rename.
 
