@@ -60,20 +60,39 @@ class FakeJobStore:
             "model": "glm-5.1",
         }
 
+    async def list_mcp_connections(self, *, user_id: str) -> list[dict[str, Any]]:
+        """The owner's stored connections, for cases that use real resolution."""
+        return [
+            {
+                "server": "github",
+                "account_label": "octocat",
+                "access_token_ciphertext": "ciphertext-that-needs-a-key",
+                "refresh_token_ciphertext": None,
+                "expires_at": None,
+            }
+        ]
+
 
 class Upstream:
     """A stand-in MCP server that records what the gateway sent it."""
 
-    def __init__(self, *, body: bytes | None = None, content_type: str = "application/json"):
+    def __init__(
+        self,
+        *,
+        body: bytes | None = None,
+        content_type: str = "application/json",
+        status_code: int = 200,
+    ):
         self.requests: list[httpx.Request] = []
         self.body = body if body is not None else b'{"jsonrpc":"2.0","id":1,"result":{}}'
         self.content_type = content_type
+        self.status_code = status_code
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         """Record the request and answer with the canned body."""
         self.requests.append(request)
         return httpx.Response(
-            200,
+            self.status_code,
             content=self.body,
             headers={"content-type": self.content_type, "mcp-session-id": "sess-1"},
         )
@@ -93,6 +112,22 @@ def _registry(tools: frozenset[str] = frozenset({"get_issue"})) -> McpRegistry:
     )
 
 
+def _patch_registry(monkeypatch, registry: McpRegistry, resolved_for: list[str] | None = None):
+    """Resolve every user to ``registry``, recording who was asked about.
+
+    Servers resolve per user now, so the relay has to name one — and these
+    tests care *which*: the caller is a sandbox, and the credential it spends
+    must be the job owner's. ``resolved_for`` is how that is observed.
+    """
+
+    async def _resolve(store, *, user_id, cipher=None):
+        if resolved_for is not None:
+            resolved_for.append(user_id)
+        return registry
+
+    monkeypatch.setattr(agent_mcp_router, "registry_for_user", _resolve)
+
+
 @pytest.fixture()
 def upstream():
     """The stand-in MCP server."""
@@ -108,7 +143,7 @@ def store():
 @pytest_asyncio.fixture()
 async def client(monkeypatch, store, upstream):
     """Mount the proxy router with a mocked upstream and a fixed registry."""
-    monkeypatch.setattr(agent_mcp_router, "get_registry", _registry)
+    _patch_registry(monkeypatch, _registry())
     monkeypatch.setattr(
         agent_mcp_router,
         "build_upstream_client",
@@ -179,7 +214,7 @@ async def test_a_registry_header_replaces_the_sandbox_header_rather_than_joining
             )
         }
     )
-    monkeypatch.setattr(agent_mcp_router, "get_registry", lambda: registry)
+    _patch_registry(monkeypatch, registry)
     monkeypatch.setattr(
         agent_mcp_router,
         "build_upstream_client",
@@ -260,7 +295,7 @@ async def test_the_catalogue_is_filtered_on_the_way_back(monkeypatch, store, ups
             "result": {"tools": [{"name": "get_issue"}, {"name": "create_issue"}]},
         }
     ).encode()
-    monkeypatch.setattr(agent_mcp_router, "get_registry", _registry)
+    _patch_registry(monkeypatch, _registry())
     monkeypatch.setattr(
         agent_mcp_router,
         "build_upstream_client",
@@ -277,11 +312,108 @@ async def test_the_catalogue_is_filtered_on_the_way_back(monkeypatch, store, ups
     assert [tool["name"] for tool in response.json()["result"]["tools"]] == ["get_issue"]
 
 
-async def test_a_server_removed_from_the_registry_reports_a_deployment_fault(
+async def test_tools_resolve_against_the_job_owner_not_the_caller(monkeypatch, store, upstream):
+    """The sandbox does not get to say whose tools it is spending.
+
+    The caller here is a sandbox holding a job token; the owner is whoever the
+    fence says the job belongs to. Resolution must ask about the owner, because
+    a per-user registry asked about anyone else is one user's credential
+    spending on another user's job.
+    """
+    resolved_for: list[str] = []
+    _patch_registry(monkeypatch, _registry(), resolved_for)
+    monkeypatch.setattr(
+        agent_mcp_router,
+        "build_upstream_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(upstream.handler)),
+    )
+    app = FastAPI()
+    app.include_router(agent_mcp_router.router)
+    app.dependency_overrides[get_agent_job_store] = lambda: store
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as api:
+        response = await api.post("/v1/agent/mcp/github", json=_rpc("initialize"), headers=_auth())
+    assert response.status_code == 200
+    assert resolved_for == ["owner-1"]
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_an_upstream_refusing_the_credential_is_attributed_to_the_server(
+    client, upstream, caplog, status
+):
+    """The third way a connection dies, and the only one visible from here.
+
+    Expiry and an unreadable credential are caught during resolution; an
+    upstream that has stopped accepting a live-looking token can only be found
+    by asking it. Unattributed, that reads as the sandbox misbehaving — which
+    is how an hour of silent 401s went unnoticed before the gateway's route
+    learned to name the server (hybridInference#1199).
+
+    The status still reaches the agent unchanged: it is the answer to the
+    agent's own request, and rewriting it would hide a real reply from the CLI.
+    """
+    upstream.status_code = status
+
+    with caplog.at_level("WARNING"):
+        response = await client.post(
+            "/v1/agent/mcp/github", json=_rpc("initialize"), headers=_auth()
+        )
+
+    assert response.status_code == status
+    rejected = [
+        record
+        for record in caplog.records
+        if record.__dict__.get("event") == "agent_mcp_upstream_rejected_credential"
+    ]
+    assert [(record.server, record.job_id, record.status) for record in rejected] == [
+        ("github", _FENCE["job_id"], status)
+    ]
+
+
+async def test_an_upstream_answering_normally_logs_no_credential_warning(client, upstream, caplog):
+    """A warning on every reply would be noise nobody reads."""
+    with caplog.at_level("WARNING"):
+        await client.post("/v1/agent/mcp/github", json=_rpc("initialize"), headers=_auth())
+
+    assert not [
+        record
+        for record in caplog.records
+        if record.__dict__.get("event") == "agent_mcp_upstream_rejected_credential"
+    ]
+
+
+async def test_a_lost_encryption_key_is_a_503_and_not_an_unhandled_error(
+    monkeypatch, store, upstream
+):
+    """Real resolution, no key: the documented 503, not a 500 with a stack trace.
+
+    Deliberately does **not** patch ``registry_for_user`` — the bug this pins
+    was in the real one, which raised on a missing key while only the composer
+    caught it. A deployment that had the key, has connections, and then loses it
+    (a rotation gone wrong, a partial rollout) would turn every tool call of
+    every running job into a 500. Fail-closed either way; the difference is
+    whether the alerts say what happened.
+    """
+    monkeypatch.delenv("AGENT_SOURCE_CONTROL_ENCRYPTION_KEY", raising=False)
+    monkeypatch.setattr(
+        agent_mcp_router,
+        "build_upstream_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(upstream.handler)),
+    )
+    app = FastAPI()
+    app.include_router(agent_mcp_router.router)
+    app.dependency_overrides[get_agent_job_store] = lambda: store
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as api:
+        response = await api.post("/v1/agent/mcp/github", json=_rpc("initialize"), headers=_auth())
+
+    assert response.status_code == 503
+    assert upstream.requests == []
+
+
+async def test_a_server_the_owner_no_longer_has_reports_it_as_unavailable(
     monkeypatch, client, upstream
 ):
-    """Granted at creation, gone since: a 503, not a permission error."""
-    monkeypatch.setattr(agent_mcp_router, "get_registry", McpRegistry)
+    """Granted at creation, disconnected since: a 503, not a permission error."""
+    _patch_registry(monkeypatch, McpRegistry())
     response = await client.post("/v1/agent/mcp/github", json=_rpc("initialize"), headers=_auth())
     assert response.status_code == 503
     assert upstream.requests == []

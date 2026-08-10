@@ -23,6 +23,13 @@ tool calls.
 this process; the sandbox addresses the relay, and the relay addresses the
 upstream. The response is filtered before it goes back, so a tool outside the
 server's allowlist is neither advertised nor callable.
+
+**The credential is the job owner's, and the owner is read from the fence.**
+Servers resolve per user, so this has to name one — and the only defensible
+choice is the person whose job this is, taken from the same fence lookup that
+decides whether the token is still live. Not the caller: the caller is a
+sandbox running untrusted repository content, and it does not get to say whose
+tools it is spending.
 """
 
 from __future__ import annotations
@@ -41,7 +48,7 @@ from cloud_agent.mcp_proxy import (
     filter_json_body,
     plan_request,
 )
-from cloud_agent.mcp_registry import McpServer, get_registry
+from cloud_agent.mcp_registry import McpServer, registry_for_user
 from cloud_agent.tokens import SCOPE_MCP, InvalidAgentToken, parse_worker_token
 
 if TYPE_CHECKING:
@@ -187,19 +194,34 @@ async def _authorize(
             },
         )
 
-    server = get_registry().get(server_name)
+    # The owner's servers, not the caller's — see the module docstring. The
+    # same fence row that authorized this call names them.
+    registry = await registry_for_user(store, user_id=identity["user_id"])
+    server = registry.get(server_name)
     if server is None:
-        # Granted at creation, gone from the registry since. Not the job's
-        # fault and not a permission problem: say so plainly rather than
-        # reporting it as a missing endpoint.
+        # Granted at creation and unreachable now: the owner disconnected the
+        # server, the credential stopped decrypting, or the provider left the
+        # catalogue. Not the job's fault and not a permission problem, so it is
+        # reported as the server being gone rather than as a missing endpoint
+        # or a refusal — and deliberately without saying which of the three it
+        # was, since the sandbox has no business learning about its owner's
+        # account state.
+        logger.warning(
+            "agent_mcp_server_unavailable",
+            extra={
+                "event": "agent_mcp_server_unavailable",
+                "job_id": job_id,
+                "server": server_name,
+            },
+        )
         raise HTTPException(
             status_code=503,
             detail={
                 "error": {
                     "type": "server_error",
                     "message": (
-                        f"The {server_name!r} MCP server is no longer configured on this "
-                        "deployment."
+                        f"The {server_name!r} MCP server is not currently connected for "
+                        "this job's owner."
                     ),
                 }
             },
@@ -280,6 +302,31 @@ async def _proxy(
                 }
             },
         ) from exc
+
+    if upstream.status_code in (401, 403):
+        # The third way a connection dies, and the only one visible from here.
+        # Expiry and an unreadable credential are caught during resolution; an
+        # upstream that has simply stopped accepting a live-looking token can
+        # only be discovered by asking it. Attributed to the server, because
+        # unattributed it reads as the sandbox misbehaving when the truth is
+        # that this owner's connection needs re-authorizing — the shape the
+        # gateway's route learned after an hour of silent 401s
+        # (hybridInference#1199) and which came across with this surface.
+        #
+        # Logged, not converted: the status belongs to the agent's own request
+        # and rewriting it would hide a real answer from the CLI. Feeding this
+        # back into `connection_states()`, so Integrations says "connect it
+        # again" before the next job fails, needs a place to record it and
+        # belongs with the connect flow that writes the row.
+        logger.warning(
+            "agent_mcp_upstream_rejected_credential",
+            extra={
+                "event": "agent_mcp_upstream_rejected_credential",
+                "job_id": job_id,
+                "server": server.name,
+                "status": upstream.status_code,
+            },
+        )
 
     content_type = upstream.headers.get("content-type", "")
     if content_type.startswith("text/event-stream"):
