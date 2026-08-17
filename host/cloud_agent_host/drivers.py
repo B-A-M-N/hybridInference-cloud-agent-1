@@ -179,6 +179,9 @@ class LaunchContext:
     #: Host directory the platform bind-mounts at the sandbox's state target.
     #: ``None`` disables session persistence (and with it export/restore).
     state_dir: str | None = None
+    #: Spawns with a live stdin (SandboxSpec.live_input). ``None`` means this
+    #: caller does not offer residency; ``launch_live`` refuses without it.
+    spawn_live: Callable[[list[str], dict[str, str]], SandboxProcess] | None = None
 
 
 class HarnessTurn:
@@ -416,13 +419,31 @@ class ClaudeCodeDriver(HarnessDriver):
         """Fresh session, or one that continues an exported state's memory."""
         if state is None:
             return ClaudeCodeSession(self, context)
+        self._restore(context, state)
+        return ClaudeCodeSession(self, context, resume_session_id=state.session_id)
+
+    def launch_live(
+        self, context: LaunchContext, state: HarnessState | None = None
+    ) -> ClaudeCodeLiveSession:
+        """A resident session (HOT): the process outlives its turns.
+
+        With ``state``, the resident process itself resumes the restored
+        session — a COLD start that immediately becomes hot, which is exactly
+        what a follow-up landing on a fresh host does.
+        """
+        if state is not None:
+            self._restore(context, state)
+            return ClaudeCodeLiveSession(self, context, resume_session_id=state.session_id)
+        return ClaudeCodeLiveSession(self, context)
+
+    @staticmethod
+    def _restore(context: LaunchContext, state: HarnessState) -> None:
         if context.state_dir is None:
             raise StateRestoreUnsupported("restore needs a state mount")
         root = pathlib.Path(context.state_dir) / "claude"
         root.mkdir(parents=True, exist_ok=True)
         with tarfile.open(fileobj=io.BytesIO(state.blob), mode="r:gz") as archive:
             _extract_below(archive, root)
-        return ClaudeCodeSession(self, context, resume_session_id=state.session_id)
 
 
 def _extract_below(archive: tarfile.TarFile, root: pathlib.Path) -> None:
@@ -437,6 +458,129 @@ def _extract_below(archive: tarfile.TarFile, root: pathlib.Path) -> None:
     # The loop above is the filter: only plain files and directories, only
     # below the state dir. Works on every Python this repo supports.
     archive.extractall(base)
+
+
+class ClaudeCodeLiveTurn(HarnessTurn):
+    """One turn on a resident process: borrows the shared stdout, ends at result."""
+
+    def __init__(self, session: ClaudeCodeLiveSession, process: SandboxProcess) -> None:
+        super().__init__(session, process)
+        self._saw_result = False
+
+    def raw_lines(self) -> Iterator[str]:
+        """This turn's slice of the shared stream, up to its result line."""
+        for line in self._session.shared_lines():
+            yield line
+            if self._runtime.turn_settled(line):
+                self._saw_result = True
+                return
+
+    def iter_events(self) -> Iterator[HarnessEvent]:
+        """Floor + dialect events for this turn only."""
+        yield HarnessEvent(TURN_STARTED)
+        for line in self.raw_lines():
+            yield self.event_for_line(line)
+        yield self.finish_event()
+
+    def wait(self) -> TurnResult:
+        """Settle this turn without waiting for the resident process to die."""
+        if self._result is None:
+            if not self._cancelled and not self._saw_result:
+                # Settling without having drained the slice: consume it now —
+                # the boundary and the final message both live in the stream.
+                for line in self.raw_lines():
+                    self.event_for_line(line)
+            if self._cancelled:
+                exit_code = self._process.wait()
+            elif self._saw_result:
+                # The process is deliberately still alive: a settled turn on a
+                # resident session exits nothing.
+                exit_code = 0
+            else:
+                # The stream ended without a result event: the process died
+                # mid-turn. A zero here would be a lie a retry acts on.
+                exit_code = self._process.wait() or 1
+            self._result = self._build_result(exit_code)
+            self._session.turn_finished()
+        return self._result
+
+
+class ClaudeCodeLiveSession(ClaudeCodeSession):
+    """The resident session (HOT): one process, many turns, stdin-fed."""
+
+    def __init__(
+        self,
+        driver: HarnessDriver,
+        context: LaunchContext,
+        *,
+        resume_session_id: str | None = None,
+    ) -> None:
+        super().__init__(driver, context, resume_session_id=resume_session_id)
+        if context.spawn_live is None:
+            raise DriverError("a live session needs a live-input spawn")
+        argv, extra_env = self.runtime.prepare_live(
+            workdir=context.workdir,
+            model="",  # pinned per session below, chosen by the first turn's model
+            gateway_base_url=context.gateway_base_url,
+            credential=context.credential,
+            provides_isolation=context.provides_isolation,
+            mcp_config=context.mcp_config,
+            **self._extra_prepare_kwargs(),
+        )
+        self._argv_template = argv
+        self._extra_env = extra_env
+        self._process: SandboxProcess | None = None
+        self._lines: Iterator[str] | None = None
+        self._model: str | None = None
+        self._live_turn: ClaudeCodeLiveTurn | None = None
+
+    def shared_lines(self) -> Iterator[str]:
+        """The session's single stdout reader, borrowed by the current turn."""
+        assert self._lines is not None
+        return self._lines
+
+    def start_turn(self, turn_input: TurnInput) -> HarnessTurn:
+        """Feed one user turn to the resident process, spawning it lazily.
+
+        The first turn fixes the session's model — a resident process reads
+        its model once (D6: ``model_switch: restart``). A later turn naming a
+        different model refuses here and the platform restarts the session.
+        """
+        if self._closed:
+            raise DriverError("session is closed")
+        if self._live_turn is not None and self._live_turn._result is None:
+            raise DriverError("a turn is already running on this session")
+        if self._process is None:
+            argv = [*self._argv_template]
+            model_at = argv.index("--model") + 1
+            argv[model_at] = turn_input.model
+            env = dict(self._context.base_env)
+            env.update(self._extra_env)
+            env["ANTHROPIC_MODEL"] = turn_input.model
+            env["ANTHROPIC_SMALL_FAST_MODEL"] = turn_input.model
+            assert self._context.spawn_live is not None
+            self._process = self._context.spawn_live(argv, env)
+            self._lines = self._process.lines()
+            self._model = turn_input.model
+        elif turn_input.model != self._model:
+            raise DriverError(
+                f"this resident session runs {self._model!r}; switching to "
+                f"{turn_input.model!r} takes a restart (model_switch=restart)"
+            )
+        self._process.write_line(self.runtime.user_message_line(turn_input.prompt))
+        self._live_turn = ClaudeCodeLiveTurn(self, self._process)
+        return self._live_turn
+
+    def turn_finished(self) -> None:
+        """A settled turn leaves a live session ready for the next one."""
+        return
+
+    def close(self) -> None:
+        """End the residency: EOF stdin, then the platform backstop."""
+        self._closed = True
+        if self._process is not None:
+            self._process.close_stdin()
+            self._process.kill()
 
 
 _DRIVER_TYPES: dict[str, type[HarnessDriver]] = {
