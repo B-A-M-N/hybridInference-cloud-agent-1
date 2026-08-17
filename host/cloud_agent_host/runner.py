@@ -293,6 +293,15 @@ class ControlPlane:
             {"kind": kind, "content": content},
         )
 
+    def report_continuity(self, mode: str) -> None:
+        """Record this attempt's continuity rung. Best-effort observability."""
+        try:
+            self._post(f"/v1/agent/worker/jobs/{self.job_id}/continuity", {"mode": mode})
+        except LeaseLost:
+            raise
+        except Exception:
+            pass
+
     def suspend_terminals(self, phase: str) -> None:
         """Freeze owner PTYs before workspace preparation or artifact capture."""
         self._post(
@@ -915,9 +924,11 @@ def run_agent(
     if session is not None:
         # The restored session *is* the memory: only the new prompt goes in.
         turn_input = TurnInput(prompt=job.task_prompt, model=job.model)
+        control.report_continuity("cold_native")
     else:
         session = driver.launch(context)
         turn_input = TurnInput(prompt=conversation_prompt(job), model=job.model)
+        control.report_continuity("replay")
     if state_dir is not None:
         # After restore, before spawn: whatever the driver just wrote (and the
         # empty dir on a fresh turn) must be writable by the sandbox user, or

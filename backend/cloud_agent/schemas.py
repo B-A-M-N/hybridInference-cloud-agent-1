@@ -565,6 +565,12 @@ class WorkerArtifactResponse(BaseModel):
     artifact_id: int
 
 
+class WorkerContinuityRequest(BaseModel):
+    """Which continuity rung this attempt is running on (design §9)."""
+
+    mode: Literal["hot", "cold_native", "replay"]
+
+
 class WorkerFinishRequest(BaseModel):
     """Terminal transition reported by a worker."""
 

@@ -2124,6 +2124,26 @@ class AgentJobStore:
                 client_seq=event_seq,
             )
 
+    async def record_continuity_mode(
+        self, *, attempt_id: int, lease_generation: int, mode: str
+    ) -> bool:
+        """Stamp which continuity rung this attempt runs on, lease-fenced."""
+        async with self._pool.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    UPDATE agent_attempts
+                    SET continuity_mode = $3
+                    WHERE id = $1 AND lease_generation = $2
+                      AND status = 'running' AND lease_expires_at > NOW()
+                    RETURNING id
+                    """,
+                    attempt_id,
+                    lease_generation,
+                    mode,
+                )
+            )
+
     async def terminal_workspace_ready(self, *, attempt_id: int) -> bool:
         """Return whether the live attempt currently permits terminal writes.
 

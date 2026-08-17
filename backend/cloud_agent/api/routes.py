@@ -113,6 +113,7 @@ from cloud_agent.schemas import (
     WorkerArtifactResponse,
     WorkerClaimRequest,
     WorkerClaimResponse,
+    WorkerContinuityRequest,
     WorkerEventRequest,
     WorkerEventResponse,
     WorkerFinishRequest,
@@ -2883,6 +2884,31 @@ async def worker_append_event(
     if event_id is None:
         raise _lease_lost()
     return WorkerEventResponse(event_id=event_id)
+
+
+@router.post("/worker/jobs/{job_id}/continuity", response_model=WorkerAckResponse)
+async def worker_report_continuity(
+    job_id: str,
+    body: WorkerContinuityRequest,
+    authorization: str | None = Header(None),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+) -> WorkerAckResponse:
+    """Record which continuity rung this attempt runs on (design §9).
+
+    Observability, deliberately fenced like every other worker write: a
+    superseded attempt must not be able to relabel how the live one ran.
+    """
+    job_store = _require_store(store)
+    claims = _worker_claims(authorization)
+    _match_job(claims, job_id)
+    recorded = await job_store.record_continuity_mode(
+        attempt_id=claims["attempt_id"],
+        lease_generation=claims["lease_generation"],
+        mode=body.mode,
+    )
+    if not recorded:
+        raise _lease_lost()
+    return WorkerAckResponse(ok=True)
 
 
 @router.post("/worker/jobs/{job_id}/terminals/suspend", response_model=WorkerAckResponse)
