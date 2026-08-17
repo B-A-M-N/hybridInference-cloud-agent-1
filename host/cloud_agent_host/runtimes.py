@@ -304,6 +304,62 @@ class ClaudeCodeRuntime(AgentRuntime):
             env["CLAUDE_CONFIG_DIR"] = config_dir
         return argv, env
 
+    def prepare_live(
+        self,
+        *,
+        workdir: str,
+        model: str,
+        gateway_base_url: str,
+        credential: str,
+        provides_isolation: bool = False,
+        mcp_config: RuntimeMCPConfig = EMPTY_RUNTIME_MCP_CONFIG,
+        config_dir: str | None = None,
+        resume_session_id: str | None = None,
+    ) -> tuple[list[str], dict[str, str]]:
+        """The resident invocation (HOT): prompts arrive on stdin, not argv.
+
+        ``--input-format stream-json`` keeps the process alive between turns,
+        reading user messages from stdin — the terminal-never-closed shape the
+        design's HOT tier is. Everything else (flags, env, MCP pairing) is the
+        one-shot invocation verbatim, built by the same code so the two can
+        never drift.
+        """
+        argv, env = self.prepare(
+            workdir=workdir,
+            task_prompt="",
+            model=model,
+            gateway_base_url=gateway_base_url,
+            credential=credential,
+            provides_isolation=provides_isolation,
+            mcp_config=mcp_config,
+            config_dir=config_dir,
+            resume_session_id=resume_session_id,
+        )
+        # Drop the empty positional prompt (`-p ""`), add the input format.
+        prompt_at = argv.index("-p")
+        del argv[prompt_at : prompt_at + 2]
+        argv[1:1] = ["-p", "--input-format", "stream-json"]
+        return argv, env
+
+    @staticmethod
+    def user_message_line(text: str) -> str:
+        """One stdin line carrying one user turn, in the CLI's wire shape."""
+        return json.dumps(
+            {
+                "type": "user",
+                "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+            }
+        )
+
+    @staticmethod
+    def turn_settled(line: str) -> bool:
+        """Whether this stdout line is the CLI's end-of-turn result event."""
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        return isinstance(event, dict) and event.get("type") == "result"
+
     def parse_event(self, line: str) -> NormalizedEvent | None:
         """Normalize one stream-json line."""
         line = line.strip()
