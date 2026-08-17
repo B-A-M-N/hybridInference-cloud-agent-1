@@ -608,6 +608,86 @@ def test_preflight_accepts_the_workdir_root_on_every_backend():
     ProcessBackend(acknowledged_unsafe=True).preflight(workdir_root="/tmp")
 
 
+def test_container_preflight_proves_guest_kernel_with_the_exact_runtime_and_image(monkeypatch):
+    calls: list[list[str]] = []
+    monkeypatch.setattr(sandbox_mod.os, "uname", lambda: SimpleNamespace(release="host-kernel"))
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv[1] == "run":
+            return SimpleNamespace(returncode=0, stdout="guest-kernel\n", stderr="")
+        if argv[1:3] == ["network", "inspect"]:
+            return SimpleNamespace(returncode=0, stdout="true\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="27.0\n", stderr="")
+
+    monkeypatch.setattr(sandbox_mod.subprocess, "run", fake_run)
+    backend = ContainerBackend(
+        image="registry.example/sandbox@sha256:abc",
+        runtime=KATA_RUNTIME,
+        network="agent-egress",
+    )
+
+    backend.preflight()
+
+    probe = next(argv for argv in calls if argv[1] == "run")
+    assert probe[probe.index("--runtime") + 1] == KATA_RUNTIME
+    assert probe[probe.index("--entrypoint") + 2] == "registry.example/sandbox@sha256:abc"
+    stamp = backend.version_stamp()
+    assert stamp["host_kernel"] == "host-kernel"
+    assert stamp["guest_kernel"] == "guest-kernel"
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr", "message"),
+    [
+        (0, "host-kernel\n", "", "reported the host kernel"),
+        (0, "\n", "", "no guest kernel"),
+        (125, "", "runtime failed", "could not start sandbox image"),
+    ],
+)
+def test_container_preflight_refuses_an_unproved_kernel_boundary(
+    monkeypatch, returncode, stdout, stderr, message
+):
+    monkeypatch.setattr(sandbox_mod.os, "uname", lambda: SimpleNamespace(release="host-kernel"))
+    monkeypatch.setattr(
+        sandbox_mod.subprocess,
+        "run",
+        lambda argv, **kwargs: SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr),
+    )
+    backend = ContainerBackend(image="img:1", runtime=KATA_RUNTIME)
+
+    with pytest.raises(SandboxError, match=message):
+        backend._probe_kernel_boundary()
+
+
+def test_plain_runc_cannot_fabricate_a_guest_kernel_attestation(monkeypatch):
+    monkeypatch.setattr(sandbox_mod.os, "uname", lambda: SimpleNamespace(release="host-kernel"))
+    backend = ContainerBackend(image="img:1")
+
+    backend._probe_kernel_boundary()
+
+    stamp = backend.version_stamp()
+    assert stamp["sandbox_runtime"] == ""
+    assert stamp["host_kernel"] == "host-kernel"
+    assert stamp["guest_kernel"] is None
+
+
+def test_custom_runtime_is_reported_exactly_not_relabeled_as_kata(monkeypatch):
+    monkeypatch.setattr(sandbox_mod.os, "uname", lambda: SimpleNamespace(release="host-kernel"))
+    monkeypatch.setattr(
+        sandbox_mod.subprocess,
+        "run",
+        lambda argv, **kwargs: SimpleNamespace(returncode=0, stdout="custom-guest\n", stderr=""),
+    )
+    backend = ContainerBackend(image="img:1", runtime="runsc")
+
+    backend._probe_kernel_boundary()
+
+    stamp = backend.version_stamp()
+    assert stamp["sandbox_runtime"] == "runsc"
+    assert stamp["guest_kernel"] == "custom-guest"
+
+
 def test_the_world_writable_fallback_reaches_the_whole_tree(tmp_path, monkeypatch):
     """Opening up only the root leaves every checked-out file unwritable.
 

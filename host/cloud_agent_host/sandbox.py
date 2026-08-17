@@ -696,6 +696,14 @@ class ContainerBackend(SandboxBackend):
         # Filled by the first version_stamp() call. The image is pinned for
         # this backend's lifetime, so one inspect answers for every heartbeat.
         self._version_stamp: dict[str, Any] | None = None
+        # Filled by preflight from a real container under the exact runtime
+        # this backend will pass to every job. Kept separate from the cached
+        # image inspect so calling version_stamp before preflight cannot freeze
+        # out the later proof.
+        self._kernel_probe: dict[str, str | None] = {
+            "host_kernel": os.uname().release,
+            "guest_kernel": None,
+        }
 
     @property
     def provides_isolation(self) -> bool:
@@ -713,7 +721,7 @@ class ContainerBackend(SandboxBackend):
         return metadata
 
     def version_stamp(self) -> dict[str, Any]:
-        """Report isolation runtime, image digest and baked CLI versions.
+        """Report runtime, image, CLI versions and the preflight kernel probe.
 
         ``sandbox_runtime`` is always present and ``""`` is a positive
         statement — a container backend with no VM runtime is runc on the
@@ -727,7 +735,7 @@ class ContainerBackend(SandboxBackend):
         """
         if self._version_stamp is None:
             self._version_stamp = self._collect_version_stamp()
-        return dict(self._version_stamp)
+        return {**self._version_stamp, **self._kernel_probe}
 
     def _collect_version_stamp(self) -> dict[str, Any]:
         stamp: dict[str, Any] = {
@@ -942,6 +950,7 @@ class ContainerBackend(SandboxBackend):
             raise SandboxError(f"{self.docker_binary} is not usable: {exc}") from exc
         if result.returncode != 0:
             raise SandboxError(f"{self.docker_binary} is not usable: {result.stderr.strip()[:200]}")
+        self._probe_kernel_boundary()
         self._check_networks_are_closed()
         if workdir_root is not None:
             self._check_bind_mountable(workdir_root)
@@ -956,6 +965,62 @@ class ContainerBackend(SandboxBackend):
                     ),
                 },
             )
+
+    def _probe_kernel_boundary(self) -> None:
+        """Observe the kernel supplied by the configured container runtime.
+
+        Merely accepting ``--runtime`` proves only that Docker knows a name.
+        The dangerous failure mode is a deployment that labels itself VM-
+        isolated while jobs still share the host kernel, so preflight starts
+        the configured image under the exact runtime jobs will use and compares
+        the observed kernels. Plain runc records no guest proof and remains
+        available only to ``trusted-v1`` scheduling.
+        """
+        self._kernel_probe = {"host_kernel": os.uname().release, "guest_kernel": None}
+        if not self.runtime:
+            return
+        argv = [
+            self.docker_binary,
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--runtime",
+            self.runtime,
+            "--entrypoint",
+            "/bin/sh",
+            self.image,
+            "-c",
+            "uname -r",
+        ]
+        try:
+            probe = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SandboxError(f"could not probe sandbox runtime {self.runtime!r}: {exc}") from exc
+        if probe.returncode != 0:
+            raise SandboxError(
+                f"could not start sandbox image {self.image!r} under runtime "
+                f"{self.runtime!r}: {probe.stderr.strip()[:200]}"
+            )
+        lines = [line.strip() for line in probe.stdout.splitlines() if line.strip()]
+        if not lines:
+            raise SandboxError(
+                f"sandbox runtime {self.runtime!r} returned no guest kernel from uname -r"
+            )
+        guest_kernel = lines[-1]
+        host_kernel = str(self._kernel_probe["host_kernel"])
+        if guest_kernel == host_kernel:
+            raise SandboxError(
+                f"sandbox runtime {self.runtime!r} reported the host kernel "
+                f"{host_kernel!r}; refusing to claim VM isolation"
+            )
+        self._kernel_probe["guest_kernel"] = guest_kernel
 
     def _check_networks_are_closed(self) -> None:
         """Check every network a phase can run on, not just the default one.

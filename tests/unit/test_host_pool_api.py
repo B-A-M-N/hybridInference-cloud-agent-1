@@ -660,8 +660,23 @@ class ClaimRecorder(FakeHostPoolStore):
         super().__init__()
         self.claims: list[dict[str, Any]] = []
 
-    async def claim_job(self, *, worker_id: str, lease_ttl_seconds: float, host: str | None = None):
-        self.claims.append({"worker_id": worker_id, "host": host})
+    async def claim_job(
+        self,
+        *,
+        worker_id: str,
+        lease_ttl_seconds: float,
+        host: str | None = None,
+        host_credential_hash: str | None = None,
+        claim_attestation: dict[str, Any] | None = None,
+    ):
+        self.claims.append(
+            {
+                "worker_id": worker_id,
+                "host": host,
+                "host_credential_hash": host_credential_hash,
+                "claim_attestation": claim_attestation,
+            }
+        )
         return None
 
 
@@ -701,12 +716,33 @@ async def test_a_host_credential_names_the_claiming_machine(claim_client):
 
     response = await async_client.post(
         "/v1/agent/worker/claim",
-        json={"worker_id": "w1", "host": "runner-b"},
+        json={
+            "worker_id": "w1",
+            "host": "runner-b",
+            "attestation": {
+                "sandbox_runtime": "io.containerd.kata.v2",
+                "host_kernel": "host",
+                "guest_kernel": "guest",
+            },
+        },
         headers={"Authorization": f"Bearer {credential}"},
     )
 
     assert response.status_code == 200
-    assert store.claims == [{"worker_id": "w1", "host": "runner-a"}]
+    assert store.claims == [
+        {
+            "worker_id": "w1",
+            "host": "runner-a",
+            "host_credential_hash": hash_secret(credential),
+            "claim_attestation": {
+                "sandbox_runtime": "io.containerd.kata.v2",
+                "sandbox_image_digest": None,
+                "runtime_versions": {},
+                "host_kernel": "host",
+                "guest_kernel": "guest",
+            },
+        }
+    ]
 
 
 async def test_the_shared_dispatcher_token_still_reports_its_host_in_the_body(claim_client):
@@ -715,12 +751,22 @@ async def test_the_shared_dispatcher_token_still_reports_its_host_in_the_body(cl
 
     response = await async_client.post(
         "/v1/agent/worker/claim",
-        json={"worker_id": "w1", "host": "runner-b"},
+        json={
+            "worker_id": "w1",
+            "host": "runner-b",
+            "attestation": {
+                "sandbox_runtime": "io.containerd.kata.v2",
+                "host_kernel": "host",
+                "guest_kernel": "guest",
+            },
+        },
         headers={"Authorization": "Bearer the-shared-dispatcher-token"},
     )
 
     assert response.status_code == 200
-    assert store.claims == [{"worker_id": "w1", "host": "runner-b"}]
+    assert store.claims[0]["host"] == "runner-b"
+    assert store.claims[0]["host_credential_hash"] is None
+    assert store.claims[0]["claim_attestation"]["guest_kernel"] == "guest"
 
 
 async def test_a_revoked_host_credential_cannot_claim(claim_client):

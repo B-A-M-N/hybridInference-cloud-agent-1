@@ -12,9 +12,10 @@ import binascii
 from datetime import datetime  # noqa: TC003
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from cloud_agent.entitlement import REPO_PATTERN
+from cloud_agent.execution_profiles import ExecutionProfile
 from cloud_agent.host_pool import ENROLL_TOKEN_TTL_S
 
 # A lease is the only thing that lets the reaper take a job back from a stuck
@@ -96,6 +97,16 @@ class AgentJobCreate(BaseModel):
     )
     metadata: dict[str, Any] | None = Field(None, description="Opaque caller metadata.")
 
+    @model_validator(mode="before")
+    @classmethod
+    def execution_profile_is_server_owned(cls, value: Any) -> Any:
+        """Refuse an apparent profile choice instead of silently ignoring it."""
+        if isinstance(value, dict) and "execution_profile" in value:
+            raise ValueError(
+                "execution_profile is server-owned; callers cannot select or downgrade it"
+            )
+        return value
+
 
 class AgentJobResponse(BaseModel):
     """One agent job as returned to its owner."""
@@ -108,6 +119,7 @@ class AgentJobResponse(BaseModel):
     task_prompt: str
     runtime: str
     model: str
+    execution_profile: ExecutionProfile = ExecutionProfile.TRUSTED_V1
     base_ref: str | None = None
     base_sha: str | None = None
     output_branch: str | None = None
@@ -404,6 +416,22 @@ class AgentGitWorkspaceResponse(BaseModel):
 # ── Worker-facing (capability-token authenticated) ─────────────────────
 
 
+class WorkerClaimAttestation(BaseModel):
+    """What this exact runner replica proved before asking for work.
+
+    This travels on the claim rather than being inferred from the host's last
+    heartbeat: replicas on one host may briefly run different images/runtimes
+    during a rollout, and the claimant is the only source that can say what it
+    is about to spawn.
+    """
+
+    sandbox_runtime: str | None = Field(None, max_length=128)
+    sandbox_image_digest: str | None = Field(None, max_length=512)
+    runtime_versions: dict[str, str] = Field(default_factory=dict, max_length=64)
+    host_kernel: str | None = Field(None, max_length=256)
+    guest_kernel: str | None = Field(None, max_length=256)
+
+
 class WorkerClaimRequest(BaseModel):
     """Worker request to claim the next queued job."""
 
@@ -427,6 +455,13 @@ class WorkerClaimRequest(BaseModel):
             "predate host reporting."
         ),
     )
+    attestation: WorkerClaimAttestation | None = Field(
+        None,
+        description=(
+            "Claim-time runtime/image/version/kernel stamp from this exact runner replica. "
+            "Required for untrusted-kata-v1; legacy trusted-v1 claims may omit it."
+        ),
+    )
 
 
 class WorkerClaimResponse(BaseModel):
@@ -444,6 +479,7 @@ class WorkerClaimResponse(BaseModel):
     setup_script: str | None = None
     runtime: str
     model: str
+    execution_profile: ExecutionProfile = ExecutionProfile.TRUSTED_V1
     worker_token: str
     sandbox_token: str = Field(
         "",

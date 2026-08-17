@@ -56,6 +56,10 @@ from cloud_agent.entitlement import (
     repos_for_user,
     require_entitled_repo,
 )
+from cloud_agent.execution_profiles import (
+    RESERVED_EXECUTION_METADATA_KEYS,
+    default_execution_profile,
+)
 from cloud_agent.gateway import GatewayError
 from cloud_agent.github_app import AppNotInstalled, GitHubAppError
 from cloud_agent.host_pool import hash_secret
@@ -336,6 +340,7 @@ def _job_response(job: dict[str, Any], usage: dict[str, Any] | None = None) -> A
         task_prompt=job["task_prompt"],
         runtime=job["runtime"],
         model=job["model"],
+        execution_profile=job.get("execution_profile", "trusted-v1"),
         base_ref=base_ref,
         base_sha=job["base_sha"],
         output_branch=branch_name_for(job.get("thread_id") or job["id"]),
@@ -1162,17 +1167,30 @@ async def create_agent_job(
     # Reserved display fact: caller metadata must not be able to claim the
     # job was pinned from a different branch than the one the API resolved.
     metadata.pop(BASE_REF_METADATA_KEY, None)
+    # Runtime/profile/probe facts are server-owned columns.  Keeping forged
+    # copies in opaque metadata would not affect scheduling, but it would let a
+    # caller manufacture a contradictory audit trail in the owner response.
+    for key in RESERVED_EXECUTION_METADATA_KEYS:
+        metadata.pop(key, None)
     if body.base_ref:
         metadata[BASE_REF_METADATA_KEY] = body.base_ref
     mcp_servers = await _resolve_mcp_servers(
         body.mcp_servers, runtime=body.runtime, store=job_store, user_id=user["user_id"]
     )
+    try:
+        execution_profile = default_execution_profile().value
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": {"type": "invalid_configuration", "message": str(exc)}},
+        ) from exc
     job = await job_store.create_job(
         user_id=user["user_id"],
         repo=body.repo,
         task_prompt=body.task_prompt,
         runtime=body.runtime,
         model=model,
+        execution_profile=execution_profile,
         base_sha=base_sha,
         setup_script=body.setup_script,
         metadata=metadata or None,
@@ -2281,6 +2299,11 @@ _HOST_IDENTITY_PREFIX = "host:"
 #: for every dependency override a test installs.
 _HOST_REQUEST_ATTR = "agent_host"
 
+#: Hash of the exact host credential that passed authentication.  The store
+#: re-checks it while taking the host row/slot, closing the auth→claim race
+#: where a credential is revoked or superseded between those two operations.
+_HOST_CREDENTIAL_HASH_REQUEST_ATTR = "agent_host_credential_hash"
+
 #: Cheap structural check before touching the signing key: host credentials
 #: carry their own token prefix, so a dispatcher or admin token never reaches
 #: the host parser at all.
@@ -2353,6 +2376,7 @@ async def verify_dispatcher_access(
                     },
                 )
             request.state.__setattr__(_HOST_REQUEST_ATTR, host["host"])
+            request.state.__setattr__(_HOST_CREDENTIAL_HASH_REQUEST_ATTR, hash_secret(presented))
             return f"{_HOST_IDENTITY_PREFIX}{host['host']}"
     return await verify_admin_access(request=request, authorization=authorization)
 
@@ -2650,11 +2674,14 @@ async def worker_claim(
     # and only after verifying a signature and a stored hash. Deriving it from
     # the identity string instead would make "which host am I" a substring
     # match on a value E7 will source from a JWT.
-    host = getattr(request.state, _HOST_REQUEST_ATTR, None) or body.host
+    authenticated_host = getattr(request.state, _HOST_REQUEST_ATTR, None)
+    host = authenticated_host or body.host
     claim = await job_store.claim_job(
         worker_id=body.worker_id,
         lease_ttl_seconds=body.lease_ttl_seconds,
         host=host,
+        host_credential_hash=getattr(request.state, _HOST_CREDENTIAL_HASH_REQUEST_ATTR, None),
+        claim_attestation=(body.attestation.model_dump() if body.attestation is not None else None),
     )
     if claim is None:
         return None
@@ -2786,6 +2813,7 @@ async def worker_claim(
         setup_script=claim.get("setup_script"),
         runtime=claim["runtime"],
         model=claim["model"],
+        execution_profile=claim.get("execution_profile", "trusted-v1"),
         worker_token=token,
         sandbox_token=sandbox_token,
         mcp_token=mcp_token,

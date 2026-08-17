@@ -476,6 +476,27 @@ whatever pipeline deploys the gateway, on its own side):
   possible and stays explicit: set `AGENT_SANDBOX_BACKEND=container`, and every
   deploy restates what it costs.
 
+The control plane independently enforces the same fact at scheduling time.
+Set `AGENT_DEFAULT_EXECUTION_PROFILE=untrusted-kata-v1` for any deployment that
+accepts untrusted repositories, after at least one enrolled Kata Host passes
+preflight. A secure job is claimable only when all of the following are true in
+the same claim transaction:
+
+- the caller presents that Host's current per-host credential (the shared
+  dispatcher token is insufficient);
+- the exact runner replica reports `io.containerd.kata.v2`;
+- Python preflight started the configured sandbox image under that runtime and
+  observed a non-empty guest kernel different from the Host kernel.
+
+The claim, not the Host's mutable heartbeat row, supplies the attempt's runtime,
+image digest, CLI version and kernel stamp. This matters during rolling deploys,
+when runc and Kata replicas can temporarily share one Host row. A missing probe,
+an old runner, a custom runtime, a self-declared `kata` capability or a revoked
+Host credential simply cannot claim the secure job; there is no fallback to
+runc. `trusted-v1` keeps the legacy claim path only for trusted internal/dev
+repositories. Existing rows migrate to that compatibility profile, while every
+follow-up and fork inherits the profile already stored on its thread.
+
 ### How many runners
 
 **One runner runs one job at a time.** It claims, runs the job to completion,
