@@ -216,6 +216,9 @@ async def heartbeat_host(
         runner_version=body.runner_version,
         broker_url=_checked_broker_url(body.broker_url),
         capabilities=body.capabilities,
+        sandbox_runtime=body.sandbox_runtime,
+        sandbox_image_digest=body.sandbox_image_digest,
+        runtime_versions=body.runtime_versions,
     )
     if updated is None:
         # The row vanished between authentication and the write — a forget

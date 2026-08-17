@@ -94,6 +94,9 @@ class FakeHostPoolStore:
             "runner_version": None,
             "broker_url": None,
             "last_heartbeat_at": None,
+            "sandbox_runtime": None,
+            "sandbox_image_digest": None,
+            "runtime_versions": None,
             "enrolled": False,
             "credential_hash": None,
         }
@@ -140,6 +143,9 @@ class FakeHostPoolStore:
         runner_version: str | None = None,
         broker_url: str | None = None,
         capabilities: list[str] | None = None,
+        sandbox_runtime: str | None = None,
+        sandbox_image_digest: str | None = None,
+        runtime_versions: dict[str, str] | None = None,
     ) -> dict[str, Any] | None:
         row = self.rows.get(host)
         if row is None:
@@ -151,6 +157,11 @@ class FakeHostPoolStore:
             ("slots_total", slots_total),
             ("runner_version", runner_version),
             ("broker_url", broker_url),
+            # "" and {} overwrite — only None means "not reported", exactly
+            # the COALESCE the real store applies.
+            ("sandbox_runtime", sandbox_runtime),
+            ("sandbox_image_digest", sandbox_image_digest),
+            ("runtime_versions", runtime_versions),
         ):
             if value is not None:
                 row[field] = value
@@ -513,6 +524,54 @@ async def test_a_heartbeat_can_update_capacity_and_version(client):
     assert response.json()["slots_total"] == 6
     assert store.rows["runner-a"]["runner_version"] == "1.4.0"
     assert store.rows["runner-a"]["broker_url"] == "http://broker-a:8092"
+
+
+async def test_a_heartbeat_carries_the_version_stamp_to_the_admin_page(client):
+    """What runs on a host — runtime, image, CLI versions — is heartbeat-borne.
+
+    ``sandbox_runtime: ""`` is the interesting value: it is the host positively
+    attesting shared-kernel runc, and it must survive to the admin surface
+    rather than collapsing into "never reported".
+    """
+    async_client, store = client
+    credential = await _enroll(async_client, store)
+
+    await async_client.post(
+        "/v1/agent/host/heartbeat",
+        json={
+            "sandbox_runtime": "",
+            "sandbox_image_digest": "sha256:abc123",
+            "runtime_versions": {"claude-code": "1.2.3"},
+        },
+        headers={"Authorization": f"Bearer {credential}"},
+    )
+
+    assert store.rows["runner-a"]["sandbox_runtime"] == ""
+    assert store.rows["runner-a"]["sandbox_image_digest"] == "sha256:abc123"
+    assert store.rows["runner-a"]["runtime_versions"] == {"claude-code": "1.2.3"}
+    listed = (await async_client.get("/admin/agent/runner-hosts", headers=ADMIN)).json()
+    (shown,) = [h for h in listed["hosts"] if h["host"] == "runner-a"]
+    assert shown["sandbox_runtime"] == ""
+    assert shown["sandbox_image_digest"] == "sha256:abc123"
+    assert shown["runtime_versions"] == {"claude-code": "1.2.3"}
+
+
+async def test_a_stampless_heartbeat_keeps_the_last_stamp(client):
+    """A runner predating the stamp fields must not blank a recorded one."""
+    async_client, store = client
+    credential = await _enroll(async_client, store)
+    await async_client.post(
+        "/v1/agent/host/heartbeat",
+        json={"sandbox_runtime": "io.containerd.kata.v2", "runtime_versions": {}},
+        headers={"Authorization": f"Bearer {credential}"},
+    )
+
+    await async_client.post(
+        "/v1/agent/host/heartbeat", json={}, headers={"Authorization": f"Bearer {credential}"}
+    )
+
+    assert store.rows["runner-a"]["sandbox_runtime"] == "io.containerd.kata.v2"
+    assert store.rows["runner-a"]["runtime_versions"] == {}
 
 
 async def test_a_heartbeat_without_a_credential_is_refused(client):

@@ -161,6 +161,9 @@ _HOST_COLUMN_NAMES = (
     "runner_version",
     "broker_url",
     "last_heartbeat_at",
+    "sandbox_runtime",
+    "sandbox_image_digest",
+    "runtime_versions",
 )
 _HOST_COLUMNS = ", ".join(_HOST_COLUMN_NAMES) + ", (credential_hash IS NOT NULL) AS enrolled"
 # The same list qualified with ``h.``. Required wherever the query joins
@@ -1282,6 +1285,8 @@ class AgentJobStore:
         host = dict(row)
         host["labels"] = _load_json(host.get("labels")) or {}
         host["capabilities"] = _load_json(host.get("capabilities")) or []
+        # None (never reported) and {} (reported: no labels) stay distinct.
+        host["runtime_versions"] = _load_json(host.get("runtime_versions"))
         return host
 
     async def issue_enroll_token(
@@ -1443,6 +1448,9 @@ class AgentJobStore:
         runner_version: str | None = None,
         broker_url: str | None = None,
         capabilities: list[str] | None = None,
+        sandbox_runtime: str | None = None,
+        sandbox_image_digest: str | None = None,
+        runtime_versions: dict[str, str] | None = None,
     ) -> dict[str, Any] | None:
         """Record a heartbeat, promoting the host to ``online`` when it may.
 
@@ -1470,7 +1478,10 @@ class AgentJobStore:
                     slots_total = COALESCE($2, slots_total),
                     runner_version = COALESCE($3, runner_version),
                     broker_url = COALESCE($4, broker_url),
-                    capabilities = COALESCE($5::jsonb, capabilities)
+                    capabilities = COALESCE($5::jsonb, capabilities),
+                    sandbox_runtime = COALESCE($6, sandbox_runtime),
+                    sandbox_image_digest = COALESCE($7, sandbox_image_digest),
+                    runtime_versions = COALESCE($8::jsonb, runtime_versions)
                 WHERE host = $1
                 RETURNING {_HOST_COLUMNS}
                 """,
@@ -1479,6 +1490,11 @@ class AgentJobStore:
                 runner_version,
                 broker_url,
                 None if capabilities is None else json.dumps(normalize_capabilities(capabilities)),
+                # "" survives COALESCE deliberately: an empty runtime is the
+                # host attesting shared-kernel runc, not declining to answer.
+                sandbox_runtime,
+                sandbox_image_digest,
+                None if runtime_versions is None else json.dumps(runtime_versions),
             )
         return None if row is None else self._host_row_to_dict(row)
 
@@ -1688,9 +1704,11 @@ class AgentJobStore:
                 # to claim is the one outcome that makes the switch a lie.
                 return None
             capabilities = "[]"
+            host_stamp: dict[str, Any] = {}
             if host is not None:
                 host_row = await conn.fetchrow(
-                    "SELECT status, capabilities, slots_total, slots_used "
+                    "SELECT status, capabilities, slots_total, slots_used, "
+                    "sandbox_runtime, sandbox_image_digest, runtime_versions "
                     "FROM agent_runner_hosts WHERE host = $1",
                     host,
                 )
@@ -1707,6 +1725,11 @@ class AgentJobStore:
                 ):
                     return None
                 capabilities = host_row["capabilities"]
+                host_stamp = {
+                    "sandbox_runtime": host_row["sandbox_runtime"],
+                    "sandbox_image_digest": host_row["sandbox_image_digest"],
+                    "runtime_versions": _load_json(host_row["runtime_versions"]) or {},
+                }
             # Follow-ups may be submitted while a run is active. Promote only
             # those whose direct parent has settled; a chain therefore
             # advances one turn at a time even with multiple waiting messages.
@@ -1770,12 +1793,20 @@ class AgentJobStore:
                 "SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM agent_attempts WHERE job_id = $1",
                 job_id,
             )
+            # The stamp is copied from the host row at claim time, not joined at
+            # read time: the question a retry or an audit asks is "what ran the
+            # attempt", and the host's *current* image answers a different
+            # question once the machine upgrades (issue #54).
+            runtime_versions = host_stamp.get("runtime_versions") or {}
+            runtime_version = runtime_versions.get(job_row["runtime"])
             attempt = await conn.fetchrow(
                 """
                 INSERT INTO agent_attempts
                     (job_id, attempt_no, lease_owner, lease_generation,
-                     lease_expires_at, base_sha, host_id)
-                VALUES ($1, $2, $3, $4, NOW() + make_interval(secs => $5), $6, $7)
+                     lease_expires_at, base_sha, host_id,
+                     sandbox_runtime, sandbox_image_digest, runtime_version)
+                VALUES ($1, $2, $3, $4, NOW() + make_interval(secs => $5), $6, $7,
+                        $8, $9, $10)
                 RETURNING id, attempt_no, lease_generation
                 """,
                 job_id,
@@ -1785,6 +1816,9 @@ class AgentJobStore:
                 lease_ttl_seconds,
                 job_row["base_sha"],
                 host,
+                host_stamp.get("sandbox_runtime"),
+                host_stamp.get("sandbox_image_digest"),
+                runtime_version,
             )
             await conn.execute(
                 "UPDATE agent_jobs SET state = 'running', current_attempt_id = $2, "

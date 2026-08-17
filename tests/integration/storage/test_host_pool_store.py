@@ -396,6 +396,65 @@ async def test_a_claim_takes_a_slot_and_stamps_the_attempt(store):
     assert (await store.host_for_attempt(attempt_id=claim["attempt_id"]))["host"] == "runner-a"
 
 
+async def test_a_heartbeat_round_trips_the_version_stamp(store):
+    """'' and {} are answers, and a stampless beat does not erase them."""
+    await _enrol(store, "runner-a")
+    row = await store.record_host_heartbeat(
+        host="runner-a",
+        sandbox_runtime="",
+        sandbox_image_digest="sha256:abc",
+        runtime_versions={},
+    )
+    assert row["sandbox_runtime"] == ""
+    assert row["sandbox_image_digest"] == "sha256:abc"
+    assert row["runtime_versions"] == {}
+
+    row = await store.record_host_heartbeat(host="runner-a")
+
+    assert row["sandbox_runtime"] == ""
+    assert row["sandbox_image_digest"] == "sha256:abc"
+    assert row["runtime_versions"] == {}
+
+
+async def test_a_claim_copies_the_hosts_version_stamp_onto_the_attempt(store):
+    """The attempt records what ran it, immune to later host upgrades."""
+    await _enrol(store, "runner-a")
+    await store.record_host_heartbeat(
+        host="runner-a",
+        sandbox_runtime="io.containerd.kata.v2",
+        sandbox_image_digest="sha256:def",
+        runtime_versions={"claude-code": "1.2.3", "codex": "0.5.0"},
+    )
+    await _create_job(store)  # runtime claude-code
+
+    claim = await store.claim_job(worker_id="w1", lease_ttl_seconds=60, host="runner-a")
+
+    assert claim is not None
+    async with store._pool.acquire() as conn:
+        attempt = await conn.fetchrow(
+            "SELECT sandbox_runtime, sandbox_image_digest, runtime_version "
+            "FROM agent_attempts WHERE id = $1",
+            claim["attempt_id"],
+        )
+    assert attempt["sandbox_runtime"] == "io.containerd.kata.v2"
+    assert attempt["sandbox_image_digest"] == "sha256:def"
+    assert attempt["runtime_version"] == "1.2.3"
+
+    # A host that has never reported stamps nothing — and still claims.
+    await _enrol(store, "runner-b")
+    await _create_job(store)
+    bare = await store.claim_job(worker_id="w2", lease_ttl_seconds=60, host="runner-b")
+    assert bare is not None
+    async with store._pool.acquire() as conn:
+        attempt = await conn.fetchrow(
+            "SELECT sandbox_runtime, sandbox_image_digest, runtime_version "
+            "FROM agent_attempts WHERE id = $1",
+            bare["attempt_id"],
+        )
+    assert attempt["sandbox_runtime"] is None
+    assert attempt["runtime_version"] is None
+
+
 async def test_a_full_host_claims_nothing_more(store):
     await _enrol(store, "runner-a", slots_total=1)
     await _create_job(store)

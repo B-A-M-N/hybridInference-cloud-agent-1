@@ -285,12 +285,20 @@ def heartbeat(
     broker_url: str | None = None,
     capabilities: list[str] | None = None,
     runner_version: str | None = None,
+    sandbox_runtime: str | None = None,
+    sandbox_image_digest: str | None = None,
+    runtime_versions: dict[str, str] | None = None,
 ) -> HostIdentity:
     """Report liveness and capacity, and read back what the pool decided.
 
     The answer carries the operator's side of the conversation — ``draining``,
     ``offline``, a changed interval — which is the only way a runner learns
     that a human asked it to stop taking work.
+
+    The version stamp travels with every beat (issue #54): ``sandbox_runtime``
+    (``""`` = shared-kernel runc, a positive statement), the sandbox image
+    digest, and the CLI versions baked into that image. ``None`` means "not
+    reported" and leaves the control plane's last knowledge in place.
     """
     answer = _post(
         f"{base_url.rstrip('/')}/v1/agent/host/heartbeat",
@@ -299,6 +307,9 @@ def heartbeat(
             "broker_url": broker_url,
             "capabilities": capabilities,
             "runner_version": runner_version,
+            "sandbox_runtime": sandbox_runtime,
+            "sandbox_image_digest": sandbox_image_digest,
+            "runtime_versions": runtime_versions,
         },
         bearer=identity.credential,
     )
@@ -422,6 +433,9 @@ class HostHeartbeat:
         broker_url: str | None = None,
         capabilities: list[str] | None = None,
         runner_version: str | None = None,
+        sandbox_runtime: str | None = None,
+        sandbox_image_digest: str | None = None,
+        runtime_versions: dict[str, str] | None = None,
     ) -> None:
         self._base_url = base_url
         self._identity = identity
@@ -429,6 +443,9 @@ class HostHeartbeat:
         self._broker_url = broker_url
         self._capabilities = capabilities
         self._runner_version = runner_version
+        self._sandbox_runtime = sandbox_runtime
+        self._sandbox_image_digest = sandbox_image_digest
+        self._runtime_versions = runtime_versions
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         #: Set when the control plane says this host is gone. The runner reads
@@ -486,6 +503,9 @@ class HostHeartbeat:
                     broker_url=self._broker_url,
                     capabilities=self._capabilities,
                     runner_version=self._runner_version,
+                    sandbox_runtime=self._sandbox_runtime,
+                    sandbox_image_digest=self._sandbox_image_digest,
+                    runtime_versions=self._runtime_versions,
                 )
             except HostRemoved:
                 # Definitive: this credential is not one the control plane

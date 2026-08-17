@@ -1346,12 +1346,22 @@ def run_forever(
     )
     pool: HostHeartbeat | None = None
     if identity is not None:
+        # Collected once — the image and runtime are pinned for this process's
+        # lifetime — and repeated on every beat so a control plane that lost
+        # the row (or predates the columns) converges on the truth (issue #54).
+        # ``getattr`` for the same reason as ``check_gateway_reachable`` above:
+        # a deployment-owned backend that predates the hook must keep running.
+        stamper = getattr(backend, "version_stamp", None)
+        stamp: dict[str, Any] = stamper() if stamper is not None else {}
         pool = HostHeartbeat(
             base_url=base_url,
             identity=identity,
             broker_url=_broker_url_from_env(),
             slots_total=int(os.environ.get("AGENT_HOST_SLOTS") or 0) or None,
             runner_version=_runner_version(),
+            sandbox_runtime=stamp.get("sandbox_runtime"),
+            sandbox_image_digest=stamp.get("sandbox_image_digest"),
+            runtime_versions=stamp.get("runtime_versions"),
         )
         pool.start()
         where = f" on host {identity.host} (enrolled)"

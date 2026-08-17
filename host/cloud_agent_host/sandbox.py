@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import hashlib
+import json
 import os
 import secrets
 import shlex
@@ -39,7 +40,7 @@ import time
 import tty
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from cloud_agent_host.egress import (
     PHASES,
@@ -102,6 +103,13 @@ if getent hosts "$host" >/dev/null 2>&1; then echo dns-only; else echo unresolve
 # `--runtime` flag as runc, which is why one backend covers both: they are the
 # same mechanism with a different isolation boundary underneath.
 KATA_RUNTIME = "io.containerd.kata.v2"
+
+# Image labels carrying the CLI versions baked into a sandbox image, e.g.
+# ``org.freeinference.runtime.claude-code.version=1.2.3``. The image build
+# writes them; the runner only reads. Unlabeled images report no versions
+# rather than guessing — a stamp that might be wrong is worse than none.
+RUNTIME_VERSION_LABEL_PREFIX = "org.freeinference.runtime."
+RUNTIME_VERSION_LABEL_SUFFIX = ".version"
 
 # Must match `useradd --uid` in deploy/sandbox/Dockerfile.agent-sandbox. The
 # runner chowns each job worktree to this id before mounting it, so a drift
@@ -233,6 +241,16 @@ class SandboxBackend(ABC):
     def sandbox_metadata(self) -> dict[str, str]:
         """Return trusted, owner-visible metadata for this execution backend."""
         return {"sandbox_backend": self.name}
+
+    def version_stamp(self) -> dict[str, Any]:
+        """What actually runs here, for the host heartbeat to report.
+
+        Empty for backends with nothing to attest. The container backend
+        reports its isolation runtime, image digest and the CLI versions baked
+        into the image, so the control plane can stamp attempts with what
+        executed them (issue #54) instead of trusting documentation.
+        """
+        return {}
 
     @abstractmethod
     def spawn(self, spec: SandboxSpec) -> SandboxProcess:
@@ -664,6 +682,9 @@ class ContainerBackend(SandboxBackend):
         # starts. The ephemeral value prevents accidental broad cleanup if a
         # backend is constructed outside that broker-owned lifecycle.
         self._terminal_owner_id = "unscoped-" + secrets.token_hex(12)
+        # Filled by the first version_stamp() call. The image is pinned for
+        # this backend's lifetime, so one inspect answers for every heartbeat.
+        self._version_stamp: dict[str, Any] | None = None
 
     @property
     def provides_isolation(self) -> bool:
@@ -679,6 +700,73 @@ class ContainerBackend(SandboxBackend):
         if self.runtime:
             metadata["sandbox_runtime"] = self.runtime
         return metadata
+
+    def version_stamp(self) -> dict[str, Any]:
+        """Report isolation runtime, image digest and baked CLI versions.
+
+        ``sandbox_runtime`` is always present and ``""`` is a positive
+        statement — a container backend with no VM runtime is runc on the
+        shared kernel. ``None``/absent would read as "not reported", and the
+        difference between "attested runc" and "silent" is exactly what the
+        control plane needs to stop trusting documentation about isolation.
+
+        Digest and versions degrade to empty on inspect failure rather than
+        failing the heartbeat: liveness reporting must not come to depend on
+        the local image store answering.
+        """
+        if self._version_stamp is None:
+            self._version_stamp = self._collect_version_stamp()
+        return dict(self._version_stamp)
+
+    def _collect_version_stamp(self) -> dict[str, Any]:
+        stamp: dict[str, Any] = {
+            "sandbox_runtime": self.runtime or "",
+            "sandbox_image_digest": "",
+            "runtime_versions": {},
+        }
+        try:
+            proc = subprocess.run(
+                [self.docker_binary, "image", "inspect", self.image, "--format", "{{json .}}"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return stamp
+        if proc.returncode != 0:
+            return stamp
+        try:
+            info = json.loads(proc.stdout.strip() or "{}")
+        except json.JSONDecodeError:
+            return stamp
+        if not isinstance(info, dict):
+            return stamp
+        # RepoDigests names the registry content address — stable across hosts
+        # pulling the same image. A locally built, never-pushed image has none;
+        # its local Id still pins *what* ran, just not where it came from.
+        digests = info.get("RepoDigests")
+        if isinstance(digests, list) and digests and isinstance(digests[0], str):
+            stamp["sandbox_image_digest"] = digests[0]
+        elif isinstance(info.get("Id"), str):
+            stamp["sandbox_image_digest"] = info["Id"]
+        labels = (info.get("Config") or {}).get("Labels") or {}
+        if isinstance(labels, dict):
+            versions: dict[str, str] = {}
+            for key, value in labels.items():
+                if (
+                    isinstance(key, str)
+                    and isinstance(value, str)
+                    and key.startswith(RUNTIME_VERSION_LABEL_PREFIX)
+                    and key.endswith(RUNTIME_VERSION_LABEL_SUFFIX)
+                ):
+                    runtime_id = key[
+                        len(RUNTIME_VERSION_LABEL_PREFIX) : -len(RUNTIME_VERSION_LABEL_SUFFIX)
+                    ]
+                    if runtime_id:
+                        versions[runtime_id] = value
+            stamp["runtime_versions"] = versions
+        return stamp
 
     @property
     def is_vm_isolated(self) -> bool:

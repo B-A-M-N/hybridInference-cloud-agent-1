@@ -799,6 +799,21 @@ class AgentRunnerHost(BaseModel):  # type: ignore[no-any-unimported]
         description="Where this host's workspace broker listens, as the control plane reaches it.",
     )
     last_heartbeat_at: datetime | None = None
+    sandbox_runtime: str | None = Field(
+        None,
+        description=(
+            "Attested container runtime for this host's jobs. '' = "
+            "shared-kernel runc; null = the host has never reported one."
+        ),
+    )
+    sandbox_image_digest: str | None = Field(
+        None,
+        description="Digest of the sandbox image this host launches, as last reported.",
+    )
+    runtime_versions: dict[str, str] | None = Field(
+        None,
+        description="CLI versions baked into the sandbox image, keyed by runtime id.",
+    )
 
 
 class ListAgentRunnerHostsResponse(BaseModel):  # type: ignore[no-any-unimported]
@@ -963,6 +978,37 @@ class HostHeartbeatRequest(BaseModel):  # type: ignore[no-any-unimported]
     runner_version: str | None = Field(None, max_length=128)
     broker_url: str | None = Field(None, max_length=2048)
     capabilities: list[str] | None = Field(None, max_length=64)
+    sandbox_runtime: str | None = Field(
+        None,
+        max_length=128,
+        description=(
+            "The container runtime jobs actually execute under, e.g. "
+            "'io.containerd.kata.v2'. Empty string is a positive statement — "
+            "shared-kernel runc — where omitting the field means 'not "
+            "reported' and keeps the last known value. This is the isolation "
+            "attestation the scheduler and admin read; it must say what runs, "
+            "not what the deployment intended."
+        ),
+    )
+    sandbox_image_digest: str | None = Field(
+        None,
+        max_length=512,
+        description=(
+            "Content digest of the sandbox image this host launches, from the "
+            "local image store (RepoDigest, or the local image Id for a "
+            "never-pushed build). Stamped onto attempts at claim so a retry "
+            "can know exactly what executed the original."
+        ),
+    )
+    runtime_versions: dict[str, str] | None = Field(
+        None,
+        max_length=64,
+        description=(
+            "CLI version baked into the sandbox image, keyed by runtime id "
+            "(e.g. {'claude-code': '1.2.3'}), read from image labels. An "
+            "empty dict means 'inspected, image carries no version labels'."
+        ),
+    )
 
 
 class HostHeartbeatResponse(BaseModel):  # type: ignore[no-any-unimported]
