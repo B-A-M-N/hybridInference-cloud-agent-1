@@ -1,0 +1,337 @@
+"""Driver → Session → Turn: the platform's handle on a harness (design §5).
+
+This is the object model the session-resident-threads design commits to
+(``docs/specs/2026-08-17-session-resident-harness-threads-design.md``), layered
+over the dialect adapters in :mod:`cloud_agent_host.runtimes`. The split of
+labour is deliberate and mirrors the design's D7:
+
+- **runtimes.py** stays the *dialect* layer — how one CLI is invoked and how
+  one line of its output maps onto normalized events. It knows nothing about
+  sessions or the platform.
+- **drivers.py** is the *contract* layer the runner drives: ``launch`` a
+  session, ``start_turn`` on it, iterate its events, ``wait`` for a
+  :class:`TurnResult` whose guarantees the platform can lean on (D9).
+
+Today every registered harness is a one-shot process: a session carries at
+most one turn, ``launch(state=...)`` is refused, and continuity is ``replay``.
+That is not a limitation of this interface — it is the honest report of what
+is implemented. The COLD loop (issue #56) teaches the claude-code driver
+``export_state``/``launch(state)`` and flips its continuity to ``resume``; HOT
+(issue #57) brings the live-input session and ``hot``. The interface does not
+change for either, which is the point of landing it first.
+
+Synchronous by design: the runner is threaded, and the only transport v1
+drivers own is container stdio. The design doc's async signatures become
+meaningful with the live-input transport and arrive with it.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal
+
+from cloud_agent_host.runtimes import (
+    EMPTY_RUNTIME_MCP_CONFIG,
+    MESSAGE,
+    AgentRuntime,
+    RuntimeMCPConfig,
+    get_runtime,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+
+    from cloud_agent_host.sandbox import SandboxProcess
+
+# Floor events (design D9): the minimum any driver must yield around a turn,
+# synthesized here so a dialect adapter cannot forget them. They are the
+# runner's control-flow signal, not stream rows — the platform's stored
+# vocabulary stays the runtimes.py kinds.
+TURN_STARTED = "turn_started"
+TURN_COMPLETED = "turn_completed"
+TURN_FAILED = "turn_failed"
+FLOOR_EVENT_TYPES = frozenset({TURN_STARTED, TURN_COMPLETED, TURN_FAILED})
+
+#: Yielded for a stdout line the dialect adapter had no event for. Carries the
+#: raw line so the caller can keep its tail; never uploaded.
+LINE = "line"
+
+
+class DriverError(Exception):
+    """Raised when a driver cannot honour a request."""
+
+
+class StateRestoreUnsupported(DriverError):
+    """``launch(state=...)`` before the driver implements restore (P2)."""
+
+
+class StateExportUnsupported(DriverError):
+    """``export_state()`` before the driver implements it (P2)."""
+
+
+class ForkUnsupported(DriverError):
+    """``fork()`` before the driver implements it (D8 v1: none do)."""
+
+
+@dataclass(frozen=True)
+class HarnessCapabilities:
+    """What this harness can do, in the design's semantic vocabulary.
+
+    Values state what is *implemented and wired*, never what the upstream CLI
+    could theoretically do — the capability matrix in the design doc is
+    provisional until a contract test pins each cell against the stamped
+    image (issue #54), and until then the honest answer everywhere is the
+    replay world we actually run.
+    """
+
+    continuity: Literal["hot", "resume", "replay"] = "replay"
+    steering: Literal["mid_turn", "queue_only", "none"] = "none"
+    fork: Literal["at_latest", "at_anchor", "none"] = "none"
+    # Replay rebuilds the conversation as text, so any turn may pick any
+    # model — per-turn switching is the one thing the replay world does
+    # *better* than sessions. Session-capable drivers will downgrade this to
+    # "restart" (claude-code) as the design records.
+    model_switch: Literal["per_turn", "restart", "none"] = "per_turn"
+
+
+@dataclass(frozen=True)
+class TurnInput:
+    """One user turn: the prompt and the model to answer it with."""
+
+    prompt: str
+    model: str
+
+
+@dataclass(frozen=True)
+class TurnResult:
+    """The platform-facing outcome of one turn (design D9).
+
+    The hard guarantee: ``status == "completed"`` implies ``final_output`` is
+    non-empty. A harness that produced only tool activity still yields a
+    displayable line — synthesized by the driver — because an empty thread
+    after a successful run is the pi-blank-thread bug, and this dataclass is
+    where that class of bug is made unrepresentable.
+    """
+
+    status: Literal["completed", "failed", "cancelled"]
+    final_output: str
+    exit_code: int
+    usage: dict[str, Any] | None = None
+    raw: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.status == "completed" and not self.final_output.strip():
+            raise ValueError("a completed turn must carry a non-empty final_output")
+
+
+@dataclass(frozen=True)
+class HarnessEvent:
+    """One item of a turn's stream.
+
+    Dialect events carry their ``raw_line``; floor events carry none. A line
+    the adapter had no event for is yielded as :data:`LINE` so the caller can
+    keep its tail without this layer deciding what to drop.
+    """
+
+    event_type: str
+    payload: dict[str, Any] = field(default_factory=dict)
+    raw_line: str | None = None
+
+    @property
+    def is_floor(self) -> bool:
+        """Whether this is driver control flow rather than a stream row."""
+        return self.event_type in FLOOR_EVENT_TYPES
+
+
+@dataclass(frozen=True)
+class LaunchContext:
+    """Everything a session needs that is not the turn itself.
+
+    ``spawn`` is the sandbox boundary made explicit: the *platform* places the
+    process inside the sandbox (D7 — no driver may create a harness process
+    anywhere else), and the driver owns everything that flows over the
+    returned handle's transport.
+    """
+
+    workdir: str
+    gateway_base_url: str
+    credential: str
+    provides_isolation: bool
+    spawn: Callable[[list[str], dict[str, str]], SandboxProcess]
+    base_env: dict[str, str] = field(default_factory=dict)
+    mcp_config: RuntimeMCPConfig = EMPTY_RUNTIME_MCP_CONFIG
+
+
+class HarnessTurn:
+    """One executing turn: its event stream, cancellation, and result."""
+
+    def __init__(self, session: HarnessSession, process: SandboxProcess) -> None:
+        self._session = session
+        self._process = process
+        self._runtime = session.runtime
+        self._cancelled = False
+        self._final_messages: list[str] = []
+        self._result: TurnResult | None = None
+
+    def iter_events(self) -> Iterator[HarnessEvent]:
+        """Yield floor and dialect events as the harness produces them.
+
+        Blocking, line-driven iteration. The caller that must interleave
+        deadline/lease checks reads the process on its own thread exactly as
+        before — this iterator is the single place a line becomes an event.
+        """
+        yield HarnessEvent(TURN_STARTED)
+        for line in self._process.lines():
+            yield self.event_for_line(line)
+        yield self.finish_event()
+
+    def event_for_line(self, line: str) -> HarnessEvent:
+        """Map one stdout line to its event; :data:`LINE` when there is none."""
+        event = self._runtime.parse_event(line)
+        if event is None:
+            return HarnessEvent(LINE, raw_line=line)
+        if event.event_type == MESSAGE:
+            text = str((event.payload or {}).get("text", ""))
+            if text.strip():
+                self._final_messages.append(text)
+        return HarnessEvent(event.event_type, dict(event.payload or {}), raw_line=line)
+
+    def raw_lines(self) -> Iterator[str]:
+        """The transport's line stream, for callers that pump on their own thread.
+
+        The runner reads stdout on a dedicated thread so deadline, lease and
+        cancel checks keep running while the agent is silent; it feeds each
+        line back through :meth:`event_for_line`. Iterating :meth:`iter_events`
+        directly is the single-threaded equivalent.
+        """
+        return self._process.lines()
+
+    def stderr_text(self) -> str:
+        """Whatever the harness wrote to stderr, once it has exited."""
+        return self._process.stderr_text()
+
+    def cancel(self) -> None:
+        """Stop this turn now. The kill is the platform's backstop, kept here."""
+        self._cancelled = True
+        self._process.kill()
+
+    def wait(self) -> TurnResult:
+        """Wait for exit and return the contract-checked result."""
+        if self._result is None:
+            exit_code = self._process.wait()
+            self._result = self._build_result(exit_code)
+            self._session.turn_finished()
+        return self._result
+
+    def finish_event(self) -> HarnessEvent:
+        """The floor event describing how this turn ended."""
+        result = self.wait()
+        if result.status == "completed":
+            return HarnessEvent(TURN_COMPLETED, {"final_output": result.final_output})
+        return HarnessEvent(TURN_FAILED, {"status": result.status, "exit_code": result.exit_code})
+
+    def _build_result(self, exit_code: int) -> TurnResult:
+        if self._cancelled:
+            return TurnResult(status="cancelled", final_output="", exit_code=exit_code)
+        if exit_code != 0:
+            return TurnResult(status="failed", final_output="", exit_code=exit_code)
+        final = "\n\n".join(self._final_messages).strip()
+        if not final:
+            # D9: tool-only runs still owe the owner a displayable line. This
+            # text is deliberately explicit about being synthesized — a driver
+            # must never put words in the agent's mouth.
+            final = "(the agent finished without a closing message)"
+        return TurnResult(status="completed", final_output=final, exit_code=exit_code)
+
+
+class HarnessSession:
+    """A launched harness. Today: one turn, then done (the replay world)."""
+
+    def __init__(self, driver: HarnessDriver, context: LaunchContext) -> None:
+        self._driver = driver
+        self._context = context
+        self._turn: HarnessTurn | None = None
+        self._turn_done = False
+        self._closed = False
+
+    @property
+    def runtime(self) -> AgentRuntime:
+        """The dialect adapter this session speaks through."""
+        return self._driver.runtime
+
+    def start_turn(self, turn_input: TurnInput) -> HarnessTurn:
+        """Spawn the harness for this turn inside the platform's sandbox."""
+        if self._closed:
+            raise DriverError("session is closed")
+        if self._turn is not None and not self._turn_done:
+            raise DriverError("a turn is already running on this session")
+        if self._turn is not None:
+            # One-shot CLIs cannot take a second turn on one process. The
+            # session that can (HOT, issue #57) overrides this, not callers.
+            raise DriverError(
+                f"the {self._driver.id!r} driver runs one turn per session; "
+                "launch a new session for the next turn"
+            )
+        argv, extra_env = self.runtime.prepare(
+            workdir=self._context.workdir,
+            task_prompt=turn_input.prompt,
+            model=turn_input.model,
+            gateway_base_url=self._context.gateway_base_url,
+            credential=self._context.credential,
+            provides_isolation=self._context.provides_isolation,
+            mcp_config=self._context.mcp_config,
+        )
+        env = dict(self._context.base_env)
+        env.update(extra_env)
+        process = self._context.spawn(argv, env)
+        self._turn = HarnessTurn(self, process)
+        return self._turn
+
+    def turn_finished(self) -> None:
+        """Recorded by the turn on completion; not a caller API."""
+        self._turn_done = True
+
+    def export_state(self) -> bytes:
+        """Refused until a driver implements checkpointing (issue #56)."""
+        raise StateExportUnsupported(
+            f"the {self._driver.id!r} driver does not export session state yet"
+        )
+
+    def fork(self, at: object | None = None) -> HarnessSession:
+        """Refused in v1 (design D8); the signature is the reserved contract."""
+        raise ForkUnsupported(f"the {self._driver.id!r} driver does not fork sessions")
+
+    def close(self) -> None:
+        """Release the session; kills a still-running turn."""
+        self._closed = True
+        if self._turn is not None and not self._turn_done:
+            self._turn.cancel()
+
+
+class HarnessDriver:
+    """Launches sessions for one registered harness."""
+
+    def __init__(self, runtime: AgentRuntime) -> None:
+        self.runtime = runtime
+
+    @property
+    def id(self) -> str:
+        """The registry id this driver answers for."""
+        return self.runtime.name
+
+    def capabilities(self) -> HarnessCapabilities:
+        """The semantic capability row for this harness, as implemented."""
+        return HarnessCapabilities()
+
+    def launch(self, context: LaunchContext, state: bytes | None = None) -> HarnessSession:
+        """Create a session; ``state`` restores one exported earlier (P2)."""
+        if state is not None:
+            raise StateRestoreUnsupported(
+                f"the {self.id!r} driver does not restore session state yet"
+            )
+        return HarnessSession(self, context)
+
+
+def get_driver(runtime_id: str, *, generic_command: str | None = None) -> HarnessDriver:
+    """Resolve a registry id to its driver. Raises ``KeyError`` like get_runtime."""
+    return HarnessDriver(get_runtime(runtime_id, generic_command=generic_command))

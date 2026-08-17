@@ -41,6 +41,7 @@ from typing import Any
 
 import httpx
 
+from cloud_agent_host.drivers import LINE, HarnessDriver, LaunchContext, TurnInput
 from cloud_agent_host.enrollment import HostHeartbeat, ensure_enrolled
 from cloud_agent_host.logging_utils import configure_process_logging
 from cloud_agent_host.patch_gate import branch_name_for, validate_patch
@@ -764,38 +765,42 @@ def run_agent(
     Returns ``(exit_code, tail, tool_errors)``. Raises :class:`LeaseLost` if this attempt
     stops owning the job mid-run.
     """
-    argv, extra_env = runtime.prepare(
-        workdir=workdir,
-        task_prompt=conversation_prompt(job),
-        model=job.model,
-        gateway_base_url=gateway_base_url,
-        # Only the model-scoped credential crosses into the sandbox. The full
-        # capability token — which can write events, artifacts and terminal
-        # states — stays out here with the runner. After E9, grant scope and
-        # TTL bound the sandbox credential; spend remains subject to the owning
-        # user's gateway quota. There is deliberately no per-job monetary cap.
-        credential=job.sandbox_token,
-        # Runtime-specific permission flags must follow the actual execution
-        # boundary. In particular, Codex cannot nest bubblewrap inside the
-        # capability-dropped container backend.
-        provides_isolation=backend.provides_isolation,
-        # The runner is the only source of this value. Repository contents
-        # never become runtime MCP configuration, and adapters without a
-        # gateway-mediated path reject a non-empty set.
-        mcp_config=mcp_config,
-    )
-
     # Hermetic environment, and the *backend's* idea of it rather than the
     # runner's. For an isolated backend the runner's PATH and HOME name paths
     # inside the runner's own filesystem: forwarding HOME=/root into a
     # container that runs unprivileged makes every agent CLI fail on startup
     # trying to write its config. Inheriting the whole environment would be
     # worse still — it would hand the agent whatever the host is carrying.
-    env = dict(backend.base_env())
-    env.update(_SAFE_DIRECTORY_ENV)
-    env.update(extra_env)
+    base_env = dict(backend.base_env())
+    base_env.update(_SAFE_DIRECTORY_ENV)
 
-    process = backend.spawn(SandboxSpec(argv=argv, workdir=workdir, env=env))
+    driver = HarnessDriver(runtime)
+    session = driver.launch(
+        LaunchContext(
+            workdir=workdir,
+            gateway_base_url=gateway_base_url,
+            # Only the model-scoped credential crosses into the sandbox. The
+            # full capability token — which can write events, artifacts and
+            # terminal states — stays out here with the runner. After E9,
+            # grant scope and TTL bound the sandbox credential; spend remains
+            # subject to the owning user's gateway quota. There is
+            # deliberately no per-job monetary cap.
+            credential=job.sandbox_token,
+            # Runtime-specific permission flags must follow the actual
+            # execution boundary. In particular, Codex cannot nest bubblewrap
+            # inside the capability-dropped container backend.
+            provides_isolation=backend.provides_isolation,
+            # The platform places the process inside the sandbox (design D7);
+            # the driver owns everything on the returned handle's transport.
+            spawn=lambda argv, env: backend.spawn(SandboxSpec(argv=argv, workdir=workdir, env=env)),
+            base_env=base_env,
+            # The runner is the only source of this value. Repository contents
+            # never become runtime MCP configuration, and adapters without a
+            # gateway-mediated path reject a non-empty set.
+            mcp_config=mcp_config,
+        )
+    )
+    turn = session.start_turn(TurnInput(prompt=conversation_prompt(job), model=job.model))
 
     deadline = time.monotonic() + timeout_s
     tail: list[str] = []
@@ -817,7 +822,7 @@ def run_agent(
 
     def _pump() -> None:
         try:
-            for line in process.lines():
+            for line in turn.raw_lines():
                 lines.put(line)
         finally:
             lines.put(None)
@@ -827,14 +832,14 @@ def run_agent(
 
     while True:
         if heart.lease_lost:
-            process.kill()
+            turn.cancel()
             raise LeaseLost("lease lost while the agent was running")
         if heart.cancel_requested:
-            process.kill()
+            turn.cancel()
             control.append_event(NormalizedEvent("lifecycle", {"phase": "cancelled_by_owner"}))
             return 130, "".join(tail), tool_errors
         if time.monotonic() > deadline:
-            process.kill()
+            turn.cancel()
             control.append_event(
                 NormalizedEvent("error", {"text": f"agent exceeded {timeout_s:.0f}s"})
             )
@@ -850,10 +855,10 @@ def run_agent(
 
         tail.append(line)
         del tail[:-40]
-        event = runtime.parse_event(line)
-        if event is not None:
-            if event.event_type == "tool_result" and (event.payload or {}).get("is_error"):
-                content = str((event.payload or {}).get("content", ""))
+        item = turn.event_for_line(line)
+        if item.event_type != LINE:
+            if item.event_type == "tool_result" and (item.payload or {}).get("is_error"):
+                content = str((item.payload or {}).get("content", ""))
                 tool_errors.append(content[:200])
                 blocked = detect_blocked_egress(content)
                 if blocked and blocked not in denied_hosts:
@@ -861,10 +866,11 @@ def run_agent(
                     # `host` is what makes this a first-class egress row in the
                     # owner's stream rather than one more failed command.
                     control.append_event(NormalizedEvent("error", {"host": blocked}))
-            control.append_event(event)
+            control.append_event(NormalizedEvent(item.event_type, item.payload))
 
-    exit_code = process.wait()
-    stderr = process.stderr_text()
+    result = turn.wait()
+    exit_code = result.exit_code
+    stderr = turn.stderr_text()
     if stderr.strip():
         tail.append(stderr[-2000:])
     if tool_errors:
