@@ -27,6 +27,9 @@ meaningful with the live-input transport and arrive with it.
 
 from __future__ import annotations
 
+import io
+import pathlib
+import tarfile
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -37,6 +40,7 @@ from cloud_agent_host.runtimes import (
     RuntimeMCPConfig,
     get_runtime,
 )
+from cloud_agent_host.sandbox import STATE_MOUNT_TARGET
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -144,6 +148,18 @@ class HarnessEvent:
 
 
 @dataclass(frozen=True)
+class HarnessState:
+    """One exported harness session: the driver's opaque blob plus its name.
+
+    The platform stores and transports this (encrypted, size-capped) inside a
+    ThreadCheckpoint; only the driver that exported it can interpret ``blob``.
+    """
+
+    session_id: str
+    blob: bytes
+
+
+@dataclass(frozen=True)
 class LaunchContext:
     """Everything a session needs that is not the turn itself.
 
@@ -160,6 +176,9 @@ class LaunchContext:
     spawn: Callable[[list[str], dict[str, str]], SandboxProcess]
     base_env: dict[str, str] = field(default_factory=dict)
     mcp_config: RuntimeMCPConfig = EMPTY_RUNTIME_MCP_CONFIG
+    #: Host directory the platform bind-mounts at the sandbox's state target.
+    #: ``None`` disables session persistence (and with it export/restore).
+    state_dir: str | None = None
 
 
 class HarnessTurn:
@@ -280,12 +299,17 @@ class HarnessSession:
             credential=self._context.credential,
             provides_isolation=self._context.provides_isolation,
             mcp_config=self._context.mcp_config,
+            **self._extra_prepare_kwargs(),
         )
         env = dict(self._context.base_env)
         env.update(extra_env)
         process = self._context.spawn(argv, env)
         self._turn = HarnessTurn(self, process)
         return self._turn
+
+    def _extra_prepare_kwargs(self) -> dict[str, Any]:
+        """Dialect-specific prepare arguments; the generic session has none."""
+        return {}
 
     def turn_finished(self) -> None:
         """Recorded by the turn on completion; not a caller API."""
@@ -332,6 +356,95 @@ class HarnessDriver:
         return HarnessSession(self, context)
 
 
+#: Where the claude CLI keeps its config inside the sandbox: under the state
+#: mount, so sessions survive the container (paired with the constant
+#: ``/workspace`` workdir, which keeps the project-dir encoding stable).
+CLAUDE_STATE_CONFIG_DIR = f"{STATE_MOUNT_TARGET}/claude"
+
+
+class ClaudeCodeSession(HarnessSession):
+    """A claude-code session: persistable, restorable, still one turn (COLD)."""
+
+    def __init__(
+        self,
+        driver: HarnessDriver,
+        context: LaunchContext,
+        *,
+        resume_session_id: str | None = None,
+    ) -> None:
+        super().__init__(driver, context)
+        self._resume_session_id = resume_session_id
+
+    def _extra_prepare_kwargs(self) -> dict[str, Any]:
+        if self._context.state_dir is None:
+            return {}
+        return {
+            "config_dir": CLAUDE_STATE_CONFIG_DIR,
+            "resume_session_id": self._resume_session_id,
+        }
+
+    def export_state(self) -> HarnessState:
+        """Package the session tree the turn just wrote (design §6).
+
+        Complete or refuse — never a best-effort partial: a checkpoint that
+        might be half a session is worse than replay, which is always there.
+        """
+        if self._context.state_dir is None:
+            raise StateExportUnsupported("this session ran without a state mount")
+        session_id = getattr(self.runtime, "session_id", None)
+        if not session_id:
+            raise StateExportUnsupported("the CLI never announced a session id")
+        root = pathlib.Path(self._context.state_dir) / "claude"
+        if not any(root.glob(f"projects/*/{session_id}.jsonl")):
+            raise StateExportUnsupported(
+                f"no session file for {session_id!r} under the state mount"
+            )
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+            archive.add(root / "projects", arcname="projects")
+        return HarnessState(session_id=session_id, blob=buffer.getvalue())
+
+
+class ClaudeCodeDriver(HarnessDriver):
+    """The claude-code driver: the first with real continuity (issue #56)."""
+
+    def capabilities(self) -> HarnessCapabilities:
+        """COLD-native continuity; HOT arrives with the live session (#57)."""
+        return HarnessCapabilities(continuity="resume")
+
+    def launch(self, context: LaunchContext, state: HarnessState | None = None) -> HarnessSession:
+        """Fresh session, or one that continues an exported state's memory."""
+        if state is None:
+            return ClaudeCodeSession(self, context)
+        if context.state_dir is None:
+            raise StateRestoreUnsupported("restore needs a state mount")
+        root = pathlib.Path(context.state_dir) / "claude"
+        root.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(fileobj=io.BytesIO(state.blob), mode="r:gz") as archive:
+            _extract_below(archive, root)
+        return ClaudeCodeSession(self, context, resume_session_id=state.session_id)
+
+
+def _extract_below(archive: tarfile.TarFile, root: pathlib.Path) -> None:
+    """Extract refusing traversal: a checkpoint is data, not a path authority."""
+    base = root.resolve()
+    for member in archive.getmembers():
+        target = (base / member.name).resolve()
+        if not target.is_relative_to(base):
+            raise DriverError(f"checkpoint entry escapes the state dir: {member.name!r}")
+        if not (member.isfile() or member.isdir()):
+            raise DriverError(f"checkpoint entry has a refused type: {member.name!r}")
+    # The loop above is the filter: only plain files and directories, only
+    # below the state dir. Works on every Python this repo supports.
+    archive.extractall(base)
+
+
+_DRIVER_TYPES: dict[str, type[HarnessDriver]] = {
+    "claude-code": ClaudeCodeDriver,
+}
+
+
 def get_driver(runtime_id: str, *, generic_command: str | None = None) -> HarnessDriver:
     """Resolve a registry id to its driver. Raises ``KeyError`` like get_runtime."""
-    return HarnessDriver(get_runtime(runtime_id, generic_command=generic_command))
+    runtime = get_runtime(runtime_id, generic_command=generic_command)
+    return _DRIVER_TYPES.get(runtime_id, HarnessDriver)(runtime)

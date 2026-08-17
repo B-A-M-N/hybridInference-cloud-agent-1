@@ -216,6 +216,10 @@ class ClaudeCodeRuntime(AgentRuntime):
         # One adapter instance per job (see get_runtime), so this is per-run
         # state — the suppression below cannot leak across jobs.
         self._reported_subtypes: set[str] = set()
+        #: The CLI's own session id, captured from the ``init`` event. This is
+        #: the name of the session file a checkpoint exports and a later turn
+        #: resumes (design §6); ``None`` until the CLI has announced itself.
+        self.session_id: str | None = None
 
     def prepare(
         self,
@@ -227,12 +231,25 @@ class ClaudeCodeRuntime(AgentRuntime):
         credential: str,
         provides_isolation: bool = False,
         mcp_config: RuntimeMCPConfig = EMPTY_RUNTIME_MCP_CONFIG,
+        config_dir: str | None = None,
+        resume_session_id: str | None = None,
     ) -> tuple[list[str], dict[str, str]]:
-        """Build the headless invocation and its environment."""
+        """Build the headless invocation and its environment.
+
+        ``config_dir`` relocates the CLI's config/session storage (the state
+        mount, so session files outlive the container); ``resume_session_id``
+        continues an earlier session with only the new prompt — the COLD
+        restore of design §6. Both are claude-specific and passed only by the
+        claude driver; the generic session never sets them.
+        """
         argv = [
             self.binary,
             "-p",
             task_prompt,
+        ]
+        if resume_session_id:
+            argv += ["--resume", resume_session_id]
+        argv += [
             "--model",
             model,
             "--output-format",
@@ -280,6 +297,11 @@ class ClaudeCodeRuntime(AgentRuntime):
             "DISABLE_TELEMETRY": "1",
             "DISABLE_AUTOUPDATER": "1",
         }
+        if config_dir:
+            # Session files land under the state mount instead of the
+            # container's throwaway HOME, which is what makes them exportable
+            # after exit and restorable before the next turn.
+            env["CLAUDE_CONFIG_DIR"] = config_dir
         return argv, env
 
     def parse_event(self, line: str) -> NormalizedEvent | None:
@@ -306,12 +328,17 @@ class ClaudeCodeRuntime(AgentRuntime):
                     return None
                 self._reported_subtypes.add(subtype)
                 return self._raw(line, f"unclassified system subtype {subtype!r}")
+            if subtype == "init":
+                captured = str(event.get("session_id") or "").strip()
+                if captured:
+                    self.session_id = captured
             return NormalizedEvent(
                 LIFECYCLE,
                 {
                     "phase": subtype,
                     "model": event.get("model"),
                     "runtime_version": event.get("claude_code_version"),
+                    "session_id": self.session_id,
                 },
             )
         if kind == "assistant":

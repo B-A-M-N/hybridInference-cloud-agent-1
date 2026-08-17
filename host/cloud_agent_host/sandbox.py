@@ -144,6 +144,13 @@ def _walk_entries(path: str) -> Iterator[tuple[str, bool]]:
             yield os.path.join(root, name), False
 
 
+#: Where a job's durable harness state (agent session files) is mounted inside
+#: the sandbox. Constant on purpose: Claude Code derives its session-file path
+#: from CWD and config dir, and a path that moved between turns would strand
+#: the session a checkpoint restored (design §6, workdir/HOME stability).
+STATE_MOUNT_TARGET = "/agent-state"
+
+
 @dataclass
 class SandboxSpec:
     """Everything a backend needs to run one job's agent."""
@@ -151,6 +158,10 @@ class SandboxSpec:
     argv: list[str]
     workdir: str
     env: dict[str, str] = field(default_factory=dict)
+    #: Host directory bind-mounted at :data:`STATE_MOUNT_TARGET` so harness
+    #: session files survive the container. ``None`` mounts nothing — the
+    #: pre-checkpoint behaviour, and what every non-session phase uses.
+    state_dir: str | None = None
     # Which lifecycle phase this spawn belongs to. The two get different egress
     # tiers: setup installs dependencies and needs a registry, the agent turn
     # afterwards does not — and the agent turn is the one running untrusted
@@ -1294,6 +1305,15 @@ class ContainerBackend(SandboxBackend):
             f"type=bind,source={spec.workdir},target=/workspace",
             "--workdir",
             "/workspace",
+        ]
+        if spec.state_dir is not None:
+            # Deliberately outside /workspace: session files must never be
+            # able to leak into the patch the publisher pushes.
+            argv += [
+                "--mount",
+                f"type=bind,source={spec.state_dir},target={STATE_MOUNT_TARGET}",
+            ]
+        argv += [
             # Stated rather than inherited from the image: the runner chowns
             # the worktree to exactly this id, and a silent drift between the
             # two leaves the agent unable to write to its own working tree.
