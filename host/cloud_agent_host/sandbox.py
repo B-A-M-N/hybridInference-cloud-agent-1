@@ -1009,7 +1009,10 @@ class ContainerBackend(SandboxBackend):
         available only to ``trusted-v1`` scheduling.
         """
         self._kernel_probe = {"host_kernel": os.uname().release, "guest_kernel": None}
-        if not self.runtime:
+        # Docker's implicit default and an explicitly named ``runc`` are the
+        # same shared-kernel boundary.  They remain valid for trusted-v1 and
+        # must not be mistaken for a failed VM probe.
+        if not self.runtime or self.runtime == "runc":
             return
         argv = [
             self.docker_binary,
@@ -1048,10 +1051,16 @@ class ContainerBackend(SandboxBackend):
         guest_kernel = lines[-1]
         host_kernel = str(self._kernel_probe["host_kernel"])
         if guest_kernel == host_kernel:
-            raise SandboxError(
-                f"sandbox runtime {self.runtime!r} reported the host kernel "
-                f"{host_kernel!r}; refusing to claim VM isolation"
-            )
+            # The secure profile names Kata exactly, so fail its preflight
+            # loudly. Other custom runtimes may still serve trusted-v1; they
+            # simply receive no guest-kernel evidence and can never satisfy
+            # the control plane's Kata predicate.
+            if self.runtime == KATA_RUNTIME:
+                raise SandboxError(
+                    f"sandbox runtime {self.runtime!r} reported the host kernel "
+                    f"{host_kernel!r}; refusing to claim VM isolation"
+                )
+            return
         self._kernel_probe["guest_kernel"] = guest_kernel
 
     def _check_networks_are_closed(self) -> None:

@@ -672,6 +672,21 @@ def test_plain_runc_cannot_fabricate_a_guest_kernel_attestation(monkeypatch):
     assert stamp["guest_kernel"] is None
 
 
+def test_explicit_runc_remains_available_to_the_trusted_profile(monkeypatch):
+    """Naming Docker's default runtime must not turn trusted-v1 into a VM."""
+    monkeypatch.setattr(sandbox_mod.os, "uname", lambda: SimpleNamespace(release="host-kernel"))
+    monkeypatch.setattr(
+        sandbox_mod.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("runc was probed as a VM")),
+    )
+    backend = ContainerBackend(image="img:1", runtime="runc")
+
+    backend._probe_kernel_boundary()
+
+    assert backend._kernel_probe == {"host_kernel": "host-kernel", "guest_kernel": None}
+
+
 def test_custom_runtime_is_reported_exactly_not_relabeled_as_kata(monkeypatch):
     monkeypatch.setattr(sandbox_mod.os, "uname", lambda: SimpleNamespace(release="host-kernel"))
     monkeypatch.setattr(
@@ -686,6 +701,20 @@ def test_custom_runtime_is_reported_exactly_not_relabeled_as_kata(monkeypatch):
     stamp = backend.version_stamp()
     assert stamp["sandbox_runtime"] == "runsc"
     assert stamp["guest_kernel"] == "custom-guest"
+
+
+def test_a_shared_kernel_custom_runtime_gets_no_vm_evidence(monkeypatch):
+    monkeypatch.setattr(sandbox_mod.os, "uname", lambda: SimpleNamespace(release="host-kernel"))
+    monkeypatch.setattr(
+        sandbox_mod.subprocess,
+        "run",
+        lambda argv, **kwargs: SimpleNamespace(returncode=0, stdout="host-kernel\n", stderr=""),
+    )
+    backend = ContainerBackend(image="img:1", runtime="custom-runc")
+
+    backend._probe_kernel_boundary()
+
+    assert backend._kernel_probe["guest_kernel"] is None
 
 
 def test_the_world_writable_fallback_reaches_the_whole_tree(tmp_path, monkeypatch):

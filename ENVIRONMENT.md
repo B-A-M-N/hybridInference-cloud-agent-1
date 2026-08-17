@@ -176,7 +176,7 @@ compose, because they name the stack rather than configure it.
 | Variable | New? | Notes |
 |---|---|---|
 | `AGENT_SANDBOX_BACKEND` | existing | |
-| `AGENT_SANDBOX_RUNTIME` | existing | `runc` for trusted internal repos; Kata/gVisor required for public multi-tenant use. |
+| `AGENT_SANDBOX_RUNTIME` | existing | Unset or `runc` for trusted internal repos. The enforced public/untrusted profile currently requires exactly `io.containerd.kata.v2`; gVisor needs its own future execution profile and is not accepted as Kata evidence. |
 | `AGENT_SANDBOX_IMAGE` | existing | Tag it per environment (`freeinference-cloud-agent-job:staging` / `:prod`) on a machine that runs both, or a rebuild on one side replaces the image the other is running. `-job` and not `-sandbox`, so it cannot be read as `…-sandbox-<env>-runner`, the image the runner container itself is built from. |
 | `AGENT_SANDBOX_NETWORK` | existing | |
 | `AGENT_SANDBOX_DOCKER` | existing | |
