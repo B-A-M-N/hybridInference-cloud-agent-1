@@ -151,6 +151,12 @@ _JOB_COLUMNS = (
 )
 _QUALIFIED_JOB_COLUMNS = ", ".join(f"j.{column.strip()}" for column in _JOB_COLUMNS.split(","))
 
+#: How long a queued turn is reserved for its thread's resident host before
+#: any host may claim it (design §7). Long enough to survive a busy runner's
+#: poll cycle; short enough that a vanished host costs one COLD start, not a
+#: stuck queue.
+RESIDENCY_AFFINITY_HOLD_S = 30.0
+
 # Everything a caller may see about a host. ``credential_hash`` is deliberately
 # not in it — reading it back out would make the row as good as the credential
 # — and is reported only as the boolean ``enrolled``.
@@ -1797,23 +1803,44 @@ class AgentJobStore:
                 """,
                 list(TERMINAL_STATES),
             )
+            # Affinity (design §7): a job whose thread is hot on another host
+            # is *held* for that host — its live process has the whole
+            # conversation in memory, and any other machine would demote the
+            # turn to COLD for no reason. The hold is a window, not a pin: if
+            # the resident host does not collect within it (busy, gone,
+            # draining), anyone may take the job and the ladder degrades one
+            # rung, exactly as designed. ``updated_at`` is when the job last
+            # became claimable, so waiting follow-ups time out from promotion,
+            # not creation. FOR UPDATE OF j: the residency row is read, never
+            # locked — claims must not serialize behind heartbeats.
             job_row = await conn.fetchrow(
                 f"""
-                SELECT {_JOB_COLUMNS} FROM agent_jobs
-                WHERE state = 'queued' AND cancel_requested = FALSE
-                  AND COALESCE(metadata->'requires', '[]'::jsonb) <@ $1::jsonb
+                SELECT {_QUALIFIED_JOB_COLUMNS} FROM agent_jobs j
+                LEFT JOIN agent_thread_residencies r
+                  ON r.thread_id = j.thread_id
+                 AND r.status = 'hot'
+                 AND r.lease_expires_at > NOW()
+                WHERE j.state = 'queued' AND j.cancel_requested = FALSE
+                  AND COALESCE(j.metadata->'requires', '[]'::jsonb) <@ $1::jsonb
                   AND (
-                        execution_profile = '{ExecutionProfile.TRUSTED_V1.value}'
+                        j.execution_profile = '{ExecutionProfile.TRUSTED_V1.value}'
                         OR (
-                            execution_profile = '{ExecutionProfile.UNTRUSTED_KATA_V1.value}'
-                            AND $2::boolean
+                            j.execution_profile = '{ExecutionProfile.UNTRUSTED_KATA_V1.value}'
+                            AND $3::boolean
                         )
                   )
-                ORDER BY created_at
+                  AND (
+                        r.thread_id IS NULL
+                        OR r.host = $2
+                        OR j.updated_at <= NOW()
+                            - make_interval(secs => {RESIDENCY_AFFINITY_HOLD_S})
+                  )
+                ORDER BY j.created_at
                 LIMIT 1
-                FOR UPDATE SKIP LOCKED
+                FOR UPDATE OF j SKIP LOCKED
                 """,
                 capabilities,
+                host,
                 secure_attestation,
             )
             if job_row is None:
@@ -2155,6 +2182,26 @@ class AgentJobStore:
                 client_seq=event_seq,
             )
 
+    async def record_continuity_mode(
+        self, *, attempt_id: int, lease_generation: int, mode: str
+    ) -> bool:
+        """Stamp which continuity rung this attempt runs on, lease-fenced."""
+        async with self._pool.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    UPDATE agent_attempts
+                    SET continuity_mode = $3
+                    WHERE id = $1 AND lease_generation = $2
+                      AND status = 'running' AND lease_expires_at > NOW()
+                    RETURNING id
+                    """,
+                    attempt_id,
+                    lease_generation,
+                    mode,
+                )
+            )
+
     async def terminal_workspace_ready(self, *, attempt_id: int) -> bool:
         """Return whether the live attempt currently permits terminal writes.
 
@@ -2370,6 +2417,206 @@ class AgentJobStore:
                 kind,
                 content,
             )
+
+    # ── Thread residency (design §7, issue #57) ────────────────────────
+    #
+    # One row per thread, never deleted, generation strictly increasing —
+    # see migration 0009 for why deletion is forbidden. Every mutation is
+    # generation-scoped so a late writer from a previous residency changes
+    # nothing: heartbeats cannot re-promote, releases cannot end a successor.
+
+    async def establish_residency(
+        self,
+        *,
+        thread_id: str,
+        host: str,
+        runtime_id: str,
+        runtime_version: str | None,
+        ttl_seconds: float,
+        sandbox_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Take (or take over) a thread's residency; returns the new row.
+
+        Atomic: two hosts racing serialize on the row, each gets a distinct
+        generation, and the larger one owns the thread — the loser's next
+        generation-scoped call answers ``False`` and it stands down.
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO agent_thread_residencies
+                    (thread_id, host, sandbox_id, runtime_id, runtime_version,
+                     status, lease_expires_at)
+                VALUES ($1, $2, $3, $4, $5, 'hot',
+                        NOW() + make_interval(secs => $6))
+                ON CONFLICT (thread_id) DO UPDATE SET
+                    generation = agent_thread_residencies.generation + 1,
+                    host = EXCLUDED.host,
+                    sandbox_id = EXCLUDED.sandbox_id,
+                    runtime_id = EXCLUDED.runtime_id,
+                    runtime_version = EXCLUDED.runtime_version,
+                    status = 'hot',
+                    lease_expires_at = EXCLUDED.lease_expires_at,
+                    established_at = NOW(),
+                    last_active_at = NOW()
+                RETURNING *
+                """,
+                thread_id,
+                host,
+                sandbox_id,
+                runtime_id,
+                runtime_version,
+                ttl_seconds,
+            )
+        return dict(row)
+
+    async def heartbeat_residency(
+        self, *, thread_id: str, generation: int, ttl_seconds: float, host: str | None = None
+    ) -> bool:
+        """Extend a residency's lease — only the generation that holds it.
+
+        ``host`` narrows the write to the machine the row names: a beat is a
+        holder's statement, and a guessed (thread, generation) from anywhere
+        else must extend nothing. ``None`` is for internal callers.
+        """
+        async with self._pool.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    UPDATE agent_thread_residencies
+                    SET lease_expires_at = NOW() + make_interval(secs => $3),
+                        last_active_at = NOW()
+                    WHERE thread_id = $1 AND generation = $2 AND status = 'hot'
+                      AND ($4::text IS NULL OR host = $4)
+                    RETURNING thread_id
+                    """,
+                    thread_id,
+                    generation,
+                    ttl_seconds,
+                    host,
+                )
+            )
+
+    async def release_residency(
+        self, *, thread_id: str, generation: int, host: str | None = None
+    ) -> bool:
+        """End a residency (teardown/eviction) — only its own generation."""
+        async with self._pool.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    UPDATE agent_thread_residencies
+                    SET status = 'none', last_active_at = NOW()
+                    WHERE thread_id = $1 AND generation = $2 AND status <> 'none'
+                      AND ($3::text IS NULL OR host = $3)
+                    RETURNING thread_id
+                    """,
+                    thread_id,
+                    generation,
+                    host,
+                )
+            )
+
+    async def record_residency_checkpoint(
+        self, *, thread_id: str, generation: int, turn_id: str
+    ) -> bool:
+        """Note the newest turn whose checkpoint this residency exported."""
+        async with self._pool.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    UPDATE agent_thread_residencies
+                    SET last_checkpoint_turn_id = $3, last_active_at = NOW()
+                    WHERE thread_id = $1 AND generation = $2
+                    RETURNING thread_id
+                    """,
+                    thread_id,
+                    generation,
+                    turn_id,
+                )
+            )
+
+    async def host_runs_thread(self, *, host: str, thread_id: str) -> bool:
+        """Whether ``host`` currently runs an attempt of ``thread_id``.
+
+        The establish gate: residency is something a host earns by actually
+        running the thread's turn, not something it may assert about arbitrary
+        threads — a compromised machine must not be able to pull other
+        machines' conversations toward itself via affinity.
+        """
+        async with self._pool.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    SELECT 1 FROM agent_jobs j
+                    JOIN agent_attempts a ON a.id = j.current_attempt_id
+                    WHERE j.thread_id = $2 AND a.host_id = $1 AND a.status = 'running'
+                    LIMIT 1
+                    """,
+                    host,
+                    thread_id,
+                )
+            )
+
+    async def resident_host(self, *, thread_id: str) -> dict[str, Any] | None:
+        """The live hot residency for a thread, or ``None``.
+
+        Live means unexpired: the reaper marks expiry on its own schedule,
+        and scheduling decisions between passes must not trust a lease the
+        clock has already taken away.
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT * FROM agent_thread_residencies
+                WHERE thread_id = $1 AND status = 'hot' AND lease_expires_at > NOW()
+                """,
+                thread_id,
+            )
+        return None if row is None else dict(row)
+
+    async def reap_expired_residencies(self) -> list[dict[str, Any]]:
+        """Mark every hot residency whose lease lapsed as ``none``.
+
+        The control plane's unilateral half of the fence: the host may still
+        be running the sandbox, but its generation no longer opens anything —
+        not heartbeats, not credentials — and the next turn goes COLD.
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE agent_thread_residencies
+                SET status = 'none'
+                WHERE status = 'hot' AND lease_expires_at <= NOW()
+                RETURNING thread_id, generation, host
+                """
+            )
+        return [dict(row) for row in rows]
+
+    async def prune_thread_checkpoints(self, *, keep_job_id: str) -> int:
+        """Keep only ``keep_job_id``'s checkpoint within its thread.
+
+        Latest-per-thread retention (design §6): the newest checkpoint is the
+        only one the claim gate could ever hand out — an older one would fail
+        ``through_turn_id`` — so keeping it would be pure storage cost. Rows
+        are deleted, not archived; the transcript remains the durable record.
+        """
+        async with self._pool.acquire() as conn:
+            deleted = await conn.fetch(
+                """
+                DELETE FROM agent_job_artifacts a
+                USING agent_jobs sibling, agent_jobs kept
+                WHERE a.kind = 'checkpoint'
+                  AND kept.id = $1
+                  AND sibling.id = a.job_id
+                  AND sibling.thread_id = kept.thread_id
+                  AND sibling.thread_id IS NOT NULL
+                  AND a.job_id <> $1
+                RETURNING a.id
+                """,
+                keep_job_id,
+            )
+        return len(deleted)
 
     async def get_artifact(self, *, job_id: str, kind: str) -> dict[str, Any] | None:
         """Fetch the most recent artifact of a kind for a job."""

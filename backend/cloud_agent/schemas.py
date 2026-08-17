@@ -521,6 +521,15 @@ class WorkerClaimResponse(BaseModel):
         None,
         description="Successful parent patch to rehydrate before this follow-up runs.",
     )
+    context_checkpoint: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "The parent turn's ThreadCheckpoint envelope, decrypted and gated "
+            "(same driver, same CLI version, exported by exactly the turn this "
+            "follow-up continues). Null means replay — the always-available, "
+            "merely forgetful path."
+        ),
+    )
     mcp_servers: list[str] = Field(
         default_factory=list,
         description=(
@@ -590,6 +599,12 @@ class WorkerArtifactResponse(BaseModel):
     """Stored artifact id."""
 
     artifact_id: int
+
+
+class WorkerContinuityRequest(BaseModel):
+    """Which continuity rung this attempt is running on (design §9)."""
+
+    mode: Literal["hot", "cold_native", "replay"]
 
 
 class WorkerFinishRequest(BaseModel):
@@ -1020,6 +1035,13 @@ class HostRegisterResponse(BaseModel):  # type: ignore[no-any-unimported]
     )
 
 
+class ResidencyBeat(BaseModel):  # type: ignore[no-any-unimported]
+    """One hot sandbox a host reports alive."""
+
+    thread_id: str = Field(..., min_length=1, max_length=128)
+    generation: int = Field(..., ge=1)
+
+
 class HostHeartbeatRequest(BaseModel):  # type: ignore[no-any-unimported]
     """A host reporting that it is still there, and what it now looks like.
 
@@ -1063,6 +1085,40 @@ class HostHeartbeatRequest(BaseModel):  # type: ignore[no-any-unimported]
             "empty dict means 'inspected, image carries no version labels'."
         ),
     )
+    residencies: list[ResidencyBeat] | None = Field(
+        None,
+        max_length=128,
+        description=(
+            "The hot sandboxes this host still holds, generation-scoped. Each "
+            "listed residency's lease is extended; one that no longer holds "
+            "its generation comes back in residencies_lost and the host tears "
+            "that sandbox down (design §7)."
+        ),
+    )
+
+
+class HostResidencyEstablishRequest(BaseModel):  # type: ignore[no-any-unimported]
+    """A host taking residency for a thread it is running (design §7)."""
+
+    thread_id: str = Field(..., min_length=1, max_length=128)
+    runtime_id: str = Field(..., min_length=1, max_length=64)
+    runtime_version: str | None = Field(None, max_length=128)
+    sandbox_id: str | None = Field(None, max_length=253)
+
+
+class HostResidencyEstablishResponse(BaseModel):  # type: ignore[no-any-unimported]
+    """The residency the host now holds — the generation is its fence."""
+
+    thread_id: str
+    generation: int
+    ttl_seconds: float
+
+
+class HostResidencyReleaseRequest(BaseModel):  # type: ignore[no-any-unimported]
+    """A host ending a residency it holds (teardown, eviction, drain)."""
+
+    thread_id: str = Field(..., min_length=1, max_length=128)
+    generation: int = Field(..., ge=1)
 
 
 class HostHeartbeatResponse(BaseModel):  # type: ignore[no-any-unimported]
@@ -1072,6 +1128,14 @@ class HostHeartbeatResponse(BaseModel):  # type: ignore[no-any-unimported]
     status: str
     slots_total: int | None = None
     slots_used: int = 0
+    residencies_lost: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Thread ids whose reported generation no longer holds its "
+            "residency. The host tears those sandboxes down; their threads "
+            "continue COLD off their checkpoints."
+        ),
+    )
     broker_error: str | None = Field(
         None,
         description=(

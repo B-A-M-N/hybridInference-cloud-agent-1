@@ -433,6 +433,22 @@ async def reap_expired_attempts(
             await _reap_offline_hosts(store)
         except Exception:
             logger.warning("Host reaper pass failed", exc_info=True)
+        # Residencies after hosts, before attempts: a lapsed hot sandbox must
+        # lose its generation (heartbeats, credentials, affinity) before the
+        # attempt pass requeues anything that might route back to it. Its own
+        # try, for the same reason as the host pass above.
+        try:
+            lapsed = await store.reap_expired_residencies()
+            if lapsed:
+                logger.info(
+                    "agent_residencies_lapsed",
+                    extra={
+                        "event": "agent_residencies_lapsed",
+                        "threads": [row["thread_id"] for row in lapsed],
+                    },
+                )
+        except Exception:
+            logger.warning("Residency reaper pass failed", exc_info=True)
         try:
             actions = await store.reap_expired(max_attempts=max_attempts)
             await _reconcile_settled_terminals(store)

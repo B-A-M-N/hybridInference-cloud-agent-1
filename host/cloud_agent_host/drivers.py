@@ -446,5 +446,13 @@ _DRIVER_TYPES: dict[str, type[HarnessDriver]] = {
 
 def get_driver(runtime_id: str, *, generic_command: str | None = None) -> HarnessDriver:
     """Resolve a registry id to its driver. Raises ``KeyError`` like get_runtime."""
-    runtime = get_runtime(runtime_id, generic_command=generic_command)
-    return _DRIVER_TYPES.get(runtime_id, HarnessDriver)(runtime)
+    return driver_for(get_runtime(runtime_id, generic_command=generic_command))
+
+
+def driver_for(runtime: AgentRuntime) -> HarnessDriver:
+    """The driver for an already-resolved dialect adapter.
+
+    ``getattr`` for the same reason the runner reads backend hooks that way:
+    a hand-rolled adapter without a ``name`` is a generic driver, not a crash.
+    """
+    return _DRIVER_TYPES.get(getattr(runtime, "name", "generic"), HarnessDriver)(runtime)

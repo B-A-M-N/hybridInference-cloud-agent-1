@@ -162,6 +162,10 @@ class SandboxSpec:
     #: session files survive the container. ``None`` mounts nothing — the
     #: pre-checkpoint behaviour, and what every non-session phase uses.
     state_dir: str | None = None
+    #: Keep stdin open for a resident session (HOT, design §7): follow-up
+    #: turns are written to the process instead of spawning a new one. The
+    #: default is the one-shot world every other phase runs in.
+    live_input: bool = False
     # Which lifecycle phase this spawn belongs to. The two get different egress
     # tiers: setup installs dependencies and needs a registry, the agent turn
     # afterwards does not — and the agent turn is the one running untrusted
@@ -191,6 +195,19 @@ class SandboxProcess(ABC):
     @abstractmethod
     def stderr_text(self) -> str:
         """Return whatever the agent wrote to stderr."""
+
+    def write_line(self, text: str) -> None:
+        """Write one line to the agent's stdin (HOT live input, design §7).
+
+        Only meaningful for a process spawned with ``live_input``; the
+        default refuses, because writing into a closed pipe should be a
+        driver bug surfaced loudly, not a silent drop.
+        """
+        raise SandboxError("this sandbox process was not spawned with live input")
+
+    def close_stdin(self) -> None:
+        """Signal end-of-input to a live process. No-op without live input."""
+        return
 
 
 class TerminalProcess(ABC):
@@ -356,6 +373,21 @@ class _PopenProcess(SandboxProcess):
             # Bounded: a runaway agent must not turn its own noise into an
             # out-of-memory on the runner.
             del self._stderr_chunks[:-200]
+
+    def write_line(self, text: str) -> None:
+        """Write one line to the child's stdin, flushed immediately."""
+        stdin = self._process.stdin
+        if stdin is None:
+            raise SandboxError("this sandbox process was not spawned with live input")
+        stdin.write(text.rstrip("\n") + "\n")
+        stdin.flush()
+
+    def close_stdin(self) -> None:
+        """EOF the child's stdin; harmless when there is none."""
+        stdin = self._process.stdin
+        if stdin is not None:
+            with contextlib.suppress(OSError):
+                stdin.close()
 
     def lines(self) -> Iterator[str]:
         """Yield stdout lines from the child process."""
@@ -1441,7 +1473,11 @@ class ContainerBackend(SandboxBackend):
                 # certs); the agent's environment is passed via --env above and
                 # does not leak into the client's.
                 env={**os.environ},
-                stdin=subprocess.DEVNULL,
+                # `docker run --interactive` forwards the client's stdin, so a
+                # live pipe here is a live pipe inside the sandbox (HOT). The
+                # one-shot world keeps DEVNULL: a CLI that would block on a
+                # silent open pipe must see EOF immediately.
+                stdin=subprocess.PIPE if spec.live_input else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,

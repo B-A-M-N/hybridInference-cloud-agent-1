@@ -80,9 +80,13 @@ class FakeControl:
         self.artifacts: dict[str, str] = {}
         self.finished: tuple[str, str | None] | None = None
         self.job_id = "ajob_1"
+        self.continuity: str | None = None
 
     def append_event(self, event) -> None:
         self.events.append((event.event_type, event.payload))
+
+    def report_continuity(self, mode: str) -> None:
+        self.continuity = mode
 
     def save_artifact(self, kind: str, content: str) -> None:
         self.artifacts[kind] = content

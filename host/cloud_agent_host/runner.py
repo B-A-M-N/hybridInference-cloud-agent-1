@@ -26,6 +26,8 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import hashlib
+import json
 import os
 import pathlib
 import queue
@@ -41,7 +43,14 @@ from typing import Any
 
 import httpx
 
-from cloud_agent_host.drivers import LINE, HarnessDriver, LaunchContext, TurnInput
+from cloud_agent_host.drivers import (
+    LINE,
+    DriverError,
+    HarnessState,
+    LaunchContext,
+    TurnInput,
+    driver_for,
+)
 from cloud_agent_host.enrollment import HostHeartbeat, ensure_enrolled
 from cloud_agent_host.logging_utils import configure_process_logging
 from cloud_agent_host.patch_gate import branch_name_for, validate_patch
@@ -191,6 +200,9 @@ class ClaimedJob:
     # The prior successful run's edits, re-applied before the next sandbox is
     # started. Credentials still never cross the sandbox boundary.
     context_patch: str | None = None
+    # The parent turn's ThreadCheckpoint envelope, already decrypted and gated
+    # by the control plane. None means replay (design §9).
+    context_checkpoint: dict[str, Any] | None = None
     # MCP servers this job was granted. Names only: the runner learns nothing
     # about where they actually are, because the sandbox reaches them through
     # the gateway's proxy rather than directly.
@@ -222,6 +234,7 @@ class ClaimedJob:
             clone_token=body.get("clone_token") or None,
             context_messages=list(body.get("context_messages") or []),
             context_patch=body.get("context_patch") or None,
+            context_checkpoint=body.get("context_checkpoint") or None,
             mcp_servers=list(body.get("mcp_servers") or []),
         )
 
@@ -281,6 +294,15 @@ class ControlPlane:
             f"/v1/agent/worker/jobs/{self.job_id}/artifacts",
             {"kind": kind, "content": content},
         )
+
+    def report_continuity(self, mode: str) -> None:
+        """Record this attempt's continuity rung. Best-effort observability."""
+        try:
+            self._post(f"/v1/agent/worker/jobs/{self.job_id}/continuity", {"mode": mode})
+        except LeaseLost:
+            raise
+        except Exception:
+            pass
 
     def suspend_terminals(self, phase: str) -> None:
         """Freeze owner PTYs before workspace preparation or artifact capture."""
@@ -771,6 +793,66 @@ def save_workspace_snapshot(control: ControlPlane, *, workdir: str, patch: str) 
     return True
 
 
+def _export_checkpoint(
+    control: ControlPlane, *, session: Any, job: ClaimedJob, backend: Any
+) -> None:
+    """Package the turn's session into a ThreadCheckpoint and hand it up."""
+    try:
+        exported = session.export_state()
+    except DriverError as exc:
+        control.append_event(
+            NormalizedEvent(
+                "lifecycle", {"phase": "checkpoint_export_failed", "detail": str(exc)[:200]}
+            )
+        )
+        return
+    stamper = getattr(backend, "version_stamp", None)
+    stamp: dict[str, Any] = stamper() if stamper is not None else {}
+    envelope = {
+        "harness_state": {
+            "driver": session.runtime.name,
+            "driver_version": (stamp.get("runtime_versions") or {}).get(session.runtime.name, ""),
+            "state_format_version": 1,
+            "runtime_image_digest": stamp.get("sandbox_image_digest", ""),
+            "sha256": hashlib.sha256(exported.blob).hexdigest(),
+            "size": len(exported.blob),
+            "blob": base64.b64encode(exported.blob).decode("ascii"),
+        },
+        "consistency": {"through_turn_id": job.job_id, "attempt_id": job.attempt_id},
+        "session_id": exported.session_id,
+    }
+    try:
+        control.save_artifact("checkpoint", json.dumps(envelope))
+    except LeaseLost:
+        raise
+    except Exception as exc:
+        control.append_event(
+            NormalizedEvent(
+                "lifecycle", {"phase": "checkpoint_export_failed", "detail": str(exc)[:200]}
+            )
+        )
+        return
+    control.append_event(
+        NormalizedEvent("lifecycle", {"phase": "checkpoint_exported", "size": len(exported.blob)})
+    )
+
+
+def state_from_checkpoint(envelope: dict[str, Any]) -> HarnessState | None:
+    """Decode a claim's checkpoint envelope; ``None`` on any defect (replay)."""
+    harness = envelope.get("harness_state") or {}
+    session_id = str(envelope.get("session_id") or "")
+    blob_b64 = harness.get("blob")
+    if not session_id or not isinstance(blob_b64, str):
+        return None
+    try:
+        blob = base64.b64decode(blob_b64, validate=True)
+    except (ValueError, TypeError):
+        return None
+    if hashlib.sha256(blob).hexdigest() != harness.get("sha256"):
+        return None
+    return HarnessState(session_id=session_id, blob=blob)
+
+
 def run_agent(
     runtime: AgentRuntime,
     *,
@@ -782,11 +864,20 @@ def run_agent(
     timeout_s: float,
     backend: SandboxBackend,
     mcp_config: RuntimeMCPConfig = EMPTY_RUNTIME_MCP_CONFIG,
+    state: HarnessState | None = None,
+    state_dir: str | None = None,
 ) -> tuple[int, str, list[str]]:
     """Run the agent, streaming its output back as normalized events.
 
     Returns ``(exit_code, tail, tool_errors)``. Raises :class:`LeaseLost` if this attempt
     stops owning the job mid-run.
+
+    ``state`` is the parent turn's exported session (already decrypted and
+    gated by the control plane): restore it and the turn runs with the
+    agent's full memory on just the new prompt. Restore failing — or absent —
+    falls back to the transcript replay this function always ran, inside the
+    same attempt (design §9). ``state_dir`` is the host directory the sandbox
+    persists session files into; without it nothing is exported or restored.
     """
     # Hermetic environment, and the *backend's* idea of it rather than the
     # runner's. For an isolated backend the runner's PATH and HOME name paths
@@ -797,33 +888,58 @@ def run_agent(
     base_env = dict(backend.base_env())
     base_env.update(_SAFE_DIRECTORY_ENV)
 
-    driver = HarnessDriver(runtime)
-    session = driver.launch(
-        LaunchContext(
-            workdir=workdir,
-            gateway_base_url=gateway_base_url,
-            # Only the model-scoped credential crosses into the sandbox. The
-            # full capability token — which can write events, artifacts and
-            # terminal states — stays out here with the runner. After E9,
-            # grant scope and TTL bound the sandbox credential; spend remains
-            # subject to the owning user's gateway quota. There is
-            # deliberately no per-job monetary cap.
-            credential=job.sandbox_token,
-            # Runtime-specific permission flags must follow the actual
-            # execution boundary. In particular, Codex cannot nest bubblewrap
-            # inside the capability-dropped container backend.
-            provides_isolation=backend.provides_isolation,
-            # The platform places the process inside the sandbox (design D7);
-            # the driver owns everything on the returned handle's transport.
-            spawn=lambda argv, env: backend.spawn(SandboxSpec(argv=argv, workdir=workdir, env=env)),
-            base_env=base_env,
-            # The runner is the only source of this value. Repository contents
-            # never become runtime MCP configuration, and adapters without a
-            # gateway-mediated path reject a non-empty set.
-            mcp_config=mcp_config,
-        )
+    driver = driver_for(runtime)
+    context = LaunchContext(
+        workdir=workdir,
+        gateway_base_url=gateway_base_url,
+        # Only the model-scoped credential crosses into the sandbox. The
+        # full capability token — which can write events, artifacts and
+        # terminal states — stays out here with the runner. After E9,
+        # grant scope and TTL bound the sandbox credential; spend remains
+        # subject to the owning user's gateway quota. There is
+        # deliberately no per-job monetary cap.
+        credential=job.sandbox_token,
+        # Runtime-specific permission flags must follow the actual
+        # execution boundary. In particular, Codex cannot nest bubblewrap
+        # inside the capability-dropped container backend.
+        provides_isolation=backend.provides_isolation,
+        # The platform places the process inside the sandbox (design D7);
+        # the driver owns everything on the returned handle's transport.
+        spawn=lambda argv, env: backend.spawn(
+            SandboxSpec(argv=argv, workdir=workdir, env=env, state_dir=state_dir)
+        ),
+        base_env=base_env,
+        # The runner is the only source of this value. Repository contents
+        # never become runtime MCP configuration, and adapters without a
+        # gateway-mediated path reject a non-empty set.
+        mcp_config=mcp_config,
+        state_dir=state_dir,
     )
-    turn = session.start_turn(TurnInput(prompt=conversation_prompt(job), model=job.model))
+    session = None
+    if state is not None:
+        try:
+            session = driver.launch(context, state)
+        except DriverError as exc:
+            # In-attempt fallback (design §9): the turn still runs, on replay,
+            # and the degradation is a first-class row in the owner's stream.
+            control.append_event(
+                NormalizedEvent("lifecycle", {"phase": "cold_fallback", "detail": str(exc)[:200]})
+            )
+            session = None
+    if session is not None:
+        # The restored session *is* the memory: only the new prompt goes in.
+        turn_input = TurnInput(prompt=job.task_prompt, model=job.model)
+        control.report_continuity("cold_native")
+    else:
+        session = driver.launch(context)
+        turn_input = TurnInput(prompt=conversation_prompt(job), model=job.model)
+        control.report_continuity("replay")
+    if state_dir is not None:
+        # After restore, before spawn: whatever the driver just wrote (and the
+        # empty dir on a fresh turn) must be writable by the sandbox user, or
+        # the CLI cannot record the very session the next turn would resume.
+        backend.adopt_workdir(state_dir)
+    turn = session.start_turn(turn_input)
 
     deadline = time.monotonic() + timeout_s
     tail: list[str] = []
@@ -893,6 +1009,13 @@ def run_agent(
 
     result = turn.wait()
     exit_code = result.exit_code
+    if result.status == "completed" and state_dir is not None:
+        # Every settled turn exports (design §6): this is COLD's substrate and
+        # HOT's crash insurance. Failure is non-fatal — the user's work is the
+        # patch, and losing a checkpoint costs one replay, not the turn — but
+        # it is a first-class row, because a thread that quietly went
+        # forgetful is the old bug wearing a new face.
+        _export_checkpoint(control, session=session, job=job, backend=backend)
     stderr = turn.stderr_text()
     if stderr.strip():
         tail.append(stderr[-2000:])
@@ -988,6 +1111,18 @@ def run_once(
         finish_attempt("failed", str(exc))
         control.close()
         return 2
+
+    # Session persistence, for runtimes whose driver has real continuity. The
+    # state dir is a sibling of the worktree — never inside it, so session
+    # files cannot leak into a patch — and per job, like the worktree itself.
+    state_dir: str | None = None
+    context_state: HarnessState | None = None
+    if driver_for(runtime).capabilities().continuity != "replay":
+        state_path = pathlib.Path(f"{workdir}.state")
+        state_path.mkdir(parents=True, exist_ok=True)
+        state_dir = str(state_path)
+        if job.context_checkpoint:
+            context_state = state_from_checkpoint(job.context_checkpoint)
 
     # Ask the backend, not this host: with an isolated backend the agent CLIs
     # live in the sandbox image, so probing the runner's own PATH would refuse
@@ -1140,6 +1275,8 @@ def run_once(
                 base_url=job.mcp_base_url,
                 credential=job.mcp_token,
             ),
+            state=context_state,
+            state_dir=state_dir,
         )
 
         # Freeze both interactive input and already-running terminal process

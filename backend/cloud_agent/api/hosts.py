@@ -28,6 +28,7 @@ minutes.
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -43,6 +44,10 @@ from cloud_agent.schemas import (
     HostHeartbeatResponse,
     HostRegisterRequest,
     HostRegisterResponse,
+    HostResidencyEstablishRequest,
+    HostResidencyEstablishResponse,
+    HostResidencyReleaseRequest,
+    WorkerAckResponse,
 )
 from cloud_agent.tokens import InvalidHostToken, mint_host_token, parse_host_token
 
@@ -52,6 +57,10 @@ if TYPE_CHECKING:
     from cloud_agent.storage.store import AgentJobStore
 
 router = APIRouter(prefix="/v1/agent/host", tags=["agent-hosts"])
+
+#: How long a hot sandbox's lease lives between beats (design §7). The cap on
+#: how long an idle resident process may hold its (idle-inert) credentials.
+RESIDENCY_TTL_S = float(os.environ.get("AGENT_RESIDENCY_TTL_S") or 1800.0)
 
 
 def _require_store(store: AgentJobStore | None) -> AgentJobStore:
@@ -225,11 +234,26 @@ async def heartbeat_host(
         # landing mid-request. Refusing is right: this credential now names
         # nothing.
         raise _unauthorized("This host credential is no longer valid.")
+    # Residency beats ride the host heartbeat (design §7): one wire message
+    # says "I am here" and "these sandboxes are still mine", generation-scoped
+    # so a beat from a taken-over residency extends nothing — it comes back in
+    # residencies_lost and the host tears that sandbox down.
+    lost: list[str] = []
+    for beat in body.residencies or []:
+        extended = await job_store.heartbeat_residency(
+            thread_id=beat.thread_id,
+            generation=beat.generation,
+            host=updated["host"],
+            ttl_seconds=RESIDENCY_TTL_S,
+        )
+        if not extended:
+            lost.append(beat.thread_id)
     return HostHeartbeatResponse(
         host=updated["host"],
         status=updated["status"],
         slots_total=updated["slots_total"],
         slots_used=updated["slots_used"],
+        residencies_lost=lost,
         heartbeat_interval_seconds=HEARTBEAT_INTERVAL_S,
         # Rate-limited inside the probe. Heartbeats are this host's liveness
         # signal and must not come to depend on a second service answering, but
@@ -238,6 +262,64 @@ async def heartbeat_host(
         # host was misconfigured, and it stayed invisible for a day.
         broker_error=await _probed_broker_error(updated["host"], body.broker_url),
     )
+
+
+@router.post("/residencies", response_model=HostResidencyEstablishResponse)
+async def establish_thread_residency(
+    body: HostResidencyEstablishRequest,
+    host: dict[str, Any] = Depends(authenticate_host),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+) -> HostResidencyEstablishResponse:
+    """Take (or take over) residency for a thread this host is running.
+
+    Residency is earned, not asserted: the host must hold the thread's
+    *running* attempt right now, which is why the runner establishes at turn
+    end, before finish. Without the gate, a compromised machine could pull
+    other machines' conversations toward itself through claim affinity.
+    """
+    job_store = _require_store(store)
+    if not await job_store.host_runs_thread(host=host["host"], thread_id=body.thread_id):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": {
+                    "type": "not_running_thread",
+                    "message": "residency belongs to the host running the thread's turn",
+                }
+            },
+        )
+    row = await job_store.establish_residency(
+        thread_id=body.thread_id,
+        host=host["host"],
+        runtime_id=body.runtime_id,
+        runtime_version=body.runtime_version,
+        sandbox_id=body.sandbox_id,
+        ttl_seconds=RESIDENCY_TTL_S,
+    )
+    return HostResidencyEstablishResponse(
+        thread_id=row["thread_id"],
+        generation=row["generation"],
+        ttl_seconds=RESIDENCY_TTL_S,
+    )
+
+
+@router.post("/residencies/release", response_model=WorkerAckResponse)
+async def release_thread_residency(
+    body: HostResidencyReleaseRequest,
+    host: dict[str, Any] = Depends(authenticate_host),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+) -> WorkerAckResponse:
+    """End a residency this host holds (teardown, eviction, drain).
+
+    Generation-scoped like every other residency write: releasing with a
+    stale generation is a no-op ``ok=false``, never an error — the successor
+    it would otherwise end belongs to someone else now.
+    """
+    job_store = _require_store(store)
+    released = await job_store.release_residency(
+        thread_id=body.thread_id, generation=body.generation, host=host["host"]
+    )
+    return WorkerAckResponse(ok=released)
 
 
 async def _probed_broker_error(
