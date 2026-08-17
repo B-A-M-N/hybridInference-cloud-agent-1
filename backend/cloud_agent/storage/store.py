@@ -2313,6 +2313,148 @@ class AgentJobStore:
                 content,
             )
 
+    # ── Thread residency (design §7, issue #57) ────────────────────────
+    #
+    # One row per thread, never deleted, generation strictly increasing —
+    # see migration 0009 for why deletion is forbidden. Every mutation is
+    # generation-scoped so a late writer from a previous residency changes
+    # nothing: heartbeats cannot re-promote, releases cannot end a successor.
+
+    async def establish_residency(
+        self,
+        *,
+        thread_id: str,
+        host: str,
+        runtime_id: str,
+        runtime_version: str | None,
+        ttl_seconds: float,
+        sandbox_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Take (or take over) a thread's residency; returns the new row.
+
+        Atomic: two hosts racing serialize on the row, each gets a distinct
+        generation, and the larger one owns the thread — the loser's next
+        generation-scoped call answers ``False`` and it stands down.
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO agent_thread_residencies
+                    (thread_id, host, sandbox_id, runtime_id, runtime_version,
+                     status, lease_expires_at)
+                VALUES ($1, $2, $3, $4, $5, 'hot',
+                        NOW() + make_interval(secs => $6))
+                ON CONFLICT (thread_id) DO UPDATE SET
+                    generation = agent_thread_residencies.generation + 1,
+                    host = EXCLUDED.host,
+                    sandbox_id = EXCLUDED.sandbox_id,
+                    runtime_id = EXCLUDED.runtime_id,
+                    runtime_version = EXCLUDED.runtime_version,
+                    status = 'hot',
+                    lease_expires_at = EXCLUDED.lease_expires_at,
+                    established_at = NOW(),
+                    last_active_at = NOW()
+                RETURNING *
+                """,
+                thread_id,
+                host,
+                sandbox_id,
+                runtime_id,
+                runtime_version,
+                ttl_seconds,
+            )
+        return dict(row)
+
+    async def heartbeat_residency(
+        self, *, thread_id: str, generation: int, ttl_seconds: float
+    ) -> bool:
+        """Extend a residency's lease — only the generation that holds it."""
+        async with self._pool.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    UPDATE agent_thread_residencies
+                    SET lease_expires_at = NOW() + make_interval(secs => $3),
+                        last_active_at = NOW()
+                    WHERE thread_id = $1 AND generation = $2 AND status = 'hot'
+                    RETURNING thread_id
+                    """,
+                    thread_id,
+                    generation,
+                    ttl_seconds,
+                )
+            )
+
+    async def release_residency(self, *, thread_id: str, generation: int) -> bool:
+        """End a residency (teardown/eviction) — only its own generation."""
+        async with self._pool.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    UPDATE agent_thread_residencies
+                    SET status = 'none', last_active_at = NOW()
+                    WHERE thread_id = $1 AND generation = $2 AND status <> 'none'
+                    RETURNING thread_id
+                    """,
+                    thread_id,
+                    generation,
+                )
+            )
+
+    async def record_residency_checkpoint(
+        self, *, thread_id: str, generation: int, turn_id: str
+    ) -> bool:
+        """Note the newest turn whose checkpoint this residency exported."""
+        async with self._pool.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    UPDATE agent_thread_residencies
+                    SET last_checkpoint_turn_id = $3, last_active_at = NOW()
+                    WHERE thread_id = $1 AND generation = $2
+                    RETURNING thread_id
+                    """,
+                    thread_id,
+                    generation,
+                    turn_id,
+                )
+            )
+
+    async def resident_host(self, *, thread_id: str) -> dict[str, Any] | None:
+        """The live hot residency for a thread, or ``None``.
+
+        Live means unexpired: the reaper marks expiry on its own schedule,
+        and scheduling decisions between passes must not trust a lease the
+        clock has already taken away.
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT * FROM agent_thread_residencies
+                WHERE thread_id = $1 AND status = 'hot' AND lease_expires_at > NOW()
+                """,
+                thread_id,
+            )
+        return None if row is None else dict(row)
+
+    async def reap_expired_residencies(self) -> list[dict[str, Any]]:
+        """Mark every hot residency whose lease lapsed as ``none``.
+
+        The control plane's unilateral half of the fence: the host may still
+        be running the sandbox, but its generation no longer opens anything —
+        not heartbeats, not credentials — and the next turn goes COLD.
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE agent_thread_residencies
+                SET status = 'none'
+                WHERE status = 'hot' AND lease_expires_at <= NOW()
+                RETURNING thread_id, generation, host
+                """
+            )
+        return [dict(row) for row in rows]
+
     async def prune_thread_checkpoints(self, *, keep_job_id: str) -> int:
         """Keep only ``keep_job_id``'s checkpoint within its thread.
 

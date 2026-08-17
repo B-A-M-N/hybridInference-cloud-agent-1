@@ -39,6 +39,7 @@ _TABLES_IN_FK_ORDER = (
     "agent_job_events",
     "agent_attempts",
     "agent_jobs",
+    "agent_thread_residencies",
     "agent_threads",
     "agent_host_enroll_tokens",
     "agent_runner_hosts",
@@ -823,3 +824,79 @@ async def test_the_pin_and_the_pool_both_have_to_agree(store):
     assert await store.claim_job(worker_id="w2", lease_ttl_seconds=60, host="runner-b") is None
     await store.set_host_status(host="runner-a", status=HOST_DRAINING)
     assert await store.claim_job(worker_id="w1", lease_ttl_seconds=60, host="runner-a") is None
+
+
+# ── P3: thread residency (design §7) ───────────────────────────────────
+
+
+async def test_a_takeover_bumps_the_generation_and_the_old_one_is_dead(store):
+    """Contract tests 10 and 13: one winner, and late writers change nothing."""
+    first = await store.establish_residency(
+        thread_id="t1",
+        host="runner-a",
+        runtime_id="claude-code",
+        runtime_version="1.2.3",
+        ttl_seconds=60,
+    )
+    assert (first["generation"], first["status"]) == (1, "hot")
+
+    second = await store.establish_residency(
+        thread_id="t1",
+        host="runner-b",
+        runtime_id="claude-code",
+        runtime_version="1.2.3",
+        ttl_seconds=60,
+    )
+    assert second["generation"] == 2
+
+    live = await store.resident_host(thread_id="t1")
+    assert (live["host"], live["generation"]) == ("runner-b", 2)
+    # The previous generation can neither re-promote nor end its successor.
+    assert await store.heartbeat_residency(thread_id="t1", generation=1, ttl_seconds=60) is False
+    assert await store.release_residency(thread_id="t1", generation=1) is False
+    assert await store.heartbeat_residency(thread_id="t1", generation=2, ttl_seconds=60) is True
+
+
+async def test_the_reaper_lapses_expired_residencies_without_resetting_generations(store):
+    await store.establish_residency(
+        thread_id="t1",
+        host="runner-a",
+        runtime_id="claude-code",
+        runtime_version=None,
+        ttl_seconds=-1,
+    )
+
+    lapsed = await store.reap_expired_residencies()
+
+    assert [(row["thread_id"], row["generation"]) for row in lapsed] == [("t1", 1)]
+    assert await store.resident_host(thread_id="t1") is None
+    # Re-establishing continues the count — a dead generation stays dead.
+    revived = await store.establish_residency(
+        thread_id="t1",
+        host="runner-a",
+        runtime_id="claude-code",
+        runtime_version=None,
+        ttl_seconds=60,
+    )
+    assert revived["generation"] == 2
+
+
+async def test_release_ends_the_residency_but_the_row_survives(store):
+    row = await store.establish_residency(
+        thread_id="t1",
+        host="runner-a",
+        runtime_id="claude-code",
+        runtime_version=None,
+        ttl_seconds=60,
+    )
+    assert await store.release_residency(thread_id="t1", generation=row["generation"]) is True
+    assert await store.resident_host(thread_id="t1") is None
+
+    again = await store.establish_residency(
+        thread_id="t1",
+        host="runner-a",
+        runtime_id="claude-code",
+        runtime_version=None,
+        ttl_seconds=60,
+    )
+    assert again["generation"] == row["generation"] + 1
