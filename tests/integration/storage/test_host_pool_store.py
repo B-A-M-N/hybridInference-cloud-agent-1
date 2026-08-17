@@ -900,3 +900,52 @@ async def test_release_ends_the_residency_but_the_row_survives(store):
         ttl_seconds=60,
     )
     assert again["generation"] == row["generation"] + 1
+
+
+async def test_a_hot_threads_turn_is_held_for_its_resident_host(store):
+    """Affinity is a window, not a pin (design §7)."""
+    await _enrol(store, "runner-a")
+    await _enrol(store, "runner-b")
+    job = await _create_job(store)
+    await store.establish_residency(
+        thread_id=job["thread_id"],
+        host="runner-b",
+        runtime_id="claude-code",
+        runtime_version=None,
+        ttl_seconds=60,
+    )
+
+    # Held: the stranger gets nothing while the resident host's window runs.
+    assert await store.claim_job(worker_id="w1", lease_ttl_seconds=60, host="runner-a") is None
+    claimed = await store.claim_job(worker_id="w2", lease_ttl_seconds=60, host="runner-b")
+    assert claimed is not None and claimed["id"] == job["id"]
+
+
+async def test_the_affinity_hold_expires_rather_than_stranding_the_turn(store):
+    await _enrol(store, "runner-a")
+    job = await _create_job(store)
+    await store.establish_residency(
+        thread_id=job["thread_id"],
+        host="runner-gone",
+        runtime_id="claude-code",
+        runtime_version=None,
+        ttl_seconds=60,
+    )
+    async with store._pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_jobs SET updated_at = NOW() - interval '31 seconds' WHERE id = $1",
+            job["id"],
+        )
+
+    claimed = await store.claim_job(worker_id="w1", lease_ttl_seconds=60, host="runner-a")
+
+    assert claimed is not None and claimed["id"] == job["id"]
+
+
+async def test_a_thread_without_a_residency_is_anyones(store):
+    await _enrol(store, "runner-a")
+    job = await _create_job(store)
+
+    claimed = await store.claim_job(worker_id="w1", lease_ttl_seconds=60, host="runner-a")
+
+    assert claimed is not None and claimed["id"] == job["id"]

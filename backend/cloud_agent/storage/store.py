@@ -145,6 +145,12 @@ _JOB_COLUMNS = (
 )
 _QUALIFIED_JOB_COLUMNS = ", ".join(f"j.{column.strip()}" for column in _JOB_COLUMNS.split(","))
 
+#: How long a queued turn is reserved for its thread's resident host before
+#: any host may claim it (design §7). Long enough to survive a busy runner's
+#: poll cycle; short enough that a vanished host costs one COLD start, not a
+#: stuck queue.
+RESIDENCY_AFFINITY_HOLD_S = 30.0
+
 # Everything a caller may see about a host. ``credential_hash`` is deliberately
 # not in it — reading it back out would make the row as good as the credential
 # — and is reported only as the boolean ``enrolled``.
@@ -1752,16 +1758,37 @@ class AgentJobStore:
                 """,
                 list(TERMINAL_STATES),
             )
+            # Affinity (design §7): a job whose thread is hot on another host
+            # is *held* for that host — its live process has the whole
+            # conversation in memory, and any other machine would demote the
+            # turn to COLD for no reason. The hold is a window, not a pin: if
+            # the resident host does not collect within it (busy, gone,
+            # draining), anyone may take the job and the ladder degrades one
+            # rung, exactly as designed. ``updated_at`` is when the job last
+            # became claimable, so waiting follow-ups time out from promotion,
+            # not creation. FOR UPDATE OF j: the residency row is read, never
+            # locked — claims must not serialize behind heartbeats.
             job_row = await conn.fetchrow(
                 f"""
-                SELECT {_JOB_COLUMNS} FROM agent_jobs
-                WHERE state = 'queued' AND cancel_requested = FALSE
-                  AND COALESCE(metadata->'requires', '[]'::jsonb) <@ $1::jsonb
-                ORDER BY created_at
+                SELECT {_QUALIFIED_JOB_COLUMNS} FROM agent_jobs j
+                LEFT JOIN agent_thread_residencies r
+                  ON r.thread_id = j.thread_id
+                 AND r.status = 'hot'
+                 AND r.lease_expires_at > NOW()
+                WHERE j.state = 'queued' AND j.cancel_requested = FALSE
+                  AND COALESCE(j.metadata->'requires', '[]'::jsonb) <@ $1::jsonb
+                  AND (
+                        r.thread_id IS NULL
+                        OR r.host = $2
+                        OR j.updated_at <= NOW()
+                            - make_interval(secs => {RESIDENCY_AFFINITY_HOLD_S})
+                  )
+                ORDER BY j.created_at
                 LIMIT 1
-                FOR UPDATE SKIP LOCKED
+                FOR UPDATE OF j SKIP LOCKED
                 """,
                 capabilities,
+                host,
             )
             if job_row is None:
                 return None
