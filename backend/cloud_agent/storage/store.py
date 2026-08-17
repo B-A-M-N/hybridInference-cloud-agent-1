@@ -2055,6 +2055,7 @@ class AgentJobStore:
         lease_generation: int,
         event_type: str,
         payload: dict[str, Any] | None = None,
+        event_seq: int | None = None,
     ) -> int | None:
         """Append one event, fenced by the live lease.
 
@@ -2093,6 +2094,7 @@ class AgentJobStore:
                 attempt_id=attempt_id,
                 event_type=event_type,
                 payload=payload,
+                client_seq=event_seq,
             )
 
     async def terminal_workspace_ready(self, *, attempt_id: int) -> bool:
@@ -2214,15 +2216,29 @@ class AgentJobStore:
         attempt_id: int,
         event_type: str,
         payload: dict[str, Any] | None,
+        client_seq: int | None = None,
     ) -> int:
-        """Insert one event row inside the caller's transaction."""
+        """Insert one event row inside the caller's transaction.
+
+        A ``client_seq`` the attempt has already stored is a retry of a
+        response that never arrived: answer with the stored row's id and do
+        not run the thread-message mirror again — it ran when the row landed.
+        """
+        if client_seq is not None:
+            existing = await conn.fetchval(
+                "SELECT id FROM agent_job_events WHERE attempt_id = $1 AND client_seq = $2",
+                attempt_id,
+                client_seq,
+            )
+            if existing is not None:
+                return int(existing)
         event_id = await conn.fetchval(
             """
-            INSERT INTO agent_job_events (job_id, attempt_id, seq, event_type, payload)
+            INSERT INTO agent_job_events (job_id, attempt_id, seq, event_type, payload, client_seq)
             VALUES (
                 $1, $2,
                 (SELECT COALESCE(MAX(seq), 0) + 1 FROM agent_job_events WHERE attempt_id = $2),
-                $3, $4::jsonb
+                $3, $4::jsonb, $5
             )
             RETURNING id
             """,
@@ -2230,6 +2246,7 @@ class AgentJobStore:
             attempt_id,
             event_type,
             json.dumps(payload) if payload is not None else None,
+            client_seq,
         )
         text = (payload or {}).get("text")
         if event_type == "message" and isinstance(text, str) and text.strip():

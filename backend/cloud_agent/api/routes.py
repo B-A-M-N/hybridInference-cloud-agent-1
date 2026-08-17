@@ -2840,6 +2840,7 @@ async def worker_append_event(
         lease_generation=claims["lease_generation"],
         event_type=body.event_type,
         payload=body.payload,
+        event_seq=body.event_seq,
     )
     if event_id is None:
         raise _lease_lost()

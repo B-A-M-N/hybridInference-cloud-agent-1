@@ -518,6 +518,17 @@ class WorkerEventRequest(BaseModel):
         description="thinking|message|tool_use|...|lifecycle",
     )
     payload: dict[str, Any] | None = None
+    event_seq: int | None = Field(
+        None,
+        ge=1,
+        description=(
+            "The worker's own monotonically increasing number for this upload "
+            "within its attempt. A replayed number is answered with the "
+            "already-stored event's id instead of a duplicate row, which is "
+            "what makes retrying a dropped response safe. Omitted by workers "
+            "that predate it; those keep today's at-least-once behaviour."
+        ),
+    )
 
 
 class WorkerEventResponse(BaseModel):

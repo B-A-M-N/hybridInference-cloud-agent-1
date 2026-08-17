@@ -230,6 +230,10 @@ class ControlPlane:
     def __init__(self, base_url: str, token: str, *, timeout: float = 30.0) -> None:
         self._base = base_url.rstrip("/")
         self._client = httpx.Client(timeout=timeout, headers={"Authorization": f"Bearer {token}"})
+        # This client serves exactly one attempt (one claim, one token), so a
+        # plain counter is the whole numbering scheme. It makes each upload
+        # idempotent server-side, which is what licenses the retry below.
+        self._event_seq = 0
 
     def close(self) -> None:
         """Release the HTTP connection pool."""
@@ -243,11 +247,25 @@ class ControlPlane:
         return response.json() if response.content else {}
 
     def append_event(self, event: NormalizedEvent) -> None:
-        """Report one normalized event."""
-        self._post(
-            f"/v1/agent/worker/jobs/{self.job_id}/events",
-            {"event_type": event.event_type, "payload": event.payload},
-        )
+        """Report one normalized event, retrying once now that replay is safe.
+
+        The retry exists *because of* ``event_seq``: before it, a response
+        lost on the wire left the runner unable to tell "never stored" from
+        "stored, answer dropped", and re-sending risked a duplicate row in the
+        owner's stream. With the number attached, the server answers a replay
+        with the already-stored id, so one transport error no longer kills an
+        otherwise healthy turn.
+        """
+        self._event_seq += 1
+        body = {
+            "event_type": event.event_type,
+            "payload": event.payload,
+            "event_seq": self._event_seq,
+        }
+        try:
+            self._post(f"/v1/agent/worker/jobs/{self.job_id}/events", body)
+        except httpx.TransportError:
+            self._post(f"/v1/agent/worker/jobs/{self.job_id}/events", body)
 
     def heartbeat(self, ttl: float) -> dict[str, Any]:
         """Renew the lease and learn whether cancellation is pending."""
