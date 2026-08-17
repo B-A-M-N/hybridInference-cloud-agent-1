@@ -485,6 +485,15 @@ class WorkerClaimResponse(BaseModel):
         None,
         description="Successful parent patch to rehydrate before this follow-up runs.",
     )
+    context_checkpoint: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "The parent turn's ThreadCheckpoint envelope, decrypted and gated "
+            "(same driver, same CLI version, exported by exactly the turn this "
+            "follow-up continues). Null means replay — the always-available, "
+            "merely forgetful path."
+        ),
+    )
     mcp_servers: list[str] = Field(
         default_factory=list,
         description=(

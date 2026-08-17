@@ -50,6 +50,13 @@ from cloud_agent.api.deps import (
     verify_admin_access,
 )
 from cloud_agent.broker_routing import broker_for_attempt, broker_for_job
+from cloud_agent.checkpoints import (
+    CHECKPOINT_KIND,
+    MAX_CHECKPOINT_CONTENT_BYTES,
+    checkpoint_cipher,
+    gate_for_claim,
+    open_checkpoint,
+)
 from cloud_agent.entitlement import (
     REPO_PATTERN,
     RepoNotAllowed,
@@ -2796,8 +2803,39 @@ async def worker_claim(
         clone_token=clone_token,
         context_messages=context["messages"],
         context_patch=context["patch"],
+        context_checkpoint=await _claimable_checkpoint(job_store, claim=claim, host=host),
         mcp_servers=list(claim.get("mcp_servers") or []),
         metadata=claim["metadata"],
+    )
+
+
+async def _claimable_checkpoint(
+    job_store: AgentJobStore, *, claim: dict[str, Any], host: str | None
+) -> dict[str, Any] | None:
+    """The parent turn's checkpoint, when it matches what is about to run.
+
+    Fetch → decrypt → gate (driver, through-turn, CLI version against the
+    claiming host's stamp). Every failure is ``None``: the runner replays,
+    which is the design's degradation ladder, never an error.
+    """
+    parent_job_id = claim.get("parent_job_id")
+    if not parent_job_id:
+        return None
+    stored = await job_store.get_artifact(job_id=parent_job_id, kind=CHECKPOINT_KIND)
+    if stored is None:
+        return None
+    envelope = open_checkpoint(stored["content"])
+    if envelope is None:
+        return None
+    versions = None
+    if host:
+        row = await job_store.get_host(host=host)
+        versions = (row or {}).get("runtime_versions")
+    return gate_for_claim(
+        envelope,
+        runtime=claim["runtime"],
+        parent_job_id=parent_job_id,
+        host_runtime_versions=versions,
     )
 
 
@@ -2957,19 +2995,53 @@ async def worker_save_artifact(
     authorization: str | None = Header(None),
     store: AgentJobStore | None = Depends(get_agent_job_store),
 ) -> WorkerArtifactResponse:
-    """Store (or replace) an artifact produced by this attempt."""
+    """Store (or replace) an artifact produced by this attempt.
+
+    Checkpoints are special-cased twice: sealed (encrypted) before they touch
+    the table, and pruned to latest-per-thread after they land. A checkpoint
+    this deployment cannot seal — no key — or that exceeds the size cap is
+    *discarded*, answered with ``artifact_id=0``: losing a checkpoint costs
+    one thread a replay, which is the designed degradation, while failing the
+    attempt over it would cost the user a finished turn.
+    """
     job_store = _require_store(store)
     claims = _worker_claims(authorization)
     _match_job(claims, job_id)
+    content = body.content
+    if body.kind == CHECKPOINT_KIND:
+        sealed = _sealed_checkpoint(job_id, body.content)
+        if sealed is None:
+            return WorkerArtifactResponse(artifact_id=0)
+        content = sealed
     artifact_id = await job_store.save_artifact(
         attempt_id=claims["attempt_id"],
         lease_generation=claims["lease_generation"],
         kind=body.kind,
-        content=body.content,
+        content=content,
     )
     if artifact_id is None:
         raise _lease_lost()
+    if body.kind == CHECKPOINT_KIND:
+        await job_store.prune_thread_checkpoints(keep_job_id=job_id)
     return WorkerArtifactResponse(artifact_id=artifact_id)
+
+
+def _sealed_checkpoint(job_id: str, content: str) -> str | None:
+    """Encrypt a checkpoint for storage; ``None`` discards it, with the reason."""
+    if len(content.encode("utf-8")) > MAX_CHECKPOINT_CONTENT_BYTES:
+        logger.info(
+            "agent_checkpoint_discarded",
+            extra={
+                "event": "agent_checkpoint_discarded",
+                "job_id": job_id,
+                "detail": f"over the {MAX_CHECKPOINT_CONTENT_BYTES} byte cap",
+            },
+        )
+        return None
+    cipher = checkpoint_cipher()
+    if cipher is None:
+        return None
+    return cipher.encrypt(content)
 
 
 @router.post("/worker/jobs/{job_id}/finish", response_model=WorkerAckResponse)

@@ -2313,6 +2313,31 @@ class AgentJobStore:
                 content,
             )
 
+    async def prune_thread_checkpoints(self, *, keep_job_id: str) -> int:
+        """Keep only ``keep_job_id``'s checkpoint within its thread.
+
+        Latest-per-thread retention (design §6): the newest checkpoint is the
+        only one the claim gate could ever hand out — an older one would fail
+        ``through_turn_id`` — so keeping it would be pure storage cost. Rows
+        are deleted, not archived; the transcript remains the durable record.
+        """
+        async with self._pool.acquire() as conn:
+            deleted = await conn.fetch(
+                """
+                DELETE FROM agent_job_artifacts a
+                USING agent_jobs sibling, agent_jobs kept
+                WHERE a.kind = 'checkpoint'
+                  AND kept.id = $1
+                  AND sibling.id = a.job_id
+                  AND sibling.thread_id = kept.thread_id
+                  AND sibling.thread_id IS NOT NULL
+                  AND a.job_id <> $1
+                RETURNING a.id
+                """,
+                keep_job_id,
+            )
+        return len(deleted)
+
     async def get_artifact(self, *, job_id: str, kind: str) -> dict[str, Any] | None:
         """Fetch the most recent artifact of a kind for a job."""
         async with self._pool.acquire() as conn:
