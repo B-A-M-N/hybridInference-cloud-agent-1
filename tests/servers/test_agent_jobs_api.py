@@ -1149,6 +1149,49 @@ async def test_follow_up_model_switch_gets_the_same_fail_fast(client: AsyncClien
     assert response.json()["detail"]["error"]["type"] == "model_not_available"
 
 
+async def test_an_unregistered_runtime_is_refused_at_create(client: AsyncClient):
+    """An arbitrary runtime string dies here, not as a claimed-then-dead job."""
+    response = await client.post(
+        "/v1/agent/jobs",
+        json={
+            "repo": "owner/name",
+            "task_prompt": "fix it",
+            "model": "glm-5.1",
+            "runtime": "no-such-harness",
+        },
+    )
+    assert response.status_code == 400
+    assert "no-such-harness" in response.json()["detail"]["error"]["message"]
+
+
+async def test_a_follow_up_cannot_switch_the_threads_harness(client: AsyncClient):
+    """The harness is fixed per thread (design D2); its session is the memory.
+
+    Echoing the thread's own runtime stays a 201 — existing callers do that —
+    and a *different* registered runtime is the refusal, pointing at fork.
+    """
+    parent_id = await _create_job(client)
+
+    switched = await client.post(
+        f"/v1/agent/jobs/{parent_id}/follow-ups",
+        json={"prompt": "continue on another harness", "runtime": "codex"},
+    )
+    assert switched.status_code == 400
+    assert "fork" in switched.json()["detail"]["error"]["message"]
+
+    echoed = await client.post(
+        f"/v1/agent/jobs/{parent_id}/follow-ups",
+        json={"prompt": "continue here", "runtime": "claude-code"},
+    )
+    assert echoed.status_code == 201
+
+    invented = await client.post(
+        f"/v1/agent/jobs/{parent_id}/follow-ups",
+        json={"prompt": "continue on nothing", "runtime": "no-such-harness"},
+    )
+    assert invented.status_code == 400
+
+
 async def test_config_offers_the_models_the_create_endpoint_accepts(client: AsyncClient):
     """The picker and the validator must be the same list, or one is lying."""
     config = await client.get("/v1/agent/config")

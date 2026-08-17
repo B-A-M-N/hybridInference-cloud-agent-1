@@ -1082,6 +1082,28 @@ async def _resolve_mcp_servers(
     return servers
 
 
+def _require_registered_runtime(runtime: str) -> None:
+    """400 unless ``runtime`` names a registered harness.
+
+    The registry is the trust boundary (design D2): what may run is what this
+    deployment registered, never whatever string a request carried.
+    """
+    known = registered_runtimes()
+    if runtime not in known:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "type": "invalid_request",
+                    "message": (
+                        f"unknown runtime {runtime!r}; this deployment registers: "
+                        + ", ".join(known)
+                    ),
+                }
+            },
+        )
+
+
 @router.post("/jobs", response_model=AgentJobResponse, status_code=201)
 async def create_agent_job(
     body: AgentJobCreate,
@@ -1092,6 +1114,11 @@ async def create_agent_job(
 ) -> AgentJobResponse:
     """Queue a new agent job for the authenticated user."""
     job_store = _require_store(store)
+    # Fail here, not at claim time. An unregistered runtime used to travel all
+    # the way into a queued row and burn a claim before anything noticed —
+    # the composer only offers registered ids, so an arbitrary string can only
+    # arrive from a direct API caller, and it deserves a 400, not a dead job.
+    _require_registered_runtime(body.runtime)
     # Canonical from here on. The grant the gateway mints names canonical
     # ids, so a job that stored the alias would carry a scope matching
     # nothing — created successfully, dead at its first inference call.
@@ -1345,6 +1372,27 @@ async def create_agent_follow_up(
     """Append a turn to a task thread and queue its next isolated run."""
     job_store = _require_store(store)
     parent = await _owned_job(job_store, job_id, user)
+    # The harness is fixed per thread (design D2): continuity is the harness
+    # session, and no other harness can continue it. The field survives as an
+    # explicit no-op so existing callers that echo the thread's runtime keep
+    # working; a *different* runtime is refused rather than silently starting
+    # a turn the thread's memory cannot follow.
+    if body.runtime is not None:
+        _require_registered_runtime(body.runtime)
+        if body.runtime != parent["runtime"]:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "type": "invalid_request",
+                        "message": (
+                            f"this thread runs on {parent['runtime']!r} and a thread's "
+                            "harness is fixed; fork the thread to continue on "
+                            f"{body.runtime!r}"
+                        ),
+                    }
+                },
+            )
     # A follow-up may switch models; the switched-to model gets the same
     # fail-fast as a fresh job. An omitted model inherits the parent's, which
     # was validated when it was chosen.

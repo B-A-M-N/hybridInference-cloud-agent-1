@@ -216,7 +216,14 @@ class AgentFollowUpRequest(BaseModel):
     """A new user turn appended to an existing task thread."""
 
     prompt: str = Field(..., min_length=1, max_length=100_000)
-    runtime: str | None = Field(None, description="Optional harness override for this turn.")
+    runtime: str | None = Field(
+        None,
+        description=(
+            "Accepted only when it names the thread's own harness — a thread's "
+            "harness is fixed (its session is the unit of continuity; design "
+            "D2). Any other value is a 400; fork the thread to switch."
+        ),
+    )
     model: str | None = Field(None, description="Optional model override for this turn.")
 
     @field_validator("prompt")
