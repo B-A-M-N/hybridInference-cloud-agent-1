@@ -949,3 +949,36 @@ async def test_a_thread_without_a_residency_is_anyones(store):
     claimed = await store.claim_job(worker_id="w1", lease_ttl_seconds=60, host="runner-a")
 
     assert claimed is not None and claimed["id"] == job["id"]
+
+
+async def test_residency_writes_are_scoped_to_the_holding_host(store):
+    """A guessed (thread, generation) from another machine changes nothing."""
+    row = await store.establish_residency(
+        thread_id="t1",
+        host="runner-a",
+        runtime_id="claude-code",
+        runtime_version=None,
+        ttl_seconds=60,
+    )
+    generation = row["generation"]
+
+    assert (
+        await store.heartbeat_residency(
+            thread_id="t1", generation=generation, ttl_seconds=60, host="runner-b"
+        )
+        is False
+    )
+    assert (
+        await store.release_residency(thread_id="t1", generation=generation, host="runner-b")
+        is False
+    )
+    assert (
+        await store.heartbeat_residency(
+            thread_id="t1", generation=generation, ttl_seconds=60, host="runner-a"
+        )
+        is True
+    )
+    assert (
+        await store.release_residency(thread_id="t1", generation=generation, host="runner-a")
+        is True
+    )

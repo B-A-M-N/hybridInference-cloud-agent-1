@@ -2413,9 +2413,14 @@ class AgentJobStore:
         return dict(row)
 
     async def heartbeat_residency(
-        self, *, thread_id: str, generation: int, ttl_seconds: float
+        self, *, thread_id: str, generation: int, ttl_seconds: float, host: str | None = None
     ) -> bool:
-        """Extend a residency's lease — only the generation that holds it."""
+        """Extend a residency's lease — only the generation that holds it.
+
+        ``host`` narrows the write to the machine the row names: a beat is a
+        holder's statement, and a guessed (thread, generation) from anywhere
+        else must extend nothing. ``None`` is for internal callers.
+        """
         async with self._pool.acquire() as conn:
             return bool(
                 await conn.fetchval(
@@ -2424,15 +2429,19 @@ class AgentJobStore:
                     SET lease_expires_at = NOW() + make_interval(secs => $3),
                         last_active_at = NOW()
                     WHERE thread_id = $1 AND generation = $2 AND status = 'hot'
+                      AND ($4::text IS NULL OR host = $4)
                     RETURNING thread_id
                     """,
                     thread_id,
                     generation,
                     ttl_seconds,
+                    host,
                 )
             )
 
-    async def release_residency(self, *, thread_id: str, generation: int) -> bool:
+    async def release_residency(
+        self, *, thread_id: str, generation: int, host: str | None = None
+    ) -> bool:
         """End a residency (teardown/eviction) — only its own generation."""
         async with self._pool.acquire() as conn:
             return bool(
@@ -2441,10 +2450,12 @@ class AgentJobStore:
                     UPDATE agent_thread_residencies
                     SET status = 'none', last_active_at = NOW()
                     WHERE thread_id = $1 AND generation = $2 AND status <> 'none'
+                      AND ($3::text IS NULL OR host = $3)
                     RETURNING thread_id
                     """,
                     thread_id,
                     generation,
+                    host,
                 )
             )
 
@@ -2464,6 +2475,28 @@ class AgentJobStore:
                     thread_id,
                     generation,
                     turn_id,
+                )
+            )
+
+    async def host_runs_thread(self, *, host: str, thread_id: str) -> bool:
+        """Whether ``host`` currently runs an attempt of ``thread_id``.
+
+        The establish gate: residency is something a host earns by actually
+        running the thread's turn, not something it may assert about arbitrary
+        threads — a compromised machine must not be able to pull other
+        machines' conversations toward itself via affinity.
+        """
+        async with self._pool.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    SELECT 1 FROM agent_jobs j
+                    JOIN agent_attempts a ON a.id = j.current_attempt_id
+                    WHERE j.thread_id = $2 AND a.host_id = $1 AND a.status = 'running'
+                    LIMIT 1
+                    """,
+                    host,
+                    thread_id,
                 )
             )
 
