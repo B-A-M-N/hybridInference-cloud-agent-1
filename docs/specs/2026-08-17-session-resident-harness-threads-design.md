@@ -57,9 +57,10 @@ This document is the reviewed decision.
 > infrastructure event.
 
 Non-goals (v1): mid-turn interject/steering (enabled by this architecture,
-separate project), a WARM tier (workspace kept after process death — decide
-from HOT/COLD telemetry), cross-harness threads, driver plugin frameworks,
-unifying every harness's raw event vocabulary.
+separate project), cross-harness threads, driver plugin frameworks,
+unifying every harness's raw event vocabulary. (True HOT sat here while it
+waited on residency-scoped credentials; the §14 amendment un-deferred it and
+it is implemented — the live process rides the residency's grant.)
 
 ## 3. Decision record
 
@@ -134,8 +135,14 @@ ThreadCheckpoint storage         checkpoint export/restore
 Continuity ladder (automatic and observable degradation):
 
 ```text
-HOT          process alive, next turn injected via live input   layers 1-4¹
-COLD-native  new sandbox + ThreadCheckpoint import              layers 1-2
+hot          process alive, next turn injected via live input   layers 1-4¹
+             (on the residency's thread-attributed grant, §14)
+warm_native  resident workspace + per-turn --resume restart     layers 1-3
+             (the restart rung: grantless residencies, model
+             switches, MCP turns, and the turn that spawns the
+             live process — the process must predate a turn for
+             that turn to be ``hot``)
+cold_native  new sandbox + ThreadCheckpoint import              layers 1-2
 replay       new sandbox + transcript prompt (today's path)     layer 2 only
 ```
 
@@ -438,3 +445,103 @@ Per driver, against the pinned image (extends the existing
 5. TTL default and per-host hot-sandbox memory budget.
 6. Per-driver shell-state behavior tests (what layer-4 sub-state each driver
    may additionally promise).
+
+## 13. Implementation notes (v1, PR #58)
+
+Recorded per this document's own rule: divergences are decisions, and
+decisions get written down.
+
+1. **Hot turns restart the process per turn — measured, not assumed.**
+   §8's residency handle and an earlier helper-file rotation idea were both
+   struck by experiment (``tests/external/test_credential_rotation.py``,
+   against the pinned CLI): the ``apiKeyHelper`` result is fetched once per
+   process; ``CLAUDE_CODE_API_KEY_HELPER_TTL_MS`` unset, ``0`` and ``1``
+   behave identically; and a 401 on a revoked key yields an error result
+   with no refetch and no retry. There is **no in-process re-keying** in the
+   pinned CLI's headless mode. What is resident is therefore the workspace,
+   the state mount and the CP-fenced row — never a process — and each hot
+   turn starts a fresh ``--resume`` process whose environment carries its
+   own attempt's grant. Billing stays exactly per-attempt; an idle
+   residency holds no live process and no live credential at all. The
+   stdin multi-turn session machinery remains in-tree, unit-tested and
+   unwired, for the day a residency-scoped credential (server-side
+   per-call resolution) exists; the external test doubles as the tripwire
+   that says when a CLI upgrade makes in-process rotation real.
+
+2. **The MCP and model-switch exclusions are lifted — for the workspace.**
+   Both were live-process-era constraints; under restart every resident turn
+   carries a fresh environment, so MCP threads and model switches reuse the
+   resident workspace like any other turn. With §14 the live process is
+   back, and so are its gates, now scoped to the process alone: an MCP turn
+   rides warm (the relay token is still per-attempt), and a model switch
+   restarts — and re-keys the residency at promotion, because the grant is
+   model-scoped. What still ends a residency outright is a harness switch
+   (another CLI cannot read this session) and a base the tree cannot fetch.
+
+3. **The first implemented resident rung was §2's WARM semantics, recorded
+   as ``warm_native``, per turn.** Every resident
+   turn skips clone, context patch and setup, resumes the native session in
+   the preserved workspace, and pays one CLI start. Layer 4 (processes) was
+   not continuous — the price of per-attempt credentials, paid until the
+   §14 amendment made the residency itself the credential's subject. The
+   restart rung remains, as the path for grantless residencies, model
+   switches, MCP turns and live-process death. The idle cost of a residency
+   is a workspace, a row — and with a grant, a live TTL-capped credential
+   (§14); the budget's LRU pressure caps the workspaces.
+4. **Contract-test coverage** (§10) lives in the unit and dbtest suites for
+   every branch exercisable without a real CLI: fencing (4, 9, 10, 13),
+   consistency (12), floor/TurnResult (2), fork refusal (6), model-switch
+   restart (7), degradation branches (3, partial). The memory fixture (1)
+   and cancel-against-a-real-process (5) need the pinned image and belong
+   to the staging acceptance run before public exposure.
+
+## 14. Amendment — D5 relaxed to thread-level attribution (2026-08-18, Murphy)
+
+Per-attempt cost **attribution** was a declared invariant, not an accounting
+necessity: every turn of a thread is the same user, the same account, the
+same model, so total billing and quota enforcement are identical either way.
+What per-attempt granularity bought — per-turn cost display, direct audit
+lookup, a minutes-scale zombie cut-off — is worth less than what it blocked:
+the live process, which the pinned CLI permits only under a
+process-lifetime credential.
+
+**Amended invariant:** inference attribution is per **thread** for resident
+turns. Consequences, accepted explicitly:
+
+- The residency grant lives for the residency: minted at establish
+  (attributed to the thread), renewed on beats, revoked at release, lapse
+  and takeover — generation rotation is credential rotation. An idle hot
+  sandbox holds a live, TTL-capped credential (the original §8 v1
+  concession, reinstated knowingly).
+- Per-turn cost display, where wanted, is derived by bracketing
+  ``api_logs`` timestamps with attempt start/end — a view, not a ledger
+  change.
+- The zombie cut-off becomes reaper-plus-revocation latency rather than
+  renewal starvation; comparable magnitude, now explicit.
+
+This unblocks true HOT with agent-side work only: §13's item 1 stands as
+the record of *why* per-turn restart was built, and the live-input session
+it kept in-tree is what this amendment finally wires in.
+
+**Implemented (2026-08-18).** The shape that shipped, where it is stricter
+than the text above:
+
+- Establish mints the grant (attributed ``thread:<thread_id>``, scoped to
+  the establishing turn's model) and returns it with the generation; the
+  beat that extends a lease renews its grant; release, lapse and takeover
+  revoke it. A mint or link failure degrades to a workspace-only residency
+  — turns ride ``warm_native`` on their own per-attempt grants, never an
+  outage.
+- ``hot`` is recorded only when the process predates the turn. The turn
+  that *spawns* the live process (over the resident workspace, on the
+  residency credential) is ``warm_native``: same fresh-process semantics,
+  honestly labelled. The next turn is hot.
+- MCP turns do not ride the live process — the relay token in a resident
+  environment would be the establishing attempt's, and stale mid-thread.
+  They ride warm; lifting this needs a residency-lifetime relay token.
+- A model switch restarts (D6) and re-keys: promotion drops the old
+  generation and establishes a successor whose grant is scoped to the new
+  model, so the thread is hot again from the following turn.
+- A live session that fails its turn, loses its lease, or is evicted is
+  closed at the same points the residency drops; a survivor without a
+  residency to live in is closed rather than leaked.

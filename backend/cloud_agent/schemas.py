@@ -417,13 +417,7 @@ class AgentGitWorkspaceResponse(BaseModel):
 
 
 class WorkerClaimAttestation(BaseModel):
-    """What this exact runner replica proved before asking for work.
-
-    This travels on the claim rather than being inferred from the host's last
-    heartbeat: replicas on one host may briefly run different images/runtimes
-    during a rollout, and the claimant is the only source that can say what it
-    is about to spawn.
-    """
+    """Runtime evidence collected by this exact claiming runner replica."""
 
     sandbox_runtime: str | None = Field(None, max_length=128)
     sandbox_image_digest: str | None = Field(None, max_length=512)
@@ -459,7 +453,7 @@ class WorkerClaimRequest(BaseModel):
         None,
         description=(
             "Claim-time runtime/image/version/kernel stamp from this exact runner replica. "
-            "Required for untrusted-kata-v1; legacy trusted-v1 claims may omit it."
+            "Required for untrusted-kata-v1; trusted-v1 claims may omit it."
         ),
     )
 
@@ -602,9 +596,15 @@ class WorkerArtifactResponse(BaseModel):
 
 
 class WorkerContinuityRequest(BaseModel):
-    """Which continuity rung this attempt is running on (design §9)."""
+    """Which continuity rung this attempt is running on (design §9).
 
-    mode: Literal["hot", "cold_native", "replay"]
+    ``warm_native`` is the implemented resident rung: native session and
+    workspace continuous, process restarted per turn. ``hot`` is reserved for
+    a live process receiving injected turns and stays unreported until
+    residency-scoped credentials make one possible (design §13).
+    """
+
+    mode: Literal["hot", "warm_native", "cold_native", "replay"]
 
 
 class WorkerFinishRequest(BaseModel):
@@ -1112,6 +1112,20 @@ class HostResidencyEstablishResponse(BaseModel):  # type: ignore[no-any-unimport
     thread_id: str
     generation: int
     ttl_seconds: float
+    credential: str | None = Field(
+        None,
+        description=(
+            "The residency's inference grant (design §14): thread-attributed, "
+            "renewed by this host's beats, revoked when the residency ends. "
+            "It is what a live resident process runs on. Null degrades the "
+            "residency to workspace-only — turns then ride warm_native on "
+            "their own per-attempt grants."
+        ),
+    )
+    model: str | None = Field(
+        None,
+        description="The model the grant is scoped to (the establishing turn's).",
+    )
 
 
 class HostResidencyReleaseRequest(BaseModel):  # type: ignore[no-any-unimported]
@@ -1128,11 +1142,13 @@ class HostHeartbeatResponse(BaseModel):  # type: ignore[no-any-unimported]
     status: str
     slots_total: int | None = None
     slots_used: int = 0
-    residencies_lost: list[str] = Field(
+    residencies_lost: list[ResidencyBeat] = Field(
         default_factory=list,
         description=(
-            "Thread ids whose reported generation no longer holds its "
-            "residency. The host tears those sandboxes down; their threads "
+            "The reported beats whose generation no longer holds its "
+            "residency — echoed back with the generation, so a late answer "
+            "to an old beat cannot end the successor the host has since "
+            "established. The host retires those workspaces; their threads "
             "continue COLD off their checkpoints."
         ),
     )

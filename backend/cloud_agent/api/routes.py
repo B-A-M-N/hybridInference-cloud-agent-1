@@ -1175,9 +1175,8 @@ async def create_agent_job(
     # Reserved display fact: caller metadata must not be able to claim the
     # job was pinned from a different branch than the one the API resolved.
     metadata.pop(BASE_REF_METADATA_KEY, None)
-    # Runtime/profile/probe facts are server-owned columns.  Keeping forged
-    # copies in opaque metadata would not affect scheduling, but it would let a
-    # caller manufacture a contradictory audit trail in the owner response.
+    # Execution policy and its evidence are server-owned facts. Opaque
+    # metadata must not be able to manufacture a contradictory audit trail.
     for key in RESERVED_EXECUTION_METADATA_KEYS:
         metadata.pop(key, None)
     if body.base_ref:
@@ -2307,9 +2306,8 @@ _HOST_IDENTITY_PREFIX = "host:"
 #: for every dependency override a test installs.
 _HOST_REQUEST_ATTR = "agent_host"
 
-#: Hash of the exact host credential that passed authentication.  The store
-#: re-checks it while taking the host row/slot, closing the auth→claim race
-#: where a credential is revoked or superseded between those two operations.
+#: Hash of the exact host credential that passed authentication. The store
+#: re-checks it while taking the slot, closing the auth-to-claim race.
 _HOST_CREDENTIAL_HASH_REQUEST_ATTR = "agent_host_credential_hash"
 
 #: Cheap structural check before touching the signing key: host credentials
@@ -2682,8 +2680,7 @@ async def worker_claim(
     # and only after verifying a signature and a stored hash. Deriving it from
     # the identity string instead would make "which host am I" a substring
     # match on a value E7 will source from a JWT.
-    authenticated_host = getattr(request.state, _HOST_REQUEST_ATTR, None)
-    host = authenticated_host or body.host
+    host = getattr(request.state, _HOST_REQUEST_ATTR, None) or body.host
     claim = await job_store.claim_job(
         worker_id=body.worker_id,
         lease_ttl_seconds=body.lease_ttl_seconds,
@@ -2832,20 +2829,22 @@ async def worker_claim(
         clone_token=clone_token,
         context_messages=context["messages"],
         context_patch=context["patch"],
-        context_checkpoint=await _claimable_checkpoint(job_store, claim=claim, host=host),
+        context_checkpoint=await _claimable_checkpoint(job_store, claim=claim),
         mcp_servers=list(claim.get("mcp_servers") or []),
         metadata=claim["metadata"],
     )
 
 
 async def _claimable_checkpoint(
-    job_store: AgentJobStore, *, claim: dict[str, Any], host: str | None
+    job_store: AgentJobStore, *, claim: dict[str, Any]
 ) -> dict[str, Any] | None:
     """The parent turn's checkpoint, when it matches what is about to run.
 
-    Fetch → decrypt → gate (driver, through-turn, CLI version against the
-    claiming host's stamp). Every failure is ``None``: the runner replays,
-    which is the design's degradation ladder, never an error.
+    Fetch → decrypt → gate (driver, through-turn, and the CLI version the
+    claim transaction stamped onto this very attempt — never a re-read of the
+    mutable host row, which a rolling upgrade's heartbeat can move between
+    claim and here). Every failure is ``None``: the runner replays, which is
+    the design's degradation ladder, never an error.
     """
     parent_job_id = claim.get("parent_job_id")
     if not parent_job_id:
@@ -2856,15 +2855,11 @@ async def _claimable_checkpoint(
     envelope = open_checkpoint(stored["content"])
     if envelope is None:
         return None
-    versions = None
-    if host:
-        row = await job_store.get_host(host=host)
-        versions = (row or {}).get("runtime_versions")
     return gate_for_claim(
         envelope,
         runtime=claim["runtime"],
         parent_job_id=parent_job_id,
-        host_runtime_versions=versions,
+        stamped_runtime_version=claim.get("runtime_version"),
     )
 
 

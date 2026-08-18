@@ -1890,7 +1890,8 @@ class AgentJobStore:
                      host_kernel, guest_kernel)
                 VALUES ($1, $2, $3, $4, NOW() + make_interval(secs => $5), $6, $7,
                         $8, $9, $10, $11, $12)
-                RETURNING id, attempt_no, lease_generation
+                RETURNING id, attempt_no, lease_generation,
+                          sandbox_runtime, sandbox_image_digest, runtime_version
                 """,
                 job_id,
                 next_no,
@@ -1917,6 +1918,13 @@ class AgentJobStore:
         claim["attempt_id"] = attempt["id"]
         claim["attempt_no"] = attempt["attempt_no"]
         claim["lease_generation"] = attempt["lease_generation"]
+        # The stamp as *written*, not as the host row reads later: the
+        # checkpoint gate must compare against what this attempt runs, and a
+        # rolling upgrade's heartbeat can move the host row between claim and
+        # gate (review finding: the TOCTOU the stamping existed to kill).
+        claim["sandbox_runtime"] = attempt["sandbox_runtime"]
+        claim["sandbox_image_digest"] = attempt["sandbox_image_digest"]
+        claim["runtime_version"] = attempt["runtime_version"]
         return claim
 
     @staticmethod
@@ -2434,14 +2442,40 @@ class AgentJobStore:
         runtime_version: str | None,
         ttl_seconds: float,
         sandbox_id: str | None = None,
-    ) -> dict[str, Any]:
-        """Take (or take over) a thread's residency; returns the new row.
+    ) -> dict[str, Any] | None:
+        """Take (or take over) a thread's residency; ``None`` = not earned.
 
-        Atomic: two hosts racing serialize on the row, each gets a distinct
-        generation, and the larger one owns the thread — the loser's next
-        generation-scoped call answers ``False`` and it stands down.
+        Residency is something a host earns by *currently* running the
+        thread's turn — attempt on this host, ``running``, lease unexpired —
+        and the check shares a transaction and a row lock with the write, so
+        a finish or a supersede cannot slip between them, and an expired
+        attempt the reaper has not reached yet earns nothing (review
+        finding 4). Atomic across racers: two hosts serialize on the row,
+        each gets a distinct generation, and the larger one owns the thread.
         """
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            earns = await conn.fetchrow(
+                """
+                SELECT j.id AS job_id, j.user_id, j.model, a.id AS attempt_id
+                FROM agent_jobs j
+                JOIN agent_attempts a ON a.id = j.current_attempt_id
+                WHERE j.thread_id = $1 AND a.host_id = $2
+                  AND a.status = 'running' AND a.lease_expires_at > NOW()
+                LIMIT 1
+                FOR SHARE OF a
+                """,
+                thread_id,
+                host,
+            )
+            if earns is None:
+                return None
+            # The predecessor's grant, captured under the same transaction: a
+            # takeover is a credential rotation, and the old generation's
+            # grant must be revocable by the caller that just superseded it.
+            previous_grant_id = await conn.fetchval(
+                "SELECT grant_id FROM agent_thread_residencies WHERE thread_id = $1 FOR UPDATE",
+                thread_id,
+            )
             row = await conn.fetchrow(
                 """
                 INSERT INTO agent_thread_residencies
@@ -2468,53 +2502,83 @@ class AgentJobStore:
                 runtime_version,
                 ttl_seconds,
             )
-        return dict(row)
+        result = dict(row)
+        result["previous_grant_id"] = previous_grant_id
+        result["establishing_job_id"] = earns["job_id"]
+        result["establishing_attempt_id"] = earns["attempt_id"]
+        result["user_id"] = earns["user_id"]
+        result["model"] = earns["model"]
+        return result
 
-    async def heartbeat_residency(
-        self, *, thread_id: str, generation: int, ttl_seconds: float, host: str | None = None
-    ) -> bool:
-        """Extend a residency's lease — only the generation that holds it.
+    async def link_residency_grant(self, *, thread_id: str, generation: int, grant_id: str) -> bool:
+        """Record the grant a residency runs on — only its own generation.
 
-        ``host`` narrows the write to the machine the row names: a beat is a
-        holder's statement, and a guessed (thread, generation) from anywhere
-        else must extend nothing. ``None`` is for internal callers.
+        A link that matched nothing means the residency was taken over between
+        mint and link; the caller revokes the orphan grant rather than handing
+        out a credential nothing owns.
         """
         async with self._pool.acquire() as conn:
             return bool(
                 await conn.fetchval(
                     """
                     UPDATE agent_thread_residencies
-                    SET lease_expires_at = NOW() + make_interval(secs => $3),
-                        last_active_at = NOW()
+                    SET grant_id = $3
                     WHERE thread_id = $1 AND generation = $2 AND status = 'hot'
-                      AND ($4::text IS NULL OR host = $4)
                     RETURNING thread_id
                     """,
                     thread_id,
                     generation,
-                    ttl_seconds,
-                    host,
+                    grant_id,
                 )
+            )
+
+    async def heartbeat_residency(
+        self, *, thread_id: str, generation: int, ttl_seconds: float, host: str | None = None
+    ) -> str | None:
+        """Extend a residency's lease — only the generation that holds it.
+
+        Returns ``None`` when nothing was extended (lost/taken over), else the
+        residency's grant id — ``""`` when it runs without one — so the caller
+        can renew the credential in the same pass. ``host`` narrows the write
+        to the machine the row names: a beat is a holder's statement, and a
+        guessed (thread, generation) from anywhere else must extend nothing.
+        """
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(
+                """
+                UPDATE agent_thread_residencies
+                SET lease_expires_at = NOW() + make_interval(secs => $3),
+                    last_active_at = NOW()
+                WHERE thread_id = $1 AND generation = $2 AND status = 'hot'
+                  AND ($4::text IS NULL OR host = $4)
+                RETURNING COALESCE(grant_id, '')
+                """,
+                thread_id,
+                generation,
+                ttl_seconds,
+                host,
             )
 
     async def release_residency(
         self, *, thread_id: str, generation: int, host: str | None = None
-    ) -> bool:
-        """End a residency (teardown/eviction) — only its own generation."""
+    ) -> str | None:
+        """End a residency (teardown/eviction) — only its own generation.
+
+        Returns ``None`` when nothing was released, else the grant id to
+        revoke (``""`` when the residency ran without one).
+        """
         async with self._pool.acquire() as conn:
-            return bool(
-                await conn.fetchval(
-                    """
-                    UPDATE agent_thread_residencies
-                    SET status = 'none', last_active_at = NOW()
-                    WHERE thread_id = $1 AND generation = $2 AND status <> 'none'
-                      AND ($3::text IS NULL OR host = $3)
-                    RETURNING thread_id
-                    """,
-                    thread_id,
-                    generation,
-                    host,
-                )
+            return await conn.fetchval(
+                """
+                UPDATE agent_thread_residencies
+                SET status = 'none', last_active_at = NOW()
+                WHERE thread_id = $1 AND generation = $2 AND status <> 'none'
+                  AND ($3::text IS NULL OR host = $3)
+                RETURNING COALESCE(grant_id, '')
+                """,
+                thread_id,
+                generation,
+                host,
             )
 
     async def record_residency_checkpoint(
@@ -2533,28 +2597,6 @@ class AgentJobStore:
                     thread_id,
                     generation,
                     turn_id,
-                )
-            )
-
-    async def host_runs_thread(self, *, host: str, thread_id: str) -> bool:
-        """Whether ``host`` currently runs an attempt of ``thread_id``.
-
-        The establish gate: residency is something a host earns by actually
-        running the thread's turn, not something it may assert about arbitrary
-        threads — a compromised machine must not be able to pull other
-        machines' conversations toward itself via affinity.
-        """
-        async with self._pool.acquire() as conn:
-            return bool(
-                await conn.fetchval(
-                    """
-                    SELECT 1 FROM agent_jobs j
-                    JOIN agent_attempts a ON a.id = j.current_attempt_id
-                    WHERE j.thread_id = $2 AND a.host_id = $1 AND a.status = 'running'
-                    LIMIT 1
-                    """,
-                    host,
-                    thread_id,
                 )
             )
 
@@ -2588,7 +2630,7 @@ class AgentJobStore:
                 UPDATE agent_thread_residencies
                 SET status = 'none'
                 WHERE status = 'hot' AND lease_expires_at <= NOW()
-                RETURNING thread_id, generation, host
+                RETURNING thread_id, generation, host, grant_id
                 """
             )
         return [dict(row) for row in rows]

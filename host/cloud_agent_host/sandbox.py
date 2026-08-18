@@ -209,6 +209,10 @@ class SandboxProcess(ABC):
         """Signal end-of-input to a live process. No-op without live input."""
         return
 
+    def poll(self) -> int | None:
+        """Reap-if-exited: the exit code, or ``None`` while still running."""
+        return None
+
 
 class TerminalProcess(ABC):
     """A byte-oriented interactive terminal living inside one sandbox.
@@ -389,6 +393,10 @@ class _PopenProcess(SandboxProcess):
             with contextlib.suppress(OSError):
                 stdin.close()
 
+    def poll(self) -> int | None:
+        """Reap-if-exited without blocking."""
+        return self._process.poll()
+
     def lines(self) -> Iterator[str]:
         """Yield stdout lines from the child process."""
         assert self._process.stdout is not None
@@ -456,7 +464,9 @@ class ProcessBackend(SandboxBackend):
                 spec.argv,
                 cwd=spec.workdir,
                 env=spec.env,
-                stdin=subprocess.DEVNULL,
+                # Same contract as the container backend: a live spawn keeps
+                # stdin open for follow-up turns; everything else sees EOF.
+                stdin=subprocess.PIPE if spec.live_input else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -729,9 +739,8 @@ class ContainerBackend(SandboxBackend):
         # this backend's lifetime, so one inspect answers for every heartbeat.
         self._version_stamp: dict[str, Any] | None = None
         # Filled by preflight from a real container under the exact runtime
-        # this backend will pass to every job. Kept separate from the cached
-        # image inspect so calling version_stamp before preflight cannot freeze
-        # out the later proof.
+        # passed to jobs. Kept separate so an early image stamp cannot freeze
+        # out the later kernel observation.
         self._kernel_probe: dict[str, str | None] = {
             "host_kernel": os.uname().release,
             "guest_kernel": None,
@@ -999,19 +1008,10 @@ class ContainerBackend(SandboxBackend):
             )
 
     def _probe_kernel_boundary(self) -> None:
-        """Observe the kernel supplied by the configured container runtime.
-
-        Merely accepting ``--runtime`` proves only that Docker knows a name.
-        The dangerous failure mode is a deployment that labels itself VM-
-        isolated while jobs still share the host kernel, so preflight starts
-        the configured image under the exact runtime jobs will use and compares
-        the observed kernels. Plain runc records no guest proof and remains
-        available only to ``trusted-v1`` scheduling.
-        """
+        """Observe the kernel supplied by the configured container runtime."""
         self._kernel_probe = {"host_kernel": os.uname().release, "guest_kernel": None}
-        # Docker's implicit default and an explicitly named ``runc`` are the
-        # same shared-kernel boundary.  They remain valid for trusted-v1 and
-        # must not be mistaken for a failed VM probe.
+        # Docker's implicit default and explicit runc are the same trusted-only
+        # shared-kernel boundary, not a failed VM probe.
         if not self.runtime or self.runtime == "runc":
             return
         argv = [
@@ -1051,10 +1051,6 @@ class ContainerBackend(SandboxBackend):
         guest_kernel = lines[-1]
         host_kernel = str(self._kernel_probe["host_kernel"])
         if guest_kernel == host_kernel:
-            # The secure profile names Kata exactly, so fail its preflight
-            # loudly. Other custom runtimes may still serve trusted-v1; they
-            # simply receive no guest-kernel evidence and can never satisfy
-            # the control plane's Kata predicate.
             if self.runtime == KATA_RUNTIME:
                 raise SandboxError(
                     f"sandbox runtime {self.runtime!r} reported the host kernel "

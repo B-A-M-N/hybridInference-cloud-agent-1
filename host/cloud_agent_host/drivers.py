@@ -281,6 +281,11 @@ class HarnessSession:
         """The dialect adapter this session speaks through."""
         return self._driver.runtime
 
+    @property
+    def closed(self) -> bool:
+        """Whether :meth:`close` has ended this session."""
+        return self._closed
+
     def start_turn(self, turn_input: TurnInput) -> HarnessTurn:
         """Spawn the harness for this turn inside the platform's sandbox."""
         if self._closed:
@@ -422,19 +427,45 @@ class ClaudeCodeDriver(HarnessDriver):
         self._restore(context, state)
         return ClaudeCodeSession(self, context, resume_session_id=state.session_id)
 
+    def launch_resident(self, context: LaunchContext, *, session_id: str) -> HarnessSession:
+        """A hot turn in a resident workspace: resume from state already on disk.
+
+        No blob restore — the state mount still holds the session files the
+        previous turn wrote. The turn runs the verified one-shot ``--resume``
+        mechanics with **this attempt's own credential in its own process
+        environment**, which is what the credential-rotation experiments
+        (tests/external) proved is the only per-turn key mechanism the pinned
+        CLI actually honours.
+        """
+        if context.state_dir is None:
+            raise StateRestoreUnsupported("a resident turn needs the thread's state mount")
+        return ClaudeCodeSession(self, context, resume_session_id=session_id)
+
     def launch_live(
         self, context: LaunchContext, state: HarnessState | None = None
     ) -> ClaudeCodeLiveSession:
-        """A resident session (HOT): the process outlives its turns.
-
-        With ``state``, the resident process itself resumes the restored
-        session — a COLD start that immediately becomes hot, which is exactly
-        what a follow-up landing on a fresh host does.
-        """
+        """A stdin-fed multi-turn session over a fresh or restored state tree."""
         if state is not None:
             self._restore(context, state)
             return ClaudeCodeLiveSession(self, context, resume_session_id=state.session_id)
         return ClaudeCodeLiveSession(self, context)
+
+    def launch_resident_live(
+        self, context: LaunchContext, *, session_id: str
+    ) -> ClaudeCodeLiveSession:
+        """The HOT transport: a live process resumed over a resident workspace.
+
+        The mirror of :meth:`launch_resident` — same on-disk resume, but the
+        process stays alive after the turn settles and takes the next turn on
+        stdin. Only correct with a residency-lifetime credential in
+        ``context.credential`` (design §14: the thread-attributed grant that
+        host beats renew), because the pinned CLI runs its whole life on its
+        launch key — the measured fact that forced warm_native before §14
+        relaxed attribution to the thread.
+        """
+        if context.state_dir is None:
+            raise StateRestoreUnsupported("a resident turn needs the thread's state mount")
+        return ClaudeCodeLiveSession(self, context, resume_session_id=session_id)
 
     @staticmethod
     def _restore(context: LaunchContext, state: HarnessState) -> None:
@@ -473,6 +504,9 @@ class ClaudeCodeLiveTurn(HarnessTurn):
             yield line
             if self._runtime.turn_settled(line):
                 self._saw_result = True
+                # Opportunistic reap: a process that died right after its
+                # result must not linger as a zombie until the session closes.
+                self._process.poll()
                 return
 
     def iter_events(self) -> Iterator[HarnessEvent]:
@@ -506,7 +540,19 @@ class ClaudeCodeLiveTurn(HarnessTurn):
 
 
 class ClaudeCodeLiveSession(ClaudeCodeSession):
-    """The resident session (HOT): one process, many turns, stdin-fed."""
+    """A stdin-fed multi-turn session: the process survives between turns.
+
+    Measured against the pinned CLI (2.1.220, headless stream-json; see
+    ``tests/external/test_credential_rotation.py``): the ``apiKeyHelper``
+    result is fetched exactly once per process — ``CLAUDE_CODE_API_KEY_HELPER_
+    TTL_MS`` of 0 and 1 change nothing, and a 401 on a revoked key produces an
+    error result without a refetch or retry. A live process therefore runs its
+    whole life on its launch credential — which is why it must be launched on
+    the *residency's* credential, the thread-attributed grant of design §14
+    that host beats renew and release/takeover revokes, never on one turn's
+    per-attempt token. With attribution per thread, one long-lived key for
+    the whole conversation is the ledger telling the truth, not a lie.
+    """
 
     def __init__(
         self,
@@ -518,6 +564,8 @@ class ClaudeCodeLiveSession(ClaudeCodeSession):
         super().__init__(driver, context, resume_session_id=resume_session_id)
         if context.spawn_live is None:
             raise DriverError("a live session needs a live-input spawn")
+        if context.state_dir is None:
+            raise DriverError("a resident session needs a state mount")
         argv, extra_env = self.runtime.prepare_live(
             workdir=context.workdir,
             model="",  # pinned per session below, chosen by the first turn's model
@@ -567,7 +615,13 @@ class ClaudeCodeLiveSession(ClaudeCodeSession):
                 f"this resident session runs {self._model!r}; switching to "
                 f"{turn_input.model!r} takes a restart (model_switch=restart)"
             )
-        self._process.write_line(self.runtime.user_message_line(turn_input.prompt))
+        try:
+            self._process.write_line(self.runtime.user_message_line(turn_input.prompt))
+        except OSError as exc:
+            # A broken pipe is the resident process having died idle. One
+            # typed refusal, so the caller's fallback ladder catches it the
+            # same way it catches every other driver refusal.
+            raise DriverError(f"resident process is gone: {exc}") from exc
         self._live_turn = ClaudeCodeLiveTurn(self, self._process)
         return self._live_turn
 
@@ -575,12 +629,27 @@ class ClaudeCodeLiveSession(ClaudeCodeSession):
         """A settled turn leaves a live session ready for the next one."""
         return
 
+    def process_alive(self) -> bool:
+        """Whether the resident process is spawned and still running.
+
+        The platform checks this before labelling a turn ``hot``: a session
+        whose process died idle (or never spawned) restarts, and calling that
+        restart ``hot`` would make the hit-rate lie.
+        """
+        return not self._closed and self._process is not None and self._process.poll() is None
+
     def close(self) -> None:
-        """End the residency: EOF stdin, then the platform backstop."""
+        """End the session: EOF stdin, the kill backstop, and the reap.
+
+        The final ``wait`` matters: a killed child that nobody waits on stays
+        a zombie until the runner exits, and a long-lived runner accumulates
+        one per closed session.
+        """
         self._closed = True
         if self._process is not None:
             self._process.close_stdin()
             self._process.kill()
+            self._process.wait()
 
 
 _DRIVER_TYPES: dict[str, type[HarnessDriver]] = {
