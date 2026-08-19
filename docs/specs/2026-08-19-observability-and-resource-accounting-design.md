@@ -1,6 +1,11 @@
 # Observability and per-tool resource accounting
 
 - **Status:** draft v1 — for review (Murphy, Juncheng)
+- **Scope cut (2026-08-19, Murphy):** per-chat surfaces ship first; the
+  entire admin layer — aggregate API, console admin pages, alert checker,
+  emit() seam — is **deferred**. §10 carries the re-cut phases; deferred
+  sections remain in this document as the agreed direction for when the
+  admin layer is picked up.
 - **Date:** 2026-08-19
 - **Companion:** `2026-08-17-session-resident-harness-threads-design.md`
   (continuity ladder, `continuity_mode` column, §9's promised admin
@@ -275,8 +280,9 @@ and a few console pages — zero new services (O1).
 
 ## 7. Signal catalog (initial; the allowlist test pins it)
 
-**Aggregates** (served by the CP aggregate API to the console, watched by
-the checker; bounded dimensions per O7): turn duration histogram ×
+**Aggregates** (DEFERRED with the admin layer — served by the CP aggregate
+API to the console, watched by the checker; bounded dimensions per O7):
+turn duration histogram ×
 (runtime, continuity_mode); turns total × (terminal state, degradation
 reason); continuity mode counter (the §9 aggregate, finally); checkpoint
 export outcome + size histogram; residency establish/evict/takeover counters
@@ -293,10 +299,10 @@ start/stop/gap.
 **Ledger projection**: floor events + terminal events, deny-body per O9,
 dedupe key `(attempt_id, client_seq)` carried in attributes.
 
-**Alert seed set** (a CP-side periodic checker over Postgres/CP state,
-posting to its own Slack webhook — the `alert_slack` pattern, deliberately
-never wired into the status-monitor control plane): claim loop silent
-> 2 min; turn
+**Alert seed set** (DEFERRED with the admin layer — a CP-side periodic
+checker over Postgres/CP state, posting to its own Slack webhook — the
+`alert_slack` pattern, deliberately never wired into the status-monitor
+control plane): claim loop silent > 2 min; turn
 failure rate; export failure streak (design §6 says a thread quietly loses
 cold resume — now it pages); denied-CONNECT burst; unclassified-bytes growth;
 sampler coverage < 0.9 sustained; host hot-sandbox budget saturation.
@@ -343,17 +349,22 @@ sampler coverage < 0.9 sustained; host hot-sandbox budget saturation.
 
 ## 10. Implementation plan
 
+Re-cut 2026-08-19 (Murphy): the per-chat surfaces (§11's end-user
+experience) ship first; everything admin-facing is deferred wholesale.
+
 | Phase | Content | Note |
 |---|---|---|
-| **OBS-0** | The emit() seam with no-op default; CP alert checker (claim-loop silence, queue depth, heartbeat gaps) → Slack webhook; env vars into ENVIRONMENT.md + the wiring test | "We have a pulse." Zero new services, no schema changes |
-| **OBS-1** | Severity mapping + ops records; CP aggregate API + console admin pages (continuity funnel, capacity water-line, consumption leaderboard, security) — the aggregates the resident design's §9 promised; full alert seed set in the checker | Closes the blind-tuning gap for residency knobs |
-| **OBS-2** | ResourceSampler + attempt/residency windows + `attempt_resources` + veth totals; Squid logformat extension + flow parser + verdict alerts | First resource facts; security dividend (denied-CONNECT, unclassified-bytes) |
-| **OBS-3** | Tool windows (`message` for all Tier-1) + claude-code hook `exact` upgrade + `tool_call_resources` + per-turn resource line in the thread UI (§11) | The per-tool ask, honest about precision |
-| **OBS-4** | Candidates, each its own decision: attaching a standard metrics stack (OTLP → Prometheus/Grafana) behind the emit() seam if ad-hoc exploration demands it; claude-code native OTel passthrough (verify against pinned CLI); MCP relay byte counters; pi native `tool_execution_*` boundaries; spans; #57 gateway-join read path; gateway-side paper events (other repo) | Not committed by this doc |
+| **CHAT-1** | The footer's free half + the resource spine: continuity badge + tooltip and turn duration (from `continuity_mode` and attempt timestamps — **already recorded**; API exposure + UI only) and the per-tool duration table derived from stored `tool_use`/`tool_result` events (`message` windows, labelled approximate); plus ResourceSampler + attempt windows + `attempt_resources` + veth totals → footer CPU / peak-mem / net numbers | One PR, one repo (host + backend + web). The DS-alignment payoff — the honest-degradation badge — costs zero new measurement |
+| **CHAT-2** | Squid logformat extension (`%>st`, `%tr`) + flow parser + `egress_flows` → network panel (per-domain bytes, denied highlighted) + blocked count in the footer | The security dividend, made user-visible |
+| **CHAT-3** | Per-tool resource correlation (windowed attribution, `tool_call_resources`, shared/overlap labelling) + claude-code hook `exact` upgrade | The precision rung; contract tests 2, 3, 6 |
+| **CHAT-4** | Per-turn $ in the footer via the #57 gateway read path (bracketed `api_logs` view) | Footer ships without $ until the gateway join exists |
+| **DEFERRED — admin layer** | emit() seam + severity mapping + ops projection; CP aggregate API + console admin pages; alert checker + §7 seed set | Direction agreed in this doc; picked up when admin observability is prioritized |
+| **Later candidates** | Standard metrics stack (OTLP → Prometheus/Grafana) behind the seam; claude-code native OTel passthrough (verify against pinned CLI); MCP relay byte counters; pi native `tool_execution_*` boundaries; spans; gateway-side paper events (other repo) | Not committed by this doc |
 
-Phases are ordered so each ships standalone value; OBS-2 and OBS-3 are where
-the review should spend its skepticism (window semantics, caps, hook
-contract).
+Ordered so the user-visible chat experience lands first. CHAT-1's badge and
+duration columns are pure exposure of data the platform already records, so
+the first PR's only genuinely new machinery is the sampler. CHAT-3 is where
+review skepticism belongs (window semantics, caps, hook contract).
 
 ## 11. Product surfaces
 
@@ -382,7 +393,7 @@ product, not ports.
   a fabricated small number; `message`-level windows are labelled
   approximate until the hook upgrade.
 
-**Admin.** Console admin pages — the same chart components as the
+**Admin (DEFERRED — 08-19 scope cut).** Console admin pages — the same chart components as the
 user-facing turn views, pointed at the CP aggregate API; no third-party
 dashboard (O1), and the same pages serve future org admins, who would never
 be handed a Grafana anyway: health pulse (claim lag, queues), continuity
@@ -406,13 +417,14 @@ reports, compute-based pricing or quotas.
 
 ## 12. Open questions (resolve during review / OBS-0)
 
-1. Alert webhook destination and channel (its own webhook, `alert_slack`
-   pattern; a third producer — never the status-monitor control plane).
+1. (Deferred with the admin layer) Alert webhook destination and channel
+   (its own webhook, `alert_slack` pattern; a third producer — never the
+   status-monitor control plane).
 2. veth resolution mechanics (host-side peer lookup at launch) — pick at
    implementation; pure detail.
-3. Which runner-local signals the checker needs pushed to the CP (claim
-   heartbeat exists; does sampler liveness ride the rollup POSTs or its own
-   beat?).
+3. (Deferred with the admin layer) Which runner-local signals the checker
+   needs pushed to the CP (claim heartbeat exists; does sampler liveness
+   ride the rollup POSTs or its own beat?).
 4. Tool-name label bound for Tier-2/raw runtimes (unknown tool vocabularies
    — likely `other` bucket to protect O7).
 5. Whether `message` windows for claude-code should subtract streaming time
