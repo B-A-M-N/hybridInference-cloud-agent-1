@@ -91,7 +91,8 @@ each cite where they are pinned.
   not the user's own chosen backend.
 - **The Cordis seam machinery.** One in-process service registry does not
   map onto our three processes (control plane, runner, sandbox). The seam
-  reduces to: capture points in CP and runner, one OTLP exporter each.
+  reduces to: capture points in CP and runner, each ending at an `emit()`
+  whose default backend is a no-op (O1).
 - **Per-chunk ledger mirroring** — see A7; we already batch deltas.
 
 ## 3. Goal
@@ -99,25 +100,28 @@ each cite where they are pinned.
 > Every attempt tells its whole story in queryable form: **what happened**
 > (ledger), **what it consumed** (CPU, memory, io, network — per attempt,
 > per residency, and per tool call), and **what the platform did around it**
-> (ops). One OTLP pipeline exports the operational view; Postgres keeps the
-> billing- and paper-grade rollups. A turn that we failed to measure says so
-> instead of reporting zeros.
+> (ops). Postgres keeps every fact; our own console renders the operational
+> view; a Slack-webhook checker watches it. A turn that we failed to
+> measure says so instead of reporting zeros.
 
 Non-goals (v1): distributed tracing (correlation ids suffice; spans are an
 OBS-4 candidate), log-aggregation overhaul, harness-native OTel passthrough
 (claude-code can export its own metrics; OBS-4 candidate, verify against the
-pinned CLI), dashboards beyond one provisioned Grafana folder, and any
-attribution precision beyond the honest window model of §6.
+pinned CLI), any third-party dashboard or metrics stack (no Grafana, no
+Prometheus, no collector — O1), and any attribution precision beyond the
+honest window model of §6.
 
 ## 4. Decision record
 
-- **O1 — OTLP is the wire; Postgres is the retention authority.** CP and
-  runner export metrics and ops logs via the OpenTelemetry Python SDK to one
-  collector per deployment (CP host compose), which feeds Prometheus
-  (30-day operational retention) and Grafana. Everything billing- or
-  paper-grade (per-attempt/per-tool rollups) is written to Postgres rows
-  with no expiry and *also* surfaced as metrics. Losing Prometheus loses
-  dashboards, never facts.
+- **O1 — Postgres is the only deployed backend; export is a seam, not a
+  stack.** We deploy no Grafana, Prometheus, or collector — the gateway
+  already removed Prometheus once, and this deployment gets no second
+  metrics estate to operate. Every fact lives in Postgres; the admin
+  surface is our own console reading a CP aggregate API; alerting is a
+  CP-side checker posting to a Slack webhook. The DS boundary axiom is kept
+  as a *seam*: capture ends at `emit()`, and the default emit backend is a
+  no-op. Attaching an OTLP exporter later (if ad-hoc exploration ever
+  justifies a standard stack) is configuration, not surgery (OBS-4).
 - **O2 — Three signal classes.** DS's `ledger` and `ops`, plus one they
   don't have: **resources** — periodic samples rolled up into per-window
   facts. Resources are measurements, not events: they become metrics and
@@ -172,10 +176,10 @@ attribution precision beyond the honest window model of §6.
   via telemetry. The redaction stage is the DS waterfall shape — orderable
   rules, fail-closed per record, exported copy only — with the default rule
   set present rather than empty.
-- **O10 — Retention.** Prometheus 30 d; Squid raw log 7 d after parsing;
-  Postgres rollups and parsed flow rows indefinite (paper dataset); raw 1 Hz
-  samples are a runner-side ring buffer only — rollups are computed at
-  window close and the samples discarded.
+- **O10 — Retention.** Squid raw log 7 d after parsing; Postgres rollups
+  and parsed flow rows indefinite (paper dataset); raw 1 Hz samples are a
+  runner-side ring buffer only — rollups are computed at window close and
+  the samples discarded. One retention tier, no second estate (O1).
 
 ## 5. Architecture
 
@@ -187,17 +191,17 @@ harness + tool children              ResourceSampler (1 Hz, host-side    worker 
    state mount, append-only]         │                                    + NEW resource rollups
                                      ├─► window rollup at turn/idle close ─► Postgres rows
 squid egress                         │                                    agent_job_events (exists)
-  access log (bytes/verdict) ──►     egress log collector ──────────────► net flow rows
+  access log (bytes/verdict) ──►     egress log parser ─────────────────► net flow rows
                                      │
-                                     OTel SDK (metrics + ops logs) ──►    collector ─► Prometheus ─► Grafana
-                                                                          (CP exports its own too)
+                                     emit() seam (default no-op;          aggregate API ─► console admin pages
+                                     OTLP-attachable later, O1)           alert checker ─► Slack webhook
 gateway api_logs (exists, billing authority) ───────── joined by grant attribution / attempt window ──► #57 read path
 ```
 
 The runner→CP path for rollups is the existing worker-report pattern
 (`worker_report_continuity` is the precedent): a small authenticated POST at
-window close, idempotent per `(attempt_id, kind)`. The OTLP path is for
-operational metrics only and may be lossy (O1).
+window close, idempotent per `(attempt_id, kind)`. The emit() seam may be
+lossy by contract; Postgres rows are the facts (O1).
 
 ## 6. The resource model (the new part)
 
@@ -266,12 +270,13 @@ egress_flows: attempt_id nullable (idle flows keep residency ids), ts_start,
 sandbox-visible overhead. Postgres grows by one row per attempt, ≤500 per
 attempt for tools, one per egress connection; all bounded, all indexed by
 attempt. The hook file grows within a turn and is truncated at turn close.
-The collector/Prometheus/Grafana stack is one compose file on the CP host,
-±300 MB RAM — the standing cost of having eyes.
+The standing cost of having eyes is one checker loop, one aggregate API,
+and a few console pages — zero new services (O1).
 
 ## 7. Signal catalog (initial; the allowlist test pins it)
 
-**Metrics** (bounded labels per O7): turn duration histogram ×
+**Aggregates** (served by the CP aggregate API to the console, watched by
+the checker; bounded dimensions per O7): turn duration histogram ×
 (runtime, continuity_mode); turns total × (terminal state, degradation
 reason); continuity mode counter (the §9 aggregate, finally); checkpoint
 export outcome + size histogram; residency establish/evict/takeover counters
@@ -288,7 +293,10 @@ start/stop/gap.
 **Ledger projection**: floor events + terminal events, deny-body per O9,
 dedupe key `(attempt_id, client_seq)` carried in attributes.
 
-**Alert seed set** (Grafana-provisioned): claim loop silent > 2 min; turn
+**Alert seed set** (a CP-side periodic checker over Postgres/CP state,
+posting to its own Slack webhook — the `alert_slack` pattern, deliberately
+never wired into the status-monitor control plane): claim loop silent
+> 2 min; turn
 failure rate; export failure streak (design §6 says a thread quietly loses
 cold resume — now it pages); denied-CONNECT burst; unclassified-bytes growth;
 sampler coverage < 0.9 sustained; host hot-sandbox budget saturation.
@@ -298,7 +306,7 @@ sampler coverage < 0.9 sustained; host hot-sandbox budget saturation.
 | Situation | Behavior |
 |---|---|
 | Sampler crashes mid-turn | Turn unaffected; rollup ships with `coverage < 1`; ops record |
-| Collector/Prometheus down | Exports drop per SDK policy; Postgres rollups unaffected (O1) |
+| Attached export backend down (if any) | emit() drops per SDK policy; Postgres facts, console, and checker unaffected (O1) |
 | Hook file absent / harness without hooks | `source = message` windows; no error |
 | Hook cannot execute | Tool proceeds (passive contract); coverage of `exact` windows only |
 | Parallel tool calls | `overlap_n > 1`, shared fields only |
@@ -323,8 +331,8 @@ sampler coverage < 0.9 sustained; host hot-sandbox budget saturation.
    call (pinned against the stamped CLI, like the capability matrix).
 7. Denied CONNECT increments the verdict counter with the attempt attributed
    when one is live.
-8. Label allowlist: no metric in the registry carries an unbounded label
-   (lint-style walk).
+8. Dimension allowlist: no aggregate-API dimension (nor any attached
+   exporter's label) is unbounded (lint-style walk).
 9. Ledger export: tool arguments/results and prompt text never appear in an
    exported record (deny-body default), while types/sizes/ids do.
 10. Rollup idempotency: re-POSTing a window rollup upserts, never doubles.
@@ -337,11 +345,11 @@ sampler coverage < 0.9 sustained; host hot-sandbox budget saturation.
 
 | Phase | Content | Note |
 |---|---|---|
-| **OBS-0** | Collector + Prometheus + Grafana compose on CP host; CP + runner OTel SDK wiring; process-health metrics (up, claim-loop lag, queue depth); env vars into ENVIRONMENT.md + the wiring test | "We have a pulse." No schema changes |
-| **OBS-1** | Ledger/ops projection with severity mapping and deny-body redaction; floor-event metrics incl. the continuity aggregates §9 promised; alert seed set | Closes the blind-tuning gap for residency knobs |
-| **OBS-2** | ResourceSampler + attempt/residency windows + `attempt_resources` + veth totals; Squid logformat extension + flow collector + verdict alerts | First resource facts; security dividend (denied-CONNECT, unclassified-bytes) |
+| **OBS-0** | The emit() seam with no-op default; CP alert checker (claim-loop silence, queue depth, heartbeat gaps) → Slack webhook; env vars into ENVIRONMENT.md + the wiring test | "We have a pulse." Zero new services, no schema changes |
+| **OBS-1** | Severity mapping + ops records; CP aggregate API + console admin pages (continuity funnel, capacity water-line, consumption leaderboard, security) — the aggregates the resident design's §9 promised; full alert seed set in the checker | Closes the blind-tuning gap for residency knobs |
+| **OBS-2** | ResourceSampler + attempt/residency windows + `attempt_resources` + veth totals; Squid logformat extension + flow parser + verdict alerts | First resource facts; security dividend (denied-CONNECT, unclassified-bytes) |
 | **OBS-3** | Tool windows (`message` for all Tier-1) + claude-code hook `exact` upgrade + `tool_call_resources` + per-turn resource line in the thread UI (§11) | The per-tool ask, honest about precision |
-| **OBS-4** | Candidates, each its own decision: claude-code native OTel passthrough (verify against pinned CLI); MCP relay byte counters; pi native `tool_execution_*` boundaries; spans; #57 gateway-join read path; gateway-side paper events (other repo) | Not committed by this doc |
+| **OBS-4** | Candidates, each its own decision: attaching a standard metrics stack (OTLP → Prometheus/Grafana) behind the emit() seam if ad-hoc exploration demands it; claude-code native OTel passthrough (verify against pinned CLI); MCP relay byte counters; pi native `tool_execution_*` boundaries; spans; #57 gateway-join read path; gateway-side paper events (other repo) | Not committed by this doc |
 
 Phases are ordered so each ships standalone value; OBS-2 and OBS-3 are where
 the review should spend its skepticism (window semantics, caps, hook
@@ -374,11 +382,14 @@ product, not ports.
   a fabricated small number; `message`-level windows are labelled
   approximate until the hook upgrade.
 
-**Admin.** Grafana folders: health pulse (claim lag, queues), continuity
+**Admin.** Console admin pages — the same chart components as the
+user-facing turn views, pointed at the CP aggregate API; no third-party
+dashboard (O1), and the same pages serve future org admins, who would never
+be handed a Grafana anyway: health pulse (claim lag, queues), continuity
 funnel (HOT hit-rate per host — #61's data), capacity (hot-sandbox budget
 water-line, idle cost), consumption leaderboard (outlier turns), security
 (denied-CONNECT bursts, unclassified-bytes growth). Slack alerts from the §7
-seed set. Per-attempt detail exposes coverage, sampler version, and
+checker. Per-attempt detail exposes coverage, sampler version, and
 degradation reason — the support answer to "why did my thread replay".
 
 **Alignment with DS, stated as product:** we adopt its three philosophies —
@@ -395,11 +406,13 @@ reports, compute-based pricing or quotas.
 
 ## 12. Open questions (resolve during review / OBS-0)
 
-1. Runner→collector transport and auth: OTLP/HTTP to the CP-host collector
-   over the existing outbound path — bearer token vs. reusing the tunnel.
+1. Alert webhook destination and channel (its own webhook, `alert_slack`
+   pattern; a third producer — never the status-monitor control plane).
 2. veth resolution mechanics (host-side peer lookup at launch) — pick at
    implementation; pure detail.
-3. Grafana exposure: admin-only console rewrite vs. host-local only.
+3. Which runner-local signals the checker needs pushed to the CP (claim
+   heartbeat exists; does sampler liveness ride the rollup POSTs or its own
+   beat?).
 4. Tool-name label bound for Tier-2/raw runtimes (unknown tool vocabularies
    — likely `other` bucket to protect O7).
 5. Whether `message` windows for claude-code should subtract streaming time
