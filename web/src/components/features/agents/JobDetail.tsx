@@ -28,6 +28,7 @@ import { PaneResizer } from './PaneResizer';
 import { Picker } from './Picker';
 import { TerminalWorkspace } from './TerminalWorkspace';
 import type { AgentEvent, AgentJob, AgentThreadMessage } from './types';
+import { TurnFooter } from './TurnFooter';
 import { useResizablePane } from './useResizablePane';
 import { WorkspaceFiles } from './WorkspaceFiles';
 
@@ -1293,6 +1294,8 @@ export function JobDetail({ job, onReload }: { job: AgentJob; onReload?: () => v
                   </div>
                 ) : null}
               </div>
+
+              <TurnFooter job={job} attemptNo={attemptNo} />
 
               <OutcomeCard job={job} onOpenDiff={() => openWorkspace('git')} />
             </div>

@@ -97,6 +97,27 @@ class AgentJobCreate(BaseModel):
     metadata: dict[str, Any] | None = Field(None, description="Opaque caller metadata.")
 
 
+class AttemptResources(BaseModel):
+    """What one attempt's sandbox consumed, as measured from the host.
+
+    Every counter is optional and ``coverage`` is not: a turn the sampler
+    could not read reports ``coverage = 0`` with null counters, which a
+    reader must render as "not measured" rather than as zero usage.
+    """
+
+    cpu_usec: int | None = None
+    mem_peak_bytes: int | None = None
+    mem_avg_bytes: int | None = None
+    io_read_bytes: int | None = None
+    io_write_bytes: int | None = None
+    net_rx_bytes: int | None = None
+    net_tx_bytes: int | None = None
+    sample_count: int = 0
+    #: Fraction of the attempt window actually sampled, 0..1.
+    coverage: float = 0.0
+    sampler_version: str | None = None
+
+
 class AgentJobResponse(BaseModel):
     """One agent job as returned to its owner."""
 
@@ -133,6 +154,13 @@ class AgentJobResponse(BaseModel):
     tokens_in: int | None = None
     tokens_out: int | None = None
     model_calls: int | None = None
+    # How this turn was continued and how long it took — recorded per attempt
+    # since the resident design landed, exposed here so the owner can see why
+    # a thread forgot (a ``replay`` turn was rebuilt from transcript) rather
+    # than guess. Null on turns that predate the stamp or never ran.
+    continuity_mode: str | None = None
+    duration_ms: int | None = None
+    resources: AttemptResources | None = None
     # The deployment's egress posture for this job's two phases, so the owner
     # can see what the sandbox could reach rather than take it on trust.
     setup_egress_tier: str | None = None
@@ -575,6 +603,27 @@ class WorkerContinuityRequest(BaseModel):
     """
 
     mode: Literal["hot", "warm_native", "cold_native", "replay"]
+
+
+class WorkerResourcesRequest(BaseModel):
+    """One closed attempt window's resource rollup, reported by the runner.
+
+    Counters are cumulative deltas over the window, not rates. Absent fields
+    mean the sampler could not read that backend; ``coverage`` reports how
+    much of the window was sampled at all, so a gap stays a gap instead of
+    arriving as a small, convincing number.
+    """
+
+    cpu_usec: int | None = Field(None, ge=0)
+    mem_peak_bytes: int | None = Field(None, ge=0)
+    mem_avg_bytes: int | None = Field(None, ge=0)
+    io_read_bytes: int | None = Field(None, ge=0)
+    io_write_bytes: int | None = Field(None, ge=0)
+    net_rx_bytes: int | None = Field(None, ge=0)
+    net_tx_bytes: int | None = Field(None, ge=0)
+    sample_count: int = Field(0, ge=0)
+    coverage: float = Field(0.0, ge=0.0, le=1.0)
+    sampler_version: str = Field(..., max_length=64)
 
 
 class WorkerFinishRequest(BaseModel):

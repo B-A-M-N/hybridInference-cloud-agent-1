@@ -81,12 +81,16 @@ class FakeControl:
         self.finished: tuple[str, str | None] | None = None
         self.job_id = "ajob_1"
         self.continuity: str | None = None
+        self.resources: list[dict] = []
 
     def append_event(self, event) -> None:
         self.events.append((event.event_type, event.payload))
 
     def report_continuity(self, mode: str) -> None:
         self.continuity = mode
+
+    def report_resources(self, rollup: dict) -> None:
+        self.resources.append(rollup)
 
     def save_artifact(self, kind: str, content: str) -> None:
         self.artifacts[kind] = content
@@ -1501,3 +1505,65 @@ def test_an_unusable_residency_is_a_first_class_event(tmp_path, monkeypatch):
     assert ("lifecycle", {"phase": "residency_unusable", "reason": "harness_switch"}) in [
         (kind, payload) for kind, payload in control.events
     ]
+
+
+def test_an_unmeasurable_host_still_files_an_honest_row(tmp_path):
+    """Coverage 0, not silence, when the sandbox cannot be measured.
+
+    The sampler is inert wherever a container's counters cannot be resolved —
+    a process backend (no container at all), a Docker daemon inside a VM,
+    cgroup v1. Reporting nothing at all would leave the reader unable to tell
+    an unmeasured turn from one that genuinely consumed nothing, which is the
+    one confusion this signal exists to prevent. The row is filed, and it
+    says plainly that nothing was observed.
+    """
+    control, heart = FakeControl(), FakeHeart()
+    code, _tail, _errors = run_agent(
+        _echo_runtime(1),
+        job=_JOB,
+        workdir=str(tmp_path),
+        gateway_base_url="http://gw",
+        control=control,
+        heart=heart,
+        timeout_s=30,
+        backend=ProcessBackend(acknowledged_unsafe=True),
+    )
+
+    assert code == 0
+    assert len(control.resources) == 1
+    rollup = control.resources[0]
+    assert rollup["coverage"] == 0.0
+    assert rollup["sample_count"] == 0
+    assert rollup.get("cpu_usec") is None, "an unmeasured turn reported a CPU number"
+
+
+def test_a_sampler_that_cannot_start_never_costs_the_turn(tmp_path, monkeypatch):
+    """The observer must not be able to break what it observes.
+
+    The sampler is wired directly into the path that starts the agent, so a
+    failure there — an unreadable host, a daemon that answers strangely, a
+    process object that cannot say where it runs — has to degrade into a
+    missing measurement rather than a failed turn.
+    """
+    from cloud_agent_host import runner as runner_mod
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("cgroup backend is on fire")
+
+    monkeypatch.setattr(runner_mod.ResourceSampler, "for_container", _explode)
+
+    control, heart = FakeControl(), FakeHeart()
+    code, _tail, _errors = run_agent(
+        _echo_runtime(2),
+        job=_JOB,
+        workdir=str(tmp_path),
+        gateway_base_url="http://gw",
+        control=control,
+        heart=heart,
+        timeout_s=30,
+        backend=ProcessBackend(acknowledged_unsafe=True),
+    )
+
+    assert code == 0, "a failing sampler took the turn down with it"
+    assert [payload["text"] for _kind, payload in control.events] == ["line 0", "line 1"]
+    assert control.resources[0]["coverage"] == 0.0

@@ -60,6 +60,7 @@ from cloud_agent_host.enrollment import (
 from cloud_agent_host.logging_utils import configure_process_logging
 from cloud_agent_host.patch_gate import branch_name_for, validate_patch
 from cloud_agent_host.residency import ResidentEntry, ResidentPool
+from cloud_agent_host.resources import ResourceSampler
 from cloud_agent_host.runtimes import (
     EMPTY_RUNTIME_MCP_CONFIG,
     AgentRuntime,
@@ -69,6 +70,7 @@ from cloud_agent_host.runtimes import (
 )
 from cloud_agent_host.sandbox import (
     SandboxBackend,
+    SandboxProcess,
     SandboxSpec,
     build_backend_from_env,
 )
@@ -307,6 +309,19 @@ class ControlPlane:
         """Record this attempt's continuity rung. Best-effort observability."""
         try:
             self._post(f"/v1/agent/worker/jobs/{self.job_id}/continuity", {"mode": mode})
+        except LeaseLost:
+            raise
+        except Exception:
+            pass
+
+    def report_resources(self, rollup: dict[str, Any]) -> None:
+        """Report one closed window's resource rollup. Best-effort.
+
+        Swallowed like every other observability write: a turn that ran must
+        not fail because the platform could not record what it consumed.
+        """
+        try:
+            self._post(f"/v1/agent/worker/jobs/{self.job_id}/resources", rollup)
         except LeaseLost:
             raise
         except Exception:
@@ -997,6 +1012,48 @@ def run_agent(
     a live session it created itself; one borrowed from the pool is closed by
     the pool teardown its failure triggers.
     """
+    #: This turn's resource sampler. It starts with whichever sandbox process
+    #: the turn actually uses — the one spawned below on a cold or restarting
+    #: turn, or the resident process a hot turn inherits — and is stopped in
+    #: this function's ``finally``, which is the only place every exit passes.
+    sampler = ResourceSampler(None)
+
+    def _spawn_sampled(process: SandboxProcess) -> SandboxProcess:
+        """Point the sampler at the sandbox this turn is about to use.
+
+        Rebinding rather than binding once: every spawn is a *new* container,
+        so a sampler still holding the previous one would keep reporting a
+        process this turn does not own — and, on the hot fallback path, one
+        that is already dead. Whatever it had measured is discarded with it,
+        which is correct: those numbers belong to a container this turn no
+        longer runs in.
+
+        Everything here is contained. This sits directly in the path that
+        starts the agent, so a sampler that raised would not degrade a
+        measurement — it would cost the user their turn.
+        """
+        nonlocal sampler
+        try:
+            sampler.stop()
+            # A VM-isolated runtime (kata) puts the workload inside a guest
+            # kernel. What the host can see under that container's pid is the
+            # VMM shim: its cgroup accounts for the hypervisor process, not
+            # for the agent. Measuring it would report confident numbers about
+            # the wrong thing, so this backend is honestly not measured.
+            container = (
+                None
+                if getattr(backend, "is_vm_isolated", False)
+                else getattr(process, "container", None)
+            )
+            sampler = ResourceSampler.for_container(
+                container,
+                docker_binary=getattr(backend, "docker_binary", "docker"),
+            )
+            sampler.start()
+        except Exception as exc:
+            print(f"resource sampler unavailable: {exc}", file=sys.stderr)
+        return process
+
     # Hermetic environment, and the *backend's* idea of it rather than the
     # runner's. For an isolated backend the runner's PATH and HOME name paths
     # inside the runner's own filesystem: forwarding HOME=/root into a
@@ -1023,8 +1080,8 @@ def run_agent(
         provides_isolation=backend.provides_isolation,
         # The platform places the process inside the sandbox (design D7);
         # the driver owns everything on the returned handle's transport.
-        spawn=lambda argv, env: backend.spawn(
-            SandboxSpec(argv=argv, workdir=workdir, env=env, state_dir=state_dir)
+        spawn=lambda argv, env: _spawn_sampled(
+            backend.spawn(SandboxSpec(argv=argv, workdir=workdir, env=env, state_dir=state_dir))
         ),
         base_env=base_env,
         # The runner is the only source of this value. Repository contents
@@ -1046,6 +1103,16 @@ def run_agent(
         and job.model == resident.grant_model
         and not mcp_config.server_ids
     )
+    if hot_ok and resident is not None and resident.live_session is not None:
+        # A hot turn spawns nothing, so the spawn seam above never fires. The
+        # rung that reuses a process is exactly the rung whose consumption is
+        # least obvious, so it is measured through the session it inherits.
+        with contextlib.suppress(Exception):
+            sampler = ResourceSampler.for_container(
+                getattr(resident.live_session, "container", None),
+                docker_binary=getattr(backend, "docker_binary", "docker"),
+            )
+            sampler.start()
     stale_process = resident is not None and not hot_ok and resident.live_session is not None
     if stale_process and residents is not None and job.thread_id:
         # This turn will advance the thread past the idle process's memory —
@@ -1073,13 +1140,18 @@ def run_agent(
                 hot_context = replace(
                     context,
                     credential=resident.credential,
-                    spawn_live=lambda argv, env: backend.spawn(
-                        SandboxSpec(
-                            argv=argv,
-                            workdir=workdir,
-                            env=env,
-                            state_dir=state_dir,
-                            live_input=True,
+                    # Sampled through the same seam as any other spawn: a
+                    # resident process is still a container this turn runs
+                    # work in, and it was the one rung nothing measured.
+                    spawn_live=lambda argv, env: _spawn_sampled(
+                        backend.spawn(
+                            SandboxSpec(
+                                argv=argv,
+                                workdir=workdir,
+                                env=env,
+                                state_dir=state_dir,
+                                live_input=True,
+                            )
                         )
                     ),
                 )
@@ -1267,6 +1339,16 @@ def run_agent(
             )
         return exit_code, "".join(tail), tool_errors
     finally:
+        # Observability is reported before the session teardown below: the
+        # rollup describes a window that has already closed, and a teardown
+        # failure must not cost the turn its numbers.
+        with contextlib.suppress(Exception):
+            # Reported whether or not anything was read. A window with
+            # coverage 0 is the row that says "this turn was not measured",
+            # and withholding it is what makes an unmeasured turn
+            # indistinguishable from one that consumed nothing — the single
+            # distinction this whole signal exists to preserve.
+            control.report_resources(sampler.stop())
         # Every exit but the completed hand-off closes a live session this
         # turn spawned: a leaked resident process would keep running — and
         # keep holding its grant-scoped key — with no entry owning it.

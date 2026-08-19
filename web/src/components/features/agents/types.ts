@@ -23,6 +23,13 @@ export type AgentEvent =
       tool: string;
       detail: string;
       id?: string;
+      /** Event time, ISO. Present so per-tool durations are derivable. */
+      at?: string | null;
+      /**
+       * Resolved when this row absorbed its result during folding — the only
+       * moment both ends of the call are still in the same list.
+       */
+      durationMs?: number;
       /** Collapsed tool output preview (mono block), e.g. pytest tail. */
       output?: string[];
       outputIsError?: boolean;
@@ -35,6 +42,8 @@ export type AgentEvent =
       text: string;
       toolUseId?: string;
       isError: boolean;
+      /** Event time, ISO — paired with its tool_use to time the call. */
+      at?: string | null;
       attemptNo?: number;
     }
   | { kind: 'terminal'; text: string; isError?: boolean; attemptNo?: number }
@@ -65,6 +74,22 @@ export interface AgentGate {
   label: string;
   state: 'pass' | 'pending' | 'hold';
   detail?: string;
+}
+
+export interface TurnResources {
+  cpuUsec: number | null;
+  memPeakBytes: number | null;
+  memAvgBytes: number | null;
+  ioReadBytes: number | null;
+  ioWriteBytes: number | null;
+  netRxBytes: number | null;
+  netTxBytes: number | null;
+  sampleCount: number;
+  /**
+   * Share of the turn actually sampled. Below 1 means the numbers are a
+   * floor, not a total, and the UI says so rather than rounding the gap away.
+   */
+  coverage: number;
 }
 
 export interface AgentJob {
@@ -112,6 +137,16 @@ export interface AgentJob {
   rawLines: string[];
   gates: AgentGate[];
   usage: { tokensIn: string; tokensOut: string; cachePct: number; turns: number };
+  /**
+   * How this turn was continued. `replay` means it was rebuilt from the
+   * transcript with the agent's working memory lost — the honest answer to
+   * "why did it forget", and the reason this is surfaced at all.
+   */
+  continuityMode?: 'hot' | 'warm_native' | 'cold_native' | 'replay';
+  /** Wall time of the turn's newest attempt. */
+  durationMs?: number;
+  /** Host-measured consumption. Absent when nothing measured this turn. */
+  resources?: TurnResources;
   egressDenials: number;
   /** e.g. "draft PR #1044" once published. */
   prLabel?: string;

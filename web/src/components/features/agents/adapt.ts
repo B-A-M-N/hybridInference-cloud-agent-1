@@ -8,11 +8,19 @@
 import type {
   AgentJobApi,
   AgentJobEventApi,
+  AttemptResourcesApi,
   AgentThreadApi,
   AgentThreadMessageApi,
 } from '@/lib/api/agents';
 
-import type { AgentDiffFile, AgentEvent, AgentJob, AgentJobState, DiffLine } from './types';
+import type {
+  AgentDiffFile,
+  AgentEvent,
+  AgentJob,
+  AgentJobState,
+  DiffLine,
+  TurnResources,
+} from './types';
 
 /**
  * Map a server state onto a display state.
@@ -74,6 +82,25 @@ function toolOutput(payload: Record<string, unknown>): string[] | undefined {
 }
 
 /** Map one stored event onto a UI row, or null when it has nothing to show. */
+/**
+ * The span between a tool call and its result, when both carry a time.
+ *
+ * Message-level by construction: the window opens when the model asked for
+ * the call rather than when the sandbox began running it, so it includes
+ * whatever thinking preceded execution. Returns an empty object rather than
+ * a null field so a row without usable times carries no duration at all.
+ */
+export function durationBetween(
+  startedAt: string | null | undefined,
+  endedAt: string | null | undefined,
+): { durationMs?: number } {
+  if (!startedAt || !endedAt) return {};
+  const start = Date.parse(startedAt);
+  const end = Date.parse(endedAt);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return {};
+  return { durationMs: end - start };
+}
+
 export function toDisplayEvent(event: AgentJobEventApi): AgentEvent | null {
   const payload = event.payload ?? {};
   const type = event.event_type;
@@ -94,6 +121,7 @@ export function toDisplayEvent(event: AgentJobEventApi): AgentEvent | null {
       kind: 'tool_use',
       tool: name,
       id: asText(payload, 'id') || undefined,
+      ...(event.created_at ? { at: event.created_at } : {}),
       detail: asText(payload, 'detail', 'text') || commandText(payload.input) || 'Running tool',
       ...(output ? { output } : {}),
       ...(outputIsError ? { outputIsError: true } : {}),
@@ -110,6 +138,7 @@ export function toDisplayEvent(event: AgentJobEventApi): AgentEvent | null {
         asText(payload, 'text', 'detail'),
       toolUseId: asText(payload, 'tool_use_id') || undefined,
       isError: payload.is_error === true,
+      ...(event.created_at ? { at: event.created_at } : {}),
     };
   }
 
@@ -332,6 +361,12 @@ function displayEvents(events: AgentJobEventApi[]): AgentEvent[] {
           ...target,
           output: row.text ? row.text.split('\n') : ['Command completed with no output.'],
           outputIsError: row.isError,
+          // Folding is where the pair still exists. Downstream only sees the
+          // surviving tool_use row, so a consumer that wanted to time the
+          // call — the turn footer does — would find nothing left to pair
+          // with and render every call as unfinished. The window is resolved
+          // here, while both ends are in hand.
+          ...durationBetween(target.at, row.at),
         };
         continue;
       }
@@ -362,6 +397,21 @@ function displayEvents(events: AgentJobEventApi[]): AgentEvent[] {
 }
 
 /** Build the UI job model from the API job plus whatever else we have. */
+/** Rename the host's rollup into the UI's shape, keeping every null a null. */
+export function toTurnResources(api: AttemptResourcesApi): TurnResources {
+  return {
+    cpuUsec: api.cpu_usec,
+    memPeakBytes: api.mem_peak_bytes,
+    memAvgBytes: api.mem_avg_bytes,
+    ioReadBytes: api.io_read_bytes,
+    ioWriteBytes: api.io_write_bytes,
+    netRxBytes: api.net_rx_bytes,
+    netTxBytes: api.net_tx_bytes,
+    sampleCount: api.sample_count,
+    coverage: api.coverage,
+  };
+}
+
 export function toDisplayJob(job: AgentJobApi, options: AdaptOptions = {}): AgentJob {
   const events = options.events ?? [];
   const patch = options.patch ?? '';
@@ -447,6 +497,9 @@ export function toDisplayJob(job: AgentJobApi, options: AdaptOptions = {}): Agen
     // `hasLedger` so it can say so rather than imply the job was free.
     spentUsd: job.spent_usd ?? 0,
     hasLedger: job.spent_usd !== null,
+    ...(job.continuity_mode ? { continuityMode: job.continuity_mode } : {}),
+    ...(typeof job.duration_ms === 'number' ? { durationMs: job.duration_ms } : {}),
+    ...(job.resources ? { resources: toTurnResources(job.resources) } : {}),
     timeoutLabel: '',
     networkSetup: tierLabel(job.setup_egress_tier),
     networkAgent: tierLabel(job.agent_egress_tier),

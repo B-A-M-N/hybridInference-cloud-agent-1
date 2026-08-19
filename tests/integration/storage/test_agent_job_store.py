@@ -1738,3 +1738,85 @@ async def test_a_replayed_event_seq_is_answered_with_the_stored_row(store: Agent
         )
     assert events == 2
     assert messages == 1
+
+
+async def test_a_resource_rollup_upserts_rather_than_accumulating(store: AgentJobStore):
+    """A retried post is the same window said twice, not a second window.
+
+    Idempotence here is a statement about ``ON CONFLICT``, which is exactly
+    what a fake keyed by attempt cannot test: any dict-backed stand-in is
+    idempotent by construction, so the assertion passes without the SQL being
+    right.
+    """
+    job = await _create_job(store)
+    claim = await store.claim_job(worker_id="w1", lease_ttl_seconds=60)
+    assert claim is not None
+    rollup = {
+        "cpu_usec": 1_000,
+        "mem_peak_bytes": 2_048,
+        "net_rx_bytes": 4_096,
+        "sample_count": 5,
+        "coverage": 1.0,
+        "sampler_version": "1",
+    }
+
+    assert await store.record_attempt_resources(
+        attempt_id=claim["attempt_id"], lease_generation=claim["lease_generation"], rollup=rollup
+    )
+    assert await store.record_attempt_resources(
+        attempt_id=claim["attempt_id"], lease_generation=claim["lease_generation"], rollup=rollup
+    )
+
+    telemetry = await store.job_turn_telemetry(job_id=job["id"])
+    assert telemetry is not None
+    assert telemetry["cpu_usec"] == 1_000, "a retried post accumulated instead of replacing"
+    assert telemetry["net_rx_bytes"] == 4_096
+
+
+async def test_a_superseded_attempt_cannot_overwrite_the_live_one_s_numbers(
+    store: AgentJobStore,
+):
+    """Fenced by the same predicate as every other worker write."""
+    job = await _create_job(store)
+    claim = await store.claim_job(worker_id="w1", lease_ttl_seconds=60)
+    assert claim is not None
+    await store.record_attempt_resources(
+        attempt_id=claim["attempt_id"],
+        lease_generation=claim["lease_generation"],
+        rollup={"cpu_usec": 1_000, "sample_count": 5, "coverage": 1.0, "sampler_version": "1"},
+    )
+
+    stale = await store.record_attempt_resources(
+        attempt_id=claim["attempt_id"],
+        lease_generation=claim["lease_generation"] + 1,
+        rollup={"cpu_usec": 999_999, "sample_count": 1, "coverage": 1.0, "sampler_version": "1"},
+    )
+
+    assert stale is False
+    telemetry = await store.job_turn_telemetry(job_id=job["id"])
+    assert telemetry is not None
+    assert telemetry["cpu_usec"] == 1_000
+
+
+async def test_an_unmeasured_window_is_stored_as_such_not_as_zero(store: AgentJobStore):
+    """Null counters with coverage 0 — the row that says "not measured".
+
+    Postgres is what makes this meaningful: the columns are nullable, so a
+    turn nobody could measure reads back as NULL rather than as a zero the
+    reader would have no way to question.
+    """
+    job = await _create_job(store)
+    claim = await store.claim_job(worker_id="w1", lease_ttl_seconds=60)
+    assert claim is not None
+
+    assert await store.record_attempt_resources(
+        attempt_id=claim["attempt_id"],
+        lease_generation=claim["lease_generation"],
+        rollup={"sample_count": 0, "coverage": 0.0, "sampler_version": "1"},
+    )
+
+    telemetry = await store.job_turn_telemetry(job_id=job["id"])
+    assert telemetry is not None
+    assert telemetry["cpu_usec"] is None
+    assert telemetry["coverage"] == 0.0
+    assert telemetry["sampler_version"] == "1"

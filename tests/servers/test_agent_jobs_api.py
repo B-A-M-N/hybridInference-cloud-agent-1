@@ -64,6 +64,8 @@ class FakeAgentJobStore:
         self.messages: list[dict[str, Any]] = []
         self.archived_threads: dict[str, datetime] = {}
         self.pinned_threads: dict[str, datetime] = {}
+        self.turn_telemetry: dict[str, dict[str, Any]] = {}
+        self.attempt_jobs: dict[int, str] = {}
         self.live_fence: tuple[int, int] | None = None
         self.attempt_grants: dict[int, str] = {}
         self.terminal_readiness: dict[int, bool] = {}
@@ -361,6 +363,24 @@ class FakeAgentJobStore:
             return None
         return {**job, "pinned_at": self.pinned_threads.get(job["thread_id"])}
 
+    async def job_turn_telemetry(self, *, job_id: str) -> dict[str, Any] | None:
+        """How the newest attempt ran. Absent until a runner reports one."""
+        return self.turn_telemetry.get(job_id)
+
+    async def record_attempt_resources(
+        self, *, attempt_id: int, lease_generation: int, rollup: dict[str, Any]
+    ) -> bool:
+        """Store one window's rollup, fenced and idempotent like the real store."""
+        if not self._fenced(attempt_id, lease_generation):
+            return False
+        job_id = self.attempt_jobs.get(attempt_id)
+        if job_id is None:
+            return False
+        # Upsert, never append: a rollup describes a closed window, so a
+        # retried post is the same window said twice.
+        self.turn_telemetry[job_id] = {**self.turn_telemetry.get(job_id, {}), **rollup}
+        return True
+
     async def list_jobs(
         self,
         *,
@@ -577,6 +597,7 @@ class FakeAgentJobStore:
         job["current_attempt_id"] = 100
         self.live_fence = (100, 1)
         self.terminal_readiness[100] = False
+        self.attempt_jobs[100] = job["id"]
         return {**job, "attempt_id": 100, "attempt_no": 1, "lease_generation": 1}
 
     async def record_attempt_grant(
@@ -4089,3 +4110,87 @@ async def test_an_unknown_model_is_still_refused_at_creation(client: AsyncClient
 
     assert response.status_code == 400
     assert response.json()["detail"]["error"]["type"] == "model_not_available"
+
+
+async def test_the_owner_sees_what_their_turn_consumed(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """The footer's numbers, end to end: runner posts, owner reads."""
+    job_id = await _create_job(client)
+    claim = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+    auth = {"Authorization": f"Bearer {claim['worker_token']}"}
+
+    ack = await client.post(
+        f"/v1/agent/worker/jobs/{job_id}/resources",
+        json={
+            "cpu_usec": 18_200_000,
+            "mem_peak_bytes": 1_288_490_188,
+            "net_rx_bytes": 35_651_584,
+            "net_tx_bytes": 2_097_152,
+            "sample_count": 42,
+            "coverage": 1.0,
+            "sampler_version": "1",
+        },
+        headers=auth,
+    )
+    assert ack.status_code == 200
+
+    job = (await client.get(f"/v1/agent/jobs/{job_id}")).json()
+    assert job["resources"]["cpu_usec"] == 18_200_000
+    assert job["resources"]["mem_peak_bytes"] == 1_288_490_188
+    assert job["resources"]["coverage"] == 1.0
+
+
+async def test_a_rollup_is_the_same_window_said_twice_not_two_windows(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """Retrying the post must not double a turn's consumption."""
+    job_id = await _create_job(client)
+    claim = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+    auth = {"Authorization": f"Bearer {claim['worker_token']}"}
+    body = {"cpu_usec": 1_000, "sample_count": 5, "coverage": 1.0, "sampler_version": "1"}
+
+    await client.post(f"/v1/agent/worker/jobs/{job_id}/resources", json=body, headers=auth)
+    await client.post(f"/v1/agent/worker/jobs/{job_id}/resources", json=body, headers=auth)
+
+    job = (await client.get(f"/v1/agent/jobs/{job_id}")).json()
+    assert job["resources"]["cpu_usec"] == 1_000, "a retried post doubled the turn's CPU"
+
+
+async def test_a_superseded_attempt_cannot_relabel_what_the_live_one_used(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """Fenced like every other worker write."""
+    job_id = await _create_job(client)
+    claim = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+    auth = {"Authorization": f"Bearer {claim['worker_token']}"}
+    # A takeover moves the fence to a new attempt generation.
+    store.live_fence = (101, 2)
+
+    refused = await client.post(
+        f"/v1/agent/worker/jobs/{job_id}/resources",
+        json={"cpu_usec": 999, "sample_count": 1, "coverage": 1.0, "sampler_version": "1"},
+        headers=auth,
+    )
+    assert refused.status_code == 409
+
+    job = (await client.get(f"/v1/agent/jobs/{job_id}")).json()
+    assert job["resources"] is None
+
+
+async def test_an_unmeasured_turn_reports_nothing_rather_than_zero(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """The distinction the whole feature rests on.
+
+    A turn nobody measured has no resources object at all. Reading zeros here
+    would be indistinguishable from a turn that genuinely consumed nothing —
+    and the reader would have no way to tell which they were looking at.
+    """
+    job_id = await _create_job(client)
+
+    job = (await client.get(f"/v1/agent/jobs/{job_id}")).json()
+
+    assert job["resources"] is None
+    assert job["continuity_mode"] is None
+    assert job["duration_ms"] is None
