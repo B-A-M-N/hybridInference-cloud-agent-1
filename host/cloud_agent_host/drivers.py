@@ -595,8 +595,14 @@ class ClaudeCodeLiveSession(ClaudeCodeSession):
 
     @property
     def container(self) -> str | None:
-        """The container the live process runs in, once it has been spawned."""
-        return self._process.container if self._process is not None else None
+        """The container the live process runs in, once it has been spawned.
+
+        Read defensively: the process is whatever the platform's spawn seam
+        returned, and a process that cannot say where it runs is one the
+        sampler simply does not measure. An observer must never be the reason
+        a turn fails.
+        """
+        return getattr(self._process, "container", None)
 
     def shared_lines(self) -> Iterator[str]:
         """The session's single stdout reader, borrowed by the current turn."""

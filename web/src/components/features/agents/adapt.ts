@@ -8,11 +8,19 @@
 import type {
   AgentJobApi,
   AgentJobEventApi,
+  AttemptResourcesApi,
   AgentThreadApi,
   AgentThreadMessageApi,
 } from '@/lib/api/agents';
 
-import type { AgentDiffFile, AgentEvent, AgentJob, AgentJobState, DiffLine } from './types';
+import type {
+  AgentDiffFile,
+  AgentEvent,
+  AgentJob,
+  AgentJobState,
+  DiffLine,
+  TurnResources,
+} from './types';
 
 /**
  * Map a server state onto a display state.
@@ -94,6 +102,7 @@ export function toDisplayEvent(event: AgentJobEventApi): AgentEvent | null {
       kind: 'tool_use',
       tool: name,
       id: asText(payload, 'id') || undefined,
+      ...(event.created_at ? { at: event.created_at } : {}),
       detail: asText(payload, 'detail', 'text') || commandText(payload.input) || 'Running tool',
       ...(output ? { output } : {}),
       ...(outputIsError ? { outputIsError: true } : {}),
@@ -110,6 +119,7 @@ export function toDisplayEvent(event: AgentJobEventApi): AgentEvent | null {
         asText(payload, 'text', 'detail'),
       toolUseId: asText(payload, 'tool_use_id') || undefined,
       isError: payload.is_error === true,
+      ...(event.created_at ? { at: event.created_at } : {}),
     };
   }
 
@@ -362,6 +372,21 @@ function displayEvents(events: AgentJobEventApi[]): AgentEvent[] {
 }
 
 /** Build the UI job model from the API job plus whatever else we have. */
+/** Rename the host's rollup into the UI's shape, keeping every null a null. */
+export function toTurnResources(api: AttemptResourcesApi): TurnResources {
+  return {
+    cpuUsec: api.cpu_usec,
+    memPeakBytes: api.mem_peak_bytes,
+    memAvgBytes: api.mem_avg_bytes,
+    ioReadBytes: api.io_read_bytes,
+    ioWriteBytes: api.io_write_bytes,
+    netRxBytes: api.net_rx_bytes,
+    netTxBytes: api.net_tx_bytes,
+    sampleCount: api.sample_count,
+    coverage: api.coverage,
+  };
+}
+
 export function toDisplayJob(job: AgentJobApi, options: AdaptOptions = {}): AgentJob {
   const events = options.events ?? [];
   const patch = options.patch ?? '';
@@ -447,6 +472,9 @@ export function toDisplayJob(job: AgentJobApi, options: AdaptOptions = {}): Agen
     // `hasLedger` so it can say so rather than imply the job was free.
     spentUsd: job.spent_usd ?? 0,
     hasLedger: job.spent_usd !== null,
+    ...(job.continuity_mode ? { continuityMode: job.continuity_mode } : {}),
+    ...(typeof job.duration_ms === 'number' ? { durationMs: job.duration_ms } : {}),
+    ...(job.resources ? { resources: toTurnResources(job.resources) } : {}),
     timeoutLabel: '',
     networkSetup: tierLabel(job.setup_egress_tier),
     networkAgent: tierLabel(job.agent_egress_tier),

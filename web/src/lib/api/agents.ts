@@ -26,6 +26,20 @@ export type AgentJobApiState =
   | 'failed'
   | 'cancelled';
 
+export interface AttemptResourcesApi {
+  cpu_usec: number | null;
+  mem_peak_bytes: number | null;
+  mem_avg_bytes: number | null;
+  io_read_bytes: number | null;
+  io_write_bytes: number | null;
+  net_rx_bytes: number | null;
+  net_tx_bytes: number | null;
+  sample_count: number;
+  /** Fraction of the attempt window actually sampled, 0..1. */
+  coverage: number;
+  sampler_version: string | null;
+}
+
 export interface AgentJobApi {
   id: string;
   repo: string;
@@ -57,6 +71,15 @@ export interface AgentJobApi {
   model_calls: number | null;
   setup_egress_tier: string | null;
   agent_egress_tier: string | null;
+  /** Which continuity rung this turn ran on. Null on turns that predate it. */
+  continuity_mode?: 'hot' | 'warm_native' | 'cold_native' | 'replay' | null;
+  duration_ms?: number | null;
+  /**
+   * What the sandbox consumed, measured from the host. Null when no sampler
+   * reported; a present object with `coverage` below 1 is a partial
+   * measurement and must be rendered as incomplete, never as a total.
+   */
+  resources?: AttemptResourcesApi | null;
   /** Conversation fields are optional so pre-thread deployments remain readable. */
   thread_id?: string | null;
   parent_job_id?: string | null;

@@ -81,12 +81,16 @@ class FakeControl:
         self.finished: tuple[str, str | None] | None = None
         self.job_id = "ajob_1"
         self.continuity: str | None = None
+        self.resources: list[dict] = []
 
     def append_event(self, event) -> None:
         self.events.append((event.event_type, event.payload))
 
     def report_continuity(self, mode: str) -> None:
         self.continuity = mode
+
+    def report_resources(self, rollup: dict) -> None:
+        self.resources.append(rollup)
 
     def save_artifact(self, kind: str, content: str) -> None:
         self.artifacts[kind] = content
@@ -1501,3 +1505,32 @@ def test_an_unusable_residency_is_a_first_class_event(tmp_path, monkeypatch):
     assert ("lifecycle", {"phase": "residency_unusable", "reason": "harness_switch"}) in [
         (kind, payload) for kind, payload in control.events
     ]
+
+
+def test_an_unmeasurable_host_reports_no_resource_rollup(tmp_path):
+    """Silence, not zeros, when the sandbox cannot be measured.
+
+    The sampler is inert wherever a container's counters cannot be resolved —
+    a process backend (no container at all), a Docker daemon inside a VM,
+    cgroup v1. The turn must run exactly as it did before, and post nothing:
+    a row of zeros here would be indistinguishable from a turn that genuinely
+    consumed nothing, which is the one confusion this whole feature exists to
+    prevent.
+    """
+    control, heart = FakeControl(), FakeHeart()
+    code, _tail, _errors = run_agent(
+        _echo_runtime(1),
+        job=_JOB,
+        workdir=str(tmp_path),
+        gateway_base_url="http://gw",
+        control=control,
+        heart=heart,
+        timeout_s=30,
+        backend=ProcessBackend(acknowledged_unsafe=True),
+    )
+
+    assert code == 0
+    assert control.resources == [], (
+        "an unmeasurable host reported a rollup; a turn nobody measured must "
+        "leave no row rather than a convincing set of zeros"
+    )
