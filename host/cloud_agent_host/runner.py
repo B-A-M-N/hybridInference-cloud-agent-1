@@ -1035,8 +1035,18 @@ def run_agent(
         nonlocal sampler
         try:
             sampler.stop()
+            # A VM-isolated runtime (kata) puts the workload inside a guest
+            # kernel. What the host can see under that container's pid is the
+            # VMM shim: its cgroup accounts for the hypervisor process, not
+            # for the agent. Measuring it would report confident numbers about
+            # the wrong thing, so this backend is honestly not measured.
+            container = (
+                None
+                if getattr(backend, "is_vm_isolated", False)
+                else getattr(process, "container", None)
+            )
             sampler = ResourceSampler.for_container(
-                getattr(process, "container", None),
+                container,
                 docker_binary=getattr(backend, "docker_binary", "docker"),
             )
             sampler.start()

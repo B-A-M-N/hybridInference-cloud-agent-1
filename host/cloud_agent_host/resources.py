@@ -109,8 +109,11 @@ def _parse_io_stat(text: str) -> tuple[int | None, int | None]:
     Per-device rows are summed because the sandbox's io is one workload; which
     block device served it is a host fact, not something a turn's owner asked.
     """
-    read_total: int | None = None
-    write_total: int | None = None
+    # Zero, not None: a file the kernel wrote with no device rows means this
+    # cgroup did no block io, which is a measurement. Returning "unreadable"
+    # here would turn the commonest honest zero into a hole in the row.
+    read_total: int | None = 0
+    write_total: int | None = 0
     for line in text.splitlines():
         for field in line.split()[1:]:
             key, _, raw = field.partition("=")
@@ -121,9 +124,9 @@ def _parse_io_stat(text: str) -> tuple[int | None, int | None]:
             except ValueError:
                 continue
             if key == "rbytes":
-                read_total = (read_total or 0) + value
+                read_total += value
             else:
-                write_total = (write_total or 0) + value
+                write_total += value
     return read_total, write_total
 
 
