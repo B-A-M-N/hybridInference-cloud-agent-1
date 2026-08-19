@@ -78,6 +78,14 @@ SAMPLE_INTERVAL_S = 1.0
 #: time.
 BIND_TIMEOUT_S = 30.0
 
+#: How often to re-ask while waiting for the container to appear. Much
+#: shorter than the sampling interval on purpose: every millisecond between
+#: the sandbox starting and the sampler binding is consumption nobody
+#: measured, and at the sampling interval a container that was not ready on
+#: the first ask cost a full second of a turn that often lasts ten. The extra
+#: asks happen only during startup and stop the moment one succeeds.
+BIND_POLL_S = 0.1
+
 _DEFAULT_SOCKET = "/var/run/docker.sock"
 
 
@@ -470,7 +478,7 @@ class ResourceSampler:
             if counters is not None:
                 self._counters = counters
                 return True
-            self._stop.wait(self._interval)
+            self._stop.wait(BIND_POLL_S)
         return False
 
     def _sample_once(self) -> bool:
