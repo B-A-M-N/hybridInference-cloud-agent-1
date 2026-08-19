@@ -34,9 +34,11 @@ become the user's problem.
 
 from __future__ import annotations
 
+import contextlib
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,6 +54,12 @@ SAMPLER_VERSION = "1"
 #: of work — and a turn is measured in tens of seconds, so this is fine-grained
 #: enough for per-tool windows (design §6) without being a load of its own.
 SAMPLE_INTERVAL_S = 1.0
+
+#: How long to keep asking the daemon where a container is before giving up.
+#: `docker run` returns its client process well before the container exists,
+#: and on a host that must first pull an image that gap is seconds, not
+#: milliseconds — asking once at spawn time is asking too early, every time.
+BIND_TIMEOUT_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -159,6 +167,7 @@ class ContainerCounters:
     ) -> None:
         self._proc = Path(proc_root) / str(pid)
         self._cgroup_root = Path(cgroup_root)
+        self._cgroup_line = _read_text(self._proc / "cgroup")
         self._cgroup_dir = self._resolve_cgroup()
 
     def _resolve_cgroup(self) -> Path | None:
@@ -184,8 +193,32 @@ class ContainerCounters:
         """Whether anything at all can be measured for this container."""
         return self._cgroup_dir is not None or (self._proc / "net" / "dev").exists()
 
-    def read(self) -> Sample:
-        """Take one sample; unreadable backends contribute ``None``."""
+    def alive(self) -> bool:
+        """Whether the pid still belongs to the container we resolved.
+
+        A container that exits releases its pid, and the kernel hands that
+        number to the next process the host starts — at which point
+        ``/proc/<pid>/net/dev`` describes the *host's* interfaces. Reading it
+        would report the machine's traffic since boot as this turn's network,
+        a wrong number large enough to look deliberate. The cgroup directory
+        disappears with the container, so its presence is the check; where
+        there is no cgroup to watch, the pid's own cgroup line must still
+        name the one we started from.
+        """
+        if self._cgroup_dir is not None:
+            return self._cgroup_dir.is_dir()
+        text = _read_text(self._proc / "cgroup")
+        return text is not None and text == self._cgroup_line
+
+    def read(self) -> Sample | None:
+        """Take one sample, or None once the container is gone.
+
+        None is a terminal answer, not a failed read: it means the thing
+        being measured no longer exists, and every later number would belong
+        to something else.
+        """
+        if not self.alive():
+            return None
         cpu = mem = io_read = io_write = None
         if self._cgroup_dir is not None:
             cpu_text = _read_text(self._cgroup_dir / "cpu.stat")
@@ -231,33 +264,55 @@ def _delta(samples: list[Sample], field: str) -> int | None:
     return delta if delta >= 0 else None
 
 
+def _readable(sample: Sample) -> bool:
+    """Whether this sample actually read something from the kernel.
+
+    A sample whose every counter is ``None`` is a heartbeat, not a reading.
+    Counting heartbeats as coverage is how a sampler watching a container
+    that died five seconds in would still claim to have measured the whole
+    turn — the precise failure this distinction exists to prevent.
+    """
+    return any(
+        getattr(sample, field) is not None
+        for field in (
+            "cpu_usec",
+            "mem_bytes",
+            "io_read_bytes",
+            "io_write_bytes",
+            "net_rx_bytes",
+            "net_tx_bytes",
+        )
+    )
+
+
 def rollup(samples: list[Sample], *, window_s: float) -> dict[str, object]:
     """Turn a window's samples into the numbers one attempt row carries.
 
-    ``coverage`` is the share of the window the samples actually span. It is
-    the row's honesty: a sampler that started late, died early, or never read
-    anything produces a number below 1, and a reader must present that as
-    incomplete rather than as a measurement.
+    ``coverage`` is the share of the window that readable samples actually
+    span. It is the row's honesty: a sampler that bound late, died early, or
+    read nothing at all produces a number below 1, and a reader must present
+    that as incomplete rather than as a measurement.
     """
-    if len(samples) < 2 or window_s <= 0:
+    read = [sample for sample in samples if _readable(sample)]
+    if len(read) < 2 or window_s <= 0:
         return {
-            "sample_count": len(samples),
+            "sample_count": len(read),
             "coverage": 0.0,
             "sampler_version": SAMPLER_VERSION,
         }
-    observed = samples[-1].mono - samples[0].mono
-    memory = [s.mem_bytes for s in samples if s.mem_bytes is not None]
+    observed = read[-1].mono - read[0].mono
+    memory = [s.mem_bytes for s in read if s.mem_bytes is not None]
     return {
-        "cpu_usec": _delta(samples, "cpu_usec"),
+        "cpu_usec": _delta(read, "cpu_usec"),
         # Peak and mean come from our own samples, so both describe this
         # window; the kernel's high-water mark would not.
         "mem_peak_bytes": max(memory) if memory else None,
         "mem_avg_bytes": int(sum(memory) / len(memory)) if memory else None,
-        "io_read_bytes": _delta(samples, "io_read_bytes"),
-        "io_write_bytes": _delta(samples, "io_write_bytes"),
-        "net_rx_bytes": _delta(samples, "net_rx_bytes"),
-        "net_tx_bytes": _delta(samples, "net_tx_bytes"),
-        "sample_count": len(samples),
+        "io_read_bytes": _delta(read, "io_read_bytes"),
+        "io_write_bytes": _delta(read, "io_write_bytes"),
+        "net_rx_bytes": _delta(read, "net_rx_bytes"),
+        "net_tx_bytes": _delta(read, "net_tx_bytes"),
+        "sample_count": len(read),
         "coverage": max(0.0, min(1.0, observed / window_s)),
         "sampler_version": SAMPLER_VERSION,
     }
@@ -266,10 +321,11 @@ def rollup(samples: list[Sample], *, window_s: float) -> dict[str, object]:
 def container_pid(container: str, *, docker_binary: str = "docker") -> int | None:
     """Ask the daemon for the host pid of a running container.
 
-    Returns None on every failure — a daemon that answers from inside a VM
-    (macOS, colima) reports a pid this host cannot resolve, and a container
-    that has already exited reports 0. Both are "not measurable here", which
-    is a coverage story, not an error.
+    Returns None on every failure — a container that has not been created
+    yet reports nothing, one that has exited reports 0, and a daemon
+    answering from inside a VM (macOS, colima) reports a pid this host
+    cannot resolve. All three are "not measurable *yet* or at all", which the
+    sampler resolves by retrying rather than by giving up at the first ask.
     """
     try:
         result = subprocess.run(
@@ -293,20 +349,37 @@ def container_pid(container: str, *, docker_binary: str = "docker") -> int | Non
 class ResourceSampler:
     """Samples one sandbox for the life of one attempt window.
 
+    Binding is **lazy and retried**, because ``docker run`` returns a client
+    process long before the daemon has created the container: asking who to
+    measure at spawn time reliably asks too early and gets nothing. The
+    sampler therefore starts immediately, keeps asking on its own thread
+    until the container appears, and records how much of the window it
+    managed to observe.
+
     Lives on a daemon thread so a stuck read can never hold up the turn's
     own exit, and every public method contains its own failures: the sampler
     is an observer, and an observer that can break the thing it observes is
     not worth having.
     """
 
+    #: Bounded so a long turn cannot grow the runner's memory without limit.
+    #: At one sample a second this is over three hours of window; older
+    #: samples fall off the front, which costs the delta its true origin and
+    #: is reported honestly through the shortened coverage span.
+    MAX_SAMPLES = 12_000
+
     def __init__(
         self,
-        counters: ContainerCounters | None,
+        counters: ContainerCounters | None = None,
         *,
+        resolver: Callable[[], ContainerCounters | None] | None = None,
         interval_s: float = SAMPLE_INTERVAL_S,
+        bind_timeout_s: float = BIND_TIMEOUT_S,
     ) -> None:
         self._counters = counters
+        self._resolver = resolver
         self._interval = interval_s
+        self._bind_timeout = bind_timeout_s
         self._samples: list[Sample] = []
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -320,54 +393,102 @@ class ResourceSampler:
         docker_binary: str = "docker",
         proc_root: Path | str = "/proc",
         cgroup_root: Path | str = "/sys/fs/cgroup",
+        interval_s: float = SAMPLE_INTERVAL_S,
     ) -> ResourceSampler:
-        """Build a sampler for a named container, or an inert one.
+        """Build a sampler that binds to a named container when it appears.
 
-        An inert sampler is the normal outcome on a host that cannot be read
-        (no container name, a daemon in a VM, cgroup v1). It costs nothing,
-        starts and stops like any other, and reports a rollup whose coverage
-        is 0 — which is the true statement.
+        Resolution is deferred to the sampling thread rather than performed
+        here: this is called from the path that launches the agent, where a
+        daemon round trip is both too early to succeed and too expensive to
+        spend. A host that can never be read (no container, a daemon in a VM,
+        cgroup v1) simply never binds, and reports coverage 0 — the true
+        statement.
         """
         if not container:
             return cls(None)
-        pid = container_pid(container, docker_binary=docker_binary)
-        if pid is None:
-            return cls(None)
-        counters = ContainerCounters(pid, proc_root=proc_root, cgroup_root=cgroup_root)
-        return cls(counters if counters.readable else None)
+
+        def _resolve() -> ContainerCounters | None:
+            pid = container_pid(container, docker_binary=docker_binary)
+            if pid is None:
+                return None
+            counters = ContainerCounters(pid, proc_root=proc_root, cgroup_root=cgroup_root)
+            return counters if counters.readable else None
+
+        return cls(resolver=_resolve, interval_s=interval_s)
 
     @property
     def active(self) -> bool:
-        """Whether this sampler can measure anything at all."""
-        return self._counters is not None
+        """Whether this sampler has something to measure, or may yet bind."""
+        return self._counters is not None or self._resolver is not None
 
     def start(self) -> None:
         """Begin sampling. Safe to call on an inert sampler."""
         self._started_mono = time.monotonic()
-        if self._counters is None or self._thread is not None:
+        if not self.active or self._thread is not None:
             return
         self._thread = threading.Thread(target=self._loop, name="resource-sampler", daemon=True)
         self._thread.start()
 
-    def _loop(self) -> None:
-        """Sample until stopped, containing every failure."""
-        while not self._stop.is_set():
+    def _bind(self, deadline: float) -> bool:
+        """Resolve the container, retrying until it exists or time runs out."""
+        if self._counters is not None:
+            return True
+        if self._resolver is None:
+            return False
+        while not self._stop.is_set() and time.monotonic() < deadline:
             try:
-                assert self._counters is not None
-                self._samples.append(self._counters.read())
+                counters = self._resolver()
             except Exception:
-                logger.debug("resource_sample_failed", extra={"event": "resource_sample_failed"})
+                counters = None
+            if counters is not None:
+                self._counters = counters
+                return True
+            self._stop.wait(self._interval)
+        return False
+
+    def _sample_once(self) -> bool:
+        """Append one sample; False once the container is gone."""
+        counters = self._counters
+        if counters is None:
+            return False
+        try:
+            sample = counters.read()
+        except Exception:
+            return True
+        if sample is None:
+            return False
+        self._samples.append(sample)
+        del self._samples[: -self.MAX_SAMPLES]
+        return True
+
+    def _loop(self) -> None:
+        """Bind, then sample until stopped or until the container exits."""
+        if not self._bind(time.monotonic() + self._bind_timeout):
+            return
+        # An immediate first sample anchors the window at its true start: a
+        # delta measured from one tick in would silently omit the busiest
+        # second of most turns, and the missing span would read as a partial
+        # measurement of a turn that was measured fine.
+        while not self._stop.is_set():
+            if not self._sample_once():
+                return
             self._stop.wait(self._interval)
 
     def stop(self) -> dict[str, object]:
         """Stop sampling and return the window's rollup.
 
+        A final sample is taken before the thread is joined so the window
+        closes where it actually ended rather than at the last tick, which is
+        what keeps a healthy turn's coverage at 1 instead of a systematic
+        fraction below it.
+
         The join is bounded: a sampler thread wedged in a slow read must not
-        delay the turn's terminal transition, and a rollup missing its last
-        sample is a coverage detail, not a failure.
+        delay the turn's terminal transition.
         """
         window = time.monotonic() - self._started_mono if self._started_mono is not None else 0.0
         self._stop.set()
+        with contextlib.suppress(Exception):
+            self._sample_once()
         thread, self._thread = self._thread, None
         if thread is not None:
             thread.join(timeout=2 * self._interval)

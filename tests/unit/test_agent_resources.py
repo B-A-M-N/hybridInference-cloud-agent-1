@@ -169,3 +169,112 @@ def test_a_read_that_raises_never_escapes_the_sampler(tmp_path):
     time.sleep(0.03)
     # No exception reaches the caller, and the window is honestly empty.
     assert sampler.stop()["coverage"] == 0.0
+
+
+def test_binding_waits_for_a_container_that_does_not_exist_yet(tmp_path):
+    """The race that made this feature measure almost nothing.
+
+    ``docker run`` returns its client process long before the daemon has
+    created the container, so the first ask reliably finds nothing. Binding
+    at spawn time therefore produced an inert sampler on every cold turn —
+    the common case — while every test that pre-resolved a pid passed.
+    """
+    proc, cg = _write_container(tmp_path, pid=555)
+    (cg / "cpu.stat").write_text("usage_usec 10\n")
+    (cg / "memory.current").write_text("64\n")
+    (proc / "net" / "dev").write_text("  eth0: 1 0 0 0 0 0 0 0 2 0\n")
+
+    attempts = {"n": 0}
+
+    def _resolve():
+        # Absent for the first two asks, exactly as a starting container is.
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            return None
+        return ContainerCounters(555, proc_root=tmp_path / "proc", cgroup_root=tmp_path / "cgroup")
+
+    sampler = ResourceSampler(resolver=_resolve, interval_s=0.01)
+    assert sampler.active, "a sampler that has not bound yet must still be live"
+    sampler.start()
+    time.sleep(0.1)
+    result = sampler.stop()
+
+    assert attempts["n"] >= 3, "the sampler gave up on the first ask"
+    assert result["sample_count"] >= 2
+    assert result["coverage"] > 0
+
+
+def test_a_sampler_that_never_binds_reports_zero_coverage(tmp_path):
+    """A host that can never be read says so, and stops asking."""
+    sampler = ResourceSampler(resolver=lambda: None, interval_s=0.01, bind_timeout_s=0.05)
+    sampler.start()
+    time.sleep(0.12)
+    result = sampler.stop()
+
+    assert result["coverage"] == 0.0
+    assert result["sample_count"] == 0
+
+
+def test_coverage_counts_readings_not_heartbeats():
+    """A sampler watching a dead container must not claim a measured turn.
+
+    Ticking the clock is not measuring. Samples whose every counter is
+    ``None`` are heartbeats, and counting them would let a sampler that read
+    nothing for the last nine seconds of a ten-second turn report near-total
+    coverage.
+    """
+    samples = [
+        Sample(mono=0.0, cpu_usec=100),
+        Sample(mono=1.0, cpu_usec=200),
+        *[Sample(mono=float(t)) for t in range(2, 11)],
+    ]
+
+    result = rollup(samples, window_s=10.0)
+
+    assert result["sample_count"] == 2
+    assert result["coverage"] == 0.1
+
+
+def test_a_container_that_exits_ends_the_window_instead_of_reading_a_stranger(tmp_path):
+    """The pid a container releases is handed to the next host process.
+
+    Reading ``/proc/<pid>/net/dev`` after that reports the *host's*
+    interfaces — the machine's traffic since boot, arriving as this turn's
+    network as a large, plausible, entirely wrong number.
+    """
+    proc, cg = _write_container(tmp_path, pid=777)
+    (cg / "cpu.stat").write_text("usage_usec 10\n")
+    (proc / "net" / "dev").write_text("  eth0: 1 0 0 0 0 0 0 0 2 0\n")
+    counters = ContainerCounters(777, proc_root=tmp_path / "proc", cgroup_root=tmp_path / "cgroup")
+    assert counters.read() is not None
+
+    # The container exits: its cgroup goes away, the pid does not.
+    for child in cg.iterdir():
+        child.unlink()
+    cg.rmdir()
+
+    assert counters.read() is None, "a released pid was still read as this container"
+
+
+def test_a_full_window_is_covered_end_to_end(tmp_path):
+    """A healthy turn must not be labelled partial by its own sampling rate.
+
+    Sampling on a tick alone leaves the window's first and last fractions
+    unobserved, which at one sample a second made a healthy twelve-second
+    turn report 0.96 — under any sane threshold, a permanent "partial" badge
+    on turns that were measured fine.
+    """
+    proc, cg = _write_container(tmp_path, pid=888)
+    (cg / "cpu.stat").write_text("usage_usec 10\n")
+    (proc / "net" / "dev").write_text("  eth0: 1 0 0 0 0 0 0 0 2 0\n")
+    counters = ContainerCounters(888, proc_root=tmp_path / "proc", cgroup_root=tmp_path / "cgroup")
+
+    sampler = ResourceSampler(counters, interval_s=0.05)
+    sampler.start()
+    time.sleep(0.12)
+    result = sampler.stop()
+
+    assert result["coverage"] > 0.95, (
+        f"a fully observed window reported coverage {result['coverage']}, which "
+        "would show the user a partial-measurement warning on a healthy turn"
+    )

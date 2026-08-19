@@ -1019,20 +1019,27 @@ def run_agent(
     sampler = ResourceSampler(None)
 
     def _spawn_sampled(process: SandboxProcess) -> SandboxProcess:
-        """Start measuring the sandbox the moment it exists.
+        """Point the sampler at the sandbox this turn is about to use.
 
-        Everything here is read defensively and contained: this sits directly
-        in the path that starts the agent, so a sampler that raised would not
-        degrade a measurement — it would cost the user their turn.
+        Rebinding rather than binding once: every spawn is a *new* container,
+        so a sampler still holding the previous one would keep reporting a
+        process this turn does not own — and, on the hot fallback path, one
+        that is already dead. Whatever it had measured is discarded with it,
+        which is correct: those numbers belong to a container this turn no
+        longer runs in.
+
+        Everything here is contained. This sits directly in the path that
+        starts the agent, so a sampler that raised would not degrade a
+        measurement — it would cost the user their turn.
         """
         nonlocal sampler
         try:
-            if not sampler.active:
-                sampler = ResourceSampler.for_container(
-                    getattr(process, "container", None),
-                    docker_binary=getattr(backend, "docker_binary", "docker"),
-                )
-                sampler.start()
+            sampler.stop()
+            sampler = ResourceSampler.for_container(
+                getattr(process, "container", None),
+                docker_binary=getattr(backend, "docker_binary", "docker"),
+            )
+            sampler.start()
         except Exception as exc:
             print(f"resource sampler unavailable: {exc}", file=sys.stderr)
         return process
@@ -1123,13 +1130,18 @@ def run_agent(
                 hot_context = replace(
                     context,
                     credential=resident.credential,
-                    spawn_live=lambda argv, env: backend.spawn(
-                        SandboxSpec(
-                            argv=argv,
-                            workdir=workdir,
-                            env=env,
-                            state_dir=state_dir,
-                            live_input=True,
+                    # Sampled through the same seam as any other spawn: a
+                    # resident process is still a container this turn runs
+                    # work in, and it was the one rung nothing measured.
+                    spawn_live=lambda argv, env: _spawn_sampled(
+                        backend.spawn(
+                            SandboxSpec(
+                                argv=argv,
+                                workdir=workdir,
+                                env=env,
+                                state_dir=state_dir,
+                                live_input=True,
+                            )
                         )
                     ),
                 )
@@ -1321,9 +1333,12 @@ def run_agent(
         # rollup describes a window that has already closed, and a teardown
         # failure must not cost the turn its numbers.
         with contextlib.suppress(Exception):
-            measured = sampler.stop()
-            if measured.get("sample_count"):
-                control.report_resources(measured)
+            # Reported whether or not anything was read. A window with
+            # coverage 0 is the row that says "this turn was not measured",
+            # and withholding it is what makes an unmeasured turn
+            # indistinguishable from one that consumed nothing — the single
+            # distinction this whole signal exists to preserve.
+            control.report_resources(sampler.stop())
         # Every exit but the completed hand-off closes a live session this
         # turn spawned: a leaked resident process would keep running — and
         # keep holding its grant-scoped key — with no entry owning it.

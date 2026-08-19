@@ -1507,15 +1507,15 @@ def test_an_unusable_residency_is_a_first_class_event(tmp_path, monkeypatch):
     ]
 
 
-def test_an_unmeasurable_host_reports_no_resource_rollup(tmp_path):
-    """Silence, not zeros, when the sandbox cannot be measured.
+def test_an_unmeasurable_host_still_files_an_honest_row(tmp_path):
+    """Coverage 0, not silence, when the sandbox cannot be measured.
 
     The sampler is inert wherever a container's counters cannot be resolved —
     a process backend (no container at all), a Docker daemon inside a VM,
-    cgroup v1. The turn must run exactly as it did before, and post nothing:
-    a row of zeros here would be indistinguishable from a turn that genuinely
-    consumed nothing, which is the one confusion this whole feature exists to
-    prevent.
+    cgroup v1. Reporting nothing at all would leave the reader unable to tell
+    an unmeasured turn from one that genuinely consumed nothing, which is the
+    one confusion this signal exists to prevent. The row is filed, and it
+    says plainly that nothing was observed.
     """
     control, heart = FakeControl(), FakeHeart()
     code, _tail, _errors = run_agent(
@@ -1530,10 +1530,11 @@ def test_an_unmeasurable_host_reports_no_resource_rollup(tmp_path):
     )
 
     assert code == 0
-    assert control.resources == [], (
-        "an unmeasurable host reported a rollup; a turn nobody measured must "
-        "leave no row rather than a convincing set of zeros"
-    )
+    assert len(control.resources) == 1
+    rollup = control.resources[0]
+    assert rollup["coverage"] == 0.0
+    assert rollup["sample_count"] == 0
+    assert rollup.get("cpu_usec") is None, "an unmeasured turn reported a CPU number"
 
 
 def test_a_sampler_that_cannot_start_never_costs_the_turn(tmp_path, monkeypatch):
@@ -1565,4 +1566,4 @@ def test_a_sampler_that_cannot_start_never_costs_the_turn(tmp_path, monkeypatch)
 
     assert code == 0, "a failing sampler took the turn down with it"
     assert [payload["text"] for _kind, payload in control.events] == ["line 0", "line 1"]
-    assert control.resources == []
+    assert control.resources[0]["coverage"] == 0.0
