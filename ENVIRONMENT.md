@@ -197,6 +197,37 @@ compose, because they name the stack rather than configure it.
 | `AGENT_EGRESS_PROXY_URL_CUSTOM` | existing | Same for the Custom tier, which supplies its own proxy by definition; nothing here renders a config for it. |
 | `AGENT_EGRESS_PROXY_PORT` | existing | Port the rendered Squid config listens on. A non-numeric value is refused at render rather than defaulted, since a proxy silently on the wrong port is a sandbox with no egress filtering at all. |
 
+### Agent CLI version pins (build time, not run time)
+
+Read by `deploy/host/sandbox_host.sh` and passed to `docker build` as build
+arguments. Unprefixed by deliberate exception to the `AGENT_*` convention: each
+one is named for the `ARG` it feeds in `deploy/sandbox/Dockerfile.agent-sandbox`,
+and one name for one thing beats a mapping table between the `.env` key and the
+build argument — a typo in that mapping would be invisible.
+
+Unset is the normal case and passes no build argument at all, so the image is
+built from the Dockerfile's reviewed default. Set one only when this environment
+is deliberately running something else.
+
+**The value must be an exact version.** A dist-tag (`latest`) or a range
+(`^2.1`) fails the image build. The pin is not only what gets installed — it is
+derived into the image's version labels, which the heartbeat reports, the claim
+copies onto every attempt as the durable record of what ran, and the checkpoint
+gate compares before letting a thread resume its session. A label that does not
+match the installed binary makes all three false at once.
+
+Bumping one is a real change, not a config tweak: an agent CLI that alters its
+event format alters what `host/cloud_agent_host/runtimes.py` can parse. Re-run
+the agent-loop conformance suite before shipping one.
+
+| Variable | New? | Notes |
+|---|---|---|
+| `CLAUDE_CODE_VERSION` | **NEW** | `@anthropic-ai/claude-code`. |
+| `CODEX_VERSION` | **NEW** | `@openai/codex`. |
+| `PI_VERSION` | **NEW** | `@mariozechner/pi-coding-agent`. |
+| `OPENCODE_VERSION` | **NEW** | `opencode-ai`. |
+| `KILO_VERSION` | **NEW** | `@kilocode/cli`. |
+
 ## Web (`web/`)
 
 Every one of these is baked into the bundle at build time and is therefore
