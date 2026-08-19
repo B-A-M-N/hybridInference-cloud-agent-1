@@ -1112,20 +1112,31 @@ def _require_registered_runtime(runtime: str) -> None:
         )
 
 
-@router.post("/jobs", response_model=AgentJobResponse, status_code=201)
-async def create_agent_job(
+async def _create_job_as(
     body: AgentJobCreate,
-    user: dict[str, Any] = Depends(require_agent_owner),
-    store: AgentJobStore | None = Depends(get_agent_job_store),
-    app_credentials: Any | None = Depends(get_agent_app_credentials),
-    gateway: Any = Depends(get_gateway_client),
-) -> AgentJobResponse:
-    """Queue a new agent job for the authenticated user."""
-    job_store = _require_store(store)
+    user: dict[str, Any],
+    *,
+    job_store: AgentJobStore,
+    app_credentials: Any | None,
+    gateway: Any,
+    reserved_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create one job for ``user``, shared by the owner and service doors.
+
+    Extracted so the on-call service surface (``api/service_jobs.py``) creates
+    jobs through exactly the checks the owner route runs — model resolution,
+    repo entitlement, ref pinning — rather than through a parallel path that
+    drifts. ``reserved_metadata`` is stamped *after* caller metadata for the
+    same reason ``BASE_REF_METADATA_KEY`` is popped first: a display fact the
+    platform asserts must not be spoofable by the request body.
+    """
     # Fail here, not at claim time. An unregistered runtime used to travel all
     # the way into a queued row and burn a claim before anything noticed —
     # the composer only offers registered ids, so an arbitrary string can only
     # arrive from a direct API caller, and it deserves a 400, not a dead job.
+    # The check lives in the helper rather than in the owner route because the
+    # service door creates jobs through here too: a check only one door runs
+    # is precisely the drift this extraction exists to prevent.
     _require_registered_runtime(body.runtime)
     # Canonical from here on. The grant the gateway mints names canonical
     # ids, so a job that stored the alias would carry a scope matching
@@ -1172,6 +1183,8 @@ async def create_agent_job(
     metadata.pop(BASE_REF_METADATA_KEY, None)
     if body.base_ref:
         metadata[BASE_REF_METADATA_KEY] = body.base_ref
+    for key, value in (reserved_metadata or {}).items():
+        metadata[key] = value
     mcp_servers = await _resolve_mcp_servers(
         body.mcp_servers, runtime=body.runtime, store=job_store, user_id=user["user_id"]
     )
@@ -1189,6 +1202,26 @@ async def create_agent_job(
     logger.info(
         "agent_job_created",
         extra={"event": "agent_job_created", "job_id": job["id"], "runtime": body.runtime},
+    )
+    return job
+
+
+@router.post("/jobs", response_model=AgentJobResponse, status_code=201)
+async def create_agent_job(
+    body: AgentJobCreate,
+    user: dict[str, Any] = Depends(require_agent_owner),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+    app_credentials: Any | None = Depends(get_agent_app_credentials),
+    gateway: Any = Depends(get_gateway_client),
+) -> AgentJobResponse:
+    """Queue a new agent job for the authenticated user."""
+    job_store = _require_store(store)
+    job = await _create_job_as(
+        body,
+        user,
+        job_store=job_store,
+        app_credentials=app_credentials,
+        gateway=gateway,
     )
     return _job_response(job)
 
