@@ -860,6 +860,72 @@ class AgentJobStore:
             "jobs": job_rows,
         }
 
+    async def thread_stats_inputs(self, *, job_id: str, user_id: str) -> dict[str, Any] | None:
+        """Return everything needed to summarize the thread containing a job.
+
+        The event rows come back with their bulky text fields stripped in
+        SQL: the summary reads identity, pairing and usage keys only, and a
+        long thread's transcript is megabytes we would otherwise pull across
+        the wire to throw away. Nothing is filtered by event type — wall
+        time is measured from a turn's first to last event, so a Tier-2
+        thread whose only events are ``raw`` still gets its duration.
+
+        :returns: ``None`` when the job does not exist or is not the
+            caller's, matching :meth:`get_thread_for_job`.
+        """
+        async with self._pool.acquire() as conn:
+            thread_id = await conn.fetchval(
+                "SELECT thread_id FROM agent_jobs WHERE id = $1 AND user_id = $2",
+                job_id,
+                user_id,
+            )
+            if thread_id is None:
+                return None
+            jobs = await conn.fetch(
+                "SELECT id FROM agent_jobs WHERE thread_id = $1 ORDER BY turn_no",
+                thread_id,
+            )
+            attempts = await conn.fetch(
+                """
+                SELECT a.job_id, a.started_at
+                FROM agent_attempts a
+                JOIN agent_jobs j ON j.id = a.job_id
+                WHERE j.thread_id = $1
+                """,
+                thread_id,
+            )
+            events = await conn.fetch(
+                """
+                SELECT e.job_id,
+                       e.attempt_id,
+                       e.seq,
+                       e.event_type,
+                       e.created_at,
+                       e.payload - ARRAY['text', 'input', 'content'] AS payload
+                FROM agent_job_events e
+                JOIN agent_jobs j ON j.id = e.job_id
+                WHERE j.thread_id = $1
+                ORDER BY e.attempt_id, e.seq
+                """,
+                thread_id,
+            )
+        return {
+            "thread_id": thread_id,
+            "job_ids": [row["id"] for row in jobs],
+            "attempts": [dict(row) for row in attempts],
+            "events": [
+                {
+                    "job_id": row["job_id"],
+                    "attempt_id": row["attempt_id"],
+                    "seq": row["seq"],
+                    "event_type": row["event_type"],
+                    "created_at": row["created_at"],
+                    "payload": _load_json(row["payload"]),
+                }
+                for row in events
+            ],
+        }
+
     async def follow_up_context(self, *, job_id: str) -> dict[str, Any]:
         """Return prior turns and the resumable parent patch for a claimed run."""
         async with self._pool.acquire() as conn:

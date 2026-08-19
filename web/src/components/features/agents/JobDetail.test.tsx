@@ -13,6 +13,7 @@ import {
   getAgentConfig,
   getAgentJobFiles,
   getAgentJobGit,
+  getAgentThreadStats,
   listAgentTerminals,
   resizeAgentTerminal,
   streamAgentTerminal,
@@ -39,6 +40,7 @@ vi.mock('@/lib/api/agents', () => ({
   getAgentConfig: vi.fn(),
   getAgentJobFiles: vi.fn(),
   getAgentJobGit: vi.fn(),
+  getAgentThreadStats: vi.fn(),
   listAgentTerminals: vi.fn(),
   resizeAgentTerminal: vi.fn(),
   streamAgentTerminal: vi.fn(),
@@ -144,6 +146,9 @@ describe('JobDetail', () => {
       patch: '',
       commits: [],
     });
+    // Absent by default: the stats bar is additive, and every case here
+    // predates it. The bar's own file covers what it renders when present.
+    vi.mocked(getAgentThreadStats).mockReset().mockResolvedValue(null);
     vi.mocked(createAgentTerminal).mockReset();
     vi.mocked(deleteAgentTerminal).mockReset();
     vi.mocked(listAgentTerminals).mockReset().mockResolvedValue([]);
