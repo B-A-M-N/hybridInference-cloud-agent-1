@@ -54,20 +54,30 @@ const CONTINUITY_LABEL: Record<string, { text: string; tone: string; title: stri
 };
 
 /**
- * Round to at most one decimal, without printing a pointless ".0".
+ * Round the way the reader will see it, so callers can branch on the printed
+ * value rather than the one before rounding — the gap between the two is how
+ * "60.0s" and "1024MB" happen.
  *
  * The decimal is kept below 100 because that is where it still carries
  * meaning — "18.2s" of CPU is a different statement from "18s" — and dropped
  * above it, where a tenth of a gigabyte is noise in a footer.
  */
+function rounded(value: number): number {
+  return value >= 100 ? Math.round(value) : Math.round(value * 10) / 10;
+}
+
 function trim(value: number): string {
-  return value >= 100 || Number.isInteger(value) ? String(Math.round(value)) : value.toFixed(1);
+  const shown = rounded(value);
+  return Number.isInteger(shown) ? String(shown) : shown.toFixed(1);
 }
 
 export function formatDuration(ms: number | null | undefined): string | null {
   if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return null;
   if (ms < 1000) return `${Math.round(ms)}ms`;
-  const seconds = ms / 1000;
+  // Rounding is decided once, before the branch: 59.96s rounds to 60, and a
+  // branch taken on the unrounded value renders it as "60.0s" — or, one
+  // minute later, as "1m 60s".
+  const seconds = rounded(ms / 1000);
   if (seconds < 60) return `${trim(seconds)}s`;
   const minutes = Math.floor(seconds / 60);
   const rest = Math.round(seconds - minutes * 60);
@@ -79,7 +89,9 @@ export function formatBytes(bytes: number | null | undefined): string | null {
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
   let value = bytes;
   let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
+  // Compared after rounding, so a value that will *print* as 1024 climbs to
+  // the next unit instead of rendering as "1024MB".
+  while (rounded(value) >= 1024 && unit < units.length - 1) {
     value /= 1024;
     unit += 1;
   }
@@ -93,35 +105,57 @@ export function formatCpu(usec: number | null | undefined): string | null {
 }
 
 /**
- * Pair `tool_use` rows with their `tool_result` to time each call.
+ * Time each tool call in one attempt.
+ *
+ * The window normally arrives already resolved on the `tool_use` row: the
+ * adapter folds a result into its call and keeps the span there, because by
+ * the time anything downstream sees the stream the result row is gone. The
+ * pairing below is the fallback for rows that were never folded — a call
+ * whose payload carried its own output, or a stream that ended mid-call.
  *
  * Message-level by construction: the window opens when the model asked for
  * the call, not when the sandbox began running it, so it carries whatever
- * thinking preceded execution. Unpaired calls (still running, or a stream
- * that ended early) keep their row with a null duration rather than being
- * dropped — a call that never returned is exactly what a reader is looking
- * for.
+ * thinking preceded execution. Unpaired calls keep their row with a null
+ * duration rather than being dropped — a call that never returned is exactly
+ * what a reader is looking for.
  */
-export function toolTimings(events: AgentEvent[]): ToolTiming[] {
+export function toolTimings(events: AgentEvent[], attemptNo?: number): ToolTiming[] {
+  const scoped =
+    attemptNo === undefined
+      ? events
+      : events.filter((event) => event.attemptNo === undefined || event.attemptNo === attemptNo);
+  // Results that survived folding, keyed within their own attempt: a retried
+  // turn repeats its tool ids, and pairing on the bare id would time a call
+  // against a different attempt's result.
   const results = new Map<string, { at: string | null; isError: boolean }>();
-  for (const event of events) {
+  for (const event of scoped) {
     if (event.kind === 'tool_result' && event.toolUseId) {
-      results.set(event.toolUseId, { at: event.at ?? null, isError: event.isError });
+      results.set(`${event.attemptNo ?? ''}:${event.toolUseId}`, {
+        at: event.at ?? null,
+        isError: event.isError,
+      });
     }
   }
   const timings: ToolTiming[] = [];
-  for (const event of events) {
+  for (const event of scoped) {
     if (event.kind !== 'tool_use') continue;
-    const result = event.id ? results.get(event.id) : undefined;
-    const start = event.at ? Date.parse(event.at) : NaN;
-    const end = result?.at ? Date.parse(result.at) : NaN;
-    const ms =
-      Number.isFinite(start) && Number.isFinite(end) && end >= start ? end - start : null;
+    // The common case: the adapter folded this call's result into the row and
+    // resolved the window there, because the result row no longer exists by
+    // the time anything downstream sees the stream.
+    const result = event.id ? results.get(`${event.attemptNo ?? ''}:${event.id}`) : undefined;
+    let ms = event.durationMs ?? null;
+    if (ms === null) {
+      const start = event.at ? Date.parse(event.at) : NaN;
+      const end = result?.at ? Date.parse(result.at) : NaN;
+      ms = Number.isFinite(start) && Number.isFinite(end) && end >= start ? end - start : null;
+    }
     timings.push({
       tool: event.tool,
       detail: event.detail,
       ms,
-      isError: result?.isError === true || event.outputIsError === true,
+      // Both sources: folding moves the flag onto the call's own row, while
+      // a row that was never folded still has its result standing beside it.
+      isError: event.outputIsError === true || result?.isError === true,
     });
   }
   return timings;
@@ -175,9 +209,12 @@ function ToolTimingTable({ timings }: { timings: ToolTiming[] }) {
   );
 }
 
-export function TurnFooter({ job }: { job: AgentJob }) {
+export function TurnFooter({ job, attemptNo }: { job: AgentJob; attemptNo?: number }) {
   const [open, setOpen] = useState(false);
-  const timings = useMemo(() => toolTimings(job.events), [job.events]);
+  // Scoped to the attempt the reader is looking at: the body above already
+  // switches with the attempt picker, and a footer that did not would label
+  // one attempt's transcript with another's numbers.
+  const timings = useMemo(() => toolTimings(job.events, attemptNo), [job.events, attemptNo]);
   const badge = job.continuityMode ? CONTINUITY_LABEL[job.continuityMode] : undefined;
   const duration = formatDuration(job.durationMs);
   const resources = job.resources;

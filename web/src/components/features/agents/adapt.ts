@@ -82,6 +82,25 @@ function toolOutput(payload: Record<string, unknown>): string[] | undefined {
 }
 
 /** Map one stored event onto a UI row, or null when it has nothing to show. */
+/**
+ * The span between a tool call and its result, when both carry a time.
+ *
+ * Message-level by construction: the window opens when the model asked for
+ * the call rather than when the sandbox began running it, so it includes
+ * whatever thinking preceded execution. Returns an empty object rather than
+ * a null field so a row without usable times carries no duration at all.
+ */
+export function durationBetween(
+  startedAt: string | null | undefined,
+  endedAt: string | null | undefined,
+): { durationMs?: number } {
+  if (!startedAt || !endedAt) return {};
+  const start = Date.parse(startedAt);
+  const end = Date.parse(endedAt);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return {};
+  return { durationMs: end - start };
+}
+
 export function toDisplayEvent(event: AgentJobEventApi): AgentEvent | null {
   const payload = event.payload ?? {};
   const type = event.event_type;
@@ -342,6 +361,12 @@ function displayEvents(events: AgentJobEventApi[]): AgentEvent[] {
           ...target,
           output: row.text ? row.text.split('\n') : ['Command completed with no output.'],
           outputIsError: row.isError,
+          // Folding is where the pair still exists. Downstream only sees the
+          // surviving tool_use row, so a consumer that wanted to time the
+          // call — the turn footer does — would find nothing left to pair
+          // with and render every call as unfinished. The window is resolved
+          // here, while both ends are in hand.
+          ...durationBetween(target.at, row.at),
         };
         continue;
       }

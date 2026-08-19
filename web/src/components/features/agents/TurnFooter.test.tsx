@@ -5,6 +5,7 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 // No user-event dependency in this repo; fireEvent is the house click.
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { toDisplayJob } from './adapt';
 import { TurnFooter, formatBytes, formatCpu, formatDuration, toolTimings } from './TurnFooter';
 import type { AgentEvent, AgentJob, TurnResources } from './types';
 
@@ -69,6 +70,14 @@ describe('formatters', () => {
     expect(formatBytes(1024)).toBe('1KB');
     expect(formatBytes(1_288_490_188)).toBe('1.2GB');
     expect(formatCpu(18_200_000)).toBe('18.2s');
+  });
+
+  it('carries rounding across the unit boundary rather than printing past it', () => {
+    // Just under a gigabyte, which rounds to 1024MB before it climbs.
+    expect(formatBytes(1_073_741_823)).toBe('1GB');
+    // Just under a minute, which rounds to 60 seconds before it becomes one.
+    expect(formatDuration(59_960)).toBe('1m');
+    expect(formatDuration(119_600)).toBe('2m');
   });
 });
 
@@ -184,5 +193,97 @@ describe('TurnFooter', () => {
     expect(screen.getByText('cargo build')).toBeInTheDocument();
     expect(screen.getByText('15s')).toBeInTheDocument();
     expect(screen.getByText(/include the model’s own thinking time/)).toBeInTheDocument();
+  });
+});
+
+describe('the per-tool table on real data', () => {
+  // The adapter folds a tool_result into its tool_use row and drops the
+  // result, so a footer that paired the two itself found nothing to pair and
+  // rendered every call as unfinished — in production, while every test that
+  // hand-built both rows passed. These go through the real adapter.
+  const apiJob = {
+    id: 'ajob_1',
+    repo: 'o/r',
+    task_prompt: 'build it',
+    runtime: 'claude-code',
+    model: 'glm-4.6',
+    base_sha: 'abc1234',
+    state: 'done',
+    cancel_requested: false,
+    current_attempt_id: 7,
+    published_pr_url: null,
+    detail: null,
+    spent_usd: null,
+    tokens_in: null,
+    tokens_out: null,
+    model_calls: null,
+    setup_egress_tier: null,
+    agent_egress_tier: null,
+    created_at: '2026-08-19T10:00:00.000Z',
+    updated_at: '2026-08-19T10:01:00.000Z',
+  } as never;
+
+  const apiEvents = [
+    {
+      id: 1,
+      attempt_id: 7,
+      seq: 1,
+      event_type: 'tool_use',
+      payload: { id: 't1', name: 'Bash', detail: 'cargo build' },
+      created_at: '2026-08-19T10:00:00.000Z',
+    },
+    {
+      id: 2,
+      attempt_id: 7,
+      seq: 2,
+      event_type: 'tool_result',
+      payload: { tool_use_id: 't1', content: 'compiled' },
+      created_at: '2026-08-19T10:00:15.000Z',
+    },
+  ] as never;
+
+  it('times a call whose result the adapter folded away', () => {
+    const adapted = toDisplayJob(apiJob, { events: apiEvents });
+
+    const [timing] = toolTimings(adapted.events);
+
+    expect(timing.tool).toBe('Bash');
+    expect(timing.ms).toBe(15_000);
+  });
+
+  it('renders that duration in the footer instead of "unfinished"', () => {
+    const adapted = toDisplayJob(apiJob, { events: apiEvents });
+
+    render(<TurnFooter job={adapted} />);
+    fireEvent.click(screen.getByRole('button', { name: '1 tool call' }));
+
+    expect(screen.getByText('15s')).toBeInTheDocument();
+    expect(screen.queryByText('unfinished')).toBeNull();
+  });
+});
+
+describe('attempt scoping', () => {
+  it('times only the attempt the reader is looking at', () => {
+    const events: AgentEvent[] = [
+      {
+        kind: 'tool_use',
+        tool: 'Bash',
+        detail: 'first try',
+        id: 'dup',
+        attemptNo: 1,
+        durationMs: 1_000,
+      },
+      {
+        kind: 'tool_use',
+        tool: 'Bash',
+        detail: 'second try',
+        id: 'dup',
+        attemptNo: 2,
+        durationMs: 9_000,
+      },
+    ];
+
+    expect(toolTimings(events, 2).map((t) => t.detail)).toEqual(['second try']);
+    expect(toolTimings(events, 1).map((t) => t.ms)).toEqual([1_000]);
   });
 });

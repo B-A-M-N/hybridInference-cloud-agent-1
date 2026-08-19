@@ -25,6 +25,11 @@ export type AgentEvent =
       id?: string;
       /** Event time, ISO. Present so per-tool durations are derivable. */
       at?: string | null;
+      /**
+       * Resolved when this row absorbed its result during folding — the only
+       * moment both ends of the call are still in the same list.
+       */
+      durationMs?: number;
       /** Collapsed tool output preview (mono block), e.g. pytest tail. */
       output?: string[];
       outputIsError?: boolean;

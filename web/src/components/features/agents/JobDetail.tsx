@@ -1295,7 +1295,7 @@ export function JobDetail({ job, onReload }: { job: AgentJob; onReload?: () => v
                 ) : null}
               </div>
 
-              <TurnFooter job={job} />
+              <TurnFooter job={job} attemptNo={attemptNo} />
 
               <OutcomeCard job={job} onOpenDiff={() => openWorkspace('git')} />
             </div>
