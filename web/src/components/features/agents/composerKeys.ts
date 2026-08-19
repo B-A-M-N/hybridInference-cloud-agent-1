@@ -18,6 +18,11 @@ const IME_KEY_CODE = 229;
  * message on the first Chinese, Japanese or Korean word typed, so a keypress
  * made while composing is never a submit. Some browsers report the commit
  * without setting `isComposing`, hence the legacy keyCode alongside it.
+ *
+ * A submit keypress is always consumed, including when the composer has nothing
+ * to send: Enter is the send key here and never the newline, so on an empty box
+ * it does nothing at all rather than growing a blank line. Shift+Enter remains
+ * the way to break a line in any state.
  */
 export function isComposerSubmit(event: KeyboardEvent<HTMLElement>): boolean {
   if (event.key !== 'Enter') return false;

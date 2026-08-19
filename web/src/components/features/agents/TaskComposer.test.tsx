@@ -148,7 +148,9 @@ describe('TaskComposer source-control onboarding', () => {
     const composer = screen.getByRole('textbox');
     fireEvent.change(composer, { target: { value: 'Fix the flaky test' } });
 
-    fireEvent.keyDown(composer, { key: 'Enter', shiftKey: true });
+    // Shift+Enter and Alt+Enter stay the newline, so the browser keeps them.
+    expect(fireEvent.keyDown(composer, { key: 'Enter', shiftKey: true })).toBe(true);
+    expect(fireEvent.keyDown(composer, { key: 'Enter', altKey: true })).toBe(true);
     expect(createAgentJob).not.toHaveBeenCalled();
 
     fireEvent.keyDown(composer, { key: 'Enter' });
@@ -185,15 +187,41 @@ describe('TaskComposer source-control onboarding', () => {
     await waitFor(() => expect(createAgentJob).toHaveBeenCalledTimes(1));
   });
 
-  it('does not run an empty task on Enter', async () => {
+  // One chord per test: a composer that has started a run stays submitting
+  // until it navigates away, so a second send from the same render is meant to
+  // be a no-op and would prove nothing about the chord.
+  async function expectChordSends(modifier: { metaKey?: boolean; ctrlKey?: boolean }) {
+    vi.mocked(getAgentConfig).mockResolvedValue(config());
+    vi.mocked(createAgentJob).mockResolvedValue({ id: 'ajob_1' } as never);
+
+    render(<TaskComposer />);
+    await screen.findByLabelText('Repository');
+
+    const composer = screen.getByRole('textbox');
+    fireEvent.change(composer, { target: { value: 'Fix the flaky test' } });
+    fireEvent.keyDown(composer, { key: 'Enter', ...modifier });
+
+    await waitFor(() => expect(createAgentJob).toHaveBeenCalledTimes(1));
+    expect(navigation.push).toHaveBeenCalledWith('/ajob_1');
+  }
+
+  it('sends the task on \u2318+Enter too', () => expectChordSends({ metaKey: true }));
+
+  it('sends the task on Ctrl+Enter too', () => expectChordSends({ ctrlKey: true }));
+
+  it('swallows Enter on an empty task rather than growing a blank line', async () => {
     vi.mocked(getAgentConfig).mockResolvedValue(config());
 
     render(<TaskComposer />);
     await screen.findByLabelText('Repository');
 
-    fireEvent.change(screen.getByRole('textbox'), { target: { value: '   ' } });
-    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+    const composer = screen.getByRole('textbox');
+    fireEvent.change(composer, { target: { value: '   ' } });
 
+    // Enter is the send key on this composer and never the newline, so with
+    // nothing to send it does nothing at all. Shift+Enter still breaks the line.
+    expect(fireEvent.keyDown(composer, { key: 'Enter' })).toBe(false);
+    expect(fireEvent.keyDown(composer, { key: 'Enter', shiftKey: true })).toBe(true);
     expect(createAgentJob).not.toHaveBeenCalled();
   });
 });
