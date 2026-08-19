@@ -1019,14 +1019,22 @@ def run_agent(
     sampler = ResourceSampler(None)
 
     def _spawn_sampled(process: SandboxProcess) -> SandboxProcess:
-        """Start measuring the sandbox the moment it exists."""
+        """Start measuring the sandbox the moment it exists.
+
+        Everything here is read defensively and contained: this sits directly
+        in the path that starts the agent, so a sampler that raised would not
+        degrade a measurement — it would cost the user their turn.
+        """
         nonlocal sampler
-        if not sampler.active:
-            sampler = ResourceSampler.for_container(
-                process.container,
-                docker_binary=getattr(backend, "docker_binary", "docker"),
-            )
-            sampler.start()
+        try:
+            if not sampler.active:
+                sampler = ResourceSampler.for_container(
+                    getattr(process, "container", None),
+                    docker_binary=getattr(backend, "docker_binary", "docker"),
+                )
+                sampler.start()
+        except Exception as exc:
+            print(f"resource sampler unavailable: {exc}", file=sys.stderr)
         return process
 
     # Hermetic environment, and the *backend's* idea of it rather than the
@@ -1082,11 +1090,12 @@ def run_agent(
         # A hot turn spawns nothing, so the spawn seam above never fires. The
         # rung that reuses a process is exactly the rung whose consumption is
         # least obvious, so it is measured through the session it inherits.
-        sampler = ResourceSampler.for_container(
-            resident.live_session.container,
-            docker_binary=getattr(backend, "docker_binary", "docker"),
-        )
-        sampler.start()
+        with contextlib.suppress(Exception):
+            sampler = ResourceSampler.for_container(
+                getattr(resident.live_session, "container", None),
+                docker_binary=getattr(backend, "docker_binary", "docker"),
+            )
+            sampler.start()
     stale_process = resident is not None and not hot_ok and resident.live_session is not None
     if stale_process and residents is not None and job.thread_id:
         # This turn will advance the thread past the idle process's memory —

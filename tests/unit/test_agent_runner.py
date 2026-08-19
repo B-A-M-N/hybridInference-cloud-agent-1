@@ -1534,3 +1534,35 @@ def test_an_unmeasurable_host_reports_no_resource_rollup(tmp_path):
         "an unmeasurable host reported a rollup; a turn nobody measured must "
         "leave no row rather than a convincing set of zeros"
     )
+
+
+def test_a_sampler_that_cannot_start_never_costs_the_turn(tmp_path, monkeypatch):
+    """The observer must not be able to break what it observes.
+
+    The sampler is wired directly into the path that starts the agent, so a
+    failure there — an unreadable host, a daemon that answers strangely, a
+    process object that cannot say where it runs — has to degrade into a
+    missing measurement rather than a failed turn.
+    """
+    from cloud_agent_host import runner as runner_mod
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("cgroup backend is on fire")
+
+    monkeypatch.setattr(runner_mod.ResourceSampler, "for_container", _explode)
+
+    control, heart = FakeControl(), FakeHeart()
+    code, _tail, _errors = run_agent(
+        _echo_runtime(2),
+        job=_JOB,
+        workdir=str(tmp_path),
+        gateway_base_url="http://gw",
+        control=control,
+        heart=heart,
+        timeout_s=30,
+        backend=ProcessBackend(acknowledged_unsafe=True),
+    )
+
+    assert code == 0, "a failing sampler took the turn down with it"
+    assert [payload["text"] for _kind, payload in control.events] == ["line 0", "line 1"]
+    assert control.resources == []
