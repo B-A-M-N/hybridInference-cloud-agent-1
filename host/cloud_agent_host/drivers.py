@@ -286,6 +286,17 @@ class HarnessSession:
         """Whether :meth:`close` has ended this session."""
         return self._closed
 
+    @property
+    def container(self) -> str | None:
+        """The sandbox container this session's process runs in, if any.
+
+        The host-side resource sampler is the only consumer: a resident turn
+        reuses a process spawned by an earlier turn, so without this the one
+        rung that needs no spawn would be the one rung nobody could measure.
+        Sessions without a live process of their own answer None.
+        """
+        return None
+
     def start_turn(self, turn_input: TurnInput) -> HarnessTurn:
         """Spawn the harness for this turn inside the platform's sandbox."""
         if self._closed:
@@ -581,6 +592,11 @@ class ClaudeCodeLiveSession(ClaudeCodeSession):
         self._lines: Iterator[str] | None = None
         self._model: str | None = None
         self._live_turn: ClaudeCodeLiveTurn | None = None
+
+    @property
+    def container(self) -> str | None:
+        """The container the live process runs in, once it has been spawned."""
+        return self._process.container if self._process is not None else None
 
     def shared_lines(self) -> Iterator[str]:
         """The session's single stdout reader, borrowed by the current turn."""

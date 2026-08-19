@@ -2152,6 +2152,94 @@ class AgentJobStore:
                 )
             )
 
+    async def record_attempt_resources(
+        self,
+        *,
+        attempt_id: int,
+        lease_generation: int,
+        rollup: dict[str, Any],
+    ) -> bool:
+        """Store one attempt's resource rollup, lease-fenced and idempotent.
+
+        Fenced like every other worker write: a superseded attempt must not be
+        able to overwrite what the live one consumed. Idempotent because the
+        runner may retry the post — a rollup describes a closed window, so a
+        repeat is the same window said twice, never a second window to add.
+
+        Absent counters stay NULL: a backend the sampler could not read is not
+        a machine that used nothing, and ``coverage`` says which happened.
+        """
+        async with self._pool.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    WITH live AS (
+                        SELECT id, job_id
+                        FROM agent_attempts
+                        WHERE id = $1 AND lease_generation = $2
+                          AND status = 'running' AND lease_expires_at > NOW()
+                    )
+                    INSERT INTO agent_attempt_resources (
+                        attempt_id, job_id, cpu_usec, mem_peak_bytes, mem_avg_bytes,
+                        io_read_bytes, io_write_bytes, net_rx_bytes, net_tx_bytes,
+                        sample_count, coverage, sampler_version
+                    )
+                    SELECT live.id, live.job_id, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+                    FROM live
+                    ON CONFLICT (attempt_id) DO UPDATE SET
+                        cpu_usec = EXCLUDED.cpu_usec,
+                        mem_peak_bytes = EXCLUDED.mem_peak_bytes,
+                        mem_avg_bytes = EXCLUDED.mem_avg_bytes,
+                        io_read_bytes = EXCLUDED.io_read_bytes,
+                        io_write_bytes = EXCLUDED.io_write_bytes,
+                        net_rx_bytes = EXCLUDED.net_rx_bytes,
+                        net_tx_bytes = EXCLUDED.net_tx_bytes,
+                        sample_count = EXCLUDED.sample_count,
+                        coverage = EXCLUDED.coverage,
+                        sampler_version = EXCLUDED.sampler_version
+                    RETURNING attempt_id
+                    """,
+                    attempt_id,
+                    lease_generation,
+                    rollup.get("cpu_usec"),
+                    rollup.get("mem_peak_bytes"),
+                    rollup.get("mem_avg_bytes"),
+                    rollup.get("io_read_bytes"),
+                    rollup.get("io_write_bytes"),
+                    rollup.get("net_rx_bytes"),
+                    rollup.get("net_tx_bytes"),
+                    int(rollup.get("sample_count") or 0),
+                    float(rollup.get("coverage") or 0.0),
+                    str(rollup.get("sampler_version") or "unknown"),
+                )
+            )
+
+    async def job_turn_telemetry(self, *, job_id: str) -> dict[str, Any] | None:
+        """Read how a job's newest attempt ran: continuity, window, resources.
+
+        Newest attempt rather than the current one: a retried turn's earlier
+        attempts each have their own window, and the one a reader wants is the
+        one that produced the result in front of them. One round trip, because
+        this rides the job-detail read that the thread view already makes.
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT a.continuity_mode, a.started_at, a.finished_at,
+                       r.cpu_usec, r.mem_peak_bytes, r.mem_avg_bytes,
+                       r.io_read_bytes, r.io_write_bytes,
+                       r.net_rx_bytes, r.net_tx_bytes,
+                       r.sample_count, r.coverage, r.sampler_version
+                FROM agent_attempts a
+                LEFT JOIN agent_attempt_resources r ON r.attempt_id = a.id
+                WHERE a.job_id = $1
+                ORDER BY a.attempt_no DESC
+                LIMIT 1
+                """,
+                job_id,
+            )
+            return dict(row) if row else None
+
     async def terminal_workspace_ready(self, *, attempt_id: int) -> bool:
         """Return whether the live attempt currently permits terminal writes.
 

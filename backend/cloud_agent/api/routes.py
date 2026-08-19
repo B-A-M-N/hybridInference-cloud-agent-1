@@ -98,6 +98,7 @@ from cloud_agent.schemas import (
     AgentThreadResponse,
     AgentWorkspaceResponse,
     AgentWorkspaceWriteRequest,
+    AttemptResources,
     GitHubConnectionResponse,
     GitHubConnectRequest,
     McpIntegrationResponse,
@@ -119,6 +120,7 @@ from cloud_agent.schemas import (
     WorkerFinishRequest,
     WorkerHeartbeatRequest,
     WorkerHeartbeatResponse,
+    WorkerResourcesRequest,
     WorkerTerminalSuspendRequest,
 )
 from cloud_agent.source_control import (
@@ -327,7 +329,44 @@ def _egress_tiers() -> tuple[str | None, str | None]:
     return policy.tier_for("setup").value, policy.tier_for("agent").value
 
 
-def _job_response(job: dict[str, Any], usage: dict[str, Any] | None = None) -> AgentJobResponse:
+def _attempt_duration_ms(telemetry: dict[str, Any] | None) -> int | None:
+    """How long the newest attempt ran, or None while it still is."""
+    if not telemetry:
+        return None
+    started, finished = telemetry.get("started_at"), telemetry.get("finished_at")
+    if started is None or finished is None:
+        return None
+    return max(0, int((finished - started).total_seconds() * 1000))
+
+
+def _attempt_resources(telemetry: dict[str, Any] | None) -> AttemptResources | None:
+    """Shape the resource rollup, or None when no sampler ever reported.
+
+    A row whose counters are all null is still returned: it carries
+    ``coverage`` and is how a reader learns the turn was not measured, which
+    is a different statement from a turn that used nothing.
+    """
+    if not telemetry or telemetry.get("sampler_version") is None:
+        return None
+    return AttemptResources(
+        cpu_usec=telemetry.get("cpu_usec"),
+        mem_peak_bytes=telemetry.get("mem_peak_bytes"),
+        mem_avg_bytes=telemetry.get("mem_avg_bytes"),
+        io_read_bytes=telemetry.get("io_read_bytes"),
+        io_write_bytes=telemetry.get("io_write_bytes"),
+        net_rx_bytes=telemetry.get("net_rx_bytes"),
+        net_tx_bytes=telemetry.get("net_tx_bytes"),
+        sample_count=telemetry.get("sample_count") or 0,
+        coverage=float(telemetry.get("coverage") or 0.0),
+        sampler_version=telemetry.get("sampler_version"),
+    )
+
+
+def _job_response(
+    job: dict[str, Any],
+    usage: dict[str, Any] | None = None,
+    telemetry: dict[str, Any] | None = None,
+) -> AgentJobResponse:
     """Shape a store job row for the owner-facing API."""
     usage = usage or {}
     setup_tier, agent_tier = _egress_tiers()
@@ -365,6 +404,9 @@ def _job_response(job: dict[str, Any], usage: dict[str, Any] | None = None) -> A
         model_calls=usage.get("model_calls"),
         setup_egress_tier=setup_tier,
         agent_egress_tier=agent_tier,
+        continuity_mode=(telemetry or {}).get("continuity_mode"),
+        duration_ms=_attempt_duration_ms(telemetry),
+        resources=_attempt_resources(telemetry),
     )
 
 
@@ -1281,7 +1323,11 @@ async def get_agent_job(
     """Fetch one of the caller's agent jobs, with what it has spent so far."""
     job_store = _require_store(store)
     job = await _owned_job(job_store, job_id, user)
-    return _job_response(job, await _job_usage(log_store, job_id))
+    return _job_response(
+        job,
+        await _job_usage(log_store, job_id),
+        await job_store.job_turn_telemetry(job_id=job_id),
+    )
 
 
 @router.post("/jobs/{job_id}/cancel", response_model=AgentJobCancelResponse)
@@ -2936,6 +2982,32 @@ async def worker_report_continuity(
         attempt_id=claims["attempt_id"],
         lease_generation=claims["lease_generation"],
         mode=body.mode,
+    )
+    if not recorded:
+        raise _lease_lost()
+    return WorkerAckResponse(ok=True)
+
+
+@router.post("/worker/jobs/{job_id}/resources", response_model=WorkerAckResponse)
+async def worker_report_resources(
+    job_id: str,
+    body: WorkerResourcesRequest,
+    authorization: str | None = Header(None),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+) -> WorkerAckResponse:
+    """Record one closed attempt window's resource rollup.
+
+    Fenced like every other worker write, and idempotent: the rollup
+    describes a window that is already closed, so a retried post is the same
+    window said twice rather than a second window to add.
+    """
+    job_store = _require_store(store)
+    claims = _worker_claims(authorization)
+    _match_job(claims, job_id)
+    recorded = await job_store.record_attempt_resources(
+        attempt_id=claims["attempt_id"],
+        lease_generation=claims["lease_generation"],
+        rollup=body.model_dump(),
     )
     if not recorded:
         raise _lease_lost()
