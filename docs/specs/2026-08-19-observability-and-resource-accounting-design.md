@@ -340,14 +340,60 @@ sampler coverage < 0.9 sustained; host hot-sandbox budget saturation.
 | **OBS-0** | Collector + Prometheus + Grafana compose on CP host; CP + runner OTel SDK wiring; process-health metrics (up, claim-loop lag, queue depth); env vars into ENVIRONMENT.md + the wiring test | "We have a pulse." No schema changes |
 | **OBS-1** | Ledger/ops projection with severity mapping and deny-body redaction; floor-event metrics incl. the continuity aggregates §9 promised; alert seed set | Closes the blind-tuning gap for residency knobs |
 | **OBS-2** | ResourceSampler + attempt/residency windows + `attempt_resources` + veth totals; Squid logformat extension + flow collector + verdict alerts | First resource facts; security dividend (denied-CONNECT, unclassified-bytes) |
-| **OBS-3** | Tool windows (`message` for all Tier-1) + claude-code hook `exact` upgrade + `tool_call_resources` + per-turn resource line in the thread UI | The per-tool ask, honest about precision |
+| **OBS-3** | Tool windows (`message` for all Tier-1) + claude-code hook `exact` upgrade + `tool_call_resources` + per-turn resource line in the thread UI (§11) | The per-tool ask, honest about precision |
 | **OBS-4** | Candidates, each its own decision: claude-code native OTel passthrough (verify against pinned CLI); MCP relay byte counters; pi native `tool_execution_*` boundaries; spans; #57 gateway-join read path; gateway-side paper events (other repo) | Not committed by this doc |
 
 Phases are ordered so each ships standalone value; OBS-2 and OBS-3 are where
 the review should spend its skepticism (window semantics, caps, hook
 contract).
 
-## 11. Open questions (resolve during review / OBS-0)
+## 11. Product surfaces
+
+What a person actually sees. The DS harness's user-facing observability is
+the transcript itself plus a sharing disclosure — verified: no user-visible
+cost, resource, or diagnostics UI exists in its docs or packages. It is a
+local tool; its user owns the machine and can run `htop` themselves. We are
+hosted: the user cannot see the machine, so the surfaces below are new
+product, not ports.
+
+**End user (thread UI).** v1 settles per turn, at turn close:
+
+- **Turn footer, one line:** continuity badge + duration + inference cost +
+  CPU seconds + peak memory + network in/out + blocked-connection count.
+  Example: `hot · 42s · $0.031 · CPU 18.2s · peak 1.2GB · net ↓34MB ↑2MB ·
+  2 blocked`.
+- **Expanded:** a per-tool table (tool, duration, CPU, peak mem, windowed
+  net; parallel calls labelled *shared — upper bound*), and a network panel
+  (per-domain bytes, allowed/denied verdicts, denied highlighted).
+- **The "explain the weird" surfaces** — the highest-value part: a `replay`
+  badge with a tooltip saying this turn was rebuilt from transcript and why
+  (export failure / host move); the footer separating compute-slow from
+  network-slow; the denied list answering "is it phoning home".
+- **Honesty rules are product copy, not fine print:** shared numbers say
+  shared; a turn with `coverage < 1` shows "resource data incomplete", never
+  a fabricated small number; `message`-level windows are labelled
+  approximate until the hook upgrade.
+
+**Admin.** Grafana folders: health pulse (claim lag, queues), continuity
+funnel (HOT hit-rate per host — #61's data), capacity (hot-sandbox budget
+water-line, idle cost), consumption leaderboard (outlier turns), security
+(denied-CONNECT bursts, unclassified-bytes growth). Slack alerts from the §7
+seed set. Per-attempt detail exposes coverage, sampler version, and
+degradation reason — the support answer to "why did my thread replay".
+
+**Alignment with DS, stated as product:** we adopt its three philosophies —
+transcript fidelity (our floor contract guarantees a never-blank turn;
+Tier-2 remains a raw tail, honestly below their bar), honest degradation
+(they never degrade so never say; we degrade, so we badge it), and
+say-what-you-record (their consent disclosure becomes our transparency
+statement: events, resources, and egress are recorded; tool arguments and
+prompt text never leave the database via telemetry).
+
+**Doors opened, not committed:** runaway protection (live samples make "this
+turn has burned 30 CPU-minutes" a promptable/limitable signal), org usage
+reports, compute-based pricing or quotas.
+
+## 12. Open questions (resolve during review / OBS-0)
 
 1. Runner→collector transport and auth: OTLP/HTTP to the CP-host collector
    over the existing outbound path — bearer token vs. reusing the tunnel.
