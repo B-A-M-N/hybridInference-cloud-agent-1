@@ -137,4 +137,63 @@ describe('TaskComposer source-control onboarding', () => {
     expect(await screen.findByLabelText('Repository')).toHaveValue('owner/default');
     expect(listRepoBranches).toHaveBeenCalledWith('owner/default');
   });
+
+  it('runs the task on Enter and keeps Shift+Enter a newline', async () => {
+    vi.mocked(getAgentConfig).mockResolvedValue(config());
+    vi.mocked(createAgentJob).mockResolvedValue({ id: 'ajob_1' } as never);
+
+    render(<TaskComposer />);
+    await screen.findByLabelText('Repository');
+
+    const composer = screen.getByRole('textbox');
+    fireEvent.change(composer, { target: { value: 'Fix the flaky test' } });
+
+    fireEvent.keyDown(composer, { key: 'Enter', shiftKey: true });
+    expect(createAgentJob).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(composer, { key: 'Enter' });
+
+    await waitFor(() =>
+      expect(createAgentJob).toHaveBeenCalledWith({
+        repo: 'owner/repository',
+        task_prompt: 'Fix the flaky test',
+        runtime: 'claude-code',
+        model: 'model-a',
+        base_ref: 'dev',
+      }),
+    );
+    expect(navigation.push).toHaveBeenCalledWith('/ajob_1');
+  });
+
+  it('leaves Enter to the IME while a candidate is being composed', async () => {
+    vi.mocked(getAgentConfig).mockResolvedValue(config());
+    vi.mocked(createAgentJob).mockResolvedValue({ id: 'ajob_1' } as never);
+
+    render(<TaskComposer />);
+    await screen.findByLabelText('Repository');
+
+    const composer = screen.getByRole('textbox');
+    fireEvent.change(composer, { target: { value: '\u4fee\u590d' } });
+
+    // Committing a Chinese, Japanese or Korean candidate reaches the page as an
+    // Enter keypress. Sending on it would cut the message off mid-word.
+    fireEvent.keyDown(composer, { key: 'Enter', isComposing: true });
+    fireEvent.keyDown(composer, { key: 'Enter', keyCode: 229 });
+    expect(createAgentJob).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(composer, { key: 'Enter' });
+    await waitFor(() => expect(createAgentJob).toHaveBeenCalledTimes(1));
+  });
+
+  it('does not run an empty task on Enter', async () => {
+    vi.mocked(getAgentConfig).mockResolvedValue(config());
+
+    render(<TaskComposer />);
+    await screen.findByLabelText('Repository');
+
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '   ' } });
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+
+    expect(createAgentJob).not.toHaveBeenCalled();
+  });
 });

@@ -4,6 +4,7 @@ import { useRouter } from 'next/navigation';
 import { useEffect, useState } from 'react';
 import { createAgentJob, getAgentConfig, listRepoBranches } from '@/lib/api/agents';
 import type { AgentConfigApi } from '@/lib/api/agents';
+import { isComposerSubmit } from './composerKeys';
 import { ConnectSourceControl } from './ConnectSourceControl';
 import { Picker } from './Picker';
 
@@ -153,6 +154,11 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
           rows={4}
           value={task}
           onChange={(event) => setTask(event.target.value)}
+          onKeyDown={(event) => {
+            if (!isComposerSubmit(event)) return;
+            event.preventDefault();
+            void run();
+          }}
           disabled={disconnected}
           placeholder={
             disconnected
@@ -205,6 +211,7 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
             type="button"
             disabled={!canRun}
             onClick={() => void run()}
+            title="Run — ⏎ to send, ⇧⏎ for a new line"
             className={`ml-auto inline-flex items-center gap-1.5 rounded-lg bg-crimson px-3.5 py-1.5 text-[13px] font-medium text-white shadow-sm transition-colors ${
               canRun ? 'hover:bg-crimson-dark' : 'cursor-not-allowed opacity-60'
             }`}
