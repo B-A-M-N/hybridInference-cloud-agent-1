@@ -97,7 +97,13 @@ describe('toolTimings', () => {
       isError: false,
       at: '2026-08-19T10:00:15.000Z',
     },
-    { kind: 'tool_use', tool: 'Read', detail: 'src/main.rs', id: 't2', at: '2026-08-19T10:00:16.000Z' },
+    {
+      kind: 'tool_use',
+      tool: 'Read',
+      detail: 'src/main.rs',
+      id: 't2',
+      at: '2026-08-19T10:00:16.000Z',
+    },
   ];
 
   it('pairs each call with its result to derive a window', () => {
@@ -114,7 +120,13 @@ describe('toolTimings', () => {
 
   it('marks a failed call from either the result or the tool row', () => {
     const failed: AgentEvent[] = [
-      { kind: 'tool_use', tool: 'Bash', detail: 'exit 1', id: 't9', at: '2026-08-19T10:00:00.000Z' },
+      {
+        kind: 'tool_use',
+        tool: 'Bash',
+        detail: 'exit 1',
+        id: 't9',
+        at: '2026-08-19T10:00:00.000Z',
+      },
       {
         kind: 'tool_result',
         text: 'boom',
@@ -129,7 +141,9 @@ describe('toolTimings', () => {
 
 describe('TurnFooter', () => {
   it('shows the continuity rung and what the turn consumed', () => {
-    render(<TurnFooter job={job({ continuityMode: 'hot', durationMs: 42_000, resources: RESOURCES })} />);
+    render(
+      <TurnFooter job={job({ continuityMode: 'hot', durationMs: 42_000, resources: RESOURCES })} />,
+    );
     expect(screen.getByText('hot')).toBeInTheDocument();
     expect(screen.getByText('42s')).toBeInTheDocument();
     expect(screen.getByText('18.2s')).toBeInTheDocument();
