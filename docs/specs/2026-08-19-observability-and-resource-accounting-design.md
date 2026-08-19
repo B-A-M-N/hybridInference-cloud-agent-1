@@ -355,16 +355,18 @@ experience) ship first; everything admin-facing is deferred wholesale.
 | Phase | Content | Note |
 |---|---|---|
 | **CHAT-1** | The footer's free half + the resource spine: continuity badge + tooltip and turn duration (from `continuity_mode` and attempt timestamps — **already recorded**; API exposure + UI only) and the per-tool duration table derived from stored `tool_use`/`tool_result` events (`message` windows, labelled approximate); plus ResourceSampler + attempt windows + `attempt_resources` + veth totals → footer CPU / peak-mem / net numbers | One PR, one repo (host + backend + web). The DS-alignment payoff — the honest-degradation badge — costs zero new measurement |
-| **CHAT-2** | Squid logformat extension (`%>st`, `%tr`) + flow parser + `egress_flows` → network panel (per-domain bytes, denied highlighted) + blocked count in the footer | The security dividend, made user-visible |
-| **CHAT-3** | Per-tool resource correlation (windowed attribution, `tool_call_resources`, shared/overlap labelling) + claude-code hook `exact` upgrade | The precision rung; contract tests 2, 3, 6 |
-| **CHAT-4** | Per-turn $ in the footer via the #57 gateway read path (bracketed `api_logs` view) | Footer ships without $ until the gateway join exists |
+| **CHAT-2** | The Trajectory view — a second tab beside Chat on a thread: full event list (user / assistant / tool / context) with per-call drill-down (payload, result, duration, timing-source label), session minimap strip, bottom stats bar (turns, steps, model-time vs tool-time split, TTFT, tok/s where usage events carry counts), search, session-log export | Pure read of `agent_job_events` — no schema changes, frontend-heavy. The DS-parity surface (§11) |
+| **CHAT-3** | Squid logformat extension (`%>st`, `%tr`) + flow parser + `egress_flows` → network panel (per-domain bytes, denied highlighted) + blocked count in the footer | The security dividend, made user-visible |
+| **CHAT-4** | Per-tool resource correlation (windowed attribution, `tool_call_resources`, shared/overlap labelling) + claude-code hook `exact` upgrade — upgrades both the footer expand and the Trajectory timing tab | The precision rung; contract tests 2, 3, 6 |
+| **CHAT-5** | Per-turn $ in the footer via the #57 gateway read path (bracketed `api_logs` view) | Footer ships without $ until the gateway join exists |
 | **DEFERRED — admin layer** | emit() seam + severity mapping + ops projection; CP aggregate API + console admin pages; alert checker + §7 seed set | Direction agreed in this doc; picked up when admin observability is prioritized |
 | **Later candidates** | Standard metrics stack (OTLP → Prometheus/Grafana) behind the seam; claude-code native OTel passthrough (verify against pinned CLI); MCP relay byte counters; pi native `tool_execution_*` boundaries; spans; gateway-side paper events (other repo) | Not committed by this doc |
 
 Ordered so the user-visible chat experience lands first. CHAT-1's badge and
-duration columns are pure exposure of data the platform already records, so
-the first PR's only genuinely new machinery is the sampler. CHAT-3 is where
-review skepticism belongs (window semantics, caps, hook contract).
+duration columns and the whole of CHAT-2 are pure exposure of data the
+platform already records, so the only genuinely new machinery before CHAT-3
+is the sampler. CHAT-4 is where review skepticism belongs (window
+semantics, caps, hook contract).
 
 ## 11. Product surfaces
 
@@ -388,6 +390,18 @@ product, not ports.
   badge with a tooltip saying this turn was rebuilt from transcript and why
   (export failure / host move); the footer separating compute-slow from
   network-slow; the denied list answering "is it phoning home".
+- **The Trajectory view — the DS-parity surface.** A second tab beside the
+  chat, mirroring the DS harness's own Trajectory page: the full event list
+  (user / assistant / tool / context rows) with a per-call drill-down panel
+  (payload, result, duration, and a timing-source label — DS's panel labels
+  its source too), a session minimap strip, a bottom stats bar (turns,
+  steps, model-time vs tool-time, TTFT, tok/s where usage events carry
+  counts), search, and session-log export. This is a pure read of the
+  stored event ledger. Two honest gaps against DS, both labelled in the UI:
+  call timing is message-level until the CHAT-4 hook upgrade, and a schema
+  tab can only cover tools we recognize (runtime catalogs plus what the MCP
+  relay saw) — unknown tools show name and payload only. Tier-2 threads
+  degrade to the raw tail, floor events only.
 - **Honesty rules are product copy, not fine print:** shared numbers say
   shared; a turn with `coverage < 1` shows "resource data incomplete", never
   a fabricated small number; `message`-level windows are labelled
