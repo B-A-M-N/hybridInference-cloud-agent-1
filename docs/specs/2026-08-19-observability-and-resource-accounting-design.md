@@ -257,8 +257,12 @@ by attempt, not window.
 ```text
 attempt_resources: attempt_id PK, cpu_usec, mem_peak_bytes, mem_avg_bytes,
   io_read_bytes, io_write_bytes, net_rx_bytes, net_tx_bytes,
-  net_gateway_bytes, net_mcp_bytes, net_egress_bytes, net_unclassified_bytes,
   sample_count, coverage, sampler_version, created_at
+  — the four classification columns (net_gateway_bytes, net_mcp_bytes,
+  net_egress_bytes, net_unclassified_bytes) land with CHAT-3, which is what
+  parses the egress log; adding them earlier would ship four columns that
+  nothing can populate and that a reader could not distinguish from
+  measured zeroes
 
 tool_call_resources: attempt_id, tool_use_id, tool_name, source(exact|message),
   started_at, ended_at, overlap_n_max,
