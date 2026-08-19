@@ -32,6 +32,7 @@ import json
 import os
 import re
 import secrets
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Request
@@ -96,6 +97,7 @@ from cloud_agent.schemas import (
     AgentThreadMessageResponse,
     AgentThreadPinResponse,
     AgentThreadResponse,
+    AgentThreadStatsResponse,
     AgentWorkspaceResponse,
     AgentWorkspaceWriteRequest,
     AttemptResources,
@@ -132,6 +134,7 @@ from cloud_agent.source_control import (
 )
 from cloud_agent.storage.store import PUBLISHING, RUNNING, TERMINAL_STATES
 from cloud_agent.terminal_coordination import resume_settled_terminal
+from cloud_agent.thread_stats import summarize_thread
 from cloud_agent.tokens import (
     SCOPE_FULL,
     SCOPE_MCP,
@@ -1646,6 +1649,34 @@ async def get_agent_thread(
         created_at=_iso(thread["created_at"]),
         updated_at=_iso(thread["updated_at"]),
     )
+
+
+@router.get("/jobs/{job_id}/thread/stats", response_model=AgentThreadStatsResponse)
+async def get_agent_thread_stats(
+    job_id: str,
+    user: dict[str, Any] = Depends(require_agent_owner),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+) -> AgentThreadStatsResponse:
+    """Summarize the thread containing a job: turns, timings, tokens.
+
+    Every number is derived from rows the platform already writes, so a
+    thread that predates this endpoint answers it in full. Measures the
+    thread's runtime does not report come back ``null`` rather than zero.
+    """
+    job_store = _require_store(store)
+    await _owned_job(job_store, job_id, user)
+    inputs = await job_store.thread_stats_inputs(job_id=job_id, user_id=user["user_id"])
+    if inputs is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": {"type": "not_found", "message": f"No thread for {job_id}"}},
+        )
+    stats = summarize_thread(
+        job_ids=inputs["job_ids"],
+        attempts=inputs["attempts"],
+        events=inputs["events"],
+    )
+    return AgentThreadStatsResponse(thread_id=inputs["thread_id"], **asdict(stats))
 
 
 @router.get("/jobs/{job_id}/events", response_model=AgentJobEventsResponse)

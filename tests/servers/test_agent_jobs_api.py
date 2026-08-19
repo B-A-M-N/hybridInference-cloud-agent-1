@@ -327,6 +327,28 @@ class FakeAgentJobStore:
             "jobs": jobs,
         }
 
+    async def thread_stats_inputs(self, *, job_id: str, user_id: str) -> dict[str, Any] | None:
+        job = self.jobs.get(job_id)
+        if job is None or job["user_id"] != user_id:
+            return None
+        thread_id = job["thread_id"]
+        thread_jobs = sorted(
+            (item for item in self.jobs.values() if item["thread_id"] == thread_id),
+            key=lambda item: item["turn_no"],
+        )
+        job_ids = [item["id"] for item in thread_jobs]
+        return {
+            "thread_id": thread_id,
+            "job_ids": job_ids,
+            # This stand-in stamps no clocks (``append_event`` stores
+            # ``created_at: None``), so the timings come back zero here and
+            # the arithmetic is pinned by ``tests/unit/test_thread_stats.py``
+            # instead. What this fake is for is the HTTP contract: ownership,
+            # shape, and the counts that need no clock.
+            "attempts": [{"job_id": item["id"], "started_at": None} for item in thread_jobs],
+            "events": [event for event in self.events if event["job_id"] in set(job_ids)],
+        }
+
     async def follow_up_context(self, *, job_id: str) -> dict[str, Any]:
         job = self.jobs[job_id]
         parent_id = job.get("parent_job_id")
@@ -971,6 +993,114 @@ async def test_repo_filter_rejects_a_value_git_would_read_as_an_option(client: A
     """The filter is shape-checked like the create field it mirrors."""
     rejected = await client.get("/v1/agent/jobs?repo=--upload-pack=sh")
     assert rejected.status_code == 422
+
+
+def _seed_event(
+    store: FakeAgentJobStore,
+    *,
+    job_id: str,
+    seq: int,
+    event_type: str,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    """Put one event straight into the stand-in, bypassing the fenced write."""
+    store.events.append(
+        {
+            "id": len(store.events) + 1,
+            "job_id": job_id,
+            "attempt_id": 1,
+            "seq": seq,
+            "event_type": event_type,
+            "payload": payload or {},
+            "created_at": None,
+        }
+    )
+
+
+async def test_thread_stats_summarize_every_turn_in_the_thread(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """The bar counts the whole conversation, not just the job asked about."""
+    parent_id = await _create_job(client)
+    follow_up = await client.post(
+        f"/v1/agent/jobs/{parent_id}/follow-ups",
+        json={"prompt": "and the docs too"},
+    )
+    child_id = follow_up.json()["id"]
+    _seed_event(
+        store,
+        job_id=parent_id,
+        seq=1,
+        event_type="tool_use",
+        payload={"id": "a", "name": "bash", "usage": {"input_tokens": 100, "output_tokens": 10}},
+    )
+    _seed_event(
+        store,
+        job_id=parent_id,
+        seq=2,
+        event_type="tool_result",
+        payload={"tool_use_id": "a", "is_error": True},
+    )
+    _seed_event(
+        store,
+        job_id=child_id,
+        seq=3,
+        event_type="message",
+        payload={"text": "done", "usage": {"input_tokens": 40, "output_tokens": 5}},
+    )
+
+    # Either end of the thread answers with the same thread-wide summary.
+    for job_id in (parent_id, child_id):
+        response = await client.get(f"/v1/agent/jobs/{job_id}/thread/stats")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["thread_id"] == follow_up.json()["thread_id"]
+        assert body["turns"] == 2
+        assert body["tool_calls"] == 1
+        assert body["failed_tool_calls"] == 1
+        assert body["input_tokens"] == 140
+        assert body["output_tokens"] == 15
+        assert body["tokens_source"] == "runtime"
+        assert body["timing_source"] == "message_events"
+
+
+async def test_thread_stats_report_absent_tokens_as_null(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """A runtime that reports no usage must not look like one that used none."""
+    job_id = await _create_job(client)
+    _seed_event(store, job_id=job_id, seq=1, event_type="raw", payload={"text": "tier-2 tail"})
+
+    body = (await client.get(f"/v1/agent/jobs/{job_id}/thread/stats")).json()
+
+    assert body["input_tokens"] is None
+    assert body["output_tokens"] is None
+    assert body["cache_hit_ratio"] is None
+    assert body["output_tokens_per_second"] is None
+    assert body["tokens_source"] == "unavailable"
+
+
+async def test_thread_stats_are_owner_scoped(client: AsyncClient, store: FakeAgentJobStore):
+    """Someone else's thread is not summarizable, same as it is not readable."""
+    job_id = await _create_job(client)
+    store.jobs[job_id]["user_id"] = _OTHER
+
+    response = await client.get(f"/v1/agent/jobs/{job_id}/thread/stats")
+
+    assert response.status_code == 404
+
+
+async def test_thread_stats_answer_a_thread_that_never_ran(client: AsyncClient):
+    """A queued thread has no events yet and still renders a bar."""
+    job_id = await _create_job(client)
+
+    body = (await client.get(f"/v1/agent/jobs/{job_id}/thread/stats")).json()
+
+    assert body["turns"] == 1
+    assert body["tool_calls"] == 0
+    assert body["wall_seconds"] == 0.0
+    assert body["ttft_seconds"] is None
 
 
 async def test_archived_threads_leave_the_active_project_tree(client: AsyncClient):

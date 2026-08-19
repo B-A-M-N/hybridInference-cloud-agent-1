@@ -286,6 +286,32 @@ class AgentThreadResponse(BaseModel):
     updated_at: str | None = None
 
 
+class AgentThreadStatsResponse(BaseModel):
+    """Aggregate numbers for a thread, derived from its stored events.
+
+    Optional fields are ``null`` when the thread's runtime does not report
+    the underlying measure — never ``0``, which a reader would take as a
+    measured fact. ``timing_source`` and ``tokens_source`` tell a client how
+    much to trust the rest, so the UI can label what it renders.
+    """
+
+    thread_id: str
+    turns: int
+    tool_calls: int
+    failed_tool_calls: int
+    wall_seconds: float
+    model_seconds: float
+    tool_seconds: float
+    ttft_seconds: float | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_hit_ratio: float | None = None
+    output_tokens_per_second: float | None = None
+    tokens_source: str
+    timing_source: str
+
+
 class AgentJobArtifactResponse(BaseModel):
     """One stored artifact (e.g. the produced patch)."""
 

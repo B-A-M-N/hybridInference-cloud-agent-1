@@ -106,6 +106,28 @@ export interface AgentThreadApi {
   updated_at?: string | null;
 }
 
+/**
+ * Aggregate numbers for a thread. A null field means the thread's runtime
+ * does not report that measure — render it as a dash, never as a zero.
+ */
+export interface AgentThreadStatsApi {
+  thread_id: string;
+  turns: number;
+  tool_calls: number;
+  failed_tool_calls: number;
+  wall_seconds: number;
+  model_seconds: number;
+  tool_seconds: number;
+  ttft_seconds: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_hit_ratio: number | null;
+  output_tokens_per_second: number | null;
+  tokens_source: string;
+  timing_source: string;
+}
+
 export interface AgentJobEventApi {
   id: number;
   attempt_id: number;
@@ -402,6 +424,16 @@ export async function getAgentJobThread(jobId: string): Promise<AgentThreadApi |
   const resp = await fetchWithAuth(API_BASE, `/v1/agent/jobs/${encodeURIComponent(jobId)}/thread`);
   if (resp.status === 404) return null;
   return jsonOrThrow<AgentThreadApi>(resp);
+}
+
+/** Load a thread's aggregate stats. Old standalone jobs return null. */
+export async function getAgentThreadStats(jobId: string): Promise<AgentThreadStatsApi | null> {
+  const resp = await fetchWithAuth(
+    API_BASE,
+    `/v1/agent/jobs/${encodeURIComponent(jobId)}/thread/stats`,
+  );
+  if (resp.status === 404) return null;
+  return jsonOrThrow<AgentThreadStatsApi>(resp);
 }
 
 export async function createAgentJob(body: CreateAgentJobRequest): Promise<AgentJobApi> {

@@ -27,6 +27,7 @@ import { lifecyclePhaseLabel, toDiffFileDetails } from './adapt';
 import { PaneResizer } from './PaneResizer';
 import { Picker } from './Picker';
 import { TerminalWorkspace } from './TerminalWorkspace';
+import { ThreadStatsBar } from './ThreadStatsBar';
 import type { AgentEvent, AgentJob, AgentThreadMessage } from './types';
 import { TurnFooter } from './TurnFooter';
 import { useResizablePane } from './useResizablePane';
@@ -1373,6 +1374,7 @@ export function JobDetail({ job, onReload }: { job: AgentJob; onReload?: () => v
                   </button>
                 </div>
               </form>
+              <ThreadStatsBar job={job} />
               {actionError ? (
                 <p className="mt-2 text-center text-xs text-red-600" role="alert">
                   {actionError}
