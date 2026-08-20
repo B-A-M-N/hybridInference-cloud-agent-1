@@ -69,10 +69,13 @@ from cloud_agent_host.runtimes import (
     get_runtime,
 )
 from cloud_agent_host.sandbox import (
+    SANDBOX_PATH,
     SandboxBackend,
+    SandboxError,
     SandboxProcess,
     SandboxSpec,
     build_backend_from_env,
+    runtime_bin_dir,
 )
 from cloud_agent_host.setup import build_cache_from_env, run_setup
 from cloud_agent_host.workspace_paths import purge_stale_workspaces, workspace_path
@@ -224,6 +227,11 @@ class ClaimedJob:
     # about where they actually are, because the sandbox reaches them through
     # the gateway's proxy rather than directly.
     mcp_servers: list[str] = field(default_factory=list)
+    # The CLI version the control plane stamped on this attempt, resolved from
+    # the thread's pin, the deployment's selection, or this host's default.
+    # ``None`` from a control plane that predates selection — the image's
+    # symlinked default then applies, which is what that control plane means.
+    runtime_version: str | None = None
 
     @classmethod
     def from_response(cls, body: dict[str, Any]) -> ClaimedJob:
@@ -256,6 +264,7 @@ class ClaimedJob:
             context_patch=body.get("context_patch") or None,
             context_checkpoint=body.get("context_checkpoint") or None,
             mcp_servers=list(body.get("mcp_servers") or []),
+            runtime_version=body.get("runtime_version") or None,
         )
 
 
@@ -989,6 +998,63 @@ def state_from_checkpoint(envelope: dict[str, Any]) -> HarnessState | None:
     return HarnessState(session_id=session_id, blob=blob)
 
 
+def runtime_version_unavailable(job: ClaimedJob, backend: SandboxBackend) -> str | None:
+    """Why this host cannot run the version the attempt is stamped with, if so.
+
+    Normally unreachable: the control plane refuses a selection no host offers,
+    and the claim falls back when the *claiming* host does not list it. What is
+    left is drift — a host rebuilt with a shorter menu, claiming in the window
+    before its heartbeat says so.
+
+    Checked against the image's own labels rather than by probing inside the
+    container. ``install-runtimes.sh`` installs and labels from the same
+    argument and fails the build when a version does not install, so a version
+    the labels offer is a version the image holds.
+    """
+    version = job.runtime_version
+    if not version:
+        # No selection reached this attempt — an older control plane, or a host
+        # that never reported a version. The image default is exactly right.
+        return None
+    stamper = getattr(backend, "version_stamp", None)
+    stamp: dict[str, Any] = stamper() if stamper is not None else {}
+    available = (stamp.get("runtime_versions_available") or {}).get(job.runtime)
+    if available is None or version in available:
+        return None
+    return (
+        f"this attempt is stamped {job.runtime} {version}, which this host's sandbox "
+        f"image does not contain (it offers: {', '.join(available) or 'nothing'}). "
+        "Rebuild the image with that version in its *_EXTRA_VERSIONS, or clear the "
+        "selection on the admin page."
+    )
+
+
+def _select_runtime_version(
+    env: dict[str, str], *, job: ClaimedJob, backend: SandboxBackend
+) -> None:
+    """Point the sandbox's PATH at the CLI version this attempt is stamped with.
+
+    A PATH prepend is the whole mechanism: every runtime resolves its binary by
+    name — ``binary = "claude"``, and the pi/opencode/kilo wrappers end in
+    ``os.execvp("pi", ...)`` — so neither the adapters nor the wrappers have to
+    know a version was chosen.
+
+    **Raises rather than falling back**, even though ``run_once`` has already
+    reported the same condition as a failed attempt. With the versioned
+    directory absent the binary name still resolves — to the image's symlinked
+    default — and the job would run a different CLI than its attempt records.
+    That row is what the heartbeat, the audit trail and the checkpoint gate all
+    read as fact, and nothing downstream could notice it was wrong. A refused
+    attempt is recoverable; a false record is not.
+    """
+    reason = runtime_version_unavailable(job, backend)
+    if reason is not None:
+        raise SandboxError(reason)
+    if job.runtime_version:
+        bin_dir = runtime_bin_dir(job.runtime, job.runtime_version)
+        env["PATH"] = f"{bin_dir}:{env.get('PATH', SANDBOX_PATH)}"
+
+
 def run_agent(
     runtime: AgentRuntime,
     *,
@@ -1115,6 +1181,7 @@ def _run_agent(
     # worse still — it would hand the agent whatever the host is carrying.
     base_env = dict(backend.base_env())
     base_env.update(_SAFE_DIRECTORY_ENV)
+    _select_runtime_version(base_env, job=job, backend=backend)
 
     driver = driver_for(runtime)
     context = LaunchContext(
@@ -1706,6 +1773,14 @@ def run_once(
                 )
                 return 1
 
+        # Before the agent, and reported rather than raised: an attempt that
+        # dies on a lease timeout tells an operator nothing, and this one has a
+        # specific, actionable cause.
+        version_problem = runtime_version_unavailable(job, backend)
+        if version_problem is not None:
+            finish_attempt("failed", version_problem, base_sha=base_sha)
+            return 1
+
         # Everything before this point is trusted workspace preparation.
         # Retained terminals resume only for the agent execution window.
         control.resume_terminals()
@@ -2076,6 +2151,7 @@ def run_forever(
             sandbox_runtime=stamp.get("sandbox_runtime"),
             sandbox_image_digest=stamp.get("sandbox_image_digest"),
             runtime_versions=stamp.get("runtime_versions"),
+            runtime_versions_available=stamp.get("runtime_versions_available"),
             residency_beats=residents.beats,
             on_residencies_lost=residents.handle_lost,
         )

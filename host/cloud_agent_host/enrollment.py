@@ -291,6 +291,7 @@ def heartbeat(
     sandbox_runtime: str | None = None,
     sandbox_image_digest: str | None = None,
     runtime_versions: dict[str, str] | None = None,
+    runtime_versions_available: dict[str, list[str]] | None = None,
     residencies: list[dict[str, Any]] | None = None,
     on_residencies_lost: Callable[[list[str]], None] | None = None,
 ) -> HostIdentity:
@@ -304,6 +305,11 @@ def heartbeat(
     (``""`` = shared-kernel runc, a positive statement), the sandbox image
     digest, and the CLI versions baked into that image. ``None`` means "not
     reported" and leaves the control plane's last knowledge in place.
+
+    ``runtime_versions`` is the *default* per runtime and
+    ``runtime_versions_available`` the whole menu this image holds. The admin
+    page offers the menu and the claim validates a stored selection against it,
+    so a host that stops reporting a version stops being asked to run it.
     """
     answer = _post(
         f"{base_url.rstrip('/')}/v1/agent/host/heartbeat",
@@ -315,6 +321,7 @@ def heartbeat(
             "sandbox_runtime": sandbox_runtime,
             "sandbox_image_digest": sandbox_image_digest,
             "runtime_versions": runtime_versions,
+            "runtime_versions_available": runtime_versions_available,
             "residencies": residencies,
         },
         bearer=identity.credential,
@@ -510,6 +517,7 @@ class HostHeartbeat:
         sandbox_runtime: str | None = None,
         sandbox_image_digest: str | None = None,
         runtime_versions: dict[str, str] | None = None,
+        runtime_versions_available: dict[str, list[str]] | None = None,
         residency_beats: Callable[[], list[dict[str, Any]]] | None = None,
         on_residencies_lost: Callable[[list[str]], None] | None = None,
     ) -> None:
@@ -522,6 +530,7 @@ class HostHeartbeat:
         self._sandbox_runtime = sandbox_runtime
         self._sandbox_image_digest = sandbox_image_digest
         self._runtime_versions = runtime_versions
+        self._runtime_versions_available = runtime_versions_available
         # Freshly asked on every beat — a static list would report sandboxes
         # the pool has already torn down.
         self._residency_beats = residency_beats
@@ -586,6 +595,7 @@ class HostHeartbeat:
                     sandbox_runtime=self._sandbox_runtime,
                     sandbox_image_digest=self._sandbox_image_digest,
                     runtime_versions=self._runtime_versions,
+                    runtime_versions_available=self._runtime_versions_available,
                     residencies=(
                         self._residency_beats() if self._residency_beats is not None else None
                     ),

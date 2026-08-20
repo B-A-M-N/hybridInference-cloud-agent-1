@@ -29,6 +29,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from cloud_agent_host.runtimes import registered_runtimes
+
 REPO = Path(__file__).resolve().parents[2]
 DOCKERFILE = REPO / "deploy/sandbox/Dockerfile.agent-sandbox"
 SANDBOX_HOST = REPO / "deploy/host/sandbox_host.sh"
@@ -36,18 +38,50 @@ SANDBOX_HOST = REPO / "deploy/host/sandbox_host.sh"
 #: `ARG NAME_VERSION=1.2.3` — a pin, with the default that makes it optional.
 _ARG_PIN = re.compile(r"^ARG ([A-Z0-9_]+_VERSION)=(\S+)$", re.MULTILINE)
 
-#: `NAME="$(env_or_dotenv NAME)"` — the script's explicit configuration reads.
-_SCRIPT_READ = re.compile(r"env_or_dotenv ([A-Z0-9_]+_VERSION)\)")
+#: `ARG NAME_EXTRA_VERSIONS=` — the menu's optional tail, empty by default.
+_ARG_EXTRA = re.compile(r"^ARG ([A-Z0-9_]+_EXTRA_VERSIONS)=$", re.MULTILINE)
 
-#: The `for name in A B C; do` list that becomes `--build-arg`.
-_PASS_THROUGH = re.compile(r"for name in ((?:[A-Z0-9_]+_VERSION[ \t]*)+);")
+#: `ARG NAME_VERSIONS=${NAME_VERSION}...` — the derived menu behind each label.
+_ARG_MENU = re.compile(r"^ARG ([A-Z0-9_]+_VERSIONS)=\$\{", re.MULTILINE)
+
+#: `NAME="$(env_or_dotenv NAME)"` — the script's explicit configuration reads.
+_SCRIPT_READ = re.compile(r"env_or_dotenv ([A-Z0-9_]+_VERSIONS?)\)")
+
+#: Everything between `for name in` and `; do`. Matched as one span rather than
+#: as a list of names so that reformatting the loop cannot quietly shrink what
+#: this test believes it covers. The script has more than one loop of this
+#: shape — `require_env` iterates credentials — so the caller picks the version
+#: one by content rather than by position.
+_PASS_THROUGH = re.compile(r"for name in ([A-Z0-9_ \t\\\n]+); do")
+
+
+def _passed_to_docker_build(script: str) -> set[str] | None:
+    """The names the `--build-arg` loop iterates, or None if it is gone."""
+    for names in _PASS_THROUGH.findall(script):
+        if "_VERSION" in names:
+            # The loop wraps, so the span carries line continuations.
+            return set(names.replace("\\", " ").split())
+    return None
+
 
 #: `check claude "${CLAUDE_CODE_VERSION}"` at the end of the image build.
 _VERIFIED = re.compile(r'check \S+ "\$\{([A-Z0-9_]+_VERSION)\}"')
 
+#: `install-runtimes.sh <id> <pkg> <bin> "${NAME_VERSIONS}"` — the install call.
+_INSTALL = re.compile(r'install-runtimes\.sh \S+ \S+ \S+ "\$\{([A-Z0-9_]+_VERSIONS)\}"')
+
 
 def _pins() -> dict[str, str]:
     return dict(_ARG_PIN.findall(DOCKERFILE.read_text()))
+
+
+def _extras() -> set[str]:
+    return set(_ARG_EXTRA.findall(DOCKERFILE.read_text()))
+
+
+def _configurable() -> set[str]:
+    """Every build argument a deployment is allowed to set."""
+    return set(_pins()) | _extras()
 
 
 def test_every_pin_has_a_reviewed_default() -> None:
@@ -62,13 +96,12 @@ def test_the_deploy_script_passes_through_exactly_the_pins() -> None:
     """A pin the deploy cannot set is a pin an operator will set and lose."""
     script = SANDBOX_HOST.read_text()
     read = set(_SCRIPT_READ.findall(script))
-    match = _PASS_THROUGH.search(script)
-    assert match, "sandbox_host.sh has no --build-arg pass-through loop — regex drift?"
-    passed = set(match.group(1).split())
+    passed = _passed_to_docker_build(script)
+    assert passed is not None, "sandbox_host.sh has no --build-arg pass-through loop"
 
-    assert read == set(_pins()), (
+    assert read == _configurable(), (
         "deploy/host/sandbox_host.sh reads "
-        f"{sorted(read)} but the Dockerfile pins {sorted(_pins())}"
+        f"{sorted(read)} but the Dockerfile offers {sorted(_configurable())}"
     )
     assert passed == read, (
         f"sandbox_host.sh reads {sorted(read)} but only passes {sorted(passed)} "
@@ -92,10 +125,11 @@ def test_the_example_offers_every_pin() -> None:
     assigned = {
         match.group(1)
         for line in example.splitlines()
-        if (match := re.match(r"\s*([A-Z0-9_]+_VERSION)=", line))
+        if (match := re.match(r"\s*([A-Z0-9_]+_VERSIONS?)=", line))
     }
-    assert assigned == set(_pins()), (
-        f"deploy/host/.env.example offers {sorted(assigned)}, pins are {sorted(_pins())}"
+    assert assigned == _configurable(), (
+        f"deploy/host/.env.example offers {sorted(assigned)}, "
+        f"the Dockerfile takes {sorted(_configurable())}"
     )
 
 
@@ -191,3 +225,53 @@ def test_a_pin_in_dotenv_reaches_docker_build(tmp_path: Path) -> None:
     # And only that one. A pin nobody set must not be passed as empty, which
     # would override the Dockerfile default with nothing and install `pkg@`.
     assert build.count("--build-arg") == 1, build
+
+
+# ── The menu ─────────────────────────────────────────────────────────────
+
+
+def test_every_runtime_offers_a_menu_derived_from_its_pin() -> None:
+    """A label may only advertise versions the same build actually installed.
+
+    `.versions` is what the admin page offers and what the claim validates a
+    selection against. Derived from the pin plus that runtime's extras, and
+    never passed in directly, so there is no build in which the menu names a
+    version the install loop never saw.
+    """
+    dockerfile = DOCKERFILE.read_text()
+    menus = set(_ARG_MENU.findall(dockerfile))
+
+    expected = {f"{name}S" for name in _pins()}
+    assert menus == expected, f"menus {sorted(menus)} do not match the pins {sorted(expected)}"
+
+    for pin in _pins():
+        menu = re.search(rf"^ARG {pin}S=(\S+)$", dockerfile, re.MULTILINE)
+        assert menu, f"no menu derived for {pin}"
+        # Default first: `install-runtimes.sh` symlinks the head of the list
+        # onto PATH, so a menu that led with the extras would silently change
+        # what a job with no selection runs.
+        assert menu.group(1).startswith("${" + pin + "}"), (
+            f"{pin}S must start with the pin — the first entry is the default"
+        )
+        assert f"{pin[: -len('_VERSION')]}_EXTRA_VERSIONS" in menu.group(1)
+
+
+def test_the_install_reads_the_menu_not_the_pin() -> None:
+    """Installing the pin alone would leave the extras advertised and absent."""
+    installed = set(_INSTALL.findall(DOCKERFILE.read_text()))
+    assert installed == {f"{name}S" for name in _pins()}, (
+        f"install-runtimes.sh is called with {sorted(installed)}; every runtime "
+        "must be installed from its menu, or a label offers a version no job can run"
+    )
+
+
+def test_every_menu_is_labelled() -> None:
+    """An unlabelled menu is a host that reports one option and holds several."""
+    dockerfile = DOCKERFILE.read_text()
+    for runtime_id in registered_runtimes():
+        for suffix in ("version", "versions"):
+            assert re.search(
+                rf"org\.freeinference\.runtime\.{re.escape(runtime_id)}\.{suffix}="
+                r'"\$\{[A-Z0-9_]+\}"',
+                dockerfile,
+            ), f"{runtime_id} has no .{suffix} label"

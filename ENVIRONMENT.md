@@ -229,6 +229,27 @@ the agent-loop conformance suite before shipping one.
 | `OPENCODE_VERSION` | **NEW** | `opencode-ai`. |
 | `KILO_VERSION` | **NEW** | `@kilocode/cli`. |
 
+Each runtime also takes a `*_EXTRA_VERSIONS` — comma-separated, blank by
+default — naming **additional** versions the same image carries beside the
+default above. That list is the *menu*: build time decides what the image
+holds, and an admin picks which item new work runs from the runner-hosts page
+(`agent_runner_policy.runtime_versions`). Blank leaves an image holding exactly
+its defaults, which is where every deployment starts.
+
+The same exactness rule applies, and so does the parser one, harder: putting a
+version on the menu is a claim that `runtimes.py` can read its event stream.
+Run `pytest -m external tests/external/test_runtime_stream_conformance.py`
+against it before adding it — a version nobody checked, offered in a dropdown,
+is one click from a job that dies at its first turn.
+
+| Variable | New? | Notes |
+|---|---|---|
+| `CLAUDE_CODE_EXTRA_VERSIONS` | **NEW** | Extra `@anthropic-ai/claude-code` versions. ~300 MB each. |
+| `CODEX_EXTRA_VERSIONS` | **NEW** | Extra `@openai/codex` versions. |
+| `PI_EXTRA_VERSIONS` | **NEW** | Extra `@mariozechner/pi-coding-agent` versions. |
+| `OPENCODE_EXTRA_VERSIONS` | **NEW** | Extra `opencode-ai` versions. |
+| `KILO_EXTRA_VERSIONS` | **NEW** | Extra `@kilocode/cli` versions. |
+
 ## Web (`web/`)
 
 Every one of these is baked into the bundle at build time and is therefore

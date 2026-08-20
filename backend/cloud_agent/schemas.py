@@ -1034,17 +1034,35 @@ class AgentRunnerHost(BaseModel):  # type: ignore[no-any-unimported]
     )
     runtime_versions: dict[str, str] | None = Field(
         None,
-        description="CLI versions baked into the sandbox image, keyed by runtime id.",
+        description=(
+            "The *default* CLI version per runtime id — what a job runs when "
+            "nothing has been selected."
+        ),
+    )
+    runtime_versions_available: dict[str, list[str]] | None = Field(
+        None,
+        description=(
+            "Every CLI version this host's image holds, keyed by runtime id, "
+            "default first. The menu an admin may select from; the control "
+            "plane cannot serve a version absent from it."
+        ),
     )
 
 
 class ListAgentRunnerHostsResponse(BaseModel):  # type: ignore[no-any-unimported]
-    """The runner pool and which member currently takes jobs."""
+    """The runner pool, which member takes jobs, and which versions it runs."""
 
     hosts: list[AgentRunnerHost]
     active_host: str | None = Field(
         None,
         description="Pinned host, or null when any runner may claim.",
+    )
+    runtime_versions: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "The deployment's chosen CLI version per runtime id. A runtime "
+            "absent here runs its claiming host's default."
+        ),
     )
 
 
@@ -1055,6 +1073,26 @@ class SetActiveAgentRunnerHostRequest(BaseModel):  # type: ignore[no-any-unimpor
         None,
         max_length=253,
         description="A host that has polled at least once, or null to unpin.",
+    )
+
+
+class SetRuntimeVersionRequest(BaseModel):  # type: ignore[no-any-unimported]
+    """Choose the CLI version this deployment runs for one runtime."""
+
+    runtime: str = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="Runtime id, as the registry knows it (e.g. 'claude-code').",
+    )
+    version: str | None = Field(
+        None,
+        max_length=128,
+        description=(
+            "A version some host in the pool offers, or null to return this "
+            "runtime to the image default. Applies to new threads; a thread "
+            "already running keeps the version it started on."
+        ),
     )
 
 
@@ -1233,9 +1271,18 @@ class HostHeartbeatRequest(BaseModel):  # type: ignore[no-any-unimported]
         None,
         max_length=64,
         description=(
-            "CLI version baked into the sandbox image, keyed by runtime id "
-            "(e.g. {'claude-code': '1.2.3'}), read from image labels. An "
-            "empty dict means 'inspected, image carries no version labels'."
+            "The *default* CLI version per runtime id (e.g. "
+            "{'claude-code': '1.2.3'}), read from image labels. An empty dict "
+            "means 'inspected, image carries no version labels'."
+        ),
+    )
+    runtime_versions_available: dict[str, list[str]] | None = Field(
+        None,
+        max_length=64,
+        description=(
+            "Every CLI version this image holds, keyed by runtime id, default "
+            "first — the menu an admin may select from. Null means not "
+            "reported and leaves the control plane's last knowledge in place."
         ),
     )
     residencies: list[ResidencyBeat] | None = Field(

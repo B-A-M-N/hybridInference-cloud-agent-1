@@ -80,7 +80,9 @@ async def store():
         async with pool.acquire() as conn:
             for table in _TABLES_IN_FK_ORDER:
                 await conn.execute(f"DELETE FROM {table}")
-            await conn.execute("UPDATE agent_runner_policy SET active_host = NULL")
+            await conn.execute(
+                "UPDATE agent_runner_policy SET active_host = NULL, runtime_versions = NULL"
+            )
 
     await _reset()
     try:
@@ -1499,3 +1501,158 @@ async def test_warm_native_survives_a_downgrade_by_folding_into_cold_native(stor
         lease_generation=claim["lease_generation"],
         mode="warm_native",
     )
+
+
+# ── Choosing which version the pool runs ─────────────────────────────────
+
+
+#: The image these tests' host holds: default first, then the extra.
+MENU = ["2.1.220", "2.1.235"]
+
+
+async def _menu_host(store, host: str, *, menu: list[str] = MENU) -> None:
+    """A host whose *heartbeat* advertises a default and its image's menu.
+
+    That row is what the admin page renders and what ``set_runtime_version``
+    validates a choice against. It is deliberately not what the claim reads —
+    see ``_menu_attestation``.
+    """
+    await _enrol(store, host)
+    await store.record_host_heartbeat(
+        host=host,
+        sandbox_runtime="",
+        sandbox_image_digest="sha256:menu",
+        runtime_versions={"claude-code": menu[0]},
+        runtime_versions_available={"claude-code": menu},
+    )
+
+
+def _menu_attestation(menu: list[str] = MENU) -> dict:
+    """What the claiming replica says about its *own* image.
+
+    The claim believes this rather than the heartbeat row: a mutable row shared
+    by every replica on a machine is not evidence about the process actually
+    taking the job during a rolling deployment.
+    """
+    return _kata_attestation(
+        runtime_versions={"claude-code": menu[0]},
+        runtime_versions_available={"claude-code": menu},
+    )
+
+
+async def _menu_claim(store, worker: str, *, menu: list[str] = MENU):
+    """Claim as a replica whose image holds ``menu``."""
+    return await store.claim_job(
+        worker_id=worker,
+        lease_ttl_seconds=60,
+        host="runner-a",
+        claim_attestation=_menu_attestation(menu),
+    )
+
+
+async def test_a_heartbeat_round_trips_the_menu_beside_the_default(store):
+    """Two facts, two columns; a stampless beat erases neither."""
+    await _menu_host(store, "runner-a")
+
+    row = await store.record_host_heartbeat(host="runner-a")
+
+    assert row["runtime_versions"] == {"claude-code": "2.1.220"}
+    assert row["runtime_versions_available"] == {"claude-code": ["2.1.220", "2.1.235"]}
+
+
+async def test_a_selection_reaches_the_attempt_the_claim_stamps(store):
+    """The feature, end to end in SQL: admin picks, the next attempt records it."""
+    await _menu_host(store, "runner-a")
+    assert await store.set_runtime_version(runtime="claude-code", version="2.1.235")
+    await _create_job(store)  # runtime claude-code
+
+    claim = await _menu_claim(store, "w1")
+
+    assert claim is not None
+    assert claim["runtime_version"] == "2.1.235"
+
+
+async def test_a_version_no_host_offers_is_refused(store):
+    """Refused rather than stored: the claim would fall back and say nothing."""
+    await _menu_host(store, "runner-a", menu=["2.1.220"])
+
+    assert not await store.set_runtime_version(runtime="claude-code", version="2.1.235")
+
+    _, _, selected = await store.runner_pool()
+    assert selected == {}
+
+
+async def test_clearing_a_selection_returns_to_the_host_default(store):
+    await _menu_host(store, "runner-a")
+    await store.set_runtime_version(runtime="claude-code", version="2.1.235")
+
+    assert await store.set_runtime_version(runtime="claude-code", version=None)
+    await _create_job(store)
+    claim = await _menu_claim(store, "w1")
+
+    assert claim is not None
+    assert claim["runtime_version"] == "2.1.220"
+
+
+async def test_a_thread_keeps_its_version_when_the_selection_moves(store):
+    """The reason resolution is ordered rather than "latest selection wins".
+
+    Turn one runs the default. An admin switches. Turn two of the *same thread*
+    must still be stamped with the version turn one ran, or the checkpoint gate
+    refuses its session and the conversation silently forgets itself.
+    """
+    await _menu_host(store, "runner-a")
+    first = await _create_job(store)
+    turn_one = await _menu_claim(store, "w1")
+    assert turn_one is not None and turn_one["runtime_version"] == "2.1.220"
+    # Settled with no patch, which is enough for the claim to promote its
+    # follow-up — this test is about versions, not about publishing.
+    await store.transition(
+        job_id=first["id"],
+        attempt_id=turn_one["attempt_id"],
+        lease_generation=turn_one["lease_generation"],
+        from_states=("running",),
+        to_state="succeeded",
+    )
+
+    await store.set_runtime_version(runtime="claude-code", version="2.1.235")
+
+    child = await store.create_follow_up(
+        parent_job_id=first["id"], user_id="u1", prompt="and the docs"
+    )
+    assert child is not None
+    turn_two = await _menu_claim(store, "w2")
+
+    assert turn_two is not None
+    assert turn_two["runtime_version"] == "2.1.220", (
+        "an admin's switch reached into a live thread; its next turn would replay"
+    )
+
+    # And a *new* thread does get the new version — otherwise the selection
+    # would be inert rather than merely non-retroactive.
+    await _create_job(store)
+    fresh = await _menu_claim(store, "w3")
+    assert fresh is not None and fresh["runtime_version"] == "2.1.235"
+
+
+async def test_a_selection_the_image_lost_falls_back_instead_of_parking(store):
+    """The drift the fallback exists for, reachable in exactly this order.
+
+    A selection is only accepted while some host offers it — but the image can
+    be rebuilt with a shorter menu afterwards, and then the stored choice names
+    a version nothing installs. Refusing the claim there would park the queue
+    on a configuration change nobody would connect to it; running the
+    default is the smaller wrong, and the claim logs which it did.
+    """
+    await _menu_host(store, "runner-a")
+    assert await store.set_runtime_version(runtime="claude-code", version="2.1.235")
+
+    # The rebuild: same host, same name, an image that no longer holds 2.1.235.
+    # The claiming replica says so itself, which is the evidence that counts —
+    # its heartbeat may not have caught up mid-rollout.
+    await _create_job(store)
+
+    claim = await _menu_claim(store, "w1", menu=["2.1.220"])
+
+    assert claim is not None, "an unservable selection must not park the queue"
+    assert claim["runtime_version"] == "2.1.220"

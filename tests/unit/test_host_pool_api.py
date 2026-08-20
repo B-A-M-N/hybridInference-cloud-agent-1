@@ -56,6 +56,7 @@ class FakeHostPoolStore:
         self.rows: dict[str, dict[str, Any]] = {}
         self.tokens: dict[str, dict[str, Any]] = {}
         self.active_host: str | None = None
+        self.runtime_versions: dict[str, str] = {}
         self.establish_answer: dict[str, Any] | None = None
         self.linked: list[tuple[str, int, str]] = []
         self.link_ok = True
@@ -102,6 +103,7 @@ class FakeHostPoolStore:
             "sandbox_runtime": None,
             "sandbox_image_digest": None,
             "runtime_versions": None,
+            "runtime_versions_available": None,
             "enrolled": False,
             "credential_hash": None,
         }
@@ -151,6 +153,7 @@ class FakeHostPoolStore:
         sandbox_runtime: str | None = None,
         sandbox_image_digest: str | None = None,
         runtime_versions: dict[str, str] | None = None,
+        runtime_versions_available: dict[str, list[str]] | None = None,
     ) -> dict[str, Any] | None:
         row = self.rows.get(host)
         if row is None:
@@ -167,6 +170,7 @@ class FakeHostPoolStore:
             ("sandbox_runtime", sandbox_runtime),
             ("sandbox_image_digest", sandbox_image_digest),
             ("runtime_versions", runtime_versions),
+            ("runtime_versions_available", runtime_versions_available),
         ):
             if value is not None:
                 row[field] = value
@@ -198,9 +202,22 @@ class FakeHostPoolStore:
         row["enrolled"] = False
         return "ok"
 
-    async def runner_pool(self) -> tuple[list[dict[str, Any]], str | None]:
+    async def runner_pool(self) -> tuple[list[dict[str, Any]], str | None, dict[str, str]]:
         rows = [{**row, "is_active": row["host"] == self.active_host} for row in self.rows.values()]
-        return rows, self.active_host
+        return rows, self.active_host, dict(self.runtime_versions)
+
+    async def set_runtime_version(self, *, runtime: str, version: str | None) -> bool:
+        if version is None:
+            self.runtime_versions.pop(runtime, None)
+            return True
+        offered = (
+            version in ((row.get("runtime_versions_available") or {}).get(runtime) or [])
+            for row in self.rows.values()
+        )
+        if not any(offered):
+            return False
+        self.runtime_versions[runtime] = version
+        return True
 
     # -- thread residencies
     #
