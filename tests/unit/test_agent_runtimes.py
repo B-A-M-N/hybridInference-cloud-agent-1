@@ -712,10 +712,23 @@ def test_auto_adds_no_flag():
     assert "--effort" not in argv
 
 
+def test_claude_code_offers_xhigh():
+    """Captured from 2.1.220. The first declaration read --help and missed it."""
+    argv, _env = _prepare(ClaudeCodeRuntime(), reasoning_effort="xhigh")
+
+    assert argv[argv.index("--effort") + 1] == "xhigh"
+
+
 def test_a_level_the_cli_does_not_have_is_refused_not_passed_through():
-    """Fail closed. A level the CLI rejects would die inside the sandbox."""
-    with pytest.raises(RuntimeEffortUnsupportedError):
-        _prepare(ClaudeCodeRuntime(), reasoning_effort="xhigh")
+    """Fail closed, and here that is load-bearing rather than tidy.
+
+    claude-code does not reject an unknown level — `--effort ultra`, `none`
+    and `minimal` all arrive on the wire as `high`. Forwarding one would run
+    the turn at a depth nobody chose while the UI reported the one they did.
+    """
+    for level in ("ultra", "none", "minimal"):
+        with pytest.raises(RuntimeEffortUnsupportedError):
+            _prepare(ClaudeCodeRuntime(), reasoning_effort=level)
 
 
 def test_codex_expresses_effort_as_a_config_override():
@@ -813,7 +826,7 @@ def test_only_runtimes_with_a_verified_flag_are_advertised():
     # Every registered runtime was captured against the pinned CLI; see
     # tests/fixtures/agent_runtime_streams/effort_wire_shapes.md.
     assert set(advertised) == {"claude-code", "codex", "pi", "opencode", "kilo"}
-    assert advertised["claude-code"] == ["low", "medium", "high", "max"]
+    assert advertised["claude-code"] == ["low", "medium", "high", "xhigh", "max"]
     # pi is the short list, and deliberately: two of its six flag levels do not
     # survive the trip to the wire.
     assert advertised["pi"] == ["minimal", "low", "medium", "high"]

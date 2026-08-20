@@ -4359,7 +4359,13 @@ async def test_effort_is_offered_only_where_runtime_and_model_both_deliver(clien
 
     # claude-code can express effort; the Tier 2 runtimes cannot, and are
     # absent rather than listed with an empty vocabulary.
-    assert config["runtime_reasoning_efforts"]["claude-code"] == ["low", "medium", "high", "max"]
+    assert config["runtime_reasoning_efforts"]["claude-code"] == [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    ]
     assert config["runtime_reasoning_efforts"]["codex"][:3] == ["none", "minimal", "low"]
     assert config["runtime_reasoning_efforts"]["pi"] == ["minimal", "low", "medium", "high"]
     assert config["model_reasoning_efforts"] == {"glm-5.1": ["low", "high", "max"]}

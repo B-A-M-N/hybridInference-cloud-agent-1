@@ -540,12 +540,18 @@ class ClaudeCodeRuntime(AgentRuntime):
             },
         )
 
-    #: The CLI's own vocabulary, from ``claude --help`` on the pinned build:
-    #: "Effort level for the current session (low, medium, high, max)". Not
-    #: the platform's scale and not the models' — the offered set is this
-    #: intersected with what the chosen model declares, which is how a model
-    #: with no ``medium`` never gets offered one.
-    EFFORT_LEVELS = ("low", "medium", "high", "max")
+    #: Captured from the pinned 2.1.220, **not** from ``--help``: the 2.1.90
+    #: help string reads "(low, medium, high, max)" and this list was first
+    #: written from it, missing ``xhigh`` — which the CLI does put on the wire.
+    #: Reading the documentation instead of the request is how a level the
+    #: product supports went unoffered.
+    #:
+    #: Exactness matters more here than for the config-file runtimes, because
+    #: **an unrecognised level is not refused, it silently becomes ``high``**
+    #: (``--effort ultra``, ``none`` and ``minimal`` all arrive as ``high``).
+    #: A level declared here that the CLI does not know would therefore run at
+    #: a depth nobody chose while reporting the one they did.
+    EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 
     def effort_args(self, effort: str | None) -> list[str]:
         """Express effort as ``--effort <level>``."""
