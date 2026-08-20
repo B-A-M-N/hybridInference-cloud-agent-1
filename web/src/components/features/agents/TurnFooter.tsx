@@ -222,7 +222,12 @@ export function TurnFooter({ job, attemptNo }: { job: AgentJob; attemptNo?: numb
   // A sampler that reported at all but covered only part of the window makes
   // every number below a floor. Saying so is the difference between a partial
   // measurement and a wrong one.
-  const partial = Boolean(resources && resources.coverage < 0.99 && stats.length > 0);
+  // Warn only when the gap is material. Binding to a container the daemon
+  // has not finished creating costs a fraction of a second that no threshold
+  // can recover, so a warning at "anything short of perfect" fires on every
+  // healthy turn — and a warning that always fires is one nobody reads.
+  // Missing a tenth of a turn is worth saying; missing two percent is not.
+  const partial = Boolean(resources && resources.coverage < 0.9 && stats.length > 0);
   const unmeasured = Boolean(resources && stats.length === 0);
 
   // `unmeasured` counts as something to say: a sampler that ran and could
