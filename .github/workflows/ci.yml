@@ -226,6 +226,153 @@ jobs:
       # leakage between files. A serial run silently passes on that class of bug.
       - name: Pytest
         run: uv run pytest -n 4 --dist loadfile -q -m "not external and not dbtest"
+
+  # The other half of that command. `test` above deselects `dbtest`, and until
+  # this job existed nothing selected it — 158 tests that are written, green,
+  # and were never once executed by CI. The cost of that is on the record: the
+  # xfail in tests/integration/servers/test_agent_jobs_lifecycle.py documents a
+  # router/test mismatch that survived a whole migration, and says why in its
+  # own reason string — "It was never caught because the dbtest tier does not
+  # run in CI."
+  #
+  # These tests need a real Postgres because what they pin lives in SQL, not in
+  # Python: `FOR UPDATE SKIP LOCKED` is the entire guarantee that two workers
+  # cannot claim one job, and lease_generation fencing is the entire guarantee
+  # that a superseded attempt cannot publish a duplicate PR. A fake store can
+  # only restate what its author believed those statements do.
+  #
+  # A separate job rather than dropping the deselect from `test`: that job is
+  # the fast, dependency-free one that every backend change waits on, and it
+  # stays that way. The split also matches `make test` / `make test-db`, which
+  # is the contract AGENTS.md already documents.
+  test-db:
+    name: Tests (Postgres)
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    # ci-general is spark2 (aarch64), whose runner user is in the `docker`
+    # group — service containers need that socket, and this is the pool that
+    # has it. postgres:15 publishes an arm64 manifest.
+    runs-on: [self-hosted, Linux, ci-general]
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          # The name the fixtures already default to. They were written against
+          # the gateway repo's CI, which provides exactly this; the tests moved
+          # here in the split and the database did not.
+          POSTGRES_DB: hybridinference_test_db
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      TEST_DB_HOST: localhost
+      TEST_DB_PORT: ${{ job.services.postgres.ports['5432'] }}
+      TEST_DB_NAME: hybridinference_test_db
+      TEST_DB_USER: postgres
+      TEST_DB_PASSWORD: postgres
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Isolate uv cache dir
+        run: |
+          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache" >> "${GITHUB_ENV}"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          prune-cache: false
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync dependencies
+        run: uv sync
+
+      # Before pytest, because every dbtest fixture answers an unreachable
+      # database with `pytest.skip`, not a failure. That is right for a laptop
+      # with no Postgres and exactly wrong here: it makes "green having run
+      # nothing" this job's natural failure mode, which is the same false
+      # signal the job exists to remove. So connectivity is asserted where it
+      # can still fail loudly.
+      - name: The database is actually reachable
+        run: |
+          uv run python - <<'PY'
+          import os, sys
+          import asyncpg, asyncio
+
+          async def main():
+              conn = await asyncpg.connect(
+                  host=os.environ["TEST_DB_HOST"],
+                  port=int(os.environ["TEST_DB_PORT"]),
+                  database=os.environ["TEST_DB_NAME"],
+                  user=os.environ["TEST_DB_USER"],
+                  password=os.environ["TEST_DB_PASSWORD"],
+              )
+              print(await conn.fetchval("SELECT version()"))
+              await conn.close()
+
+          asyncio.run(main())
+          PY
+
+      # Serial, and not `-n 4` like the job above. The fixtures derive a
+      # per-worker database name (`..._gw0`, `..._gw1`, …) so that xdist
+      # workers cannot truncate each other's tables — but the service
+      # container creates one database, so under `-n 4` all four workers would
+      # fail to connect and every test would skip. The tier runs in about 15
+      # seconds; there is nothing here worth sharding.
+      - name: Pytest (dbtest tier)
+        run: uv run pytest -q -m "dbtest" --junitxml=${RUNNER_TEMP}/dbtest.xml
+
+      # The second half of the same guard. A fixture that skips on a database
+      # it cannot reach turns a broken service container into a passing job,
+      # and a `pytest -m` that silently matches nothing exits 0 too. Neither is
+      # distinguishable from success in the check list, so assert the shape of
+      # the run rather than trusting its exit code.
+      - name: The tier actually ran
+        run: |
+          uv run python - <<'PY'
+          import os, sys, xml.etree.ElementTree as ET
+
+          root = ET.parse(os.environ["RUNNER_TEMP"] + "/dbtest.xml").getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          ran = int(suite.get("tests", 0))
+
+          # Per-testcase, not the suite's `skipped` attribute: junit counts an
+          # xfail as a skip, and this tier has a standing one. Only
+          # type="pytest.skip" is a test that declined to run, which is what a
+          # database-less run produces.
+          skipped = [
+              tc.get("name")
+              for tc in suite.iter("testcase")
+              for sk in tc.findall("skipped")
+              if sk.get("type") == "pytest.skip"
+          ]
+          print(f"dbtest: {ran} collected, {len(skipped)} skipped")
+
+          # A floor, not the exact count, so adding tests never fails this. It
+          # only has to be high enough that a database-less run cannot clear
+          # it — that run skips all of them.
+          if ran < 100:
+              sys.exit(f"only {ran} dbtests ran; the tier is not being selected")
+          if skipped:
+              sys.exit(
+                  f"{len(skipped)} dbtests skipped — the fixtures skip when Postgres "
+                  f"is unreachable, so this job proved nothing: {skipped[:5]}"
+              )
+          PY
   # -------------------------------------------------------------------- web
   check:
     name: Web ${{ matrix.check.name }}
@@ -699,6 +846,7 @@ jobs:
       - changes
       - lint
       - test
+      - test-db
       - check
       - gitleaks
       - build
@@ -711,6 +859,7 @@ jobs:
             changes=${{ needs.changes.result }}
             lint=${{ needs.lint.result }}
             test=${{ needs.test.result }}
+            test-db=${{ needs.test-db.result }}
             web=${{ needs.check.result }}
             gitleaks=${{ needs.gitleaks.result }}
             build=${{ needs.build.result }}

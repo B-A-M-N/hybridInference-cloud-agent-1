@@ -44,7 +44,7 @@ need a gateway secret here, the design is wrong — stop and escalate.
 | Variable | New? | Value / who provisions |
 |---|---|---|
 | `AGENT_DATABASE_URL` | **NEW** | Postgres DSN for the agent-owned database. Must be a database this service owns outright — sharing one with the gateway would reintroduce the coupling the split exists to remove. |
-| `AGENT_TEST_DATABASE_URL` | **NEW** | Used by `make test-db` only. Local/CI throwaway database. |
+| `TEST_DB_HOST` / `TEST_DB_PORT` / `TEST_DB_NAME` / `TEST_DB_USER` / `TEST_DB_PASSWORD` | **NEW** | Used by `make test-db` only — the `dbtest` fixtures read these five, not a DSN. Defaults: `localhost` / `5432` / `hybridinference_test_db` / `postgres` / `postgres`. `TEST_DB_NAME` must contain `_test_`; the fixtures refuse to run otherwise, so they cannot be pointed at a real database by a stray environment. Under `pytest -n`, each xdist worker appends its own id and needs that database to already exist — which is why CI runs this tier serially. |
 
 ### Gateway contracts
 
