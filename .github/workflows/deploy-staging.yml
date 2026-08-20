@@ -46,6 +46,17 @@ jobs:
       (github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.conclusion == 'success') }}
     runs-on: [self-hosted, Linux, deploy-cloud-agent-control-staging]
+    # Records the deployment, so staging appears in the repository's
+    # Deployments panel beside production instead of being visible only to
+    # someone who knows to open the Actions tab — and knows that a
+    # `workflow_run` job is filed under the default branch, so filtering the
+    # run list by `dev` shows nothing and reads as "it never deployed".
+    #
+    # Both jobs write to this one environment, matching production above.
+    # They are independent, so a run where one half fails and the other
+    # succeeds later leaves the panel green: the panel answers "did a deploy
+    # happen", and the Actions run answers "did both halves land".
+    environment: staging
     timeout-minutes: 30
 
     steps:
@@ -100,6 +111,7 @@ jobs:
       (github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.conclusion == 'success') }}
     runs-on: [self-hosted, Linux, deploy-cloud-agent-sandbox-staging]
+    environment: staging
     timeout-minutes: 45
     concurrency:
       group: cloud-agent-host-deploy
