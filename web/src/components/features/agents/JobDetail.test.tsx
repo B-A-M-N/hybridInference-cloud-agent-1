@@ -290,6 +290,61 @@ describe('JobDetail', () => {
     expect(navigation.push).toHaveBeenCalledWith('/ajob_child');
   });
 
+  it('sends the follow-up on Enter and keeps Shift+Enter a newline', async () => {
+    vi.mocked(followUpAgentJob).mockResolvedValue({ id: 'ajob_child' } as never);
+    render(<JobDetail job={makeJob()} />);
+
+    const composer = screen.getByLabelText('Add a follow-up');
+    fireEvent.change(composer, { target: { value: 'Now add a regression test' } });
+
+    // Shift+Enter and Alt+Enter stay the newline, so the browser keeps them.
+    expect(fireEvent.keyDown(composer, { key: 'Enter', shiftKey: true })).toBe(true);
+    expect(fireEvent.keyDown(composer, { key: 'Enter', altKey: true })).toBe(true);
+    expect(followUpAgentJob).not.toHaveBeenCalled();
+
+    // An IME commits its candidate with Enter; that keypress is the word, not
+    // the send.
+    fireEvent.keyDown(composer, { key: 'Enter', isComposing: true });
+    expect(followUpAgentJob).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(composer, { key: 'Enter' });
+
+    await waitFor(() =>
+      expect(followUpAgentJob).toHaveBeenCalledWith('ajob_1', {
+        prompt: 'Now add a regression test',
+      }),
+    );
+    expect(navigation.push).toHaveBeenCalledWith('/ajob_child');
+  });
+
+  it('swallows Enter on an empty follow-up rather than growing a blank line', async () => {
+    render(<JobDetail job={makeJob()} />);
+
+    const composer = screen.getByLabelText('Add a follow-up');
+    fireEvent.change(composer, { target: { value: '   ' } });
+
+    // Enter is the send key on this composer and never the newline, so with
+    // nothing to send it does nothing at all. Shift+Enter still breaks the line.
+    expect(fireEvent.keyDown(composer, { key: 'Enter' })).toBe(false);
+    expect(fireEvent.keyDown(composer, { key: 'Enter', shiftKey: true })).toBe(true);
+    expect(followUpAgentJob).not.toHaveBeenCalled();
+  });
+
+  it('accepts the other send chord people arrive with', async () => {
+    vi.mocked(followUpAgentJob).mockResolvedValue({ id: 'ajob_child' } as never);
+    render(<JobDetail job={makeJob()} />);
+
+    const composer = screen.getByLabelText('Add a follow-up');
+    fireEvent.change(composer, { target: { value: 'Now add a regression test' } });
+    fireEvent.keyDown(composer, { key: 'Enter', metaKey: true });
+
+    await waitFor(() =>
+      expect(followUpAgentJob).toHaveBeenCalledWith('ajob_1', {
+        prompt: 'Now add a regression test',
+      }),
+    );
+  });
+
   it('switches the model for the next turn without leaving the thread', async () => {
     vi.mocked(followUpAgentJob).mockResolvedValue({ id: 'ajob_child' } as never);
     render(<JobDetail job={makeJob()} />);

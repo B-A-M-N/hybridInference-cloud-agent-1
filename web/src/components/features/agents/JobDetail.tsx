@@ -24,6 +24,7 @@ import {
 } from '@/lib/api/agents';
 
 import { lifecyclePhaseLabel, toDiffFileDetails } from './adapt';
+import { isComposerSubmit } from './composerKeys';
 import { PaneResizer } from './PaneResizer';
 import { Picker } from './Picker';
 import { TerminalWorkspace } from './TerminalWorkspace';
@@ -1310,6 +1311,13 @@ export function JobDetail({ job, onReload }: { job: AgentJob; onReload?: () => v
                   rows={2}
                   value={followUp}
                   onChange={(event) => setFollowUp(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (!isComposerSubmit(event)) return;
+                    event.preventDefault();
+                    // Through the form, so the keyboard and the button take the
+                    // same path and cannot drift apart.
+                    event.currentTarget.form?.requestSubmit();
+                  }}
                   placeholder="Add a follow-up"
                   aria-label="Add a follow-up"
                   className="w-full resize-none rounded-t-xl border-0 bg-transparent px-4 pt-3 text-sm leading-relaxed text-gray-900 placeholder:text-gray-400 focus:outline-none focus:ring-0"
@@ -1352,6 +1360,7 @@ export function JobDetail({ job, onReload }: { job: AgentJob; onReload?: () => v
                     disabled={!followUp.trim() || submitting}
                     className="ml-auto inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-crimson text-white shadow-sm transition-colors hover:bg-crimson-dark disabled:cursor-not-allowed disabled:opacity-40"
                     aria-label="Send follow-up"
+                    title="Send follow-up — ⏎ to send, ⇧⏎ for a new line"
                   >
                     {submitting ? (
                       <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-white/40 border-t-white" />
