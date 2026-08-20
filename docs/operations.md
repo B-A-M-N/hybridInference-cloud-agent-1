@@ -524,6 +524,9 @@ workdir bind-mountable, egress network resolvable) instead of leaving it in a
 detached log. Equivalent by hand:
 
 ```bash
+# Add `--build-arg CLAUDE_CODE_VERSION=<exact version>` (and the equivalents for
+# codex / pi / opencode / kilo) to run a version other than the Dockerfile's.
+# `sandbox_host.sh` does this for you from the host's .env.
 docker build -f deploy/sandbox/Dockerfile.agent-sandbox \
              -t hybridinference-agent-sandbox:latest .
 
@@ -539,6 +542,7 @@ runners share one queue with no leader and no sharding.
 |---|---|---|
 | `AGENT_SANDBOX_BACKEND` | `kata` | `process` (no isolation) refuses to start unless `AGENT_SANDBOX_ALLOW_UNISOLATED=1`. On the default `kata`, deploy refuses until the host has the shim and one real container proves it gets its own kernel; `container` is an explicit, and loudly restated, shared-kernel downgrade |
 | `AGENT_SANDBOX_IMAGE` | required | Image built from `Dockerfile.agent-sandbox` or an equivalent deployment-owned image |
+| `CLAUDE_CODE_VERSION`, `CODEX_VERSION`, `PI_VERSION`, `OPENCODE_VERSION`, `KILO_VERSION` | Dockerfile default | Which agent CLI version this host bakes into its sandbox image. Blank uses the reviewed pin — set one only to run something else here (staging soaking a new CLI, or a rollback). Must be an *exact* version: the build refuses a dist-tag or a range, because the pin is derived into the image labels that the heartbeat reports, the claim stamps onto every attempt, and the checkpoint gate compares before resuming a thread's session. Bumping one changes what the event parser must handle — re-run the agent-loop conformance suite |
 | `AGENT_SANDBOX_NETWORK` | `agent-egress` | Declared `internal: true`, so a sandbox reaches the gateway and nothing else. Also the `platform_only` network unless `AGENT_EGRESS_NETWORK_PLATFORM_ONLY` overrides it |
 | `AGENT_EGRESS_SETUP_TIER` / `_AGENT_TIER` | `platform_only` | One of `platform_only` / `trusted` / `custom` / `full`, **per phase**. The design's external-beta shape is setup=`trusted`, agent=`platform_only`; the overlay ships both closed because there is no setup phase yet and no allowlist-fronted network to run one on |
 | `AGENT_EGRESS_NETWORK_*` | — | Network per tier. A tier with no network is an error when a phase selects it, never a fall back to a more open one |

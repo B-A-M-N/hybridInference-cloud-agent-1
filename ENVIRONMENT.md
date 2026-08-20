@@ -44,7 +44,7 @@ need a gateway secret here, the design is wrong — stop and escalate.
 | Variable | New? | Value / who provisions |
 |---|---|---|
 | `AGENT_DATABASE_URL` | **NEW** | Postgres DSN for the agent-owned database. Must be a database this service owns outright — sharing one with the gateway would reintroduce the coupling the split exists to remove. |
-| `AGENT_TEST_DATABASE_URL` | **NEW** | Used by `make test-db` only. Local/CI throwaway database. |
+| `TEST_DB_HOST` / `TEST_DB_PORT` / `TEST_DB_NAME` / `TEST_DB_USER` / `TEST_DB_PASSWORD` | **NEW** | Used by `make test-db` only — the `dbtest` fixtures read these five, not a DSN. Defaults: `localhost` / `5432` / `hybridinference_test_db` / `postgres` / `postgres`. `TEST_DB_NAME` must contain `_test_`; the fixtures refuse to run otherwise, so they cannot be pointed at a real database by a stray environment. Under `pytest -n`, each xdist worker appends its own id and needs that database to already exist — which is why CI runs this tier serially. |
 
 ### Gateway contracts
 
@@ -65,6 +65,8 @@ need a gateway secret here, the design is wrong — stop and escalate.
 | `AGENT_SESSION_SECRET` | **NEW** | Signs the web session cookie (task E8). Generate random 32 bytes, unique per environment. |
 | `AGENT_DISPATCHER_TOKEN` | existing | Authenticates host agents claiming work. Existing deployments may hold this outside this service's own configuration; confirm where it is actually read from before cutover rather than assuming. |
 | `AGENT_DEFAULT_EXECUTION_PROFILE` | **NEW** | Server-owned policy for new root threads. `untrusted-kata-v1` requires an enrolled Host whose current credential still matches and whose exact claiming replica attests `io.containerd.kata.v2` with a guest kernel different from the Host. `trusted-v1` preserves the legacy runc/process path for trusted internal/dev repositories. Follow-ups and forks inherit the stored profile; callers cannot select it. |
+| `AGENT_ONCALL_DISPATCH_TOKEN` | **NEW** | Authenticates the gateway alert relay on `/v1/agent/service/oncall/*` — one credential, one door, like `AGENT_DISPATCHER_TOKEN` for the runner. Random 32 bytes, same value in the relay's `.env.oncall`, distinct per environment. Unset opens nothing (the door then answers only to `ADMIN_TOKEN`). |
+| `AGENT_ONCALL_USER_ID` | **NEW** | Gateway user id every on-call job runs as. Its role decides which models the job's grant may carry (`glm-5.2` needs `internal`+), and its quota is what the analysis spends. Unset: the on-call door answers 503, the rest of the service is unaffected. |
 | `AGENT_RESIDENCY_TTL_S` | **NEW** | How long a hot sandbox's residency lease lives between host heartbeats (session-resident threads, design §7). Granted at establish and on every beat; the reaper lapses what outlives it, demoting the thread to a COLD start off its checkpoint. Default 1800. Also the cap on how long an idle resident process is kept at all, and the TTL of the residency's thread-attributed grant (design §14) — the idle process holds a live credential, renewed by the same beats and revoked with the residency, so this number bounds its lifetime too. |
 | `ADMIN_TOKEN` | existing | The machine-to-machine admin credential (task E7). **Unset opens nothing** — `verify_admin_access` refuses an empty configured value rather than matching an empty presented one — so a deployment that skips it has no token door, only the admin-session one. |
 
@@ -154,7 +156,7 @@ compose, because they name the stack rather than configure it.
 |---|---|---|
 | `AGENT_WORKSPACE_BROKER_URL` | existing | Single-host global. Phase G resolves this per host from the database; the env var stays as the fallback when an attempt has no `host_id`. On a runner host it is also **how that runner dials its own broker** — a compose service name, resolvable there and nowhere else. |
 | `AGENT_WORKSPACE_BROKER_ADVERTISE_URL` | NEW | What the runner *reports* at enrolment, when that differs from what it *dials*. Unset, the two are one address, which is correct for every co-located deployment. Required when the control plane is on another machine: the service name above means nothing there, so the stored `broker_url` is unreachable and every terminal, file listing and git status answers 503 — jobs die at the first one, every attempt. Set it to the far end of the reverse forward (`AGENT_BROKER_REVERSE_BIND`/`_PORT`) and never without it. |
-| `AGENT_WORKSPACE_BROKER_TOKEN` | existing | **Still global after phase G.** Host rows carry a broker *URL*, not a credential, so every broker in the pool authenticates this one value — a compromised host's broker token opens every other host's broker. Making it per-host is secret distribution (issue at enrollment, rotate, deliver), not routing, and is deliberately not done here. |
+| `AGENT_WORKSPACE_BROKER_TOKEN` | existing | **Still global after phase G, and that means the same literal value on the control plane and on every host.** Host rows carry a broker *URL*, not a credential, so every broker in the pool authenticates this one value — a compromised host's broker token opens every other host's broker. Making it per-host is secret distribution (issue at enrollment, rotate, deliver), not routing, and is deliberately not done here. **Nothing detects a mismatch.** Two hosts provisioned independently get two secrets, both valid-looking, and the pool then answers 401 to every file listing, terminal and git status for jobs on the odd one out — which reads as a broken tunnel, not as a credential. This has already happened once (staging, 2026-08-06). Compare `sha256` of the value on both machines when provisioning a host, and never the value itself. |
 | `AGENT_BROKER_URL_ALLOWED_HOSTS` | **NEW** | Comma-separated hostnames a registering machine may name as its broker. **Read by the control plane, not the host** — it is listed here because it is the other half of the token above: a host proposes its own broker address and is then sent the pool's shared credential, so an unfiltered address is that credential handed to anything a compromised or mistyped registration names. Names, not patterns; a pool's machines are few and known. Unset means any host, which is what this did before the check — opt-in so an upgrade does not break an existing pool. |
 | `AGENT_CONTROL_PLANE_URL` | **NEW** | Where this runner claims work, registers this host and heartbeats. Split from `AGENT_GATEWAY_URL` because the two are the same origin only when control plane and gateway are co-located; a remote runner reaches each through its own tunnel alias. On the standalone stack it defaults to the control-plane tunnel (`AGENT_CONTROL_PLANE_HOSTNAME`), **not** the MCP one — those were briefly the same relay, and pointing here at MCP sends every claim to a listener that serves only MCP, so jobs are never taken and the 404 names a path rather than a port. |
 | `AGENT_WORKER_ID` | existing | |
@@ -195,6 +197,37 @@ compose, because they name the stack rather than configure it.
 | `AGENT_EGRESS_PROXY_URL_TRUSTED` | existing | The proxy a Trusted-tier sandbox is pointed at — the one enforcing the built-in registry list plus `AGENT_EGRESS_ALLOWLIST`. |
 | `AGENT_EGRESS_PROXY_URL_CUSTOM` | existing | Same for the Custom tier, which supplies its own proxy by definition; nothing here renders a config for it. |
 | `AGENT_EGRESS_PROXY_PORT` | existing | Port the rendered Squid config listens on. A non-numeric value is refused at render rather than defaulted, since a proxy silently on the wrong port is a sandbox with no egress filtering at all. |
+
+### Agent CLI version pins (build time, not run time)
+
+Read by `deploy/host/sandbox_host.sh` and passed to `docker build` as build
+arguments. Unprefixed by deliberate exception to the `AGENT_*` convention: each
+one is named for the `ARG` it feeds in `deploy/sandbox/Dockerfile.agent-sandbox`,
+and one name for one thing beats a mapping table between the `.env` key and the
+build argument — a typo in that mapping would be invisible.
+
+Unset is the normal case and passes no build argument at all, so the image is
+built from the Dockerfile's reviewed default. Set one only when this environment
+is deliberately running something else.
+
+**The value must be an exact version.** A dist-tag (`latest`) or a range
+(`^2.1`) fails the image build. The pin is not only what gets installed — it is
+derived into the image's version labels, which the heartbeat reports, the claim
+copies onto every attempt as the durable record of what ran, and the checkpoint
+gate compares before letting a thread resume its session. A label that does not
+match the installed binary makes all three false at once.
+
+Bumping one is a real change, not a config tweak: an agent CLI that alters its
+event format alters what `host/cloud_agent_host/runtimes.py` can parse. Re-run
+the agent-loop conformance suite before shipping one.
+
+| Variable | New? | Notes |
+|---|---|---|
+| `CLAUDE_CODE_VERSION` | **NEW** | `@anthropic-ai/claude-code`. |
+| `CODEX_VERSION` | **NEW** | `@openai/codex`. |
+| `PI_VERSION` | **NEW** | `@mariozechner/pi-coding-agent`. |
+| `OPENCODE_VERSION` | **NEW** | `opencode-ai`. |
+| `KILO_VERSION` | **NEW** | `@kilocode/cli`. |
 
 ## Web (`web/`)
 

@@ -20,14 +20,21 @@ import {
   forkAgentJob,
   getAgentConfig,
   getAgentJobGit,
+  type AgentConfigApi,
   type AgentGitWorkspaceApi,
 } from '@/lib/api/agents';
 
 import { lifecyclePhaseLabel, toDiffFileDetails } from './adapt';
+import { isComposerSubmit } from './composerKeys';
+import { AUTO_EFFORT, effortOptions, offeredEfforts } from './effort';
 import { PaneResizer } from './PaneResizer';
 import { Picker } from './Picker';
 import { TerminalWorkspace } from './TerminalWorkspace';
-import type { AgentEvent, AgentJob, AgentThreadMessage } from './types';
+import { ThreadStatsBar } from './ThreadStatsBar';
+import type { AgentEvent, AgentHistoryTurn, AgentJob, AgentThreadMessage } from './types';
+import type { AgentJobEventApi, AgentThreadEventApi } from '@/lib/api/agents';
+import { TurnFooter } from './TurnFooter';
+import { TrajectoryView } from './TrajectoryView';
 import { useResizablePane } from './useResizablePane';
 import { WorkspaceFiles } from './WorkspaceFiles';
 
@@ -358,7 +365,15 @@ function ThreadTurn({
   );
 }
 
-function EventRow({ event }: { event: AgentEvent }) {
+function EventRow({
+  event,
+  onFork,
+  busy,
+}: {
+  event: AgentEvent;
+  onFork?: () => void;
+  busy?: boolean;
+}) {
   if (event.kind === 'lifecycle') return <LifecycleRow text={event.text} />;
   if (event.kind === 'thinking') {
     return (
@@ -371,7 +386,21 @@ function EventRow({ event }: { event: AgentEvent }) {
       </div>
     );
   }
-  if (event.kind === 'message') return <AssistantMessage text={event.text} />;
+  if (event.kind === 'message') {
+    return (
+      <AssistantMessage
+        text={event.text}
+        extraActions={
+          onFork ? (
+            <MessageActionButton label="Fork from here" onClick={onFork} disabled={busy}>
+              <ForkIcon />
+              Fork from here
+            </MessageActionButton>
+          ) : undefined
+        }
+      />
+    );
+  }
   if (event.kind === 'tool_use') return <ToolActivity event={event} />;
   if (event.kind === 'tool_result') {
     return (
@@ -402,6 +431,66 @@ function EventRow({ event }: { event: AgentEvent }) {
     );
   }
   return <p className="py-1 text-[11px] text-gray-400">{event.text}</p>;
+}
+
+function HistoryTurn({
+  turn,
+  previousJobId,
+  busy,
+  onFork,
+  onRewind,
+}: {
+  turn: AgentHistoryTurn;
+  previousJobId?: string;
+  busy: boolean;
+  onFork: (jobId: string) => void;
+  onRewind: (jobId: string, prompt: string) => void;
+}) {
+  const hasEventMessages = turn.events.some((event) => event.kind === 'message');
+  const toolCalls = turn.events.filter((event) => event.kind === 'tool_use').length;
+  const fallbackMessages = hasEventMessages
+    ? []
+    : turn.messages.filter((message) => message.role === 'assistant');
+
+  return (
+    <section aria-label={`Turn ${turn.turnNo}`}>
+      {turn.messages
+        .filter((message) => message.role === 'user')
+        .map((message) => (
+          <ThreadTurn
+            key={message.id}
+            message={message}
+            busy={busy}
+            onRewind={previousJobId ? () => onRewind(previousJobId, message.content) : undefined}
+          />
+        ))}
+      <div aria-label={`Turn ${turn.turnNo} agent activity`} className="mt-2">
+        {turn.events.map((event, index) => (
+          <EventRow
+            key={`${turn.jobId}-${index}`}
+            event={event}
+            busy={busy}
+            onFork={event.kind === 'message' ? () => onFork(turn.jobId) : undefined}
+          />
+        ))}
+        {fallbackMessages.map((message) => (
+          <ThreadTurn
+            key={message.id}
+            message={message}
+            busy={busy}
+            onFork={() => onFork(turn.jobId)}
+          />
+        ))}
+      </div>
+      <div className="my-5 flex items-center gap-3 text-[11px] text-gray-400">
+        <span className="h-px flex-1 bg-gray-200" />
+        <span>
+          Turn {turn.turnNo} · {toolCalls} tool call{toolCalls === 1 ? '' : 's'}
+        </span>
+        <span className="h-px flex-1 bg-gray-200" />
+      </div>
+    </section>
+  );
 }
 
 function DetailStat({ label, value }: { label: string; value: string }) {
@@ -512,6 +601,12 @@ function DetailsDrawer({
                 <dl className="mt-2 divide-y divide-gray-100">
                   <DetailStat label="Agent" value={job.runtime} />
                   <DetailStat label="Model" value={job.model} />
+                  {/* Only when a depth was chosen. An absent row is the honest
+                      rendering of Auto: nobody picked, so there is nothing to
+                      report. */}
+                  {job.reasoningEffort ? (
+                    <DetailStat label="Reasoning" value={job.reasoningEffort} />
+                  ) : null}
                   <DetailStat label="Sandbox" value={job.sandbox} />
                   <DetailStat label="Setup network" value={job.networkSetup} />
                   <DetailStat label="Agent network" value={job.networkAgent} />
@@ -891,19 +986,41 @@ function GitPanel({ job, active }: { job: AgentJob; active: boolean }) {
   );
 }
 
-export function JobDetail({ job, onReload }: { job: AgentJob; onReload?: () => void }) {
+export function JobDetail({
+  job,
+  events = [],
+  onReload,
+}: {
+  job: AgentJob;
+  /** The stored stream, for the trajectory tab. Absent in fixtures. */
+  events?: (AgentJobEventApi | AgentThreadEventApi)[];
+  onReload?: () => void;
+}) {
   const router = useRouter();
   const liveAttempt = useMemo(
     () => (job.attempts.length > 0 ? job.attempts[job.attempts.length - 1].no : 0),
     [job.attempts],
   );
   const [attemptNo, setAttemptNo] = useState(liveAttempt);
+  // What the remount used to do. Moving to the next turn of a conversation no
+  // longer rebuilds this component, so the attempt selection has to follow the
+  // turn explicitly — otherwise turn two would open showing turn one's chosen
+  // attempt.
+  useEffect(() => {
+    setAttemptNo(liveAttempt);
+    // Only when the turn changes: re-running this on every attempt update
+    // would fight the reader's own selection.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job.id]);
   const [drawer, setDrawer] = useState<DrawerView | null>(null);
+  const [tab, setTab] = useState<'chat' | 'trajectory'>('chat');
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const [workspaceTab, setWorkspaceTab] = useState<WorkspaceTab>('git');
   const [followUp, setFollowUp] = useState('');
+  const [config, setConfig] = useState<AgentConfigApi | null>(null);
   const [models, setModels] = useState<string[]>([]);
   const [model, setModel] = useState(job.model);
+  const [effort, setEffort] = useState(job.reasoningEffort ?? AUTO_EFFORT);
   const [submitting, setSubmitting] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [forking, setForking] = useState(false);
@@ -927,14 +1044,19 @@ export function JobDetail({ job, onReload }: { job: AgentJob; onReload?: () => v
   useEffect(() => {
     let cancelled = false;
     getAgentConfig()
-      .then((config) => {
-        if (!cancelled) setModels(config.models ?? []);
+      .then((loaded) => {
+        if (cancelled) return;
+        setConfig(loaded);
+        setModels(loaded.models ?? []);
       })
       .catch(() => {
         // A list we could not load is not a list to pick from: the composer
         // falls back to naming the inherited model, which is what a turn with
         // no override runs on anyway.
-        if (!cancelled) setModels([]);
+        if (!cancelled) {
+          setConfig(null);
+          setModels([]);
+        }
       });
     return () => {
       cancelled = true;
@@ -947,6 +1069,21 @@ export function JobDetail({ job, onReload }: { job: AgentJob; onReload?: () => v
     if (models.length === 0) return [];
     return models.includes(job.model) ? models : [job.model, ...models];
   }, [job.model, models]);
+
+  // Against the model this turn would run — the switched-to one, or the
+  // inherited one — because a pair offered last turn need not be offered now.
+  const efforts = useMemo(
+    () => effortOptions(offeredEfforts(config, job.runtime, model || job.model)),
+    [config, job.runtime, job.model, model],
+  );
+  useEffect(() => {
+    // Only once the config has arrived. Before that the offered set is empty
+    // because nothing is *known*, not because nothing is offered — and acting
+    // on it would wipe a legitimate selection a moment before the answer
+    // lands.
+    if (!config) return;
+    if (!efforts.includes(effort)) setEffort(AUTO_EFFORT);
+  }, [config, efforts, effort]);
 
   // An "Edit & rewind" fork leaves the edited prompt behind for its landing
   // page. Session-scoped and consumed once, so a reload does not resurrect it.
@@ -1049,8 +1186,20 @@ export function JobDetail({ job, onReload }: { job: AgentJob; onReload?: () => v
         // Only an actual switch is sent. Omitted, the turn inherits the
         // parent's model, which was validated when it was chosen.
         ...(model && model !== job.model ? { model } : {}),
+        // Only an actual change is sent, and clearing back to Auto sends the
+        // reset sentinel: an omitted field means "inherit", so a null could
+        // never express "stop thinking hard".
+        ...(effort !== (job.reasoningEffort ?? AUTO_EFFORT) ? { reasoning_effort: effort } : {}),
       });
-      router.push(`/${child.id}`);
+      // This is the next turn of the same transcript, not a new page for the
+      // reader. Next scrolls on navigation by default, which jumps the task
+      // region back to the top and makes every follow-up look like a reload.
+      router.push(`/${child.id}`, { scroll: false });
+      // Also what the remount used to do. Without it the composer stayed
+      // disabled with the sent text still in it, because nothing else ever
+      // cleared either.
+      setFollowUp('');
+      setSubmitting(false);
     } catch (cause: unknown) {
       setActionError(cause instanceof Error ? cause.message : 'Could not queue the follow-up');
       setSubmitting(false);
@@ -1080,10 +1229,19 @@ export function JobDetail({ job, onReload }: { job: AgentJob; onReload?: () => v
     }
   }
 
-  const threadMessages = job.threadMessages ?? [];
-  const lastHistoryJobId = threadMessages.length
-    ? threadMessages[threadMessages.length - 1].jobId
-    : undefined;
+  const allThreadMessages = job.threadMessages ?? [];
+  const historyTurns = job.historyTurns;
+  // A real API-backed job has reconstructed historical turns. Keep only this
+  // job's durable-message fallback here; fixtures still use the legacy flat
+  // history, and forked turns still need their copied messages.
+  const threadMessages = historyTurns
+    ? allThreadMessages.filter((message) => message.jobId === job.id)
+    : allThreadMessages;
+  const lastHistoryJobId = historyTurns?.length
+    ? historyTurns[historyTurns.length - 1].jobId
+    : allThreadMessages.length
+      ? allThreadMessages[allThreadMessages.length - 1].jobId
+      : undefined;
 
   return (
     <section className="flex h-full min-h-0 flex-col bg-gray-50/40">
@@ -1120,6 +1278,23 @@ export function JobDetail({ job, onReload }: { job: AgentJob; onReload?: () => v
               </button>
             </div>
           </div>
+          <nav aria-label="Run views" className="mr-3 flex shrink-0 items-center gap-1 text-[13px]">
+            {(['chat', 'trajectory'] as const).map((view) => (
+              <button
+                key={view}
+                type="button"
+                onClick={() => setTab(view)}
+                aria-current={tab === view ? 'page' : undefined}
+                className={`rounded-lg px-2.5 py-1 capitalize transition-colors ${
+                  tab === view
+                    ? 'bg-gray-100 font-medium text-gray-900'
+                    : 'text-gray-500 hover:text-gray-800'
+                }`}
+              >
+                {view}
+              </button>
+            ))}
+          </nav>
           <span
             className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${pill.className}`}
           >
@@ -1199,103 +1374,136 @@ export function JobDetail({ job, onReload }: { job: AgentJob; onReload?: () => v
           }`}
         >
           <div className="mx-auto flex w-full max-w-4xl flex-1 flex-col px-6 pb-6 pt-7">
-            <div className="flex-1">
-              {threadMessages.map((message, index) => {
-                const previous = index > 0 ? threadMessages[index - 1] : undefined;
-                const rewindAnchor =
-                  message.role === 'user' && previous && previous.jobId !== message.jobId
-                    ? previous.jobId
-                    : undefined;
-                return (
-                  <ThreadTurn
-                    key={message.id}
-                    message={message}
-                    busy={forking}
-                    onFork={
-                      message.role === 'assistant' ? () => void forkFrom(message.jobId) : undefined
-                    }
-                    onRewind={
-                      rewindAnchor ? () => void forkFrom(rewindAnchor, message.content) : undefined
-                    }
-                  />
-                );
-              })}
-
-              {job.historyIncludesPrompt ? null : (
-                <div className="group my-4 rounded-xl border border-gray-200/90 bg-white px-4 py-3 shadow-subtle">
-                  <Markdown text={job.prompt || job.title} />
-                  <MessageActions align="end">
-                    <MessageActionButton
-                      label="Copy message"
-                      onClick={() => void copyMessage(job.prompt || job.title)}
-                    >
-                      <CopyIcon />
-                      Copy
-                    </MessageActionButton>
-                    {lastHistoryJobId && lastHistoryJobId !== job.id ? (
-                      <MessageActionButton
-                        label="Edit & rewind"
-                        onClick={() => void forkFrom(lastHistoryJobId, job.prompt || job.title)}
-                        disabled={forking}
-                      >
-                        <RewindIcon />
-                        Edit &amp; rewind
-                      </MessageActionButton>
-                    ) : null}
-                  </MessageActions>
-                </div>
-              )}
-
-              {job.stateNote && job.state !== 'failed' ? (
-                <p className="mb-2 text-xs text-gray-400">{job.stateNote}</p>
-              ) : null}
-
-              {job.attempts.length > 1 ? (
-                <div className="my-3 flex flex-wrap items-center gap-1.5 text-xs">
-                  <span className="mr-1 text-gray-400">Run attempts</span>
-                  {job.attempts.map((attempt) => (
-                    <button
-                      key={attempt.no}
-                      type="button"
-                      onClick={() => setAttemptNo(attempt.no)}
-                      className={`rounded-md px-2 py-1 ${
-                        attempt.no === attemptNo
-                          ? 'bg-gray-900 text-white'
-                          : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
-                      }`}
-                    >
-                      {attempt.no} · {attempt.status}
-                    </button>
-                  ))}
-                </div>
-              ) : null}
-
-              {selectedAttempt?.status === 'superseded' && selectedAttempt.note ? (
-                <div className="my-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[13px] text-amber-800">
-                  {selectedAttempt.note}
-                </div>
-              ) : null}
-
-              <div aria-label="Agent activity" className="mt-2">
-                {visibleEvents.map((event, index) => (
-                  <EventRow key={`${event.attemptNo ?? 0}-${index}`} event={event} />
-                ))}
-                {job.liveNote ? (
-                  <div className="flex items-center gap-2.5 py-3 text-[13px] text-gray-500">
-                    <span className="h-2 w-2 animate-pulse rounded-full bg-blue-500" />
-                    {job.liveNote}
-                  </div>
-                ) : null}
-                {job.state === 'queued' && visibleEvents.length === 0 ? (
-                  <div className="flex items-center gap-2.5 py-3 text-[13px] text-gray-500">
-                    <span className="h-2 w-2 animate-pulse rounded-full bg-gray-400" />
-                    {job.parentJobId ? 'Queued after the current run' : 'Waiting for a runner'}
-                  </div>
-                ) : null}
+            {tab === 'trajectory' ? (
+              <div className="flex-1">
+                <TrajectoryView events={events} />
               </div>
+            ) : (
+              <div className="flex-1">
+                {historyTurns?.map((turn, index) => (
+                  <HistoryTurn
+                    key={turn.jobId}
+                    turn={turn}
+                    previousJobId={index > 0 ? historyTurns[index - 1].jobId : undefined}
+                    busy={forking}
+                    onFork={(anchorJobId) => void forkFrom(anchorJobId)}
+                    onRewind={(anchorJobId, prompt) => void forkFrom(anchorJobId, prompt)}
+                  />
+                ))}
+                {threadMessages.map((message, index) => {
+                  const previous = index > 0 ? threadMessages[index - 1] : undefined;
+                  const rewindParent =
+                    previous?.jobId ?? (historyTurns ? lastHistoryJobId : undefined);
+                  const rewindAnchor =
+                    message.role === 'user' && rewindParent && rewindParent !== message.jobId
+                      ? rewindParent
+                      : undefined;
+                  return (
+                    <ThreadTurn
+                      key={message.id}
+                      message={message}
+                      busy={forking}
+                      onFork={
+                        message.role === 'assistant'
+                          ? () => void forkFrom(message.jobId)
+                          : undefined
+                      }
+                      onRewind={
+                        rewindAnchor
+                          ? () => void forkFrom(rewindAnchor, message.content)
+                          : undefined
+                      }
+                    />
+                  );
+                })}
 
-              <OutcomeCard job={job} onOpenDiff={() => openWorkspace('git')} />
-            </div>
+                {job.historyIncludesPrompt ? null : (
+                  <div className="group my-4 rounded-xl border border-gray-200/90 bg-white px-4 py-3 shadow-subtle">
+                    <Markdown text={job.prompt || job.title} />
+                    <MessageActions align="end">
+                      <MessageActionButton
+                        label="Copy message"
+                        onClick={() => void copyMessage(job.prompt || job.title)}
+                      >
+                        <CopyIcon />
+                        Copy
+                      </MessageActionButton>
+                      {lastHistoryJobId && lastHistoryJobId !== job.id ? (
+                        <MessageActionButton
+                          label="Edit & rewind"
+                          onClick={() => void forkFrom(lastHistoryJobId, job.prompt || job.title)}
+                          disabled={forking}
+                        >
+                          <RewindIcon />
+                          Edit &amp; rewind
+                        </MessageActionButton>
+                      ) : null}
+                    </MessageActions>
+                  </div>
+                )}
+
+                {job.stateNote && job.state !== 'failed' ? (
+                  <p className="mb-2 text-xs text-gray-400">{job.stateNote}</p>
+                ) : null}
+
+                {job.attempts.length > 1 ? (
+                  <div className="my-3 flex flex-wrap items-center gap-1.5 text-xs">
+                    <span className="mr-1 text-gray-400">Run attempts</span>
+                    {job.attempts.map((attempt) => (
+                      <button
+                        key={attempt.no}
+                        type="button"
+                        onClick={() => setAttemptNo(attempt.no)}
+                        className={`rounded-md px-2 py-1 ${
+                          attempt.no === attemptNo
+                            ? 'bg-gray-900 text-white'
+                            : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
+                        }`}
+                      >
+                        {attempt.no} · {attempt.status}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+
+                {selectedAttempt?.status === 'superseded' && selectedAttempt.note ? (
+                  <div className="my-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[13px] text-amber-800">
+                    {selectedAttempt.note}
+                  </div>
+                ) : null}
+
+                <div aria-label="Agent activity" className="mt-2">
+                  {visibleEvents.map((event, index) => (
+                    <EventRow
+                      key={`${event.attemptNo ?? 0}-${index}`}
+                      event={event}
+                      busy={forking}
+                      onFork={
+                        event.kind === 'message' && !isActive
+                          ? () => void forkFrom(job.id)
+                          : undefined
+                      }
+                    />
+                  ))}
+                  {job.liveNote ? (
+                    <div className="flex items-center gap-2.5 py-3 text-[13px] text-gray-500">
+                      <span className="h-2 w-2 animate-pulse rounded-full bg-blue-500" />
+                      {job.liveNote}
+                    </div>
+                  ) : null}
+                  {job.state === 'queued' && visibleEvents.length === 0 ? (
+                    <div className="flex items-center gap-2.5 py-3 text-[13px] text-gray-500">
+                      <span className="h-2 w-2 animate-pulse rounded-full bg-gray-400" />
+                      {job.parentJobId ? 'Queued after the current run' : 'Waiting for a runner'}
+                    </div>
+                  ) : null}
+                </div>
+
+                <TurnFooter job={job} attemptNo={attemptNo} />
+
+                <OutcomeCard job={job} onOpenDiff={() => openWorkspace('git')} />
+              </div>
+            )}
 
             <div className="sticky bottom-0 z-10 -mx-2 mt-10 bg-gradient-to-t from-gray-50 via-gray-50/95 px-2 pb-2 pt-8">
               <form
@@ -1306,6 +1514,13 @@ export function JobDetail({ job, onReload }: { job: AgentJob; onReload?: () => v
                   rows={2}
                   value={followUp}
                   onChange={(event) => setFollowUp(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (!isComposerSubmit(event)) return;
+                    event.preventDefault();
+                    // Through the form, so the keyboard and the button take the
+                    // same path and cannot drift apart.
+                    event.currentTarget.form?.requestSubmit();
+                  }}
                   placeholder="Add a follow-up"
                   aria-label="Add a follow-up"
                   className="w-full resize-none rounded-t-xl border-0 bg-transparent px-4 pt-3 text-sm leading-relaxed text-gray-900 placeholder:text-gray-400 focus:outline-none focus:ring-0"
@@ -1329,6 +1544,12 @@ export function JobDetail({ job, onReload }: { job: AgentJob; onReload?: () => v
                         options={modelOptions}
                         onChange={setModel}
                       />
+                      <Picker
+                        label="Reasoning for this turn"
+                        value={effort}
+                        options={efforts}
+                        onChange={setEffort}
+                      />
                       {isActive ? (
                         <span className="min-w-0 truncate text-[11px] text-gray-400">
                           · queued after this run
@@ -1348,6 +1569,7 @@ export function JobDetail({ job, onReload }: { job: AgentJob; onReload?: () => v
                     disabled={!followUp.trim() || submitting}
                     className="ml-auto inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-crimson text-white shadow-sm transition-colors hover:bg-crimson-dark disabled:cursor-not-allowed disabled:opacity-40"
                     aria-label="Send follow-up"
+                    title="Send follow-up — ⏎ to send, ⇧⏎ for a new line"
                   >
                     {submitting ? (
                       <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-white/40 border-t-white" />
@@ -1370,6 +1592,7 @@ export function JobDetail({ job, onReload }: { job: AgentJob; onReload?: () => v
                   </button>
                 </div>
               </form>
+              <ThreadStatsBar job={job} />
               {actionError ? (
                 <p className="mt-2 text-center text-xs text-red-600" role="alert">
                   {actionError}

@@ -100,10 +100,17 @@ class HarnessCapabilities:
 
 @dataclass(frozen=True)
 class TurnInput:
-    """One user turn: the prompt and the model to answer it with."""
+    """One user turn: the prompt, the model, and how hard to think about it."""
 
     prompt: str
     model: str
+    #: ``None`` is Auto — no flag, whatever the CLI and model do by default,
+    #: which is what every turn did before this existed. A value has been
+    #: checked against both halves of the pair by the control plane; the
+    #: runtime refuses anything it cannot express rather than dropping it.
+    #: Fixed at spawn like the model is, so a resident session changing it
+    #: restarts (see :class:`ClaudeCodeLiveSession`).
+    reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -286,6 +293,17 @@ class HarnessSession:
         """Whether :meth:`close` has ended this session."""
         return self._closed
 
+    @property
+    def container(self) -> str | None:
+        """The sandbox container this session's process runs in, if any.
+
+        The host-side resource sampler is the only consumer: a resident turn
+        reuses a process spawned by an earlier turn, so without this the one
+        rung that needs no spawn would be the one rung nobody could measure.
+        Sessions without a live process of their own answer None.
+        """
+        return None
+
     def start_turn(self, turn_input: TurnInput) -> HarnessTurn:
         """Spawn the harness for this turn inside the platform's sandbox."""
         if self._closed:
@@ -307,6 +325,7 @@ class HarnessSession:
             credential=self._context.credential,
             provides_isolation=self._context.provides_isolation,
             mcp_config=self._context.mcp_config,
+            reasoning_effort=turn_input.reasoning_effort,
             **self._extra_prepare_kwargs(),
         )
         env = dict(self._context.base_env)
@@ -580,7 +599,22 @@ class ClaudeCodeLiveSession(ClaudeCodeSession):
         self._process: SandboxProcess | None = None
         self._lines: Iterator[str] | None = None
         self._model: str | None = None
+        #: Pinned by the first turn alongside the model, and compared against
+        #: every later one. ``None`` is a real value here (Auto), so this is
+        #: only meaningful once ``_process`` exists.
+        self._reasoning_effort: str | None = None
         self._live_turn: ClaudeCodeLiveTurn | None = None
+
+    @property
+    def container(self) -> str | None:
+        """The container the live process runs in, once it has been spawned.
+
+        Read defensively: the process is whatever the platform's spawn seam
+        returned, and a process that cannot say where it runs is one the
+        sampler simply does not measure. An observer must never be the reason
+        a turn fails.
+        """
+        return getattr(self._process, "container", None)
 
     def shared_lines(self) -> Iterator[str]:
         """The session's single stdout reader, borrowed by the current turn."""
@@ -593,6 +627,9 @@ class ClaudeCodeLiveSession(ClaudeCodeSession):
         The first turn fixes the session's model — a resident process reads
         its model once (D6: ``model_switch: restart``). A later turn naming a
         different model refuses here and the platform restarts the session.
+        The reasoning effort is fixed the same way and for the same reason:
+        it is a launch flag, read once at spawn, so a turn that wants a
+        different depth needs a different process.
         """
         if self._closed:
             raise DriverError("session is closed")
@@ -602,6 +639,12 @@ class ClaudeCodeLiveSession(ClaudeCodeSession):
             argv = [*self._argv_template]
             model_at = argv.index("--model") + 1
             argv[model_at] = turn_input.model
+            # The template was built without an effort, so the flag is spliced
+            # in beside the model rather than replaced. Spelling comes from the
+            # dialect layer; this method only knows there is one.
+            argv[model_at + 1 : model_at + 1] = self.runtime.effort_args(
+                turn_input.reasoning_effort
+            )
             env = dict(self._context.base_env)
             env.update(self._extra_env)
             env["ANTHROPIC_MODEL"] = turn_input.model
@@ -610,10 +653,18 @@ class ClaudeCodeLiveSession(ClaudeCodeSession):
             self._process = self._context.spawn_live(argv, env)
             self._lines = self._process.lines()
             self._model = turn_input.model
+            self._reasoning_effort = turn_input.reasoning_effort
         elif turn_input.model != self._model:
             raise DriverError(
                 f"this resident session runs {self._model!r}; switching to "
                 f"{turn_input.model!r} takes a restart (model_switch=restart)"
+            )
+        elif turn_input.reasoning_effort != self._reasoning_effort:
+            raise DriverError(
+                f"this resident session runs at reasoning effort "
+                f"{self._reasoning_effort!r}; switching to "
+                f"{turn_input.reasoning_effort!r} takes a restart "
+                "(model_switch=restart)"
             )
         try:
             self._process.write_line(self.runtime.user_message_line(turn_input.prompt))

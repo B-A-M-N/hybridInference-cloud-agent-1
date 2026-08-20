@@ -32,6 +32,7 @@ import json
 import os
 import re
 import secrets
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Request
@@ -77,6 +78,7 @@ from cloud_agent.mcp_registry import connection_states, registry_for_user
 from cloud_agent.schemas import (
     BASE_REF_METADATA_KEY,
     EVENT_TYPE_PATTERN,
+    RESET_REASONING_EFFORT,
     AgentConfigResponse,
     AgentFollowUpRequest,
     AgentGitWorkspaceResponse,
@@ -97,11 +99,15 @@ from cloud_agent.schemas import (
     AgentTerminalSessionResizeRequest,
     AgentTerminalSessionResponse,
     AgentThreadArchiveResponse,
+    AgentThreadEvent,
+    AgentThreadEventsResponse,
     AgentThreadMessageResponse,
     AgentThreadPinResponse,
     AgentThreadResponse,
+    AgentThreadStatsResponse,
     AgentWorkspaceResponse,
     AgentWorkspaceWriteRequest,
+    AttemptResources,
     GitHubConnectionResponse,
     GitHubConnectRequest,
     McpIntegrationResponse,
@@ -123,6 +129,7 @@ from cloud_agent.schemas import (
     WorkerFinishRequest,
     WorkerHeartbeatRequest,
     WorkerHeartbeatResponse,
+    WorkerResourcesRequest,
     WorkerTerminalSuspendRequest,
 )
 from cloud_agent.source_control import (
@@ -134,6 +141,7 @@ from cloud_agent.source_control import (
 )
 from cloud_agent.storage.store import PUBLISHING, RUNNING, TERMINAL_STATES
 from cloud_agent.terminal_coordination import resume_settled_terminal
+from cloud_agent.thread_stats import summarize_thread
 from cloud_agent.tokens import (
     SCOPE_FULL,
     SCOPE_MCP,
@@ -143,13 +151,21 @@ from cloud_agent.tokens import (
     parse_host_token,
     parse_worker_token,
 )
-from cloud_agent.visible_models import agent_canonical_model, agent_visible_models
+from cloud_agent.visible_models import (
+    agent_canonical_model,
+    agent_model_reasoning_efforts,
+    agent_visible_models,
+)
 from cloud_agent_host.egress import (
     EgressPolicyError,
     build_policy_from_env as build_egress_policy,
 )
 from cloud_agent_host.patch_gate import branch_name_for
-from cloud_agent_host.runtimes import registered_runtimes, runtimes_supporting_mcp
+from cloud_agent_host.runtimes import (
+    registered_runtimes,
+    runtime_reasoning_efforts,
+    runtimes_supporting_mcp,
+)
 from cloud_agent_host.workspace_broker_client import (
     WorkspaceBrokerClient,
     WorkspaceBrokerError,
@@ -331,7 +347,44 @@ def _egress_tiers() -> tuple[str | None, str | None]:
     return policy.tier_for("setup").value, policy.tier_for("agent").value
 
 
-def _job_response(job: dict[str, Any], usage: dict[str, Any] | None = None) -> AgentJobResponse:
+def _attempt_duration_ms(telemetry: dict[str, Any] | None) -> int | None:
+    """How long the newest attempt ran, or None while it still is."""
+    if not telemetry:
+        return None
+    started, finished = telemetry.get("started_at"), telemetry.get("finished_at")
+    if started is None or finished is None:
+        return None
+    return max(0, int((finished - started).total_seconds() * 1000))
+
+
+def _attempt_resources(telemetry: dict[str, Any] | None) -> AttemptResources | None:
+    """Shape the resource rollup, or None when no sampler ever reported.
+
+    A row whose counters are all null is still returned: it carries
+    ``coverage`` and is how a reader learns the turn was not measured, which
+    is a different statement from a turn that used nothing.
+    """
+    if not telemetry or telemetry.get("sampler_version") is None:
+        return None
+    return AttemptResources(
+        cpu_usec=telemetry.get("cpu_usec"),
+        mem_peak_bytes=telemetry.get("mem_peak_bytes"),
+        mem_avg_bytes=telemetry.get("mem_avg_bytes"),
+        io_read_bytes=telemetry.get("io_read_bytes"),
+        io_write_bytes=telemetry.get("io_write_bytes"),
+        net_rx_bytes=telemetry.get("net_rx_bytes"),
+        net_tx_bytes=telemetry.get("net_tx_bytes"),
+        sample_count=telemetry.get("sample_count") or 0,
+        coverage=float(telemetry.get("coverage") or 0.0),
+        sampler_version=telemetry.get("sampler_version"),
+    )
+
+
+def _job_response(
+    job: dict[str, Any],
+    usage: dict[str, Any] | None = None,
+    telemetry: dict[str, Any] | None = None,
+) -> AgentJobResponse:
     """Shape a store job row for the owner-facing API."""
     usage = usage or {}
     setup_tier, agent_tier = _egress_tiers()
@@ -349,6 +402,7 @@ def _job_response(job: dict[str, Any], usage: dict[str, Any] | None = None) -> A
         runtime=job["runtime"],
         model=job["model"],
         execution_profile=job.get("execution_profile", "trusted-v1"),
+        reasoning_effort=job.get("reasoning_effort"),
         base_ref=base_ref,
         base_sha=job["base_sha"],
         output_branch=branch_name_for(job.get("thread_id") or job["id"]),
@@ -370,6 +424,9 @@ def _job_response(job: dict[str, Any], usage: dict[str, Any] | None = None) -> A
         model_calls=usage.get("model_calls"),
         setup_egress_tier=setup_tier,
         agent_egress_tier=agent_tier,
+        continuity_mode=(telemetry or {}).get("continuity_mode"),
+        duration_ms=_attempt_duration_ms(telemetry),
+        resources=_attempt_resources(telemetry),
     )
 
 
@@ -432,6 +489,13 @@ async def get_agent_config(
         # will hit — not /v1/models, which answers for the *browsing* user and
         # offered models whose first agent call then 404ed.
         models=await agent_visible_models(gateway, user_id=user["user_id"]),
+        # Two halves of one control. The composer offers their intersection per
+        # (runtime, model) pair and no control when it is empty — which is also
+        # what an older gateway, answering no domains, produces.
+        runtime_reasoning_efforts=runtime_reasoning_efforts(),
+        model_reasoning_efforts=await agent_model_reasoning_efforts(
+            gateway, user_id=user["user_id"]
+        ),
         # This user's connected servers, not the deployment's: same reason the
         # repository list above is theirs. Public fields only — McpServerSummary
         # has nowhere to put a URL or a credential, which is how it stays that
@@ -1117,25 +1181,97 @@ def _require_registered_runtime(runtime: str) -> None:
         )
 
 
-@router.post("/jobs", response_model=AgentJobResponse, status_code=201)
-async def create_agent_job(
+async def _require_offered_effort(
+    effort: str | None,
+    *,
+    runtime: str,
+    model: str,
+    gateway: Any,
+    user: dict[str, Any],
+) -> str | None:
+    """400 unless ``effort`` is one this runtime *and* this model both accept.
+
+    The offered set is the intersection, and it is checked rather than clamped.
+    Clamping looks kinder and is worse: glm-5.3 has no ``medium``, so a
+    ``medium`` quietly served as ``high`` would bill and behave as a depth
+    nobody chose while reporting the one they did — the same lie as a flag that
+    resolves to nothing, which is what this whole control exists to end.
+
+    Args:
+        effort: The requested level, or ``None`` for Auto.
+        runtime: The harness this turn will run on.
+        model: The canonical model id, already resolved.
+        gateway: Client for the gateway's internal contracts.
+        user: The authenticated owner.
+
+    Returns:
+        The value to store: ``None`` for Auto, else the validated level.
+
+    Raises:
+        HTTPException: 400 when the pair does not offer this value.
+    """
+    if effort is None or effort == RESET_REASONING_EFFORT:
+        # The sentinel means Auto wherever it appears. On a follow-up it also
+        # has to be told apart from "inherit" (that caller checks it before
+        # getting here); on a create there is nothing to inherit, so the two
+        # spellings of Auto are the same answer and neither is a 400.
+        return None
+    runtime_levels = runtime_reasoning_efforts().get(runtime, [])
+    model_levels = (await agent_model_reasoning_efforts(gateway, user_id=user["user_id"])).get(
+        model, []
+    )
+    offered = [level for level in runtime_levels if level in model_levels]
+    if effort in offered:
+        return effort
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "error": {
+                "type": "reasoning_effort_not_available",
+                "message": (
+                    f"Reasoning effort {effort!r} is not available for {runtime!r} "
+                    f"with {model!r}. Available: {', '.join(offered) or 'none'}."
+                ),
+            }
+        },
+    )
+
+
+async def _create_job_as(
     body: AgentJobCreate,
-    user: dict[str, Any] = Depends(require_agent_owner),
-    store: AgentJobStore | None = Depends(get_agent_job_store),
-    app_credentials: Any | None = Depends(get_agent_app_credentials),
-    gateway: Any = Depends(get_gateway_client),
-) -> AgentJobResponse:
-    """Queue a new agent job for the authenticated user."""
-    job_store = _require_store(store)
+    user: dict[str, Any],
+    *,
+    job_store: AgentJobStore,
+    app_credentials: Any | None,
+    gateway: Any,
+    reserved_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create one job for ``user``, shared by the owner and service doors.
+
+    Extracted so the on-call service surface (``api/service_jobs.py``) creates
+    jobs through exactly the checks the owner route runs — model resolution,
+    repo entitlement, ref pinning — rather than through a parallel path that
+    drifts. ``reserved_metadata`` is stamped *after* caller metadata for the
+    same reason ``BASE_REF_METADATA_KEY`` is popped first: a display fact the
+    platform asserts must not be spoofable by the request body.
+    """
     # Fail here, not at claim time. An unregistered runtime used to travel all
     # the way into a queued row and burn a claim before anything noticed —
     # the composer only offers registered ids, so an arbitrary string can only
     # arrive from a direct API caller, and it deserves a 400, not a dead job.
+    # The check lives in the helper rather than in the owner route because the
+    # service door creates jobs through here too: a check only one door runs
+    # is precisely the drift this extraction exists to prevent.
     _require_registered_runtime(body.runtime)
     # Canonical from here on. The grant the gateway mints names canonical
     # ids, so a job that stored the alias would carry a scope matching
     # nothing — created successfully, dead at its first inference call.
     model = await _require_resolvable_model(body.model, gateway=gateway, user=user)
+    # Checked against the *resolved* model, not the requested spelling: the
+    # domain belongs to the model the turn will actually call.
+    reasoning_effort = await _require_offered_effort(
+        body.reasoning_effort, runtime=body.runtime, model=model, gateway=gateway, user=user
+    )
     # The requester chooses the repository and the platform later mints a real
     # installation token for it. Without this the two combine into a confused
     # deputy: name any repository the App reaches, and read it back through
@@ -1181,6 +1317,8 @@ async def create_agent_job(
         metadata.pop(key, None)
     if body.base_ref:
         metadata[BASE_REF_METADATA_KEY] = body.base_ref
+    for key, value in (reserved_metadata or {}).items():
+        metadata[key] = value
     mcp_servers = await _resolve_mcp_servers(
         body.mcp_servers, runtime=body.runtime, store=job_store, user_id=user["user_id"]
     )
@@ -1198,6 +1336,7 @@ async def create_agent_job(
         runtime=body.runtime,
         model=model,
         execution_profile=execution_profile,
+        reasoning_effort=reasoning_effort,
         base_sha=base_sha,
         setup_script=body.setup_script,
         metadata=metadata or None,
@@ -1206,6 +1345,26 @@ async def create_agent_job(
     logger.info(
         "agent_job_created",
         extra={"event": "agent_job_created", "job_id": job["id"], "runtime": body.runtime},
+    )
+    return job
+
+
+@router.post("/jobs", response_model=AgentJobResponse, status_code=201)
+async def create_agent_job(
+    body: AgentJobCreate,
+    user: dict[str, Any] = Depends(require_agent_owner),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+    app_credentials: Any | None = Depends(get_agent_app_credentials),
+    gateway: Any = Depends(get_gateway_client),
+) -> AgentJobResponse:
+    """Queue a new agent job for the authenticated user."""
+    job_store = _require_store(store)
+    job = await _create_job_as(
+        body,
+        user,
+        job_store=job_store,
+        app_credentials=app_credentials,
+        gateway=gateway,
     )
     return _job_response(job)
 
@@ -1265,7 +1424,11 @@ async def get_agent_job(
     """Fetch one of the caller's agent jobs, with what it has spent so far."""
     job_store = _require_store(store)
     job = await _owned_job(job_store, job_id, user)
-    return _job_response(job, await _job_usage(log_store, job_id))
+    return _job_response(
+        job,
+        await _job_usage(log_store, job_id),
+        await job_store.job_turn_telemetry(job_id=job_id),
+    )
 
 
 @router.post("/jobs/{job_id}/cancel", response_model=AgentJobCancelResponse)
@@ -1424,6 +1587,21 @@ async def create_agent_follow_up(
     model = None
     if body.model:
         model = await _require_resolvable_model(body.model, gateway=gateway, user=user)
+    # Effort is per turn, like the model, and inherits when omitted. Unlike the
+    # model it needs a way *back*: null already means "no override, inherit", so
+    # clearing an inherited effort takes the explicit reset sentinel. Validated
+    # against the model this turn will run — which may be the switched-to one,
+    # and a pair that was offered last turn need not be offered this one.
+    reasoning_effort: str | None = None
+    reset_effort = body.reasoning_effort == RESET_REASONING_EFFORT
+    if body.reasoning_effort is not None and not reset_effort:
+        reasoning_effort = await _require_offered_effort(
+            body.reasoning_effort,
+            runtime=parent["runtime"],
+            model=model or parent["model"],
+            gateway=gateway,
+            user=user,
+        )
     try:
         await require_entitled_repo(
             parent["repo"],
@@ -1466,6 +1644,8 @@ async def create_agent_follow_up(
         # Canonical, or the parent's when omitted — never the alias the caller
         # typed, which the gateway's grant would not match.
         model=model if body.model else None,
+        reasoning_effort=reasoning_effort,
+        reset_reasoning_effort=reset_effort,
     )
     if job is None:
         raise HTTPException(
@@ -1583,6 +1763,68 @@ async def get_agent_thread(
         jobs=[_job_response(job) for job in thread["jobs"]],
         created_at=_iso(thread["created_at"]),
         updated_at=_iso(thread["updated_at"]),
+    )
+
+
+@router.get("/jobs/{job_id}/thread/stats", response_model=AgentThreadStatsResponse)
+async def get_agent_thread_stats(
+    job_id: str,
+    user: dict[str, Any] = Depends(require_agent_owner),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+) -> AgentThreadStatsResponse:
+    """Summarize the thread containing a job: turns, timings, tokens.
+
+    Every number is derived from rows the platform already writes, so a
+    thread that predates this endpoint answers it in full. Measures the
+    thread's runtime does not report come back ``null`` rather than zero.
+    """
+    job_store = _require_store(store)
+    await _owned_job(job_store, job_id, user)
+    inputs = await job_store.thread_stats_inputs(job_id=job_id, user_id=user["user_id"])
+    if inputs is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": {"type": "not_found", "message": f"No thread for {job_id}"}},
+        )
+    stats = summarize_thread(
+        job_ids=inputs["job_ids"],
+        attempts=inputs["attempts"],
+        events=inputs["events"],
+    )
+    return AgentThreadStatsResponse(thread_id=inputs["thread_id"], **asdict(stats))
+
+
+@router.get("/jobs/{job_id}/thread/events", response_model=AgentThreadEventsResponse)
+async def list_agent_thread_events(
+    job_id: str,
+    after: int = Query(0, ge=0, description="Return events with a global id greater than this."),
+    limit: int = Query(_EVENT_PAGE_SIZE, ge=1, le=1000),
+    user: dict[str, Any] = Depends(require_agent_owner),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+) -> AgentThreadEventsResponse:
+    """Page every turn's event log, with payloads and turn labels intact."""
+    job_store = _require_store(store)
+    await _owned_job(job_store, job_id, user)
+    events = await job_store.list_thread_events_after(
+        job_id=job_id, user_id=user["user_id"], after_id=after, limit=limit
+    )
+    if events is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return AgentThreadEventsResponse(
+        events=[
+            AgentThreadEvent(
+                id=event["id"],
+                job_id=event["job_id"],
+                turn_no=event.get("turn_no") or 1,
+                attempt_id=event["attempt_id"],
+                seq=event["seq"],
+                event_type=event["event_type"],
+                payload=event["payload"],
+                created_at=_iso(event["created_at"]),
+            )
+            for event in events
+        ],
+        next_cursor=events[-1]["id"] if events else after,
     )
 
 
@@ -2819,6 +3061,7 @@ async def worker_claim(
         runtime=claim["runtime"],
         model=claim["model"],
         execution_profile=claim.get("execution_profile", "trusted-v1"),
+        reasoning_effort=claim.get("reasoning_effort"),
         worker_token=token,
         sandbox_token=sandbox_token,
         mcp_token=mcp_token,
@@ -2928,6 +3171,32 @@ async def worker_report_continuity(
         attempt_id=claims["attempt_id"],
         lease_generation=claims["lease_generation"],
         mode=body.mode,
+    )
+    if not recorded:
+        raise _lease_lost()
+    return WorkerAckResponse(ok=True)
+
+
+@router.post("/worker/jobs/{job_id}/resources", response_model=WorkerAckResponse)
+async def worker_report_resources(
+    job_id: str,
+    body: WorkerResourcesRequest,
+    authorization: str | None = Header(None),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+) -> WorkerAckResponse:
+    """Record one closed attempt window's resource rollup.
+
+    Fenced like every other worker write, and idempotent: the rollup
+    describes a window that is already closed, so a retried post is the same
+    window said twice rather than a second window to add.
+    """
+    job_store = _require_store(store)
+    claims = _worker_claims(authorization)
+    _match_job(claims, job_id)
+    recorded = await job_store.record_attempt_resources(
+        attempt_id=claims["attempt_id"],
+        lease_generation=claims["lease_generation"],
+        rollup=body.model_dump(),
     )
     if not recorded:
         raise _lease_lost()

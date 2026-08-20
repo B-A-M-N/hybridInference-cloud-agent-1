@@ -26,12 +26,28 @@ export type AgentJobApiState =
   | 'failed'
   | 'cancelled';
 
+export interface AttemptResourcesApi {
+  cpu_usec: number | null;
+  mem_peak_bytes: number | null;
+  mem_avg_bytes: number | null;
+  io_read_bytes: number | null;
+  io_write_bytes: number | null;
+  net_rx_bytes: number | null;
+  net_tx_bytes: number | null;
+  sample_count: number;
+  /** Fraction of the attempt window actually sampled, 0..1. */
+  coverage: number;
+  sampler_version: string | null;
+}
+
 export interface AgentJobApi {
   id: string;
   repo: string;
   task_prompt: string;
   runtime: string;
   model: string;
+  /** How hard the model was asked to think. Null is Auto — nobody chose. */
+  reasoning_effort?: string | null;
   /** Requested branch/ref before the backend pinned it to base_sha. */
   base_ref?: string | null;
   base_sha: string | null;
@@ -57,6 +73,15 @@ export interface AgentJobApi {
   model_calls: number | null;
   setup_egress_tier: string | null;
   agent_egress_tier: string | null;
+  /** Which continuity rung this turn ran on. Null on turns that predate it. */
+  continuity_mode?: 'hot' | 'warm_native' | 'cold_native' | 'replay' | null;
+  duration_ms?: number | null;
+  /**
+   * What the sandbox consumed, measured from the host. Null when no sampler
+   * reported; a present object with `coverage` below 1 is a partial
+   * measurement and must be rendered as incomplete, never as a total.
+   */
+  resources?: AttemptResourcesApi | null;
   /** Conversation fields are optional so pre-thread deployments remain readable. */
   thread_id?: string | null;
   parent_job_id?: string | null;
@@ -81,6 +106,28 @@ export interface AgentThreadApi {
   jobs: AgentJobApi[];
   created_at?: string | null;
   updated_at?: string | null;
+}
+
+/**
+ * Aggregate numbers for a thread. A null field means the thread's runtime
+ * does not report that measure — render it as a dash, never as a zero.
+ */
+export interface AgentThreadStatsApi {
+  thread_id: string;
+  turns: number;
+  tool_calls: number;
+  failed_tool_calls: number;
+  wall_seconds: number;
+  model_seconds: number;
+  tool_seconds: number;
+  ttft_seconds: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_hit_ratio: number | null;
+  output_tokens_per_second: number | null;
+  tokens_source: string;
+  timing_source: string;
 }
 
 export interface AgentJobEventApi {
@@ -146,6 +193,17 @@ export interface AgentConfigApi {
   mcp_servers?: AgentMcpServerApi[];
   /** Runtimes that can be given MCP servers; others refuse such a job. */
   mcp_runtimes?: string[];
+  /**
+   * Effort levels each runtime can express, in its own vocabulary. A runtime
+   * absent here cannot express one at all.
+   */
+  runtime_reasoning_efforts?: Record<string, string[]>;
+  /**
+   * Effort levels each model accepts. Offer the intersection with the chosen
+   * runtime's, and no control when it is empty — which is also what a backend
+   * too old to answer these produces.
+   */
+  model_reasoning_efforts?: Record<string, string[]>;
   setup_egress_tier: string | null;
   agent_egress_tier: string | null;
   github_connected: boolean;
@@ -274,6 +332,8 @@ export interface CreateAgentJobRequest {
   task_prompt: string;
   model: string;
   runtime?: string;
+  /** Omitted is Auto: the runtime and model decide for themselves. */
+  reasoning_effort?: string;
   /** A branch. The platform pins it to a commit at creation. */
   base_ref?: string;
   base_sha?: string;
@@ -381,6 +441,16 @@ export async function getAgentJobThread(jobId: string): Promise<AgentThreadApi |
   return jsonOrThrow<AgentThreadApi>(resp);
 }
 
+/** Load a thread's aggregate stats. Old standalone jobs return null. */
+export async function getAgentThreadStats(jobId: string): Promise<AgentThreadStatsApi | null> {
+  const resp = await fetchWithAuth(
+    API_BASE,
+    `/v1/agent/jobs/${encodeURIComponent(jobId)}/thread/stats`,
+  );
+  if (resp.status === 404) return null;
+  return jsonOrThrow<AgentThreadStatsApi>(resp);
+}
+
 export async function createAgentJob(body: CreateAgentJobRequest): Promise<AgentJobApi> {
   const resp = await fetchWithAuth(API_BASE, '/v1/agent/jobs', {
     method: 'POST',
@@ -404,6 +474,12 @@ export interface FollowUpAgentJobRequest {
   /** Omitted values inherit the parent run's harness and model. */
   runtime?: string;
   model?: string;
+  /**
+   * Omitted inherits the previous turn's effort; the literal `'auto'` (the
+   * components' `AUTO_EFFORT`) clears it back to Auto. Null cannot mean
+   * "clear" — it is already what "inherit" sends.
+   */
+  reasoning_effort?: string;
 }
 
 /** Queue another turn in the same thread, after its currently active run. */
@@ -447,6 +523,37 @@ export async function listAgentJobEvents(
     `/v1/agent/jobs/${encodeURIComponent(jobId)}/events?after=${after}&limit=${limit}`,
   );
   return jsonOrThrow(resp);
+}
+
+/** One stored event labelled with the conversation turn it belongs to. */
+export interface AgentThreadEventApi extends AgentJobEventApi {
+  job_id: string;
+  turn_no: number;
+}
+
+/** Page through every turn's event log in append order. */
+export async function listAgentThreadEvents(
+  jobId: string,
+  after = 0,
+  limit = 1000,
+): Promise<{ events: AgentThreadEventApi[]; next_cursor: number }> {
+  const resp = await fetchWithAuth(
+    API_BASE,
+    `/v1/agent/jobs/${encodeURIComponent(jobId)}/thread/events?after=${after}&limit=${limit}`,
+  );
+  return jsonOrThrow(resp);
+}
+
+/** Read a complete thread without imposing the server's page size on Chat. */
+export async function listAllAgentThreadEvents(jobId: string): Promise<AgentThreadEventApi[]> {
+  const events: AgentThreadEventApi[] = [];
+  let cursor = 0;
+  for (;;) {
+    const page = await listAgentThreadEvents(jobId, cursor, 1000);
+    events.push(...page.events);
+    if (page.events.length < 1000 || page.next_cursor <= cursor) return events;
+    cursor = page.next_cursor;
+  }
 }
 
 export async function getAgentJobArtifact(

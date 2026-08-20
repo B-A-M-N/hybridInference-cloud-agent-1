@@ -64,6 +64,8 @@ class FakeAgentJobStore:
         self.messages: list[dict[str, Any]] = []
         self.archived_threads: dict[str, datetime] = {}
         self.pinned_threads: dict[str, datetime] = {}
+        self.turn_telemetry: dict[str, dict[str, Any]] = {}
+        self.attempt_jobs: dict[int, str] = {}
         self.live_fence: tuple[int, int] | None = None
         self.attempt_grants: dict[int, str] = {}
         self.terminal_readiness: dict[int, bool] = {}
@@ -130,6 +132,7 @@ class FakeAgentJobStore:
         job.setdefault("base_sha", None)
         job.setdefault("metadata", None)
         job.setdefault("execution_profile", "trusted-v1")
+        job.setdefault("reasoning_effort", None)
         self.jobs[job_id] = job
         self.messages.append(
             {
@@ -151,6 +154,8 @@ class FakeAgentJobStore:
         prompt: str,
         runtime: str | None = None,
         model: str | None = None,
+        reasoning_effort: str | None = None,
+        reset_reasoning_effort: bool = False,
     ) -> dict[str, Any] | None:
         requested = self.jobs.get(parent_job_id)
         if requested is None or requested["user_id"] != user_id:
@@ -178,6 +183,13 @@ class FakeAgentJobStore:
             "task_prompt": prompt,
             "runtime": runtime or parent["runtime"],
             "model": model or parent["model"],
+            # Mirrors the store: inherit when omitted, and only the explicit
+            # reset clears an effort the thread already carries.
+            "reasoning_effort": (
+                None
+                if reset_reasoning_effort
+                else (reasoning_effort or parent.get("reasoning_effort"))
+            ),
             "state": (
                 "queued"
                 if parent["state"] in {"failed", "cancelled"}
@@ -326,6 +338,28 @@ class FakeAgentJobStore:
             "jobs": jobs,
         }
 
+    async def thread_stats_inputs(self, *, job_id: str, user_id: str) -> dict[str, Any] | None:
+        job = self.jobs.get(job_id)
+        if job is None or job["user_id"] != user_id:
+            return None
+        thread_id = job["thread_id"]
+        thread_jobs = sorted(
+            (item for item in self.jobs.values() if item["thread_id"] == thread_id),
+            key=lambda item: item["turn_no"],
+        )
+        job_ids = [item["id"] for item in thread_jobs]
+        return {
+            "thread_id": thread_id,
+            "job_ids": job_ids,
+            # This stand-in stamps no clocks (``append_event`` stores
+            # ``created_at: None``), so the timings come back zero here and
+            # the arithmetic is pinned by ``tests/unit/test_thread_stats.py``
+            # instead. What this fake is for is the HTTP contract: ownership,
+            # shape, and the counts that need no clock.
+            "attempts": [{"job_id": item["id"], "started_at": None} for item in thread_jobs],
+            "events": [event for event in self.events if event["job_id"] in set(job_ids)],
+        }
+
     async def follow_up_context(self, *, job_id: str) -> dict[str, Any]:
         job = self.jobs[job_id]
         parent_id = job.get("parent_job_id")
@@ -361,6 +395,44 @@ class FakeAgentJobStore:
         if job is None:
             return None
         return {**job, "pinned_at": self.pinned_threads.get(job["thread_id"])}
+
+    async def list_thread_events_after(
+        self, *, job_id: str, user_id: str, after_id: int = 0, limit: int = 500
+    ) -> list[dict[str, Any]] | None:
+        """Every event of the containing thread, labelled by turn."""
+        job = self.jobs.get(job_id)
+        if job is None or job.get("user_id") != user_id:
+            return None
+        thread_id = job.get("thread_id")
+        turns = {
+            other["id"]: other.get("turn_no") or 1
+            for other in self.jobs.values()
+            if other.get("thread_id") == thread_id
+        }
+        rows = [
+            {**event, "turn_no": turns[event["job_id"]]}
+            for event in self.events
+            if event["job_id"] in turns and event["id"] > after_id
+        ]
+        return sorted(rows, key=lambda row: row["id"])[:limit]
+
+    async def job_turn_telemetry(self, *, job_id: str) -> dict[str, Any] | None:
+        """How the newest attempt ran. Absent until a runner reports one."""
+        return self.turn_telemetry.get(job_id)
+
+    async def record_attempt_resources(
+        self, *, attempt_id: int, lease_generation: int, rollup: dict[str, Any]
+    ) -> bool:
+        """Store one window's rollup, fenced and idempotent like the real store."""
+        if not self._fenced(attempt_id, lease_generation):
+            return False
+        job_id = self.attempt_jobs.get(attempt_id)
+        if job_id is None:
+            return False
+        # Upsert, never append: a rollup describes a closed window, so a
+        # retried post is the same window said twice.
+        self.turn_telemetry[job_id] = {**self.turn_telemetry.get(job_id, {}), **rollup}
+        return True
 
     async def list_jobs(
         self,
@@ -584,6 +656,7 @@ class FakeAgentJobStore:
         job["current_attempt_id"] = 100
         self.live_fence = (100, 1)
         self.terminal_readiness[100] = False
+        self.attempt_jobs[100] = job["id"]
         return {**job, "attempt_id": 100, "attempt_no": 1, "lease_generation": 1}
 
     async def record_attempt_grant(
@@ -761,6 +834,11 @@ def store() -> FakeAgentJobStore:
 
 # Every model id the tests submit must resolve, or create fails fast by design.
 _TEST_MODELS = ("glm-5.1", "qwen-next", "m")
+#: One model that takes an effort and one that does not, so the intersection
+#: is exercised in both directions. No ``medium``, matching the real registry's
+#: glm-5.3 entry: a fixture that offered the intuitive three would pass against
+#: an implementation that assumed them.
+_TEST_MODEL_EFFORTS = {"glm-5.1": ["low", "high", "max"]}
 
 
 class _FakeGateway:
@@ -788,6 +866,15 @@ class _FakeGateway:
         `AttributeError` the moment the caller started asking for the table.
         """
         return list(_TEST_MODELS), dict(self.aliases)
+
+    async def model_reasoning_efforts(self, user_id: str) -> dict[str, list[str]]:
+        """Which models take a reasoning effort, and which values.
+
+        Same reason the alias method exists here: the real client asks, so a
+        fake that does not answer sends every composer and create path into an
+        ``AttributeError`` rather than the behaviour under test.
+        """
+        return {model: list(values) for model, values in _TEST_MODEL_EFFORTS.items()}
 
 
 class _FakeGrants:
@@ -1012,6 +1099,114 @@ async def test_repo_filter_rejects_a_value_git_would_read_as_an_option(client: A
     """The filter is shape-checked like the create field it mirrors."""
     rejected = await client.get("/v1/agent/jobs?repo=--upload-pack=sh")
     assert rejected.status_code == 422
+
+
+def _seed_event(
+    store: FakeAgentJobStore,
+    *,
+    job_id: str,
+    seq: int,
+    event_type: str,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    """Put one event straight into the stand-in, bypassing the fenced write."""
+    store.events.append(
+        {
+            "id": len(store.events) + 1,
+            "job_id": job_id,
+            "attempt_id": 1,
+            "seq": seq,
+            "event_type": event_type,
+            "payload": payload or {},
+            "created_at": None,
+        }
+    )
+
+
+async def test_thread_stats_summarize_every_turn_in_the_thread(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """The bar counts the whole conversation, not just the job asked about."""
+    parent_id = await _create_job(client)
+    follow_up = await client.post(
+        f"/v1/agent/jobs/{parent_id}/follow-ups",
+        json={"prompt": "and the docs too"},
+    )
+    child_id = follow_up.json()["id"]
+    _seed_event(
+        store,
+        job_id=parent_id,
+        seq=1,
+        event_type="tool_use",
+        payload={"id": "a", "name": "bash", "usage": {"input_tokens": 100, "output_tokens": 10}},
+    )
+    _seed_event(
+        store,
+        job_id=parent_id,
+        seq=2,
+        event_type="tool_result",
+        payload={"tool_use_id": "a", "is_error": True},
+    )
+    _seed_event(
+        store,
+        job_id=child_id,
+        seq=3,
+        event_type="message",
+        payload={"text": "done", "usage": {"input_tokens": 40, "output_tokens": 5}},
+    )
+
+    # Either end of the thread answers with the same thread-wide summary.
+    for job_id in (parent_id, child_id):
+        response = await client.get(f"/v1/agent/jobs/{job_id}/thread/stats")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["thread_id"] == follow_up.json()["thread_id"]
+        assert body["turns"] == 2
+        assert body["tool_calls"] == 1
+        assert body["failed_tool_calls"] == 1
+        assert body["input_tokens"] == 140
+        assert body["output_tokens"] == 15
+        assert body["tokens_source"] == "runtime"
+        assert body["timing_source"] == "message_events"
+
+
+async def test_thread_stats_report_absent_tokens_as_null(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """A runtime that reports no usage must not look like one that used none."""
+    job_id = await _create_job(client)
+    _seed_event(store, job_id=job_id, seq=1, event_type="raw", payload={"text": "tier-2 tail"})
+
+    body = (await client.get(f"/v1/agent/jobs/{job_id}/thread/stats")).json()
+
+    assert body["input_tokens"] is None
+    assert body["output_tokens"] is None
+    assert body["cache_hit_ratio"] is None
+    assert body["output_tokens_per_second"] is None
+    assert body["tokens_source"] == "unavailable"
+
+
+async def test_thread_stats_are_owner_scoped(client: AsyncClient, store: FakeAgentJobStore):
+    """Someone else's thread is not summarizable, same as it is not readable."""
+    job_id = await _create_job(client)
+    store.jobs[job_id]["user_id"] = _OTHER
+
+    response = await client.get(f"/v1/agent/jobs/{job_id}/thread/stats")
+
+    assert response.status_code == 404
+
+
+async def test_thread_stats_answer_a_thread_that_never_ran(client: AsyncClient):
+    """A queued thread has no events yet and still renders a bar."""
+    job_id = await _create_job(client)
+
+    body = (await client.get(f"/v1/agent/jobs/{job_id}/thread/stats")).json()
+
+    assert body["turns"] == 1
+    assert body["tool_calls"] == 0
+    assert body["wall_seconds"] == 0.0
+    assert body["ttft_seconds"] is None
 
 
 async def test_archived_threads_leave_the_active_project_tree(client: AsyncClient):
@@ -4151,3 +4346,319 @@ async def test_an_unknown_model_is_still_refused_at_creation(client: AsyncClient
 
     assert response.status_code == 400
     assert response.json()["detail"]["error"]["type"] == "model_not_available"
+
+
+async def test_the_owner_sees_what_their_turn_consumed(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """The footer's numbers, end to end: runner posts, owner reads."""
+    job_id = await _create_job(client)
+    claim = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+    auth = {"Authorization": f"Bearer {claim['worker_token']}"}
+
+    ack = await client.post(
+        f"/v1/agent/worker/jobs/{job_id}/resources",
+        json={
+            "cpu_usec": 18_200_000,
+            "mem_peak_bytes": 1_288_490_188,
+            "net_rx_bytes": 35_651_584,
+            "net_tx_bytes": 2_097_152,
+            "sample_count": 42,
+            "coverage": 1.0,
+            "sampler_version": "1",
+        },
+        headers=auth,
+    )
+    assert ack.status_code == 200
+
+    job = (await client.get(f"/v1/agent/jobs/{job_id}")).json()
+    assert job["resources"]["cpu_usec"] == 18_200_000
+    assert job["resources"]["mem_peak_bytes"] == 1_288_490_188
+    assert job["resources"]["coverage"] == 1.0
+
+
+async def test_a_rollup_is_the_same_window_said_twice_not_two_windows(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """Retrying the post must not double a turn's consumption."""
+    job_id = await _create_job(client)
+    claim = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+    auth = {"Authorization": f"Bearer {claim['worker_token']}"}
+    body = {"cpu_usec": 1_000, "sample_count": 5, "coverage": 1.0, "sampler_version": "1"}
+
+    await client.post(f"/v1/agent/worker/jobs/{job_id}/resources", json=body, headers=auth)
+    await client.post(f"/v1/agent/worker/jobs/{job_id}/resources", json=body, headers=auth)
+
+    job = (await client.get(f"/v1/agent/jobs/{job_id}")).json()
+    assert job["resources"]["cpu_usec"] == 1_000, "a retried post doubled the turn's CPU"
+
+
+async def test_a_superseded_attempt_cannot_relabel_what_the_live_one_used(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """Fenced like every other worker write."""
+    job_id = await _create_job(client)
+    claim = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+    auth = {"Authorization": f"Bearer {claim['worker_token']}"}
+    # A takeover moves the fence to a new attempt generation.
+    store.live_fence = (101, 2)
+
+    refused = await client.post(
+        f"/v1/agent/worker/jobs/{job_id}/resources",
+        json={"cpu_usec": 999, "sample_count": 1, "coverage": 1.0, "sampler_version": "1"},
+        headers=auth,
+    )
+    assert refused.status_code == 409
+
+    job = (await client.get(f"/v1/agent/jobs/{job_id}")).json()
+    assert job["resources"] is None
+
+
+async def test_an_unmeasured_turn_reports_nothing_rather_than_zero(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """The distinction the whole feature rests on.
+
+    A turn nobody measured has no resources object at all. Reading zeros here
+    would be indistinguishable from a turn that genuinely consumed nothing —
+    and the reader would have no way to tell which they were looking at.
+    """
+    job_id = await _create_job(client)
+
+    job = (await client.get(f"/v1/agent/jobs/{job_id}")).json()
+
+    assert job["resources"] is None
+    assert job["continuity_mode"] is None
+    assert job["duration_ms"] is None
+
+
+# ── Reasoning effort ───────────────────────────────────────────────────
+
+
+async def test_effort_is_offered_only_where_runtime_and_model_both_deliver(client: AsyncClient):
+    """The composer is told both halves; it offers their intersection."""
+    config = (await client.get("/v1/agent/config")).json()
+
+    # claude-code can express effort; the Tier 2 runtimes cannot, and are
+    # absent rather than listed with an empty vocabulary.
+    assert config["runtime_reasoning_efforts"]["claude-code"] == ["low", "medium", "high", "max"]
+    assert config["runtime_reasoning_efforts"]["codex"][:3] == ["none", "minimal", "low"]
+    assert config["runtime_reasoning_efforts"]["pi"] == ["minimal", "low", "medium", "high"]
+    assert config["model_reasoning_efforts"] == {"glm-5.1": ["low", "high", "max"]}
+
+
+async def test_a_turn_records_the_effort_it_was_created_with(client: AsyncClient):
+    response = await client.post(
+        "/v1/agent/jobs",
+        json={
+            "repo": "owner/name",
+            "task_prompt": "fix it",
+            "model": "glm-5.1",
+            "reasoning_effort": "high",
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["reasoning_effort"] == "high"
+
+
+async def test_a_turn_without_an_effort_is_auto(client: AsyncClient):
+    """Auto is null, and null is what every turn before this control reports."""
+    job_id = await _create_job(client)
+
+    job = (await client.get(f"/v1/agent/jobs/{job_id}")).json()
+
+    assert job["reasoning_effort"] is None
+
+
+async def test_an_effort_outside_the_intersection_is_refused(client: AsyncClient):
+    """``medium`` is a real claude-code level and not one this model takes.
+
+    Refused rather than clamped to a neighbour: a turn served at a depth
+    nobody chose, while reporting the one they did, is the same lie as a flag
+    that resolves to nothing.
+    """
+    response = await client.post(
+        "/v1/agent/jobs",
+        json={
+            "repo": "owner/name",
+            "task_prompt": "fix it",
+            "model": "glm-5.1",
+            "reasoning_effort": "medium",
+        },
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]["error"]
+    assert detail["type"] == "reasoning_effort_not_available"
+    # The refusal names what *is* available, so the caller can retry once.
+    assert "low, high, max" in detail["message"]
+
+
+async def test_an_effort_on_a_model_that_takes_none_is_refused(client: AsyncClient):
+    response = await client.post(
+        "/v1/agent/jobs",
+        json={
+            "repo": "owner/name",
+            "task_prompt": "fix it",
+            "model": "qwen-next",
+            "reasoning_effort": "high",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"]["message"].endswith("Available: none.")
+
+
+async def test_a_follow_up_inherits_the_efforts_of_the_turn_before_it(client: AsyncClient):
+    created = await client.post(
+        "/v1/agent/jobs",
+        json={
+            "repo": "owner/name",
+            "task_prompt": "fix it",
+            "model": "glm-5.1",
+            "reasoning_effort": "high",
+        },
+    )
+    parent_id = created.json()["id"]
+
+    inherited = await client.post(
+        f"/v1/agent/jobs/{parent_id}/follow-ups", json={"prompt": "keep going"}
+    )
+    assert inherited.status_code == 201
+    assert inherited.json()["reasoning_effort"] == "high"
+
+    switched = await client.post(
+        f"/v1/agent/jobs/{parent_id}/follow-ups",
+        json={"prompt": "now the easy bit", "reasoning_effort": "low"},
+    )
+    assert switched.status_code == 201
+    assert switched.json()["reasoning_effort"] == "low"
+
+
+async def test_a_follow_up_can_reset_an_inherited_effort_to_auto(client: AsyncClient):
+    """Null already means "inherit", so clearing takes the explicit sentinel."""
+    created = await client.post(
+        "/v1/agent/jobs",
+        json={
+            "repo": "owner/name",
+            "task_prompt": "fix it",
+            "model": "glm-5.1",
+            "reasoning_effort": "max",
+        },
+    )
+    parent_id = created.json()["id"]
+
+    reset = await client.post(
+        f"/v1/agent/jobs/{parent_id}/follow-ups",
+        json={"prompt": "back to normal", "reasoning_effort": "auto"},
+    )
+
+    assert reset.status_code == 201
+    assert reset.json()["reasoning_effort"] is None
+
+
+async def test_a_follow_up_effort_is_checked_against_the_model_it_switches_to(
+    client: AsyncClient,
+):
+    """A pair offered last turn need not be offered this one."""
+    created = await client.post(
+        "/v1/agent/jobs",
+        json={
+            "repo": "owner/name",
+            "task_prompt": "fix it",
+            "model": "glm-5.1",
+            "reasoning_effort": "high",
+        },
+    )
+    parent_id = created.json()["id"]
+
+    response = await client.post(
+        f"/v1/agent/jobs/{parent_id}/follow-ups",
+        json={"prompt": "switch", "model": "qwen-next", "reasoning_effort": "high"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"]["type"] == "reasoning_effort_not_available"
+
+
+async def test_a_level_the_runtime_cannot_express_is_refused_at_create(client: AsyncClient):
+    """The other half of the intersection: the model takes it, the CLI cannot say it.
+
+    pi reaches the wire with four of its six flag levels — `xhigh` arrives as
+    `high` and `off` sends nothing — so offering `xhigh` would hand someone a
+    depth this runtime cannot actually ask for. The refusal belongs here,
+    before the job exists.
+    """
+    response = await client.post(
+        "/v1/agent/jobs",
+        json={
+            "repo": "owner/name",
+            "task_prompt": "fix it",
+            "runtime": "pi",
+            "model": "glm-5.1",
+            "reasoning_effort": "xhigh",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"]["type"] == "reasoning_effort_not_available"
+
+
+async def test_every_runtime_still_takes_ordinary_turns(client: AsyncClient):
+    """And nothing else about them changed: Auto is every turn they ever ran."""
+    for runtime in ("pi", "opencode", "kilo", "codex"):
+        response = await client.post(
+            "/v1/agent/jobs",
+            json={
+                "repo": "owner/name",
+                "task_prompt": "fix it",
+                "runtime": runtime,
+                "model": "glm-5.1",
+            },
+        )
+        assert response.status_code == 201, f"{runtime}: {response.text}"
+        assert response.json()["reasoning_effort"] is None
+
+
+async def test_a_thread_read_returns_what_earlier_turns_did(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """A follow-up must not make the previous turn's tool activity unreachable."""
+    first_id = await _create_job(client)
+    claim = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+    auth = {"Authorization": f"Bearer {claim['worker_token']}"}
+    await client.post(
+        f"/v1/agent/worker/jobs/{first_id}/events",
+        json={"event_type": "tool_use", "payload": {"id": "t1", "name": "Bash"}},
+        headers=auth,
+    )
+    await client.post(
+        f"/v1/agent/worker/jobs/{first_id}/events",
+        json={"event_type": "message", "payload": {"text": "done"}},
+        headers=auth,
+    )
+    await client.post(f"/v1/agent/worker/jobs/{first_id}/finish", json={"state": "succeeded"})
+    second = await client.post(
+        f"/v1/agent/jobs/{first_id}/follow-ups", json={"prompt": "and now the docs"}
+    )
+    second_id = second.json()["id"]
+
+    per_job = (await client.get(f"/v1/agent/jobs/{second_id}/events")).json()
+    assert per_job["events"] == []
+
+    thread = (await client.get(f"/v1/agent/jobs/{second_id}/thread/events")).json()
+    assert [event["event_type"] for event in thread["events"]] == ["tool_use", "message"]
+    assert {event["turn_no"] for event in thread["events"]} == {1}
+    assert thread["events"][0]["payload"]["name"] == "Bash"
+
+
+async def test_a_thread_event_read_refuses_a_foreign_job(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    job_id = await _create_job(client)
+    store.jobs[job_id]["user_id"] = "someone-else"
+
+    response = await client.get(f"/v1/agent/jobs/{job_id}/thread/events")
+
+    assert response.status_code == 404

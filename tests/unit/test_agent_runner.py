@@ -81,12 +81,16 @@ class FakeControl:
         self.finished: tuple[str, str | None] | None = None
         self.job_id = "ajob_1"
         self.continuity: str | None = None
+        self.resources: list[dict] = []
 
     def append_event(self, event) -> None:
         self.events.append((event.event_type, event.payload))
 
     def report_continuity(self, mode: str) -> None:
         self.continuity = mode
+
+    def report_resources(self, rollup: dict) -> None:
+        self.resources.append(rollup)
 
     def save_artifact(self, kind: str, content: str) -> None:
         self.artifacts[kind] = content
@@ -1385,3 +1389,242 @@ def test_promotion_rekeys_the_residency_on_a_model_switch(tmp_path):
         residents=pool,  # type: ignore[arg-type]
     )
     assert pool.dropped == []
+
+
+# ── the resident base probe runs inside the sandbox, never in the runner ─
+
+
+class _ProbeProcess:
+    def __init__(self, exit_code: int) -> None:
+        self._exit = exit_code
+
+    def lines(self):
+        return iter(())
+
+    def kill(self) -> None:
+        pass
+
+    def wait(self) -> int:
+        return self._exit
+
+    def stderr_text(self) -> str:
+        return "" if self._exit == 0 else "fatal: not a valid object name"
+
+
+class _ProbeBackend:
+    def __init__(self, exit_code: int) -> None:
+        self.exit_code = exit_code
+        self.specs: list = []
+
+    def spawn(self, spec):
+        self.specs.append(spec)
+        return _ProbeProcess(self.exit_code)
+
+
+def test_the_base_probe_is_sandboxed_git_with_no_fetch(tmp_path):
+    """Staging acceptance regression: the first version ran runner-side git
+    against the agent-owned tree — git's dubious-ownership refusal failed the
+    probe on every real deployment and silently demoted every resident turn
+    to cold. The probe must run through the backend (inside the boundary the
+    agent already owned, like build_patch), with the safe-directory config
+    the sandbox side gets — and it must not fetch: that would put the clone
+    credential inside an agent-controlled filesystem."""
+    import dataclasses
+
+    from cloud_agent_host.runner import _resident_base_ready
+
+    job = dataclasses.replace(_JOB, base_sha="a" * 40)
+    backend = _ProbeBackend(exit_code=0)
+    assert _resident_base_ready(str(tmp_path), job, backend) is True
+    (spec,) = backend.specs
+    assert spec.argv == ["git", "cat-file", "-e", f"{'a' * 40}^{{commit}}"]
+    assert spec.workdir == str(tmp_path)
+    assert spec.env == {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "safe.directory",
+        "GIT_CONFIG_VALUE_0": "*",
+    }
+
+    missing = _ProbeBackend(exit_code=1)
+    assert _resident_base_ready(str(tmp_path), job, missing) is False
+    (spec,) = missing.specs
+    assert "fetch" not in " ".join(spec.argv)  # cold restart, never a fetch
+
+    # No pinned base short-circuits without spawning anything.
+    lazy = _ProbeBackend(exit_code=0)
+    assert _resident_base_ready(str(tmp_path), dataclasses.replace(_JOB, base_sha=None), lazy)
+    assert lazy.specs == []
+    # A malformed sha is refused before any process runs.
+    assert not _resident_base_ready(str(tmp_path), dataclasses.replace(_JOB, base_sha="HEAD"), lazy)
+    assert lazy.specs == []
+
+
+def test_an_unusable_residency_is_a_first_class_event(tmp_path, monkeypatch):
+    """The demotion must say so in the owner's stream: the staging acceptance
+    debugged the silent version of this branch blind, from CP access logs."""
+    import dataclasses
+
+    job = dataclasses.replace(_JOB, thread_id="t-hot", base_sha=None, runtime="generic")
+    entry = _resident_entry(tmp_path, runtime_id="claude-code")  # thread ran another harness
+
+    class _Pool:
+        def __init__(self) -> None:
+            self.dropped: list = []
+
+        def lookup(self, thread_id):
+            return entry if thread_id == "t-hot" else None
+
+        def drop(self, thread_id, *, release, generation=None):
+            self.dropped.append((thread_id, release, generation))
+
+        def offer(self, **_kw):
+            return None
+
+    class _Control(FakeControl):
+        def __init__(self) -> None:
+            super().__init__()
+            self.job_id = job.job_id
+
+        def finish(self, state, detail=None, **_kw):
+            self.finished = (state, detail)
+
+    class _EchoBackend(ProcessBackend):
+        def has_binary(self, name: str) -> bool:
+            return True
+
+    control = _Control()
+    monkeypatch.setattr(runner_mod, "claim", lambda **_kw: job)
+    monkeypatch.setattr(runner_mod, "ControlPlane", lambda *a, **k: control)
+    monkeypatch.setattr(runner_mod, "Heartbeater", lambda *a, **k: FakeHeart())
+    monkeypatch.setattr(runner_mod, "existing_checkout_sha", lambda *a, **k: "abc")
+    monkeypatch.setattr(runner_mod, "align_existing_checkout", lambda *a, **k: "abc")
+    monkeypatch.setattr(runner_mod, "build_patch", lambda *a, **k: "")
+    monkeypatch.setattr(runner_mod, "save_workspace_snapshot", lambda *a, **k: True)
+    runtime = _echo_runtime(2)
+    monkeypatch.setattr(runner_mod, "get_runtime", lambda *a, **k: runtime)
+
+    pool = _Pool()
+    code = runner_mod.run_once(
+        base_url="http://cp",
+        dispatcher_token="tok",
+        worker_id="w1",
+        workdir=str(tmp_path),
+        backend=_EchoBackend(acknowledged_unsafe=True),
+        residents=pool,  # type: ignore[arg-type]
+    )
+
+    assert code == 0
+    assert pool.dropped and pool.dropped[0][0] == "t-hot"
+    assert ("lifecycle", {"phase": "residency_unusable", "reason": "harness_switch"}) in [
+        (kind, payload) for kind, payload in control.events
+    ]
+
+
+def test_an_unmeasurable_host_still_files_an_honest_row(tmp_path):
+    """Coverage 0, not silence, when the sandbox cannot be measured.
+
+    The sampler is inert wherever a container's counters cannot be resolved —
+    a process backend (no container at all), a Docker daemon inside a VM,
+    cgroup v1. Reporting nothing at all would leave the reader unable to tell
+    an unmeasured turn from one that genuinely consumed nothing, which is the
+    one confusion this signal exists to prevent. The row is filed, and it
+    says plainly that nothing was observed.
+    """
+    control, heart = FakeControl(), FakeHeart()
+    code, _tail, _errors = run_agent(
+        _echo_runtime(1),
+        job=_JOB,
+        workdir=str(tmp_path),
+        gateway_base_url="http://gw",
+        control=control,
+        heart=heart,
+        timeout_s=30,
+        backend=ProcessBackend(acknowledged_unsafe=True),
+    )
+
+    assert code == 0
+    assert len(control.resources) == 1
+    rollup = control.resources[0]
+    assert rollup["coverage"] == 0.0
+    assert rollup["sample_count"] == 0
+    assert rollup.get("cpu_usec") is None, "an unmeasured turn reported a CPU number"
+
+
+def test_a_sampler_that_cannot_start_never_costs_the_turn(tmp_path, monkeypatch):
+    """The observer must not be able to break what it observes.
+
+    The sampler is wired directly into the path that starts the agent, so a
+    failure there — an unreadable host, a daemon that answers strangely, a
+    process object that cannot say where it runs — has to degrade into a
+    missing measurement rather than a failed turn.
+    """
+    from cloud_agent_host import runner as runner_mod
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("cgroup backend is on fire")
+
+    monkeypatch.setattr(runner_mod.ResourceSampler, "for_container", _explode)
+
+    control, heart = FakeControl(), FakeHeart()
+    code, _tail, _errors = run_agent(
+        _echo_runtime(2),
+        job=_JOB,
+        workdir=str(tmp_path),
+        gateway_base_url="http://gw",
+        control=control,
+        heart=heart,
+        timeout_s=30,
+        backend=ProcessBackend(acknowledged_unsafe=True),
+    )
+
+    assert code == 0, "a failing sampler took the turn down with it"
+    assert [payload["text"] for _kind, payload in control.events] == ["line 0", "line 1"]
+    assert control.resources[0]["coverage"] == 0.0
+
+
+def test_a_turn_that_fails_before_it_starts_still_stops_its_sampler(tmp_path, monkeypatch):
+    """The sampling thread must not outlive the turn that created it.
+
+    The sampler starts deep inside the turn, at whichever spawn the turn
+    actually uses, while the frame that stops it used to be a `finally`
+    further down. Anything raised in between — a driver error, a lost lease,
+    a workspace that will not open — left the thread sampling for the life of
+    the runner process, one leak per failed turn.
+    """
+    import threading
+
+    before = threading.active_count()
+
+    class _Exploding:
+        """A backend whose spawn raises after the sampler is already live."""
+
+        name = "process"
+        provides_isolation = False
+        is_vm_isolated = False
+
+        def spawn(self, spec):
+            raise RuntimeError("the sandbox could not be created")
+
+        def base_env(self):
+            return {}
+
+        def adopt_workdir(self, path):
+            return None
+
+    control, heart = FakeControl(), FakeHeart()
+    with pytest.raises(RuntimeError, match="could not be created"):
+        run_agent(
+            _echo_runtime(1),
+            job=_JOB,
+            workdir=str(tmp_path),
+            gateway_base_url="http://gw",
+            control=control,
+            heart=heart,
+            timeout_s=30,
+            backend=_Exploding(),
+        )
+
+    # The rollup is still filed — a turn that died is still a turn nobody
+    # measured — and no sampler thread is left behind.
+    assert control.resources and control.resources[0]["coverage"] == 0.0
+    assert threading.active_count() <= before, "a sampler thread outlived its turn"

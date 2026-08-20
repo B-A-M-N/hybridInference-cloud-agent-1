@@ -196,6 +196,17 @@ class SandboxProcess(ABC):
     def stderr_text(self) -> str:
         """Return whatever the agent wrote to stderr."""
 
+    @property
+    def container(self) -> str | None:
+        """The container this runs in, when it runs in one.
+
+        Only the host-side resource sampler consumes this: measuring a
+        sandbox means resolving its cgroup, and that starts from a name the
+        daemon can be asked about. Backends without a container answer None
+        and are simply not measured.
+        """
+        return None
+
     def write_line(self, text: str) -> None:
         """Write one line to the agent's stdin (HOT live input, design §7).
 
@@ -359,8 +370,9 @@ class _PopenProcess(SandboxProcess):
     that will never produce another line.
     """
 
-    def __init__(self, process: subprocess.Popen) -> None:
+    def __init__(self, process: subprocess.Popen, *, container: str | None = None) -> None:
         self._process = process
+        self._container = container
         self._stderr_chunks: list[str] = []
         self._stderr_thread: threading.Thread | None = None
         if process.stderr is not None:
@@ -368,6 +380,11 @@ class _PopenProcess(SandboxProcess):
                 target=self._drain_stderr, daemon=True, name="sandbox-stderr"
             )
             self._stderr_thread.start()
+
+    @property
+    def container(self) -> str | None:
+        """The container name, when this process is a ``docker run`` client."""
+        return self._container
 
     def _drain_stderr(self) -> None:
         """Read stderr to EOF, keeping a bounded tail."""
@@ -1377,6 +1394,7 @@ class ContainerBackend(SandboxBackend):
         spec: SandboxSpec,
         *,
         terminal_name: str | None = None,
+        job_name: str | None = None,
     ) -> list[str]:
         """Compose the shared, security-sensitive ``docker run`` argv.
 
@@ -1390,6 +1408,13 @@ class ContainerBackend(SandboxBackend):
             "--rm",
             "--interactive",
         ]
+        if job_name is not None:
+            # Named for one reason: the host-side sampler resolves a
+            # container's cgroup through the daemon, and an anonymous
+            # container cannot be asked about. Server-generated like the
+            # terminal name below, and deliberately unlabelled — the terminal
+            # crash sweep must not mistake a running job for a stray TTY.
+            argv += ["--name", job_name]
         if terminal_name is not None:
             argv += [
                 "--tty",
@@ -1451,9 +1476,9 @@ class ContainerBackend(SandboxBackend):
         argv += spec.argv
         return argv
 
-    def build_command(self, spec: SandboxSpec) -> list[str]:
+    def build_command(self, spec: SandboxSpec, *, name: str | None = None) -> list[str]:
         """Compose the ``docker run`` argv for one non-terminal job."""
-        return self._build_command(spec)
+        return self._build_command(spec, job_name=name)
 
     def build_terminal_command(self, spec: SandboxSpec, *, name: str) -> list[str]:
         """Compose a contained ``docker run -it`` argv for a terminal."""
@@ -1461,7 +1486,8 @@ class ContainerBackend(SandboxBackend):
 
     def spawn(self, spec: SandboxSpec) -> SandboxProcess:
         """Start the agent inside a throwaway container."""
-        command = self.build_command(spec)
+        container_name = f"hyi-job-{secrets.token_hex(12)}"
+        command = self.build_command(spec, name=container_name)
         logger.info(
             "agent_sandbox_spawn",
             extra={
@@ -1487,7 +1513,8 @@ class ContainerBackend(SandboxBackend):
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
-            )
+            ),
+            container=container_name,
         )
 
     def spawn_terminal(self, spec: SandboxSpec, *, rows: int, cols: int) -> TerminalProcess:

@@ -8,9 +8,15 @@ import { useAgentJob } from '@/components/features/agents/useAgentJobs';
 export default function AgentJobPage() {
   const params = useParams<{ jobId: string }>();
   const jobId = params?.jobId ?? '';
-  const { job, loading, error, reload } = useAgentJob(jobId);
+  const { job, events, loading, error, reload } = useAgentJob(jobId);
 
-  if (loading) {
+  // Only the first load blanks the page. Sending a follow-up navigates to a
+  // new turn of the same conversation, and replacing everything with a
+  // centred "Loading…" for that round trip is why sending felt like a page
+  // refresh — the thread the reader was in the middle of vanished and came
+  // back. The hook keeps the previous job until the next one arrives, so
+  // there is something to show throughout.
+  if (loading && !job) {
     return (
       <div className="flex h-full items-center justify-center">
         <p className="text-sm text-gray-500">Loading job…</p>
@@ -42,7 +48,9 @@ export default function AgentJobPage() {
     );
   }
 
-  // Keyed on the id: JobDetail holds per-attempt state, and without a remount
-  // navigating between jobs kept the previous job's selected attempt.
-  return <JobDetail key={job.id} job={job} onReload={reload} />;
+  // Keyed on the *conversation*, not the turn. The per-turn state this used
+  // to reset by remounting is reset by an effect in JobDetail instead, so
+  // moving to the next turn of a thread no longer throws away the view the
+  // reader is looking at — including which tab they had open.
+  return <JobDetail key={job.threadId ?? job.id} job={job} events={events} onReload={reload} />;
 }

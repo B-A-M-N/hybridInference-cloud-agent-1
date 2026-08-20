@@ -121,6 +121,7 @@ def _job_row_to_dict(row: Any) -> dict[str, Any]:
         "runtime": row["runtime"],
         "model": row["model"],
         "execution_profile": row["execution_profile"],
+        "reasoning_effort": row["reasoning_effort"],
         "state": row["state"],
         "cancel_requested": row["cancel_requested"],
         "terminal_resume_pending": row["terminal_resume_pending"],
@@ -143,7 +144,7 @@ def _job_row_to_dict(row: Any) -> dict[str, Any]:
 
 _JOB_COLUMNS = (
     "id, thread_id, parent_job_id, turn_no, user_id, repo, base_sha, task_prompt, "
-    "setup_script, runtime, model, execution_profile, state, "
+    "setup_script, runtime, model, execution_profile, reasoning_effort, state, "
     "cancel_requested, terminal_resume_pending, current_attempt_id, "
     "published_pr_url, published_commit_sha, detail, "
     "metadata, fork_source_job_id, mcp_servers, "
@@ -486,6 +487,7 @@ class AgentJobStore:
         runtime: str,
         model: str,
         execution_profile: str | None = None,
+        reasoning_effort: str | None = None,
         base_sha: str | None = None,
         setup_script: str | None = None,
         metadata: dict[str, Any] | None = None,
@@ -517,8 +519,10 @@ class AgentJobStore:
                 f"""
                 INSERT INTO agent_jobs
                     (id, thread_id, turn_no, user_id, repo, base_sha, task_prompt,
-                     setup_script, runtime, model, execution_profile, metadata, mcp_servers)
-                VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12)
+                     setup_script, runtime, model, execution_profile, reasoning_effort,
+                     metadata, mcp_servers)
+                VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                        $12::jsonb, $13)
                 RETURNING {_JOB_COLUMNS}
                 """,
                 job_id,
@@ -531,6 +535,7 @@ class AgentJobStore:
                 runtime,
                 model,
                 execution_profile,
+                reasoning_effort,
                 json.dumps(metadata) if metadata is not None else None,
                 list(mcp_servers or []),
             )
@@ -615,8 +620,15 @@ class AgentJobStore:
         prompt: str,
         runtime: str | None = None,
         model: str | None = None,
+        reasoning_effort: str | None = None,
+        reset_reasoning_effort: bool = False,
     ) -> dict[str, Any] | None:
         """Append a user turn and create the run that will answer it.
+
+        ``reasoning_effort`` overrides the inherited depth; omitting it keeps
+        the parent's, as an omitted model does. ``reset_reasoning_effort``
+        clears it back to Auto — the one thing a null override cannot express,
+        since null is what "inherit" already sends.
 
         A follow-up submitted while the latest turn is active is stored as
         ``waiting``. The thread row is locked before selecting that turn, so
@@ -661,10 +673,10 @@ class AgentJobStore:
                 f"""
                 INSERT INTO agent_jobs
                     (id, thread_id, parent_job_id, turn_no, user_id, repo, base_sha,
-                     task_prompt, setup_script, runtime, model, execution_profile, state,
-                     metadata, mcp_servers)
+                     task_prompt, setup_script, runtime, model, execution_profile,
+                     reasoning_effort, state, metadata, mcp_servers)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                        $14::jsonb, $15)
+                        $14, $15::jsonb, $16)
                 RETURNING {_JOB_COLUMNS}
                 """,
                 job_id,
@@ -679,6 +691,9 @@ class AgentJobStore:
                 runtime or parent["runtime"],
                 model or parent["model"],
                 parent["execution_profile"],
+                None
+                if reset_reasoning_effort
+                else (reasoning_effort or parent["reasoning_effort"]),
                 state,
                 json.dumps(_load_json(parent["metadata"]))
                 if parent["metadata"] is not None
@@ -877,6 +892,124 @@ class AgentJobStore:
             "updated_at": thread["updated_at"],
             "messages": [dict(message) for message in messages],
             "jobs": job_rows,
+        }
+
+    async def list_thread_events_after(
+        self,
+        *,
+        job_id: str,
+        user_id: str,
+        after_id: int = 0,
+        limit: int = 500,
+    ) -> list[dict[str, Any]] | None:
+        """Page a whole thread's events, payloads intact.
+
+        The per-job read beside this one is scoped to the turn being watched.
+        Without this thread read, history keeps only durable messages, so
+        everything an earlier turn *did* becomes invisible even though every
+        row remains stored.
+
+        Payloads are intentionally preserved: the caller needs tool inputs and
+        outputs to reconstruct the historical activity. The result is paged so
+        a long thread is not pulled into memory in one response.
+
+        :returns: ``None`` when the job does not exist or is not the caller's,
+            matching :meth:`get_thread_for_job`.
+        """
+        async with self._pool.acquire() as conn:
+            thread_id = await conn.fetchval(
+                "SELECT thread_id FROM agent_jobs WHERE id = $1 AND user_id = $2",
+                job_id,
+                user_id,
+            )
+            if thread_id is None:
+                return None
+            rows = await conn.fetch(
+                """
+                SELECT e.id,
+                       e.job_id,
+                       j.turn_no,
+                       e.attempt_id,
+                       e.seq,
+                       e.event_type,
+                       e.payload,
+                       e.created_at
+                FROM agent_job_events e
+                JOIN agent_jobs j ON j.id = e.job_id
+                WHERE j.thread_id = $1 AND e.id > $2
+                ORDER BY e.id
+                LIMIT $3
+                """,
+                thread_id,
+                after_id,
+                limit,
+            )
+        return [{**dict(row), "payload": _load_json(row["payload"])} for row in rows]
+
+    async def thread_stats_inputs(self, *, job_id: str, user_id: str) -> dict[str, Any] | None:
+        """Return everything needed to summarize the thread containing a job.
+
+        The event rows come back with their bulky text fields stripped in
+        SQL: the summary reads identity, pairing and usage keys only, and a
+        long thread's transcript is megabytes we would otherwise pull across
+        the wire to throw away. Nothing is filtered by event type — wall
+        time is measured from a turn's first to last event, so a Tier-2
+        thread whose only events are ``raw`` still gets its duration.
+
+        :returns: ``None`` when the job does not exist or is not the
+            caller's, matching :meth:`get_thread_for_job`.
+        """
+        async with self._pool.acquire() as conn:
+            thread_id = await conn.fetchval(
+                "SELECT thread_id FROM agent_jobs WHERE id = $1 AND user_id = $2",
+                job_id,
+                user_id,
+            )
+            if thread_id is None:
+                return None
+            jobs = await conn.fetch(
+                "SELECT id FROM agent_jobs WHERE thread_id = $1 ORDER BY turn_no",
+                thread_id,
+            )
+            attempts = await conn.fetch(
+                """
+                SELECT a.job_id, a.started_at
+                FROM agent_attempts a
+                JOIN agent_jobs j ON j.id = a.job_id
+                WHERE j.thread_id = $1
+                """,
+                thread_id,
+            )
+            events = await conn.fetch(
+                """
+                SELECT e.job_id,
+                       e.attempt_id,
+                       e.seq,
+                       e.event_type,
+                       e.created_at,
+                       e.payload - ARRAY['text', 'input', 'content'] AS payload
+                FROM agent_job_events e
+                JOIN agent_jobs j ON j.id = e.job_id
+                WHERE j.thread_id = $1
+                ORDER BY e.attempt_id, e.seq
+                """,
+                thread_id,
+            )
+        return {
+            "thread_id": thread_id,
+            "job_ids": [row["id"] for row in jobs],
+            "attempts": [dict(row) for row in attempts],
+            "events": [
+                {
+                    "job_id": row["job_id"],
+                    "attempt_id": row["attempt_id"],
+                    "seq": row["seq"],
+                    "event_type": row["event_type"],
+                    "created_at": row["created_at"],
+                    "payload": _load_json(row["payload"]),
+                }
+                for row in events
+            ],
         }
 
     async def follow_up_context(self, *, job_id: str) -> dict[str, Any]:
@@ -2209,6 +2342,94 @@ class AgentJobStore:
                     mode,
                 )
             )
+
+    async def record_attempt_resources(
+        self,
+        *,
+        attempt_id: int,
+        lease_generation: int,
+        rollup: dict[str, Any],
+    ) -> bool:
+        """Store one attempt's resource rollup, lease-fenced and idempotent.
+
+        Fenced like every other worker write: a superseded attempt must not be
+        able to overwrite what the live one consumed. Idempotent because the
+        runner may retry the post — a rollup describes a closed window, so a
+        repeat is the same window said twice, never a second window to add.
+
+        Absent counters stay NULL: a backend the sampler could not read is not
+        a machine that used nothing, and ``coverage`` says which happened.
+        """
+        async with self._pool.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    WITH live AS (
+                        SELECT id, job_id
+                        FROM agent_attempts
+                        WHERE id = $1 AND lease_generation = $2
+                          AND status = 'running' AND lease_expires_at > NOW()
+                    )
+                    INSERT INTO agent_attempt_resources (
+                        attempt_id, job_id, cpu_usec, mem_peak_bytes, mem_avg_bytes,
+                        io_read_bytes, io_write_bytes, net_rx_bytes, net_tx_bytes,
+                        sample_count, coverage, sampler_version
+                    )
+                    SELECT live.id, live.job_id, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+                    FROM live
+                    ON CONFLICT (attempt_id) DO UPDATE SET
+                        cpu_usec = EXCLUDED.cpu_usec,
+                        mem_peak_bytes = EXCLUDED.mem_peak_bytes,
+                        mem_avg_bytes = EXCLUDED.mem_avg_bytes,
+                        io_read_bytes = EXCLUDED.io_read_bytes,
+                        io_write_bytes = EXCLUDED.io_write_bytes,
+                        net_rx_bytes = EXCLUDED.net_rx_bytes,
+                        net_tx_bytes = EXCLUDED.net_tx_bytes,
+                        sample_count = EXCLUDED.sample_count,
+                        coverage = EXCLUDED.coverage,
+                        sampler_version = EXCLUDED.sampler_version
+                    RETURNING attempt_id
+                    """,
+                    attempt_id,
+                    lease_generation,
+                    rollup.get("cpu_usec"),
+                    rollup.get("mem_peak_bytes"),
+                    rollup.get("mem_avg_bytes"),
+                    rollup.get("io_read_bytes"),
+                    rollup.get("io_write_bytes"),
+                    rollup.get("net_rx_bytes"),
+                    rollup.get("net_tx_bytes"),
+                    int(rollup.get("sample_count") or 0),
+                    float(rollup.get("coverage") or 0.0),
+                    str(rollup.get("sampler_version") or "unknown"),
+                )
+            )
+
+    async def job_turn_telemetry(self, *, job_id: str) -> dict[str, Any] | None:
+        """Read how a job's newest attempt ran: continuity, window, resources.
+
+        Newest attempt rather than the current one: a retried turn's earlier
+        attempts each have their own window, and the one a reader wants is the
+        one that produced the result in front of them. One round trip, because
+        this rides the job-detail read that the thread view already makes.
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT a.continuity_mode, a.started_at, a.finished_at,
+                       r.cpu_usec, r.mem_peak_bytes, r.mem_avg_bytes,
+                       r.io_read_bytes, r.io_write_bytes,
+                       r.net_rx_bytes, r.net_tx_bytes,
+                       r.sample_count, r.coverage, r.sampler_version
+                FROM agent_attempts a
+                LEFT JOIN agent_attempt_resources r ON r.attempt_id = a.id
+                WHERE a.job_id = $1
+                ORDER BY a.attempt_no DESC
+                LIMIT 1
+                """,
+                job_id,
+            )
+            return dict(row) if row else None
 
     async def terminal_workspace_ready(self, *, attempt_id: int) -> bool:
         """Return whether the live attempt currently permits terminal writes.

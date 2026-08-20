@@ -13,6 +13,7 @@ import {
   getAgentConfig,
   getAgentJobFiles,
   getAgentJobGit,
+  getAgentThreadStats,
   listAgentTerminals,
   resizeAgentTerminal,
   streamAgentTerminal,
@@ -39,6 +40,7 @@ vi.mock('@/lib/api/agents', () => ({
   getAgentConfig: vi.fn(),
   getAgentJobFiles: vi.fn(),
   getAgentJobGit: vi.fn(),
+  getAgentThreadStats: vi.fn(),
   listAgentTerminals: vi.fn(),
   resizeAgentTerminal: vi.fn(),
   streamAgentTerminal: vi.fn(),
@@ -144,6 +146,9 @@ describe('JobDetail', () => {
       patch: '',
       commits: [],
     });
+    // Absent by default: the stats bar is additive, and every case here
+    // predates it. The bar's own file covers what it renders when present.
+    vi.mocked(getAgentThreadStats).mockReset().mockResolvedValue(null);
     vi.mocked(createAgentTerminal).mockReset();
     vi.mocked(deleteAgentTerminal).mockReset();
     vi.mocked(listAgentTerminals).mockReset().mockResolvedValue([]);
@@ -184,8 +189,48 @@ describe('JobDetail', () => {
     expect(screen.getByText('Earlier question')).toBeInTheDocument();
     expect(screen.getByText('Earlier answer')).toBeInTheDocument();
     expect(screen.getByText(/with all of its detail/)).toBeInTheDocument();
-    expect(screen.getByText('Setting up environment')).toBeInTheDocument();
+    expect(screen.getByText('Run started')).toBeInTheDocument();
     expect(screen.getByText('I found the', { exact: false })).toBeInTheDocument();
+  });
+
+  it("keeps a previous turn's tool activity after a follow-up is appended", () => {
+    render(
+      <JobDetail
+        job={makeJob({
+          turnNo: 2,
+          threadMessages: HISTORY,
+          historyTurns: [
+            {
+              jobId: 'ajob_0',
+              turnNo: 1,
+              messages: HISTORY,
+              events: [
+                { kind: 'message', text: 'I will inspect the repository.', attemptNo: 1 },
+                {
+                  kind: 'tool_use',
+                  tool: 'Read',
+                  detail: 'src/router.py',
+                  output: ['router source'],
+                  attemptNo: 1,
+                },
+                { kind: 'message', text: 'Earlier answer', attemptNo: 1 },
+              ],
+            },
+          ],
+        })}
+      />,
+    );
+
+    const turn = screen.getByLabelText('Turn 1');
+    const activity = within(turn).getByText('Read').closest('details');
+    expect(activity).not.toBeNull();
+    expect(activity).not.toHaveAttribute('open');
+    expect(activity).toHaveTextContent('src/router.py');
+    expect(activity).toHaveTextContent('router source');
+    expect(within(turn).getByText('Earlier answer')).toBeInTheDocument();
+    expect(screen.getAllByText('Earlier answer')).toHaveLength(1);
+    expect(within(turn).getByText('Turn 1 · 1 tool call')).toBeInTheDocument();
+    expect(screen.getByText(/with all of its detail/)).toBeInTheDocument();
   });
 
   it('shows reasoning as a status without rendering raw thinking text', () => {
@@ -282,7 +327,62 @@ describe('JobDetail', () => {
         prompt: 'Now add a regression test',
       }),
     );
-    expect(navigation.push).toHaveBeenCalledWith('/ajob_child');
+    expect(navigation.push).toHaveBeenCalledWith('/ajob_child', { scroll: false });
+  });
+
+  it('sends the follow-up on Enter and keeps Shift+Enter a newline', async () => {
+    vi.mocked(followUpAgentJob).mockResolvedValue({ id: 'ajob_child' } as never);
+    render(<JobDetail job={makeJob()} />);
+
+    const composer = screen.getByLabelText('Add a follow-up');
+    fireEvent.change(composer, { target: { value: 'Now add a regression test' } });
+
+    // Shift+Enter and Alt+Enter stay the newline, so the browser keeps them.
+    expect(fireEvent.keyDown(composer, { key: 'Enter', shiftKey: true })).toBe(true);
+    expect(fireEvent.keyDown(composer, { key: 'Enter', altKey: true })).toBe(true);
+    expect(followUpAgentJob).not.toHaveBeenCalled();
+
+    // An IME commits its candidate with Enter; that keypress is the word, not
+    // the send.
+    fireEvent.keyDown(composer, { key: 'Enter', isComposing: true });
+    expect(followUpAgentJob).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(composer, { key: 'Enter' });
+
+    await waitFor(() =>
+      expect(followUpAgentJob).toHaveBeenCalledWith('ajob_1', {
+        prompt: 'Now add a regression test',
+      }),
+    );
+    expect(navigation.push).toHaveBeenCalledWith('/ajob_child', { scroll: false });
+  });
+
+  it('swallows Enter on an empty follow-up rather than growing a blank line', async () => {
+    render(<JobDetail job={makeJob()} />);
+
+    const composer = screen.getByLabelText('Add a follow-up');
+    fireEvent.change(composer, { target: { value: '   ' } });
+
+    // Enter is the send key on this composer and never the newline, so with
+    // nothing to send it does nothing at all. Shift+Enter still breaks the line.
+    expect(fireEvent.keyDown(composer, { key: 'Enter' })).toBe(false);
+    expect(fireEvent.keyDown(composer, { key: 'Enter', shiftKey: true })).toBe(true);
+    expect(followUpAgentJob).not.toHaveBeenCalled();
+  });
+
+  it('accepts the other send chord people arrive with', async () => {
+    vi.mocked(followUpAgentJob).mockResolvedValue({ id: 'ajob_child' } as never);
+    render(<JobDetail job={makeJob()} />);
+
+    const composer = screen.getByLabelText('Add a follow-up');
+    fireEvent.change(composer, { target: { value: 'Now add a regression test' } });
+    fireEvent.keyDown(composer, { key: 'Enter', metaKey: true });
+
+    await waitFor(() =>
+      expect(followUpAgentJob).toHaveBeenCalledWith('ajob_1', {
+        prompt: 'Now add a regression test',
+      }),
+    );
   });
 
   it('switches the model for the next turn without leaving the thread', async () => {
@@ -836,5 +936,193 @@ describe('JobDetail', () => {
 
     expect(screen.getByLabelText('Add a follow-up')).toHaveValue('edited prompt');
     expect(sessionStorage.getItem('agent-rewind-draft-ajob_1')).toBeNull();
+  });
+});
+
+describe('JobDetail reasoning effort', () => {
+  const THINKING_CONFIG = {
+    ...AGENT_CONFIG,
+    runtime_reasoning_efforts: { 'claude-code': ['low', 'medium', 'high', 'max'] },
+    // No `medium` on the model, matching the real glm-5.3 entry.
+    model_reasoning_efforts: { 'qwen-test': ['low', 'high', 'max'] },
+  };
+
+  beforeEach(() => {
+    navigation.push.mockReset();
+    vi.mocked(followUpAgentJob).mockReset();
+    vi.mocked(getAgentConfig).mockReset();
+    vi.mocked(getAgentConfig).mockResolvedValue(THINKING_CONFIG);
+    vi.mocked(followUpAgentJob).mockResolvedValue({ id: 'ajob_child' } as never);
+  });
+
+  afterEach(() => cleanup());
+
+  it('offers the intersection for the turn the follow-up would run', async () => {
+    render(<JobDetail job={makeJob()} />);
+
+    const picker = await screen.findByLabelText('Reasoning for this turn');
+    const offered = Array.from(picker.querySelectorAll('option')).map((o) => o.textContent);
+    expect(offered).toEqual(['auto', 'low', 'high', 'max']);
+  });
+
+  it('shows the effort a turn ran at, and nothing when it was Auto', () => {
+    const { unmount } = render(<JobDetail job={makeJob({ reasoningEffort: 'max' })} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Run details' }));
+    expect(screen.getByText('Reasoning')).toBeInTheDocument();
+    expect(screen.getByText('max')).toBeInTheDocument();
+    unmount();
+
+    render(<JobDetail job={makeJob()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Run details' }));
+    // Auto renders no row: an absent row is the honest display of "nobody
+    // chose", where a "Reasoning: auto" row would imply someone did.
+    expect(screen.queryByText('Reasoning')).not.toBeInTheDocument();
+  });
+
+  it('sends only an actual change, and the reset when clearing to Auto', async () => {
+    const { unmount } = render(<JobDetail job={makeJob({ reasoningEffort: 'high' })} />);
+
+    // Inherited and untouched: the field is absent, which the backend reads as
+    // "inherit" rather than "clear".
+    fireEvent.change(screen.getByLabelText('Add a follow-up'), { target: { value: 'again' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send follow-up' }));
+    await waitFor(() =>
+      expect(followUpAgentJob).toHaveBeenCalledWith('ajob_1', { prompt: 'again' }),
+    );
+    unmount();
+
+    vi.mocked(followUpAgentJob).mockClear();
+    render(<JobDetail job={makeJob({ reasoningEffort: 'high' })} />);
+    fireEvent.change(await screen.findByLabelText('Reasoning for this turn'), {
+      target: { value: 'auto' },
+    });
+    fireEvent.change(screen.getByLabelText('Add a follow-up'), { target: { value: 'easy one' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send follow-up' }));
+
+    await waitFor(() =>
+      expect(followUpAgentJob).toHaveBeenCalledWith('ajob_1', {
+        prompt: 'easy one',
+        reasoning_effort: 'auto',
+      }),
+    );
+  });
+
+  it('drops a level the switched-to model does not offer', async () => {
+    render(<JobDetail job={makeJob({ reasoningEffort: 'high' })} />);
+
+    // glm-test takes no effort, so the control disappears and the inherited
+    // level must not ride along to a model that would refuse it.
+    fireEvent.change(await screen.findByLabelText('Model for this turn'), {
+      target: { value: 'glm-test' },
+    });
+    await waitFor(() =>
+      expect(screen.queryByLabelText('Reasoning for this turn')).not.toBeInTheDocument(),
+    );
+
+    fireEvent.change(screen.getByLabelText('Add a follow-up'), { target: { value: 'switch' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send follow-up' }));
+
+    await waitFor(() =>
+      expect(followUpAgentJob).toHaveBeenCalledWith('ajob_1', {
+        prompt: 'switch',
+        model: 'glm-test',
+        reasoning_effort: 'auto',
+      }),
+    );
+  });
+});
+
+describe('the trajectory tab', () => {
+  afterEach(() => cleanup());
+
+  it('switches between the reading of the stream and the stream itself', () => {
+    const job = makeJob({ events: [{ kind: 'message', text: 'the build passes' }] });
+    const stored = [
+      {
+        id: 1,
+        attempt_id: 1,
+        seq: 1,
+        event_type: 'tool_use',
+        payload: { id: 't1', name: 'Bash', detail: 'cargo build' },
+        created_at: '2026-08-19T10:00:00.000Z',
+      },
+    ] as never;
+
+    render(<JobDetail job={job} events={stored} />);
+
+    // Chat first: the reading, with no trajectory chrome.
+    expect(screen.queryByLabelText('Search events')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'trajectory' }));
+
+    expect(screen.getByLabelText('Search events')).toBeInTheDocument();
+    expect(screen.getByText('Bash')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'chat' }));
+
+    expect(screen.queryByLabelText('Search events')).toBeNull();
+  });
+
+  it('separates stored events by conversation turn', () => {
+    const stored = [
+      {
+        id: 1,
+        job_id: 'ajob_0',
+        turn_no: 1,
+        attempt_id: 1,
+        seq: 1,
+        event_type: 'tool_use',
+        payload: { id: 't1', name: 'Read', detail: 'README.md' },
+        created_at: null,
+      },
+      {
+        id: 2,
+        job_id: 'ajob_1',
+        turn_no: 2,
+        attempt_id: 2,
+        seq: 1,
+        event_type: 'tool_use',
+        payload: { id: 't2', name: 'Bash', detail: 'pytest' },
+        created_at: null,
+      },
+    ] as never;
+    render(<JobDetail job={makeJob()} events={stored} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'trajectory' }));
+
+    expect(screen.getByText('Turn 1')).toBeInTheDocument();
+    expect(screen.getByText('Turn 2')).toBeInTheDocument();
+    expect(screen.getByText('Read')).toBeInTheDocument();
+    expect(screen.getByText('Bash')).toBeInTheDocument();
+  });
+
+  it('still renders when no stored stream was handed down', () => {
+    // Fixtures and older callers pass no events; the tab must degrade to its
+    // empty state rather than throwing on an undefined list.
+    render(<JobDetail job={makeJob()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'trajectory' }));
+
+    expect(screen.getByText(/stored no events/)).toBeInTheDocument();
+  });
+});
+
+describe('sending a follow-up', () => {
+  afterEach(() => cleanup());
+
+  it('clears the composer instead of leaving it disabled with the sent text', async () => {
+    // A remount used to do this. Keying on the conversation rather than the
+    // turn removed the remount, and with it the only thing that ever reset
+    // either — the composer stayed disabled with the prompt still in it.
+    vi.mocked(followUpAgentJob).mockResolvedValue({ id: 'ajob_next' } as never);
+    render(<JobDetail job={makeJob()} />);
+    const box = screen.getByPlaceholderText('Add a follow-up');
+
+    fireEvent.change(box, { target: { value: 'and now the docs' } });
+    fireEvent.submit(box.closest('form') as HTMLFormElement);
+
+    await waitFor(() => expect(followUpAgentJob).toHaveBeenCalled());
+    await waitFor(() => expect((box as HTMLTextAreaElement).value).toBe(''));
+    expect(box).not.toBeDisabled();
   });
 });

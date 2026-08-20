@@ -60,6 +60,7 @@ from cloud_agent_host.enrollment import (
 from cloud_agent_host.logging_utils import configure_process_logging
 from cloud_agent_host.patch_gate import branch_name_for, validate_patch
 from cloud_agent_host.residency import ResidentEntry, ResidentPool
+from cloud_agent_host.resources import ResourceSampler, daemon_reachable
 from cloud_agent_host.runtimes import (
     EMPTY_RUNTIME_MCP_CONFIG,
     AgentRuntime,
@@ -69,6 +70,7 @@ from cloud_agent_host.runtimes import (
 )
 from cloud_agent_host.sandbox import (
     SandboxBackend,
+    SandboxProcess,
     SandboxSpec,
     build_backend_from_env,
 )
@@ -194,6 +196,11 @@ class ClaimedJob:
     # inference address.
     mcp_token: str = ""
     mcp_base_url: str = ""
+    # How hard the model should think on this turn, in the runtime's own
+    # vocabulary. None is Auto: no flag, whatever the CLI and model default to.
+    # Defaulted rather than required, because absent and Auto are the same
+    # state — there is nothing a caller could pass to mean "unknown".
+    reasoning_effort: str | None = None
     # Shell run before the agent, under the setup egress tier. Optional, so it
     # carries a default rather than forcing every caller to pass one.
     setup_script: str | None = None
@@ -235,6 +242,9 @@ class ClaimedJob:
             runtime=body["runtime"],
             model=body["model"],
             execution_profile=body.get("execution_profile") or "trusted-v1",
+            # Absent from a control plane that predates the control, which is
+            # the same thing as Auto — no separate "unknown" state to carry.
+            reasoning_effort=body.get("reasoning_effort"),
             worker_token=body["worker_token"],
             # Older gateways return only worker_token; fall back so a
             # runner can still talk to one that predates scoped tokens.
@@ -309,6 +319,19 @@ class ControlPlane:
         """Record this attempt's continuity rung. Best-effort observability."""
         try:
             self._post(f"/v1/agent/worker/jobs/{self.job_id}/continuity", {"mode": mode})
+        except LeaseLost:
+            raise
+        except Exception:
+            pass
+
+    def report_resources(self, rollup: dict[str, Any]) -> None:
+        """Report one closed window's resource rollup. Best-effort.
+
+        Swallowed like every other observability write: a turn that ran must
+        not fail because the platform could not record what it consumed.
+        """
+        try:
+            self._post(f"/v1/agent/worker/jobs/{self.job_id}/resources", rollup)
         except LeaseLost:
             raise
         except Exception:
@@ -912,30 +935,42 @@ def _promote_to_resident(
     return generation
 
 
-def _resident_base_ready(workdir: str, job: ClaimedJob) -> bool:
-    """Make the turn's pinned base resolvable in the resident tree.
+def _resident_base_ready(workdir: str, job: ClaimedJob, backend: SandboxBackend) -> bool:
+    """Is the turn's pinned base resolvable in the resident tree?
 
-    A publish since the last turn moved ``base_sha`` to a commit this tree
-    has never fetched; ``build_patch`` diffs against it later, so it must
-    exist locally before the turn is allowed to run hot.
+    Probed **inside the sandbox**, exactly like ``build_patch`` and for the
+    same reason: this tree — ``.git/config`` included — has belonged to the
+    agent since adopt, and trusted-runner git against it would execute
+    whatever the agent left in ``diff.external`` or ``core.fsmonitor`` with
+    the runner's privileges. git's dubious-ownership refusal enforces the
+    same boundary from the other side — the tree was chowned to the sandbox
+    user at adopt, so runner-side git refuses it outright, which is how the
+    staging acceptance caught the first version of this gate running in the
+    wrong place (every resident turn silently demoted to cold).
+
+    A base the tree cannot resolve ends the residency rather than fetching
+    into it: the fetch would need the clone credential inside a filesystem
+    the agent controlled, and the cold restart this degrades to clones
+    runner-side, before the tree is handed over — where that credential
+    already lives. A publish moving the base mid-thread is rare enough that
+    one honest cold turn is the right price.
     """
     if not job.base_sha:
         return True
     if not _COMMIT_SHA.fullmatch(job.base_sha):
         return False
-    probe = _run_git(["cat-file", "-e", f"{job.base_sha}^{{commit}}"], cwd=workdir)
-    if probe.returncode == 0:
-        return True
-    url = f"https://github.com/{job.repo}.git"
-    fetch = _run_git(
-        ["fetch", "--quiet", "--depth", "1", url, "--end-of-options", job.base_sha],
-        cwd=workdir,
-        env_extra=_auth_env(job.clone_token),
+    process = backend.spawn(
+        SandboxSpec(
+            argv=["git", "cat-file", "-e", f"{job.base_sha}^{{commit}}"],
+            workdir=workdir,
+            env=dict(_SAFE_DIRECTORY_ENV),
+        )
     )
-    if fetch.returncode != 0:
+    try:
+        _read_bounded(process, deadline_s=_GIT_TIMEOUT_S, max_bytes=65536)
+    except WorktreeError:
         return False
-    _assert_no_credential_on_disk(workdir, job.clone_token)
-    return _run_git(["cat-file", "-e", f"{job.base_sha}^{{commit}}"], cwd=workdir).returncode == 0
+    return True
 
 
 def state_from_checkpoint(envelope: dict[str, Any]) -> HarnessState | None:
@@ -973,6 +1008,61 @@ def run_agent(
 ) -> tuple[int, str, list[str]]:
     """Run the agent, streaming its output back as normalized events.
 
+    This frame exists to own the resource sampler. It is the only one every
+    exit passes: the sampler starts deep inside the turn, at whichever spawn
+    the turn actually uses, and an exception raised while preparing that turn
+    used to leave its thread sampling for the life of the runner process.
+
+    The rollup is reported whether or not anything was read. A window with
+    coverage 0 is the row that says "this turn was not measured", and
+    withholding it is what makes an unmeasured turn indistinguishable from
+    one that consumed nothing — the single distinction this whole signal
+    exists to preserve.
+    """
+    sampler = ResourceSampler(None)
+    try:
+        return _run_agent(
+            runtime,
+            job=job,
+            workdir=workdir,
+            gateway_base_url=gateway_base_url,
+            control=control,
+            heart=heart,
+            timeout_s=timeout_s,
+            backend=backend,
+            mcp_config=mcp_config,
+            state=state,
+            state_dir=state_dir,
+            resident=resident,
+            residents=residents,
+            live_out=live_out,
+            sampler=sampler,
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            control.report_resources(sampler.stop())
+
+
+def _run_agent(
+    runtime: AgentRuntime,
+    *,
+    job: ClaimedJob,
+    workdir: str,
+    gateway_base_url: str,
+    control: ControlPlane,
+    heart: Heartbeater,
+    timeout_s: float,
+    backend: SandboxBackend,
+    mcp_config: RuntimeMCPConfig = EMPTY_RUNTIME_MCP_CONFIG,
+    state: HarnessState | None = None,
+    state_dir: str | None = None,
+    resident: ResidentEntry | None = None,
+    residents: ResidentPool | None = None,
+    live_out: dict[str, Any] | None = None,
+    sampler: ResourceSampler,
+) -> tuple[int, str, list[str]]:
+    """Run the agent, streaming its output back as normalized events.
+
     Returns ``(exit_code, tail, tool_errors)``. Raises :class:`LeaseLost` if this attempt
     stops owning the job mid-run.
 
@@ -990,6 +1080,33 @@ def run_agent(
     a live session it created itself; one borrowed from the pool is closed by
     the pool teardown its failure triggers.
     """
+
+    def _spawn_sampled(process: SandboxProcess) -> SandboxProcess:
+        """Point the sampler at the sandbox this turn is about to use.
+
+        Rebinding rather than binding once: every spawn is a *new* container,
+        so a sampler still holding the previous one would keep reporting a
+        container this turn does not own — and, on the hot fallback path, one
+        that is already dead.
+
+        Everything here is contained. This sits directly in the path that
+        starts the agent, so a sampler that raised would not degrade a
+        measurement — it would cost the user their turn.
+        """
+        try:
+            # A VM-isolated runtime (kata) runs the workload inside a guest
+            # kernel; the daemon's accounting for that container describes the
+            # hypervisor, not the agent. Confident numbers about the wrong
+            # thing are worse than none, so it is honestly not measured.
+            sampler.rebind(
+                None
+                if getattr(backend, "is_vm_isolated", False)
+                else getattr(process, "container", None)
+            )
+        except Exception as exc:
+            print(f"resource sampler unavailable: {exc}", file=sys.stderr)
+        return process
+
     # Hermetic environment, and the *backend's* idea of it rather than the
     # runner's. For an isolated backend the runner's PATH and HOME name paths
     # inside the runner's own filesystem: forwarding HOME=/root into a
@@ -1016,8 +1133,8 @@ def run_agent(
         provides_isolation=backend.provides_isolation,
         # The platform places the process inside the sandbox (design D7);
         # the driver owns everything on the returned handle's transport.
-        spawn=lambda argv, env: backend.spawn(
-            SandboxSpec(argv=argv, workdir=workdir, env=env, state_dir=state_dir)
+        spawn=lambda argv, env: _spawn_sampled(
+            backend.spawn(SandboxSpec(argv=argv, workdir=workdir, env=env, state_dir=state_dir))
         ),
         base_env=base_env,
         # The runner is the only source of this value. Repository contents
@@ -1039,6 +1156,12 @@ def run_agent(
         and job.model == resident.grant_model
         and not mcp_config.server_ids
     )
+    if hot_ok and resident is not None and resident.live_session is not None:
+        # A hot turn spawns nothing, so the spawn seam above never fires. The
+        # rung that reuses a process is exactly the rung whose consumption is
+        # least obvious, so it is measured through the session it inherits.
+        with contextlib.suppress(Exception):
+            sampler.rebind(getattr(resident.live_session, "container", None))
     stale_process = resident is not None and not hot_ok and resident.live_session is not None
     if stale_process and residents is not None and job.thread_id:
         # This turn will advance the thread past the idle process's memory —
@@ -1066,13 +1189,18 @@ def run_agent(
                 hot_context = replace(
                     context,
                     credential=resident.credential,
-                    spawn_live=lambda argv, env: backend.spawn(
-                        SandboxSpec(
-                            argv=argv,
-                            workdir=workdir,
-                            env=env,
-                            state_dir=state_dir,
-                            live_input=True,
+                    # Sampled through the same seam as any other spawn: a
+                    # resident process is still a container this turn runs
+                    # work in, and it was the one rung nothing measured.
+                    spawn_live=lambda argv, env: _spawn_sampled(
+                        backend.spawn(
+                            SandboxSpec(
+                                argv=argv,
+                                workdir=workdir,
+                                env=env,
+                                state_dir=state_dir,
+                                live_input=True,
+                            )
                         )
                     ),
                 )
@@ -1086,7 +1214,13 @@ def run_agent(
             if state_dir is not None:
                 backend.adopt_workdir(state_dir)
             try:
-                turn = live.start_turn(TurnInput(prompt=job.task_prompt, model=job.model))
+                turn = live.start_turn(
+                    TurnInput(
+                        prompt=job.task_prompt,
+                        model=job.model,
+                        reasoning_effort=job.reasoning_effort,
+                    )
+                )
             except DriverError as exc:
                 # The process is gone, or refused the turn. Close what we
                 # hold and run the ladder from warm in the same tree.
@@ -1103,7 +1237,11 @@ def run_agent(
                 )
             else:
                 session = live
-                turn_input = TurnInput(prompt=job.task_prompt, model=job.model)
+                turn_input = TurnInput(
+                    prompt=job.task_prompt,
+                    model=job.model,
+                    reasoning_effort=job.reasoning_effort,
+                )
                 # ``hot`` only when the process predates the turn — a fresh
                 # spawn is warm_native whatever transport it runs on, and a
                 # label that overclaims makes the hit-rate lie.
@@ -1125,7 +1263,11 @@ def run_agent(
             )
             session = None
         else:
-            turn_input = TurnInput(prompt=job.task_prompt, model=job.model)
+            turn_input = TurnInput(
+                prompt=job.task_prompt,
+                model=job.model,
+                reasoning_effort=job.reasoning_effort,
+            )
             control.report_continuity("warm_native")
     if session is None and state is not None:
         try:
@@ -1139,11 +1281,19 @@ def run_agent(
             session = None
         else:
             # The restored session *is* the memory: only the new prompt goes in.
-            turn_input = TurnInput(prompt=job.task_prompt, model=job.model)
+            turn_input = TurnInput(
+                prompt=job.task_prompt,
+                model=job.model,
+                reasoning_effort=job.reasoning_effort,
+            )
             control.report_continuity("cold_native")
     if session is None:
         session = driver.launch(context)
-        turn_input = TurnInput(prompt=conversation_prompt(job), model=job.model)
+        turn_input = TurnInput(
+            prompt=conversation_prompt(job),
+            model=job.model,
+            reasoning_effort=job.reasoning_effort,
+        )
         control.report_continuity("replay")
     if turn is None:
         assert turn_input is not None
@@ -1373,21 +1523,31 @@ def run_once(
     if residents is not None and job.thread_id:
         entry = residents.lookup(job.thread_id)
         if entry is not None:
-            # Every resident turn is a fresh process with a fresh environment
-            # (design §13, measured), so a model switch or an MCP grant needs
-            # nothing the restart does not already provide — the live-process
-            # era's gates on both are gone. What still ends a residency is a
-            # harness switch (another CLI cannot read this session) and a
-            # base the tree cannot fetch.
-            usable = entry.runtime_id == job.runtime and _resident_base_ready(entry.workdir, job)
-            if usable:
+            # What ends a residency at lookup is a harness switch (another
+            # CLI cannot read this session) and a base the tree cannot
+            # resolve; model switches and MCP turns reuse the workspace and
+            # are gated off the live process further down, in run_agent.
+            if entry.runtime_id != job.runtime:
+                unusable_reason = "harness_switch"
+            elif not _resident_base_ready(entry.workdir, job, backend):
+                unusable_reason = "base_unresolvable"
+            else:
+                unusable_reason = None
                 resident = entry
                 workdir = entry.workdir
                 state_dir = entry.state_dir
                 context_state = None
-            else:
-                # A restart-shaped turn (model switch, MCP, unfetchable base):
-                # end the residency and run the ladder from COLD — the
+            if unusable_reason is not None:
+                # First-class row, not a silent demotion: the staging
+                # acceptance spent an hour blind on exactly this branch —
+                # every turn quietly cold with promotion still succeeding.
+                control.append_event(
+                    NormalizedEvent(
+                        "lifecycle",
+                        {"phase": "residency_unusable", "reason": unusable_reason},
+                    )
+                )
+                # End the residency and run the ladder from COLD — the
                 # checkpoint it exported is the memory this turn resumes.
                 residents.drop(job.thread_id, release=True)
 
@@ -1480,7 +1640,19 @@ def run_once(
             finish_attempt("failed", str(exc))
             return 2
         control.append_event(
-            NormalizedEvent("lifecycle", {"phase": "checked_out", "base_sha": base_sha})
+            NormalizedEvent(
+                "lifecycle",
+                {
+                    "phase": "checked_out",
+                    "base_sha": base_sha,
+                    # A resident turn skipped the clone entirely — the tree is
+                    # the one this conversation has been building. Reporting
+                    # the same milestone either way told the owner their
+                    # thread had been rebuilt when it had not, and contradicted
+                    # the continuity badge on the very same turn.
+                    "reused": reused_workspace,
+                },
+            )
         )
 
         # A durable workspace already contains the preceding turn's edits.
@@ -1833,6 +2005,21 @@ def run_forever(
     # Pass the workdir root so a backend that bind-mounts it can prove the
     # mount works now, rather than failing every job with an opaque error.
     backend.preflight(workdir_root=str(root))
+    # Whether this runner can measure at all, checked once and said out loud.
+    # The first sampler assumed it ran on the host and read cgroupfs through a
+    # pid; deployed as a container beside its sandboxes, every read failed and
+    # the only symptom was grey text under every turn. An assumption about the
+    # deployment that nothing checks is how that happens twice, so this is the
+    # check. It is a warning, never fatal: a runner that cannot measure must
+    # still run jobs.
+    if getattr(backend, "measurable", True):
+        unmeasurable = daemon_reachable()
+        if unmeasurable:
+            print(
+                f"resource measurement is unavailable: {unmeasurable}. Turns will run "
+                "normally and report no resource usage.",
+                file=sys.stderr,
+            )
     # The sandbox must be able to reach the gateway it will be handed —
     # `gateway_url`, not the control plane this runner claims against. Checking
     # the wrong one proves the runner's own connectivity and says nothing about

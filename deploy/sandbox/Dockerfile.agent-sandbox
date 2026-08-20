@@ -35,6 +35,20 @@ FROM node:22-bookworm-slim
 # `400 System message must be at the beginning` — so each job died at its first
 # turn, with an error that pointed at the model rather than at the CLI version.
 # An unpinned agent CLI is a dependency that changes under you between builds.
+#
+# The defaults live here, beside the event parser in
+# `host/cloud_agent_host/runtimes.py` that is written against them — those two
+# are the pair that has to agree, so the reviewed value belongs in the same
+# tree as the code it was reviewed against.
+#
+# Each is also a build argument a deployment may override
+# (`deploy/host/sandbox_host.sh` passes them from that host's `.env`), because
+# *which* reviewed version an environment runs is deployment configuration, not
+# source. Without that, "let staging soak the new CLI for a week while
+# production stays put" was a change to the code both environments build from,
+# and every version bump — including a revert at 3am — needed a pull request.
+# An override must still be an exact version; the check at the end of this file
+# is what makes that true rather than merely asked for.
 ARG CLAUDE_CODE_VERSION=2.1.220
 ARG CODEX_VERSION=0.145.0
 ARG PI_VERSION=0.73.1
@@ -122,9 +136,37 @@ ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
     PI_OFFLINE=1
 
 # Fail loudly at build time if a runtime did not land, rather than at 3am when
-# a job claims it and dies.
-RUN claude --version && codex --version && pi --version && opencode --version \
-    && kilo --version
+# a job claims it and dies — and prove each one *is* the version this image
+# claims to hold.
+#
+# The second half is what makes the pins safe to hand to a deployment. The
+# labels above are derived from the build arguments, and everything downstream
+# treats a label as a statement of fact about the binary: the heartbeat reports
+# it, the claim copies it onto the attempt, and the checkpoint gate compares it
+# before letting a thread resume its own session. Hand-reviewed exact pins made
+# that true by construction. An operator-supplied value does not — `latest`, a
+# range like `^2.1`, or a version npm quietly resolved elsewhere each produce an
+# image whose label is a lie, and the first symptom of that lie is a thread
+# that silently forgets its history (a version mismatch downgrades to replay).
+#
+# So the rule is: the pin must be an exact version, and this proves it before
+# the image exists.
+RUN set -eu; \
+    check() { \
+        got="$("$1" --version 2>&1 | tail -1)"; \
+        case "$got" in \
+            *"$2"*) echo "$1: $got" ;; \
+            *) echo "ERROR: $1 reports '$got', but this image is labelled '$2'." >&2; \
+               echo "A runtime pin must be an exact version — a dist-tag or a range" >&2; \
+               echo "makes the version label, and every record derived from it, a lie." >&2; \
+               exit 1 ;; \
+        esac; \
+    }; \
+    check claude "${CLAUDE_CODE_VERSION}"; \
+    check codex "${CODEX_VERSION}"; \
+    check pi "${PI_VERSION}"; \
+    check opencode "${OPENCODE_VERSION}"; \
+    check kilo "${KILO_VERSION}"
 
 # No ENTRYPOINT: the runner supplies the full argv from the runtime adapter,
 # so this image never decides what an agent run looks like.

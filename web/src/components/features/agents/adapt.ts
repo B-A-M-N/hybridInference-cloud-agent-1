@@ -8,11 +8,21 @@
 import type {
   AgentJobApi,
   AgentJobEventApi,
+  AttemptResourcesApi,
   AgentThreadApi,
+  AgentThreadEventApi,
   AgentThreadMessageApi,
 } from '@/lib/api/agents';
 
-import type { AgentDiffFile, AgentEvent, AgentJob, AgentJobState, DiffLine } from './types';
+import type {
+  AgentDiffFile,
+  AgentEvent,
+  AgentHistoryTurn,
+  AgentJob,
+  AgentJobState,
+  DiffLine,
+  TurnResources,
+} from './types';
 
 /**
  * Map a server state onto a display state.
@@ -74,6 +84,25 @@ function toolOutput(payload: Record<string, unknown>): string[] | undefined {
 }
 
 /** Map one stored event onto a UI row, or null when it has nothing to show. */
+/**
+ * The span between a tool call and its result, when both carry a time.
+ *
+ * Message-level by construction: the window opens when the model asked for
+ * the call rather than when the sandbox began running it, so it includes
+ * whatever thinking preceded execution. Returns an empty object rather than
+ * a null field so a row without usable times carries no duration at all.
+ */
+export function durationBetween(
+  startedAt: string | null | undefined,
+  endedAt: string | null | undefined,
+): { durationMs?: number } {
+  if (!startedAt || !endedAt) return {};
+  const start = Date.parse(startedAt);
+  const end = Date.parse(endedAt);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return {};
+  return { durationMs: end - start };
+}
+
 export function toDisplayEvent(event: AgentJobEventApi): AgentEvent | null {
   const payload = event.payload ?? {};
   const type = event.event_type;
@@ -94,6 +123,7 @@ export function toDisplayEvent(event: AgentJobEventApi): AgentEvent | null {
       kind: 'tool_use',
       tool: name,
       id: asText(payload, 'id') || undefined,
+      ...(event.created_at ? { at: event.created_at } : {}),
       detail: asText(payload, 'detail', 'text') || commandText(payload.input) || 'Running tool',
       ...(output ? { output } : {}),
       ...(outputIsError ? { outputIsError: true } : {}),
@@ -110,6 +140,7 @@ export function toDisplayEvent(event: AgentJobEventApi): AgentEvent | null {
         asText(payload, 'text', 'detail'),
       toolUseId: asText(payload, 'tool_use_id') || undefined,
       isError: payload.is_error === true,
+      ...(event.created_at ? { at: event.created_at } : {}),
     };
   }
 
@@ -129,7 +160,13 @@ export function toDisplayEvent(event: AgentJobEventApi): AgentEvent | null {
     return { kind: 'lifecycle', text: `attempt superseded (${reason})` };
   }
   if (type === 'lifecycle') {
-    return { kind: 'lifecycle', text: asText(payload, 'phase', 'text') || 'lifecycle' };
+    const phase = asText(payload, 'phase', 'text') || 'lifecycle';
+    // The runner reports whether it reused the tree; the milestone reads
+    // differently depending on the answer, and only the runner can know it.
+    if (phase === 'checked_out' && payload.reused === true) {
+      return { kind: 'lifecycle', text: 'workspace_reused' };
+    }
+    return { kind: 'lifecycle', text: phase };
   }
   if (type === 'raw') {
     // Raw records are unclassified runtime protocol data. They remain available
@@ -260,15 +297,25 @@ function rawEventLine(event: AgentJobEventApi): string {
 
 export interface AdaptOptions {
   events?: AgentJobEventApi[];
+  threadEvents?: AgentThreadEventApi[];
   patch?: string | null;
   thread?: AgentThreadApi | null;
 }
 
 const LIFECYCLE_LABELS: Record<string, string> = {
-  started: 'Setting up environment',
-  init: 'Setting up environment',
-  system: 'Setting up environment',
+  // Three phases used to share one label, so the platform starting a turn and
+  // the agent announcing itself rendered as the same ticked step, twice. They
+  // are different milestones and now say so — the back-to-back collapse below
+  // only ever hid the pair when nothing came between them, which on a resident
+  // turn it does.
+  started: 'Run started',
+  init: 'Agent ready',
+  system: 'Agent ready',
   checked_out: 'Repository ready',
+  // A resident turn skipped the clone: the tree is the one this conversation
+  // has been building. Saying "repository ready" either way told the owner
+  // their thread had been rebuilt when it had not.
+  workspace_reused: 'Reusing this conversation\u2019s workspace',
   context_restored: 'Previous work restored',
   setup: 'Installing project dependencies',
   workspace_preparing: 'Preparing workspace',
@@ -332,6 +379,12 @@ function displayEvents(events: AgentJobEventApi[]): AgentEvent[] {
           ...target,
           output: row.text ? row.text.split('\n') : ['Command completed with no output.'],
           outputIsError: row.isError,
+          // Folding is where the pair still exists. Downstream only sees the
+          // surviving tool_use row, so a consumer that wanted to time the
+          // call — the turn footer does — would find nothing left to pair
+          // with and render every call as unfinished. The window is resolved
+          // here, while both ends are in hand.
+          ...durationBetween(target.at, row.at),
         };
         continue;
       }
@@ -362,6 +415,21 @@ function displayEvents(events: AgentJobEventApi[]): AgentEvent[] {
 }
 
 /** Build the UI job model from the API job plus whatever else we have. */
+/** Rename the host's rollup into the UI's shape, keeping every null a null. */
+export function toTurnResources(api: AttemptResourcesApi): TurnResources {
+  return {
+    cpuUsec: api.cpu_usec,
+    memPeakBytes: api.mem_peak_bytes,
+    memAvgBytes: api.mem_avg_bytes,
+    ioReadBytes: api.io_read_bytes,
+    ioWriteBytes: api.io_write_bytes,
+    netRxBytes: api.net_rx_bytes,
+    netTxBytes: api.net_tx_bytes,
+    sampleCount: api.sample_count,
+    coverage: api.coverage,
+  };
+}
+
 export function toDisplayJob(job: AgentJobApi, options: AdaptOptions = {}): AgentJob {
   const events = options.events ?? [];
   const patch = options.patch ?? '';
@@ -411,6 +479,23 @@ export function toDisplayJob(job: AgentJobApi, options: AdaptOptions = {}): Agen
       priorJobIds ? priorJobIds.has(message.job_id) : message.job_id !== job.id,
     )
     .map(mapMessage);
+  const historicalJobs = (options.thread?.jobs ?? []).filter(
+    (threadJob) =>
+      threadJob.id !== job.id &&
+      (currentTurn === undefined || (threadJob.turn_no ?? 1) < currentTurn),
+  );
+  const threadEvents = options.threadEvents;
+  let historyTurns: AgentHistoryTurn[] | undefined;
+  if (threadEvents !== undefined) {
+    historyTurns = historicalJobs.map((threadJob) => ({
+      jobId: threadJob.id,
+      turnNo: threadJob.turn_no ?? 1,
+      messages: (options.thread?.messages ?? [])
+        .filter((message) => message.job_id === threadJob.id)
+        .map(mapMessage),
+      events: displayEvents(threadEvents.filter((event) => event.job_id === threadJob.id)),
+    }));
+  }
   // A turn copied by fork has no events; its durable messages are the only
   // record of what it said. For a settled job whose event log carries no
   // message rows, render the thread's copy of the turn — prompt included, so
@@ -442,11 +527,15 @@ export function toDisplayJob(job: AgentJobApi, options: AdaptOptions = {}): Agen
     branch: job.output_branch ?? `agent/${job.thread_id ?? options.thread?.thread_id ?? job.id}`,
     runtime: job.runtime,
     model: job.model,
+    reasoningEffort: job.reasoning_effort ?? undefined,
     // Summed server-side from api_logs. Null there means no ledger is
     // configured; 0 is the honest display for that, but the panel below reads
     // `hasLedger` so it can say so rather than imply the job was free.
     spentUsd: job.spent_usd ?? 0,
     hasLedger: job.spent_usd !== null,
+    ...(job.continuity_mode ? { continuityMode: job.continuity_mode } : {}),
+    ...(typeof job.duration_ms === 'number' ? { durationMs: job.duration_ms } : {}),
+    ...(job.resources ? { resources: toTurnResources(job.resources) } : {}),
     timeoutLabel: '',
     networkSetup: tierLabel(job.setup_egress_tier),
     networkAgent: tierLabel(job.agent_egress_tier),
@@ -474,6 +563,7 @@ export function toDisplayJob(job: AgentJobApi, options: AdaptOptions = {}): Agen
     parentJobId: job.parent_job_id ?? undefined,
     turnNo: job.turn_no,
     threadMessages: [...priorMessages, ...ownMessages],
+    ...(historyTurns ? { historyTurns } : {}),
     historyIncludesPrompt: ownMessages.some((message) => message.role === 'user'),
   };
 }

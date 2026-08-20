@@ -23,6 +23,13 @@ export type AgentEvent =
       tool: string;
       detail: string;
       id?: string;
+      /** Event time, ISO. Present so per-tool durations are derivable. */
+      at?: string | null;
+      /**
+       * Resolved when this row absorbed its result during folding — the only
+       * moment both ends of the call are still in the same list.
+       */
+      durationMs?: number;
       /** Collapsed tool output preview (mono block), e.g. pytest tail. */
       output?: string[];
       outputIsError?: boolean;
@@ -35,6 +42,8 @@ export type AgentEvent =
       text: string;
       toolUseId?: string;
       isError: boolean;
+      /** Event time, ISO — paired with its tool_use to time the call. */
+      at?: string | null;
       attemptNo?: number;
     }
   | { kind: 'terminal'; text: string; isError?: boolean; attemptNo?: number }
@@ -47,6 +56,14 @@ export interface AgentThreadMessage {
   content: string;
   jobId: string;
   createdAt: string | null;
+}
+
+/** One completed turn reconstructed in the same order the agent produced it. */
+export interface AgentHistoryTurn {
+  jobId: string;
+  turnNo: number;
+  messages: AgentThreadMessage[];
+  events: AgentEvent[];
 }
 
 export interface DiffLine {
@@ -65,6 +82,22 @@ export interface AgentGate {
   label: string;
   state: 'pass' | 'pending' | 'hold';
   detail?: string;
+}
+
+export interface TurnResources {
+  cpuUsec: number | null;
+  memPeakBytes: number | null;
+  memAvgBytes: number | null;
+  ioReadBytes: number | null;
+  ioWriteBytes: number | null;
+  netRxBytes: number | null;
+  netTxBytes: number | null;
+  sampleCount: number;
+  /**
+   * Share of the turn actually sampled. Below 1 means the numbers are a
+   * floor, not a total, and the UI says so rather than rounding the gap away.
+   */
+  coverage: number;
 }
 
 export interface AgentJob {
@@ -87,6 +120,11 @@ export interface AgentJob {
   runtime: string;
   runtimeVersion?: string;
   model: string;
+  /**
+   * How hard this turn asked the model to think. Undefined is Auto — nobody
+   * chose — which is every turn created before the control existed.
+   */
+  reasoningEffort?: string;
   /** Set when the model is served on our own hardware, e.g. "H200". */
   modelLocal?: string;
   spentUsd: number;
@@ -112,6 +150,16 @@ export interface AgentJob {
   rawLines: string[];
   gates: AgentGate[];
   usage: { tokensIn: string; tokensOut: string; cachePct: number; turns: number };
+  /**
+   * How this turn was continued. `replay` means it was rebuilt from the
+   * transcript with the agent's working memory lost — the honest answer to
+   * "why did it forget", and the reason this is surfaced at all.
+   */
+  continuityMode?: 'hot' | 'warm_native' | 'cold_native' | 'replay';
+  /** Wall time of the turn's newest attempt. */
+  durationMs?: number;
+  /** Host-measured consumption. Absent when nothing measured this turn. */
+  resources?: TurnResources;
   egressDenials: number;
   /** e.g. "draft PR #1044" once published. */
   prLabel?: string;
@@ -121,6 +169,8 @@ export interface AgentJob {
   turnNo?: number;
   /** Completed turns before this job. The current prompt/activity are separate. */
   threadMessages?: AgentThreadMessage[];
+  /** Historical turns with their tool activity restored from the event log. */
+  historyTurns?: AgentHistoryTurn[];
   /**
    * True when threadMessages already carries this job's own turn (a forked
    * copy has no events, so its durable messages are rendered instead) — the

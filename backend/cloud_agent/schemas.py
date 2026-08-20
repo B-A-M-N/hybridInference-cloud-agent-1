@@ -42,6 +42,12 @@ EVENT_TYPE_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
 # publisher targets the PR at it, so a caller must not be able to forge one.
 BASE_REF_METADATA_KEY = "_agent_base_ref"
 
+#: What a follow-up sends to clear an inherited effort back to Auto. A plain
+#: null cannot mean this: null is what "no override, inherit" already sends,
+#: and the two have to be distinguishable or a thread that once chose an
+#: effort could never stop choosing one.
+RESET_REASONING_EFFORT = "auto"
+
 
 class AgentJobCreate(BaseModel):
     """Request body for creating an agent job."""
@@ -58,6 +64,17 @@ class AgentJobCreate(BaseModel):
     task_prompt: str = Field(..., description="What the agent should do.")
     runtime: str = Field("claude-code", description="Agent runtime id.")
     model: str = Field(..., description="Gateway model id the runtime should use.")
+    reasoning_effort: str | None = Field(
+        None,
+        max_length=32,
+        description=(
+            "How hard the model should think. Null is Auto — no instruction, "
+            "whatever the runtime and model do by default. A value must be one "
+            "both the runtime and the chosen model accept (the intersection "
+            "reported by /config); anything else is a 400 rather than a "
+            "silently dropped or nearest-value setting."
+        ),
+    )
     setup_script: str | None = Field(
         None,
         max_length=8000,
@@ -108,6 +125,27 @@ class AgentJobCreate(BaseModel):
         return value
 
 
+class AttemptResources(BaseModel):
+    """What one attempt's sandbox consumed, as measured from the host.
+
+    Every counter is optional and ``coverage`` is not: a turn the sampler
+    could not read reports ``coverage = 0`` with null counters, which a
+    reader must render as "not measured" rather than as zero usage.
+    """
+
+    cpu_usec: int | None = None
+    mem_peak_bytes: int | None = None
+    mem_avg_bytes: int | None = None
+    io_read_bytes: int | None = None
+    io_write_bytes: int | None = None
+    net_rx_bytes: int | None = None
+    net_tx_bytes: int | None = None
+    sample_count: int = 0
+    #: Fraction of the attempt window actually sampled, 0..1.
+    coverage: float = 0.0
+    sampler_version: str | None = None
+
+
 class AgentJobResponse(BaseModel):
     """One agent job as returned to its owner."""
 
@@ -120,6 +158,10 @@ class AgentJobResponse(BaseModel):
     runtime: str
     model: str
     execution_profile: ExecutionProfile = ExecutionProfile.TRUSTED_V1
+    #: Null means Auto, which is also what every turn created before this
+    #: control existed reports. The UI renders nothing for it: an absent chip
+    #: is the honest display of "nobody chose".
+    reasoning_effort: str | None = None
     base_ref: str | None = None
     base_sha: str | None = None
     output_branch: str | None = None
@@ -145,6 +187,21 @@ class AgentJobResponse(BaseModel):
     tokens_in: int | None = None
     tokens_out: int | None = None
     model_calls: int | None = None
+    # How this turn was continued and how long it took — recorded per attempt
+    # since the resident design landed, exposed here so the owner can see why
+    # a thread forgot (a ``replay`` turn was rebuilt from transcript) rather
+    # than guess.
+    #
+    # **Populated only by the single-job read** (``GET /jobs/{id}``), which is
+    # the one the turn view renders from. List and thread reads leave all
+    # three null rather than paying a per-row lookup for a field nothing on
+    # those paths displays — so a null here means "not fetched on this path",
+    # which is NOT the same statement as ``resources.coverage == 0``
+    # ("fetched, and nothing could be measured"). A future consumer that
+    # wants these in a listing needs a batched read, not a loop.
+    continuity_mode: str | None = None
+    duration_ms: int | None = None
+    resources: AttemptResources | None = None
     # The deployment's egress posture for this job's two phases, so the owner
     # can see what the sandbox could reach rather than take it on trust.
     setup_egress_tier: str | None = None
@@ -193,6 +250,25 @@ class AgentJobEvent(BaseModel):
     created_at: str | None = None
 
 
+class AgentThreadEvent(AgentJobEvent):
+    """One event, with the turn it belongs to.
+
+    The per-job stream needs no such label — every row is the turn being
+    watched. Across a thread it is what lets a reader see where one turn
+    ended and the next began.
+    """
+
+    job_id: str
+    turn_no: int = 1
+
+
+class AgentThreadEventsResponse(BaseModel):
+    """A page of a whole thread's events, plus the cursor to resume from."""
+
+    events: list[AgentThreadEvent]
+    next_cursor: int
+
+
 class AgentJobEventsResponse(BaseModel):
     """A page of events plus the cursor to resume from."""
 
@@ -237,6 +313,17 @@ class AgentFollowUpRequest(BaseModel):
         ),
     )
     model: str | None = Field(None, description="Optional model override for this turn.")
+    reasoning_effort: str | None = Field(
+        None,
+        max_length=32,
+        description=(
+            "Optional reasoning-effort override for this turn. Omitted inherits "
+            "the previous turn's, as an omitted model does. The literal "
+            f"{RESET_REASONING_EFFORT!r} resets to Auto — effort needs a way "
+            "back that model never did, because null is a value a turn can "
+            "legitimately hold rather than the absence of one."
+        ),
+    )
 
     @field_validator("prompt")
     @classmethod
@@ -268,6 +355,32 @@ class AgentThreadResponse(BaseModel):
     jobs: list[AgentJobResponse]
     created_at: str | None = None
     updated_at: str | None = None
+
+
+class AgentThreadStatsResponse(BaseModel):
+    """Aggregate numbers for a thread, derived from its stored events.
+
+    Optional fields are ``null`` when the thread's runtime does not report
+    the underlying measure — never ``0``, which a reader would take as a
+    measured fact. ``timing_source`` and ``tokens_source`` tell a client how
+    much to trust the rest, so the UI can label what it renders.
+    """
+
+    thread_id: str
+    turns: int
+    tool_calls: int
+    failed_tool_calls: int
+    wall_seconds: float
+    model_seconds: float
+    tool_seconds: float
+    ttft_seconds: float | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_hit_ratio: float | None = None
+    output_tokens_per_second: float | None = None
+    tokens_source: str
+    timing_source: str
 
 
 class AgentJobArtifactResponse(BaseModel):
@@ -474,6 +587,9 @@ class WorkerClaimResponse(BaseModel):
     runtime: str
     model: str
     execution_profile: ExecutionProfile = ExecutionProfile.TRUSTED_V1
+    #: Null is Auto. A runner too old to read it simply runs at the CLI's
+    #: default, which is what the field means anyway.
+    reasoning_effort: str | None = None
     worker_token: str
     sandbox_token: str = Field(
         "",
@@ -607,6 +723,27 @@ class WorkerContinuityRequest(BaseModel):
     mode: Literal["hot", "warm_native", "cold_native", "replay"]
 
 
+class WorkerResourcesRequest(BaseModel):
+    """One closed attempt window's resource rollup, reported by the runner.
+
+    Counters are cumulative deltas over the window, not rates. Absent fields
+    mean the sampler could not read that backend; ``coverage`` reports how
+    much of the window was sampled at all, so a gap stays a gap instead of
+    arriving as a small, convincing number.
+    """
+
+    cpu_usec: int | None = Field(None, ge=0)
+    mem_peak_bytes: int | None = Field(None, ge=0)
+    mem_avg_bytes: int | None = Field(None, ge=0)
+    io_read_bytes: int | None = Field(None, ge=0)
+    io_write_bytes: int | None = Field(None, ge=0)
+    net_rx_bytes: int | None = Field(None, ge=0)
+    net_tx_bytes: int | None = Field(None, ge=0)
+    sample_count: int = Field(0, ge=0)
+    coverage: float = Field(0.0, ge=0.0, le=1.0)
+    sampler_version: str = Field(..., max_length=64)
+
+
 class WorkerFinishRequest(BaseModel):
     """Terminal transition reported by a worker."""
 
@@ -689,6 +826,22 @@ class AgentConfigResponse(BaseModel):
         description=(
             "Model ids an agent job can actually call for this user — the same "
             "predicate the create endpoint enforces, not the /v1/models list."
+        ),
+    )
+    runtime_reasoning_efforts: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Effort levels each runtime can express, in its own vocabulary. A "
+            "runtime absent here cannot express one at all."
+        ),
+    )
+    model_reasoning_efforts: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Effort levels each model accepts, from the gateway's registry. The "
+            "composer offers the intersection with the chosen runtime's, and no "
+            "control at all when that is empty — which is also what it shows "
+            "against a gateway too old to answer this."
         ),
     )
     mcp_servers: list[McpServerSummary] = Field(
