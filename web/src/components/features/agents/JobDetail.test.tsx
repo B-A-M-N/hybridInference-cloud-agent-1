@@ -327,7 +327,7 @@ describe('JobDetail', () => {
         prompt: 'Now add a regression test',
       }),
     );
-    expect(navigation.push).toHaveBeenCalledWith('/ajob_child');
+    expect(navigation.push).toHaveBeenCalledWith('/ajob_child', { scroll: false });
   });
 
   it('sends the follow-up on Enter and keeps Shift+Enter a newline', async () => {
@@ -354,7 +354,7 @@ describe('JobDetail', () => {
         prompt: 'Now add a regression test',
       }),
     );
-    expect(navigation.push).toHaveBeenCalledWith('/ajob_child');
+    expect(navigation.push).toHaveBeenCalledWith('/ajob_child', { scroll: false });
   });
 
   it('swallows Enter on an empty follow-up rather than growing a blank line', async () => {
