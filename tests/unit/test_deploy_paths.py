@@ -177,3 +177,32 @@ def test_the_workflow_targets_this_repository() -> None:
     assert "HarvardMadSys/freeinference-cloud-agent" in text
     assert "HarvardMadSys/hybridInference" not in text
     assert "PYTHONPATH=host python -m cloud_agent_host.runner" in text
+
+
+@pytest.mark.parametrize(
+    ("workflow", "expected"),
+    [
+        (".github/workflows/deploy-staging.yml", "staging"),
+        (".github/workflows/deploy-prod.yml", "production"),
+    ],
+)
+def test_every_deploy_job_records_which_environment_it_deployed(workflow: str, expected: str):
+    """Both halves of a deploy must name their environment, or it is invisible.
+
+    A job without `environment:` deploys without leaving a record, so the
+    repository's Deployments panel shows nothing for it. Staging shipped that
+    way: the only trace of a deploy was in the Actions tab, filed under the
+    default branch because `workflow_run` runs are — so filtering the run list
+    by `dev` showed nothing at all and read as "it never deployed".
+
+    Parameterized over both workflows because the failure is asymmetry: one
+    half declared and the other not is exactly the state this replaces, and it
+    is invisible until somebody goes looking for a deployment that happened.
+    """
+    spec = yaml.safe_load((REPO / workflow).read_text(encoding="utf-8"))
+    environments = {name: job.get("environment") for name, job in spec["jobs"].items()}
+
+    assert environments, f"{workflow} declares no jobs"
+    assert all(value == expected for value in environments.values()), (
+        f"{workflow} has jobs that deploy without recording it: {environments}"
+    )
