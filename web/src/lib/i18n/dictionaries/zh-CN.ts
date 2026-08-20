@@ -64,6 +64,31 @@ export const zhCN: Record<TranslationKey, string> = {
   'settings.language.label': '界面语言',
   'settings.language.hint': '只影响界面显示。你用什么语言跟 Agent 说话,它就用什么语言回答。',
 
+  // ── Composer ────────────────────────────────────────────────────────────
+  'composer.heading': '让 Agent 做什么?',
+  'composer.subheading': '在隔离沙箱里运行,内部不含任何凭据 —— 产出是一个 draft PR。',
+  'composer.placeholder':
+    '描述一个任务…… 例如:修复 /v1/messages 上的 SSE 总超时回归,并补一个单元测试',
+  'composer.placeholderDisconnected': '连接 GitHub 后才能描述任务',
+  'composer.connectToRun': '连接 GitHub 后才能选仓库并运行',
+  'composer.repository': '仓库',
+  'composer.branch': '分支',
+  'composer.agent': 'Agent',
+  'composer.model': '模型',
+  'composer.reasoning': '推理强度',
+  'composer.run': '运行',
+  'composer.starting': '启动中…',
+  'composer.runTitle': '运行 —— ⏎ 发送,⇧⏎ 换行',
+  'composer.network': '网络:准备阶段 {setup} · Agent 阶段 {agent}',
+  'composer.loadConfigFailed': '无法加载配置',
+  'composer.startFailed': '无法启动任务',
+  'connect.title': '先连接 GitHub',
+  'connect.titleUnavailable': 'GitHub 尚未开放配置',
+  'connect.body': '选择 Agent 可以工作的仓库。凭据不会进入沙箱。',
+  'connect.bodyUnavailable': '请联系管理员为 cloud agent 开通仓库访问。',
+  'connect.action': '连接 GitHub',
+  'connect.actionUnavailable': '查看集成',
+
   // ── Shared ──────────────────────────────────────────────────────────────
   'common.loading': '加载中…',
 };

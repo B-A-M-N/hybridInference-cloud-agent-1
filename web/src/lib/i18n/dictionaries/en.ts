@@ -63,6 +63,34 @@ export const en = {
   'settings.language.hint':
     'Changes the interface only. Agents keep answering in whatever language you write to them in.',
 
+  // ── Composer ────────────────────────────────────────────────────────────
+  'composer.heading': 'What should the agent do?',
+  'composer.subheading':
+    'Runs in an isolated sandbox. No credentials inside — the output is a draft PR.',
+  'composer.placeholder':
+    'Describe a task… e.g. Fix the SSE total-timeout regression on /v1/messages and add a unit test',
+  'composer.placeholderDisconnected': 'Connect GitHub to describe a task',
+  'composer.connectToRun': 'Connect GitHub to select a repository and run',
+  'composer.repository': 'Repository',
+  'composer.branch': 'Branch',
+  'composer.agent': 'Agent',
+  'composer.model': 'Model',
+  'composer.reasoning': 'Reasoning',
+  'composer.run': 'Run',
+  'composer.starting': 'Starting…',
+  'composer.runTitle': 'Run — ⏎ to send, ⇧⏎ for a new line',
+  'composer.network': 'Network: setup {setup} · agent {agent}',
+  'composer.loadConfigFailed': 'could not load config',
+  'composer.startFailed': 'could not start the job',
+  'connect.title': 'Connect GitHub to start',
+  'connect.titleUnavailable': 'GitHub setup is not available yet',
+  'connect.body':
+    'Choose the repositories the agent can work on. Credentials never enter the sandbox.',
+  'connect.bodyUnavailable':
+    'Contact your administrator to enable repository access for cloud agents.',
+  'connect.action': 'Connect GitHub',
+  'connect.actionUnavailable': 'View integrations',
+
   // ── Shared ──────────────────────────────────────────────────────────────
   'common.loading': 'Loading…',
 } as const;

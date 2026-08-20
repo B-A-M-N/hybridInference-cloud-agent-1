@@ -49,8 +49,8 @@ function propertyOf(token: string): string {
   const parts = token.split(':');
   const base = parts[parts.length - 1];
   const variants = parts.slice(0, -1).join(':');
-  const prefix = ['bg-', 'text-', 'border-', 'divide-', 'ring-', 'from-', 'via-', 'to-'].find(
-    (p) => base.startsWith(p),
+  const prefix = ['bg-', 'text-', 'border-', 'divide-', 'ring-', 'from-', 'via-', 'to-'].find((p) =>
+    base.startsWith(p),
   );
   return `${variants}|${prefix ?? base}`;
 }

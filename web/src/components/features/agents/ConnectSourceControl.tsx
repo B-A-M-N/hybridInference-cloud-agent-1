@@ -1,11 +1,13 @@
 'use client';
 
 import Link from 'next/link';
+import { useT } from '@/components/providers';
 
 // Inline onboarding shown above the disabled composer. Keeping the task shape
 // visible gives the user context for why GitHub is needed without pretending
 // a repository can already be selected.
 export function ConnectSourceControl({ installUrl }: { installUrl: string | null }) {
+  const t = useT();
   return (
     <div
       role="status"
@@ -18,19 +20,17 @@ export function ConnectSourceControl({ installUrl }: { installUrl: string | null
       </span>
       <div className="min-w-0 flex-1">
         <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-50">
-          {installUrl ? 'Connect GitHub to start' : 'GitHub setup is not available yet'}
+          {installUrl ? t('connect.title') : t('connect.titleUnavailable')}
         </h2>
         <p className="mt-0.5 text-[13px] leading-relaxed text-gray-500 dark:text-gray-400">
-          {installUrl
-            ? 'Choose the repositories the agent can work on. Credentials never enter the sandbox.'
-            : 'Contact your administrator to enable repository access for cloud agents.'}
+          {installUrl ? t('connect.body') : t('connect.bodyUnavailable')}
         </p>
       </div>
       <Link
         href="/integrations"
         className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg bg-gray-900 dark:bg-gray-100 px-3.5 py-2 text-[13px] font-medium text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-white"
       >
-        {installUrl ? 'Connect GitHub' : 'View integrations'}
+        {installUrl ? t('connect.action') : t('connect.actionUnavailable')}
         <svg
           className="h-3.5 w-3.5"
           viewBox="0 0 24 24"
