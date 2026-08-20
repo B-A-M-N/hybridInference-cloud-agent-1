@@ -31,8 +31,8 @@ import { PaneResizer } from './PaneResizer';
 import { Picker } from './Picker';
 import { TerminalWorkspace } from './TerminalWorkspace';
 import { ThreadStatsBar } from './ThreadStatsBar';
-import type { AgentEvent, AgentJob, AgentThreadMessage } from './types';
-import type { AgentJobEventApi } from '@/lib/api/agents';
+import type { AgentEvent, AgentHistoryTurn, AgentJob, AgentThreadMessage } from './types';
+import type { AgentJobEventApi, AgentThreadEventApi } from '@/lib/api/agents';
 import { TurnFooter } from './TurnFooter';
 import { TrajectoryView } from './TrajectoryView';
 import { useResizablePane } from './useResizablePane';
@@ -365,7 +365,15 @@ function ThreadTurn({
   );
 }
 
-function EventRow({ event }: { event: AgentEvent }) {
+function EventRow({
+  event,
+  onFork,
+  busy,
+}: {
+  event: AgentEvent;
+  onFork?: () => void;
+  busy?: boolean;
+}) {
   if (event.kind === 'lifecycle') return <LifecycleRow text={event.text} />;
   if (event.kind === 'thinking') {
     return (
@@ -378,7 +386,21 @@ function EventRow({ event }: { event: AgentEvent }) {
       </div>
     );
   }
-  if (event.kind === 'message') return <AssistantMessage text={event.text} />;
+  if (event.kind === 'message') {
+    return (
+      <AssistantMessage
+        text={event.text}
+        extraActions={
+          onFork ? (
+            <MessageActionButton label="Fork from here" onClick={onFork} disabled={busy}>
+              <ForkIcon />
+              Fork from here
+            </MessageActionButton>
+          ) : undefined
+        }
+      />
+    );
+  }
   if (event.kind === 'tool_use') return <ToolActivity event={event} />;
   if (event.kind === 'tool_result') {
     return (
@@ -409,6 +431,66 @@ function EventRow({ event }: { event: AgentEvent }) {
     );
   }
   return <p className="py-1 text-[11px] text-gray-400">{event.text}</p>;
+}
+
+function HistoryTurn({
+  turn,
+  previousJobId,
+  busy,
+  onFork,
+  onRewind,
+}: {
+  turn: AgentHistoryTurn;
+  previousJobId?: string;
+  busy: boolean;
+  onFork: (jobId: string) => void;
+  onRewind: (jobId: string, prompt: string) => void;
+}) {
+  const hasEventMessages = turn.events.some((event) => event.kind === 'message');
+  const toolCalls = turn.events.filter((event) => event.kind === 'tool_use').length;
+  const fallbackMessages = hasEventMessages
+    ? []
+    : turn.messages.filter((message) => message.role === 'assistant');
+
+  return (
+    <section aria-label={`Turn ${turn.turnNo}`}>
+      {turn.messages
+        .filter((message) => message.role === 'user')
+        .map((message) => (
+          <ThreadTurn
+            key={message.id}
+            message={message}
+            busy={busy}
+            onRewind={previousJobId ? () => onRewind(previousJobId, message.content) : undefined}
+          />
+        ))}
+      <div aria-label={`Turn ${turn.turnNo} agent activity`} className="mt-2">
+        {turn.events.map((event, index) => (
+          <EventRow
+            key={`${turn.jobId}-${index}`}
+            event={event}
+            busy={busy}
+            onFork={event.kind === 'message' ? () => onFork(turn.jobId) : undefined}
+          />
+        ))}
+        {fallbackMessages.map((message) => (
+          <ThreadTurn
+            key={message.id}
+            message={message}
+            busy={busy}
+            onFork={() => onFork(turn.jobId)}
+          />
+        ))}
+      </div>
+      <div className="my-5 flex items-center gap-3 text-[11px] text-gray-400">
+        <span className="h-px flex-1 bg-gray-200" />
+        <span>
+          Turn {turn.turnNo} · {toolCalls} tool call{toolCalls === 1 ? '' : 's'}
+        </span>
+        <span className="h-px flex-1 bg-gray-200" />
+      </div>
+    </section>
+  );
 }
 
 function DetailStat({ label, value }: { label: string; value: string }) {
@@ -911,7 +993,7 @@ export function JobDetail({
 }: {
   job: AgentJob;
   /** The stored stream, for the trajectory tab. Absent in fixtures. */
-  events?: AgentJobEventApi[];
+  events?: (AgentJobEventApi | AgentThreadEventApi)[];
   onReload?: () => void;
 }) {
   const router = useRouter();
@@ -1144,10 +1226,19 @@ export function JobDetail({
     }
   }
 
-  const threadMessages = job.threadMessages ?? [];
-  const lastHistoryJobId = threadMessages.length
-    ? threadMessages[threadMessages.length - 1].jobId
-    : undefined;
+  const allThreadMessages = job.threadMessages ?? [];
+  const historyTurns = job.historyTurns;
+  // A real API-backed job has reconstructed historical turns. Keep only this
+  // job's durable-message fallback here; fixtures still use the legacy flat
+  // history, and forked turns still need their copied messages.
+  const threadMessages = historyTurns
+    ? allThreadMessages.filter((message) => message.jobId === job.id)
+    : allThreadMessages;
+  const lastHistoryJobId = historyTurns?.length
+    ? historyTurns[historyTurns.length - 1].jobId
+    : allThreadMessages.length
+      ? allThreadMessages[allThreadMessages.length - 1].jobId
+      : undefined;
 
   return (
     <section className="flex h-full min-h-0 flex-col bg-gray-50/40">
@@ -1286,11 +1377,23 @@ export function JobDetail({
               </div>
             ) : (
               <div className="flex-1">
+                {historyTurns?.map((turn, index) => (
+                  <HistoryTurn
+                    key={turn.jobId}
+                    turn={turn}
+                    previousJobId={index > 0 ? historyTurns[index - 1].jobId : undefined}
+                    busy={forking}
+                    onFork={(anchorJobId) => void forkFrom(anchorJobId)}
+                    onRewind={(anchorJobId, prompt) => void forkFrom(anchorJobId, prompt)}
+                  />
+                ))}
                 {threadMessages.map((message, index) => {
                   const previous = index > 0 ? threadMessages[index - 1] : undefined;
+                  const rewindParent =
+                    previous?.jobId ?? (historyTurns ? lastHistoryJobId : undefined);
                   const rewindAnchor =
-                    message.role === 'user' && previous && previous.jobId !== message.jobId
-                      ? previous.jobId
+                    message.role === 'user' && rewindParent && rewindParent !== message.jobId
+                      ? rewindParent
                       : undefined;
                   return (
                     <ThreadTurn
@@ -1368,7 +1471,16 @@ export function JobDetail({
 
                 <div aria-label="Agent activity" className="mt-2">
                   {visibleEvents.map((event, index) => (
-                    <EventRow key={`${event.attemptNo ?? 0}-${index}`} event={event} />
+                    <EventRow
+                      key={`${event.attemptNo ?? 0}-${index}`}
+                      event={event}
+                      busy={forking}
+                      onFork={
+                        event.kind === 'message' && !isActive
+                          ? () => void forkFrom(job.id)
+                          : undefined
+                      }
+                    />
                   ))}
                   {job.liveNote ? (
                     <div className="flex items-center gap-2.5 py-3 text-[13px] text-gray-500">

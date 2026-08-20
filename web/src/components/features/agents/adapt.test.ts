@@ -310,6 +310,44 @@ describe('toDisplayJob', () => {
     ]);
   });
 
+  it('reconstructs a previous turn with its tool activity in stream order', () => {
+    const current = { ...JOB, id: 'ajob_2', thread_id: 'thread_1', turn_no: 2 };
+    const job = toDisplayJob(current, {
+      thread: {
+        thread_id: 'thread_1',
+        jobs: [{ ...JOB, id: 'ajob_1', thread_id: 'thread_1', turn_no: 1 }, current],
+        messages: [
+          { id: 1, role: 'user', content: 'first question', job_id: 'ajob_1', created_at: null },
+          { id: 2, role: 'assistant', content: 'first answer', job_id: 'ajob_1', created_at: null },
+        ],
+      },
+      threadEvents: [
+        {
+          ...event(1, 'tool_use', { id: 'tool_1', name: 'Bash', input: { command: 'pwd' } }),
+          job_id: 'ajob_1',
+          turn_no: 1,
+        },
+        {
+          ...event(2, 'tool_result', { tool_use_id: 'tool_1', content: '/workspace' }),
+          job_id: 'ajob_1',
+          turn_no: 1,
+        },
+        {
+          ...event(3, 'message', { text: 'first answer' }),
+          job_id: 'ajob_1',
+          turn_no: 1,
+        },
+      ],
+    });
+
+    expect(job.historyTurns).toHaveLength(1);
+    expect(job.historyTurns?.[0].messages[0].content).toBe('first question');
+    expect(job.historyTurns?.[0].events).toEqual([
+      expect.objectContaining({ kind: 'tool_use', detail: 'pwd', output: ['/workspace'] }),
+      expect.objectContaining({ kind: 'message', text: 'first answer' }),
+    ]);
+  });
+
   it('renders a settled turn from durable messages when it has no events', () => {
     // A fork's copied anchor never streamed: its thread messages are the only
     // record, prompt included, so the separate prompt card must stand down.

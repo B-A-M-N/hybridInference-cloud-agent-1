@@ -193,6 +193,46 @@ describe('JobDetail', () => {
     expect(screen.getByText('I found the', { exact: false })).toBeInTheDocument();
   });
 
+  it("keeps a previous turn's tool activity after a follow-up is appended", () => {
+    render(
+      <JobDetail
+        job={makeJob({
+          turnNo: 2,
+          threadMessages: HISTORY,
+          historyTurns: [
+            {
+              jobId: 'ajob_0',
+              turnNo: 1,
+              messages: HISTORY,
+              events: [
+                { kind: 'message', text: 'I will inspect the repository.', attemptNo: 1 },
+                {
+                  kind: 'tool_use',
+                  tool: 'Read',
+                  detail: 'src/router.py',
+                  output: ['router source'],
+                  attemptNo: 1,
+                },
+                { kind: 'message', text: 'Earlier answer', attemptNo: 1 },
+              ],
+            },
+          ],
+        })}
+      />,
+    );
+
+    const turn = screen.getByLabelText('Turn 1');
+    const activity = within(turn).getByText('Read').closest('details');
+    expect(activity).not.toBeNull();
+    expect(activity).not.toHaveAttribute('open');
+    expect(activity).toHaveTextContent('src/router.py');
+    expect(activity).toHaveTextContent('router source');
+    expect(within(turn).getByText('Earlier answer')).toBeInTheDocument();
+    expect(screen.getAllByText('Earlier answer')).toHaveLength(1);
+    expect(within(turn).getByText('Turn 1 · 1 tool call')).toBeInTheDocument();
+    expect(screen.getByText(/with all of its detail/)).toBeInTheDocument();
+  });
+
   it('shows reasoning as a status without rendering raw thinking text', () => {
     render(
       <JobDetail
@@ -1021,6 +1061,39 @@ describe('the trajectory tab', () => {
     fireEvent.click(screen.getByRole('button', { name: 'chat' }));
 
     expect(screen.queryByLabelText('Search events')).toBeNull();
+  });
+
+  it('separates stored events by conversation turn', () => {
+    const stored = [
+      {
+        id: 1,
+        job_id: 'ajob_0',
+        turn_no: 1,
+        attempt_id: 1,
+        seq: 1,
+        event_type: 'tool_use',
+        payload: { id: 't1', name: 'Read', detail: 'README.md' },
+        created_at: null,
+      },
+      {
+        id: 2,
+        job_id: 'ajob_1',
+        turn_no: 2,
+        attempt_id: 2,
+        seq: 1,
+        event_type: 'tool_use',
+        payload: { id: 't2', name: 'Bash', detail: 'pytest' },
+        created_at: null,
+      },
+    ] as never;
+    render(<JobDetail job={makeJob()} events={stored} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'trajectory' }));
+
+    expect(screen.getByText('Turn 1')).toBeInTheDocument();
+    expect(screen.getByText('Turn 2')).toBeInTheDocument();
+    expect(screen.getByText('Read')).toBeInTheDocument();
+    expect(screen.getByText('Bash')).toBeInTheDocument();
   });
 
   it('still renders when no stored stream was handed down', () => {

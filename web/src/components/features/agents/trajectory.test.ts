@@ -27,6 +27,12 @@ describe('toTrajectory', () => {
     expect(rows.map((row) => row.eventType)).toEqual(['tool_use', 'tool_result']);
   });
 
+  it('keeps the turn label supplied by a whole-thread read', () => {
+    const [row] = toTrajectory([{ ...event({ id: 1 }), job_id: 'ajob_2', turn_no: 2 }]);
+
+    expect(row.turnNo).toBe(2);
+  });
+
   it('keeps repeated thinking rows instead of collapsing them', () => {
     const rows = toTrajectory([
       event({ id: 1, event_type: 'thinking', payload: { text: 'a' } }),

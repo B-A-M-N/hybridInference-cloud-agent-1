@@ -6,7 +6,7 @@ import {
   getAgentJobArtifact,
   getAgentJobFiles,
   getAgentJobThread,
-  listAgentJobEvents,
+  listAllAgentThreadEvents,
   listAgentJobs,
   listAgentProjects,
   streamAgentJob,
@@ -19,6 +19,7 @@ import type {
   AgentJobSymlinkApi,
   AgentProjectApi,
   AgentThreadApi,
+  AgentThreadEventApi,
 } from '@/lib/api/agents';
 import { toDisplayJob } from './adapt';
 import type { AgentJob } from './types';
@@ -212,14 +213,15 @@ export function useProjectJobs(limit = 200): {
 /** One job, its event log, and its patch — kept live over SSE. */
 export function useAgentJob(jobId: string): {
   job: AgentJob | null;
-  /** The stored stream, unfolded — what the trajectory view reads. */
-  events: AgentJobEventApi[];
+  /** Every turn's stored stream, unfolded — what the trajectory view reads. */
+  events: AgentThreadEventApi[];
   loading: boolean;
   error: string | null;
   reload: () => void;
 } {
   const [api, setApi] = useState<AgentJobApi | null>(null);
   const [events, setEvents] = useState<AgentJobEventApi[]>([]);
+  const [threadEvents, setThreadEvents] = useState<AgentThreadEventApi[]>([]);
   const [patch, setPatch] = useState<string | null>(null);
   const [thread, setThread] = useState<AgentThreadApi | null>(null);
   const [loading, setLoading] = useState(true);
@@ -236,13 +238,15 @@ export function useAgentJob(jobId: string): {
     setPatch(null);
     setLoading(true);
 
-    Promise.all([getAgentJob(jobId), listAgentJobEvents(jobId), getAgentJobThread(jobId)])
-      .then(([job, page, foundThread]) => {
+    Promise.all([getAgentJob(jobId), getAgentJobThread(jobId), listAllAgentThreadEvents(jobId)])
+      .then(([job, foundThread, foundEvents]) => {
         if (cancelled) return;
+        const ownEvents = foundEvents.filter((event) => event.job_id === jobId);
         setApi(job);
-        setEvents(page.events);
+        setEvents(ownEvents);
+        setThreadEvents(foundEvents);
         setThread(foundThread);
-        page.events.forEach((event) => seen.current.add(event.id));
+        ownEvents.forEach((event) => seen.current.add(event.id));
         setError(null);
       })
       .catch((cause: unknown) => {
@@ -279,6 +283,8 @@ export function useAgentJob(jobId: string): {
   // opened for them at all.
   const isLive =
     state === 'waiting' || state === 'running' || state === 'queued' || state === 'publishing';
+  const currentTurnNo =
+    api?.turn_no ?? thread?.jobs.find((threadJob) => threadJob.id === jobId)?.turn_no ?? 1;
   useEffect(() => {
     if (!jobId || !isLive) return undefined;
     const controller = new AbortController();
@@ -290,6 +296,10 @@ export function useAgentJob(jobId: string): {
         if (seen.current.has(event.id)) return;
         seen.current.add(event.id);
         setEvents((current) => [...current, event]);
+        setThreadEvents((current) => [
+          ...current,
+          { ...event, job_id: jobId, turn_no: currentTurnNo },
+        ]);
         // The stream is also the fastest authority for a waiting/queued child
         // becoming active; keep the status pill in step without polling.
         setApi((current) => (current ? applyAgentLifecycleEvent(current, event) : current));
@@ -301,13 +311,13 @@ export function useAgentJob(jobId: string): {
       if (!controller.signal.aborted) reload();
     });
     return () => controller.abort();
-  }, [jobId, isLive, reload]);
+  }, [currentTurnNo, jobId, isLive, reload]);
 
-  const job = api ? toDisplayJob(api, { events, patch, thread }) : null;
+  const job = api ? toDisplayJob(api, { events, patch, thread, threadEvents }) : null;
   // Both shapes, deliberately: `job.events` is the chat view's *reading* of
   // the stream — folded, deduplicated, unknown kinds dropped — while the
   // trajectory needs the rows the platform actually stored.
-  return { job, events, loading, error, reload };
+  return { job, events: threadEvents, loading, error, reload };
 }
 
 /** One directory of the workspace tree, as far as it has been loaded. */
