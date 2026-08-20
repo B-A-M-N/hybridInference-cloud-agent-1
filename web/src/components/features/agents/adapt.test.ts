@@ -596,16 +596,58 @@ describe('lifecycle noise', () => {
     expect(kinds).toEqual(['thinking', 'message', 'thinking']);
   });
 
-  it('does not repeat a milestone the platform and the CLI both report', () => {
-    // "started" (platform) and "init" (CLI) both mean setting up environment.
+  it('tells the platform starting a turn apart from the agent coming up', () => {
+    // These were one label, collapsed when adjacent. They are two different
+    // milestones — the platform claimed the turn, then the CLI announced
+    // itself — and on a resident turn other milestones fall between them, so
+    // the collapse missed and the same words appeared twice.
     const events = [
       event(1, 'lifecycle', { phase: 'started' }),
-      event(2, 'lifecycle', { phase: 'init' }),
-      event(3, 'lifecycle', { phase: 'checked_out' }),
+      event(2, 'lifecycle', { phase: 'checked_out' }),
+      event(3, 'lifecycle', { phase: 'init' }),
     ];
+
     const texts = toDisplayJob(job, { events })
       .events.filter((e) => e.kind === 'lifecycle')
       .map((e) => (e.kind === 'lifecycle' ? lifecyclePhaseLabel(e.text).text : ''));
-    expect(texts).toEqual(['Setting up environment', 'Repository ready']);
+
+    expect(texts).toEqual(['Run started', 'Repository ready', 'Agent ready']);
+  });
+
+  it('still collapses the same milestone reported twice in a row', () => {
+    const events = [
+      event(1, 'lifecycle', { phase: 'init' }),
+      event(2, 'lifecycle', { phase: 'system' }),
+      event(3, 'lifecycle', { phase: 'checked_out' }),
+    ];
+
+    const texts = toDisplayJob(job, { events })
+      .events.filter((e) => e.kind === 'lifecycle')
+      .map((e) => (e.kind === 'lifecycle' ? lifecyclePhaseLabel(e.text).text : ''));
+
+    expect(texts).toEqual(['Agent ready', 'Repository ready']);
+  });
+
+  it('says a resident turn reused its tree rather than claiming a checkout', () => {
+    // The runner skips the clone entirely on a resident turn. Reporting
+    // "Repository ready" either way told the owner their conversation had
+    // been rebuilt, contradicting the continuity badge on the same turn.
+    const events = [event(1, 'lifecycle', { phase: 'checked_out', reused: true })];
+
+    const texts = toDisplayJob(job, { events })
+      .events.filter((e) => e.kind === 'lifecycle')
+      .map((e) => (e.kind === 'lifecycle' ? lifecyclePhaseLabel(e.text).text : ''));
+
+    expect(texts).toEqual(['Reusing this conversation\u2019s workspace']);
+  });
+
+  it('still reports a real checkout as one', () => {
+    const events = [event(1, 'lifecycle', { phase: 'checked_out', reused: false })];
+
+    const texts = toDisplayJob(job, { events })
+      .events.filter((e) => e.kind === 'lifecycle')
+      .map((e) => (e.kind === 'lifecycle' ? lifecyclePhaseLabel(e.text).text : ''));
+
+    expect(texts).toEqual(['Repository ready']);
   });
 });

@@ -912,6 +912,16 @@ export function JobDetail({
     [job.attempts],
   );
   const [attemptNo, setAttemptNo] = useState(liveAttempt);
+  // What the remount used to do. Moving to the next turn of a conversation no
+  // longer rebuilds this component, so the attempt selection has to follow the
+  // turn explicitly — otherwise turn two would open showing turn one's chosen
+  // attempt.
+  useEffect(() => {
+    setAttemptNo(liveAttempt);
+    // Only when the turn changes: re-running this on every attempt update
+    // would fight the reader's own selection.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job.id]);
   const [drawer, setDrawer] = useState<DrawerView | null>(null);
   const [tab, setTab] = useState<'chat' | 'trajectory'>('chat');
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
@@ -1066,6 +1076,11 @@ export function JobDetail({
         ...(model && model !== job.model ? { model } : {}),
       });
       router.push(`/${child.id}`);
+      // Also what the remount used to do. Without it the composer stayed
+      // disabled with the sent text still in it, because nothing else ever
+      // cleared either.
+      setFollowUp('');
+      setSubmitting(false);
     } catch (cause: unknown) {
       setActionError(cause instanceof Error ? cause.message : 'Could not queue the follow-up');
       setSubmitting(false);

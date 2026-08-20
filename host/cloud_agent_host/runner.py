@@ -1602,7 +1602,19 @@ def run_once(
             finish_attempt("failed", str(exc))
             return 2
         control.append_event(
-            NormalizedEvent("lifecycle", {"phase": "checked_out", "base_sha": base_sha})
+            NormalizedEvent(
+                "lifecycle",
+                {
+                    "phase": "checked_out",
+                    "base_sha": base_sha,
+                    # A resident turn skipped the clone entirely — the tree is
+                    # the one this conversation has been building. Reporting
+                    # the same milestone either way told the owner their
+                    # thread had been rebuilt when it had not, and contradicted
+                    # the continuity badge on the very same turn.
+                    "reused": reused_workspace,
+                },
+            )
         )
 
         # A durable workspace already contains the preceding turn's edits.
