@@ -266,11 +266,17 @@ jobs:
           POSTGRES_DB: hybridinference_test_db
         ports:
           - 5432/tcp
+        # 1s, not the 10s this was copied from. Docker runs the first probe one
+        # interval after start, so a 10s interval means the job waits at least
+        # ten seconds no matter how fast Postgres is. Measured on this runner:
+        # 10.3s to healthy at `10s`, 2.5s at `1s` — the server is ready in
+        # about two. `pg_isready` is a connect-and-exit, so probing it every
+        # second costs nothing worth counting.
         options: >-
           --health-cmd pg_isready
-          --health-interval 10s
+          --health-interval 1s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 15
 
     steps:
       - uses: actions/checkout@v6
