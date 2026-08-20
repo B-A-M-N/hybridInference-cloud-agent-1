@@ -189,7 +189,7 @@ describe('JobDetail', () => {
     expect(screen.getByText('Earlier question')).toBeInTheDocument();
     expect(screen.getByText('Earlier answer')).toBeInTheDocument();
     expect(screen.getByText(/with all of its detail/)).toBeInTheDocument();
-    expect(screen.getByText('Setting up environment')).toBeInTheDocument();
+    expect(screen.getByText('Run started')).toBeInTheDocument();
     expect(screen.getByText('I found the', { exact: false })).toBeInTheDocument();
   });
 
@@ -938,5 +938,25 @@ describe('the trajectory tab', () => {
     fireEvent.click(screen.getByRole('button', { name: 'trajectory' }));
 
     expect(screen.getByText(/stored no events/)).toBeInTheDocument();
+  });
+});
+
+describe('sending a follow-up', () => {
+  afterEach(() => cleanup());
+
+  it('clears the composer instead of leaving it disabled with the sent text', async () => {
+    // A remount used to do this. Keying on the conversation rather than the
+    // turn removed the remount, and with it the only thing that ever reset
+    // either — the composer stayed disabled with the prompt still in it.
+    vi.mocked(followUpAgentJob).mockResolvedValue({ id: 'ajob_next' } as never);
+    render(<JobDetail job={makeJob()} />);
+    const box = screen.getByPlaceholderText('Add a follow-up');
+
+    fireEvent.change(box, { target: { value: 'and now the docs' } });
+    fireEvent.submit(box.closest('form') as HTMLFormElement);
+
+    await waitFor(() => expect(followUpAgentJob).toHaveBeenCalled());
+    await waitFor(() => expect((box as HTMLTextAreaElement).value).toBe(''));
+    expect(box).not.toBeDisabled();
   });
 });

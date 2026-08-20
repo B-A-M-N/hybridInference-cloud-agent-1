@@ -158,7 +158,13 @@ export function toDisplayEvent(event: AgentJobEventApi): AgentEvent | null {
     return { kind: 'lifecycle', text: `attempt superseded (${reason})` };
   }
   if (type === 'lifecycle') {
-    return { kind: 'lifecycle', text: asText(payload, 'phase', 'text') || 'lifecycle' };
+    const phase = asText(payload, 'phase', 'text') || 'lifecycle';
+    // The runner reports whether it reused the tree; the milestone reads
+    // differently depending on the answer, and only the runner can know it.
+    if (phase === 'checked_out' && payload.reused === true) {
+      return { kind: 'lifecycle', text: 'workspace_reused' };
+    }
+    return { kind: 'lifecycle', text: phase };
   }
   if (type === 'raw') {
     // Raw records are unclassified runtime protocol data. They remain available
@@ -294,10 +300,19 @@ export interface AdaptOptions {
 }
 
 const LIFECYCLE_LABELS: Record<string, string> = {
-  started: 'Setting up environment',
-  init: 'Setting up environment',
-  system: 'Setting up environment',
+  // Three phases used to share one label, so the platform starting a turn and
+  // the agent announcing itself rendered as the same ticked step, twice. They
+  // are different milestones and now say so — the back-to-back collapse below
+  // only ever hid the pair when nothing came between them, which on a resident
+  // turn it does.
+  started: 'Run started',
+  init: 'Agent ready',
+  system: 'Agent ready',
   checked_out: 'Repository ready',
+  // A resident turn skipped the clone: the tree is the one this conversation
+  // has been building. Saying "repository ready" either way told the owner
+  // their thread had been rebuilt when it had not.
+  workspace_reused: 'Reusing this conversation\u2019s workspace',
   context_restored: 'Previous work restored',
   setup: 'Installing project dependencies',
   workspace_preparing: 'Preparing workspace',
