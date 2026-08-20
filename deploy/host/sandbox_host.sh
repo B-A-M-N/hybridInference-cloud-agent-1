@@ -109,6 +109,31 @@ TUNNEL_PORT="${TUNNEL_PORT:-8080}"
 EGRESS_NETWORK="$(env_or_dotenv AGENT_EGRESS_NETWORK_PLATFORM_ONLY)"
 EGRESS_NETWORK="${EGRESS_NETWORK:-agent-egress}"
 
+# Which agent CLI versions this deployment bakes into its sandbox image.
+#
+# All optional, and unset is the normal case: an empty value passes no build
+# argument at all, so the image is built from the reviewed default in
+# `deploy/sandbox/Dockerfile.agent-sandbox` — byte for byte the image this host
+# built before any of this existed. Setting one is how an environment runs a
+# version other than the default (staging soaking a new CLI, or a deployment
+# pinned back after a bad one) without editing the source both environments
+# build from.
+#
+# Named exactly as the Dockerfile's `ARG`s — one name for one thing, so there
+# is no mapping table between `.env` and `--build-arg` for a typo to hide in.
+#
+# The reads below are one spelled-out call each rather than a loop, because
+# `test_env_examples.py` recognises configuration by exactly this literal
+# `env_or_dotenv NAME` shape; a loop over a list of names would read to it as
+# no configuration at all. `test_runtime_version_pins.py` then holds this set
+# equal to the set of pins the Dockerfile declares, so a runtime added there
+# without a line here fails rather than being quietly unconfigurable.
+CLAUDE_CODE_VERSION="$(env_or_dotenv CLAUDE_CODE_VERSION)"
+CODEX_VERSION="$(env_or_dotenv CODEX_VERSION)"
+PI_VERSION="$(env_or_dotenv PI_VERSION)"
+OPENCODE_VERSION="$(env_or_dotenv OPENCODE_VERSION)"
+KILO_VERSION="$(env_or_dotenv KILO_VERSION)"
+
 require_env() {
   # Named up front, because each of these fails much later and much less
   # legibly: a missing token as a 401 per claim, a missing key as a container
@@ -265,8 +290,24 @@ cmd_up() {
         "(set AGENT_RUNNER_HOST in .env to rename it)"
   fi
 
+  # Only the pins this deployment actually sets are passed; the rest fall
+  # through to the Dockerfile's reviewed defaults. Logged one per line, because
+  # "which CLI version did this host build" is the first question asked when a
+  # job behaves differently here than elsewhere, and the build log is where
+  # somebody looks before the database.
+  local build_args=() name
+  for name in CLAUDE_CODE_VERSION CODEX_VERSION PI_VERSION OPENCODE_VERSION KILO_VERSION; do
+    [[ -n "${!name}" ]] || continue
+    log "runtime pin: ${name}=${!name} (overrides the Dockerfile default)"
+    build_args+=(--build-arg "${name}=${!name}")
+  done
+
   log "building the sandbox image (${SANDBOX_IMAGE})"
-  docker build -f deploy/sandbox/Dockerfile.agent-sandbox -t "$SANDBOX_IMAGE" .
+  # The `+` guard is load-bearing under `set -u`: with no overrides at all,
+  # a bare `"${build_args[@]}"` is an unbound reference on bash before 4.4,
+  # and this script also runs on developer machines.
+  docker build ${build_args[@]+"${build_args[@]}"} \
+    -f deploy/sandbox/Dockerfile.agent-sandbox -t "$SANDBOX_IMAGE" .
 
   log "starting the gateway tunnel and ${replicas} runner(s)"
   AGENT_SANDBOX_IMAGE="$SANDBOX_IMAGE" AGENT_RUNNER_REPLICAS="$replicas" \
