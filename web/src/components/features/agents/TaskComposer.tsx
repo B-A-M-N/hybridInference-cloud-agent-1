@@ -1,11 +1,12 @@
 'use client';
 
 import { useRouter } from 'next/navigation';
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { createAgentJob, getAgentConfig, listRepoBranches } from '@/lib/api/agents';
 import type { AgentConfigApi } from '@/lib/api/agents';
 import { isComposerSubmit } from './composerKeys';
 import { ConnectSourceControl } from './ConnectSourceControl';
+import { AUTO_EFFORT, effortOptions, offeredEfforts } from './effort';
 import { Picker } from './Picker';
 
 // New-task composer (the /agents index state). Runtime × model are first-class
@@ -34,6 +35,7 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
   const [branch, setBranch] = useState('');
   const [runtime, setRuntime] = useState('');
   const [model, setModel] = useState('');
+  const [effort, setEffort] = useState(AUTO_EFFORT);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -65,6 +67,22 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
       cancelled = true;
     };
   }, [initialRepo]);
+
+  // The offered efforts follow the (runtime, model) pair, so switching either
+  // can empty the set or drop the current choice out of it.
+  const efforts = useMemo(
+    () => effortOptions(offeredEfforts(config, runtime, model)),
+    [config, runtime, model],
+  );
+  useEffect(() => {
+    // Only once the config has arrived: before that the offered set is empty
+    // because nothing is *known*, not because nothing is offered.
+    if (!config) return;
+    // Falling back rather than submitting a level the new pair does not offer:
+    // the backend would refuse it, and the picker would have shown a value it
+    // could not deliver — the exact failure this control exists to avoid.
+    if (!efforts.includes(effort)) setEffort(AUTO_EFFORT);
+  }, [config, efforts, effort]);
 
   // Branches follow the selected repository, so they reload when it changes.
   useEffect(() => {
@@ -111,6 +129,9 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
         // Sent as a ref; the platform pins it to a commit at creation, because
         // a branch moves and the publisher applies onto a fixed one.
         ...(branch ? { base_ref: branch } : {}),
+        // Auto is the absence of the field, not a value: a fresh turn has
+        // nothing to inherit, so "no instruction" is simply not sending one.
+        ...(effort !== AUTO_EFFORT ? { reasoning_effort: effort } : {}),
       });
       router.push(`/${job.id}`);
     } catch (cause: unknown) {
@@ -204,6 +225,7 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
                 onChange={setRuntime}
               />
               <Picker label="Model" value={model} options={models} onChange={setModel} />
+              <Picker label="Reasoning" value={effort} options={efforts} onChange={setEffort} />
             </>
           )}
 

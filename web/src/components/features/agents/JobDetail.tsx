@@ -20,11 +20,13 @@ import {
   forkAgentJob,
   getAgentConfig,
   getAgentJobGit,
+  type AgentConfigApi,
   type AgentGitWorkspaceApi,
 } from '@/lib/api/agents';
 
 import { lifecyclePhaseLabel, toDiffFileDetails } from './adapt';
 import { isComposerSubmit } from './composerKeys';
+import { AUTO_EFFORT, effortOptions, offeredEfforts } from './effort';
 import { PaneResizer } from './PaneResizer';
 import { Picker } from './Picker';
 import { TerminalWorkspace } from './TerminalWorkspace';
@@ -517,6 +519,12 @@ function DetailsDrawer({
                 <dl className="mt-2 divide-y divide-gray-100">
                   <DetailStat label="Agent" value={job.runtime} />
                   <DetailStat label="Model" value={job.model} />
+                  {/* Only when a depth was chosen. An absent row is the honest
+                      rendering of Auto: nobody picked, so there is nothing to
+                      report. */}
+                  {job.reasoningEffort ? (
+                    <DetailStat label="Reasoning" value={job.reasoningEffort} />
+                  ) : null}
                   <DetailStat label="Sandbox" value={job.sandbox} />
                   <DetailStat label="Setup network" value={job.networkSetup} />
                   <DetailStat label="Agent network" value={job.networkAgent} />
@@ -927,8 +935,10 @@ export function JobDetail({
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const [workspaceTab, setWorkspaceTab] = useState<WorkspaceTab>('git');
   const [followUp, setFollowUp] = useState('');
+  const [config, setConfig] = useState<AgentConfigApi | null>(null);
   const [models, setModels] = useState<string[]>([]);
   const [model, setModel] = useState(job.model);
+  const [effort, setEffort] = useState(job.reasoningEffort ?? AUTO_EFFORT);
   const [submitting, setSubmitting] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [forking, setForking] = useState(false);
@@ -952,14 +962,19 @@ export function JobDetail({
   useEffect(() => {
     let cancelled = false;
     getAgentConfig()
-      .then((config) => {
-        if (!cancelled) setModels(config.models ?? []);
+      .then((loaded) => {
+        if (cancelled) return;
+        setConfig(loaded);
+        setModels(loaded.models ?? []);
       })
       .catch(() => {
         // A list we could not load is not a list to pick from: the composer
         // falls back to naming the inherited model, which is what a turn with
         // no override runs on anyway.
-        if (!cancelled) setModels([]);
+        if (!cancelled) {
+          setConfig(null);
+          setModels([]);
+        }
       });
     return () => {
       cancelled = true;
@@ -972,6 +987,21 @@ export function JobDetail({
     if (models.length === 0) return [];
     return models.includes(job.model) ? models : [job.model, ...models];
   }, [job.model, models]);
+
+  // Against the model this turn would run — the switched-to one, or the
+  // inherited one — because a pair offered last turn need not be offered now.
+  const efforts = useMemo(
+    () => effortOptions(offeredEfforts(config, job.runtime, model || job.model)),
+    [config, job.runtime, job.model, model],
+  );
+  useEffect(() => {
+    // Only once the config has arrived. Before that the offered set is empty
+    // because nothing is *known*, not because nothing is offered — and acting
+    // on it would wipe a legitimate selection a moment before the answer
+    // lands.
+    if (!config) return;
+    if (!efforts.includes(effort)) setEffort(AUTO_EFFORT);
+  }, [config, efforts, effort]);
 
   // An "Edit & rewind" fork leaves the edited prompt behind for its landing
   // page. Session-scoped and consumed once, so a reload does not resurrect it.
@@ -1074,6 +1104,10 @@ export function JobDetail({
         // Only an actual switch is sent. Omitted, the turn inherits the
         // parent's model, which was validated when it was chosen.
         ...(model && model !== job.model ? { model } : {}),
+        // Only an actual change is sent, and clearing back to Auto sends the
+        // reset sentinel: an omitted field means "inherit", so a null could
+        // never express "stop thinking hard".
+        ...(effort !== (job.reasoningEffort ?? AUTO_EFFORT) ? { reasoning_effort: effort } : {}),
       });
       router.push(`/${child.id}`);
       // Also what the remount used to do. Without it the composer stayed
@@ -1394,6 +1428,12 @@ export function JobDetail({
                         value={model}
                         options={modelOptions}
                         onChange={setModel}
+                      />
+                      <Picker
+                        label="Reasoning for this turn"
+                        value={effort}
+                        options={efforts}
+                        onChange={setEffort}
                       />
                       {isActive ? (
                         <span className="min-w-0 truncate text-[11px] text-gray-400">
