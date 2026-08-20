@@ -79,6 +79,13 @@ class RuntimeCapabilities:
     #: assumed from the model, because both halves have to be able to deliver:
     #: a model that takes an effort is no use behind a CLI with no way to say
     #: one, and the intersection is what gets offered.
+    #:
+    #: **Ordered weakest to strongest.** The composer preselects the deepest
+    #: level a pair offers, and it finds it by taking the last one rather than
+    #: by consulting a ranking table — there is no platform-wide effort scale
+    #: to build such a table from, and inventing one would mean a third
+    #: vocabulary to keep in step with the CLIs' and the models'. The order is
+    #: therefore part of the declaration, and ``test_agent_runtimes`` pins it.
     reasoning_efforts: tuple[str, ...] = ()
     # Whether this adapter can point the CLI at the gateway's MCP proxy *and*
     # shut out every other MCP config source. Both halves or neither: a runtime

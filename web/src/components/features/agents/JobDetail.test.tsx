@@ -902,8 +902,8 @@ describe('JobDetail', () => {
 describe('JobDetail reasoning effort', () => {
   const THINKING_CONFIG = {
     ...AGENT_CONFIG,
-    runtime_reasoning_efforts: { 'claude-code': ['low', 'medium', 'high', 'max'] },
-    // No `medium` on the model, matching the real glm-5.3 entry.
+    runtime_reasoning_efforts: { 'claude-code': ['low', 'medium', 'high', 'xhigh', 'max'] },
+    // Neither `medium` nor `xhigh`, matching the real glm-5.3 entry.
     model_reasoning_efforts: { 'qwen-test': ['low', 'high', 'max'] },
   };
 
@@ -917,15 +917,24 @@ describe('JobDetail reasoning effort', () => {
 
   afterEach(() => cleanup());
 
-  it('offers the intersection for the turn the follow-up would run', async () => {
+  it('offers exactly what the model accepts for the turn it would run', async () => {
     render(<JobDetail job={makeJob()} />);
 
     const picker = await screen.findByLabelText('Reasoning for this turn');
     const offered = Array.from(picker.querySelectorAll('option')).map((o) => o.textContent);
-    expect(offered).toEqual(['auto', 'low', 'high', 'max']);
+    expect(offered).toEqual(['low', 'high', 'max']);
   });
 
-  it('shows the effort a turn ran at, and nothing when it was Auto', () => {
+  it('leads with the inherited level, and the deepest when nothing was inherited', async () => {
+    const { unmount } = render(<JobDetail job={makeJob({ reasoningEffort: 'low' })} />);
+    expect(await screen.findByLabelText('Reasoning for this turn')).toHaveValue('low');
+    unmount();
+
+    render(<JobDetail job={makeJob()} />);
+    expect(await screen.findByLabelText('Reasoning for this turn')).toHaveValue('max');
+  });
+
+  it('shows the effort a turn ran at, and nothing for turns that predate it', () => {
     const { unmount } = render(<JobDetail job={makeJob({ reasoningEffort: 'max' })} />);
     fireEvent.click(screen.getByRole('button', { name: 'Run details' }));
     expect(screen.getByText('Reasoning')).toBeInTheDocument();
@@ -934,16 +943,15 @@ describe('JobDetail reasoning effort', () => {
 
     render(<JobDetail job={makeJob()} />);
     fireEvent.click(screen.getByRole('button', { name: 'Run details' }));
-    // Auto renders no row: an absent row is the honest display of "nobody
-    // chose", where a "Reasoning: auto" row would imply someone did.
+    // An absent row is the honest display of a turn nobody chose a depth for,
+    // which is every turn created before this control existed.
     expect(screen.queryByText('Reasoning')).not.toBeInTheDocument();
   });
 
-  it('sends only an actual change, and the reset when clearing to Auto', async () => {
+  it('inherits silently when untouched, and sends an actual change', async () => {
     const { unmount } = render(<JobDetail job={makeJob({ reasoningEffort: 'high' })} />);
 
-    // Inherited and untouched: the field is absent, which the backend reads as
-    // "inherit" rather than "clear".
+    // Untouched: the field is absent, which the backend reads as "inherit".
     fireEvent.change(screen.getByLabelText('Add a follow-up'), { target: { value: 'again' } });
     fireEvent.click(screen.getByRole('button', { name: 'Send follow-up' }));
     await waitFor(() =>
@@ -954,7 +962,7 @@ describe('JobDetail reasoning effort', () => {
     vi.mocked(followUpAgentJob).mockClear();
     render(<JobDetail job={makeJob({ reasoningEffort: 'high' })} />);
     fireEvent.change(await screen.findByLabelText('Reasoning for this turn'), {
-      target: { value: 'auto' },
+      target: { value: 'low' },
     });
     fireEvent.change(screen.getByLabelText('Add a follow-up'), { target: { value: 'easy one' } });
     fireEvent.click(screen.getByRole('button', { name: 'Send follow-up' }));
@@ -962,7 +970,24 @@ describe('JobDetail reasoning effort', () => {
     await waitFor(() =>
       expect(followUpAgentJob).toHaveBeenCalledWith('ajob_1', {
         prompt: 'easy one',
-        reasoning_effort: 'auto',
+        reasoning_effort: 'low',
+      }),
+    );
+  });
+
+  it('sends the shown level on a thread that carried none', async () => {
+    // The control cannot render blank, so a thread with no stored level shows
+    // the deepest on offer — and what is shown is what is sent.
+    render(<JobDetail job={makeJob()} />);
+    await screen.findByLabelText('Reasoning for this turn');
+
+    fireEvent.change(screen.getByLabelText('Add a follow-up'), { target: { value: 'go' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send follow-up' }));
+
+    await waitFor(() =>
+      expect(followUpAgentJob).toHaveBeenCalledWith('ajob_1', {
+        prompt: 'go',
+        reasoning_effort: 'max',
       }),
     );
   });
@@ -986,7 +1011,6 @@ describe('JobDetail reasoning effort', () => {
       expect(followUpAgentJob).toHaveBeenCalledWith('ajob_1', {
         prompt: 'switch',
         model: 'glm-test',
-        reasoning_effort: 'auto',
       }),
     );
   });

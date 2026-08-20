@@ -830,3 +830,22 @@ def test_only_runtimes_with_a_verified_flag_are_advertised():
     # pi is the short list, and deliberately: two of its six flag levels do not
     # survive the trip to the wire.
     assert advertised["pi"] == ["minimal", "low", "medium", "high"]
+
+
+#: Increasing effort, as both CLI vocabularies spell it. Not a platform scale —
+#: nothing consults this at run time. It exists so the ordering contract on
+#: `reasoning_efforts` is checked here rather than trusted.
+_EFFORT_RANK = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def test_every_declaration_is_ordered_weakest_to_strongest():
+    """The composer takes the last level as the deepest, so order is a contract.
+
+    A declaration written out of order would silently make the composer
+    preselect the wrong depth — cheap where it should be deep, or the reverse
+    on someone's bill.
+    """
+    for name, levels in runtime_reasoning_efforts().items():
+        ranks = [_EFFORT_RANK.index(level) for level in levels]
+        assert ranks == sorted(ranks), f"{name} declares {levels} out of order"
+        assert len(set(ranks)) == len(ranks), f"{name} declares a level twice"

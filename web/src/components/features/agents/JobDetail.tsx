@@ -26,7 +26,7 @@ import {
 
 import { lifecyclePhaseLabel, toDiffFileDetails } from './adapt';
 import { isComposerSubmit } from './composerKeys';
-import { AUTO_EFFORT, effortOptions, offeredEfforts } from './effort';
+import { highestEffort, offeredEfforts } from './effort';
 import { PaneResizer } from './PaneResizer';
 import { Picker } from './Picker';
 import { TerminalWorkspace } from './TerminalWorkspace';
@@ -938,7 +938,7 @@ export function JobDetail({
   const [config, setConfig] = useState<AgentConfigApi | null>(null);
   const [models, setModels] = useState<string[]>([]);
   const [model, setModel] = useState(job.model);
-  const [effort, setEffort] = useState(job.reasoningEffort ?? AUTO_EFFORT);
+  const [effort, setEffort] = useState(job.reasoningEffort ?? '');
   const [submitting, setSubmitting] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [forking, setForking] = useState(false);
@@ -991,16 +991,18 @@ export function JobDetail({
   // Against the model this turn would run — the switched-to one, or the
   // inherited one — because a pair offered last turn need not be offered now.
   const efforts = useMemo(
-    () => effortOptions(offeredEfforts(config, job.runtime, model || job.model)),
+    () => offeredEfforts(config, job.runtime, model || job.model),
     [config, job.runtime, job.model, model],
   );
   useEffect(() => {
     // Only once the config has arrived. Before that the offered set is empty
     // because nothing is *known*, not because nothing is offered — and acting
-    // on it would wipe a legitimate selection a moment before the answer
-    // lands.
+    // on it would wipe the inherited level a moment before the answer lands.
     if (!config) return;
-    if (!efforts.includes(effort)) setEffort(AUTO_EFFORT);
+    // The inherited level leads; a turn that inherited nothing, or one whose
+    // switched-to model does not offer what it inherited, falls to the deepest
+    // the new pair has.
+    if (!efforts.includes(effort)) setEffort(highestEffort(efforts));
   }, [config, efforts, effort]);
 
   // An "Edit & rewind" fork leaves the edited prompt behind for its landing
@@ -1104,10 +1106,10 @@ export function JobDetail({
         // Only an actual switch is sent. Omitted, the turn inherits the
         // parent's model, which was validated when it was chosen.
         ...(model && model !== job.model ? { model } : {}),
-        // Only an actual change is sent, and clearing back to Auto sends the
-        // reset sentinel: an omitted field means "inherit", so a null could
-        // never express "stop thinking hard".
-        ...(effort !== (job.reasoningEffort ?? AUTO_EFFORT) ? { reasoning_effort: effort } : {}),
+        // Only an actual change is sent; an omitted field inherits the parent's
+        // level, which is what leaving the control alone means. A thread that
+        // carried no level and now shows one differs, so it is sent.
+        ...(effort && effort !== job.reasoningEffort ? { reasoning_effort: effort } : {}),
       });
       router.push(`/${child.id}`);
       // Also what the remount used to do. Without it the composer stayed
