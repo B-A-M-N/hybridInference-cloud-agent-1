@@ -9,15 +9,6 @@ name: Deploy Prod
 # merge timing rather than of a decision. `sync-main.yml` moves `main`, this
 # ships it, and the two stay separate acts.
 #
-# **The machines do not exist yet.** Both jobs ask for runner labels that
-# nothing carries (`deploy-cloud-agent-control-prod`,
-# `deploy-cloud-agent-sandbox-prod`), so a dispatch today queues and deploys
-# nothing. That is deliberate: the alternative — borrowing staging's labels
-# until the production hosts arrive — is a workflow that ships the production
-# commit onto staging's boxes the first time anyone tries it. Register runners
-# carrying these labels, set the repository variables below, and this starts
-# working.
-#
 # **Deploy the gateway first, this second.** The contract runs one way: this
 # service calls the gateway's identity and `/internal/*` routes, and the gateway
 # calls nothing here. A control plane shipped ahead of the gateway that serves
