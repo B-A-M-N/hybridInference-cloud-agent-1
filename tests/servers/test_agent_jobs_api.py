@@ -385,6 +385,26 @@ class FakeAgentJobStore:
             return None
         return {**job, "pinned_at": self.pinned_threads.get(job["thread_id"])}
 
+    async def list_thread_events_after(
+        self, *, job_id: str, user_id: str, after_id: int = 0, limit: int = 500
+    ) -> list[dict[str, Any]] | None:
+        """Every event of the thread containing this job, labelled by turn."""
+        job = self.jobs.get(job_id)
+        if job is None or job.get("user_id") != user_id:
+            return None
+        thread_id = job.get("thread_id")
+        turns = {
+            other["id"]: other.get("turn_no") or 1
+            for other in self.jobs.values()
+            if other.get("thread_id") == thread_id
+        }
+        rows = [
+            {**event, "turn_no": turns[event["job_id"]]}
+            for event in self.events
+            if event["job_id"] in turns and event["id"] > after_id
+        ]
+        return sorted(rows, key=lambda row: row["id"])[:limit]
+
     async def job_turn_telemetry(self, *, job_id: str) -> dict[str, Any] | None:
         """How the newest attempt ran. Absent until a runner reports one."""
         return self.turn_telemetry.get(job_id)
@@ -4324,3 +4344,57 @@ async def test_an_unmeasured_turn_reports_nothing_rather_than_zero(
     assert job["resources"] is None
     assert job["continuity_mode"] is None
     assert job["duration_ms"] is None
+
+
+async def test_a_thread_read_returns_what_earlier_turns_did(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """The gap this endpoint exists to close.
+
+    A turn's events are read per job, which is right for the turn being
+    watched and leaves every earlier turn as its durable messages alone —
+    so what turn one *did* becomes invisible the moment turn two starts,
+    while every row of it is still stored. Reported from the product as
+    "my tool calls disappeared".
+    """
+    first_id = await _create_job(client)
+    claim = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+    auth = {"Authorization": f"Bearer {claim['worker_token']}"}
+    await client.post(
+        f"/v1/agent/worker/jobs/{first_id}/events",
+        json={"event_type": "tool_use", "payload": {"id": "t1", "name": "Bash"}},
+        headers=auth,
+    )
+    await client.post(
+        f"/v1/agent/worker/jobs/{first_id}/events",
+        json={"event_type": "message", "payload": {"text": "done"}},
+        headers=auth,
+    )
+    await client.post(f"/v1/agent/worker/jobs/{first_id}/finish", json={"state": "succeeded"})
+    second = await client.post(
+        f"/v1/agent/jobs/{first_id}/follow-ups", json={"prompt": "and now the docs"}
+    )
+    second_id = second.json()["id"]
+
+    # The per-job read of turn two knows nothing of turn one.
+    per_job = (await client.get(f"/v1/agent/jobs/{second_id}/events")).json()
+    assert [event["event_type"] for event in per_job["events"]] == []
+
+    # The thread read has it, labelled with the turn it belongs to.
+    thread = (await client.get(f"/v1/agent/jobs/{second_id}/thread/events")).json()
+
+    assert [event["event_type"] for event in thread["events"]] == ["tool_use", "message"]
+    assert {event["turn_no"] for event in thread["events"]} == {1}
+    assert thread["events"][0]["payload"]["name"] == "Bash"
+
+
+async def test_a_thread_read_refuses_a_job_that_is_not_the_callers(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """Scoped by ownership like every other read of a thread."""
+    job_id = await _create_job(client)
+    store.jobs[job_id]["user_id"] = "someone-else"
+
+    response = await client.get(f"/v1/agent/jobs/{job_id}/thread/events")
+
+    assert response.status_code == 404

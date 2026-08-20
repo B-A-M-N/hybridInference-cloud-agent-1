@@ -10,13 +10,15 @@
 // So this projects the raw API events rather than the display model. Nothing
 // here is folded, deduplicated, or hidden.
 
-import type { AgentJobEventApi } from '@/lib/api/agents';
+import type { AgentJobEventApi, AgentThreadEventApi } from '@/lib/api/agents';
 
 /** The lanes the minimap groups events into, coarse on purpose. */
 export type TrajectoryLane = 'input' | 'model' | 'tools' | 'other';
 
 export interface TrajectoryRow {
   id: number;
+  /** Which turn of the thread this row belongs to. */
+  turnNo: number;
   attemptId: number;
   seq: number;
   eventType: string;
@@ -113,7 +115,7 @@ function detailOf(eventType: string, payload: Record<string, unknown>): string {
  * the call, so it carries whatever thinking preceded execution — and the view
  * says so rather than implying it measured the tool itself.
  */
-export function toTrajectory(events: AgentJobEventApi[]): TrajectoryRow[] {
+export function toTrajectory(events: (AgentJobEventApi | AgentThreadEventApi)[]): TrajectoryRow[] {
   const resultByCall = new Map<string, AgentJobEventApi>();
   for (const event of events) {
     if (event.event_type !== 'tool_result') continue;
@@ -135,6 +137,7 @@ export function toTrajectory(events: AgentJobEventApi[]): TrajectoryRow[] {
 
     return {
       id: event.id,
+      turnNo: (event as AgentThreadEventApi).turn_no ?? 1,
       attemptId: event.attempt_id,
       seq: event.seq,
       eventType,
@@ -167,6 +170,28 @@ export function filterTrajectory(rows: TrajectoryRow[], query: string): Trajecto
   return rows.filter((row) =>
     `${row.label} ${row.detail} ${row.eventType}`.toLowerCase().includes(needle),
   );
+}
+
+/**
+ * Merge the thread's stored history with the turn still streaming.
+ *
+ * The history read is a snapshot taken when the view opened; the live turn
+ * keeps producing rows after that. Both describe the same log, so identity
+ * settles duplicates — and ordering by id restores the order the platform
+ * appended them in, which is the only order that means anything here.
+ */
+export function mergeEvents(
+  history: (AgentJobEventApi | AgentThreadEventApi)[],
+  live: AgentJobEventApi[],
+): (AgentJobEventApi | AgentThreadEventApi)[] {
+  const byId = new Map<number, AgentJobEventApi | AgentThreadEventApi>();
+  for (const event of history) byId.set(event.id, event);
+  for (const event of live) {
+    // The history row is preferred: it carries the turn label the live
+    // stream has no way to know.
+    if (!byId.has(event.id)) byId.set(event.id, event);
+  }
+  return [...byId.values()].sort((a, b) => a.id - b.id);
 }
 
 /** Serialize the stored stream for download, exactly as the platform holds it. */

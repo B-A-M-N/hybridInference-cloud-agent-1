@@ -1233,7 +1233,7 @@ export function JobDetail({
           <div className="mx-auto flex w-full max-w-4xl flex-1 flex-col px-6 pb-6 pt-7">
             {tab === 'trajectory' ? (
               <div className="flex-1">
-                <TrajectoryView events={events} />
+                <TrajectoryView jobId={job.id} events={events} />
               </div>
             ) : (
               <div className="flex-1">

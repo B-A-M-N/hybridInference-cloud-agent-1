@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { AgentJobEventApi } from '@/lib/api/agents';
-import { filterTrajectory, preview, toSessionLog, toTrajectory } from './trajectory';
+import { filterTrajectory, mergeEvents, preview, toSessionLog, toTrajectory } from './trajectory';
 
 function event(over: Partial<AgentJobEventApi> & { id: number }): AgentJobEventApi {
   return {
@@ -149,5 +149,54 @@ describe('toSessionLog', () => {
 
     expect(lines).toHaveLength(2);
     expect(JSON.parse(lines[1]).event_type).toBe('raw');
+  });
+});
+
+describe('mergeEvents', () => {
+  it('keeps the history row for an id the live stream repeats', () => {
+    // The history read carries the turn label; the live stream cannot know
+    // it. Both describe the same append-only log, so identity settles it.
+    const history = [{ ...event({ id: 1 }), job_id: 'ajob_1', turn_no: 1 }] as never[];
+    const live = [event({ id: 1 })];
+
+    const merged = mergeEvents(history, live);
+
+    expect(merged).toHaveLength(1);
+    expect((merged[0] as { turn_no?: number }).turn_no).toBe(1);
+  });
+
+  it('restores the order the platform appended them in', () => {
+    const history = [{ ...event({ id: 5 }), job_id: 'a', turn_no: 1 }] as never[];
+    const live = [event({ id: 2 }), event({ id: 9 })];
+
+    expect(mergeEvents(history, live).map((row) => row.id)).toEqual([2, 5, 9]);
+  });
+
+  it('shows a still-streaming turn the history snapshot missed', () => {
+    // The fetch is a snapshot taken when the view opened; the running turn
+    // keeps producing rows after it.
+    const history = [{ ...event({ id: 1 }), job_id: 'a', turn_no: 1 }] as never[];
+    const live = [event({ id: 1 }), event({ id: 2 })];
+
+    expect(mergeEvents(history, live).map((row) => row.id)).toEqual([1, 2]);
+  });
+});
+
+describe('turn labelling', () => {
+  it('carries the turn each row belongs to, so history is attributable', () => {
+    const rows = toTrajectory([
+      {
+        ...event({ id: 1, event_type: 'tool_use', payload: { id: 't', name: 'Bash' } }),
+        job_id: 'a',
+        turn_no: 1,
+      },
+      { ...event({ id: 2 }), job_id: 'b', turn_no: 2 },
+    ] as never[]);
+
+    expect(rows.map((row) => row.turnNo)).toEqual([1, 2]);
+  });
+
+  it('defaults to turn 1 for a per-job read, which carries no label', () => {
+    expect(toTrajectory([event({ id: 1 })])[0].turnNo).toBe(1);
   });
 });

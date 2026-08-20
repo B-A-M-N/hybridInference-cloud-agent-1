@@ -217,6 +217,25 @@ class AgentJobEvent(BaseModel):
     created_at: str | None = None
 
 
+class AgentThreadEvent(AgentJobEvent):
+    """One event, with the turn it belongs to.
+
+    The per-job stream needs no such label — every row is the turn being
+    watched. Across a thread it is what lets a reader see where one turn
+    ended and the next began.
+    """
+
+    job_id: str
+    turn_no: int = 1
+
+
+class AgentThreadEventsResponse(BaseModel):
+    """A page of a whole thread's events, plus the cursor to resume from."""
+
+    events: list[AgentThreadEvent]
+    next_cursor: int
+
+
 class AgentJobEventsResponse(BaseModel):
     """A page of events plus the cursor to resume from."""
 

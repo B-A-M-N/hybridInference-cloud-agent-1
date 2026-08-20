@@ -8,12 +8,17 @@
 // It exists for the question the chat view cannot answer: not "what did the
 // agent say" but "what actually happened, and how long did each step take".
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 
-import type { AgentJobEventApi } from '@/lib/api/agents';
+import {
+  listAgentThreadEvents,
+  type AgentJobEventApi,
+  type AgentThreadEventApi,
+} from '@/lib/api/agents';
 import { formatDuration } from './TurnFooter';
 import {
   filterTrajectory,
+  mergeEvents,
   toSessionLog,
   toTrajectory,
   type TrajectoryLane,
@@ -116,16 +121,51 @@ function RowDetail({ row, resultRow }: { row: TrajectoryRow; resultRow?: Traject
   );
 }
 
-export function TrajectoryView({ events }: { events: AgentJobEventApi[] }) {
+export function TrajectoryView({
+  jobId,
+  events,
+}: {
+  /** The turn being viewed; the whole thread is read from it. */
+  jobId?: string;
+  /** The live stream of the current turn, as it arrives. */
+  events: AgentJobEventApi[];
+}) {
   const [query, setQuery] = useState('');
   const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [history, setHistory] = useState<AgentThreadEventApi[]>([]);
+  const [loading, setLoading] = useState(false);
 
-  const rows = useMemo(() => toTrajectory(events), [events]);
+  // The thread's earlier turns, which the per-job stream never carries: once
+  // a turn ends, everything it *did* survives only in this read. Fetched when
+  // the view opens rather than with the page, because the chat tab beside it
+  // has no use for it.
+  useEffect(() => {
+    if (!jobId) return;
+    let cancelled = false;
+    setLoading(true);
+    listAgentThreadEvents(jobId)
+      .then((page) => {
+        if (!cancelled) setHistory(page.events);
+      })
+      .catch(() => {
+        // The live turn is still worth showing on its own.
+        if (!cancelled) setHistory([]);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [jobId]);
+
+  const merged = useMemo(() => mergeEvents(history, events), [history, events]);
+  const rows = useMemo(() => toTrajectory(merged), [merged]);
   const visible = useMemo(() => filterTrajectory(rows, query), [rows, query]);
   const byId = useMemo(() => new Map(rows.map((row) => [row.id, row])), [rows]);
 
   function download() {
-    const blob = new Blob([toSessionLog(events)], { type: 'application/x-ndjson' });
+    const blob = new Blob([toSessionLog(merged)], { type: 'application/x-ndjson' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
@@ -137,8 +177,9 @@ export function TrajectoryView({ events }: { events: AgentJobEventApi[] }) {
   if (rows.length === 0) {
     return (
       <p className="py-8 text-center text-[13px] text-gray-500">
-        This turn stored no events. A turn that ran before event capture, or one that never started,
-        has nothing to show here.
+        {loading
+          ? 'Loading the conversation\u2019s events\u2026'
+          : 'This conversation stored no events. A thread that ran before event capture, or one whose first turn never started, has nothing to show here.'}
       </p>
     );
   }
@@ -171,10 +212,19 @@ export function TrajectoryView({ events }: { events: AgentJobEventApi[] }) {
       </div>
 
       <div className="overflow-hidden rounded-lg border border-gray-200">
-        {visible.map((row) => {
+        {visible.map((row, index) => {
           const open = selectedId === row.id;
+          // A rule where the conversation moved on, so a reader can tell
+          // which turn did what — the thing the chat tab cannot show once a
+          // turn is over.
+          const startsTurn = index === 0 || visible[index - 1].turnNo !== row.turnNo;
           return (
             <div key={row.id} className="border-b border-gray-100 last:border-b-0">
+              {startsTurn && rows.some((other) => other.turnNo !== row.turnNo) ? (
+                <p className="bg-gray-50 px-3 py-1 text-[11px] font-medium uppercase tracking-wide text-gray-400">
+                  Turn {row.turnNo}
+                </p>
+              ) : null}
               <button
                 type="button"
                 onClick={() => setSelectedId(open ? null : row.id)}

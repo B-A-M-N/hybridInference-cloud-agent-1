@@ -20,6 +20,7 @@ import {
   writeAgentTerminalInput,
   writeAgentJobFile,
   type AgentJobFilesApi,
+  listAgentThreadEvents,
 } from '@/lib/api/agents';
 
 import { JobDetail, WORKSPACE_WIDTH_STORAGE_KEY } from './JobDetail';
@@ -42,6 +43,7 @@ vi.mock('@/lib/api/agents', () => ({
   getAgentJobGit: vi.fn(),
   getAgentThreadStats: vi.fn(),
   listAgentTerminals: vi.fn(),
+  listAgentThreadEvents: vi.fn(),
   resizeAgentTerminal: vi.fn(),
   streamAgentTerminal: vi.fn(),
   writeAgentTerminalInput: vi.fn(),
@@ -902,6 +904,12 @@ describe('JobDetail', () => {
 describe('the trajectory tab', () => {
   afterEach(() => cleanup());
 
+  beforeEach(() => {
+    // The view reads the thread's earlier turns on open; the real client
+    // always returns a promise, so the double must too.
+    vi.mocked(listAgentThreadEvents).mockResolvedValue({ events: [], next_cursor: 0 });
+  });
+
   it('switches between the reading of the stream and the stream itself', () => {
     const job = makeJob({ events: [{ kind: 'message', text: 'the build passes' }] });
     const stored = [
@@ -930,13 +938,16 @@ describe('the trajectory tab', () => {
     expect(screen.queryByLabelText('Search events')).toBeNull();
   });
 
-  it('still renders when no stored stream was handed down', () => {
+  it('still renders when no stored stream was handed down', async () => {
     // Fixtures and older callers pass no events; the tab must degrade to its
     // empty state rather than throwing on an undefined list.
     render(<JobDetail job={makeJob()} />);
 
     fireEvent.click(screen.getByRole('button', { name: 'trajectory' }));
 
-    expect(screen.getByText(/stored no events/)).toBeInTheDocument();
+    // The thread read is in flight first, and says so rather than claiming
+    // the conversation is empty.
+    expect(screen.getByText(/Loading the conversation/)).toBeInTheDocument();
+    expect(await screen.findByText(/stored no events/)).toBeInTheDocument();
   });
 });

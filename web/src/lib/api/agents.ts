@@ -504,6 +504,31 @@ export async function listAgentJobEvents(
   return jsonOrThrow(resp);
 }
 
+/** One event of a thread, labelled with the turn it belongs to. */
+export interface AgentThreadEventApi extends AgentJobEventApi {
+  job_id: string;
+  turn_no: number;
+}
+
+/**
+ * Page a whole thread's event log.
+ *
+ * The per-job read above is scoped to the turn being watched, which leaves a
+ * thread's history as its durable messages alone — so what an earlier turn
+ * *did* is stored and unreachable. This is what the trajectory reads.
+ */
+export async function listAgentThreadEvents(
+  jobId: string,
+  after = 0,
+  limit = 500,
+): Promise<{ events: AgentThreadEventApi[]; next_cursor: number }> {
+  const resp = await fetchWithAuth(
+    API_BASE,
+    `/v1/agent/jobs/${encodeURIComponent(jobId)}/thread/events?after=${after}&limit=${limit}`,
+  );
+  return jsonOrThrow(resp);
+}
+
 export async function getAgentJobArtifact(
   jobId: string,
   kind: string,
