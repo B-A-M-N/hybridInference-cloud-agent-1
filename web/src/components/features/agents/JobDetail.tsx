@@ -1191,7 +1191,10 @@ export function JobDetail({
         // never express "stop thinking hard".
         ...(effort !== (job.reasoningEffort ?? AUTO_EFFORT) ? { reasoning_effort: effort } : {}),
       });
-      router.push(`/${child.id}`);
+      // This is the next turn of the same transcript, not a new page for the
+      // reader. Next scrolls on navigation by default, which jumps the task
+      // region back to the top and makes every follow-up look like a reload.
+      router.push(`/${child.id}`, { scroll: false });
       // Also what the remount used to do. Without it the composer stayed
       // disabled with the sent text still in it, because nothing else ever
       // cleared either.
