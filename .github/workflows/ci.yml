@@ -137,21 +137,20 @@ jobs:
           } | tee -a "${GITHUB_OUTPUT}"
 
   # ---------------------------------------------------------------- backend
+  # One job, three checks — not a three-cell matrix. Each cell paid for its own
+  # checkout, uv install, Python install and `uv sync` in order to run a command
+  # that takes about a second: measured over one run, 14s of environment for 1s
+  # of linting. The `ci-general` pool is two runners for fifteen jobs, so that
+  # setup is not free time in parallel — it is queue for everything behind it.
+  #
+  # `fail-fast: false` is what the matrix bought, and it is kept below: every
+  # check runs even after one fails, and the job is red if any did. This also
+  # matches `make lint`, which has run all three as one gate all along.
   lint:
-    name: ${{ matrix.check.name }}
+    name: Lint
     needs: changes
     if: needs.changes.outputs.backend == 'true'
     runs-on: [self-hosted, Linux, ci-general]
-    strategy:
-      fail-fast: false
-      matrix:
-        check:
-          - name: Ruff Format
-            command: uv run ruff format --check .
-          - name: Ruff Lint
-            command: uv run ruff check --no-fix .
-          - name: Pydocstyle
-            command: uv run pydocstyle backend host
     steps:
       - uses: actions/checkout@v6
         with:
@@ -191,8 +190,48 @@ jobs:
       - name: Sync dependencies
         run: uv sync
 
-      - name: ${{ matrix.check.name }}
-        run: ${{ matrix.check.command }}
+      # `continue-on-error` on the checks and nowhere else. A setup step that
+      # fails still stops the job outright — there is nothing to lint without a
+      # venv, and three identical failures would only bury the cause. A *check*
+      # that fails records its outcome and lets the others run, which is the
+      # property the matrix had.
+      - name: Ruff Format
+        id: ruff_format
+        continue-on-error: true
+        run: uv run ruff format --check .
+
+      - name: Ruff Lint
+        id: ruff_lint
+        continue-on-error: true
+        run: uv run ruff check --no-fix .
+
+      - name: Pydocstyle
+        id: pydocstyle
+        continue-on-error: true
+        run: uv run pydocstyle backend host
+
+      # `continue-on-error` keeps a failed check from failing the job, so
+      # without this the job would be green with a red step inside it. Same
+      # shape as `CI Gate` below, for the same reason.
+      - name: Every check passed
+        env:
+          RESULTS: >-
+            ruff-format=${{ steps.ruff_format.outcome }}
+            ruff-lint=${{ steps.ruff_lint.outcome }}
+            pydocstyle=${{ steps.pydocstyle.outcome }}
+        run: |
+          set -euo pipefail
+          failed=0
+          for entry in ${RESULTS}; do
+            name="${entry%%=*}"
+            result="${entry#*=}"
+            case "${result}" in
+              success) ;;
+              *) echo "::error title=Lint::${name} is ${result}"; failed=1 ;;
+            esac
+          done
+          [ "${failed}" -eq 0 ] || exit 1
+          echo "Lint: green"
 
   test:
     name: Tests
@@ -392,25 +431,16 @@ jobs:
               )
           PY
   # -------------------------------------------------------------------- web
+  # One job, five checks, for the reason spelled out over `lint` above — and
+  # more sharply here, because Node costs more to install than uv does. Measured
+  # over one run: 55s of setup across the five cells for 27s of actual checking,
+  # and four of the five spent longer installing than working (Prettier: 10s of
+  # setup, 1s of formatting check).
   check:
-    name: Web ${{ matrix.check.name }}
+    name: Web
     needs: changes
     if: needs.changes.outputs.web == 'true'
     runs-on: [self-hosted, Linux, ci-general]
-    strategy:
-      fail-fast: false
-      matrix:
-        check:
-          - name: ESLint
-            command: npm run lint
-          - name: Prettier
-            command: npm run format:check
-          - name: TypeScript
-            command: npm run type-check
-          - name: Tests
-            command: npm run test
-          - name: Build
-            command: npm run build
     steps:
       - uses: actions/checkout@v6
         with:
@@ -457,10 +487,69 @@ jobs:
         working-directory: ./web
         run: npm ci
 
-      - name: ${{ matrix.check.name }}
+      # Ordered cheapest-first so a formatting slip is reported in seconds
+      # rather than after the build. They no longer run concurrently, so the
+      # order is now something a reader can spend.
+      - name: ESLint
+        id: eslint
         if: steps.detect.outputs.present == 'true'
+        continue-on-error: true
         working-directory: ./web
-        run: ${{ matrix.check.command }}
+        run: npm run lint
+
+      - name: Prettier
+        id: prettier
+        if: steps.detect.outputs.present == 'true'
+        continue-on-error: true
+        working-directory: ./web
+        run: npm run format:check
+
+      - name: TypeScript
+        id: typescript
+        if: steps.detect.outputs.present == 'true'
+        continue-on-error: true
+        working-directory: ./web
+        run: npm run type-check
+
+      - name: Tests
+        id: tests
+        if: steps.detect.outputs.present == 'true'
+        continue-on-error: true
+        working-directory: ./web
+        run: npm run test
+
+      - name: Build
+        id: build
+        if: steps.detect.outputs.present == 'true'
+        continue-on-error: true
+        working-directory: ./web
+        run: npm run build
+
+      # Skipped along with the checks when web/ is absent, so this stays the
+      # deliberate no-op the `Detect web app` step describes rather than
+      # reading five empty outcomes as five failures.
+      - name: Every check passed
+        if: steps.detect.outputs.present == 'true'
+        env:
+          RESULTS: >-
+            eslint=${{ steps.eslint.outcome }}
+            prettier=${{ steps.prettier.outcome }}
+            typescript=${{ steps.typescript.outcome }}
+            tests=${{ steps.tests.outcome }}
+            build=${{ steps.build.outcome }}
+        run: |
+          set -euo pipefail
+          failed=0
+          for entry in ${RESULTS}; do
+            name="${entry%%=*}"
+            result="${entry#*=}"
+            case "${result}" in
+              success) ;;
+              *) echo "::error title=Web::${name} is ${result}"; failed=1 ;;
+            esac
+          done
+          [ "${failed}" -eq 0 ] || exit 1
+          echo "Web: green"
   # ------------------------------------------------------------------ secret
   gitleaks:
     name: Gitleaks
