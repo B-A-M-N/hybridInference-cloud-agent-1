@@ -30,7 +30,9 @@ import { Picker } from './Picker';
 import { TerminalWorkspace } from './TerminalWorkspace';
 import { ThreadStatsBar } from './ThreadStatsBar';
 import type { AgentEvent, AgentJob, AgentThreadMessage } from './types';
+import type { AgentJobEventApi } from '@/lib/api/agents';
 import { TurnFooter } from './TurnFooter';
+import { TrajectoryView } from './TrajectoryView';
 import { useResizablePane } from './useResizablePane';
 import { WorkspaceFiles } from './WorkspaceFiles';
 
@@ -894,7 +896,16 @@ function GitPanel({ job, active }: { job: AgentJob; active: boolean }) {
   );
 }
 
-export function JobDetail({ job, onReload }: { job: AgentJob; onReload?: () => void }) {
+export function JobDetail({
+  job,
+  events = [],
+  onReload,
+}: {
+  job: AgentJob;
+  /** The stored stream, for the trajectory tab. Absent in fixtures. */
+  events?: AgentJobEventApi[];
+  onReload?: () => void;
+}) {
   const router = useRouter();
   const liveAttempt = useMemo(
     () => (job.attempts.length > 0 ? job.attempts[job.attempts.length - 1].no : 0),
@@ -902,6 +913,7 @@ export function JobDetail({ job, onReload }: { job: AgentJob; onReload?: () => v
   );
   const [attemptNo, setAttemptNo] = useState(liveAttempt);
   const [drawer, setDrawer] = useState<DrawerView | null>(null);
+  const [tab, setTab] = useState<'chat' | 'trajectory'>('chat');
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const [workspaceTab, setWorkspaceTab] = useState<WorkspaceTab>('git');
   const [followUp, setFollowUp] = useState('');
@@ -1123,6 +1135,23 @@ export function JobDetail({ job, onReload }: { job: AgentJob; onReload?: () => v
               </button>
             </div>
           </div>
+          <nav aria-label="Run views" className="mr-3 flex shrink-0 items-center gap-1 text-[13px]">
+            {(['chat', 'trajectory'] as const).map((view) => (
+              <button
+                key={view}
+                type="button"
+                onClick={() => setTab(view)}
+                aria-current={tab === view ? 'page' : undefined}
+                className={`rounded-lg px-2.5 py-1 capitalize transition-colors ${
+                  tab === view
+                    ? 'bg-gray-100 font-medium text-gray-900'
+                    : 'text-gray-500 hover:text-gray-800'
+                }`}
+              >
+                {view}
+              </button>
+            ))}
+          </nav>
           <span
             className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${pill.className}`}
           >
@@ -1202,105 +1231,115 @@ export function JobDetail({ job, onReload }: { job: AgentJob; onReload?: () => v
           }`}
         >
           <div className="mx-auto flex w-full max-w-4xl flex-1 flex-col px-6 pb-6 pt-7">
-            <div className="flex-1">
-              {threadMessages.map((message, index) => {
-                const previous = index > 0 ? threadMessages[index - 1] : undefined;
-                const rewindAnchor =
-                  message.role === 'user' && previous && previous.jobId !== message.jobId
-                    ? previous.jobId
-                    : undefined;
-                return (
-                  <ThreadTurn
-                    key={message.id}
-                    message={message}
-                    busy={forking}
-                    onFork={
-                      message.role === 'assistant' ? () => void forkFrom(message.jobId) : undefined
-                    }
-                    onRewind={
-                      rewindAnchor ? () => void forkFrom(rewindAnchor, message.content) : undefined
-                    }
-                  />
-                );
-              })}
-
-              {job.historyIncludesPrompt ? null : (
-                <div className="group my-4 rounded-xl border border-gray-200/90 bg-white px-4 py-3 shadow-subtle">
-                  <Markdown text={job.prompt || job.title} />
-                  <MessageActions align="end">
-                    <MessageActionButton
-                      label="Copy message"
-                      onClick={() => void copyMessage(job.prompt || job.title)}
-                    >
-                      <CopyIcon />
-                      Copy
-                    </MessageActionButton>
-                    {lastHistoryJobId && lastHistoryJobId !== job.id ? (
-                      <MessageActionButton
-                        label="Edit & rewind"
-                        onClick={() => void forkFrom(lastHistoryJobId, job.prompt || job.title)}
-                        disabled={forking}
-                      >
-                        <RewindIcon />
-                        Edit &amp; rewind
-                      </MessageActionButton>
-                    ) : null}
-                  </MessageActions>
-                </div>
-              )}
-
-              {job.stateNote && job.state !== 'failed' ? (
-                <p className="mb-2 text-xs text-gray-400">{job.stateNote}</p>
-              ) : null}
-
-              {job.attempts.length > 1 ? (
-                <div className="my-3 flex flex-wrap items-center gap-1.5 text-xs">
-                  <span className="mr-1 text-gray-400">Run attempts</span>
-                  {job.attempts.map((attempt) => (
-                    <button
-                      key={attempt.no}
-                      type="button"
-                      onClick={() => setAttemptNo(attempt.no)}
-                      className={`rounded-md px-2 py-1 ${
-                        attempt.no === attemptNo
-                          ? 'bg-gray-900 text-white'
-                          : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
-                      }`}
-                    >
-                      {attempt.no} · {attempt.status}
-                    </button>
-                  ))}
-                </div>
-              ) : null}
-
-              {selectedAttempt?.status === 'superseded' && selectedAttempt.note ? (
-                <div className="my-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[13px] text-amber-800">
-                  {selectedAttempt.note}
-                </div>
-              ) : null}
-
-              <div aria-label="Agent activity" className="mt-2">
-                {visibleEvents.map((event, index) => (
-                  <EventRow key={`${event.attemptNo ?? 0}-${index}`} event={event} />
-                ))}
-                {job.liveNote ? (
-                  <div className="flex items-center gap-2.5 py-3 text-[13px] text-gray-500">
-                    <span className="h-2 w-2 animate-pulse rounded-full bg-blue-500" />
-                    {job.liveNote}
-                  </div>
-                ) : null}
-                {job.state === 'queued' && visibleEvents.length === 0 ? (
-                  <div className="flex items-center gap-2.5 py-3 text-[13px] text-gray-500">
-                    <span className="h-2 w-2 animate-pulse rounded-full bg-gray-400" />
-                    {job.parentJobId ? 'Queued after the current run' : 'Waiting for a runner'}
-                  </div>
-                ) : null}
+            {tab === 'trajectory' ? (
+              <div className="flex-1">
+                <TrajectoryView events={events} />
               </div>
+            ) : (
+              <div className="flex-1">
+                {threadMessages.map((message, index) => {
+                  const previous = index > 0 ? threadMessages[index - 1] : undefined;
+                  const rewindAnchor =
+                    message.role === 'user' && previous && previous.jobId !== message.jobId
+                      ? previous.jobId
+                      : undefined;
+                  return (
+                    <ThreadTurn
+                      key={message.id}
+                      message={message}
+                      busy={forking}
+                      onFork={
+                        message.role === 'assistant'
+                          ? () => void forkFrom(message.jobId)
+                          : undefined
+                      }
+                      onRewind={
+                        rewindAnchor
+                          ? () => void forkFrom(rewindAnchor, message.content)
+                          : undefined
+                      }
+                    />
+                  );
+                })}
 
-              <TurnFooter job={job} attemptNo={attemptNo} />
+                {job.historyIncludesPrompt ? null : (
+                  <div className="group my-4 rounded-xl border border-gray-200/90 bg-white px-4 py-3 shadow-subtle">
+                    <Markdown text={job.prompt || job.title} />
+                    <MessageActions align="end">
+                      <MessageActionButton
+                        label="Copy message"
+                        onClick={() => void copyMessage(job.prompt || job.title)}
+                      >
+                        <CopyIcon />
+                        Copy
+                      </MessageActionButton>
+                      {lastHistoryJobId && lastHistoryJobId !== job.id ? (
+                        <MessageActionButton
+                          label="Edit & rewind"
+                          onClick={() => void forkFrom(lastHistoryJobId, job.prompt || job.title)}
+                          disabled={forking}
+                        >
+                          <RewindIcon />
+                          Edit &amp; rewind
+                        </MessageActionButton>
+                      ) : null}
+                    </MessageActions>
+                  </div>
+                )}
 
-              <OutcomeCard job={job} onOpenDiff={() => openWorkspace('git')} />
-            </div>
+                {job.stateNote && job.state !== 'failed' ? (
+                  <p className="mb-2 text-xs text-gray-400">{job.stateNote}</p>
+                ) : null}
+
+                {job.attempts.length > 1 ? (
+                  <div className="my-3 flex flex-wrap items-center gap-1.5 text-xs">
+                    <span className="mr-1 text-gray-400">Run attempts</span>
+                    {job.attempts.map((attempt) => (
+                      <button
+                        key={attempt.no}
+                        type="button"
+                        onClick={() => setAttemptNo(attempt.no)}
+                        className={`rounded-md px-2 py-1 ${
+                          attempt.no === attemptNo
+                            ? 'bg-gray-900 text-white'
+                            : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
+                        }`}
+                      >
+                        {attempt.no} · {attempt.status}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+
+                {selectedAttempt?.status === 'superseded' && selectedAttempt.note ? (
+                  <div className="my-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[13px] text-amber-800">
+                    {selectedAttempt.note}
+                  </div>
+                ) : null}
+
+                <div aria-label="Agent activity" className="mt-2">
+                  {visibleEvents.map((event, index) => (
+                    <EventRow key={`${event.attemptNo ?? 0}-${index}`} event={event} />
+                  ))}
+                  {job.liveNote ? (
+                    <div className="flex items-center gap-2.5 py-3 text-[13px] text-gray-500">
+                      <span className="h-2 w-2 animate-pulse rounded-full bg-blue-500" />
+                      {job.liveNote}
+                    </div>
+                  ) : null}
+                  {job.state === 'queued' && visibleEvents.length === 0 ? (
+                    <div className="flex items-center gap-2.5 py-3 text-[13px] text-gray-500">
+                      <span className="h-2 w-2 animate-pulse rounded-full bg-gray-400" />
+                      {job.parentJobId ? 'Queued after the current run' : 'Waiting for a runner'}
+                    </div>
+                  ) : null}
+                </div>
+
+                <TurnFooter job={job} attemptNo={attemptNo} />
+
+                <OutcomeCard job={job} onOpenDiff={() => openWorkspace('git')} />
+              </div>
+            )}
 
             <div className="sticky bottom-0 z-10 -mx-2 mt-10 bg-gradient-to-t from-gray-50 via-gray-50/95 px-2 pb-2 pt-8">
               <form

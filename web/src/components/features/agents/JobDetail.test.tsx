@@ -898,3 +898,45 @@ describe('JobDetail', () => {
     expect(sessionStorage.getItem('agent-rewind-draft-ajob_1')).toBeNull();
   });
 });
+
+describe('the trajectory tab', () => {
+  afterEach(() => cleanup());
+
+  it('switches between the reading of the stream and the stream itself', () => {
+    const job = makeJob({ events: [{ kind: 'message', text: 'the build passes' }] });
+    const stored = [
+      {
+        id: 1,
+        attempt_id: 1,
+        seq: 1,
+        event_type: 'tool_use',
+        payload: { id: 't1', name: 'Bash', detail: 'cargo build' },
+        created_at: '2026-08-19T10:00:00.000Z',
+      },
+    ] as never;
+
+    render(<JobDetail job={job} events={stored} />);
+
+    // Chat first: the reading, with no trajectory chrome.
+    expect(screen.queryByLabelText('Search events')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'trajectory' }));
+
+    expect(screen.getByLabelText('Search events')).toBeInTheDocument();
+    expect(screen.getByText('Bash')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'chat' }));
+
+    expect(screen.queryByLabelText('Search events')).toBeNull();
+  });
+
+  it('still renders when no stored stream was handed down', () => {
+    // Fixtures and older callers pass no events; the tab must degrade to its
+    // empty state rather than throwing on an undefined list.
+    render(<JobDetail job={makeJob()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'trajectory' }));
+
+    expect(screen.getByText(/stored no events/)).toBeInTheDocument();
+  });
+});
