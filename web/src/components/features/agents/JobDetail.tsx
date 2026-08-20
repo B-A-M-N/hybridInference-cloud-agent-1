@@ -58,37 +58,43 @@ const WORKSPACE_TABS: Array<{ key: WorkspaceTab; label: string }> = [
 const STATE_PILL: Record<AgentJob['state'], { label: string; className: string; dot?: string }> = {
   running: {
     label: 'Running',
-    className: 'bg-blue-50 text-blue-700 ring-1 ring-inset ring-blue-100',
+    className:
+      'bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 ring-1 ring-inset ring-blue-100 dark:ring-blue-500/25',
     dot: 'bg-blue-500',
   },
   queued: {
     label: 'Queued',
-    className: 'bg-gray-100 text-gray-600 ring-1 ring-inset ring-gray-200/70',
-    dot: 'bg-gray-400',
+    className:
+      'bg-gray-100 dark:bg-white/5 text-gray-600 dark:text-gray-400 ring-1 ring-inset ring-gray-200/70 dark:ring-white/10',
+    dot: 'bg-gray-400 dark:bg-gray-600',
   },
   needs_review: {
     label: 'Needs review',
-    className: 'bg-amber-50 text-amber-700 ring-1 ring-inset ring-amber-100',
+    className:
+      'bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 ring-1 ring-inset ring-amber-100 dark:ring-amber-500/25',
   },
   done: {
     label: 'Done',
-    className: 'bg-emerald-50 text-emerald-700 ring-1 ring-inset ring-emerald-100',
+    className:
+      'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 ring-1 ring-inset ring-emerald-100 dark:ring-emerald-500/25',
   },
   failed: {
     label: 'Failed',
-    className: 'bg-red-50 text-red-600 ring-1 ring-inset ring-red-100',
+    className:
+      'bg-red-50 dark:bg-red-500/10 text-red-600 dark:text-red-400 ring-1 ring-inset ring-red-100 dark:ring-red-500/25',
   },
   cancelled: {
     label: 'Cancelled',
-    className: 'bg-gray-100 text-gray-500 ring-1 ring-inset ring-gray-200/70',
+    className:
+      'bg-gray-100 dark:bg-white/5 text-gray-500 dark:text-gray-400 ring-1 ring-inset ring-gray-200/70 dark:ring-white/10',
   },
 };
 
 const DIFF_LINE_CLASS = {
-  hunk: 'bg-gray-50 py-1 text-gray-400',
-  ctx: 'text-gray-600',
-  add: 'bg-emerald-50 text-emerald-700',
-  del: 'bg-red-50 text-red-700',
+  hunk: 'bg-gray-50 dark:bg-gray-950 py-1 text-gray-400 dark:text-gray-500',
+  ctx: 'text-gray-600 dark:text-gray-400',
+  add: 'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400',
+  del: 'bg-red-50 dark:bg-red-500/10 text-red-700 dark:text-red-400',
 } as const;
 
 function Chevron({ className = '' }: { className?: string }) {
@@ -122,7 +128,7 @@ function ToolIcon({ tool }: { tool: string }) {
   return (
     <svg
       aria-hidden="true"
-      className="h-4 w-4 shrink-0 text-gray-400"
+      className="h-4 w-4 shrink-0 text-gray-400 dark:text-gray-500"
       fill="none"
       viewBox="0 0 24 24"
       stroke="currentColor"
@@ -140,16 +146,16 @@ function LifecycleRow({ text }: { text: string }) {
   // no tick, muted, and clearly a passthrough of what the runtime said.
   if (!milestone) {
     return (
-      <div className="flex items-center gap-2.5 py-1 text-xs text-gray-400">
-        <span className="h-1 w-1 rounded-full bg-gray-300" />
+      <div className="flex items-center gap-2.5 py-1 text-xs text-gray-400 dark:text-gray-500">
+        <span className="h-1 w-1 rounded-full bg-gray-300 dark:bg-gray-600" />
         <span className="font-mono">{label}</span>
       </div>
     );
   }
 
   return (
-    <div className="flex items-center gap-2.5 py-2 text-[13px] text-gray-500">
-      <span className="flex h-4 w-4 items-center justify-center rounded-full bg-gray-100 text-gray-500">
+    <div className="flex items-center gap-2.5 py-2 text-[13px] text-gray-500 dark:text-gray-400">
+      <span className="flex h-4 w-4 items-center justify-center rounded-full bg-gray-100 dark:bg-white/5 text-gray-500 dark:text-gray-400">
         <svg
           aria-hidden="true"
           className="h-3 w-3"
@@ -168,19 +174,21 @@ function LifecycleRow({ text }: { text: string }) {
 
 function ToolActivity({ event }: { event: Extract<AgentEvent, { kind: 'tool_use' }> }) {
   return (
-    <details className="group my-1 rounded-lg border border-gray-200 bg-white">
-      <summary className="flex cursor-pointer list-none items-center gap-2.5 px-3 py-2 text-[13px] text-gray-700 marker:content-none">
-        <Chevron className="shrink-0 text-gray-400 transition-transform group-open:rotate-90" />
+    <details className="group my-1 rounded-lg border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900">
+      <summary className="flex cursor-pointer list-none items-center gap-2.5 px-3 py-2 text-[13px] text-gray-700 dark:text-gray-300 marker:content-none">
+        <Chevron className="shrink-0 text-gray-400 dark:text-gray-500 transition-transform group-open:rotate-90" />
         <ToolIcon tool={event.tool} />
         <span className="font-medium">{event.tool}</span>
-        <span className="min-w-0 flex-1 truncate font-mono text-xs text-gray-500">
+        <span className="min-w-0 flex-1 truncate font-mono text-xs text-gray-500 dark:text-gray-400">
           {event.detail}
         </span>
         {event.diffStat ? (
-          <span className="shrink-0 font-mono text-xs text-gray-500">{event.diffStat}</span>
+          <span className="shrink-0 font-mono text-xs text-gray-500 dark:text-gray-400">
+            {event.diffStat}
+          </span>
         ) : null}
       </summary>
-      <div className="border-t border-gray-100 px-3 py-2.5">
+      <div className="border-t border-gray-100 dark:border-white/5 px-3 py-2.5">
         {event.output ? (
           <pre
             className={`max-h-72 overflow-auto whitespace-pre-wrap rounded-md px-3 py-2.5 font-mono text-xs leading-relaxed ${
@@ -190,7 +198,7 @@ function ToolActivity({ event }: { event: Extract<AgentEvent, { kind: 'tool_use'
             {event.output.join('\n')}
           </pre>
         ) : (
-          <p className="text-xs text-gray-400">Waiting for the tool result…</p>
+          <p className="text-xs text-gray-400 dark:text-gray-500">Waiting for the tool result…</p>
         )}
       </div>
     </details>
@@ -277,7 +285,7 @@ function MessageActionButton({
       disabled={disabled}
       aria-label={label}
       title={label}
-      className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-[11px] text-gray-400 hover:bg-gray-100 hover:text-gray-700 disabled:opacity-40"
+      className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-[11px] text-gray-400 dark:text-gray-500 hover:bg-gray-100 dark:hover:bg-white/10 hover:text-gray-700 dark:hover:text-gray-200 disabled:opacity-40"
     >
       {children}
     </button>
@@ -305,7 +313,7 @@ function MessageActions({
 
 function AssistantMessage({ text, extraActions }: { text: string; extraActions?: ReactNode }) {
   return (
-    <div className="group py-3 text-gray-800">
+    <div className="group py-3 text-gray-800 dark:text-gray-200">
       <Markdown text={text} />
       <MessageActions>
         <MessageActionButton label="Copy message" onClick={() => void copyMessage(text)}>
@@ -346,7 +354,7 @@ function ThreadTurn({
   }
   return (
     <div className="group my-3 ml-auto w-fit max-w-[88%]">
-      <div className="rounded-2xl bg-gray-100 px-4 py-3 text-sm leading-relaxed text-gray-800">
+      <div className="rounded-2xl bg-gray-100 dark:bg-white/5 px-4 py-3 text-sm leading-relaxed text-gray-800 dark:text-gray-200">
         <Markdown text={message.content} />
       </div>
       <MessageActions align="end">
@@ -379,9 +387,9 @@ function EventRow({
     return (
       <div
         aria-label="Agent reasoning"
-        className="flex items-center gap-2.5 py-2 text-[13px] text-gray-400"
+        className="flex items-center gap-2.5 py-2 text-[13px] text-gray-400 dark:text-gray-500"
       >
-        <span className="h-1.5 w-1.5 rounded-full bg-gray-300" />
+        <span className="h-1.5 w-1.5 rounded-full bg-gray-300 dark:bg-gray-600" />
         Agent is reasoning
       </div>
     );
@@ -404,8 +412,8 @@ function EventRow({
   if (event.kind === 'tool_use') return <ToolActivity event={event} />;
   if (event.kind === 'tool_result') {
     return (
-      <details className="my-1 rounded-lg border border-gray-200 bg-white">
-        <summary className="cursor-pointer px-3 py-2 text-[13px] text-gray-500">
+      <details className="my-1 rounded-lg border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900">
+        <summary className="cursor-pointer px-3 py-2 text-[13px] text-gray-500 dark:text-gray-400">
           Unmatched tool result
         </summary>
         <pre className="m-3 max-h-72 overflow-auto whitespace-pre-wrap rounded-md bg-gray-950 px-3 py-2.5 font-mono text-xs text-gray-200">
@@ -423,14 +431,14 @@ function EventRow({
   }
   if (event.kind === 'egress_denied') {
     return (
-      <div className="my-2 flex items-center gap-2 rounded-lg bg-red-50 px-3 py-2 text-[13px] text-red-700">
+      <div className="my-2 flex items-center gap-2 rounded-lg bg-red-50 dark:bg-red-500/10 px-3 py-2 text-[13px] text-red-700 dark:text-red-400">
         <span className="font-medium">Network request blocked</span>
         <span className="font-mono text-xs">{event.host}</span>
-        <span className="text-red-500">× {event.attempts}</span>
+        <span className="text-red-500 dark:text-red-400">× {event.attempts}</span>
       </div>
     );
   }
-  return <p className="py-1 text-[11px] text-gray-400">{event.text}</p>;
+  return <p className="py-1 text-[11px] text-gray-400 dark:text-gray-500">{event.text}</p>;
 }
 
 function HistoryTurn({
@@ -482,12 +490,12 @@ function HistoryTurn({
           />
         ))}
       </div>
-      <div className="my-5 flex items-center gap-3 text-[11px] text-gray-400">
-        <span className="h-px flex-1 bg-gray-200" />
+      <div className="my-5 flex items-center gap-3 text-[11px] text-gray-400 dark:text-gray-500">
+        <span className="h-px flex-1 bg-gray-200 dark:bg-white/10" />
         <span>
           Turn {turn.turnNo} · {toolCalls} tool call{toolCalls === 1 ? '' : 's'}
         </span>
-        <span className="h-px flex-1 bg-gray-200" />
+        <span className="h-px flex-1 bg-gray-200 dark:bg-white/10" />
       </div>
     </section>
   );
@@ -496,8 +504,8 @@ function HistoryTurn({
 function DetailStat({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-start justify-between gap-4 py-1.5 text-[13px]">
-      <dt className="text-gray-500">{label}</dt>
-      <dd className="break-all text-right text-gray-800">{value || '—'}</dd>
+      <dt className="text-gray-500 dark:text-gray-400">{label}</dt>
+      <dd className="break-all text-right text-gray-800 dark:text-gray-200">{value || '—'}</dd>
     </div>
   );
 }
@@ -518,15 +526,15 @@ function DetailsDrawer({
         type="button"
         aria-label="Close run details"
         onClick={onClose}
-        className="absolute inset-0 bg-gray-950/15"
+        className="absolute inset-0 bg-gray-950/15 dark:bg-black/50"
       />
-      <aside className="relative flex h-full w-full max-w-xl flex-col border-l border-gray-200 bg-white shadow-2xl">
-        <div className="flex items-center border-b border-gray-200 px-5 py-4">
-          <h2 className="font-semibold text-gray-900">Run details</h2>
+      <aside className="relative flex h-full w-full max-w-xl flex-col border-l border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 shadow-2xl">
+        <div className="flex items-center border-b border-gray-200 dark:border-white/10 px-5 py-4">
+          <h2 className="font-semibold text-gray-900 dark:text-gray-50">Run details</h2>
           <button
             type="button"
             onClick={onClose}
-            className="ml-auto rounded-md p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-700"
+            className="ml-auto rounded-md p-1 text-gray-400 dark:text-gray-500 hover:bg-gray-100 dark:hover:bg-white/10 hover:text-gray-700 dark:hover:text-gray-200"
             aria-label="Close"
           >
             <svg
@@ -542,7 +550,7 @@ function DetailsDrawer({
           </button>
         </div>
 
-        <div className="flex gap-1 border-b border-gray-100 px-4 pt-2 text-[13px] font-medium">
+        <div className="flex gap-1 border-b border-gray-100 dark:border-white/5 px-4 pt-2 text-[13px] font-medium">
           {(
             [
               ['overview', 'Overview'],
@@ -556,8 +564,8 @@ function DetailsDrawer({
               onClick={() => setView(key)}
               className={`border-b-2 px-3 py-2 ${
                 view === key
-                  ? 'border-gray-900 text-gray-900'
-                  : 'border-transparent text-gray-500 hover:text-gray-900'
+                  ? 'border-gray-900 dark:border-gray-100 text-gray-900 dark:text-gray-50'
+                  : 'border-transparent text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100'
               }`}
             >
               {label}
@@ -569,20 +577,20 @@ function DetailsDrawer({
           {view === 'overview' ? (
             <div className="space-y-6">
               <section>
-                <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500">
                   Outcome
                 </h3>
-                <dl className="mt-2 divide-y divide-gray-100">
+                <dl className="mt-2 divide-y divide-gray-100 dark:divide-white/5">
                   <DetailStat label="Branch" value={job.branch} />
                   <DetailStat label="Base" value={job.baseSha} />
                   <DetailStat label="Draft PR" value={job.prLabel ?? 'Not published'} />
                 </dl>
               </section>
               <section>
-                <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500">
                   Usage
                 </h3>
-                <dl className="mt-2 divide-y divide-gray-100">
+                <dl className="mt-2 divide-y divide-gray-100 dark:divide-white/5">
                   <DetailStat
                     label="Spend"
                     value={
@@ -595,10 +603,10 @@ function DetailsDrawer({
                 </dl>
               </section>
               <section>
-                <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500">
                   Environment
                 </h3>
-                <dl className="mt-2 divide-y divide-gray-100">
+                <dl className="mt-2 divide-y divide-gray-100 dark:divide-white/5">
                   <DetailStat label="Agent" value={job.runtime} />
                   <DetailStat label="Model" value={job.model} />
                   {/* Only when a depth was chosen. An absent row is the honest
@@ -615,25 +623,30 @@ function DetailsDrawer({
               </section>
               {job.gates.length ? (
                 <section>
-                  <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400">
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500">
                     Publish checks
                   </h3>
                   <ul className="mt-2 space-y-2 text-[13px]">
                     {job.gates.map((gate) => (
-                      <li key={gate.label} className="flex items-start gap-2 text-gray-600">
+                      <li
+                        key={gate.label}
+                        className="flex items-start gap-2 text-gray-600 dark:text-gray-400"
+                      >
                         <span
                           className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${
                             gate.state === 'pass'
                               ? 'bg-emerald-500'
                               : gate.state === 'hold'
                                 ? 'bg-amber-400'
-                                : 'bg-gray-300'
+                                : 'bg-gray-300 dark:bg-gray-600'
                           }`}
                         />
                         <span>
                           {gate.label}
                           {gate.detail ? (
-                            <span className="ml-1 text-gray-400">{gate.detail}</span>
+                            <span className="ml-1 text-gray-400 dark:text-gray-500">
+                              {gate.detail}
+                            </span>
                           ) : null}
                         </span>
                       </li>
@@ -643,15 +656,20 @@ function DetailsDrawer({
               ) : null}
               {job.attempts.length ? (
                 <section>
-                  <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400">
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500">
                     Attempts
                   </h3>
-                  <ul className="mt-2 space-y-2 text-[13px] text-gray-600">
+                  <ul className="mt-2 space-y-2 text-[13px] text-gray-600 dark:text-gray-400">
                     {job.attempts.map((attempt) => (
-                      <li key={attempt.no} className="rounded-lg bg-gray-50 px-3 py-2">
+                      <li
+                        key={attempt.no}
+                        className="rounded-lg bg-gray-50 dark:bg-gray-950 px-3 py-2"
+                      >
                         Attempt {attempt.no} · {attempt.status}
                         {attempt.note ? (
-                          <p className="mt-1 text-xs text-gray-400">{attempt.note}</p>
+                          <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">
+                            {attempt.note}
+                          </p>
                         ) : null}
                       </li>
                     ))}
@@ -663,15 +681,17 @@ function DetailsDrawer({
 
           {view === 'diff' ? (
             job.diffLines.length ? (
-              <div className="overflow-hidden rounded-lg border border-gray-200">
-                <div className="flex flex-wrap gap-2 border-b border-gray-100 px-3 py-2 font-mono text-xs text-gray-500">
+              <div className="overflow-hidden rounded-lg border border-gray-200 dark:border-white/10">
+                <div className="flex flex-wrap gap-2 border-b border-gray-100 dark:border-white/5 px-3 py-2 font-mono text-xs text-gray-500 dark:text-gray-400">
                   {job.diffFiles.map((file) => (
                     <span key={file}>{file}</span>
                   ))}
                   {job.diffStat ? (
                     <span className="ml-auto">
-                      <span className="text-emerald-600">+{job.diffStat.add}</span>{' '}
-                      <span className="text-red-500">−{job.diffStat.del}</span>
+                      <span className="text-emerald-600 dark:text-emerald-400">
+                        +{job.diffStat.add}
+                      </span>{' '}
+                      <span className="text-red-500 dark:text-red-400">−{job.diffStat.del}</span>
                     </span>
                   ) : null}
                 </div>
@@ -686,17 +706,17 @@ function DetailsDrawer({
                 </pre>
               </div>
             ) : (
-              <p className="text-sm text-gray-400">No changes yet.</p>
+              <p className="text-sm text-gray-400 dark:text-gray-500">No changes yet.</p>
             )
           ) : null}
 
           {view === 'raw' ? (
             job.rawLines.length ? (
-              <pre className="overflow-x-auto whitespace-pre-wrap rounded-lg bg-gray-950 p-4 font-mono text-[11px] leading-relaxed text-gray-300">
+              <pre className="overflow-x-auto whitespace-pre-wrap rounded-lg bg-gray-950 p-4 font-mono text-[11px] leading-relaxed text-gray-300 dark:text-gray-600">
                 {job.rawLines.join('\n')}
               </pre>
             ) : (
-              <p className="text-sm text-gray-400">No raw events yet.</p>
+              <p className="text-sm text-gray-400 dark:text-gray-500">No raw events yet.</p>
             )
           ) : null}
         </div>
@@ -711,12 +731,14 @@ function OutcomeCard({ job, onOpenDiff }: { job: AgentJob; onOpenDiff: () => voi
   return (
     <div
       className={`mt-6 rounded-xl border px-4 py-3 ${
-        successful ? 'border-emerald-200 bg-emerald-50/50' : 'border-gray-200 bg-gray-50'
+        successful
+          ? 'border-emerald-200 dark:border-emerald-500/25 bg-emerald-50/50 dark:bg-emerald-500/10'
+          : 'border-gray-200 dark:border-white/10 bg-gray-50 dark:bg-gray-950'
       }`}
     >
       <div className="flex flex-wrap items-center gap-3">
         <div className="min-w-0 flex-1">
-          <p className="text-sm font-medium text-gray-900">
+          <p className="text-sm font-medium text-gray-900 dark:text-gray-50">
             {job.state === 'done'
               ? 'Draft pull request ready'
               : job.state === 'needs_review'
@@ -726,10 +748,12 @@ function OutcomeCard({ job, onOpenDiff }: { job: AgentJob; onOpenDiff: () => voi
                   : 'Run stopped'}
           </p>
           {job.stateNote ? (
-            <p className="mt-0.5 text-xs text-gray-500 [overflow-wrap:anywhere]">{job.stateNote}</p>
+            <p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400 [overflow-wrap:anywhere]">
+              {job.stateNote}
+            </p>
           ) : null}
           {job.state === 'cancelled' ? (
-            <p className="mt-1 text-xs text-gray-500">
+            <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
               Send a follow-up to continue from any saved intermediate changes.
             </p>
           ) : null}
@@ -738,7 +762,7 @@ function OutcomeCard({ job, onOpenDiff }: { job: AgentJob; onOpenDiff: () => voi
           <button
             type="button"
             onClick={onOpenDiff}
-            className="rounded-md bg-white px-3 py-1.5 text-[13px] font-medium text-gray-700 shadow-sm ring-1 ring-inset ring-gray-200 hover:bg-gray-50"
+            className="rounded-md bg-white dark:bg-gray-900 px-3 py-1.5 text-[13px] font-medium text-gray-700 dark:text-gray-300 shadow-sm ring-1 ring-inset ring-gray-200 dark:ring-white/10 hover:bg-gray-50 dark:hover:bg-white/5"
           >
             View changes
           </button>
@@ -748,7 +772,7 @@ function OutcomeCard({ job, onOpenDiff }: { job: AgentJob; onOpenDiff: () => voi
             href={job.prUrl}
             target="_blank"
             rel="noopener noreferrer"
-            className="rounded-md bg-gray-900 px-3 py-1.5 text-[13px] font-medium text-white hover:bg-gray-800"
+            className="rounded-md bg-gray-900 dark:bg-gray-100 px-3 py-1.5 text-[13px] font-medium text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-white"
           >
             Open draft PR
           </a>
@@ -812,14 +836,16 @@ function GitPanel({ job, active }: { job: AgentJob; active: boolean }) {
 
   return (
     <div className="space-y-4" aria-label="Git workspace">
-      <header className="flex flex-wrap items-center gap-3 border-b border-gray-200 pb-3">
+      <header className="flex flex-wrap items-center gap-3 border-b border-gray-200 dark:border-white/10 pb-3">
         <div className="min-w-0">
-          <p className="truncate text-sm font-medium text-gray-800">{job.repo}</p>
-          <p className="truncate font-mono text-xs text-gray-400">
+          <p className="truncate text-sm font-medium text-gray-800 dark:text-gray-200">
+            {job.repo}
+          </p>
+          <p className="truncate font-mono text-xs text-gray-400 dark:text-gray-500">
             {live?.available ? live.branch || 'detached HEAD' : job.branch}
           </p>
         </div>
-        <span className="rounded bg-gray-100 px-2 py-1 text-[11px] text-gray-500">
+        <span className="rounded bg-gray-100 dark:bg-white/5 px-2 py-1 text-[11px] text-gray-500 dark:text-gray-400">
           {error
             ? 'Unavailable'
             : live?.available
@@ -832,13 +858,16 @@ function GitPanel({ job, active }: { job: AgentJob; active: boolean }) {
           type="button"
           onClick={() => setRefreshKey((value) => value + 1)}
           disabled={loading}
-          className="ml-auto rounded-md border border-gray-200 px-2.5 py-1 text-xs text-gray-500 hover:bg-gray-50 disabled:opacity-50"
+          className="ml-auto rounded-md border border-gray-200 dark:border-white/10 px-2.5 py-1 text-xs text-gray-500 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-white/5 disabled:opacity-50"
         >
           {loading ? 'Refreshing…' : 'Refresh'}
         </button>
       </header>
 
-      <div className="flex items-center gap-5 border-b border-gray-200" role="tablist">
+      <div
+        className="flex items-center gap-5 border-b border-gray-200 dark:border-white/10"
+        role="tablist"
+      >
         {(['diff', 'review', 'commits'] as GitView[]).map((item) => (
           <button
             key={item}
@@ -848,8 +877,8 @@ function GitPanel({ job, active }: { job: AgentJob; active: boolean }) {
             onClick={() => setView(item)}
             className={`border-b-2 px-1 pb-2 text-xs font-medium capitalize ${
               view === item
-                ? 'border-gray-900 text-gray-900'
-                : 'border-transparent text-gray-400 hover:text-gray-700'
+                ? 'border-gray-900 dark:border-gray-100 text-gray-900 dark:text-gray-50'
+                : 'border-transparent text-gray-400 dark:text-gray-500 hover:text-gray-700 dark:hover:text-gray-200'
             }`}
           >
             {item}
@@ -857,46 +886,46 @@ function GitPanel({ job, active }: { job: AgentJob; active: boolean }) {
         ))}
         {view === 'diff' && files.length ? (
           <span className="ml-auto pb-2 font-mono text-[11px]">
-            <span className="text-emerald-600">+{stat.add}</span>{' '}
-            <span className="text-red-500">−{stat.del}</span>
+            <span className="text-emerald-600 dark:text-emerald-400">+{stat.add}</span>{' '}
+            <span className="text-red-500 dark:text-red-400">−{stat.del}</span>
           </span>
         ) : null}
       </div>
 
-      {error ? <p className="text-xs text-red-600">{error}</p> : null}
+      {error ? <p className="text-xs text-red-600 dark:text-red-400">{error}</p> : null}
 
       {view === 'diff' && files.length ? (
-        <section className="overflow-hidden rounded-xl border border-gray-200 lg:grid lg:grid-cols-[minmax(14rem,0.35fr)_minmax(0,1fr)]">
-          <div className="border-b border-gray-200 bg-gray-50/60 lg:border-b-0 lg:border-r">
-            <div className="flex items-center px-3 py-2.5 text-xs text-gray-500">
+        <section className="overflow-hidden rounded-xl border border-gray-200 dark:border-white/10 lg:grid lg:grid-cols-[minmax(14rem,0.35fr)_minmax(0,1fr)]">
+          <div className="border-b border-gray-200 dark:border-white/10 bg-gray-50/60 dark:bg-gray-900/60 lg:border-b-0 lg:border-r">
+            <div className="flex items-center px-3 py-2.5 text-xs text-gray-500 dark:text-gray-400">
               <span>
                 {files.length} changed file{files.length === 1 ? '' : 's'}
               </span>
               <span className="ml-auto font-mono">Changes</span>
             </div>
-            <div className="max-h-[34rem] overflow-auto border-t border-gray-200">
+            <div className="max-h-[34rem] overflow-auto border-t border-gray-200 dark:border-white/10">
               {files.map((file) => (
                 <button
                   key={file.path}
                   type="button"
                   onClick={() => setSelectedPath(file.path)}
-                  className={`flex w-full items-center gap-3 border-b border-gray-100 px-3 py-2.5 text-left text-xs last:border-b-0 ${
+                  className={`flex w-full items-center gap-3 border-b border-gray-100 dark:border-white/5 px-3 py-2.5 text-left text-xs last:border-b-0 ${
                     selected?.path === file.path
-                      ? 'bg-white text-gray-900'
-                      : 'text-gray-600 hover:bg-white'
+                      ? 'bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-50'
+                      : 'text-gray-600 dark:text-gray-400 hover:bg-white dark:hover:bg-white/10'
                   }`}
                 >
                   <span className="min-w-0 flex-1 truncate font-mono">{file.path}</span>
                   <span className="shrink-0 font-mono">
-                    <span className="text-emerald-600">+{file.add}</span>{' '}
-                    <span className="text-red-500">−{file.del}</span>
+                    <span className="text-emerald-600 dark:text-emerald-400">+{file.add}</span>{' '}
+                    <span className="text-red-500 dark:text-red-400">−{file.del}</span>
                   </span>
                 </button>
               ))}
             </div>
           </div>
-          <div className="min-w-0 bg-white">
-            <div className="border-b border-gray-100 px-4 py-2.5 font-mono text-xs text-gray-600">
+          <div className="min-w-0 bg-white dark:bg-gray-900">
+            <div className="border-b border-gray-100 dark:border-white/5 px-4 py-2.5 font-mono text-xs text-gray-600 dark:text-gray-400">
               {selected?.path}
             </div>
             <pre className="max-h-[34rem] overflow-auto font-mono text-xs leading-relaxed">
@@ -914,32 +943,34 @@ function GitPanel({ job, active }: { job: AgentJob; active: boolean }) {
           </div>
         </section>
       ) : view === 'diff' ? (
-        <div className="rounded-xl border border-dashed border-gray-200 px-5 py-12 text-center text-sm text-gray-400">
+        <div className="rounded-xl border border-dashed border-gray-200 dark:border-white/10 px-5 py-12 text-center text-sm text-gray-400 dark:text-gray-500">
           No changes yet.
         </div>
       ) : view === 'review' ? (
-        <section className="space-y-4 rounded-xl border border-gray-200 p-5">
+        <section className="space-y-4 rounded-xl border border-gray-200 dark:border-white/10 p-5">
           <div className="flex items-center gap-3">
             <div>
-              <p className="text-sm font-medium text-gray-800">
+              <p className="text-sm font-medium text-gray-800 dark:text-gray-200">
                 {files.length} changed file{files.length === 1 ? '' : 's'}
               </p>
-              <p className="mt-1 text-xs text-gray-400">
+              <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">
                 Compared with {job.baseRef || job.baseSha || 'the pinned base'}
               </p>
             </div>
             <p className="ml-auto font-mono text-xs">
-              <span className="text-emerald-600">+{stat.add}</span>{' '}
-              <span className="text-red-500">−{stat.del}</span>
+              <span className="text-emerald-600 dark:text-emerald-400">+{stat.add}</span>{' '}
+              <span className="text-red-500 dark:text-red-400">−{stat.del}</span>
             </p>
           </div>
           {files.length ? (
-            <ul className="divide-y divide-gray-100 border-y border-gray-100">
+            <ul className="divide-y divide-gray-100 dark:divide-white/5 border-y border-gray-100 dark:border-white/5">
               {files.map((file) => (
                 <li key={file.path} className="flex gap-3 py-2.5 font-mono text-xs">
-                  <span className="min-w-0 flex-1 truncate text-gray-600">{file.path}</span>
-                  <span className="text-emerald-600">+{file.add}</span>
-                  <span className="text-red-500">−{file.del}</span>
+                  <span className="min-w-0 flex-1 truncate text-gray-600 dark:text-gray-400">
+                    {file.path}
+                  </span>
+                  <span className="text-emerald-600 dark:text-emerald-400">+{file.add}</span>
+                  <span className="text-red-500 dark:text-red-400">−{file.del}</span>
                 </li>
               ))}
             </ul>
@@ -949,25 +980,31 @@ function GitPanel({ job, active }: { job: AgentJob; active: boolean }) {
               href={job.prUrl}
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex rounded-md bg-gray-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-gray-800"
+              className="inline-flex rounded-md bg-gray-900 dark:bg-gray-100 px-3 py-1.5 text-xs font-medium text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-white"
             >
               Open pull request
             </a>
           ) : (
-            <p className="text-xs text-gray-400">Pull request not published yet.</p>
+            <p className="text-xs text-gray-400 dark:text-gray-500">
+              Pull request not published yet.
+            </p>
           )}
         </section>
       ) : (
-        <section className="overflow-hidden rounded-xl border border-gray-200">
+        <section className="overflow-hidden rounded-xl border border-gray-200 dark:border-white/10">
           {live?.available && live.commits.length ? (
-            <ul className="divide-y divide-gray-100">
+            <ul className="divide-y divide-gray-100 dark:divide-white/5">
               {live.commits.map((commit) => (
                 <li key={commit.sha} className="px-4 py-3">
                   <div className="flex items-start gap-3">
-                    <span className="font-mono text-xs text-gray-400">{commit.short_sha}</span>
+                    <span className="font-mono text-xs text-gray-400 dark:text-gray-500">
+                      {commit.short_sha}
+                    </span>
                     <div className="min-w-0">
-                      <p className="truncate text-sm text-gray-700">{commit.subject}</p>
-                      <p className="mt-1 text-[11px] text-gray-400">
+                      <p className="truncate text-sm text-gray-700 dark:text-gray-300">
+                        {commit.subject}
+                      </p>
+                      <p className="mt-1 text-[11px] text-gray-400 dark:text-gray-500">
                         {commit.author} · {commit.authored_at}
                       </p>
                     </div>
@@ -976,7 +1013,7 @@ function GitPanel({ job, active }: { job: AgentJob; active: boolean }) {
               ))}
             </ul>
           ) : (
-            <p className="px-5 py-12 text-center text-sm text-gray-400">
+            <p className="px-5 py-12 text-center text-sm text-gray-400 dark:text-gray-500">
               Commit history is available for live workspaces.
             </p>
           )}
@@ -1241,14 +1278,14 @@ export function JobDetail({
       : undefined;
 
   return (
-    <section className="flex h-full min-h-0 flex-col bg-gray-50/40">
-      <header className="relative z-20 shrink-0 border-b border-gray-200/80 bg-white/95 px-6 shadow-[0_1px_0_rgba(17,24,39,0.02)] backdrop-blur">
+    <section className="flex h-full min-h-0 flex-col bg-gray-50/40 dark:bg-gray-950">
+      <header className="relative z-20 shrink-0 border-b border-gray-200/80 dark:border-white/10 bg-white/95 dark:bg-gray-900/95 px-6 shadow-[0_1px_0_rgba(17,24,39,0.02)] backdrop-blur">
         <div className="flex w-full items-center gap-3 py-3.5 pr-14">
           <div className="min-w-0 flex-1">
-            <h1 className="truncate text-base font-semibold tracking-[-0.01em] text-gray-950">
+            <h1 className="truncate text-base font-semibold tracking-[-0.01em] text-gray-950 dark:text-gray-50">
               {job.title}
             </h1>
-            <div className="mt-0.5 flex items-center gap-2 text-xs text-gray-500">
+            <div className="mt-0.5 flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
               <svg
                 aria-hidden="true"
                 className="h-3.5 w-3.5"
@@ -1269,7 +1306,7 @@ export function JobDetail({
               <button
                 type="button"
                 onClick={() => setDrawer('overview')}
-                className="shrink-0 font-medium text-gray-500 transition-colors hover:text-crimson hover:underline"
+                className="shrink-0 font-medium text-gray-500 dark:text-gray-400 transition-colors hover:text-crimson dark:hover:text-crimson-light hover:underline"
               >
                 Run details
               </button>
@@ -1284,8 +1321,8 @@ export function JobDetail({
                 aria-current={tab === view ? 'page' : undefined}
                 className={`rounded-lg px-2.5 py-1 capitalize transition-colors ${
                   tab === view
-                    ? 'bg-gray-100 font-medium text-gray-900'
-                    : 'text-gray-500 hover:text-gray-800'
+                    ? 'bg-gray-100 dark:bg-white/5 font-medium text-gray-900 dark:text-gray-50'
+                    : 'text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200'
                 }`}
               >
                 {view}
@@ -1306,10 +1343,10 @@ export function JobDetail({
             <button
               type="button"
               onClick={() => openWorkspace('git')}
-              className="hidden rounded-md px-2.5 py-1.5 text-[13px] font-medium text-gray-600 transition-colors hover:bg-gray-100 hover:text-gray-900 sm:block"
+              className="hidden rounded-md px-2.5 py-1.5 text-[13px] font-medium text-gray-600 dark:text-gray-400 transition-colors hover:bg-gray-100 dark:hover:bg-white/10 hover:text-gray-900 dark:hover:text-gray-100 sm:block"
             >
               Changes
-              <span className="ml-1 rounded bg-gray-100 px-1.5 py-0.5 text-[11px]">
+              <span className="ml-1 rounded bg-gray-100 dark:bg-white/5 px-1.5 py-0.5 text-[11px]">
                 {job.diffFiles.length}
               </span>
             </button>
@@ -1321,12 +1358,15 @@ export function JobDetail({
               disabled={stopping}
               aria-label="Stop"
               title="Stop run (Esc)"
-              className="inline-flex items-center gap-1.5 rounded-md bg-gray-900 px-2.5 py-1.5 text-[13px] font-medium text-white transition-colors hover:bg-gray-800 disabled:opacity-60"
+              className="inline-flex items-center gap-1.5 rounded-md bg-gray-900 dark:bg-gray-100 px-2.5 py-1.5 text-[13px] font-medium text-white dark:text-gray-900 transition-colors hover:bg-gray-800 dark:hover:bg-white disabled:opacity-60"
             >
-              <span className="h-2.5 w-2.5 rounded-sm bg-white" />
+              <span className="h-2.5 w-2.5 rounded-sm bg-white dark:bg-gray-900" />
               {stopping ? 'Stopping…' : 'Stop'}
               {!stopping ? (
-                <kbd aria-hidden="true" className="rounded bg-white/15 px-1 text-[10px]">
+                <kbd
+                  aria-hidden="true"
+                  className="rounded bg-white/15 px-1 text-[10px] dark:bg-gray-900/15"
+                >
                   Esc
                 </kbd>
               ) : null}
@@ -1341,8 +1381,8 @@ export function JobDetail({
           aria-controls="job-workspace-pane"
           className={`absolute right-6 top-1/2 inline-flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-md border transition-colors ${
             workspaceOpen
-              ? 'border-gray-900 bg-gray-900 text-white hover:bg-gray-800'
-              : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-100 hover:text-gray-900'
+              ? 'border-gray-900 dark:border-gray-100 bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-white'
+              : 'border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-white/10 hover:text-gray-900 dark:hover:text-gray-100'
           }`}
         >
           <svg
@@ -1415,7 +1455,7 @@ export function JobDetail({
                 })}
 
                 {job.historyIncludesPrompt ? null : (
-                  <div className="group my-4 rounded-xl border border-gray-200/90 bg-white px-4 py-3 shadow-subtle">
+                  <div className="group my-4 rounded-xl border border-gray-200/90 dark:border-white/10 bg-white dark:bg-gray-900 px-4 py-3 shadow-subtle">
                     <Markdown text={job.prompt || job.title} />
                     <MessageActions align="end">
                       <MessageActionButton
@@ -1440,12 +1480,12 @@ export function JobDetail({
                 )}
 
                 {job.stateNote && job.state !== 'failed' ? (
-                  <p className="mb-2 text-xs text-gray-400">{job.stateNote}</p>
+                  <p className="mb-2 text-xs text-gray-400 dark:text-gray-500">{job.stateNote}</p>
                 ) : null}
 
                 {job.attempts.length > 1 ? (
                   <div className="my-3 flex flex-wrap items-center gap-1.5 text-xs">
-                    <span className="mr-1 text-gray-400">Run attempts</span>
+                    <span className="mr-1 text-gray-400 dark:text-gray-500">Run attempts</span>
                     {job.attempts.map((attempt) => (
                       <button
                         key={attempt.no}
@@ -1453,8 +1493,8 @@ export function JobDetail({
                         onClick={() => setAttemptNo(attempt.no)}
                         className={`rounded-md px-2 py-1 ${
                           attempt.no === attemptNo
-                            ? 'bg-gray-900 text-white'
-                            : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
+                            ? 'bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900'
+                            : 'bg-gray-100 dark:bg-white/5 text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-white/15'
                         }`}
                       >
                         {attempt.no} · {attempt.status}
@@ -1464,7 +1504,7 @@ export function JobDetail({
                 ) : null}
 
                 {selectedAttempt?.status === 'superseded' && selectedAttempt.note ? (
-                  <div className="my-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[13px] text-amber-800">
+                  <div className="my-3 rounded-lg border border-amber-200 dark:border-amber-500/25 bg-amber-50 dark:bg-amber-500/10 px-3 py-2 text-[13px] text-amber-800 dark:text-amber-300">
                     {selectedAttempt.note}
                   </div>
                 ) : null}
@@ -1483,14 +1523,14 @@ export function JobDetail({
                     />
                   ))}
                   {job.liveNote ? (
-                    <div className="flex items-center gap-2.5 py-3 text-[13px] text-gray-500">
+                    <div className="flex items-center gap-2.5 py-3 text-[13px] text-gray-500 dark:text-gray-400">
                       <span className="h-2 w-2 animate-pulse rounded-full bg-blue-500" />
                       {job.liveNote}
                     </div>
                   ) : null}
                   {job.state === 'queued' && visibleEvents.length === 0 ? (
-                    <div className="flex items-center gap-2.5 py-3 text-[13px] text-gray-500">
-                      <span className="h-2 w-2 animate-pulse rounded-full bg-gray-400" />
+                    <div className="flex items-center gap-2.5 py-3 text-[13px] text-gray-500 dark:text-gray-400">
+                      <span className="h-2 w-2 animate-pulse rounded-full bg-gray-400 dark:bg-gray-600" />
                       {job.parentJobId ? 'Queued after the current run' : 'Waiting for a runner'}
                     </div>
                   ) : null}
@@ -1502,10 +1542,10 @@ export function JobDetail({
               </div>
             )}
 
-            <div className="sticky bottom-0 z-10 -mx-2 mt-10 bg-gradient-to-t from-gray-50 via-gray-50/95 px-2 pb-2 pt-8">
+            <div className="sticky bottom-0 z-10 -mx-2 mt-10 bg-gradient-to-t from-gray-50 via-gray-50/95 px-2 pb-2 pt-8 dark:from-gray-950 dark:via-gray-950/95">
               <form
                 onSubmit={(event) => void submitFollowUp(event)}
-                className="rounded-xl border border-gray-200/90 bg-white shadow-[0_16px_40px_-28px_rgba(17,24,39,0.55)] transition focus-within:border-crimson/30 focus-within:ring-4 focus-within:ring-crimson/[0.05]"
+                className="rounded-xl border border-gray-200/90 dark:border-white/10 bg-white dark:bg-gray-900 shadow-[0_16px_40px_-28px_rgba(17,24,39,0.55)] transition focus-within:border-crimson/30 focus-within:ring-4 focus-within:ring-crimson/[0.05]"
               >
                 <textarea
                   rows={2}
@@ -1520,7 +1560,7 @@ export function JobDetail({
                   }}
                   placeholder="Add a follow-up"
                   aria-label="Add a follow-up"
-                  className="w-full resize-none rounded-t-xl border-0 bg-transparent px-4 pt-3 text-sm leading-relaxed text-gray-900 placeholder:text-gray-400 focus:outline-none focus:ring-0"
+                  className="w-full resize-none rounded-t-xl border-0 bg-transparent px-4 pt-3 text-sm leading-relaxed text-gray-900 dark:text-gray-50 placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-0"
                 />
                 <div className="flex items-center gap-1.5 px-3 pb-2.5">
                   {modelOptions.length > 0 ? (
@@ -1530,7 +1570,7 @@ export function JobDetail({
                           run is a fresh sandbox handed a runtime-neutral replay
                           of the conversation, so it can be answered by a model
                           the thread has not used. */}
-                      <span className="shrink-0 text-[11px] text-gray-400">
+                      <span className="shrink-0 text-[11px] text-gray-400 dark:text-gray-500">
                         {job.state === 'cancelled'
                           ? `Restores any saved changes · ${job.runtime} ·`
                           : `Inherits ${job.runtime} ·`}
@@ -1548,13 +1588,13 @@ export function JobDetail({
                         onChange={setEffort}
                       />
                       {isActive ? (
-                        <span className="min-w-0 truncate text-[11px] text-gray-400">
+                        <span className="min-w-0 truncate text-[11px] text-gray-400 dark:text-gray-500">
                           · queued after this run
                         </span>
                       ) : null}
                     </>
                   ) : (
-                    <span className="min-w-0 flex-1 truncate text-[11px] text-gray-400">
+                    <span className="min-w-0 flex-1 truncate text-[11px] text-gray-400 dark:text-gray-500">
                       {job.state === 'cancelled'
                         ? `Restores any saved changes · ${job.runtime} · ${job.model}`
                         : `Inherits ${job.runtime} · ${job.model}`}
@@ -1591,7 +1631,7 @@ export function JobDetail({
               </form>
               <ThreadStatsBar job={job} />
               {actionError ? (
-                <p className="mt-2 text-center text-xs text-red-600" role="alert">
+                <p className="mt-2 text-center text-xs text-red-600 dark:text-red-400" role="alert">
                   {actionError}
                 </p>
               ) : null}
@@ -1616,12 +1656,12 @@ export function JobDetail({
           style={{ '--job-workspace-width': `${workspacePane.width}px` } as CSSProperties}
           className={`${
             workspaceOpen ? 'flex' : 'hidden'
-          } min-h-0 min-w-0 flex-col overflow-hidden bg-white lg:w-[var(--job-workspace-width)] lg:shrink-0`}
+          } min-h-0 min-w-0 flex-col overflow-hidden bg-white dark:bg-gray-900 lg:w-[var(--job-workspace-width)] lg:shrink-0`}
         >
           <nav
             aria-label="Workspace views"
             role="tablist"
-            className="sticky top-0 z-10 flex gap-1 overflow-x-auto border-b border-gray-200 bg-white px-4 text-[13px] font-medium"
+            className="sticky top-0 z-10 flex gap-1 overflow-x-auto border-b border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 px-4 text-[13px] font-medium"
           >
             {WORKSPACE_TABS.map((tab) => (
               <button
@@ -1634,13 +1674,13 @@ export function JobDetail({
                 onClick={() => openWorkspace(tab.key)}
                 className={`shrink-0 border-b-2 px-3 py-3 ${
                   workspaceTab === tab.key
-                    ? 'border-gray-900 text-gray-900'
-                    : 'border-transparent text-gray-500 hover:text-gray-900'
+                    ? 'border-gray-900 dark:border-gray-100 text-gray-900 dark:text-gray-50'
+                    : 'border-transparent text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100'
                 }`}
               >
                 {tab.label}
                 {tab.key === 'git' && job.diffFiles.length ? (
-                  <span className="ml-1.5 rounded bg-gray-100 px-1.5 py-0.5 text-[10px] text-gray-500">
+                  <span className="ml-1.5 rounded bg-gray-100 dark:bg-white/5 px-1.5 py-0.5 text-[10px] text-gray-500 dark:text-gray-400">
                     {job.diffFiles.length}
                   </span>
                 ) : null}

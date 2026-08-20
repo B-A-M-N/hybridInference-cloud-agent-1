@@ -16,12 +16,17 @@ vi.mock('@/components/features/auth/ProtectedRoute', () => ({
   ProtectedRoute: ({ children }: { children: React.ReactNode }) => <>{children}</>,
 }));
 
-vi.mock('@/components/providers', () => ({
-  useAuth: () => ({
-    state: { user: { user_name: 'Ada', email: 'ada@example.com', role: 'internal' } },
-    logout: vi.fn(),
-  }),
-}));
+vi.mock('@/components/providers', async () => {
+  const { translate } = await import('@/lib/i18n/translate');
+  return {
+    useAuth: () => ({
+      state: { user: { user_name: 'Ada', email: 'ada@example.com', role: 'internal' } },
+      logout: vi.fn(),
+    }),
+    useT: () => (key: Parameters<typeof translate>[1], vars?: Parameters<typeof translate>[2]) =>
+      translate('en', key, vars),
+  };
+});
 
 vi.mock('@/components/providers/AuthProvider', () => ({
   hasRole: () => true,

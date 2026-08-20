@@ -143,17 +143,17 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
   if (loading) {
     return (
       <section className="mx-auto w-full max-w-3xl px-6 pt-28">
-        <p className="text-center text-sm text-gray-500">Loading…</p>
+        <p className="text-center text-sm text-gray-500 dark:text-gray-400">Loading…</p>
       </section>
     );
   }
 
   return (
     <section className="mx-auto w-full max-w-3xl px-6 pb-20 pt-28">
-      <h1 className="text-center text-[28px] font-semibold tracking-[-0.025em] text-gray-950">
+      <h1 className="text-center text-[28px] font-semibold tracking-[-0.025em] text-gray-950 dark:text-gray-50">
         What should the agent do?
       </h1>
-      <p className="mt-2 text-center text-sm leading-relaxed text-gray-500">
+      <p className="mt-2 text-center text-sm leading-relaxed text-gray-500 dark:text-gray-400">
         Runs in an isolated sandbox. No credentials inside — the output is a draft PR.
       </p>
 
@@ -165,10 +165,10 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
 
       <div
         aria-disabled={disconnected || undefined}
-        className={`rounded-xl border border-gray-200/90 shadow-[0_14px_40px_-28px_rgba(17,24,39,0.5)] transition ${
+        className={`rounded-xl border border-gray-200/90 dark:border-white/10 shadow-[0_14px_40px_-28px_rgba(17,24,39,0.5)] transition ${
           disconnected
-            ? 'mt-4 bg-gray-50'
-            : 'mt-8 bg-white focus-within:border-crimson/30 focus-within:ring-4 focus-within:ring-crimson/[0.05]'
+            ? 'mt-4 bg-gray-50 dark:bg-gray-950'
+            : 'mt-8 bg-white dark:bg-gray-900 focus-within:border-crimson/30 focus-within:ring-4 focus-within:ring-crimson/[0.05]'
         }`}
       >
         <textarea
@@ -186,12 +186,12 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
               ? 'Connect GitHub to describe a task'
               : 'Describe a task… e.g. Fix the SSE total-timeout regression on /v1/messages and add a unit test'
           }
-          className="w-full resize-none rounded-t-xl border-0 bg-transparent px-5 pb-2 pt-4 text-[15px] leading-relaxed text-gray-900 placeholder:text-gray-400 focus:outline-none focus:ring-0 disabled:cursor-not-allowed"
+          className="w-full resize-none rounded-t-xl border-0 bg-transparent px-5 pb-2 pt-4 text-[15px] leading-relaxed text-gray-900 dark:text-gray-50 placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-0 disabled:cursor-not-allowed"
         />
 
-        <div className="flex flex-wrap items-center gap-2 border-t border-gray-100/90 px-3.5 py-2.5">
+        <div className="flex flex-wrap items-center gap-2 border-t border-gray-100/90 dark:border-white/5 px-3.5 py-2.5">
           {disconnected ? (
-            <span className="inline-flex min-w-0 flex-1 items-center gap-2 text-[13px] text-gray-400">
+            <span className="inline-flex min-w-0 flex-1 items-center gap-2 text-[13px] text-gray-400 dark:text-gray-500">
               <svg
                 className="h-4 w-4 shrink-0"
                 viewBox="0 0 24 24"
@@ -217,7 +217,7 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
                 onChange={setRepo}
               />
               <Picker label="Branch" value={branch} options={branches} onChange={setBranch} />
-              <span className="h-4 w-px bg-gray-200" />
+              <span className="h-4 w-px bg-gray-200 dark:bg-white/10" />
               <Picker
                 label="Agent"
                 value={runtime}
@@ -253,7 +253,7 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
       </div>
 
       {error ? (
-        <p className="mt-3 text-center text-[13px] text-red-600" role="alert">
+        <p className="mt-3 text-center text-[13px] text-red-600 dark:text-red-400" role="alert">
           {error}
         </p>
       ) : null}
@@ -262,7 +262,7 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
           a fixed "$2.00" the composer never sent — it is a backend cap, not a
           choice made on this screen, so it belongs on the job instead. */}
       {config?.github_connected && config.agent_egress_tier ? (
-        <p className="mt-3 text-center text-[12px] text-gray-500">
+        <p className="mt-3 text-center text-[12px] text-gray-500 dark:text-gray-400">
           Network: setup {TIER_LABELS[config.setup_egress_tier ?? ''] ?? config.setup_egress_tier} ·
           agent {TIER_LABELS[config.agent_egress_tier] ?? config.agent_egress_tier}
         </p>
