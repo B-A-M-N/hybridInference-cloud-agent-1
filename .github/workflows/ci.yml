@@ -272,13 +272,6 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
-    env:
-      TEST_DB_HOST: localhost
-      TEST_DB_PORT: ${{ job.services.postgres.ports['5432'] }}
-      TEST_DB_NAME: hybridinference_test_db
-      TEST_DB_USER: postgres
-      TEST_DB_PASSWORD: postgres
-
     steps:
       - uses: actions/checkout@v6
         with:
@@ -287,6 +280,25 @@ jobs:
       - name: Isolate uv cache dir
         run: |
           echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache" >> "${GITHUB_ENV}"
+
+      # Into GITHUB_ENV from a step, and not a job-level `env:` block, because
+      # the `job` context — which is where the mapped host port lives — is not
+      # available to `jobs.<id>.env`. A job-level block referencing it does not
+      # fail at the step; the whole workflow is rejected before anything runs.
+      #
+      # The port is looked up rather than fixed at 5432: `ports: - 5432/tcp`
+      # asks for an ephemeral host port, which is what lets this job run on a
+      # runner that already has a Postgres of its own — spark2 is also the
+      # staging host.
+      - name: Point the fixtures at the service container
+        run: |
+          {
+            echo "TEST_DB_HOST=localhost"
+            echo "TEST_DB_PORT=${{ job.services.postgres.ports['5432'] }}"
+            echo "TEST_DB_NAME=hybridinference_test_db"
+            echo "TEST_DB_USER=postgres"
+            echo "TEST_DB_PASSWORD=postgres"
+          } >> "${GITHUB_ENV}"
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
@@ -334,7 +346,7 @@ jobs:
       # fail to connect and every test would skip. The tier runs in about 15
       # seconds; there is nothing here worth sharding.
       - name: Pytest (dbtest tier)
-        run: uv run pytest -q -m "dbtest" --junitxml=${RUNNER_TEMP}/dbtest.xml
+        run: uv run pytest -q -m "dbtest" --junitxml="${RUNNER_TEMP}/dbtest.xml"
 
       # The second half of the same guard. A fixture that skips on a database
       # it cannot reach turns a broken service container into a passing job,
