@@ -525,6 +525,37 @@ export async function listAgentJobEvents(
   return jsonOrThrow(resp);
 }
 
+/** One stored event labelled with the conversation turn it belongs to. */
+export interface AgentThreadEventApi extends AgentJobEventApi {
+  job_id: string;
+  turn_no: number;
+}
+
+/** Page through every turn's event log in append order. */
+export async function listAgentThreadEvents(
+  jobId: string,
+  after = 0,
+  limit = 1000,
+): Promise<{ events: AgentThreadEventApi[]; next_cursor: number }> {
+  const resp = await fetchWithAuth(
+    API_BASE,
+    `/v1/agent/jobs/${encodeURIComponent(jobId)}/thread/events?after=${after}&limit=${limit}`,
+  );
+  return jsonOrThrow(resp);
+}
+
+/** Read a complete thread without imposing the server's page size on Chat. */
+export async function listAllAgentThreadEvents(jobId: string): Promise<AgentThreadEventApi[]> {
+  const events: AgentThreadEventApi[] = [];
+  let cursor = 0;
+  for (;;) {
+    const page = await listAgentThreadEvents(jobId, cursor, 1000);
+    events.push(...page.events);
+    if (page.events.length < 1000 || page.next_cursor <= cursor) return events;
+    cursor = page.next_cursor;
+  }
+}
+
 export async function getAgentJobArtifact(
   jobId: string,
   kind: string,

@@ -1,6 +1,6 @@
 'use client';
 
-// The trajectory: every stored event of a turn, in order, with the payload
+// The trajectory: every stored event of the conversation, in order, with the payload
 // behind each one.
 //
 // The chat tab beside this is a reading of the stream. This is the stream —
@@ -10,7 +10,7 @@
 
 import { useMemo, useState } from 'react';
 
-import type { AgentJobEventApi } from '@/lib/api/agents';
+import type { AgentJobEventApi, AgentThreadEventApi } from '@/lib/api/agents';
 import { formatDuration } from './TurnFooter';
 import {
   filterTrajectory,
@@ -116,7 +116,7 @@ function RowDetail({ row, resultRow }: { row: TrajectoryRow; resultRow?: Traject
   );
 }
 
-export function TrajectoryView({ events }: { events: AgentJobEventApi[] }) {
+export function TrajectoryView({ events }: { events: (AgentJobEventApi | AgentThreadEventApi)[] }) {
   const [query, setQuery] = useState('');
   const [selectedId, setSelectedId] = useState<number | null>(null);
 
@@ -137,8 +137,8 @@ export function TrajectoryView({ events }: { events: AgentJobEventApi[] }) {
   if (rows.length === 0) {
     return (
       <p className="py-8 text-center text-[13px] text-gray-500">
-        This turn stored no events. A turn that ran before event capture, or one that never started,
-        has nothing to show here.
+        This conversation stored no events. A thread that ran before event capture, or one whose
+        first turn never started, has nothing to show here.
       </p>
     );
   }
@@ -171,10 +171,16 @@ export function TrajectoryView({ events }: { events: AgentJobEventApi[] }) {
       </div>
 
       <div className="overflow-hidden rounded-lg border border-gray-200">
-        {visible.map((row) => {
+        {visible.map((row, index) => {
           const open = selectedId === row.id;
+          const startsTurn = index === 0 || visible[index - 1].turnNo !== row.turnNo;
           return (
             <div key={row.id} className="border-b border-gray-100 last:border-b-0">
+              {startsTurn && rows.some((other) => other.turnNo !== row.turnNo) ? (
+                <p className="bg-gray-50 px-3 py-1 text-[11px] font-medium uppercase tracking-wide text-gray-400">
+                  Turn {row.turnNo}
+                </p>
+              ) : null}
               <button
                 type="button"
                 onClick={() => setSelectedId(open ? null : row.id)}

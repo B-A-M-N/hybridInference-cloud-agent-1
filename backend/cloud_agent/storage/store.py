@@ -875,6 +875,58 @@ class AgentJobStore:
             "jobs": job_rows,
         }
 
+    async def list_thread_events_after(
+        self,
+        *,
+        job_id: str,
+        user_id: str,
+        after_id: int = 0,
+        limit: int = 500,
+    ) -> list[dict[str, Any]] | None:
+        """Page a whole thread's events, payloads intact.
+
+        The per-job read beside this one is scoped to the turn being watched.
+        Without this thread read, history keeps only durable messages, so
+        everything an earlier turn *did* becomes invisible even though every
+        row remains stored.
+
+        Payloads are intentionally preserved: the caller needs tool inputs and
+        outputs to reconstruct the historical activity. The result is paged so
+        a long thread is not pulled into memory in one response.
+
+        :returns: ``None`` when the job does not exist or is not the caller's,
+            matching :meth:`get_thread_for_job`.
+        """
+        async with self._pool.acquire() as conn:
+            thread_id = await conn.fetchval(
+                "SELECT thread_id FROM agent_jobs WHERE id = $1 AND user_id = $2",
+                job_id,
+                user_id,
+            )
+            if thread_id is None:
+                return None
+            rows = await conn.fetch(
+                """
+                SELECT e.id,
+                       e.job_id,
+                       j.turn_no,
+                       e.attempt_id,
+                       e.seq,
+                       e.event_type,
+                       e.payload,
+                       e.created_at
+                FROM agent_job_events e
+                JOIN agent_jobs j ON j.id = e.job_id
+                WHERE j.thread_id = $1 AND e.id > $2
+                ORDER BY e.id
+                LIMIT $3
+                """,
+                thread_id,
+                after_id,
+                limit,
+            )
+        return [{**dict(row), "payload": _load_json(row["payload"])} for row in rows]
+
     async def thread_stats_inputs(self, *, job_id: str, user_id: str) -> dict[str, Any] | None:
         """Return everything needed to summarize the thread containing a job.
 

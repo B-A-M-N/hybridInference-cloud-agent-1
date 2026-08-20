@@ -95,6 +95,8 @@ from cloud_agent.schemas import (
     AgentTerminalSessionResizeRequest,
     AgentTerminalSessionResponse,
     AgentThreadArchiveResponse,
+    AgentThreadEvent,
+    AgentThreadEventsResponse,
     AgentThreadMessageResponse,
     AgentThreadPinResponse,
     AgentThreadResponse,
@@ -1773,6 +1775,40 @@ async def get_agent_thread_stats(
         events=inputs["events"],
     )
     return AgentThreadStatsResponse(thread_id=inputs["thread_id"], **asdict(stats))
+
+
+@router.get("/jobs/{job_id}/thread/events", response_model=AgentThreadEventsResponse)
+async def list_agent_thread_events(
+    job_id: str,
+    after: int = Query(0, ge=0, description="Return events with a global id greater than this."),
+    limit: int = Query(_EVENT_PAGE_SIZE, ge=1, le=1000),
+    user: dict[str, Any] = Depends(require_agent_owner),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+) -> AgentThreadEventsResponse:
+    """Page every turn's event log, with payloads and turn labels intact."""
+    job_store = _require_store(store)
+    await _owned_job(job_store, job_id, user)
+    events = await job_store.list_thread_events_after(
+        job_id=job_id, user_id=user["user_id"], after_id=after, limit=limit
+    )
+    if events is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return AgentThreadEventsResponse(
+        events=[
+            AgentThreadEvent(
+                id=event["id"],
+                job_id=event["job_id"],
+                turn_no=event.get("turn_no") or 1,
+                attempt_id=event["attempt_id"],
+                seq=event["seq"],
+                event_type=event["event_type"],
+                payload=event["payload"],
+                created_at=_iso(event["created_at"]),
+            )
+            for event in events
+        ],
+        next_cursor=events[-1]["id"] if events else after,
+    )
 
 
 @router.get("/jobs/{job_id}/events", response_model=AgentJobEventsResponse)

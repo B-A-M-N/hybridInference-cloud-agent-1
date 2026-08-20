@@ -10,13 +10,15 @@
 // So this projects the raw API events rather than the display model. Nothing
 // here is folded, deduplicated, or hidden.
 
-import type { AgentJobEventApi } from '@/lib/api/agents';
+import type { AgentJobEventApi, AgentThreadEventApi } from '@/lib/api/agents';
 
 /** The lanes the minimap groups events into, coarse on purpose. */
 export type TrajectoryLane = 'input' | 'model' | 'tools' | 'other';
 
 export interface TrajectoryRow {
   id: number;
+  /** Which turn of the thread this row belongs to. */
+  turnNo: number;
   attemptId: number;
   seq: number;
   eventType: string;
@@ -113,7 +115,7 @@ function detailOf(eventType: string, payload: Record<string, unknown>): string {
  * the call, so it carries whatever thinking preceded execution — and the view
  * says so rather than implying it measured the tool itself.
  */
-export function toTrajectory(events: AgentJobEventApi[]): TrajectoryRow[] {
+export function toTrajectory(events: (AgentJobEventApi | AgentThreadEventApi)[]): TrajectoryRow[] {
   const resultByCall = new Map<string, AgentJobEventApi>();
   for (const event of events) {
     if (event.event_type !== 'tool_result') continue;
@@ -135,6 +137,7 @@ export function toTrajectory(events: AgentJobEventApi[]): TrajectoryRow[] {
 
     return {
       id: event.id,
+      turnNo: (event as AgentThreadEventApi).turn_no ?? 1,
       attemptId: event.attempt_id,
       seq: event.seq,
       eventType,
@@ -170,6 +173,6 @@ export function filterTrajectory(rows: TrajectoryRow[], query: string): Trajecto
 }
 
 /** Serialize the stored stream for download, exactly as the platform holds it. */
-export function toSessionLog(events: AgentJobEventApi[]): string {
+export function toSessionLog(events: (AgentJobEventApi | AgentThreadEventApi)[]): string {
   return events.map((event) => JSON.stringify(event)).join('\n');
 }
