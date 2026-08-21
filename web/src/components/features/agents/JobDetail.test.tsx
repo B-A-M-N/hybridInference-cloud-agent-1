@@ -943,7 +943,8 @@ describe('JobDetail reasoning effort', () => {
   const THINKING_CONFIG = {
     ...AGENT_CONFIG,
     runtime_reasoning_efforts: { 'claude-code': ['low', 'medium', 'high', 'xhigh', 'max'] },
-    // Neither `medium` nor `xhigh`, matching the real glm-5.3 entry.
+    // Read as a yes/no, not as a vocabulary: the offered levels are the
+    // platform's four.
     model_reasoning_efforts: { 'qwen-test': ['low', 'high', 'max'] },
   };
 
@@ -957,12 +958,12 @@ describe('JobDetail reasoning effort', () => {
 
   afterEach(() => cleanup());
 
-  it('offers exactly what the model accepts for the turn it would run', async () => {
+  it('offers the platform levels for the turn it would run', async () => {
     render(<JobDetail job={makeJob()} />);
 
     const picker = await screen.findByLabelText('Reasoning for this turn');
     const offered = Array.from(picker.querySelectorAll('option')).map((o) => o.textContent);
-    expect(offered).toEqual(['low', 'high', 'max']);
+    expect(offered).toEqual(['low', 'medium', 'high', 'max']);
   });
 
   it('leads with the inherited level, and the deepest when nothing was inherited', async () => {

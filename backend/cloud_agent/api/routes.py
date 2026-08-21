@@ -78,6 +78,7 @@ from cloud_agent.mcp_registry import connection_states, registry_for_user
 from cloud_agent.schemas import (
     BASE_REF_METADATA_KEY,
     EVENT_TYPE_PATTERN,
+    PLATFORM_REASONING_EFFORTS,
     RESET_REASONING_EFFORT,
     AgentConfigResponse,
     AgentFollowUpRequest,
@@ -489,9 +490,10 @@ async def get_agent_config(
         # will hit — not /v1/models, which answers for the *browsing* user and
         # offered models whose first agent call then 404ed.
         models=await agent_visible_models(gateway, user_id=user["user_id"]),
-        # Two halves of one control. The composer offers their intersection per
-        # (runtime, model) pair and no control when it is empty — which is also
-        # what an older gateway, answering no domains, produces.
+        # What each runtime can express, and which models take the parameter at
+        # all. The composer offers the platform's levels narrowed to the first
+        # and gated on the second, and no control when either is empty — which
+        # is also what an older gateway, answering no domains, produces.
         runtime_reasoning_efforts=runtime_reasoning_efforts(),
         model_reasoning_efforts=await agent_model_reasoning_efforts(
             gateway, user_id=user["user_id"]
@@ -1211,16 +1213,24 @@ async def _require_offered_effort(
         HTTPException: 400 when the pair does not offer this value.
     """
     if effort is None or effort == RESET_REASONING_EFFORT:
-        # The sentinel means Auto wherever it appears. On a follow-up it also
+        # The sentinel means unset wherever it appears. On a follow-up it also
         # has to be told apart from "inherit" (that caller checks it before
         # getting here); on a create there is nothing to inherit, so the two
-        # spellings of Auto are the same answer and neither is a 400.
+        # spellings are the same answer and neither is a 400.
         return None
     runtime_levels = runtime_reasoning_efforts().get(runtime, [])
-    model_levels = (await agent_model_reasoning_efforts(gateway, user_id=user["user_id"])).get(
-        model, []
+    # The model's entry is read as a yes/no — does it take the parameter at
+    # all — and not for its contents. Per-model domains were tried and
+    # withdrawn: the providers' documented lists disagreed with what their
+    # APIs accept, so the levels are this platform's and the same everywhere.
+    takes_effort = bool(
+        (await agent_model_reasoning_efforts(gateway, user_id=user["user_id"])).get(model)
     )
-    offered = [level for level in runtime_levels if level in model_levels]
+    offered = (
+        [level for level in PLATFORM_REASONING_EFFORTS if level in runtime_levels]
+        if takes_effort
+        else []
+    )
     if effort in offered:
         return effort
     raise HTTPException(

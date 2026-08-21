@@ -130,6 +130,19 @@ reasoning_efforts: tuple[str, ...] = ()   # empty = cannot express effort
 | pi | `("minimal", "low", "medium", "high")` | `--thinking <v>` **plus** `"reasoning": true` in the provider entry the wrapper writes | **Verified against the pinned 0.73.1.** Two of its six flag levels are dropped from the declaration: `xhigh` arrives as `high`, `off` sends nothing. The flag is inert without the provider declaration, which is why the wrapper changed too |
 | opencode / kilo | `("none", "minimal", "low", "medium", "high", "xhigh", "max")` | `models.<id>.options.reasoningEffort` in the wrapper's config — no CLI flag exists | **Verified against the pinned 1.18.9 / 7.4.17.** Tier 2 for events, which says nothing about this: expressing a documented config option is not the normalization work tiering is about |
 
+> **Amended 2026-08-20 (Murphy): the levels are a fixed platform list,
+> `low / medium / high / max`.** The per-model domain below was tried and
+> withdrawn. What killed it was evidence, not taste: Z.AI *documents*
+> `low/high/max` for glm-5.3, and its API accepts all seven — and says so
+> itself when handed a bad value (`reasoning_effort must be one of: none,
+> minimal, low, medium, high, xhigh, max`). A domain copied from a doc is
+> a guess wearing a citation, and the shipped glm-5.3 entry was already
+> wrong on exactly that basis. The two guards that survive are facts: the
+> runtime must be able to express the level (verified per pinned CLI), and
+> the model must take the parameter at all (or the gateway drops it and
+> the control does nothing). The rest of this section is kept as the
+> record of what was tried.
+
 **The offered set** for a composer selection is
 `runtime.reasoning_efforts ∩ model.reasoning_efforts`, **in the model's
 order**. For claude-code × glm-5.3 that is `[low, high, max]`; for

@@ -241,20 +241,39 @@ describe('TaskComposer reasoning effort', () => {
   const thinking = config({
     models: ['model-a', 'model-plain'],
     runtime_reasoning_efforts: { 'claude-code': ['low', 'medium', 'high', 'xhigh', 'max'] },
-    // No `medium` and no `xhigh`, as the real glm-5.3 has neither: the
-    // intersection has to drop levels the runtime can say but the model
-    // cannot take, and the list has to follow the model's own order.
+    // Read as a yes/no — does this model take the parameter — not as a
+    // vocabulary. The levels offered are the platform's four.
     model_reasoning_efforts: { 'model-a': ['low', 'high', 'max'] },
   });
 
-  it('offers exactly what the model accepts, and nothing the platform invented', async () => {
+  it('offers the platform levels the runtime can express', async () => {
     vi.mocked(getAgentConfig).mockResolvedValue(thinking);
 
     render(<TaskComposer />);
 
     const picker = await screen.findByLabelText('Reasoning');
     const offered = Array.from(picker.querySelectorAll('option')).map((o) => o.textContent);
-    expect(offered).toEqual(['low', 'high', 'max']);
+    // `medium` although the model's entry omits it — that entry is a yes/no.
+    // `xhigh` dropped although claude-code can say it — not a platform level.
+    expect(offered).toEqual(['low', 'medium', 'high', 'max']);
+  });
+
+  it('drops a platform level the runtime cannot express', async () => {
+    vi.mocked(getAgentConfig).mockResolvedValue(
+      config({
+        models: ['model-a'],
+        // pi's real shape: it has no `max`.
+        runtimes: ['pi'],
+        runtime_reasoning_efforts: { pi: ['minimal', 'low', 'medium', 'high'] },
+        model_reasoning_efforts: { 'model-a': ['low', 'high', 'max'] },
+      }),
+    );
+
+    render(<TaskComposer />);
+
+    const picker = await screen.findByLabelText('Reasoning');
+    const offered = Array.from(picker.querySelectorAll('option')).map((o) => o.textContent);
+    expect(offered).toEqual(['low', 'medium', 'high']);
   });
 
   it('starts at the deepest level on offer', async () => {

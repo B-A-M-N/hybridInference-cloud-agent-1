@@ -1,28 +1,32 @@
 import type { AgentConfigApi } from '@/lib/api/agents';
 
-// Which reasoning efforts a (runtime, model) pair can honour.
+// Which reasoning efforts a turn may be run at.
 //
-// The list is the model's API vocabulary intersected with what the runtime can
-// say, and that is the whole of it: there is no platform-invented "auto" entry
-// any more. An Auto option could only mean "we send nothing and let the
-// defaults decide", and for claude-code that was measurably a lie — the CLI
-// sends `high` whether or not we pass a flag, so Auto and high were the same
-// request wearing two names.
+// **A fixed platform list, not the model's own vocabulary.** Deriving the list
+// per model was tried and withdrawn: the providers' documented domains
+// disagreed with what their APIs actually accept (Z.AI documents low/high/max
+// for glm-5.3 and accepts all seven), and a domain copied from a doc is a
+// guess wearing a citation. Four levels, the same everywhere, is a claim we
+// can keep.
 //
-// The intersection is computed here rather than by either composer, so the two
-// cannot disagree about what is on offer — and the backend validates the same
-// rule again at create time, because a UI is not a permission.
+// Two guards survive, because both are facts rather than preferences:
+//
+// - **the runtime must be able to say it.** Verified against each pinned CLI
+//   (see `effort_wire_shapes.md`), and load-bearing: claude-code turns a level
+//   it does not know into `high` without complaint, so offering one it lacks
+//   would run a depth nobody chose.
+// - **the model must take the parameter at all.** The gateway forwards
+//   `reasoning_effort` only for models whose registry entry lists it, so
+//   offering it elsewhere would be a control that changes nothing.
+
+/** What this platform offers, wherever it can be delivered. */
+export const PLATFORM_EFFORTS = ['low', 'medium', 'high', 'max'];
 
 /**
- * Levels both halves accept, weakest first. Empty means no control belongs on
- * screen: either this runtime cannot express one, this model takes none, or
- * the backend predates the feature and reports neither.
+ * The levels to show for a pair, weakest first, or `[]` for no control.
  *
- * Order comes from the declarations, which are contractually weakest-to-
- * strongest on both sides (`RuntimeCapabilities.reasoning_efforts` and
- * models.yaml `reasoning_efforts`, both pinned by tests). That is what lets
- * {@link highestEffort} be "the last one" instead of a ranking table this
- * layer would have to invent and keep in step with two vocabularies.
+ * The model's entry in `model_reasoning_efforts` is read as a yes/no — does
+ * this model take the parameter — and not for its contents.
  */
 export function offeredEfforts(
   config: AgentConfigApi | null,
@@ -30,8 +34,9 @@ export function offeredEfforts(
   model: string,
 ): string[] {
   const runtimeLevels = config?.runtime_reasoning_efforts?.[runtime] ?? [];
-  const modelLevels = config?.model_reasoning_efforts?.[model] ?? [];
-  return modelLevels.filter((level) => runtimeLevels.includes(level));
+  const modelTakesIt = (config?.model_reasoning_efforts?.[model] ?? []).length > 0;
+  if (!modelTakesIt) return [];
+  return PLATFORM_EFFORTS.filter((level) => runtimeLevels.includes(level));
 }
 
 /** The deepest level on offer, or `''` when the pair offers no control. */
