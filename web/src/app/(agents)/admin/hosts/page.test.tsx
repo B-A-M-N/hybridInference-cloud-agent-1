@@ -40,7 +40,14 @@ import {
   setAgentRuntimeVersion,
 } from '@/lib/api/admin';
 
-import { formatAge, formatImage, formatSlots, formatVersions, runtimeMenu } from './format';
+import {
+  describeMenu,
+  formatAge,
+  formatImage,
+  formatSlots,
+  formatVersions,
+  runtimeMenu,
+} from './format';
 import AdminHostsPage from './page';
 
 const mocked = {
@@ -356,5 +363,67 @@ describe('version and image cells', () => {
       ['claude-code', ['2.1.220', '2.1.235']],
       ['pi', ['0.73.1']],
     ]);
+  });
+});
+
+describe('the harness section reads as a choice, not a list', () => {
+  beforeEach(() => {
+    auth.role = 'admin';
+    Object.values(mocked).forEach((m) => m.mockReset());
+    mocked.list.mockResolvedValue(pool([host()]));
+  });
+
+  afterEach(cleanup);
+
+  it('names the ceiling, because the menu is the image and not this page', () => {
+    expect(describeMenu(['2.1.220', '2.1.235'])).toBe(
+      'Image default 2.1.220 · also built in: 2.1.235',
+    );
+    // The row an operator cannot act on says so in one clause rather than
+    // implying, by looking identical to the others, that a choice exists.
+    expect(describeMenu(['0.145.0'])).toBe('The image holds only 0.145.0.');
+    expect(describeMenu([])).toBe('No version reported.');
+  });
+
+  it('puts the runtime with a real choice first', async () => {
+    // Alphabetical order buried claude-code — the only selectable one — under
+    // codex. The section exists for the runtime that can move.
+    mocked.list.mockResolvedValue(
+      pool([
+        host({
+          runtime_versions_available: {
+            codex: ['0.145.0'],
+            'claude-code': ['2.1.220', '2.1.235'],
+            pi: ['0.73.1'],
+          },
+        }),
+      ]),
+    );
+    render(<AdminHostsPage />);
+
+    await screen.findByLabelText('claude-code');
+    const labels = [...document.querySelectorAll('label[for^="harness-version-"]')].map(
+      (node) => node.textContent,
+    );
+    expect(labels[0]).toBe('claude-code');
+  });
+
+  it('still offers a fixed runtime, compressed but not removed', async () => {
+    // Pinning a single-version runtime is a weak choice, not an absent one:
+    // the control stays, it just stops taking three lines to say nothing.
+    mocked.list.mockResolvedValue(
+      pool([
+        host({
+          runtime_versions_available: {
+            'claude-code': ['2.1.220', '2.1.235'],
+            codex: ['0.145.0'],
+          },
+        }),
+      ]),
+    );
+    render(<AdminHostsPage />);
+
+    const codex = (await screen.findByLabelText('codex')) as HTMLSelectElement;
+    expect([...codex.options].map((o) => o.textContent)).toEqual(['Image default', '0.145.0']);
   });
 });
