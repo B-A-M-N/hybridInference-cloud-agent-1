@@ -10,16 +10,16 @@ replica that claimed it. Together with the runtime/image/version columns from
 0007 this is the durable claim-time attestation; the mutable host heartbeat row
 is deliberately not used to decide or describe what one replica ran.
 
-Revision ID: 0013_execution_profiles
-Revises: 0012_residency_grant
+Revision ID: 0015_execution_profiles
+Revises: 0014_reasoning_effort
 """
 
 from __future__ import annotations
 
 from alembic import op
 
-revision = "0013_execution_profiles"
-down_revision = "0012_residency_grant"
+revision = "0015_execution_profiles"
+down_revision = "0014_reasoning_effort"
 branch_labels = None
 depends_on = None
 
