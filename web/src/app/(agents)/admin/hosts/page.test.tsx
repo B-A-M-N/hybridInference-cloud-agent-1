@@ -364,14 +364,17 @@ describe('the harness section reads as a choice, not a list', () => {
 
   afterEach(cleanup);
 
-  it('names the ceiling, because the menu is the image and not this page', () => {
+  it('says only what the dropdown cannot', () => {
+    // Which version "Image default" resolves to — invisible in a closed
+    // select, and the reason to write anything under the name at all.
     expect(describeMenu(['2.1.220', '2.1.235'])).toBe(
       'Image default 2.1.220 · also built in: 2.1.235',
     );
-    // The row an operator cannot act on says so in one clause rather than
-    // implying, by looking identical to the others, that a choice exists.
-    expect(describeMenu(['0.145.0'])).toBe('The image holds only 0.145.0.');
-    expect(describeMenu([])).toBe('No version reported.');
+    // One version is no gap: opening the select answers it. A line per
+    // runtime explaining that there was nothing to choose was five copies of
+    // the same non-fact, and it crowded out the one runtime that had a choice.
+    expect(describeMenu(['0.145.0'])).toBe('');
+    expect(describeMenu([])).toBe('');
   });
 
   it('puts the runtime with a real choice first', async () => {
