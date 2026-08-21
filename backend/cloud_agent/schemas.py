@@ -599,6 +599,19 @@ class WorkerClaimResponse(BaseModel):
     #: Null is Auto. A runner too old to read it simply runs at the CLI's
     #: default, which is what the field means anyway.
     reasoning_effort: str | None = None
+    #: The CLI version this attempt was stamped with, resolved at claim from
+    #: the thread's pin, the deployment's selection, or the host's default.
+    #:
+    #: The runner puts it on the sandbox's PATH. Undeclared, it was the other
+    #: half of the same bug: the claim resolved a version and wrote it onto the
+    #: attempt, this model dropped it, the runner saw nothing and ran the image
+    #: default — so the row said 2.1.235 while the sandbox ran 2.1.220. A
+    #: silently false record is worse than a refused claim, and nothing in the
+    #: job's own output contradicts it.
+    #:
+    #: Null means the image default, which is what a runner too old to read it
+    #: runs anyway.
+    runtime_version: str | None = Field(None, max_length=128)
     worker_token: str
     sandbox_token: str = Field(
         "",
