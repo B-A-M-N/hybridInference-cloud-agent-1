@@ -537,14 +537,31 @@ export default function AdminHostsPage() {
           )}
         </div>
 
-        {/* ── Enroll ───────────────────────────────────────────────── */}
+        {/* ── Enroll ───────────────────────────────────────────────────
+            The section said what could go wrong and never what it was for.
+            Every other heading here carries a line saying what it is; this one
+            opened on the typo hazard, so the first question it drew was "what
+            is enrolling?" — which the card never answered.
+
+            What it buys is *identity*: without it a runner authenticates with
+            the pool-wide dispatcher token and reports its own name, so the name
+            is a label anything holding that token can claim, and drain or
+            remove are suggestions. That is the sentence that was missing. */}
         <div className="mt-10">
-          <h2 className="text-sm font-medium text-gray-600 dark:text-gray-400">Enroll a host</h2>
+          <h2 className="text-sm font-medium text-gray-600 dark:text-gray-400">
+            Give a host its own identity
+          </h2>
+          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
+            Until a machine enrols, its runner signs in with the token every host shares and tells
+            us its own name — so Drain and Remove apply to a name, not to a machine. Enrolling gives
+            it a credential of its own, and those actions start binding to it.
+          </p>
           <div className="mt-4 rounded-2xl border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 px-6 py-5 shadow-sm">
             <p className="max-w-3xl text-sm leading-5 text-gray-500 dark:text-gray-400">
-              Mints a one-time token for the machine named here. The name is chosen on this side
-              because registration upserts: a name already in use has that host&apos;s credential
-              revoked and its row reset, so a typo can evict a working machine.
+              Issues a one-time token for the machine named here; its runner spends it once, at
+              first start. The name is chosen on this side because registration upserts: a name
+              already in use has that host&apos;s credential revoked and its row reset, so a typo
+              can evict a working machine.
             </p>
             <div className="mt-4 flex flex-wrap items-center gap-2">
               <label htmlFor="enroll-host" className="sr-only">
