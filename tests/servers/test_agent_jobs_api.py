@@ -4441,7 +4441,15 @@ async def test_effort_is_offered_only_where_runtime_and_model_both_deliver(clien
 
     # claude-code can express effort; the Tier 2 runtimes cannot, and are
     # absent rather than listed with an empty vocabulary.
-    assert config["runtime_reasoning_efforts"]["claude-code"] == ["low", "medium", "high", "max"]
+    # The raw capability, still the CLI's own vocabulary — the composer
+    # narrows it to the platform list rather than the backend pre-chewing it.
+    assert config["runtime_reasoning_efforts"]["claude-code"] == [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    ]
     assert config["runtime_reasoning_efforts"]["codex"][:3] == ["none", "minimal", "low"]
     assert config["runtime_reasoning_efforts"]["pi"] == ["minimal", "low", "medium", "high"]
     assert config["model_reasoning_efforts"] == {"glm-5.1": ["low", "high", "max"]}
@@ -4471,8 +4479,8 @@ async def test_a_turn_without_an_effort_is_auto(client: AsyncClient):
     assert job["reasoning_effort"] is None
 
 
-async def test_an_effort_outside_the_intersection_is_refused(client: AsyncClient):
-    """``medium`` is a real claude-code level and not one this model takes.
+async def test_a_level_outside_the_platform_list_is_refused(client: AsyncClient):
+    """``xhigh`` is a real claude-code level, and not one this platform offers.
 
     Refused rather than clamped to a neighbour: a turn served at a depth
     nobody chose, while reporting the one they did, is the same lie as a flag
@@ -4484,7 +4492,7 @@ async def test_an_effort_outside_the_intersection_is_refused(client: AsyncClient
             "repo": "owner/name",
             "task_prompt": "fix it",
             "model": "glm-5.1",
-            "reasoning_effort": "medium",
+            "reasoning_effort": "xhigh",
         },
     )
 
@@ -4492,7 +4500,31 @@ async def test_an_effort_outside_the_intersection_is_refused(client: AsyncClient
     detail = response.json()["detail"]["error"]
     assert detail["type"] == "reasoning_effort_not_available"
     # The refusal names what *is* available, so the caller can retry once.
-    assert "low, high, max" in detail["message"]
+    assert "low, medium, high, max" in detail["message"]
+
+
+async def test_the_platform_list_is_offered_whatever_the_model_documents(
+    client: AsyncClient,
+):
+    """The model entry is a yes/no, not a vocabulary.
+
+    Per-model domains were withdrawn because the providers' docs disagreed
+    with their own APIs, so a level the platform offers is accepted for any
+    model that takes the parameter at all — `medium` here, which this
+    fixture's model does not list.
+    """
+    response = await client.post(
+        "/v1/agent/jobs",
+        json={
+            "repo": "owner/name",
+            "task_prompt": "fix it",
+            "model": "glm-5.1",
+            "reasoning_effort": "medium",
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["reasoning_effort"] == "medium"
 
 
 async def test_an_effort_on_a_model_that_takes_none_is_refused(client: AsyncClient):

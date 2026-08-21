@@ -69,15 +69,28 @@ fallback**.
   No silent drop, no nearest-value clamping: glm-5.3 has no `medium`,
   and a `medium` that quietly becomes `high` is the `--effort` lie again
   with extra steps.
-- **Null means auto — "the platform does not instruct", not "nothing is
-  instructed".** No flag on the argv, nothing stored, and the migration
-  backfills nothing. The draft claimed this preserved today's behaviour
-  bit-for-bit, and the §7.1 capture disproved it: **claude-code 2.1.220
-  sends `output_config: {effort: "high"}` whether or not `--effort` was
-  passed**, so for that runtime our Auto and our `high` are the same
-  request. The honest statement is the one above; the operational
-  consequence is in §7.1 and belongs in the gateway PR, not in a
-  surprise.
+- **No Auto option (amended 2026-08-20, Murphy).** The picker shows the
+  model's own levels and nothing else, and preselects the **deepest**.
+  The draft had an Auto entry meaning "the platform does not instruct";
+  the §7.1 capture had already shown that to be a lie for claude-code,
+  which sends `output_config: {effort: "high"}` with or without the flag
+  — Auto and `high` were the same request under two names. Rather than
+  label the lie, the entry is gone: *what the API offers is what the UI
+  shows*.
+
+  Two consequences, both accepted deliberately:
+
+  1. **The deepest level is now the default** for every pair that offers
+     one. On claude-code that is free — its own default was already
+     `high`, and `max` is one step. On codex, pi, opencode and kilo it is
+     not: those sent **no** effort before, so their turns ran at the
+     provider's default and now run at the deepest on offer. That is a
+     real cost and latency increase, chosen knowingly.
+  2. **Null survives in the data, not in the UI.** Every turn created
+     before this feature has none, `omitted = inherit` on a follow-up is
+     still how inheritance is expressed, and the `"auto"` sentinel stays
+     as the only way an API caller can undo an inherited level. No
+     composer sends it.
 
 ## 3. Vocabulary and capability model
 
@@ -112,15 +125,36 @@ reasoning_efforts: tuple[str, ...] = ()   # empty = cannot express effort
 
 | Runtime | v1 declaration | How it is expressed | Status |
 |---|---|---|---|
-| claude-code | `("low", "medium", "high", "max")` | `--effort <v>` on the argv, one-shot and `prepare_live` alike | **Verified against the pinned 2.1.220**: reaches the wire as `output_config.effort`. See §7.1 for what that capture also revealed |
+| claude-code | `("low", "medium", "high", "xhigh", "max")` | `--effort <v>` on the argv, one-shot and `prepare_live` alike | **Verified against the pinned 2.1.220**: reaches the wire as `output_config.effort`. See §7.1 for what that capture also revealed |
 | codex | `("none", "minimal", "low", "medium", "high", "xhigh", "max")` | `-c model_reasoning_effort="<v>"` alongside the existing `-c` provider flags | **Verified against the pinned 0.145.0**: reaches the wire as `reasoning.effort` in the `/v1/responses` body, which the gateway's Responses translation already maps. The draft deferred this as unverified; verifying took one local capture and the answer was yes |
 | pi | `("minimal", "low", "medium", "high")` | `--thinking <v>` **plus** `"reasoning": true` in the provider entry the wrapper writes | **Verified against the pinned 0.73.1.** Two of its six flag levels are dropped from the declaration: `xhigh` arrives as `high`, `off` sends nothing. The flag is inert without the provider declaration, which is why the wrapper changed too |
 | opencode / kilo | `("none", "minimal", "low", "medium", "high", "xhigh", "max")` | `models.<id>.options.reasoningEffort` in the wrapper's config — no CLI flag exists | **Verified against the pinned 1.18.9 / 7.4.17.** Tier 2 for events, which says nothing about this: expressing a documented config option is not the normalization work tiering is about |
 
+> **Amended 2026-08-20 (Murphy): the levels are a fixed platform list,
+> `low / medium / high / max`.** The per-model domain below was tried and
+> withdrawn. What killed it was evidence, not taste: Z.AI *documents*
+> `low/high/max` for glm-5.3, and its API accepts all seven — and says so
+> itself when handed a bad value (`reasoning_effort must be one of: none,
+> minimal, low, medium, high, xhigh, max`). A domain copied from a doc is
+> a guess wearing a citation, and the shipped glm-5.3 entry was already
+> wrong on exactly that basis. The two guards that survive are facts: the
+> runtime must be able to express the level (verified per pinned CLI), and
+> the model must take the parameter at all (or the gateway drops it and
+> the control does nothing). The rest of this section is kept as the
+> record of what was tried.
+
 **The offered set** for a composer selection is
-`runtime.reasoning_efforts ∩ model.reasoning_efforts`. For
-claude-code × glm-5.3 that is `{low, high, max}`; for anything × a
-non-reasoning model it is empty and the control disappears.
+`runtime.reasoning_efforts ∩ model.reasoning_efforts`, **in the model's
+order**. For claude-code × glm-5.3 that is `[low, high, max]`; for
+anything × a non-reasoning model it is empty and the control disappears.
+
+**Both declarations are ordered weakest to strongest**, and that order is
+load-bearing rather than cosmetic: the composer preselects the deepest
+level by taking the last one. The alternative — a platform-wide ranking
+table — is a third vocabulary to keep in step with every CLI's and every
+provider's, which is the invention this design avoids everywhere else.
+Tests pin the order on both sides (`test_agent_runtimes`,
+`test_registry` in the gateway).
 
 **All five runtimes express it, and the draft was wrong to assume
 otherwise.** This table said `()` for three of them on the strength of

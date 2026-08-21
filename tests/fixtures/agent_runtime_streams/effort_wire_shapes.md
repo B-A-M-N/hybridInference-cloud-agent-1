@@ -29,8 +29,18 @@ model's own declared domain is what actually refuses a nonsense level.
 | Invocation | `output_config` in the body |
 |---|---|
 | **(no `--effort`)** | **`{"effort": "high"}`** |
-| `--effort low` | `{"effort": "low"}` |
-| `--effort max` | `{"effort": "max"}` |
+| `--effort low` / `max` / `xhigh` | `{"effort": "low"／"max"／"xhigh"}` |
+| `--effort ultra` / `none` / `minimal` | **`{"effort": "high"}`** — silently |
+
+**`xhigh` works, and `--help` does not say so.** The 2.1.90 help string reads
+"(low, medium, high, max)"; the first declaration was written from it and
+missed a level the product supports. The wire is the authority here, not the
+help text.
+
+**An unknown level is not refused — it becomes `high`.** That is why
+`ClaudeCodeRuntime.EFFORT_LEVELS` has to be exact in a way the config-file
+runtimes' lists do not: a level declared here that the CLI does not know would
+run the turn at `high` while the UI reported something else.
 
 **The CLI always sends an effort, defaulting to `high`.** This is the one that
 matters operationally: "the platform sent no flag" is *not* the same as "the

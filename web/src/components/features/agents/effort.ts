@@ -1,28 +1,32 @@
 import type { AgentConfigApi } from '@/lib/api/agents';
 
-// Which reasoning efforts a (runtime, model) pair can honour, and how the
-// composer spells "let them decide".
+// Which reasoning efforts a turn may be run at.
 //
-// The intersection is computed here rather than by either picker, so the two
-// composers cannot disagree about what is on offer — and the backend validates
-// the same rule again at create time, because a UI is not a permission.
+// **A fixed platform list, not the model's own vocabulary.** Deriving the list
+// per model was tried and withdrawn: the providers' documented domains
+// disagreed with what their APIs actually accept (Z.AI documents low/high/max
+// for glm-5.3 and accepts all seven), and a domain copied from a doc is a
+// guess wearing a citation. Four levels, the same everywhere, is a claim we
+// can keep.
+//
+// Two guards survive, because both are facts rather than preferences:
+//
+// - **the runtime must be able to say it.** Verified against each pinned CLI
+//   (see `effort_wire_shapes.md`), and load-bearing: claude-code turns a level
+//   it does not know into `high` without complaint, so offering one it lacks
+//   would run a depth nobody chose.
+// - **the model must take the parameter at all.** The gateway forwards
+//   `reasoning_effort` only for models whose registry entry lists it, so
+//   offering it elsewhere would be a control that changes nothing.
+
+/** What this platform offers, wherever it can be delivered. */
+export const PLATFORM_EFFORTS = ['low', 'medium', 'high', 'max'];
 
 /**
- * The option meaning "no instruction", and the value a follow-up sends to
- * clear an inherited effort — one string for one state, because on the wire
- * they are the same request.
+ * The levels to show for a pair, weakest first, or `[]` for no control.
  *
- * Defined here rather than beside the request types so this module imports
- * only a type from the API layer. A value import would make every component
- * that computes an offered set depend on that module at runtime, which is a
- * dependency a pure intersection has no use for.
- */
-export const AUTO_EFFORT = 'auto';
-
-/**
- * Levels both halves accept. Empty means no control belongs on screen: either
- * this runtime cannot express one, this model takes none, or the backend
- * predates the feature and reports neither.
+ * The model's entry in `model_reasoning_efforts` is read as a yes/no — does
+ * this model take the parameter — and not for its contents.
  */
 export function offeredEfforts(
   config: AgentConfigApi | null,
@@ -30,15 +34,12 @@ export function offeredEfforts(
   model: string,
 ): string[] {
   const runtimeLevels = config?.runtime_reasoning_efforts?.[runtime] ?? [];
-  const modelLevels = config?.model_reasoning_efforts?.[model] ?? [];
-  return runtimeLevels.filter((level) => modelLevels.includes(level));
+  const modelTakesIt = (config?.model_reasoning_efforts?.[model] ?? []).length > 0;
+  if (!modelTakesIt) return [];
+  return PLATFORM_EFFORTS.filter((level) => runtimeLevels.includes(level));
 }
 
-/**
- * The picker's options: Auto first, then the offered levels. Empty when
- * nothing is offered, which is what makes the control disappear rather than
- * render a menu with one useless entry.
- */
-export function effortOptions(offered: string[]): string[] {
-  return offered.length > 0 ? [AUTO_EFFORT, ...offered] : [];
+/** The deepest level on offer, or `''` when the pair offers no control. */
+export function highestEffort(offered: string[]): string {
+  return offered.length > 0 ? offered[offered.length - 1] : '';
 }

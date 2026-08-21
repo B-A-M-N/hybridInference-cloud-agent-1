@@ -475,9 +475,11 @@ export interface FollowUpAgentJobRequest {
   runtime?: string;
   model?: string;
   /**
-   * Omitted inherits the previous turn's effort; the literal `'auto'` (the
-   * components' `AUTO_EFFORT`) clears it back to Auto. Null cannot mean
-   * "clear" — it is already what "inherit" sends.
+   * Omitted inherits the previous turn's effort. The literal `'auto'` clears
+   * it back to unset — null cannot mean "clear", it is already what "inherit"
+   * sends. No composer sends the sentinel (they always show a real level and
+   * send it); it stays because it is the only way an API caller can undo an
+   * inherited choice.
    */
   reasoning_effort?: string;
 }

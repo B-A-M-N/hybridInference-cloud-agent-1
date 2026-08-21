@@ -240,20 +240,48 @@ describe('TaskComposer reasoning effort', () => {
 
   const thinking = config({
     models: ['model-a', 'model-plain'],
-    runtime_reasoning_efforts: { 'claude-code': ['low', 'medium', 'high', 'max'] },
-    // No `medium`, as the real registry's glm-5.3 has none: the intersection
-    // has to drop a level the runtime can say but the model cannot take.
+    runtime_reasoning_efforts: { 'claude-code': ['low', 'medium', 'high', 'xhigh', 'max'] },
+    // Read as a yes/no — does this model take the parameter — not as a
+    // vocabulary. The levels offered are the platform's four.
     model_reasoning_efforts: { 'model-a': ['low', 'high', 'max'] },
   });
 
-  it('offers only the levels both the runtime and the model accept', async () => {
+  it('offers the platform levels the runtime can express', async () => {
     vi.mocked(getAgentConfig).mockResolvedValue(thinking);
 
     render(<TaskComposer />);
 
     const picker = await screen.findByLabelText('Reasoning');
     const offered = Array.from(picker.querySelectorAll('option')).map((o) => o.textContent);
-    expect(offered).toEqual(['auto', 'low', 'high', 'max']);
+    // `medium` although the model's entry omits it — that entry is a yes/no.
+    // `xhigh` dropped although claude-code can say it — not a platform level.
+    expect(offered).toEqual(['low', 'medium', 'high', 'max']);
+  });
+
+  it('drops a platform level the runtime cannot express', async () => {
+    vi.mocked(getAgentConfig).mockResolvedValue(
+      config({
+        models: ['model-a'],
+        // pi's real shape: it has no `max`.
+        runtimes: ['pi'],
+        runtime_reasoning_efforts: { pi: ['minimal', 'low', 'medium', 'high'] },
+        model_reasoning_efforts: { 'model-a': ['low', 'high', 'max'] },
+      }),
+    );
+
+    render(<TaskComposer />);
+
+    const picker = await screen.findByLabelText('Reasoning');
+    const offered = Array.from(picker.querySelectorAll('option')).map((o) => o.textContent);
+    expect(offered).toEqual(['low', 'medium', 'high']);
+  });
+
+  it('starts at the deepest level on offer', async () => {
+    vi.mocked(getAgentConfig).mockResolvedValue(thinking);
+
+    render(<TaskComposer />);
+
+    expect(await screen.findByLabelText('Reasoning')).toHaveValue('max');
   });
 
   it('shows no control when the model takes no effort', async () => {
@@ -296,23 +324,29 @@ describe('TaskComposer reasoning effort', () => {
     return vi.mocked(createAgentJob).mock.calls[0][0];
   }
 
-  it('sends nothing for Auto', async () => {
+  it('sends whatever the control shows, untouched', async () => {
     vi.mocked(getAgentConfig).mockResolvedValue(thinking);
 
-    expect(await submit()).not.toHaveProperty('reasoning_effort');
+    expect(await submit()).toMatchObject({ reasoning_effort: 'max' });
   });
 
   it('sends the chosen level', async () => {
     vi.mocked(getAgentConfig).mockResolvedValue(thinking);
 
-    expect(await submit('max')).toMatchObject({ reasoning_effort: 'max' });
+    expect(await submit('low')).toMatchObject({ reasoning_effort: 'low' });
   });
 
-  it('falls back to Auto when the chosen model stops offering the level', async () => {
+  it('sends nothing when the pair offers no control', async () => {
+    vi.mocked(getAgentConfig).mockResolvedValue(config({ models: ['model-plain'] }));
+
+    expect(await submit()).not.toHaveProperty('reasoning_effort');
+  });
+
+  it("falls back to the new pair's deepest when the model stops offering one", async () => {
     vi.mocked(getAgentConfig).mockResolvedValue(thinking);
 
     render(<TaskComposer />);
-    fireEvent.change(await screen.findByLabelText('Reasoning'), { target: { value: 'high' } });
+    fireEvent.change(await screen.findByLabelText('Reasoning'), { target: { value: 'low' } });
     // model-plain takes no effort at all, so the control goes away entirely —
     // and the pending selection must not survive to be submitted.
     fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'model-plain' } });

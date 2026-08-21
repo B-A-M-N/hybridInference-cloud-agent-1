@@ -42,11 +42,25 @@ EVENT_TYPE_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
 # publisher targets the PR at it, so a caller must not be able to forge one.
 BASE_REF_METADATA_KEY = "_agent_base_ref"
 
-#: What a follow-up sends to clear an inherited effort back to Auto. A plain
-#: null cannot mean this: null is what "no override, inherit" already sends,
-#: and the two have to be distinguishable or a thread that once chose an
-#: effort could never stop choosing one.
+#: What a follow-up sends to clear an inherited effort. A plain null cannot
+#: mean this: null is what "no override, inherit" already sends, and the two
+#: have to be distinguishable or a thread that once chose an effort could never
+#: stop choosing one.
 RESET_REASONING_EFFORT = "auto"
+
+#: The reasoning-effort levels this platform offers, weakest first.
+#:
+#: **Fixed, not derived per model.** Deriving them was tried and withdrawn: the
+#: providers' documented domains disagreed with what their APIs accept — Z.AI
+#: documents low/high/max for glm-5.3 and its API accepts all seven, saying so
+#: itself when handed a bad value ("reasoning_effort must be one of: none,
+#: minimal, low, medium, high, xhigh, max") — so a domain copied from a doc is
+#: a guess wearing a citation. Four levels everywhere is a claim that holds.
+#:
+#: Still narrowed by what a runtime can express, which is verified per pinned
+#: CLI and load-bearing: claude-code turns a level it does not know into
+#: `high` without complaint.
+PLATFORM_REASONING_EFFORTS = ("low", "medium", "high", "max")
 
 
 class AgentJobCreate(BaseModel):
