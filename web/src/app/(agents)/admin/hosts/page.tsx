@@ -262,12 +262,19 @@ export default function AdminHostsPage() {
           </div>
         )}
 
-        {/* ── Claiming ─────────────────────────────────────────────────
+        {/* ── Where new jobs run ───────────────────────────────────────
             Its own section because it is a *policy*, not a property of any
             one row: inline beside the pool it read as a caption on the table.
-            The pin itself still lives per-host, where the choice is made. */}
+            The pin itself still lives per-host, where the choice is made.
+
+            Titled for the effect rather than the mechanism. "Claiming" is this
+            codebase's word — a runner claims from the queue — and the first
+            person to read it on the page asked what it meant. Not "assignment"
+            either: nothing is assigned, because runners pull. */}
         <div className="mt-10">
-          <h2 className="text-sm font-medium text-gray-600 dark:text-gray-400">Claiming</h2>
+          <h2 className="text-sm font-medium text-gray-600 dark:text-gray-400">
+            Where new jobs run
+          </h2>
           <div className="mt-4 rounded-2xl border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 px-6 shadow-sm">
             <div className="flex min-h-20 flex-col justify-center gap-3 py-5 sm:flex-row sm:items-center">
               <div className="min-w-0 flex-1">
