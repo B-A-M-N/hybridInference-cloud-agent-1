@@ -3062,6 +3062,7 @@ async def worker_claim(
         model=claim["model"],
         execution_profile=claim.get("execution_profile", "trusted-v1"),
         reasoning_effort=claim.get("reasoning_effort"),
+        runtime_version=claim.get("runtime_version"),
         worker_token=token,
         sandbox_token=sandbox_token,
         mcp_token=mcp_token,

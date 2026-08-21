@@ -19,11 +19,13 @@ pinned here rather than left to the end-to-end run:
 
 from __future__ import annotations
 
+import inspect
+import re
 from typing import Any
 
 import pytest
 
-from cloud_agent.schemas import WorkerClaimAttestation
+from cloud_agent.schemas import WorkerClaimAttestation, WorkerClaimResponse
 from cloud_agent.storage.store import resolve_runtime_version
 from cloud_agent_host.runner import (
     ClaimedJob,
@@ -306,3 +308,29 @@ def test_the_menu_survives_validation() -> None:
     assert attestation.model_dump()["runtime_versions_available"] == {
         "claude-code": ["2.1.220", "2.1.235"]
     }
+
+
+def test_the_claim_response_declares_everything_the_runner_reads() -> None:
+    """The other direction of the same wire, and the same failure.
+
+    ``ClaimedJob.from_response`` reads the claim body by key. A key the
+    response model does not declare is a key the endpoint cannot send, so the
+    runner reads ``None`` and carries on with its default — which for
+    ``runtime_version`` meant the attempt row recorded 2.1.235 while the
+    sandbox ran 2.1.220. The job succeeded. Nothing in its output disagreed
+    with the row.
+
+    Asserted as a join rather than a field list: this fails for whatever is
+    threaded through next and forgotten in the middle.
+    """
+    source = inspect.getsource(ClaimedJob.from_response)
+    read = set(re.findall(r'body\.get\("([a-z_]+)"\)', source))
+    read |= set(re.findall(r'body\["([a-z_]+)"\]', source))
+    declared = set(WorkerClaimResponse.model_fields)
+
+    unsendable = read - declared
+    assert not unsendable, (
+        f"ClaimedJob reads {sorted(unsendable)} from the claim body, which "
+        "WorkerClaimResponse does not declare — the endpoint cannot send them "
+        "and the runner will always see None"
+    )
