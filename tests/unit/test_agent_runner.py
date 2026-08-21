@@ -703,11 +703,24 @@ def test_claim_sends_the_host_only_when_there_is_one(monkeypatch):
 
     runner_mod.claim(base_url="http://gw", dispatcher_token="t", worker_id="w1", lease_ttl=60)
     runner_mod.claim(
-        base_url="http://gw", dispatcher_token="t", worker_id="w1", lease_ttl=60, host="runner-b"
+        base_url="http://gw",
+        dispatcher_token="t",
+        worker_id="w1",
+        lease_ttl=60,
+        host="runner-b",
+        attestation={
+            "sandbox_runtime": "io.containerd.kata.v2",
+            "sandbox_image_digest": "sha256:abc",
+            "runtime_versions": {"claude-code": "2.1.0"},
+            "host_kernel": "host",
+            "guest_kernel": "guest",
+        },
     )
 
     assert "host" not in sent[0]
     assert sent[1]["host"] == "runner-b"
+    assert sent[1]["attestation"]["sandbox_runtime"] == "io.containerd.kata.v2"
+    assert sent[1]["attestation"]["guest_kernel"] == "guest"
 
 
 def test_the_host_flag_defaults_from_the_environment(monkeypatch):

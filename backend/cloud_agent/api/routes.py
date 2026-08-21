@@ -64,6 +64,10 @@ from cloud_agent.entitlement import (
     repos_for_user,
     require_entitled_repo,
 )
+from cloud_agent.execution_profiles import (
+    RESERVED_EXECUTION_METADATA_KEYS,
+    default_execution_profile,
+)
 from cloud_agent.gateway import GatewayError
 from cloud_agent.github_app import AppNotInstalled, GitHubAppError
 from cloud_agent.host_pool import hash_secret
@@ -95,6 +99,8 @@ from cloud_agent.schemas import (
     AgentTerminalSessionResizeRequest,
     AgentTerminalSessionResponse,
     AgentThreadArchiveResponse,
+    AgentThreadEvent,
+    AgentThreadEventsResponse,
     AgentThreadMessageResponse,
     AgentThreadPinResponse,
     AgentThreadResponse,
@@ -395,6 +401,7 @@ def _job_response(
         task_prompt=job["task_prompt"],
         runtime=job["runtime"],
         model=job["model"],
+        execution_profile=job.get("execution_profile", "trusted-v1"),
         reasoning_effort=job.get("reasoning_effort"),
         base_ref=base_ref,
         base_sha=job["base_sha"],
@@ -1304,6 +1311,10 @@ async def _create_job_as(
     # Reserved display fact: caller metadata must not be able to claim the
     # job was pinned from a different branch than the one the API resolved.
     metadata.pop(BASE_REF_METADATA_KEY, None)
+    # Execution policy and its evidence are server-owned facts. Opaque
+    # metadata must not be able to manufacture a contradictory audit trail.
+    for key in RESERVED_EXECUTION_METADATA_KEYS:
+        metadata.pop(key, None)
     if body.base_ref:
         metadata[BASE_REF_METADATA_KEY] = body.base_ref
     for key, value in (reserved_metadata or {}).items():
@@ -1311,12 +1322,20 @@ async def _create_job_as(
     mcp_servers = await _resolve_mcp_servers(
         body.mcp_servers, runtime=body.runtime, store=job_store, user_id=user["user_id"]
     )
+    try:
+        execution_profile = default_execution_profile().value
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": {"type": "invalid_configuration", "message": str(exc)}},
+        ) from exc
     job = await job_store.create_job(
         user_id=user["user_id"],
         repo=body.repo,
         task_prompt=body.task_prompt,
         runtime=body.runtime,
         model=model,
+        execution_profile=execution_profile,
         reasoning_effort=reasoning_effort,
         base_sha=base_sha,
         setup_script=body.setup_script,
@@ -1773,6 +1792,40 @@ async def get_agent_thread_stats(
         events=inputs["events"],
     )
     return AgentThreadStatsResponse(thread_id=inputs["thread_id"], **asdict(stats))
+
+
+@router.get("/jobs/{job_id}/thread/events", response_model=AgentThreadEventsResponse)
+async def list_agent_thread_events(
+    job_id: str,
+    after: int = Query(0, ge=0, description="Return events with a global id greater than this."),
+    limit: int = Query(_EVENT_PAGE_SIZE, ge=1, le=1000),
+    user: dict[str, Any] = Depends(require_agent_owner),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+) -> AgentThreadEventsResponse:
+    """Page every turn's event log, with payloads and turn labels intact."""
+    job_store = _require_store(store)
+    await _owned_job(job_store, job_id, user)
+    events = await job_store.list_thread_events_after(
+        job_id=job_id, user_id=user["user_id"], after_id=after, limit=limit
+    )
+    if events is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return AgentThreadEventsResponse(
+        events=[
+            AgentThreadEvent(
+                id=event["id"],
+                job_id=event["job_id"],
+                turn_no=event.get("turn_no") or 1,
+                attempt_id=event["attempt_id"],
+                seq=event["seq"],
+                event_type=event["event_type"],
+                payload=event["payload"],
+                created_at=_iso(event["created_at"]),
+            )
+            for event in events
+        ],
+        next_cursor=events[-1]["id"] if events else after,
+    )
 
 
 @router.get("/jobs/{job_id}/events", response_model=AgentJobEventsResponse)
@@ -2495,6 +2548,10 @@ _HOST_IDENTITY_PREFIX = "host:"
 #: for every dependency override a test installs.
 _HOST_REQUEST_ATTR = "agent_host"
 
+#: Hash of the exact host credential that passed authentication. The store
+#: re-checks it while taking the slot, closing the auth-to-claim race.
+_HOST_CREDENTIAL_HASH_REQUEST_ATTR = "agent_host_credential_hash"
+
 #: Cheap structural check before touching the signing key: host credentials
 #: carry their own token prefix, so a dispatcher or admin token never reaches
 #: the host parser at all.
@@ -2567,6 +2624,7 @@ async def verify_dispatcher_access(
                     },
                 )
             request.state.__setattr__(_HOST_REQUEST_ATTR, host["host"])
+            request.state.__setattr__(_HOST_CREDENTIAL_HASH_REQUEST_ATTR, hash_secret(presented))
             return f"{_HOST_IDENTITY_PREFIX}{host['host']}"
     return await verify_admin_access(request=request, authorization=authorization)
 
@@ -2869,6 +2927,8 @@ async def worker_claim(
         worker_id=body.worker_id,
         lease_ttl_seconds=body.lease_ttl_seconds,
         host=host,
+        host_credential_hash=getattr(request.state, _HOST_CREDENTIAL_HASH_REQUEST_ATTR, None),
+        claim_attestation=(body.attestation.model_dump() if body.attestation is not None else None),
     )
     if claim is None:
         return None
@@ -3000,6 +3060,7 @@ async def worker_claim(
         setup_script=claim.get("setup_script"),
         runtime=claim["runtime"],
         model=claim["model"],
+        execution_profile=claim.get("execution_profile", "trusted-v1"),
         reasoning_effort=claim.get("reasoning_effort"),
         worker_token=token,
         sandbox_token=sandbox_token,

@@ -30,11 +30,11 @@ export function Picker({
     return null;
   }
   return (
-    <label className="relative inline-flex items-center gap-1 rounded-md px-2 py-1.5 text-[13px] font-medium text-gray-600 hover:bg-gray-100">
+    <label className="relative inline-flex items-center gap-1 rounded-md px-2 py-1.5 text-[13px] font-medium text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-white/10">
       <span className="sr-only">{label}</span>
       {/* The width of the control. Truncated rather than unbounded so one
           pathological model id cannot push the run button off the row. */}
-      <span aria-hidden className="max-w-[13rem] truncate text-gray-700">
+      <span aria-hidden className="max-w-[13rem] truncate text-gray-700 dark:text-gray-300">
         {value}
       </span>
       <svg
@@ -43,7 +43,7 @@ export function Picker({
         fill="none"
         stroke="currentColor"
         strokeWidth={1.6}
-        className="h-3.5 w-3.5 shrink-0 text-gray-400"
+        className="h-3.5 w-3.5 shrink-0 text-gray-400 dark:text-gray-500"
       >
         <path strokeLinecap="round" strokeLinejoin="round" d="m6 8 4 4 4-4" />
       </svg>

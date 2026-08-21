@@ -194,6 +194,62 @@ def test_ttft_uses_the_first_attempt_of_a_retried_turn() -> None:
     assert stats.ttft_seconds == 12.0
 
 
+def test_ttft_across_a_thread_is_the_mean_of_its_turns() -> None:
+    """A multi-turn thread reports the average first-token time, not one turn's.
+
+    Every other ttft case here has exactly one sample, which makes the mean
+    indistinguishable from the max, the min, or the sum — mutation testing
+    found that replacing the mean with `max()` left the suite green. A thread
+    is the unit this stat is displayed for, so the aggregation across turns is
+    the behaviour worth pinning, and the three samples below are chosen so
+    that no other reduction produces the same number.
+    """
+    stats = summarize_thread(
+        job_ids=["job-1", "job-2", "job-3"],
+        attempts=[
+            _attempt(job_id="job-1", offset=0),
+            _attempt(job_id="job-2", offset=100),
+            _attempt(job_id="job-3", offset=200),
+        ],
+        events=[
+            _event(job_id="job-1", seq=1, event_type="message", payload={"text": "a"}, offset=2),
+            _event(job_id="job-2", seq=1, event_type="message", payload={"text": "b"}, offset=104),
+            _event(job_id="job-3", seq=1, event_type="message", payload={"text": "c"}, offset=212),
+        ],
+    )
+
+    # Samples are 2s, 4s and 12s: mean 6, max 12, min 2, sum 18.
+    assert stats.ttft_seconds == 6.0
+
+
+def test_ttft_ignores_a_turn_that_never_produced_output() -> None:
+    """A turn with no output contributes no sample, rather than a zero.
+
+    The same rule the rest of this module follows: a measure we do not have
+    stays absent instead of becoming a number someone would average in.
+    """
+    stats = summarize_thread(
+        job_ids=["job-1", "job-2"],
+        attempts=[
+            _attempt(job_id="job-1", offset=0),
+            _attempt(job_id="job-2", offset=100),
+        ],
+        events=[
+            _event(job_id="job-1", seq=1, event_type="message", payload={"text": "a"}, offset=4),
+            # job-2 started and only ever emitted lifecycle noise.
+            _event(
+                job_id="job-2",
+                seq=1,
+                event_type="lifecycle",
+                payload={"phase": "start"},
+                offset=101,
+            ),
+        ],
+    )
+
+    assert stats.ttft_seconds == 4.0
+
+
 def test_ttft_is_absent_without_an_attempt_row() -> None:
     stats = summarize_thread(
         job_ids=["job-1"],

@@ -10,12 +10,14 @@ import type {
   AgentJobEventApi,
   AttemptResourcesApi,
   AgentThreadApi,
+  AgentThreadEventApi,
   AgentThreadMessageApi,
 } from '@/lib/api/agents';
 
 import type {
   AgentDiffFile,
   AgentEvent,
+  AgentHistoryTurn,
   AgentJob,
   AgentJobState,
   DiffLine,
@@ -295,6 +297,7 @@ function rawEventLine(event: AgentJobEventApi): string {
 
 export interface AdaptOptions {
   events?: AgentJobEventApi[];
+  threadEvents?: AgentThreadEventApi[];
   patch?: string | null;
   thread?: AgentThreadApi | null;
 }
@@ -476,6 +479,23 @@ export function toDisplayJob(job: AgentJobApi, options: AdaptOptions = {}): Agen
       priorJobIds ? priorJobIds.has(message.job_id) : message.job_id !== job.id,
     )
     .map(mapMessage);
+  const historicalJobs = (options.thread?.jobs ?? []).filter(
+    (threadJob) =>
+      threadJob.id !== job.id &&
+      (currentTurn === undefined || (threadJob.turn_no ?? 1) < currentTurn),
+  );
+  const threadEvents = options.threadEvents;
+  let historyTurns: AgentHistoryTurn[] | undefined;
+  if (threadEvents !== undefined) {
+    historyTurns = historicalJobs.map((threadJob) => ({
+      jobId: threadJob.id,
+      turnNo: threadJob.turn_no ?? 1,
+      messages: (options.thread?.messages ?? [])
+        .filter((message) => message.job_id === threadJob.id)
+        .map(mapMessage),
+      events: displayEvents(threadEvents.filter((event) => event.job_id === threadJob.id)),
+    }));
+  }
   // A turn copied by fork has no events; its durable messages are the only
   // record of what it said. For a settled job whose event log carries no
   // message rows, render the thread's copy of the turn — prompt included, so
@@ -543,6 +563,7 @@ export function toDisplayJob(job: AgentJobApi, options: AdaptOptions = {}): Agen
     parentJobId: job.parent_job_id ?? undefined,
     turnNo: job.turn_no,
     threadMessages: [...priorMessages, ...ownMessages],
+    ...(historyTurns ? { historyTurns } : {}),
     historyIncludesPrompt: ownMessages.some((message) => message.role === 'user'),
   };
 }

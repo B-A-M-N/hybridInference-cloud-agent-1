@@ -12,9 +12,10 @@ import binascii
 from datetime import datetime  # noqa: TC003
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from cloud_agent.entitlement import REPO_PATTERN
+from cloud_agent.execution_profiles import ExecutionProfile
 from cloud_agent.host_pool import ENROLL_TOKEN_TTL_S
 
 # A lease is the only thing that lets the reaper take a job back from a stuck
@@ -113,6 +114,16 @@ class AgentJobCreate(BaseModel):
     )
     metadata: dict[str, Any] | None = Field(None, description="Opaque caller metadata.")
 
+    @model_validator(mode="before")
+    @classmethod
+    def execution_profile_is_server_owned(cls, value: Any) -> Any:
+        """Refuse an apparent profile choice instead of silently ignoring it."""
+        if isinstance(value, dict) and "execution_profile" in value:
+            raise ValueError(
+                "execution_profile is server-owned; callers cannot select or downgrade it"
+            )
+        return value
+
 
 class AttemptResources(BaseModel):
     """What one attempt's sandbox consumed, as measured from the host.
@@ -146,6 +157,7 @@ class AgentJobResponse(BaseModel):
     task_prompt: str
     runtime: str
     model: str
+    execution_profile: ExecutionProfile = ExecutionProfile.TRUSTED_V1
     #: Null means Auto, which is also what every turn created before this
     #: control existed reports. The UI renders nothing for it: an absent chip
     #: is the honest display of "nobody chose".
@@ -236,6 +248,25 @@ class AgentJobEvent(BaseModel):
     event_type: str
     payload: dict[str, Any] | None = None
     created_at: str | None = None
+
+
+class AgentThreadEvent(AgentJobEvent):
+    """One event, with the turn it belongs to.
+
+    The per-job stream needs no such label — every row is the turn being
+    watched. Across a thread it is what lets a reader see where one turn
+    ended and the next began.
+    """
+
+    job_id: str
+    turn_no: int = 1
+
+
+class AgentThreadEventsResponse(BaseModel):
+    """A page of a whole thread's events, plus the cursor to resume from."""
+
+    events: list[AgentThreadEvent]
+    next_cursor: int
 
 
 class AgentJobEventsResponse(BaseModel):
@@ -498,6 +529,16 @@ class AgentGitWorkspaceResponse(BaseModel):
 # ── Worker-facing (capability-token authenticated) ─────────────────────
 
 
+class WorkerClaimAttestation(BaseModel):
+    """Runtime evidence collected by this exact claiming runner replica."""
+
+    sandbox_runtime: str | None = Field(None, max_length=128)
+    sandbox_image_digest: str | None = Field(None, max_length=512)
+    runtime_versions: dict[str, str] = Field(default_factory=dict, max_length=64)
+    host_kernel: str | None = Field(None, max_length=256)
+    guest_kernel: str | None = Field(None, max_length=256)
+
+
 class WorkerClaimRequest(BaseModel):
     """Worker request to claim the next queued job."""
 
@@ -521,6 +562,13 @@ class WorkerClaimRequest(BaseModel):
             "predate host reporting."
         ),
     )
+    attestation: WorkerClaimAttestation | None = Field(
+        None,
+        description=(
+            "Claim-time runtime/image/version/kernel stamp from this exact runner replica. "
+            "Required for untrusted-kata-v1; trusted-v1 claims may omit it."
+        ),
+    )
 
 
 class WorkerClaimResponse(BaseModel):
@@ -538,6 +586,7 @@ class WorkerClaimResponse(BaseModel):
     setup_script: str | None = None
     runtime: str
     model: str
+    execution_profile: ExecutionProfile = ExecutionProfile.TRUSTED_V1
     #: Null is Auto. A runner too old to read it simply runs at the CLI's
     #: default, which is what the field means anyway.
     reasoning_effort: str | None = None

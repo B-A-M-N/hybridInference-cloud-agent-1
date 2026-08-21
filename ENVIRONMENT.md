@@ -44,7 +44,7 @@ need a gateway secret here, the design is wrong — stop and escalate.
 | Variable | New? | Value / who provisions |
 |---|---|---|
 | `AGENT_DATABASE_URL` | **NEW** | Postgres DSN for the agent-owned database. Must be a database this service owns outright — sharing one with the gateway would reintroduce the coupling the split exists to remove. |
-| `AGENT_TEST_DATABASE_URL` | **NEW** | Used by `make test-db` only. Local/CI throwaway database. |
+| `TEST_DB_HOST` / `TEST_DB_PORT` / `TEST_DB_NAME` / `TEST_DB_USER` / `TEST_DB_PASSWORD` | **NEW** | Used by `make test-db` only — the `dbtest` fixtures read these five, not a DSN. Defaults: `localhost` / `5432` / `hybridinference_test_db` / `postgres` / `postgres`. `TEST_DB_NAME` must contain `_test_`; the fixtures refuse to run otherwise, so they cannot be pointed at a real database by a stray environment. Under `pytest -n`, each xdist worker appends its own id and needs that database to already exist — which is why CI runs this tier serially. |
 
 ### Gateway contracts
 
@@ -64,6 +64,7 @@ need a gateway secret here, the design is wrong — stop and escalate.
 | `AGENT_CONTROL_TOKEN_SECRET` | **NEW** | Signs host/worker control tokens. Replaces the old derivation from the gateway's `API_KEY_SECRET` (task E3). Generate random 32 bytes, unique per environment. |
 | `AGENT_SESSION_SECRET` | **NEW** | Signs the web session cookie (task E8). Generate random 32 bytes, unique per environment. |
 | `AGENT_DISPATCHER_TOKEN` | existing | Authenticates host agents claiming work. Existing deployments may hold this outside this service's own configuration; confirm where it is actually read from before cutover rather than assuming. |
+| `AGENT_DEFAULT_EXECUTION_PROFILE` | **NEW** | Server-owned policy for new root threads. `untrusted-kata-v1` requires an enrolled Host whose current credential still matches and whose exact claiming replica attests `io.containerd.kata.v2` with a guest kernel different from the Host. `trusted-v1` preserves the legacy runc/process path for trusted internal/dev repositories. Follow-ups and forks inherit the stored profile; callers cannot select it. |
 | `AGENT_ONCALL_DISPATCH_TOKEN` | **NEW** | Authenticates the gateway alert relay on `/v1/agent/service/oncall/*` — one credential, one door, like `AGENT_DISPATCHER_TOKEN` for the runner. Random 32 bytes, same value in the relay's `.env.oncall`, distinct per environment. Unset opens nothing (the door then answers only to `ADMIN_TOKEN`). |
 | `AGENT_ONCALL_USER_ID` | **NEW** | Gateway user id every on-call job runs as. Its role decides which models the job's grant may carry (`glm-5.2` needs `internal`+), and its quota is what the analysis spends. Unset: the on-call door answers 503, the rest of the service is unaffected. |
 | `AGENT_RESIDENCY_TTL_S` | **NEW** | How long a hot sandbox's residency lease lives between host heartbeats (session-resident threads, design §7). Granted at establish and on every beat; the reaper lapses what outlives it, demoting the thread to a COLD start off its checkpoint. Default 1800. Also the cap on how long an idle resident process is kept at all, and the TTL of the residency's thread-attributed grant (design §14) — the idle process holds a live credential, renewed by the same beats and revoked with the residency, so this number bounds its lifetime too. |
@@ -177,7 +178,7 @@ compose, because they name the stack rather than configure it.
 | Variable | New? | Notes |
 |---|---|---|
 | `AGENT_SANDBOX_BACKEND` | existing | |
-| `AGENT_SANDBOX_RUNTIME` | existing | `runc` for trusted internal repos; Kata/gVisor required for public multi-tenant use. |
+| `AGENT_SANDBOX_RUNTIME` | existing | Unset or `runc` for trusted internal repos. The enforced public/untrusted profile currently requires exactly `io.containerd.kata.v2`; gVisor needs its own future execution profile and is not accepted as Kata evidence. |
 | `AGENT_SANDBOX_IMAGE` | existing | Tag it per environment (`freeinference-cloud-agent-job:staging` / `:prod`) on a machine that runs both, or a rebuild on one side replaces the image the other is running. `-job` and not `-sandbox`, so it cannot be read as `…-sandbox-<env>-runner`, the image the runner container itself is built from. |
 | `AGENT_SANDBOX_NETWORK` | existing | |
 | `AGENT_SANDBOX_DOCKER` | existing | |

@@ -41,10 +41,14 @@ const REFRESH_MS = 30_000;
 const ENROLL_TTL_SECONDS = 900;
 
 const STATUS_STYLES: Record<string, string> = {
-  online: 'bg-emerald-50 text-emerald-700 ring-emerald-600/20',
-  draining: 'bg-amber-50 text-amber-700 ring-amber-600/20',
-  enrolling: 'bg-blue-50 text-blue-700 ring-blue-600/20',
-  disabled: 'bg-gray-100 text-gray-600 ring-gray-500/20',
+  online:
+    'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 ring-emerald-600/20 dark:ring-emerald-500/25',
+  draining:
+    'bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 ring-amber-600/20 dark:ring-amber-500/25',
+  enrolling:
+    'bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 ring-blue-600/20 dark:ring-blue-500/25',
+  disabled:
+    'bg-gray-100 dark:bg-white/5 text-gray-600 dark:text-gray-400 ring-gray-500/20 dark:ring-white/15',
 };
 
 function StatusBadge({ status }: { status: string }) {
@@ -177,8 +181,12 @@ export default function AdminHostsPage() {
   if (!isAdmin) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-3 p-8">
-        <h1 className="text-xl font-semibold text-gray-900">Admin access required</h1>
-        <p className="text-sm text-gray-500">The runner host pool is visible to admins only.</p>
+        <h1 className="text-xl font-semibold text-gray-900 dark:text-gray-50">
+          Admin access required
+        </h1>
+        <p className="text-sm text-gray-500 dark:text-gray-400">
+          The runner host pool is visible to admins only.
+        </p>
       </div>
     );
   }
@@ -190,8 +198,8 @@ export default function AdminHostsPage() {
   return (
     <div className="flex-1 overflow-y-auto p-6">
       <div className="mx-auto max-w-5xl">
-        <h1 className="text-[17px] font-semibold text-gray-900">Runner hosts</h1>
-        <p className="mt-1 max-w-3xl text-[12px] text-gray-500">
+        <h1 className="text-[17px] font-semibold text-gray-900 dark:text-gray-50">Runner hosts</h1>
+        <p className="mt-1 max-w-3xl text-[12px] text-gray-500 dark:text-gray-400">
           The machines that may run agent jobs. A host appears here once a runner on it has reported
           in, so this is the set that has polled — not a claim that any of them is reachable right
           now. Pinning is not a drain: the new host starts claiming immediately, while jobs already
@@ -199,7 +207,7 @@ export default function AdminHostsPage() {
         </p>
 
         {error && (
-          <div className="mt-4 rounded-lg bg-red-50 px-3 py-2 text-[12px] text-red-600">
+          <div className="mt-4 rounded-lg bg-red-50 dark:bg-red-500/10 px-3 py-2 text-[12px] text-red-600 dark:text-red-400">
             {error}
             <button
               type="button"
@@ -213,7 +221,7 @@ export default function AdminHostsPage() {
 
         {notice && (
           <div
-            className="mt-4 rounded-lg bg-gray-50 px-3 py-2 text-[12px] text-gray-700"
+            className="mt-4 rounded-lg bg-gray-50 dark:bg-gray-950 px-3 py-2 text-[12px] text-gray-700 dark:text-gray-300"
             role="status"
           >
             {notice}
@@ -221,7 +229,7 @@ export default function AdminHostsPage() {
         )}
 
         {staleActive && (
-          <div className="mt-4 rounded-lg bg-amber-50 px-3 py-2 text-[12px] text-amber-800">
+          <div className="mt-4 rounded-lg bg-amber-50 dark:bg-amber-500/10 px-3 py-2 text-[12px] text-amber-800 dark:text-amber-300">
             {staleActive.host} last polled {formatAge(staleActive.seconds_since_seen)}. Jobs are
             pinned to it, so if its runner is down the queue is stopped — pin another host or choose
             Any host. (A machine that is simply busy also stops polling, so check before switching.)
@@ -233,25 +241,25 @@ export default function AdminHostsPage() {
             type="button"
             disabled={busy || activeHost === null}
             onClick={() => void handlePin(null)}
-            className="rounded-md border border-gray-200 px-2.5 py-1.5 text-[12px] font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-40"
+            className="rounded-md border border-gray-200 dark:border-white/10 px-2.5 py-1.5 text-[12px] font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-white/5 disabled:opacity-40"
           >
             Any host
           </button>
-          <span className="text-[12px] text-gray-500">
+          <span className="text-[12px] text-gray-500 dark:text-gray-400">
             {activeHost ? `Pinned to ${activeHost}` : 'Unpinned — any runner may claim'}
           </span>
         </div>
 
         {loading ? (
-          <p className="mt-6 text-[12px] text-gray-500">Loading…</p>
+          <p className="mt-6 text-[12px] text-gray-500 dark:text-gray-400">Loading…</p>
         ) : hosts.length === 0 ? (
-          <p className="mt-6 text-[12px] text-gray-500">
+          <p className="mt-6 text-[12px] text-gray-500 dark:text-gray-400">
             No runner has polled yet. Start one and it will appear here.
           </p>
         ) : (
           <div className="mt-4 overflow-x-auto">
             <table className="min-w-full text-left text-[12px]">
-              <thead className="text-gray-500">
+              <thead className="text-gray-500 dark:text-gray-400">
                 <tr>
                   <th className="py-2 pr-4 font-medium">Host</th>
                   <th className="py-2 pr-4 font-medium">Status</th>
@@ -262,19 +270,21 @@ export default function AdminHostsPage() {
                   <th className="py-2 pr-4 font-medium">Actions</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-gray-100">
+              <tbody className="divide-y divide-gray-100 dark:divide-white/5">
                 {hosts.map((host) => (
                   <tr key={host.host} className="align-top">
                     <td className="py-2.5 pr-4">
                       <div className="flex items-center gap-2">
-                        <span className="font-medium text-gray-900">{host.host}</span>
+                        <span className="font-medium text-gray-900 dark:text-gray-50">
+                          {host.host}
+                        </span>
                         {host.active && (
-                          <span className="rounded-full bg-crimson/[0.08] px-2 py-0.5 text-[11px] text-crimson">
+                          <span className="rounded-full bg-crimson/[0.08] dark:bg-crimson/20 px-2 py-0.5 text-[11px] text-crimson dark:text-crimson-light">
                             pinned
                           </span>
                         )}
                       </div>
-                      <div className="mt-0.5 text-[11px] text-gray-500">
+                      <div className="mt-0.5 text-[11px] text-gray-500 dark:text-gray-400">
                         {/* Which door the machine came through decides what its
                             name is worth: reported by the runner (a scheduling
                             label anything with the dispatcher credential can
@@ -286,12 +296,16 @@ export default function AdminHostsPage() {
                     <td className="py-2.5 pr-4">
                       <StatusBadge status={host.status} />
                     </td>
-                    <td className="py-2.5 pr-4 text-gray-700">{formatSlots(host)}</td>
-                    <td className="py-2.5 pr-4 text-gray-700">
+                    <td className="py-2.5 pr-4 text-gray-700 dark:text-gray-300">
+                      {formatSlots(host)}
+                    </td>
+                    <td className="py-2.5 pr-4 text-gray-700 dark:text-gray-300">
                       {host.capabilities.length > 0 ? host.capabilities.join(', ') : '—'}
                     </td>
-                    <td className="py-2.5 pr-4 text-gray-700">{host.runner_version ?? '—'}</td>
-                    <td className="py-2.5 pr-4 text-gray-700">
+                    <td className="py-2.5 pr-4 text-gray-700 dark:text-gray-300">
+                      {host.runner_version ?? '—'}
+                    </td>
+                    <td className="py-2.5 pr-4 text-gray-700 dark:text-gray-300">
                       {formatAge(host.seconds_since_seen)}
                     </td>
                     <td className="py-2.5 pr-4">
@@ -301,7 +315,7 @@ export default function AdminHostsPage() {
                             type="button"
                             disabled={busy}
                             onClick={() => void handlePin(host.host)}
-                            className="rounded-md border border-gray-200 px-2 py-1 font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-40"
+                            className="rounded-md border border-gray-200 dark:border-white/10 px-2 py-1 font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-white/5 disabled:opacity-40"
                           >
                             Pin
                           </button>
@@ -316,7 +330,7 @@ export default function AdminHostsPage() {
                                 `${host.host} is taking work again.`,
                               )
                             }
-                            className="rounded-md border border-gray-200 px-2 py-1 font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-40"
+                            className="rounded-md border border-gray-200 dark:border-white/10 px-2 py-1 font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-white/5 disabled:opacity-40"
                           >
                             Undrain
                           </button>
@@ -330,7 +344,7 @@ export default function AdminHostsPage() {
                                 `${host.host} stops taking new work; running attempts finish.`,
                               )
                             }
-                            className="rounded-md border border-gray-200 px-2 py-1 font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-40"
+                            className="rounded-md border border-gray-200 dark:border-white/10 px-2 py-1 font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-white/5 disabled:opacity-40"
                           >
                             Drain
                           </button>
@@ -339,7 +353,7 @@ export default function AdminHostsPage() {
                           type="button"
                           disabled={busy}
                           onClick={() => handleRemove(host.host, host.slots_used)}
-                          className="rounded-md border border-gray-200 px-2 py-1 font-medium text-red-600 hover:bg-red-50 disabled:opacity-40"
+                          className="rounded-md border border-gray-200 dark:border-white/10 px-2 py-1 font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 disabled:opacity-40"
                         >
                           Remove
                         </button>
@@ -353,7 +367,7 @@ export default function AdminHostsPage() {
                                 `Dropped ${host.host} from the list. A runner still polling there re-adds itself.`,
                               )
                             }
-                            className="rounded-md px-2 py-1 font-medium text-gray-500 hover:bg-gray-50 disabled:opacity-40"
+                            className="rounded-md px-2 py-1 font-medium text-gray-500 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-white/5 disabled:opacity-40"
                           >
                             Forget
                           </button>
@@ -367,9 +381,11 @@ export default function AdminHostsPage() {
           </div>
         )}
 
-        <div className="mt-8 rounded-xl border border-gray-200 bg-white p-5">
-          <h2 className="text-[14px] font-semibold text-gray-900">Enroll a host</h2>
-          <p className="mt-1 max-w-3xl text-[12px] text-gray-500">
+        <div className="mt-8 rounded-xl border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 p-5">
+          <h2 className="text-[14px] font-semibold text-gray-900 dark:text-gray-50">
+            Enroll a host
+          </h2>
+          <p className="mt-1 max-w-3xl text-[12px] text-gray-500 dark:text-gray-400">
             Mints a one-time token for the machine named here. The name is chosen on this side
             because registration upserts: a name already in use has that host&apos;s credential
             revoked and its row reset, so a typo can evict a working machine.
@@ -383,20 +399,20 @@ export default function AdminHostsPage() {
               value={enrollHost}
               onChange={(e) => setEnrollHost(e.target.value)}
               placeholder="runner-b"
-              className="rounded-md border border-gray-200 px-2.5 py-1.5 text-[12px] text-gray-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-crimson/25"
+              className="rounded-md border border-gray-200 dark:border-white/10 px-2.5 py-1.5 text-[12px] text-gray-900 dark:text-gray-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-crimson/25"
             />
             <button
               type="button"
               disabled={busy || enrollHost.trim() === ''}
               onClick={() => void handleEnroll()}
-              className="rounded-md bg-gray-900 px-2.5 py-1.5 text-[12px] font-medium text-white hover:bg-gray-800 disabled:opacity-40"
+              className="rounded-md bg-gray-900 dark:bg-gray-100 px-2.5 py-1.5 text-[12px] font-medium text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-white disabled:opacity-40"
             >
               Issue token
             </button>
           </div>
 
           {issuedToken && (
-            <div className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-[12px] text-amber-900">
+            <div className="mt-3 rounded-lg bg-amber-50 dark:bg-amber-500/10 px-3 py-2 text-[12px] text-amber-900 dark:text-amber-300">
               <p className="font-medium">
                 Token for {issuedToken.host} — copy it now, it is not shown again.
               </p>

@@ -131,6 +131,7 @@ class FakeAgentJobStore:
         }
         job.setdefault("base_sha", None)
         job.setdefault("metadata", None)
+        job.setdefault("execution_profile", "trusted-v1")
         job.setdefault("reasoning_effort", None)
         self.jobs[job_id] = job
         self.messages.append(
@@ -395,6 +396,26 @@ class FakeAgentJobStore:
             return None
         return {**job, "pinned_at": self.pinned_threads.get(job["thread_id"])}
 
+    async def list_thread_events_after(
+        self, *, job_id: str, user_id: str, after_id: int = 0, limit: int = 500
+    ) -> list[dict[str, Any]] | None:
+        """Every event of the containing thread, labelled by turn."""
+        job = self.jobs.get(job_id)
+        if job is None or job.get("user_id") != user_id:
+            return None
+        thread_id = job.get("thread_id")
+        turns = {
+            other["id"]: other.get("turn_no") or 1
+            for other in self.jobs.values()
+            if other.get("thread_id") == thread_id
+        }
+        rows = [
+            {**event, "turn_no": turns[event["job_id"]]}
+            for event in self.events
+            if event["job_id"] in turns and event["id"] > after_id
+        ]
+        return sorted(rows, key=lambda row: row["id"])[:limit]
+
     async def job_turn_telemetry(self, *, job_id: str) -> dict[str, Any] | None:
         """How the newest attempt ran. Absent until a runner reports one."""
         return self.turn_telemetry.get(job_id)
@@ -616,7 +637,13 @@ class FakeAgentJobStore:
         return None
 
     async def claim_job(
-        self, *, worker_id: str, lease_ttl_seconds: float, host: str | None = None
+        self,
+        *,
+        worker_id: str,
+        lease_ttl_seconds: float,
+        host: str | None = None,
+        host_credential_hash: str | None = None,
+        claim_attestation: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         await self.touch_runner_host(host=host, worker_id=worker_id)
         if self.active_host is not None and host != self.active_host:
@@ -992,6 +1019,61 @@ async def test_create_get_list_round_trip(client: AsyncClient):
 
     listed = await client.get("/v1/agent/jobs")
     assert [job["id"] for job in listed.json()["jobs"]] == [job_id]
+
+
+async def test_execution_profile_is_server_owned_and_reserved_metadata_is_dropped(
+    client: AsyncClient, store: FakeAgentJobStore, monkeypatch
+):
+    """The deployment chooses the boundary; a request cannot forge or lower it."""
+    monkeypatch.setenv("AGENT_DEFAULT_EXECUTION_PROFILE", "untrusted-kata-v1")
+    created = await client.post(
+        "/v1/agent/jobs",
+        json={
+            "repo": "owner/name",
+            "task_prompt": "fix it",
+            "model": "glm-5.1",
+            "metadata": {
+                "origin": "api-test",
+                "execution_profile": "trusted-v1",
+                "sandbox_runtime": "runc",
+                "guest_kernel": "forged",
+            },
+        },
+    )
+
+    assert created.status_code == 201
+    assert created.json()["execution_profile"] == "untrusted-kata-v1"
+    assert created.json()["metadata"] == {"origin": "api-test"}
+    assert store.jobs[created.json()["id"]]["execution_profile"] == "untrusted-kata-v1"
+
+    rejected = await client.post(
+        "/v1/agent/jobs",
+        json={
+            "repo": "owner/name",
+            "task_prompt": "try to downgrade",
+            "model": "glm-5.1",
+            "execution_profile": "trusted-v1",
+        },
+    )
+    assert rejected.status_code == 422
+    assert "server-owned" in rejected.text
+
+
+async def test_follow_up_and_fork_inherit_profile_instead_of_rereading_policy(
+    client: AsyncClient, store: FakeAgentJobStore, monkeypatch
+):
+    monkeypatch.setenv("AGENT_DEFAULT_EXECUTION_PROFILE", "untrusted-kata-v1")
+    source_id = await _create_job(client)
+    store.jobs[source_id]["state"] = "succeeded"
+
+    monkeypatch.setenv("AGENT_DEFAULT_EXECUTION_PROFILE", "trusted-v1")
+    child = await client.post(f"/v1/agent/jobs/{source_id}/follow-ups", json={"prompt": "continue"})
+    fork = await client.post(f"/v1/agent/jobs/{source_id}/fork")
+
+    assert child.status_code == 201
+    assert fork.status_code == 201
+    assert child.json()["execution_profile"] == "untrusted-kata-v1"
+    assert fork.json()["execution_profile"] == "untrusted-kata-v1"
 
 
 async def test_jobs_page_by_repo_and_projects_summarize_the_task_tree(client: AsyncClient):
@@ -4543,3 +4625,46 @@ async def test_every_runtime_still_takes_ordinary_turns(client: AsyncClient):
         )
         assert response.status_code == 201, f"{runtime}: {response.text}"
         assert response.json()["reasoning_effort"] is None
+
+
+async def test_a_thread_read_returns_what_earlier_turns_did(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """A follow-up must not make the previous turn's tool activity unreachable."""
+    first_id = await _create_job(client)
+    claim = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+    auth = {"Authorization": f"Bearer {claim['worker_token']}"}
+    await client.post(
+        f"/v1/agent/worker/jobs/{first_id}/events",
+        json={"event_type": "tool_use", "payload": {"id": "t1", "name": "Bash"}},
+        headers=auth,
+    )
+    await client.post(
+        f"/v1/agent/worker/jobs/{first_id}/events",
+        json={"event_type": "message", "payload": {"text": "done"}},
+        headers=auth,
+    )
+    await client.post(f"/v1/agent/worker/jobs/{first_id}/finish", json={"state": "succeeded"})
+    second = await client.post(
+        f"/v1/agent/jobs/{first_id}/follow-ups", json={"prompt": "and now the docs"}
+    )
+    second_id = second.json()["id"]
+
+    per_job = (await client.get(f"/v1/agent/jobs/{second_id}/events")).json()
+    assert per_job["events"] == []
+
+    thread = (await client.get(f"/v1/agent/jobs/{second_id}/thread/events")).json()
+    assert [event["event_type"] for event in thread["events"]] == ["tool_use", "message"]
+    assert {event["turn_no"] for event in thread["events"]} == {1}
+    assert thread["events"][0]["payload"]["name"] == "Bash"
+
+
+async def test_a_thread_event_read_refuses_a_foreign_job(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    job_id = await _create_job(client)
+    store.jobs[job_id]["user_id"] = "someone-else"
+
+    response = await client.get(f"/v1/agent/jobs/{job_id}/thread/events")
+
+    assert response.status_code == 404

@@ -188,6 +188,7 @@ class ClaimedJob:
     worker_token: str
     # The inference credential that enters the sandbox: a gateway grant.
     sandbox_token: str
+    execution_profile: str = "trusted-v1"
     # The MCP credential, and the relay it opens. A *second* pair, because
     # tools and inference are two services now: a leaked MCP token buys no
     # inference and a leaked grant buys no tools. Empty means this run has no
@@ -240,6 +241,7 @@ class ClaimedJob:
             setup_script=body.get("setup_script"),
             runtime=body["runtime"],
             model=body["model"],
+            execution_profile=body.get("execution_profile") or "trusted-v1",
             # Absent from a control plane that predates the control, which is
             # the same thing as Auto — no separate "unknown" state to carry.
             reasoning_effort=body.get("reasoning_effort"),
@@ -409,6 +411,7 @@ def claim(
     worker_id: str,
     lease_ttl: float,
     host: str | None = None,
+    attestation: dict[str, Any] | None = None,
 ) -> ClaimedJob | None:
     """Claim the next queued job with the dispatcher credential.
 
@@ -422,6 +425,8 @@ def claim(
     payload: dict[str, Any] = {"worker_id": worker_id, "lease_ttl_seconds": lease_ttl}
     if host:
         payload["host"] = host
+    if attestation:
+        payload["attestation"] = attestation
     try:
         # this legacy base_url still also feeds sandbox gateway traffic below.
         response = httpx.post(
@@ -1447,12 +1452,15 @@ def run_once(
         backend = build_backend_from_env()
         backend.preflight()
 
+    stamper = getattr(backend, "version_stamp", None)
+    attestation: dict[str, Any] = stamper() if stamper is not None else {}
     job = claim(
         base_url=base_url,
         dispatcher_token=dispatcher_token,
         worker_id=worker_id,
         lease_ttl=lease_ttl,
         host=host,
+        attestation=attestation,
     )
     if job is None:
         print("no queued agent job; nothing to do")

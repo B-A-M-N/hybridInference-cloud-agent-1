@@ -125,6 +125,38 @@ async def test_create_get_list_round_trip(store: AgentJobStore):
     assert await store.get_job("ajob_missing") is None
 
 
+async def test_execution_profile_persists_and_is_inherited_by_follow_up_and_fork(
+    store, monkeypatch
+):
+    legacy_default = await _create_job(store, task_prompt="trusted default")
+    assert legacy_default["execution_profile"] == "trusted-v1"
+
+    monkeypatch.setenv("AGENT_DEFAULT_EXECUTION_PROFILE", "untrusted-kata-v1")
+    store_default = await _create_job(store, task_prompt="secure store default")
+    assert store_default["execution_profile"] == "untrusted-kata-v1"
+
+    source = await _create_job(
+        store,
+        task_prompt="secure thread",
+        execution_profile="untrusted-kata-v1",
+        metadata={"execution_profile": "trusted-v1"},
+    )
+    assert source["execution_profile"] == "untrusted-kata-v1"
+    async with store._pool.acquire() as conn:
+        await conn.execute("UPDATE agent_jobs SET state = 'succeeded' WHERE id = $1", source["id"])
+
+    follow_up = await store.create_follow_up(
+        parent_job_id=source["id"], user_id="user-1", prompt="continue"
+    )
+    fork = await store.fork_thread(source_job_id=source["id"], user_id="user-1")
+
+    assert follow_up is not None
+    assert fork is not None
+    assert follow_up["execution_profile"] == "untrusted-kata-v1"
+    assert fork["execution_profile"] == "untrusted-kata-v1"
+    assert (await store.get_job(source["id"]))["execution_profile"] == "untrusted-kata-v1"
+
+
 async def test_projects_summarize_a_user_s_repos_and_page_one_at_a_time(store: AgentJobStore):
     """The sidebar's task tree: a folder per repo, and a page inside one."""
     first = await _create_job(store)
@@ -1820,3 +1852,48 @@ async def test_an_unmeasured_window_is_stored_as_such_not_as_zero(store: AgentJo
     assert telemetry["cpu_usec"] is None
     assert telemetry["coverage"] == 0.0
     assert telemetry["sampler_version"] == "1"
+
+
+async def test_thread_events_span_every_turn_and_page(store: AgentJobStore):
+    """A thread's complete log stays ordered and pageable across follow-ups."""
+    first = await _create_job(store)
+    claim = await store.claim_job(worker_id="w1", lease_ttl_seconds=60)
+    assert claim is not None
+    for kind in ("tool_use", "tool_result", "message"):
+        await store.append_event(
+            attempt_id=claim["attempt_id"],
+            lease_generation=claim["lease_generation"],
+            event_type=kind,
+            payload={"marker": kind},
+        )
+    await store.transition(
+        job_id=first["id"],
+        attempt_id=claim["attempt_id"],
+        lease_generation=claim["lease_generation"],
+        from_states=("running",),
+        to_state="succeeded",
+    )
+    second = await store.create_follow_up(
+        parent_job_id=first["id"], user_id="user-1", prompt="and the docs"
+    )
+    assert second is not None
+
+    events = await store.list_thread_events_after(job_id=second["id"], user_id="user-1")
+    assert events is not None
+    assert [event["event_type"] for event in events] == ["tool_use", "tool_result", "message"]
+    assert all(event["turn_no"] == 1 for event in events)
+    assert events[0]["payload"] == {"marker": "tool_use"}
+
+    page = await store.list_thread_events_after(job_id=second["id"], user_id="user-1", limit=2)
+    assert page is not None and len(page) == 2
+    rest = await store.list_thread_events_after(
+        job_id=second["id"], user_id="user-1", after_id=page[-1]["id"]
+    )
+    assert rest is not None and [event["event_type"] for event in rest] == ["message"]
+
+
+async def test_thread_events_stop_at_the_owner(store: AgentJobStore):
+    mine = await _create_job(store)
+
+    assert await store.list_thread_events_after(job_id=mine["id"], user_id="user-2") is None
+    assert await store.list_thread_events_after(job_id=mine["id"], user_id="user-1") == []

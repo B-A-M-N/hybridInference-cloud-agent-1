@@ -19,7 +19,7 @@ export default function AgentJobPage() {
   if (loading && !job) {
     return (
       <div className="flex h-full items-center justify-center">
-        <p className="text-sm text-gray-500">Loading job…</p>
+        <p className="text-sm text-gray-500 dark:text-gray-400">Loading job…</p>
       </div>
     );
   }
@@ -27,9 +27,14 @@ export default function AgentJobPage() {
   if (error) {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-3">
-        <h1 className="text-xl font-semibold text-gray-900">Could not load this job</h1>
-        <p className="text-sm text-gray-500">{error}</p>
-        <Link href="/" className="text-sm font-medium text-crimson hover:underline">
+        <h1 className="text-xl font-semibold text-gray-900 dark:text-gray-50">
+          Could not load this job
+        </h1>
+        <p className="text-sm text-gray-500 dark:text-gray-400">{error}</p>
+        <Link
+          href="/"
+          className="text-sm font-medium text-crimson dark:text-crimson-light hover:underline"
+        >
           Back to Agents
         </Link>
       </div>
@@ -39,9 +44,14 @@ export default function AgentJobPage() {
   if (!job) {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-3">
-        <h1 className="text-xl font-semibold text-gray-900">Job not found</h1>
-        <p className="text-sm text-gray-500">It may have been pruned, or the link is stale.</p>
-        <Link href="/" className="text-sm font-medium text-crimson hover:underline">
+        <h1 className="text-xl font-semibold text-gray-900 dark:text-gray-50">Job not found</h1>
+        <p className="text-sm text-gray-500 dark:text-gray-400">
+          It may have been pruned, or the link is stale.
+        </p>
+        <Link
+          href="/"
+          className="text-sm font-medium text-crimson dark:text-crimson-light hover:underline"
+        >
           Back to Agents
         </Link>
       </div>

@@ -111,6 +111,18 @@ async def _enrol(store: AgentJobStore, host: str, **overrides) -> dict:
     return await store.record_host_heartbeat(host=host)
 
 
+def _kata_attestation(**overrides) -> dict:
+    stamp = {
+        "sandbox_runtime": "io.containerd.kata.v2",
+        "sandbox_image_digest": "sandbox@sha256:claim",
+        "runtime_versions": {"claude-code": "2.1.0"},
+        "host_kernel": "6.8.0-host",
+        "guest_kernel": "6.1.0-kata",
+    }
+    stamp.update(overrides)
+    return stamp
+
+
 # ── G2: enrollment tokens ──────────────────────────────────────────────
 
 
@@ -417,31 +429,56 @@ async def test_a_heartbeat_round_trips_the_version_stamp(store):
     assert row["runtime_versions"] == {}
 
 
-async def test_a_claim_copies_the_hosts_version_stamp_onto_the_attempt(store):
-    """The attempt records what ran it, immune to later host upgrades."""
+async def test_a_claim_stamps_its_replicas_attestation_not_the_host_heartbeat(store):
+    """Rolling replicas sharing a host row are judged and stamped independently."""
     await _enrol(store, "runner-a")
     await store.record_host_heartbeat(
         host="runner-a",
-        sandbox_runtime="io.containerd.kata.v2",
-        sandbox_image_digest="sha256:def",
-        runtime_versions={"claude-code": "1.2.3", "codex": "0.5.0"},
+        sandbox_runtime="",
+        sandbox_image_digest="sha256:old-host-row",
+        runtime_versions={"claude-code": "0.9.0"},
     )
-    await _create_job(store)  # runtime claude-code
+    await _create_job(store, execution_profile="untrusted-kata-v1")
 
-    claim = await store.claim_job(worker_id="w1", lease_ttl_seconds=60, host="runner-a")
+    claim = await store.claim_job(
+        worker_id="w1",
+        lease_ttl_seconds=60,
+        host="runner-a",
+        host_credential_hash=hash_secret("cred-runner-a"),
+        claim_attestation=_kata_attestation(),
+    )
 
     assert claim is not None
     async with store._pool.acquire() as conn:
         attempt = await conn.fetchrow(
-            "SELECT sandbox_runtime, sandbox_image_digest, runtime_version "
+            "SELECT sandbox_runtime, sandbox_image_digest, runtime_version, "
+            "host_kernel, guest_kernel "
             "FROM agent_attempts WHERE id = $1",
             claim["attempt_id"],
         )
     assert attempt["sandbox_runtime"] == "io.containerd.kata.v2"
-    assert attempt["sandbox_image_digest"] == "sha256:def"
-    assert attempt["runtime_version"] == "1.2.3"
+    assert attempt["sandbox_image_digest"] == "sandbox@sha256:claim"
+    assert attempt["runtime_version"] == "2.1.0"
+    assert attempt["host_kernel"] == "6.8.0-host"
+    assert attempt["guest_kernel"] == "6.1.0-kata"
 
-    # A host that has never reported stamps nothing — and still claims.
+    await store.record_host_heartbeat(
+        host="runner-a",
+        sandbox_runtime="io.containerd.kata.v2",
+        sandbox_image_digest="sha256:newer-host-row",
+        runtime_versions={"claude-code": "3.0.0"},
+    )
+    async with store._pool.acquire() as conn:
+        unchanged = await conn.fetchrow(
+            "SELECT sandbox_image_digest, runtime_version FROM agent_attempts WHERE id = $1",
+            claim["attempt_id"],
+        )
+    assert dict(unchanged) == {
+        "sandbox_image_digest": "sandbox@sha256:claim",
+        "runtime_version": "2.1.0",
+    }
+
+    # A legacy trusted claim may omit the attestation and still runs.
     await _enrol(store, "runner-b")
     await _create_job(store)
     bare = await store.claim_job(worker_id="w2", lease_ttl_seconds=60, host="runner-b")
@@ -454,6 +491,105 @@ async def test_a_claim_copies_the_hosts_version_stamp_onto_the_attempt(store):
         )
     assert attempt["sandbox_runtime"] is None
     assert attempt["runtime_version"] is None
+
+
+async def test_runc_replica_skips_secure_work_and_takes_the_next_trusted_job(store):
+    await _enrol(store, "runner-a", capabilities=["kata"])
+    secure = await _create_job(store, execution_profile="untrusted-kata-v1")
+    trusted = await _create_job(store, task_prompt="trusted", execution_profile="trusted-v1")
+
+    claim = await store.claim_job(
+        worker_id="runc-replica",
+        lease_ttl_seconds=60,
+        host="runner-a",
+        host_credential_hash=hash_secret("cred-runner-a"),
+        claim_attestation=_kata_attestation(sandbox_runtime="", guest_kernel=None),
+    )
+
+    assert claim is not None and claim["id"] == trusted["id"]
+    assert (await store.get_job(secure["id"]))["state"] == "queued"
+
+
+@pytest.mark.parametrize(
+    "attestation",
+    [
+        {},
+        _kata_attestation(sandbox_runtime="", guest_kernel=None),
+        _kata_attestation(sandbox_runtime="runsc"),
+        _kata_attestation(guest_kernel="6.8.0-host"),
+        _kata_attestation(guest_kernel=""),
+    ],
+)
+async def test_capability_labels_or_arbitrary_runtime_cannot_claim_secure_work(store, attestation):
+    await _enrol(store, "runner-a", capabilities=["kata"])
+    await _create_job(store, execution_profile="untrusted-kata-v1")
+
+    assert (
+        await store.claim_job(
+            worker_id="w1",
+            lease_ttl_seconds=60,
+            host="runner-a",
+            host_credential_hash=hash_secret("cred-runner-a"),
+            claim_attestation=attestation,
+        )
+        is None
+    )
+
+
+async def test_shared_or_superseded_host_credential_cannot_claim_secure_work(store):
+    await _enrol(store, "runner-a")
+    job = await _create_job(store, execution_profile="untrusted-kata-v1")
+
+    shared = await store.claim_job(
+        worker_id="shared-dispatcher",
+        lease_ttl_seconds=60,
+        host="runner-a",
+        claim_attestation=_kata_attestation(),
+    )
+    stale = await store.claim_job(
+        worker_id="stale-host-token",
+        lease_ttl_seconds=60,
+        host="runner-a",
+        host_credential_hash=hash_secret("wrong"),
+        claim_attestation=_kata_attestation(),
+    )
+    current = await store.claim_job(
+        worker_id="current-host-token",
+        lease_ttl_seconds=60,
+        host="runner-a",
+        host_credential_hash=hash_secret("cred-runner-a"),
+        claim_attestation=_kata_attestation(),
+    )
+
+    assert shared is None
+    assert stale is None
+    assert current is not None and current["id"] == job["id"]
+
+
+async def test_reenrollment_revokes_an_already_authenticated_claim_generation(store):
+    await _enrol(store, "runner-a")
+    old_hash = hash_secret("cred-runner-a")
+    await store.register_host(host="runner-a", credential_hash=hash_secret("replacement"))
+    await store.record_host_heartbeat(host="runner-a")
+    await _create_job(store, execution_profile="untrusted-kata-v1")
+
+    assert (
+        await store.claim_job(
+            worker_id="old",
+            lease_ttl_seconds=60,
+            host="runner-a",
+            host_credential_hash=old_hash,
+            claim_attestation=_kata_attestation(),
+        )
+        is None
+    )
+    assert await store.claim_job(
+        worker_id="new",
+        lease_ttl_seconds=60,
+        host="runner-a",
+        host_credential_hash=hash_secret("replacement"),
+        claim_attestation=_kata_attestation(),
+    )
 
 
 async def test_a_full_host_claims_nothing_more(store):
@@ -1206,6 +1342,72 @@ async def test_the_affinity_hold_expires_rather_than_stranding_the_turn(store):
     assert claimed is not None and claimed["id"] == job["id"]
 
 
+async def test_residency_affinity_never_weakens_the_secure_profile_gate(store):
+    """An earned HOT residency is preference, never Kata authorization."""
+    await _enrol(store, "runner-resident")
+    await _enrol(store, "runner-replacement")
+    job = await _create_job(store, execution_profile="untrusted-kata-v1")
+
+    # Establish a real, earned residency from a secure running attempt.  This
+    # exercises the final #58 grant/HOT gate rather than manufacturing a row.
+    first = await store.claim_job(
+        worker_id="resident-kata",
+        lease_ttl_seconds=60,
+        host="runner-resident",
+        host_credential_hash=hash_secret("cred-runner-resident"),
+        claim_attestation=_kata_attestation(),
+    )
+    assert first is not None and first["id"] == job["id"]
+    residency = await store.establish_residency(
+        thread_id=job["thread_id"],
+        host="runner-resident",
+        runtime_id="claude-code",
+        runtime_version=first["runtime_version"],
+        ttl_seconds=60,
+    )
+    assert residency is not None
+    await store.release_claim(
+        job_id=job["id"],
+        attempt_id=first["attempt_id"],
+        lease_generation=first["lease_generation"],
+    )
+
+    # Same host and generation affinity still cannot authorize a runc replica.
+    assert (
+        await store.claim_job(
+            worker_id="resident-runc",
+            lease_ttl_seconds=60,
+            host="runner-resident",
+            host_credential_hash=hash_secret("cred-runner-resident"),
+            claim_attestation=_kata_attestation(sandbox_runtime="", guest_kernel=None),
+        )
+        is None
+    )
+    # The verified replacement is safe, but observes the normal affinity hold
+    # while the resident host might still collect with a conforming replica.
+    assert (
+        await store.claim_job(
+            worker_id="replacement-kata",
+            lease_ttl_seconds=60,
+            host="runner-replacement",
+            host_credential_hash=hash_secret("cred-runner-replacement"),
+            claim_attestation=_kata_attestation(),
+        )
+        is None
+    )
+
+    await _age_out_of_affinity_hold(store, job["id"])
+    claimed = await store.claim_job(
+        worker_id="replacement-kata",
+        lease_ttl_seconds=60,
+        host="runner-replacement",
+        host_credential_hash=hash_secret("cred-runner-replacement"),
+        claim_attestation=_kata_attestation(),
+    )
+
+    assert claimed is not None and claimed["id"] == job["id"]
+
+
 async def test_a_thread_without_a_residency_is_anyones(store):
     await _enrol(store, "runner-a")
     job = await _create_job(store)
@@ -1217,15 +1419,29 @@ async def test_a_thread_without_a_residency_is_anyones(store):
 
 async def test_the_claim_carries_its_own_stamp_across_a_rolling_upgrade(store):
     """Review finding 3, at the store: each claim carries the version the
-    host ran *at claim time*; a later heartbeat moving the host row must not
-    rewrite what an earlier claim was stamped with."""
+    replica ran *at claim time*; another replica's later claim must not
+    rewrite the first attempt's stamp."""
     await _enrol(store, "runner-a")
-    await store.record_host_heartbeat(host="runner-a", runtime_versions={"claude-code": "1.0.0"})
-    _job_one, claim_one = await _running_claim(store, "runner-a")
+    await _create_job(store)
+    claim_one = await store.claim_job(
+        worker_id="replica-v1",
+        lease_ttl_seconds=60,
+        host="runner-a",
+        host_credential_hash=hash_secret("cred-runner-a"),
+        claim_attestation=_kata_attestation(runtime_versions={"claude-code": "1.0.0"}),
+    )
+    assert claim_one is not None
     assert claim_one["runtime_version"] == "1.0.0"
 
-    await store.record_host_heartbeat(host="runner-a", runtime_versions={"claude-code": "2.0.0"})
-    _job_two, claim_two = await _running_claim(store, "runner-a")
+    await _create_job(store)
+    claim_two = await store.claim_job(
+        worker_id="replica-v2",
+        lease_ttl_seconds=60,
+        host="runner-a",
+        host_credential_hash=hash_secret("cred-runner-a"),
+        claim_attestation=_kata_attestation(runtime_versions={"claude-code": "2.0.0"}),
+    )
+    assert claim_two is not None
 
     assert claim_two["runtime_version"] == "2.0.0"
     assert claim_one["runtime_version"] == "1.0.0"  # the stamp is the claim's own

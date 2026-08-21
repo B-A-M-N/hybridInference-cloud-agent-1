@@ -1,6 +1,6 @@
 'use client';
 
-// The trajectory: every stored event of a turn, in order, with the payload
+// The trajectory: every stored event of the conversation, in order, with the payload
 // behind each one.
 //
 // The chat tab beside this is a reading of the stream. This is the stream —
@@ -10,7 +10,7 @@
 
 import { useMemo, useState } from 'react';
 
-import type { AgentJobEventApi } from '@/lib/api/agents';
+import type { AgentJobEventApi, AgentThreadEventApi } from '@/lib/api/agents';
 import { formatDuration } from './TurnFooter';
 import {
   filterTrajectory,
@@ -24,15 +24,15 @@ const LANES: { key: TrajectoryLane; label: string; tone: string }[] = [
   { key: 'input', label: 'Input', tone: 'bg-sky-400' },
   { key: 'model', label: 'Model', tone: 'bg-violet-400' },
   { key: 'tools', label: 'Tools', tone: 'bg-amber-400' },
-  { key: 'other', label: 'Other', tone: 'bg-gray-300' },
+  { key: 'other', label: 'Other', tone: 'bg-gray-300 dark:bg-gray-600' },
 ];
 
 const ACTOR_TONE: Record<TrajectoryRow['actor'], string> = {
   user: 'bg-sky-50 text-sky-700',
   assistant: 'bg-violet-50 text-violet-700',
-  tool: 'bg-amber-50 text-amber-700',
-  context: 'bg-gray-100 text-gray-600',
-  system: 'bg-gray-100 text-gray-600',
+  tool: 'bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400',
+  context: 'bg-gray-100 dark:bg-white/5 text-gray-600 dark:text-gray-400',
+  system: 'bg-gray-100 dark:bg-white/5 text-gray-600 dark:text-gray-400',
 };
 
 /** A strip of one mark per event, so a long turn has a shape you can scan. */
@@ -49,7 +49,7 @@ function Minimap({
     <div className="space-y-1 overflow-x-auto pb-1">
       {LANES.filter((lane) => rows.some((row) => row.lane === lane.key)).map((lane) => (
         <div key={lane.key} className="flex items-center gap-2">
-          <span className="w-12 shrink-0 text-right text-[10px] uppercase tracking-wide text-gray-400">
+          <span className="w-12 shrink-0 text-right text-[10px] uppercase tracking-wide text-gray-400 dark:text-gray-500">
             {lane.label}
           </span>
           <div className="flex gap-px">
@@ -62,7 +62,7 @@ function Minimap({
                   onClick={() => onSelect(row.id)}
                   className={`h-2.5 w-2 shrink-0 rounded-[1px] transition-opacity hover:opacity-100 ${
                     row.isError ? 'bg-rose-400' : lane.tone
-                  } ${selectedId === row.id ? 'opacity-100 ring-1 ring-gray-800' : 'opacity-70'}`}
+                  } ${selectedId === row.id ? 'opacity-100 ring-1 ring-gray-800 dark:ring-gray-100' : 'opacity-70'}`}
                 />
               ) : (
                 <span key={row.id} className="h-2.5 w-2 shrink-0" />
@@ -78,20 +78,20 @@ function Minimap({
 /** What one event carried, shown only when a reader asks for it. */
 function RowDetail({ row, resultRow }: { row: TrajectoryRow; resultRow?: TrajectoryRow }) {
   return (
-    <div className="space-y-3 border-t border-gray-200 bg-white px-3 py-3 text-[12px]">
+    <div className="space-y-3 border-t border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 px-3 py-3 text-[12px]">
       <dl className="grid grid-cols-[6rem_1fr] gap-x-3 gap-y-1">
-        <dt className="text-gray-500">Event</dt>
-        <dd className="font-mono text-gray-800">
+        <dt className="text-gray-500 dark:text-gray-400">Event</dt>
+        <dd className="font-mono text-gray-800 dark:text-gray-200">
           {row.eventType} · seq {row.seq} · attempt {row.attemptId}
         </dd>
-        <dt className="text-gray-500">Time</dt>
-        <dd className="text-gray-800">{row.at ?? 'not recorded'}</dd>
+        <dt className="text-gray-500 dark:text-gray-400">Time</dt>
+        <dd className="text-gray-800 dark:text-gray-200">{row.at ?? 'not recorded'}</dd>
         {row.durationMs !== undefined ? (
           <>
-            <dt className="text-gray-500">Duration</dt>
-            <dd className="text-gray-800">
+            <dt className="text-gray-500 dark:text-gray-400">Duration</dt>
+            <dd className="text-gray-800 dark:text-gray-200">
               {formatDuration(row.durationMs)}{' '}
-              <span className="text-gray-500">
+              <span className="text-gray-500 dark:text-gray-400">
                 — from the request to its result, so it includes the model&rsquo;s own thinking
               </span>
             </dd>
@@ -99,15 +99,15 @@ function RowDetail({ row, resultRow }: { row: TrajectoryRow; resultRow?: Traject
         ) : null}
       </dl>
       <div>
-        <p className="mb-1 font-medium text-gray-600">Payload</p>
-        <pre className="max-h-64 overflow-auto rounded bg-gray-50 p-2 font-mono text-[11px] leading-relaxed text-gray-800">
+        <p className="mb-1 font-medium text-gray-600 dark:text-gray-400">Payload</p>
+        <pre className="max-h-64 overflow-auto rounded bg-gray-50 dark:bg-gray-950 p-2 font-mono text-[11px] leading-relaxed text-gray-800 dark:text-gray-200">
           {JSON.stringify(row.payload, null, 2)}
         </pre>
       </div>
       {resultRow ? (
         <div>
-          <p className="mb-1 font-medium text-gray-600">Result</p>
-          <pre className="max-h-64 overflow-auto rounded bg-gray-50 p-2 font-mono text-[11px] leading-relaxed text-gray-800">
+          <p className="mb-1 font-medium text-gray-600 dark:text-gray-400">Result</p>
+          <pre className="max-h-64 overflow-auto rounded bg-gray-50 dark:bg-gray-950 p-2 font-mono text-[11px] leading-relaxed text-gray-800 dark:text-gray-200">
             {JSON.stringify(resultRow.payload, null, 2)}
           </pre>
         </div>
@@ -116,7 +116,7 @@ function RowDetail({ row, resultRow }: { row: TrajectoryRow; resultRow?: Traject
   );
 }
 
-export function TrajectoryView({ events }: { events: AgentJobEventApi[] }) {
+export function TrajectoryView({ events }: { events: (AgentJobEventApi | AgentThreadEventApi)[] }) {
   const [query, setQuery] = useState('');
   const [selectedId, setSelectedId] = useState<number | null>(null);
 
@@ -136,9 +136,9 @@ export function TrajectoryView({ events }: { events: AgentJobEventApi[] }) {
 
   if (rows.length === 0) {
     return (
-      <p className="py-8 text-center text-[13px] text-gray-500">
-        This turn stored no events. A turn that ran before event capture, or one that never started,
-        has nothing to show here.
+      <p className="py-8 text-center text-[13px] text-gray-500 dark:text-gray-400">
+        This conversation stored no events. A thread that ran before event capture, or one whose
+        first turn never started, has nothing to show here.
       </p>
     );
   }
@@ -154,9 +154,9 @@ export function TrajectoryView({ events }: { events: AgentJobEventApi[] }) {
           onChange={(event) => setQuery(event.target.value)}
           placeholder="Search events"
           aria-label="Search events"
-          className="min-w-0 flex-1 rounded-lg border border-gray-200 px-2.5 py-1.5 text-[13px] outline-none focus:border-gray-300"
+          className="min-w-0 flex-1 rounded-lg border border-gray-200 dark:border-white/10 px-2.5 py-1.5 text-[13px] outline-none focus:border-gray-300"
         />
-        <span className="shrink-0 text-[12px] tabular-nums text-gray-500">
+        <span className="shrink-0 text-[12px] tabular-nums text-gray-500 dark:text-gray-400">
           {visible.length === rows.length
             ? `${rows.length} events`
             : `${visible.length} of ${rows.length}`}
@@ -164,23 +164,32 @@ export function TrajectoryView({ events }: { events: AgentJobEventApi[] }) {
         <button
           type="button"
           onClick={download}
-          className="shrink-0 rounded-lg border border-gray-200 px-2.5 py-1.5 text-[12px] text-gray-600 transition-colors hover:border-gray-300 hover:text-gray-900"
+          className="shrink-0 rounded-lg border border-gray-200 dark:border-white/10 px-2.5 py-1.5 text-[12px] text-gray-600 dark:text-gray-400 transition-colors hover:border-gray-300 dark:hover:border-white/20 hover:text-gray-900 dark:hover:text-gray-100"
         >
           Session log
         </button>
       </div>
 
-      <div className="overflow-hidden rounded-lg border border-gray-200">
-        {visible.map((row) => {
+      <div className="overflow-hidden rounded-lg border border-gray-200 dark:border-white/10">
+        {visible.map((row, index) => {
           const open = selectedId === row.id;
+          const startsTurn = index === 0 || visible[index - 1].turnNo !== row.turnNo;
           return (
-            <div key={row.id} className="border-b border-gray-100 last:border-b-0">
+            <div
+              key={row.id}
+              className="border-b border-gray-100 dark:border-white/5 last:border-b-0"
+            >
+              {startsTurn && rows.some((other) => other.turnNo !== row.turnNo) ? (
+                <p className="bg-gray-50 dark:bg-gray-950 px-3 py-1 text-[11px] font-medium uppercase tracking-wide text-gray-400 dark:text-gray-500">
+                  Turn {row.turnNo}
+                </p>
+              ) : null}
               <button
                 type="button"
                 onClick={() => setSelectedId(open ? null : row.id)}
                 aria-expanded={open}
-                className={`flex w-full items-baseline gap-2 px-3 py-1.5 text-left text-[12px] transition-colors hover:bg-gray-50 ${
-                  open ? 'bg-gray-50' : ''
+                className={`flex w-full items-baseline gap-2 px-3 py-1.5 text-left text-[12px] transition-colors hover:bg-gray-50 dark:hover:bg-white/5 ${
+                  open ? 'bg-gray-50 dark:bg-gray-950' : ''
                 }`}
               >
                 <span
@@ -189,15 +198,15 @@ export function TrajectoryView({ events }: { events: AgentJobEventApi[] }) {
                   {row.actor}
                 </span>
                 <span
-                  className={`w-28 shrink-0 truncate font-medium ${row.isError ? 'text-rose-600' : 'text-gray-800'}`}
+                  className={`w-28 shrink-0 truncate font-medium ${row.isError ? 'text-rose-600 dark:text-rose-400' : 'text-gray-800 dark:text-gray-200'}`}
                 >
                   {row.label}
                 </span>
-                <span className="min-w-0 flex-1 truncate font-mono text-gray-500">
+                <span className="min-w-0 flex-1 truncate font-mono text-gray-500 dark:text-gray-400">
                   {row.detail}
                 </span>
                 {row.durationMs !== undefined ? (
-                  <span className="shrink-0 tabular-nums text-gray-400">
+                  <span className="shrink-0 tabular-nums text-gray-400 dark:text-gray-500">
                     {formatDuration(row.durationMs)}
                   </span>
                 ) : null}
@@ -212,7 +221,7 @@ export function TrajectoryView({ events }: { events: AgentJobEventApi[] }) {
           );
         })}
         {visible.length === 0 ? (
-          <p className="px-3 py-6 text-center text-[12px] text-gray-500">
+          <p className="px-3 py-6 text-center text-[12px] text-gray-500 dark:text-gray-400">
             No event matches “{query}”.
           </p>
         ) : null}

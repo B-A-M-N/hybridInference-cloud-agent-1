@@ -58,6 +58,14 @@ export interface AgentThreadMessage {
   createdAt: string | null;
 }
 
+/** One completed turn reconstructed in the same order the agent produced it. */
+export interface AgentHistoryTurn {
+  jobId: string;
+  turnNo: number;
+  messages: AgentThreadMessage[];
+  events: AgentEvent[];
+}
+
 export interface DiffLine {
   marker: 'hunk' | 'ctx' | 'add' | 'del';
   text: string;
@@ -161,6 +169,8 @@ export interface AgentJob {
   turnNo?: number;
   /** Completed turns before this job. The current prompt/activity are separate. */
   threadMessages?: AgentThreadMessage[];
+  /** Historical turns with their tool activity restored from the event log. */
+  historyTurns?: AgentHistoryTurn[];
   /**
    * True when threadMessages already carries this job's own turn (a forked
    * copy has no events, so its durable messages are rendered instead) — the

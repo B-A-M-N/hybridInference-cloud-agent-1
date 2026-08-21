@@ -20,6 +20,7 @@ import {
   getAgentJobFiles,
   getAgentJobGit,
   getAgentJobThread,
+  listAllAgentThreadEvents,
   listAgentTerminals,
   listAgentJobs,
   pinAgentJob,
@@ -99,6 +100,34 @@ describe('agents api', () => {
     expect(fetchWithAuth).toHaveBeenCalledWith(
       expect.any(String),
       '/v1/agent/jobs?limit=25&archived=true',
+    );
+  });
+
+  it('reads every page of a conversation event log', async () => {
+    const first = Array.from({ length: 1000 }, (_, index) => ({
+      id: index + 1,
+      job_id: 'ajob_1',
+      turn_no: 1,
+      attempt_id: 1,
+      seq: index + 1,
+      event_type: 'message',
+      payload: {},
+      created_at: null,
+    }));
+    fetchWithAuth
+      .mockResolvedValueOnce(jsonResponse({ events: first, next_cursor: 1000 }))
+      .mockResolvedValueOnce(
+        jsonResponse({ events: [{ ...first[0], id: 1001, turn_no: 2 }], next_cursor: 1001 }),
+      );
+
+    const events = await listAllAgentThreadEvents('job/one');
+
+    expect(events).toHaveLength(1001);
+    expect(events[1000].turn_no).toBe(2);
+    expect(fetchWithAuth).toHaveBeenNthCalledWith(
+      2,
+      expect.any(String),
+      '/v1/agent/jobs/job%2Fone/thread/events?after=1000&limit=1000',
     );
   });
 
