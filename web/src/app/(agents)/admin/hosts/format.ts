@@ -78,3 +78,18 @@ export function runtimeMenu(hosts: AgentRunnerHost[]): [string, string[]][] {
   }
   return [...menu.entries()].sort(([a], [b]) => a.localeCompare(b));
 }
+
+/**
+ * What a runtime's row says under its name.
+ *
+ * The menu is a property of the *image*, not of this page, and the selector
+ * above it is easy to read as "pick any version you like". Naming the default
+ * and what else is in there makes the ceiling visible without a paragraph
+ * about `*_EXTRA_VERSIONS` next to every row.
+ */
+export function describeMenu(versions: string[]): string {
+  if (versions.length === 0) return 'No version reported.';
+  const [fallback, ...rest] = versions;
+  if (rest.length === 0) return `The image holds only ${fallback}.`;
+  return `Image default ${fallback} · also built in: ${rest.join(', ')}`;
+}
