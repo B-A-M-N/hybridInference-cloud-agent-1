@@ -61,7 +61,13 @@ class _ClaimStore:
         self.grants: dict[int, str] = {}
 
     async def claim_job(
-        self, *, worker_id: str, lease_ttl_seconds: float, host: str | None = None
+        self,
+        *,
+        worker_id: str,
+        lease_ttl_seconds: float,
+        host: str | None = None,
+        host_credential_hash: str | None = None,
+        claim_attestation: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         if not self.queued:
             return None

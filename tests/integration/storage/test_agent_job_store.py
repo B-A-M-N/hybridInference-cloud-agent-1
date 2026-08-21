@@ -125,6 +125,38 @@ async def test_create_get_list_round_trip(store: AgentJobStore):
     assert await store.get_job("ajob_missing") is None
 
 
+async def test_execution_profile_persists_and_is_inherited_by_follow_up_and_fork(
+    store, monkeypatch
+):
+    legacy_default = await _create_job(store, task_prompt="trusted default")
+    assert legacy_default["execution_profile"] == "trusted-v1"
+
+    monkeypatch.setenv("AGENT_DEFAULT_EXECUTION_PROFILE", "untrusted-kata-v1")
+    store_default = await _create_job(store, task_prompt="secure store default")
+    assert store_default["execution_profile"] == "untrusted-kata-v1"
+
+    source = await _create_job(
+        store,
+        task_prompt="secure thread",
+        execution_profile="untrusted-kata-v1",
+        metadata={"execution_profile": "trusted-v1"},
+    )
+    assert source["execution_profile"] == "untrusted-kata-v1"
+    async with store._pool.acquire() as conn:
+        await conn.execute("UPDATE agent_jobs SET state = 'succeeded' WHERE id = $1", source["id"])
+
+    follow_up = await store.create_follow_up(
+        parent_job_id=source["id"], user_id="user-1", prompt="continue"
+    )
+    fork = await store.fork_thread(source_job_id=source["id"], user_id="user-1")
+
+    assert follow_up is not None
+    assert fork is not None
+    assert follow_up["execution_profile"] == "untrusted-kata-v1"
+    assert fork["execution_profile"] == "untrusted-kata-v1"
+    assert (await store.get_job(source["id"]))["execution_profile"] == "untrusted-kata-v1"
+
+
 async def test_projects_summarize_a_user_s_repos_and_page_one_at_a_time(store: AgentJobStore):
     """The sidebar's task tree: a folder per repo, and a page inside one."""
     first = await _create_job(store)

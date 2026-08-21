@@ -131,6 +131,7 @@ class FakeAgentJobStore:
         }
         job.setdefault("base_sha", None)
         job.setdefault("metadata", None)
+        job.setdefault("execution_profile", "trusted-v1")
         job.setdefault("reasoning_effort", None)
         self.jobs[job_id] = job
         self.messages.append(
@@ -636,7 +637,13 @@ class FakeAgentJobStore:
         return None
 
     async def claim_job(
-        self, *, worker_id: str, lease_ttl_seconds: float, host: str | None = None
+        self,
+        *,
+        worker_id: str,
+        lease_ttl_seconds: float,
+        host: str | None = None,
+        host_credential_hash: str | None = None,
+        claim_attestation: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         await self.touch_runner_host(host=host, worker_id=worker_id)
         if self.active_host is not None and host != self.active_host:
@@ -1012,6 +1019,61 @@ async def test_create_get_list_round_trip(client: AsyncClient):
 
     listed = await client.get("/v1/agent/jobs")
     assert [job["id"] for job in listed.json()["jobs"]] == [job_id]
+
+
+async def test_execution_profile_is_server_owned_and_reserved_metadata_is_dropped(
+    client: AsyncClient, store: FakeAgentJobStore, monkeypatch
+):
+    """The deployment chooses the boundary; a request cannot forge or lower it."""
+    monkeypatch.setenv("AGENT_DEFAULT_EXECUTION_PROFILE", "untrusted-kata-v1")
+    created = await client.post(
+        "/v1/agent/jobs",
+        json={
+            "repo": "owner/name",
+            "task_prompt": "fix it",
+            "model": "glm-5.1",
+            "metadata": {
+                "origin": "api-test",
+                "execution_profile": "trusted-v1",
+                "sandbox_runtime": "runc",
+                "guest_kernel": "forged",
+            },
+        },
+    )
+
+    assert created.status_code == 201
+    assert created.json()["execution_profile"] == "untrusted-kata-v1"
+    assert created.json()["metadata"] == {"origin": "api-test"}
+    assert store.jobs[created.json()["id"]]["execution_profile"] == "untrusted-kata-v1"
+
+    rejected = await client.post(
+        "/v1/agent/jobs",
+        json={
+            "repo": "owner/name",
+            "task_prompt": "try to downgrade",
+            "model": "glm-5.1",
+            "execution_profile": "trusted-v1",
+        },
+    )
+    assert rejected.status_code == 422
+    assert "server-owned" in rejected.text
+
+
+async def test_follow_up_and_fork_inherit_profile_instead_of_rereading_policy(
+    client: AsyncClient, store: FakeAgentJobStore, monkeypatch
+):
+    monkeypatch.setenv("AGENT_DEFAULT_EXECUTION_PROFILE", "untrusted-kata-v1")
+    source_id = await _create_job(client)
+    store.jobs[source_id]["state"] = "succeeded"
+
+    monkeypatch.setenv("AGENT_DEFAULT_EXECUTION_PROFILE", "trusted-v1")
+    child = await client.post(f"/v1/agent/jobs/{source_id}/follow-ups", json={"prompt": "continue"})
+    fork = await client.post(f"/v1/agent/jobs/{source_id}/fork")
+
+    assert child.status_code == 201
+    assert fork.status_code == 201
+    assert child.json()["execution_profile"] == "untrusted-kata-v1"
+    assert fork.json()["execution_profile"] == "untrusted-kata-v1"
 
 
 async def test_jobs_page_by_repo_and_projects_summarize_the_task_tree(client: AsyncClient):

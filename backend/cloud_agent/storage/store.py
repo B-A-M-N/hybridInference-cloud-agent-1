@@ -41,6 +41,11 @@ from typing import Any
 
 import asyncpg
 
+from cloud_agent.execution_profiles import (
+    KATA_RUNTIME,
+    ExecutionProfile,
+    default_execution_profile,
+)
 from cloud_agent.host_pool import (
     CLAIMABLE_STATUSES,
     HOST_DISABLED,
@@ -115,6 +120,7 @@ def _job_row_to_dict(row: Any) -> dict[str, Any]:
         "setup_script": row["setup_script"],
         "runtime": row["runtime"],
         "model": row["model"],
+        "execution_profile": row["execution_profile"],
         "reasoning_effort": row["reasoning_effort"],
         "state": row["state"],
         "cancel_requested": row["cancel_requested"],
@@ -138,7 +144,7 @@ def _job_row_to_dict(row: Any) -> dict[str, Any]:
 
 _JOB_COLUMNS = (
     "id, thread_id, parent_job_id, turn_no, user_id, repo, base_sha, task_prompt, "
-    "setup_script, runtime, model, reasoning_effort, state, "
+    "setup_script, runtime, model, execution_profile, reasoning_effort, state, "
     "cancel_requested, terminal_resume_pending, current_attempt_id, "
     "published_pr_url, published_commit_sha, detail, "
     "metadata, fork_source_job_id, mcp_servers, "
@@ -480,13 +486,22 @@ class AgentJobStore:
         task_prompt: str,
         runtime: str,
         model: str,
+        execution_profile: str | None = None,
         reasoning_effort: str | None = None,
         base_sha: str | None = None,
         setup_script: str | None = None,
         metadata: dict[str, Any] | None = None,
         mcp_servers: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Create a queued job and return it."""
+        """Create a queued job and return it.
+
+        Callers that do not name a profile still go through the deployment's
+        server-owned default.  This matters for internal producers that call
+        the store directly: bypassing the HTTP route must not silently turn a
+        secure deployment's jobs into ``trusted-v1`` work.
+        """
+        if execution_profile is None:
+            execution_profile = default_execution_profile().value
         job_id = _new_job_id()
         thread_id = _new_thread_id()
         async with self._pool.acquire() as conn, conn.transaction():
@@ -504,9 +519,10 @@ class AgentJobStore:
                 f"""
                 INSERT INTO agent_jobs
                     (id, thread_id, turn_no, user_id, repo, base_sha, task_prompt,
-                     setup_script, runtime, model, reasoning_effort, metadata,
-                     mcp_servers)
-                VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12)
+                     setup_script, runtime, model, execution_profile, reasoning_effort,
+                     metadata, mcp_servers)
+                VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                        $12::jsonb, $13)
                 RETURNING {_JOB_COLUMNS}
                 """,
                 job_id,
@@ -518,6 +534,7 @@ class AgentJobStore:
                 setup_script,
                 runtime,
                 model,
+                execution_profile,
                 reasoning_effort,
                 json.dumps(metadata) if metadata is not None else None,
                 list(mcp_servers or []),
@@ -656,10 +673,10 @@ class AgentJobStore:
                 f"""
                 INSERT INTO agent_jobs
                     (id, thread_id, parent_job_id, turn_no, user_id, repo, base_sha,
-                     task_prompt, setup_script, runtime, model, reasoning_effort,
-                     state, metadata, mcp_servers)
+                     task_prompt, setup_script, runtime, model, execution_profile,
+                     reasoning_effort, state, metadata, mcp_servers)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                        $14::jsonb, $15)
+                        $14, $15::jsonb, $16)
                 RETURNING {_JOB_COLUMNS}
                 """,
                 job_id,
@@ -673,6 +690,7 @@ class AgentJobStore:
                 parent["setup_script"],
                 runtime or parent["runtime"],
                 model or parent["model"],
+                parent["execution_profile"],
                 None
                 if reset_reasoning_effort
                 else (reasoning_effort or parent["reasoning_effort"]),
@@ -772,11 +790,11 @@ class AgentJobStore:
                     """
                     INSERT INTO agent_jobs
                         (id, thread_id, parent_job_id, turn_no, user_id, repo, base_sha,
-                         task_prompt, setup_script, runtime, model, state,
+                         task_prompt, setup_script, runtime, model, execution_profile, state,
                          published_commit_sha, detail, metadata,
                          fork_source_job_id, mcp_servers, created_at, updated_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                            $13, $14, $15::jsonb, $16, $17,
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                            $14, $15, $16::jsonb, $17, $18,
                             clock_timestamp(), clock_timestamp())
                     """,
                     copy_id,
@@ -790,6 +808,7 @@ class AgentJobStore:
                     turn["setup_script"],
                     turn["runtime"],
                     turn["model"],
+                    turn["execution_profile"],
                     # An unsettled earlier turn (a cancelled anchor can sit
                     # after a still-running parent) copies as cancelled: its
                     # messages are whatever had durably landed by now.
@@ -1798,6 +1817,8 @@ class AgentJobStore:
         worker_id: str,
         lease_ttl_seconds: float,
         host: str | None = None,
+        host_credential_hash: str | None = None,
+        claim_attestation: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Claim the oldest queued job, creating a new fenced attempt.
 
@@ -1825,13 +1846,28 @@ class AgentJobStore:
         run". Capacity and capability are operator-visible on the admin
         surface, which is where the question is answerable.
 
-        A runner reporting **no** host keeps the pre-pool path exactly: no
+        A runner reporting **no** host keeps the pre-pool path for
+        ``trusted-v1`` exactly: no
         slot, no ``host_id``, and the env-configured broker. That is what E11's
         single-host setup is, and it must not need enrolling to keep working.
         Its capability set is empty, though, so a job that *declares*
         requirements will not go to it — the fail-closed reading, and a no-op
         today because nothing sets requirements yet.
+
+        ``untrusted-kata-v1`` is a separate fail-closed gate. It requires the
+        current per-host credential to still match while the host slot is
+        taken, and a claim-time attestation from this exact replica naming the
+        Kata runtime plus unequal host/guest kernels. The mutable heartbeat row
+        is not evidence for a particular replica during a rolling deployment.
         """
+        attestation = claim_attestation or {}
+        sandbox_runtime = attestation.get("sandbox_runtime")
+        sandbox_image_digest = attestation.get("sandbox_image_digest")
+        runtime_versions = attestation.get("runtime_versions")
+        if not isinstance(runtime_versions, dict):
+            runtime_versions = {}
+        host_kernel = attestation.get("host_kernel")
+        guest_kernel = attestation.get("guest_kernel")
         await self.touch_runner_host(host=host, worker_id=worker_id)
         async with self._pool.acquire() as conn, conn.transaction():
             active_host = await conn.fetchval(
@@ -1843,19 +1879,22 @@ class AgentJobStore:
                 # to claim is the one outcome that makes the switch a lie.
                 return None
             capabilities = "[]"
-            host_stamp: dict[str, Any] = {}
+            credential_matches = False
             if host is not None:
                 host_row = await conn.fetchrow(
                     "SELECT status, capabilities, slots_total, slots_used, "
-                    "sandbox_runtime, sandbox_image_digest, runtime_versions "
+                    "(credential_hash IS NOT NULL AND credential_hash = $2) "
+                    "AS credential_matches "
                     "FROM agent_runner_hosts WHERE host = $1",
                     host,
+                    host_credential_hash,
                 )
-                # Read without a lock, and re-checked below by the conditional
-                # slot UPDATE. This read only decides *which job* to look for;
-                # the decision that must not race — is there a free slot — is
-                # made by the UPDATE, which Postgres re-evaluates against the
-                # committed row when two claims collide.
+                # This read only chooses which profile may be considered. The
+                # slot UPDATE below is the decision point: it re-checks both
+                # capacity and the exact credential hash, so a concurrent
+                # drain, revocation or re-enrolment makes the claim roll back.
+                # Avoiding an early host-row lock also preserves parallel
+                # SKIP LOCKED dequeue across replicas on the same machine.
                 if host_row is None or host_row["status"] not in CLAIMABLE_STATUSES:
                     return None
                 if (
@@ -1864,11 +1903,17 @@ class AgentJobStore:
                 ):
                     return None
                 capabilities = host_row["capabilities"]
-                host_stamp = {
-                    "sandbox_runtime": host_row["sandbox_runtime"],
-                    "sandbox_image_digest": host_row["sandbox_image_digest"],
-                    "runtime_versions": _load_json(host_row["runtime_versions"]) or {},
-                }
+                credential_matches = bool(host_row["credential_matches"])
+            secure_attestation = bool(
+                host is not None
+                and credential_matches
+                and sandbox_runtime == KATA_RUNTIME
+                and isinstance(host_kernel, str)
+                and bool(host_kernel.strip())
+                and isinstance(guest_kernel, str)
+                and bool(guest_kernel.strip())
+                and host_kernel.strip() != guest_kernel.strip()
+            )
             # Follow-ups may be submitted while a run is active. Promote only
             # those whose direct parent has settled; a chain therefore
             # advances one turn at a time even with multiple waiting messages.
@@ -1911,6 +1956,13 @@ class AgentJobStore:
                 WHERE j.state = 'queued' AND j.cancel_requested = FALSE
                   AND COALESCE(j.metadata->'requires', '[]'::jsonb) <@ $1::jsonb
                   AND (
+                        j.execution_profile = '{ExecutionProfile.TRUSTED_V1.value}'
+                        OR (
+                            j.execution_profile = '{ExecutionProfile.UNTRUSTED_KATA_V1.value}'
+                            AND $3::boolean
+                        )
+                  )
+                  AND (
                         r.thread_id IS NULL
                         OR r.host = $2
                         OR j.updated_at <= NOW()
@@ -1922,6 +1974,7 @@ class AgentJobStore:
                 """,
                 capabilities,
                 host,
+                secure_attestation,
             )
             if job_row is None:
                 return None
@@ -1941,9 +1994,16 @@ class AgentJobStore:
                     WHERE host = $1
                       AND status = '{HOST_ONLINE}'
                       AND (slots_total IS NULL OR slots_used < slots_total)
+                      AND ($3::text IS NULL OR credential_hash = $3)
+                      AND (
+                            $2 <> '{ExecutionProfile.UNTRUSTED_KATA_V1.value}'
+                            OR $3::text IS NOT NULL
+                      )
                     RETURNING slots_used
                     """,
                     host,
+                    job_row["execution_profile"],
+                    host_credential_hash,
                 )
                 if took_slot is None:
                     # Nothing has been written to the job yet, so returning
@@ -1953,20 +2013,16 @@ class AgentJobStore:
                 "SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM agent_attempts WHERE job_id = $1",
                 job_id,
             )
-            # The stamp is copied from the host row at claim time, not joined at
-            # read time: the question a retry or an audit asks is "what ran the
-            # attempt", and the host's *current* image answers a different
-            # question once the machine upgrades (issue #54).
-            runtime_versions = host_stamp.get("runtime_versions") or {}
             runtime_version = runtime_versions.get(job_row["runtime"])
             attempt = await conn.fetchrow(
                 """
                 INSERT INTO agent_attempts
                     (job_id, attempt_no, lease_owner, lease_generation,
                      lease_expires_at, base_sha, host_id,
-                     sandbox_runtime, sandbox_image_digest, runtime_version)
+                     sandbox_runtime, sandbox_image_digest, runtime_version,
+                     host_kernel, guest_kernel)
                 VALUES ($1, $2, $3, $4, NOW() + make_interval(secs => $5), $6, $7,
-                        $8, $9, $10)
+                        $8, $9, $10, $11, $12)
                 RETURNING id, attempt_no, lease_generation,
                           sandbox_runtime, sandbox_image_digest, runtime_version
                 """,
@@ -1977,9 +2033,11 @@ class AgentJobStore:
                 lease_ttl_seconds,
                 job_row["base_sha"],
                 host,
-                host_stamp.get("sandbox_runtime"),
-                host_stamp.get("sandbox_image_digest"),
+                sandbox_runtime,
+                sandbox_image_digest,
                 runtime_version,
+                host_kernel,
+                guest_kernel,
             )
             await conn.execute(
                 "UPDATE agent_jobs SET state = 'running', current_attempt_id = $2, "
