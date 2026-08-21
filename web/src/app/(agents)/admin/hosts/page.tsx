@@ -29,7 +29,7 @@ import {
 } from '@/lib/api/admin';
 import { getErrorMessage } from '@/lib/utils/errors';
 
-import { formatAge, formatImage, formatSlots, formatVersions, runtimeMenu } from './format';
+import { formatAge, formatSlots, runtimeMenu } from './format';
 
 // A runner polls only between jobs, so silence can mean "busy for an hour" as
 // easily as "gone". Carried over from the gateway's section along with the
@@ -310,12 +310,19 @@ export default function AdminHostsPage() {
             say. What a machine will *run* — CLI versions and the image they
             came from — is one question, so it is one cell. */}
         <div className="mt-10">
-          {/* The caveat that used to sit here — a host appears once its runner
-              polled, which is not a claim it is reachable now — is what the
-              "Last polled" column is called. Explaining a column heading in a
-              sentence above the table is the prose this page kept growing; the
-              case where it actually bites, a pinned host gone quiet, has its
-              own warning at the top. */}
+          {/* Six columns became four. `Runs` listed the CLI versions each host
+              holds and the digest they came from; with one runner it restated
+              the section above, and it was the widest, most-wrapping cell in
+              the table.
+
+              The cost, recorded because it is real: nothing in the UI now
+              shows a host running a *different* image from its neighbour. The
+              data is still on the host row and still in the admin response, so
+              the column comes back as markup alone the day two hosts diverge.
+
+              The caveat that used to sit above the table — a host appears once
+              its runner polled, which is not a claim it is reachable now — is
+              what the "Last polled" column is called. */}
           <h2 className="text-sm font-medium text-gray-600 dark:text-gray-400">Runner hosts</h2>
 
           {/* Which hosts take work, stated where the hosts are.
@@ -329,18 +336,8 @@ export default function AdminHostsPage() {
               "pinned" chip is ambiguous (nothing pinned, or did I miss it?),
               and pinning is not a drain — the machine that lost the pin keeps
               running what it already has. */}
-          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-2 text-sm">
-            <span className="text-gray-700 dark:text-gray-300">
-              {activeHost ? (
-                <>
-                  New jobs go to <span className="font-medium">{activeHost}</span> alone. Work
-                  already running elsewhere finishes where it started.
-                </>
-              ) : (
-                'Every host below that is online takes work. Pin one to send new jobs to it alone.'
-              )}
-            </span>
-            {activeHost && (
+          {activeHost && (
+            <div className="mt-2">
               <button
                 type="button"
                 disabled={busy}
@@ -349,8 +346,8 @@ export default function AdminHostsPage() {
               >
                 Any host
               </button>
-            )}
-          </div>
+            </div>
+          )}
 
           {loading ? (
             <p className="mt-4 text-sm text-gray-500 dark:text-gray-400">Loading…</p>
@@ -367,7 +364,6 @@ export default function AdminHostsPage() {
                       <th className="px-6 py-3 font-medium">Host</th>
                       <th className="px-3 py-3 font-medium">Status</th>
                       <th className="px-3 py-3 font-medium">Slots</th>
-                      <th className="px-3 py-3 font-medium">Runs</th>
                       <th className="px-3 py-3 font-medium whitespace-nowrap">Last polled</th>
                       <th className="px-6 py-3 text-right font-medium">Actions</th>
                     </tr>
@@ -407,20 +403,6 @@ export default function AdminHostsPage() {
                         </td>
                         <td className="px-3 py-4 whitespace-nowrap text-gray-700 dark:text-gray-300">
                           {formatSlots(host)}
-                        </td>
-                        <td className="px-3 py-4">
-                          <div className="text-gray-700 dark:text-gray-300">
-                            {formatVersions(host)}
-                          </div>
-                          {/* The digest, not the tag: two hosts on
-                              `...-job:staging` can be running different builds,
-                              and that is exactly the confusion worth resolving
-                              on sight. */}
-                          {host.sandbox_image_digest && (
-                            <div className="mt-1 font-mono text-xs text-gray-500 dark:text-gray-400">
-                              {formatImage(host)}
-                            </div>
-                          )}
                         </td>
                         <td className="px-3 py-4 whitespace-nowrap text-gray-700 dark:text-gray-300">
                           {formatAge(host.seconds_since_seen)}

@@ -38,7 +38,7 @@ import {
   setAgentRuntimeVersion,
 } from '@/lib/api/admin';
 
-import { formatAge, formatImage, formatSlots, formatVersions, runtimeMenu } from './format';
+import { formatAge, formatSlots, runtimeMenu } from './format';
 import AdminHostsPage from './page';
 
 const mocked = {
@@ -319,21 +319,6 @@ describe('harness version selection', () => {
 });
 
 describe('version and image cells', () => {
-  it('lists each runtime default, and renders a host that reports none', () => {
-    expect(formatVersions(host() as never)).toBe('claude-code 2.1.220');
-    expect(formatVersions(host({ runtime_versions: null }) as never)).toBe('—');
-    expect(formatVersions(host({ runtime_versions: {} }) as never)).toBe('—');
-  });
-
-  it('shortens a digest to something comparable at a glance', () => {
-    expect(formatImage(host() as never)).toBe('abcdef012345');
-    // A locally built image has no RepoDigest; its bare id still identifies it.
-    expect(formatImage(host({ sandbox_image_digest: 'sha256:0123456789abcdef' }) as never)).toBe(
-      '0123456789ab',
-    );
-    expect(formatImage(host({ sandbox_image_digest: null }) as never)).toBe('—');
-  });
-
   it('unions menus across hosts without losing the default ordering', () => {
     const menu = runtimeMenu([
       host({ runtime_versions_available: { 'claude-code': ['2.1.220'] } }),
