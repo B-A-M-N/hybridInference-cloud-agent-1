@@ -26,38 +26,6 @@ export function formatSlots(host: AgentRunnerHost): string {
 }
 
 /**
- * The CLI versions a host reports, as "claude-code 2.1.220, codex 0.145.0".
- *
- * The *default* per runtime, which is what a job runs unselected — the menu it
- * could also run is a pool-wide question and lives in the selector above the
- * table, not in a cell repeated per row.
- */
-export function formatVersions(host: AgentRunnerHost): string {
-  const versions = host.runtime_versions;
-  if (!versions || Object.keys(versions).length === 0) return '—';
-  return Object.entries(versions)
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([runtime, version]) => `${runtime} ${version}`)
-    .join(', ');
-}
-
-/**
- * The sandbox image, short enough to read.
- *
- * A digest is `name@sha256:<64 hex>` or a bare local id; either way the first
- * few characters identify it among the two or three an operator is comparing,
- * and the whole string would push every other column off the page.
- */
-export function formatImage(host: AgentRunnerHost): string {
-  const digest = host.sandbox_image_digest;
-  if (!digest) return '—';
-  const at = digest.lastIndexOf('@');
-  const hash = at === -1 ? digest : digest.slice(at + 1);
-  const short = hash.replace(/^sha256:/, '').slice(0, 12);
-  return short || digest.slice(0, 12);
-}
-
-/**
  * Every (runtime, versions) pair the pool as a whole offers.
  *
  * Unioned across hosts because the selection is deployment-wide while the menus
@@ -77,19 +45,4 @@ export function runtimeMenu(hosts: AgentRunnerHost[]): [string, string[]][] {
     }
   }
   return [...menu.entries()].sort(([a], [b]) => a.localeCompare(b));
-}
-
-/**
- * What a runtime's row says under its name.
- *
- * The menu is a property of the *image*, not of this page, and the selector
- * above it is easy to read as "pick any version you like". Naming the default
- * and what else is in there makes the ceiling visible without a paragraph
- * about `*_EXTRA_VERSIONS` next to every row.
- */
-export function describeMenu(versions: string[]): string {
-  if (versions.length === 0) return 'No version reported.';
-  const [fallback, ...rest] = versions;
-  if (rest.length === 0) return `The image holds only ${fallback}.`;
-  return `Image default ${fallback} · also built in: ${rest.join(', ')}`;
 }

@@ -17,7 +17,7 @@ export const zhCN: Record<TranslationKey, string> = {
   'nav.status': '服务状态',
   'nav.docsAssistant': '文档助手',
   'nav.agents': 'Agents',
-  'nav.hosts': '主机',
+  'nav.admin': '管理后台',
   'nav.dashboard': '控制台',
   'nav.logOut': '退出登录',
   'nav.expandTaskList': '展开任务列表',

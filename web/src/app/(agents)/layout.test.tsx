@@ -141,15 +141,15 @@ describe('AgentsLayout product navigation', () => {
     renderLayout();
 
     expect(screen.getByRole('link', { name: 'Agents' })).toHaveAttribute('aria-current', 'page');
-    expect(screen.getByRole('link', { name: 'Hosts' })).not.toHaveAttribute('aria-current');
+    expect(screen.getByRole('link', { name: 'Admin' })).not.toHaveAttribute('aria-current');
   });
 
-  it('moves the highlight to Hosts on the host pool page', () => {
+  it('moves the highlight to Admin on the admin page', () => {
     pathname = '/admin/hosts';
 
     renderLayout();
 
-    expect(screen.getByRole('link', { name: 'Hosts' })).toHaveAttribute('aria-current', 'page');
+    expect(screen.getByRole('link', { name: 'Admin' })).toHaveAttribute('aria-current', 'page');
 
     // And Agents is a way back rather than a label: it was a bare <span>, so
     // the only route off this page was the browser's back button.

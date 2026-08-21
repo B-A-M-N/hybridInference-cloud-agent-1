@@ -38,14 +38,7 @@ import {
   setAgentRuntimeVersion,
 } from '@/lib/api/admin';
 
-import {
-  describeMenu,
-  formatAge,
-  formatImage,
-  formatSlots,
-  formatVersions,
-  runtimeMenu,
-} from './format';
+import { formatAge, formatSlots, runtimeMenu } from './format';
 import AdminHostsPage from './page';
 
 const mocked = {
@@ -326,21 +319,6 @@ describe('harness version selection', () => {
 });
 
 describe('version and image cells', () => {
-  it('lists each runtime default, and renders a host that reports none', () => {
-    expect(formatVersions(host() as never)).toBe('claude-code 2.1.220');
-    expect(formatVersions(host({ runtime_versions: null }) as never)).toBe('—');
-    expect(formatVersions(host({ runtime_versions: {} }) as never)).toBe('—');
-  });
-
-  it('shortens a digest to something comparable at a glance', () => {
-    expect(formatImage(host() as never)).toBe('abcdef012345');
-    // A locally built image has no RepoDigest; its bare id still identifies it.
-    expect(formatImage(host({ sandbox_image_digest: 'sha256:0123456789abcdef' }) as never)).toBe(
-      '0123456789ab',
-    );
-    expect(formatImage(host({ sandbox_image_digest: null }) as never)).toBe('—');
-  });
-
   it('unions menus across hosts without losing the default ordering', () => {
     const menu = runtimeMenu([
       host({ runtime_versions_available: { 'claude-code': ['2.1.220'] } }),
@@ -364,37 +342,19 @@ describe('the harness section reads as a choice, not a list', () => {
 
   afterEach(cleanup);
 
-  it('names the ceiling, because the menu is the image and not this page', () => {
-    expect(describeMenu(['2.1.220', '2.1.235'])).toBe(
-      'Image default 2.1.220 · also built in: 2.1.235',
-    );
-    // The row an operator cannot act on says so in one clause rather than
-    // implying, by looking identical to the others, that a choice exists.
-    expect(describeMenu(['0.145.0'])).toBe('The image holds only 0.145.0.');
-    expect(describeMenu([])).toBe('No version reported.');
-  });
-
-  it('puts the runtime with a real choice first', async () => {
-    // Alphabetical order buried claude-code — the only selectable one — under
-    // codex. The section exists for the runtime that can move.
-    mocked.list.mockResolvedValue(
-      pool([
-        host({
-          runtime_versions_available: {
-            codex: ['0.145.0'],
-            'claude-code': ['2.1.220', '2.1.235'],
-            pi: ['0.73.1'],
-          },
-        }),
-      ]),
-    );
+  it('is the runtimes and their controls, and no prose', async () => {
+    // Everything this section could explain is already said elsewhere: the
+    // versions on offer are in the select, what each host holds is in the
+    // table below, that a running conversation keeps its version is in the
+    // confirmation after the change, and how to add a version is deployment
+    // documentation. Written here it was a third telling every time.
     render(<AdminHostsPage />);
 
     await screen.findByLabelText('claude-code');
-    const labels = [...document.querySelectorAll('label[for^="harness-version-"]')].map(
-      (node) => node.textContent,
-    );
-    expect(labels[0]).toBe('claude-code');
+    expect(screen.queryByText(/also built in/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/The image holds only/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/EXTRA_VERSIONS/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Applies to new threads/)).not.toBeInTheDocument();
   });
 
   it('still offers a fixed runtime, compressed but not removed', async () => {

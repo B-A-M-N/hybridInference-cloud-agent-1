@@ -133,7 +133,7 @@ function AgentsHeader({
             className={onHosts ? NAV_ITEM_CURRENT : NAV_ITEM}
             aria-current={onHosts ? 'page' : undefined}
           >
-            {t('nav.hosts')}
+            {t('nav.admin')}
           </Link>
         )}
         {branding.gatewayUrl && (
