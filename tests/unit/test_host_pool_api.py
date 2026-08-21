@@ -828,6 +828,10 @@ async def test_a_host_credential_names_the_claiming_machine(claim_client):
                 "sandbox_runtime": "io.containerd.kata.v2",
                 "sandbox_image_digest": None,
                 "runtime_versions": {},
+                # Present even when the request omitted it: the claim checks a
+                # stored selection against this, and an absent key would be
+                # indistinguishable from "this host offers nothing".
+                "runtime_versions_available": {},
                 "host_kernel": "host",
                 "guest_kernel": "guest",
             },

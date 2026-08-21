@@ -535,6 +535,15 @@ class WorkerClaimAttestation(BaseModel):
     sandbox_runtime: str | None = Field(None, max_length=128)
     sandbox_image_digest: str | None = Field(None, max_length=512)
     runtime_versions: dict[str, str] = Field(default_factory=dict, max_length=64)
+    #: Every version this replica's image holds, keyed by runtime id — the menu
+    #: a stored selection is checked against before the claim honours it.
+    #:
+    #: Declared here or it does not exist. The runner has always sent it, and
+    #: `claim_job` has always read it, but a model silently drops what it does
+    #: not name: the field went over the wire, Pydantic discarded it, the claim
+    #: saw an empty menu and fell back to the image default. Every selection an
+    #: admin made was a no-op, and the only sign was one log line.
+    runtime_versions_available: dict[str, list[str]] = Field(default_factory=dict, max_length=64)
     host_kernel: str | None = Field(None, max_length=256)
     guest_kernel: str | None = Field(None, max_length=256)
 
