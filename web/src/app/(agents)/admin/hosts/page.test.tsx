@@ -27,14 +27,12 @@ vi.mock('@/lib/api/admin', () => ({
   drainAgentRunnerHost: vi.fn(),
   undrainAgentRunnerHost: vi.fn(),
   removeAgentRunnerHost: vi.fn(),
-  issueHostEnrollToken: vi.fn(),
   setAgentRuntimeVersion: vi.fn(),
 }));
 
 import {
   drainAgentRunnerHost,
   getAgentRunnerHosts,
-  issueHostEnrollToken,
   removeAgentRunnerHost,
   setActiveAgentRunnerHost,
   setAgentRuntimeVersion,
@@ -55,7 +53,6 @@ const mocked = {
   pin: setActiveAgentRunnerHost as unknown as ReturnType<typeof vi.fn>,
   drain: drainAgentRunnerHost as unknown as ReturnType<typeof vi.fn>,
   remove: removeAgentRunnerHost as unknown as ReturnType<typeof vi.fn>,
-  enroll: issueHostEnrollToken as unknown as ReturnType<typeof vi.fn>,
   setVersion: setAgentRuntimeVersion as unknown as ReturnType<typeof vi.fn>,
 };
 
@@ -132,8 +129,6 @@ describe('AdminHostsPage', () => {
     render(<AdminHostsPage />);
 
     expect(await screen.findByText('legacy-box')).toBeInTheDocument();
-    // Rendered beside the worker id in one line, hence the substring match.
-    expect(screen.getByText(/self-reported name/)).toBeInTheDocument();
     // No ceiling declared: the slot cell is the count alone, not "0 / null".
     expect(screen.getByText('0')).toBeInTheDocument();
   });
@@ -217,22 +212,16 @@ describe('AdminHostsPage', () => {
     expect(screen.queryByText(/the queue is stopped/)).not.toBeInTheDocument();
   });
 
-  it('shows an enrollment token once, with the warning that it is not recoverable', async () => {
-    mocked.enroll.mockResolvedValue({
-      enroll_token: 'tok-abc',
-      host: 'runner-b',
-      expires_at: '2026-08-05T01:00:00Z',
-    });
+  it('does not offer to enrol a host', async () => {
+    // Removed on purpose, not lost. Enrolment binds a credential to a machine
+    // so it cannot claim to be another one, and every runner in this pool is
+    // ours — the control answered a question nobody operating this page asks.
+    // The endpoint and its client are untouched for the rare new host.
     render(<AdminHostsPage />);
 
-    fireEvent.change(await screen.findByLabelText('Host name'), {
-      target: { value: 'runner-b' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Issue token' }));
-
-    expect(await screen.findByText('tok-abc')).toBeInTheDocument();
-    expect(screen.getByText(/not shown again/)).toBeInTheDocument();
-    expect(mocked.enroll).toHaveBeenCalledWith('runner-b', 900);
+    await screen.findByText('runner-a');
+    expect(screen.queryByRole('button', { name: 'Issue token' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/enrol/i)).not.toBeInTheDocument();
   });
 
   it('keeps the last good pool when a background refresh fails', async () => {

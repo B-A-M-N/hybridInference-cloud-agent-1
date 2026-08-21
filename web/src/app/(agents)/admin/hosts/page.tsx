@@ -7,9 +7,11 @@
 // poll. The wording follows that. "Pinned", not "assigned"; "last polled", not
 // "online".
 //
-// It replaces the section that lived in the gateway's admin settings tab, which
-// had the pin, the poll age and forget — a third of the pool's lifecycle,
-// because the other two thirds (enroll, drain/remove) did not exist yet.
+// Enrolment is deliberately absent. Minting a host credential is a real
+// operation and its endpoint stays, but it exists to stop a machine claiming
+// to be a machine it is not — and every runner in this pool is ours, so the
+// control was answering a question nobody here asks. Issue a token from the
+// API on the rare day a new host needs one.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
@@ -20,7 +22,6 @@ import {
   drainAgentRunnerHost,
   forgetAgentRunnerHost,
   getAgentRunnerHosts,
-  issueHostEnrollToken,
   removeAgentRunnerHost,
   setActiveAgentRunnerHost,
   setAgentRuntimeVersion,
@@ -45,8 +46,6 @@ const RECENT_POLL_SECONDS = 300;
 // Well under the staleness threshold, so a host that stops polling is reported
 // as stale within a poll or two of actually becoming so.
 const REFRESH_MS = 30_000;
-
-const ENROLL_TTL_SECONDS = 900;
 
 const STATUS_STYLES: Record<string, string> = {
   online:
@@ -79,8 +78,6 @@ export default function AdminHostsPage() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [enrollHost, setEnrollHost] = useState('');
-  const [issuedToken, setIssuedToken] = useState<{ host: string; token: string } | null>(null);
 
   const mounted = useRef(true);
   const isAdmin = hasRole(state.user?.role, 'admin');
@@ -182,23 +179,6 @@ export default function AdminHostsPage() {
       if (!ok) return;
     }
     void run(() => removeAgentRunnerHost(host, slotsUsed > 0), `Removed ${host} from the pool.`);
-  };
-
-  const handleEnroll = async () => {
-    const host = enrollHost.trim();
-    if (!host) return;
-    setBusy(true);
-    setNotice(null);
-    try {
-      const issued = await issueHostEnrollToken(host, ENROLL_TTL_SECONDS);
-      if (!mounted.current) return;
-      setIssuedToken({ host: issued.host, token: issued.enroll_token });
-      setEnrollHost('');
-    } catch (e) {
-      if (mounted.current) setNotice(getErrorMessage(e));
-    } finally {
-      if (mounted.current) setBusy(false);
-    }
   };
 
   if (!isAdmin) {
@@ -422,13 +402,15 @@ export default function AdminHostsPage() {
                             )}
                           </div>
                           <div className="mt-1 text-xs leading-5 text-gray-500 dark:text-gray-400">
-                            {/* Which door the machine came through decides what
-                                its name is worth: reported by the runner (a
-                                scheduling label anything with the dispatcher
-                                credential can claim) or bound to a credential
-                                by enrollment. */}
-                            {host.enrolled ? 'enrolled' : 'self-reported name'}
-                            {host.last_worker_id ? ` · ${host.last_worker_id}` : ''}
+                            {/* Deliberately not "enrolled" / "self-reported
+                                name". That distinction is about whether a
+                                machine could be lying about which machine it
+                                is, and every host in this pool is one of ours —
+                                it answered a question nobody operating this
+                                page is asking. The mechanism is untouched; the
+                                credential still binds drain and remove to a
+                                machine. It is just not a thing to read here. */}
+                            {host.last_worker_id ?? '—'}
                             {host.runner_version ? ` · runner ${host.runner_version}` : ''}
                             {host.capabilities.length > 0
                               ? ` · ${host.capabilities.join(', ')}`
@@ -535,73 +517,6 @@ export default function AdminHostsPage() {
               </div>
             </div>
           )}
-        </div>
-
-        {/* ── Enroll ───────────────────────────────────────────────────
-            The section said what could go wrong and never what it was for.
-            Every other heading here carries a line saying what it is; this one
-            opened on the typo hazard, so the first question it drew was "what
-            is enrolling?" — which the card never answered.
-
-            What it buys is *identity*: without it a runner authenticates with
-            the pool-wide dispatcher token and reports its own name, so the name
-            is a label anything holding that token can claim, and drain or
-            remove are suggestions. That is the sentence that was missing. */}
-        <div className="mt-10">
-          <h2 className="text-sm font-medium text-gray-600 dark:text-gray-400">
-            Give a host its own identity
-          </h2>
-          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
-            Until a machine enrols, its runner signs in with the token every host shares and tells
-            us its own name — so Drain and Remove apply to a name, not to a machine. Enrolling gives
-            it a credential of its own, and those actions start binding to it.
-          </p>
-          <div className="mt-4 rounded-2xl border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 px-6 py-5 shadow-sm">
-            <p className="max-w-3xl text-sm leading-5 text-gray-500 dark:text-gray-400">
-              Issues a one-time token for the machine named here; its runner spends it once, at
-              first start. The name is chosen on this side because registration upserts: a name
-              already in use has that host&apos;s credential revoked and its row reset, so a typo
-              can evict a working machine.
-            </p>
-            <div className="mt-4 flex flex-wrap items-center gap-2">
-              <label htmlFor="enroll-host" className="sr-only">
-                Host name
-              </label>
-              <input
-                id="enroll-host"
-                value={enrollHost}
-                onChange={(e) => setEnrollHost(e.target.value)}
-                placeholder="runner-b"
-                className="rounded-lg border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 px-3 py-1.5 text-sm text-gray-900 dark:text-gray-50 shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-crimson/25"
-              />
-              <button
-                type="button"
-                disabled={busy || enrollHost.trim() === ''}
-                onClick={() => void handleEnroll()}
-                className="rounded-lg bg-gray-900 dark:bg-gray-100 px-3 py-1.5 text-sm font-medium text-white dark:text-gray-900 shadow-sm hover:bg-gray-800 dark:hover:bg-white disabled:opacity-40"
-              >
-                Issue token
-              </button>
-            </div>
-
-            {issuedToken && (
-              <div className="mt-4 rounded-xl border border-amber-200 dark:border-amber-500/25 bg-amber-50 dark:bg-amber-500/10 px-4 py-3 text-sm text-amber-900 dark:text-amber-300">
-                <p className="font-medium">
-                  Token for {issuedToken.host} — copy it now, it is not shown again.
-                </p>
-                {/* Only its hash is stored, so there is no call that can recover
-                    it. An operator who loses it issues another. */}
-                <code className="mt-1 block break-all font-mono text-xs">{issuedToken.token}</code>
-                <button
-                  type="button"
-                  onClick={() => setIssuedToken(null)}
-                  className="mt-2 font-medium hover:underline"
-                >
-                  Dismiss
-                </button>
-              </div>
-            )}
-          </div>
         </div>
       </section>
     </div>
