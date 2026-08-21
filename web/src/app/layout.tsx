@@ -1,6 +1,7 @@
 import '../styles/globals.css';
 import { config } from '@/config/env';
 import { Providers } from '@/components/providers';
+import { themeBootScript } from '@/lib/theme';
 
 // The root document.
 //
@@ -23,8 +24,19 @@ export const metadata = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" className="h-full">
-      <body className="flex min-h-screen flex-col bg-gray-50 text-black antialiased">
+    // `suppressHydrationWarning` is load-bearing, not noise suppression: the
+    // boot script below deliberately mutates this element's class and
+    // `color-scheme` before React hydrates, so server and client markup are
+    // *expected* to differ here. It applies to this element's own attributes
+    // only, not to the tree beneath it.
+    <html lang="en" className="h-full" suppressHydrationWarning>
+      <head>
+        {/* Runs before first paint. Without it every load renders light and
+            then flips, which for a dark-mode user is a full-screen white
+            flash on every navigation into the app. */}
+        <script dangerouslySetInnerHTML={{ __html: themeBootScript() }} />
+      </head>
+      <body className="flex min-h-screen flex-col bg-gray-50 text-black antialiased dark:bg-gray-950 dark:text-gray-100">
         <Providers>{children}</Providers>
       </body>
     </html>

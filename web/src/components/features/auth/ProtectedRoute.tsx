@@ -36,8 +36,10 @@ export function ProtectedRoute({ children }: { children: React.ReactNode }) {
   if (error) {
     return (
       <div className="flex min-h-screen flex-col items-center justify-center gap-2">
-        <h1 className="text-xl font-semibold text-gray-900">Sign-in unavailable</h1>
-        <p className="text-sm text-gray-500" role="alert">
+        <h1 className="text-xl font-semibold text-gray-900 dark:text-gray-50">
+          Sign-in unavailable
+        </h1>
+        <p className="text-sm text-gray-500 dark:text-gray-400" role="alert">
           {error}
         </p>
       </div>
@@ -47,7 +49,7 @@ export function ProtectedRoute({ children }: { children: React.ReactNode }) {
   if (state.loading || !state.isAuthenticated) {
     return (
       <div className="flex items-center justify-center min-h-screen">
-        <div className="h-12 w-12 animate-spin rounded-full border-4 border-gray-300 border-t-blue-600"></div>
+        <div className="h-12 w-12 animate-spin rounded-full border-4 border-gray-300 dark:border-white/15 border-t-blue-600"></div>
       </div>
     );
   }

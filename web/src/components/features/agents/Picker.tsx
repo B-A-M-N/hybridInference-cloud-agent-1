@@ -21,13 +21,13 @@ export function Picker({
     return null;
   }
   return (
-    <label className="inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-[13px] font-medium text-gray-600 hover:bg-gray-100">
+    <label className="inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-[13px] font-medium text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-white/10">
       <span className="sr-only">{label}</span>
       <select
         aria-label={label}
         value={value}
         onChange={(event) => onChange(event.target.value)}
-        className="cursor-pointer border-0 bg-transparent p-0 pr-5 text-[13px] font-medium text-gray-700 focus:outline-none focus:ring-0"
+        className="cursor-pointer border-0 bg-transparent p-0 pr-5 text-[13px] font-medium text-gray-700 dark:text-gray-300 focus:outline-none focus:ring-0"
       >
         {options.map((option) => (
           <option key={option} value={option}>

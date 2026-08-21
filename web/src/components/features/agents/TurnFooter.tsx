@@ -29,25 +29,25 @@ export interface ToolTiming {
 const CONTINUITY_LABEL: Record<string, { text: string; tone: string; title: string }> = {
   hot: {
     text: 'hot',
-    tone: 'bg-emerald-50 text-emerald-700 ring-emerald-600/20',
+    tone: 'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 ring-emerald-600/20 dark:ring-emerald-500/25',
     title:
       'Continued in the same live process as the previous turn. The agent kept everything it had in mind, and its workspace was never rebuilt.',
   },
   warm_native: {
     text: 'warm',
-    tone: 'bg-emerald-50 text-emerald-700 ring-emerald-600/20',
+    tone: 'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 ring-emerald-600/20 dark:ring-emerald-500/25',
     title:
       'Reopened the agent\u2019s own saved session in the workspace this thread already had. Its memory of earlier turns and the files it was working on are both intact; only its process was restarted.',
   },
   cold_native: {
     text: 'cold',
-    tone: 'bg-amber-50 text-amber-700 ring-amber-600/20',
+    tone: 'bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 ring-amber-600/20 dark:ring-amber-500/25',
     title:
       'Rebuilt in a fresh sandbox from the saved session and the saved code. The agent still remembers earlier turns, but anything it had installed or generated outside version control is gone.',
   },
   replay: {
     text: 'replay',
-    tone: 'bg-rose-50 text-rose-700 ring-rose-600/20',
+    tone: 'bg-rose-50 dark:bg-rose-500/10 text-rose-700 dark:text-rose-400 ring-rose-600/20 dark:ring-rose-500/25',
     title:
       'The agent\u2019s working memory of earlier turns was not available for this turn, so it was given the written transcript instead. It can read what was said, but it may not recall why it did something, and it will not know about anything it set up that the transcript does not mention. This happens when the previous turn\u2019s session could not be saved, or when the thread moved to another machine.',
   },
@@ -183,7 +183,7 @@ function ToolTimingTable({ timings }: { timings: ToolTiming[] }) {
   return (
     <table className="w-full text-[12px]">
       <thead>
-        <tr className="text-left text-gray-500">
+        <tr className="text-left text-gray-500 dark:text-gray-400">
           <th className="py-1 font-medium">Tool</th>
           <th className="py-1 font-medium">Detail</th>
           <th className="py-1 text-right font-medium">Duration</th>
@@ -191,15 +191,20 @@ function ToolTimingTable({ timings }: { timings: ToolTiming[] }) {
       </thead>
       <tbody>
         {timings.map((timing, index) => (
-          <tr key={`${timing.tool}-${index}`} className="border-t border-gray-100">
-            <td className="py-1 pr-3 align-top text-gray-800">
+          <tr
+            key={`${timing.tool}-${index}`}
+            className="border-t border-gray-100 dark:border-white/5"
+          >
+            <td className="py-1 pr-3 align-top text-gray-800 dark:text-gray-200">
               {timing.tool}
-              {timing.isError ? <span className="ml-1 text-rose-600">failed</span> : null}
+              {timing.isError ? (
+                <span className="ml-1 text-rose-600 dark:text-rose-400">failed</span>
+              ) : null}
             </td>
-            <td className="max-w-0 truncate py-1 pr-3 align-top font-mono text-gray-500">
+            <td className="max-w-0 truncate py-1 pr-3 align-top font-mono text-gray-500 dark:text-gray-400">
               {timing.detail}
             </td>
-            <td className="py-1 text-right align-top tabular-nums text-gray-700">
+            <td className="py-1 text-right align-top tabular-nums text-gray-700 dark:text-gray-300">
               {formatDuration(timing.ms) ?? 'unfinished'}
             </td>
           </tr>
@@ -257,8 +262,8 @@ export function TurnFooter({ job, attemptNo }: { job: AgentJob; attemptNo?: numb
   }
 
   return (
-    <section className="mt-3 rounded-lg border border-gray-200 bg-gray-50/60 px-3 py-2 text-[12px]">
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-gray-600">
+    <section className="mt-3 rounded-lg border border-gray-200 dark:border-white/10 bg-gray-50/60 dark:bg-gray-900/60 px-3 py-2 text-[12px]">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-gray-600 dark:text-gray-400">
         {badge ? (
           <button
             type="button"
@@ -273,7 +278,7 @@ export function TurnFooter({ job, attemptNo }: { job: AgentJob; attemptNo?: numb
         {duration ? <span className="tabular-nums">{duration}</span> : null}
         {stats.map((stat) => (
           <span key={stat.label} className="tabular-nums">
-            <span className="text-gray-500">{stat.label} </span>
+            <span className="text-gray-500 dark:text-gray-400">{stat.label} </span>
             {stat.value}
           </span>
         ))}
@@ -282,7 +287,7 @@ export function TurnFooter({ job, attemptNo }: { job: AgentJob; attemptNo?: numb
             type="button"
             onClick={() => setExplained(explained === 'partial' ? null : 'partial')}
             aria-expanded={explained === 'partial'}
-            className="text-amber-700 underline-offset-2 hover:underline"
+            className="text-amber-700 dark:text-amber-400 underline-offset-2 hover:underline"
           >
             partial
           </button>
@@ -292,7 +297,7 @@ export function TurnFooter({ job, attemptNo }: { job: AgentJob; attemptNo?: numb
             type="button"
             onClick={() => setExplained(explained === 'unmeasured' ? null : 'unmeasured')}
             aria-expanded={explained === 'unmeasured'}
-            className="text-gray-400 underline-offset-2 hover:underline"
+            className="text-gray-400 dark:text-gray-500 underline-offset-2 hover:underline"
           >
             resource data unavailable
           </button>
@@ -301,21 +306,21 @@ export function TurnFooter({ job, attemptNo }: { job: AgentJob; attemptNo?: numb
           <button
             type="button"
             onClick={() => setOpen((value) => !value)}
-            className="ml-auto text-gray-500 underline-offset-2 hover:text-gray-800 hover:underline"
+            className="ml-auto text-gray-500 dark:text-gray-400 underline-offset-2 hover:text-gray-800 dark:hover:text-gray-200 hover:underline"
           >
             {open ? 'Hide' : `${timings.length} tool ${timings.length === 1 ? 'call' : 'calls'}`}
           </button>
         ) : null}
       </div>
       {explanation ? (
-        <p className="mt-2 border-t border-gray-200 pt-2 text-[12px] leading-relaxed text-gray-600">
+        <p className="mt-2 border-t border-gray-200 dark:border-white/10 pt-2 text-[12px] leading-relaxed text-gray-600 dark:text-gray-400">
           {explanation}
         </p>
       ) : null}
       {open && timings.length > 0 ? (
-        <div className="mt-2 border-t border-gray-200 pt-2">
+        <div className="mt-2 border-t border-gray-200 dark:border-white/10 pt-2">
           <ToolTimingTable timings={timings} />
-          <p className="mt-2 text-[11px] text-gray-500">
+          <p className="mt-2 text-[11px] text-gray-500 dark:text-gray-400">
             Durations are measured from when the model requested each call to when its result
             arrived, so they include the model’s own thinking time. Per-call execution timing
             arrives with the next step of this work.
