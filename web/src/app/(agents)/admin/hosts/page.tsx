@@ -262,45 +262,6 @@ export default function AdminHostsPage() {
           </div>
         )}
 
-        {/* ── Where new jobs run ───────────────────────────────────────
-            Its own section because it is a *policy*, not a property of any
-            one row: inline beside the pool it read as a caption on the table.
-            The pin itself still lives per-host, where the choice is made.
-
-            Titled for the effect rather than the mechanism. "Claiming" is this
-            codebase's word — a runner claims from the queue — and the first
-            person to read it on the page asked what it meant. Not "assignment"
-            either: nothing is assigned, because runners pull. */}
-        <div className="mt-10">
-          <h2 className="text-sm font-medium text-gray-600 dark:text-gray-400">
-            Where new jobs run
-          </h2>
-          <div className="mt-4 rounded-2xl border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 px-6 shadow-sm">
-            <div className="flex min-h-20 flex-col justify-center gap-3 py-5 sm:flex-row sm:items-center">
-              <div className="min-w-0 flex-1">
-                <h3 className="font-medium text-gray-900 dark:text-gray-50">
-                  {activeHost ? `Pinned to ${activeHost}` : 'Any host may claim'}
-                </h3>
-                <p className="mt-0.5 text-sm leading-5 text-gray-500 dark:text-gray-400">
-                  {activeHost
-                    ? 'New jobs go there from its next poll. Work already running elsewhere finishes where it started — pinning is not a drain.'
-                    : 'Every host below that is online takes work. Pin one from the table to send new jobs to it alone.'}
-                </p>
-              </div>
-              <div className="flex shrink-0 justify-end">
-                <button
-                  type="button"
-                  disabled={busy || activeHost === null}
-                  onClick={() => void handlePin(null)}
-                  className="inline-flex items-center rounded-lg border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 px-3 py-1.5 text-sm font-medium text-gray-800 dark:text-gray-200 shadow-sm hover:bg-gray-50 dark:hover:bg-white/5 disabled:opacity-40 disabled:hover:bg-white dark:disabled:hover:bg-gray-900"
-                >
-                  Any host
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-
         {/* ── Harness version ──────────────────────────────────────────
             One row per runtime, because the previous inline strip put five
             selects and five bare runtime names on a single line: five copies
@@ -391,6 +352,40 @@ export default function AdminHostsPage() {
             A host appears once its runner has polled — which is not a claim that it is reachable
             now.
           </p>
+
+          {/* Which hosts take work, stated where the hosts are.
+              This was a section of its own, and the split was the confusion:
+              the *state* sat in a card at the top while the only way to change
+              it — Pin — was a button in the table below, so reading it and
+              acting on it happened in two places. It is one sentence about the
+              list, so it belongs to the list.
+
+              Worth saying out loud rather than leaving to the badge: an absent
+              "pinned" chip is ambiguous (nothing pinned, or did I miss it?),
+              and pinning is not a drain — the machine that lost the pin keeps
+              running what it already has. */}
+          <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-2 text-sm">
+            <span className="text-gray-700 dark:text-gray-300">
+              {activeHost ? (
+                <>
+                  New jobs go to <span className="font-medium">{activeHost}</span> alone. Work
+                  already running elsewhere finishes where it started.
+                </>
+              ) : (
+                'Every host below that is online takes work. Pin one to send new jobs to it alone.'
+              )}
+            </span>
+            {activeHost && (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => void handlePin(null)}
+                className="inline-flex items-center rounded-lg border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 px-2.5 py-1 text-xs font-medium text-gray-800 dark:text-gray-200 shadow-sm hover:bg-gray-50 dark:hover:bg-white/5 disabled:opacity-40"
+              >
+                Any host
+              </button>
+            )}
+          </div>
 
           {loading ? (
             <p className="mt-4 text-sm text-gray-500 dark:text-gray-400">Loading…</p>
