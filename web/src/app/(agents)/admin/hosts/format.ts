@@ -80,16 +80,16 @@ export function runtimeMenu(hosts: AgentRunnerHost[]): [string, string[]][] {
 }
 
 /**
- * What a runtime's row says under its name.
+ * What a runtime's row says under its name, or nothing.
  *
- * The menu is a property of the *image*, not of this page, and the selector
- * above it is easy to read as "pick any version you like". Naming the default
- * and what else is in there makes the ceiling visible without a paragraph
- * about `*_EXTRA_VERSIONS` next to every row.
+ * Only says the one thing its selector cannot: which version "Image default"
+ * actually resolves to. Where the image holds a single version there is no
+ * such gap — the dropdown has one option and opening it answers the question —
+ * so the row says nothing rather than spending a line per runtime explaining
+ * that there was no choice to make.
  */
 export function describeMenu(versions: string[]): string {
-  if (versions.length === 0) return 'No version reported.';
   const [fallback, ...rest] = versions;
-  if (rest.length === 0) return `The image holds only ${fallback}.`;
+  if (!fallback || rest.length === 0) return '';
   return `Image default ${fallback} · also built in: ${rest.join(', ')}`;
 }

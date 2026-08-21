@@ -205,11 +205,17 @@ export default function AdminHostsPage() {
           controls floating between paragraphs. This page had grown its own
           denser dialect, which read as unfinished beside every other screen. */}
       <section className="mx-auto w-full max-w-5xl px-6 py-12 lg:px-12 lg:py-16">
+        {/* Named for both of the things on it. It was "Runner hosts", which
+            made the harness selector a sub-heading of the machine list — and
+            the CLI version is not a property of a machine, it is a
+            deployment-wide setting sitting beside one. The giveaway was the
+            subtitle: it had to say "and which agent CLI they run it with" to
+            stretch the title over a section the title did not cover. */}
         <h1 className="text-3xl font-semibold tracking-tight text-gray-900 dark:text-gray-50">
-          Runner hosts
+          Agent execution
         </h1>
         <p className="mt-2 text-base text-gray-500 dark:text-gray-400">
-          The machines that may run agent jobs, and which agent CLI they run it with.
+          Which agent CLI new work runs with, and which machines run it.
         </p>
 
         {error && (
@@ -327,7 +333,7 @@ export default function AdminHostsPage() {
             say. What a machine will *run* — CLI versions and the image they
             came from — is one question, so it is one cell. */}
         <div className="mt-10">
-          <h2 className="text-sm font-medium text-gray-600 dark:text-gray-400">Pool</h2>
+          <h2 className="text-sm font-medium text-gray-600 dark:text-gray-400">Runner hosts</h2>
           <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
             A host appears once its runner has polled — which is not a claim that it is reachable
             now.
