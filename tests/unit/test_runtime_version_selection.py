@@ -23,6 +23,7 @@ from typing import Any
 
 import pytest
 
+from cloud_agent.schemas import WorkerClaimAttestation
 from cloud_agent.storage.store import resolve_runtime_version
 from cloud_agent_host.runner import (
     ClaimedJob,
@@ -31,6 +32,7 @@ from cloud_agent_host.runner import (
 )
 from cloud_agent_host.sandbox import (
     SANDBOX_PATH,
+    ContainerBackend,
     SandboxError,
     _labelled,
     _split_menu,
@@ -251,3 +253,56 @@ def test_an_image_that_reports_no_menu_is_trusted() -> None:
     _select_runtime_version(env, job=_job("2.1.220"), backend=_Backend(None))
 
     assert env["PATH"].startswith(runtime_bin_dir("claude-code", "2.1.220"))
+
+
+# ── The wire between them ────────────────────────────────────────────────
+
+
+def test_the_claim_schema_declares_everything_the_runner_attests() -> None:
+    """A key the model does not name is a key the model throws away.
+
+    This is the general form of a bug that reached staging. The runner sends
+    its whole ``version_stamp()`` as the claim attestation and ``claim_job``
+    read ``runtime_versions_available`` out of it — but nothing declared that
+    field on ``WorkerClaimAttestation``, so Pydantic dropped it in validation.
+    The claim saw an empty menu, every stored selection failed its
+    "does this host offer it?" check, and each one silently became a no-op.
+    One log line was the only sign.
+
+    Nothing caught it because every test went around the wire: the unit tests
+    pass ``available=`` straight into ``resolve_runtime_version``, and the
+    dbtests call ``store.claim_job(claim_attestation=...)`` directly. Both
+    skip the model that was doing the dropping.
+
+    So this asserts the join itself, and it fails for the *next* field too.
+    """
+    # Constructed rather than hand-built, so a key added to the real stamp is
+    # a key this test sees. The docker binary does not exist, which takes the
+    # degraded path — its keys are the ones a working inspect produces too, and
+    # the keys are the whole subject here.
+    backend = ContainerBackend(image="unused", docker_binary="/nonexistent-docker")
+    reported = set(backend.version_stamp())
+    declared = set(WorkerClaimAttestation.model_fields)
+
+    dropped = reported - declared
+    assert not dropped, (
+        f"the runner attests {sorted(dropped)}, which WorkerClaimAttestation does "
+        "not declare — Pydantic discards those keys and the claim never sees them"
+    )
+
+
+def test_the_menu_survives_validation() -> None:
+    """The specific field, end to end through the model the endpoint applies."""
+    attestation = WorkerClaimAttestation.model_validate(
+        {
+            "sandbox_runtime": "",
+            "runtime_versions": {"claude-code": "2.1.220"},
+            "runtime_versions_available": {"claude-code": ["2.1.220", "2.1.235"]},
+        }
+    )
+
+    # `model_dump()` is what `routes.py` hands to `claim_job`, so it is the
+    # value under test rather than the parsed object.
+    assert attestation.model_dump()["runtime_versions_available"] == {
+        "claude-code": ["2.1.220", "2.1.235"]
+    }
