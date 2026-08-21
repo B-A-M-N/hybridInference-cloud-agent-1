@@ -15,7 +15,7 @@ export const en = {
   'nav.status': 'Status',
   'nav.docsAssistant': 'Docs Assistant',
   'nav.agents': 'Agents',
-  'nav.execution': 'Execution',
+  'nav.admin': 'Admin',
   'nav.dashboard': 'Dashboard',
   'nav.logOut': 'Log out',
   'nav.expandTaskList': 'Expand task list',

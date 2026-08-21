@@ -78,18 +78,3 @@ export function runtimeMenu(hosts: AgentRunnerHost[]): [string, string[]][] {
   }
   return [...menu.entries()].sort(([a], [b]) => a.localeCompare(b));
 }
-
-/**
- * What a runtime's row says under its name, or nothing.
- *
- * Only says the one thing its selector cannot: which version "Image default"
- * actually resolves to. Where the image holds a single version there is no
- * such gap — the dropdown has one option and opening it answers the question —
- * so the row says nothing rather than spending a line per runtime explaining
- * that there was no choice to make.
- */
-export function describeMenu(versions: string[]): string {
-  const [fallback, ...rest] = versions;
-  if (!fallback || rest.length === 0) return '';
-  return `Image default ${fallback} · also built in: ${rest.join(', ')}`;
-}

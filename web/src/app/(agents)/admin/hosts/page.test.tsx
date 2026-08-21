@@ -38,14 +38,7 @@ import {
   setAgentRuntimeVersion,
 } from '@/lib/api/admin';
 
-import {
-  describeMenu,
-  formatAge,
-  formatImage,
-  formatSlots,
-  formatVersions,
-  runtimeMenu,
-} from './format';
+import { formatAge, formatImage, formatSlots, formatVersions, runtimeMenu } from './format';
 import AdminHostsPage from './page';
 
 const mocked = {
@@ -364,40 +357,19 @@ describe('the harness section reads as a choice, not a list', () => {
 
   afterEach(cleanup);
 
-  it('says only what the dropdown cannot', () => {
-    // Which version "Image default" resolves to — invisible in a closed
-    // select, and the reason to write anything under the name at all.
-    expect(describeMenu(['2.1.220', '2.1.235'])).toBe(
-      'Image default 2.1.220 · also built in: 2.1.235',
-    );
-    // One version is no gap: opening the select answers it. A line per
-    // runtime explaining that there was nothing to choose was five copies of
-    // the same non-fact, and it crowded out the one runtime that had a choice.
-    expect(describeMenu(['0.145.0'])).toBe('');
-    expect(describeMenu([])).toBe('');
-  });
-
-  it('puts the runtime with a real choice first', async () => {
-    // Alphabetical order buried claude-code — the only selectable one — under
-    // codex. The section exists for the runtime that can move.
-    mocked.list.mockResolvedValue(
-      pool([
-        host({
-          runtime_versions_available: {
-            codex: ['0.145.0'],
-            'claude-code': ['2.1.220', '2.1.235'],
-            pi: ['0.73.1'],
-          },
-        }),
-      ]),
-    );
+  it('is the runtimes and their controls, and no prose', async () => {
+    // Everything this section could explain is already said elsewhere: the
+    // versions on offer are in the select, what each host holds is in the
+    // table below, that a running conversation keeps its version is in the
+    // confirmation after the change, and how to add a version is deployment
+    // documentation. Written here it was a third telling every time.
     render(<AdminHostsPage />);
 
     await screen.findByLabelText('claude-code');
-    const labels = [...document.querySelectorAll('label[for^="harness-version-"]')].map(
-      (node) => node.textContent,
-    );
-    expect(labels[0]).toBe('claude-code');
+    expect(screen.queryByText(/also built in/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/The image holds only/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/EXTRA_VERSIONS/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Applies to new threads/)).not.toBeInTheDocument();
   });
 
   it('still offers a fixed runtime, compressed but not removed', async () => {

@@ -29,14 +29,7 @@ import {
 } from '@/lib/api/admin';
 import { getErrorMessage } from '@/lib/utils/errors';
 
-import {
-  describeMenu,
-  formatAge,
-  formatImage,
-  formatSlots,
-  formatVersions,
-  runtimeMenu,
-} from './format';
+import { formatAge, formatImage, formatSlots, formatVersions, runtimeMenu } from './format';
 
 // A runner polls only between jobs, so silence can mean "busy for an hour" as
 // easily as "gone". Carried over from the gateway's section along with the
@@ -153,11 +146,7 @@ export default function AdminHostsPage() {
   // the menus are per-image. Derived on render rather than held in state: it is
   // a view of `hosts`, and a second copy could disagree with the table beside
   // it after a poll.
-  // Choosable first: the point of the section is the runtime an operator can
-  // actually move, and alphabetical order buried claude-code under codex.
-  const menu = runtimeMenu(hosts).sort(
-    ([, a], [, b]) => Number(b.length > 1) - Number(a.length > 1),
-  );
+  const menu = runtimeMenu(hosts);
 
   const handleVersion = (runtime: string, version: string) =>
     run(
@@ -205,18 +194,18 @@ export default function AdminHostsPage() {
           controls floating between paragraphs. This page had grown its own
           denser dialect, which read as unfinished beside every other screen. */}
       <section className="mx-auto w-full max-w-5xl px-6 py-12 lg:px-12 lg:py-16">
-        {/* Named for both of the things on it. It was "Runner hosts", which
-            made the harness selector a sub-heading of the machine list — and
-            the CLI version is not a property of a machine, it is a
-            deployment-wide setting sitting beside one. The giveaway was the
-            subtitle: it had to say "and which agent CLI they run it with" to
-            stretch the title over a section the title did not cover. */}
+        {/* This is the admin area, not a page about one subject — which is
+            what "Runner hosts" made it, with the harness selector reading as a
+            sub-heading of the machine list. A CLI version is not a property of
+            a machine; both are settings an admin comes here to change, and
+            naming the container rather than one of its contents leaves room
+            for the next one without another rename.
+
+            No subtitle: the two section headings already say what is here, and
+            a sentence restating them is the prose this page kept accumulating. */}
         <h1 className="text-3xl font-semibold tracking-tight text-gray-900 dark:text-gray-50">
-          Agent execution
+          Admin
         </h1>
-        <p className="mt-2 text-base text-gray-500 dark:text-gray-400">
-          Which agent CLI new work runs with, and which machines run it.
-        </p>
 
         {error && (
           <div className="mt-6 flex items-center justify-between gap-4 rounded-xl border border-red-200 dark:border-red-500/25 bg-red-50 dark:bg-red-500/10 px-4 py-3 text-sm text-red-700 dark:text-red-400">
@@ -261,67 +250,55 @@ export default function AdminHostsPage() {
             `*_EXTRA_VERSIONS`. */}
         {menu.length > 0 && (
           <div className="mt-10">
+            {/* No subtitle, unlike the section below, because both of the
+                things one would say are already said where they land: that a
+                running conversation keeps its version is in the confirmation
+                after the change, and where the options come from — and how to
+                add one — is deployment documentation, in `.env.example` and
+                ENVIRONMENT.md, read by the person editing the `.env` rather
+                than by anyone standing on this page. */}
             <h2 className="text-sm font-medium text-gray-600 dark:text-gray-400">
               Harness version
             </h2>
-            <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
-              Applies to new threads. A conversation already running keeps the version it started
-              on.
-            </p>
             <div className="mt-4 rounded-2xl border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 px-6 shadow-sm">
-              {menu.map(([runtime, versions], index) => {
-                // A runtime whose image holds one version has nothing to weigh
-                // up, so it gets one line instead of three. Four such rows,
-                // each explaining at paragraph length that there was no choice,
-                // buried the one runtime that had one.
-                const choosable = versions.length > 1;
-                return (
-                  <div
-                    key={runtime}
-                    className={`flex flex-col justify-center gap-3 sm:flex-row sm:items-center ${
-                      choosable ? 'py-4' : 'py-2.5'
-                    } ${index > 0 ? 'border-t border-gray-100 dark:border-white/5' : ''}`}
-                  >
-                    <div className="min-w-0 flex-1">
-                      <label
-                        htmlFor={`harness-version-${runtime}`}
-                        className={
-                          choosable
-                            ? 'font-medium text-gray-900 dark:text-gray-50'
-                            : 'text-sm text-gray-700 dark:text-gray-300'
-                        }
-                      >
-                        {runtime}
-                      </label>
-                      {choosable ? (
-                        <p className="mt-0.5 text-sm leading-5 text-gray-500 dark:text-gray-400">
-                          {describeMenu(versions)}
-                        </p>
-                      ) : (
-                        <span className="ml-2 text-sm text-gray-400 dark:text-gray-500">
-                          {describeMenu(versions)}
-                        </span>
-                      )}
-                    </div>
-                    <div className="flex shrink-0 justify-end">
-                      <select
-                        id={`harness-version-${runtime}`}
-                        disabled={busy}
-                        value={runtimeVersions[runtime] ?? ''}
-                        onChange={(event) => void handleVersion(runtime, event.target.value)}
-                        className="rounded-lg border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 px-3 py-1.5 text-sm font-medium text-gray-800 dark:text-gray-200 shadow-sm hover:bg-gray-50 dark:hover:bg-white/5 disabled:opacity-40"
-                      >
-                        <option value="">Image default</option>
-                        {versions.map((version) => (
-                          <option key={version} value={version}>
-                            {version}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
+              {/* A name and its control. Nothing here pre-announces what opening
+                  the control would show: the versions on offer are in the
+                  select, and the version each host is actually holding is in
+                  the table below — said twice already, and the second telling
+                  was the abstract one. */}
+              {menu.map(([runtime, versions], index) => (
+                <div
+                  key={runtime}
+                  className={`flex flex-col justify-center gap-3 py-2.5 sm:flex-row sm:items-center ${
+                    index > 0 ? 'border-t border-gray-100 dark:border-white/5' : ''
+                  }`}
+                >
+                  <div className="min-w-0 flex-1">
+                    <label
+                      htmlFor={`harness-version-${runtime}`}
+                      className="text-sm text-gray-700 dark:text-gray-300"
+                    >
+                      {runtime}
+                    </label>
                   </div>
-                );
-              })}
+                  <div className="flex shrink-0 justify-end">
+                    <select
+                      id={`harness-version-${runtime}`}
+                      disabled={busy}
+                      value={runtimeVersions[runtime] ?? ''}
+                      onChange={(event) => void handleVersion(runtime, event.target.value)}
+                      className="rounded-lg border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 px-3 py-1.5 text-sm font-medium text-gray-800 dark:text-gray-200 shadow-sm hover:bg-gray-50 dark:hover:bg-white/5 disabled:opacity-40"
+                    >
+                      <option value="">Image default</option>
+                      {versions.map((version) => (
+                        <option key={version} value={version}>
+                          {version}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
         )}
@@ -333,11 +310,13 @@ export default function AdminHostsPage() {
             say. What a machine will *run* — CLI versions and the image they
             came from — is one question, so it is one cell. */}
         <div className="mt-10">
+          {/* The caveat that used to sit here — a host appears once its runner
+              polled, which is not a claim it is reachable now — is what the
+              "Last polled" column is called. Explaining a column heading in a
+              sentence above the table is the prose this page kept growing; the
+              case where it actually bites, a pinned host gone quiet, has its
+              own warning at the top. */}
           <h2 className="text-sm font-medium text-gray-600 dark:text-gray-400">Runner hosts</h2>
-          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
-            A host appears once its runner has polled — which is not a claim that it is reachable
-            now.
-          </p>
 
           {/* Which hosts take work, stated where the hosts are.
               This was a section of its own, and the split was the confusion:
@@ -350,7 +329,7 @@ export default function AdminHostsPage() {
               "pinned" chip is ambiguous (nothing pinned, or did I miss it?),
               and pinning is not a drain — the machine that lost the pin keeps
               running what it already has. */}
-          <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-2 text-sm">
+          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-2 text-sm">
             <span className="text-gray-700 dark:text-gray-300">
               {activeHost ? (
                 <>
