@@ -73,7 +73,9 @@ async def store():
             await conn.execute(f"DELETE FROM {table}")
         # Reset rather than delete: the policy is a singleton row, and a test
         # that left a host pinned would otherwise gate every later claim.
-        await conn.execute("UPDATE agent_runner_policy SET active_host = NULL")
+        await conn.execute(
+            "UPDATE agent_runner_policy SET active_host = NULL, runtime_versions = NULL"
+        )
 
     try:
         yield job_store
@@ -81,7 +83,9 @@ async def store():
         async with pool.acquire() as conn:
             for table in _TABLES_IN_FK_ORDER:
                 await conn.execute(f"DELETE FROM {table}")
-            await conn.execute("UPDATE agent_runner_policy SET active_host = NULL")
+            await conn.execute(
+                "UPDATE agent_runner_policy SET active_host = NULL, runtime_versions = NULL"
+            )
         await pool.close()
 
 
@@ -1725,7 +1729,7 @@ async def test_the_pool_and_the_pinned_host_come_from_one_read(store: AgentJobSt
     await store.touch_runner_host(host="runner-b", worker_id="w2")
     await store.set_active_runner_host(host="runner-b")
 
-    hosts, active = await store.runner_pool()
+    hosts, active, _ = await store.runner_pool()
 
     assert active == "runner-b"
     assert [h["host"] for h in hosts if h["is_active"]] == ["runner-b"]

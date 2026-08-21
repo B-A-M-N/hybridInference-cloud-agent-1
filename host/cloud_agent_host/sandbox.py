@@ -110,6 +110,16 @@ KATA_RUNTIME = "io.containerd.kata.v2"
 # rather than guessing — a stamp that might be wrong is worse than none.
 RUNTIME_VERSION_LABEL_PREFIX = "org.freeinference.runtime."
 RUNTIME_VERSION_LABEL_SUFFIX = ".version"
+#: The whole menu, where ``.version`` is only the default. Distinct labels
+#: because they answer different questions and a reader that knows nothing
+#: about menus must keep reading a single exact version out of ``.version``.
+RUNTIME_VERSION_MENU_LABEL_SUFFIX = ".versions"
+
+#: Where `deploy/sandbox/install-runtimes.sh` puts every version it installs.
+#: Selecting one is a PATH prepend and nothing more: all five CLIs resolve
+#: their binary through PATH, so neither the adapters in ``runtimes.py`` nor
+#: the pi/opencode/kilo wrappers have to know a choice was made.
+RUNTIME_BIN_ROOT = "/opt/runtimes"
 
 # Must match `useradd --uid` in deploy/sandbox/Dockerfile.agent-sandbox. The
 # runner chowns each job worktree to this id before mounting it, so a drift
@@ -120,6 +130,51 @@ SANDBOX_HOME = "/home/agent"
 SANDBOX_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 TERMINAL_CONTAINER_LABEL = "org.hybridinference.agent-terminal"
 TERMINAL_CONTAINER_OWNER_LABEL = "org.hybridinference.agent-terminal-owner"
+
+
+def runtime_bin_dir(runtime_id: str, version: str) -> str:
+    """Where this runtime's ``version`` keeps its binaries inside the image.
+
+    Prepending this to the sandbox's ``PATH`` is the whole of version
+    selection — see ``RUNTIME_BIN_ROOT``.
+    """
+    return f"{RUNTIME_BIN_ROOT}/{runtime_id}/{version}/bin"
+
+
+def _labelled(labels: dict[str, Any], suffix: str) -> dict[str, str]:
+    """Image labels under this project's runtime namespace, keyed by runtime id.
+
+    ``.version`` is not a suffix of ``.versions``, so the two never collide.
+    """
+    found: dict[str, str] = {}
+    for key, value in labels.items():
+        if (
+            isinstance(key, str)
+            and isinstance(value, str)
+            and key.startswith(RUNTIME_VERSION_LABEL_PREFIX)
+            and key.endswith(suffix)
+        ):
+            runtime_id = key[len(RUNTIME_VERSION_LABEL_PREFIX) : -len(suffix)]
+            if runtime_id:
+                found[runtime_id] = value
+    return found
+
+
+def _split_menu(menu: str | None, default: str) -> list[str]:
+    """The versions a runtime offers, default first and always present.
+
+    Order is the label's, which is the order they were installed in, which puts
+    the default at the head. Kept rather than sorted: "first" is a meaning here,
+    not an accident, and an operator reading the admin page sees the same order
+    the image declares.
+    """
+    versions = [part.strip() for part in (menu or "").split(",")]
+    offered = [version for version in versions if version]
+    if default and default not in offered:
+        # A menu that omits its own default cannot be honoured — the default is
+        # what a job with no selection runs, so it is always available.
+        offered.insert(0, default)
+    return offered
 
 
 class SandboxError(Exception):
@@ -800,6 +855,7 @@ class ContainerBackend(SandboxBackend):
             "sandbox_runtime": self.runtime or "",
             "sandbox_image_digest": "",
             "runtime_versions": {},
+            "runtime_versions_available": {},
         }
         try:
             proc = subprocess.run(
@@ -829,20 +885,17 @@ class ContainerBackend(SandboxBackend):
             stamp["sandbox_image_digest"] = info["Id"]
         labels = (info.get("Config") or {}).get("Labels") or {}
         if isinstance(labels, dict):
-            versions: dict[str, str] = {}
-            for key, value in labels.items():
-                if (
-                    isinstance(key, str)
-                    and isinstance(value, str)
-                    and key.startswith(RUNTIME_VERSION_LABEL_PREFIX)
-                    and key.endswith(RUNTIME_VERSION_LABEL_SUFFIX)
-                ):
-                    runtime_id = key[
-                        len(RUNTIME_VERSION_LABEL_PREFIX) : -len(RUNTIME_VERSION_LABEL_SUFFIX)
-                    ]
-                    if runtime_id:
-                        versions[runtime_id] = value
+            versions = _labelled(labels, RUNTIME_VERSION_LABEL_SUFFIX)
+            menus = _labelled(labels, RUNTIME_VERSION_MENU_LABEL_SUFFIX)
             stamp["runtime_versions"] = versions
+            # An image built before menus existed labels only its default, and
+            # a menu of one is exactly what that image offers — degrading to
+            # an *empty* menu would instead read as "this host can run nothing"
+            # and make every stored selection unservable.
+            stamp["runtime_versions_available"] = {
+                runtime_id: _split_menu(menus.get(runtime_id), default)
+                for runtime_id, default in versions.items()
+            }
         return stamp
 
     @property

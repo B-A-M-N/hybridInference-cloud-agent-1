@@ -28,6 +28,7 @@ vi.mock('@/lib/api/admin', () => ({
   undrainAgentRunnerHost: vi.fn(),
   removeAgentRunnerHost: vi.fn(),
   issueHostEnrollToken: vi.fn(),
+  setAgentRuntimeVersion: vi.fn(),
 }));
 
 import {
@@ -36,9 +37,10 @@ import {
   issueHostEnrollToken,
   removeAgentRunnerHost,
   setActiveAgentRunnerHost,
+  setAgentRuntimeVersion,
 } from '@/lib/api/admin';
 
-import { formatAge, formatSlots } from './format';
+import { formatAge, formatImage, formatSlots, formatVersions, runtimeMenu } from './format';
 import AdminHostsPage from './page';
 
 const mocked = {
@@ -47,6 +49,7 @@ const mocked = {
   drain: drainAgentRunnerHost as unknown as ReturnType<typeof vi.fn>,
   remove: removeAgentRunnerHost as unknown as ReturnType<typeof vi.fn>,
   enroll: issueHostEnrollToken as unknown as ReturnType<typeof vi.fn>,
+  setVersion: setAgentRuntimeVersion as unknown as ReturnType<typeof vi.fn>,
 };
 
 function host(over: Partial<Record<string, unknown>> = {}) {
@@ -66,12 +69,20 @@ function host(over: Partial<Record<string, unknown>> = {}) {
     runner_version: '1.2.3',
     broker_url: 'http://runner-a:8092',
     last_heartbeat_at: '2026-08-05T00:00:00Z',
+    sandbox_runtime: '',
+    sandbox_image_digest: 'freeinference-cloud-agent-job@sha256:abcdef0123456789',
+    runtime_versions: { 'claude-code': '2.1.220' },
+    runtime_versions_available: { 'claude-code': ['2.1.220', '2.1.235'] },
     ...over,
   };
 }
 
-function pool(hosts: unknown[], active: string | null = null) {
-  return { hosts, active_host: active };
+function pool(
+  hosts: unknown[],
+  active: string | null = null,
+  runtimeVersions: Record<string, string> = {},
+) {
+  return { hosts, active_host: active, runtime_versions: runtimeVersions };
 }
 
 describe('AdminHostsPage', () => {
@@ -247,5 +258,103 @@ describe('formatting', () => {
   it('omits the ceiling for a host that declares none', () => {
     expect(formatSlots({ slots_used: 2, slots_total: 4 } as never)).toBe('2 / 4');
     expect(formatSlots({ slots_used: 2, slots_total: null } as never)).toBe('2');
+  });
+});
+
+describe('harness version selection', () => {
+  beforeEach(() => {
+    auth.role = 'admin';
+    Object.values(mocked).forEach((m) => m.mockReset());
+    mocked.list.mockResolvedValue(pool([host()]));
+  });
+
+  afterEach(cleanup);
+
+  it('offers every version the pool holds, with the image default first', async () => {
+    render(<AdminHostsPage />);
+
+    const select = (await screen.findByLabelText('claude-code')) as HTMLSelectElement;
+    expect([...select.options].map((o) => o.textContent)).toEqual([
+      'Image default',
+      '2.1.220',
+      '2.1.235',
+    ]);
+    // Nothing selected means the image default — not "2.1.220 happens to be
+    // first". The two differ the moment a host is rebuilt.
+    expect(select.value).toBe('');
+  });
+
+  it('shows the deployment-wide selection, not a per-host value', async () => {
+    mocked.list.mockResolvedValue(pool([host()], null, { 'claude-code': '2.1.235' }));
+    render(<AdminHostsPage />);
+
+    const select = (await screen.findByLabelText('claude-code')) as HTMLSelectElement;
+    await waitFor(() => expect(select.value).toBe('2.1.235'));
+  });
+
+  it('sends the choice and takes the whole pool back', async () => {
+    mocked.setVersion.mockResolvedValue(pool([host()], null, { 'claude-code': '2.1.235' }));
+    render(<AdminHostsPage />);
+
+    const select = await screen.findByLabelText('claude-code');
+    fireEvent.change(select, { target: { value: '2.1.235' } });
+
+    await waitFor(() => expect(mocked.setVersion).toHaveBeenCalledWith('claude-code', '2.1.235'));
+    // The wording is the contract with the operator: this is not retroactive,
+    // and a page that implied otherwise would be the bug.
+    expect(
+      await screen.findByText(/New claude-code threads will run 2\.1\.235/),
+    ).toBeInTheDocument();
+  });
+
+  it('clears back to the image default with null, not an empty string', async () => {
+    mocked.list.mockResolvedValue(pool([host()], null, { 'claude-code': '2.1.235' }));
+    mocked.setVersion.mockResolvedValue(pool([host()]));
+    render(<AdminHostsPage />);
+
+    const select = await screen.findByLabelText('claude-code');
+    fireEvent.change(select, { target: { value: '' } });
+
+    await waitFor(() => expect(mocked.setVersion).toHaveBeenCalledWith('claude-code', null));
+  });
+
+  it('hides the selector when no host reports a menu', async () => {
+    // A pool of pre-menu hosts. An empty control that cannot do anything is
+    // worse than no control: it reads as broken rather than as absent.
+    mocked.list.mockResolvedValue(pool([host({ runtime_versions_available: null })]));
+    render(<AdminHostsPage />);
+
+    await screen.findByText('runner-a');
+    expect(screen.queryByText('Harness version')).not.toBeInTheDocument();
+  });
+});
+
+describe('version and image cells', () => {
+  it('lists each runtime default, and renders a host that reports none', () => {
+    expect(formatVersions(host() as never)).toBe('claude-code 2.1.220');
+    expect(formatVersions(host({ runtime_versions: null }) as never)).toBe('—');
+    expect(formatVersions(host({ runtime_versions: {} }) as never)).toBe('—');
+  });
+
+  it('shortens a digest to something comparable at a glance', () => {
+    expect(formatImage(host() as never)).toBe('abcdef012345');
+    // A locally built image has no RepoDigest; its bare id still identifies it.
+    expect(formatImage(host({ sandbox_image_digest: 'sha256:0123456789abcdef' }) as never)).toBe(
+      '0123456789ab',
+    );
+    expect(formatImage(host({ sandbox_image_digest: null }) as never)).toBe('—');
+  });
+
+  it('unions menus across hosts without losing the default ordering', () => {
+    const menu = runtimeMenu([
+      host({ runtime_versions_available: { 'claude-code': ['2.1.220'] } }),
+      host({
+        runtime_versions_available: { 'claude-code': ['2.1.220', '2.1.235'], pi: ['0.73.1'] },
+      }),
+    ] as never);
+    expect(menu).toEqual([
+      ['claude-code', ['2.1.220', '2.1.235']],
+      ['pi', ['0.73.1']],
+    ]);
   });
 });

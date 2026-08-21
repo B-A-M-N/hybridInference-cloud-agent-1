@@ -56,6 +56,7 @@ from cloud_agent.schemas import (
     IssueHostEnrollTokenResponse,
     ListAgentRunnerHostsResponse,
     SetActiveAgentRunnerHostRequest,
+    SetRuntimeVersionRequest,
 )
 
 if TYPE_CHECKING:
@@ -104,22 +105,25 @@ def _to_item(row: dict) -> AgentRunnerHost:
         sandbox_runtime=row.get("sandbox_runtime"),
         sandbox_image_digest=row.get("sandbox_image_digest"),
         runtime_versions=row.get("runtime_versions"),
+        runtime_versions_available=row.get("runtime_versions_available"),
     )
 
 
 async def _snapshot(store: AgentJobStore) -> ListAgentRunnerHostsResponse:
     """The pool as it stands — the response every endpoint here returns.
 
-    Both halves come from one read. ``active_host`` is the policy's own value
+    Every part comes from one read. ``active_host`` is the policy's own value
     rather than something derived from the list: where the two could disagree —
     a pinned host deleted out from under the policy — the honest answer is the
     name the claim gate is actually enforcing, not "unpinned" while the queue
-    sits still.
+    sits still. ``runtime_versions`` is the same fact about versions, and is
+    read in the same transaction as the menus it must be displayed against.
     """
-    rows, active = await store.runner_pool()
+    rows, active, selected_versions = await store.runner_pool()
     return ListAgentRunnerHostsResponse(
         hosts=[_to_item(row) for row in rows],
         active_host=active,
+        runtime_versions=selected_versions,
     )
 
 
@@ -168,6 +172,52 @@ async def set_active_agent_runner_host(
         "agent.runner_host.set_active",
         None,
         {"old_host": previous, "new_host": payload.host},
+    )
+    return await _snapshot(job_store)
+
+
+@router.put("/agent/runtime-versions", response_model=ListAgentRunnerHostsResponse)
+async def set_agent_runtime_version(
+    request: Request,
+    payload: SetRuntimeVersionRequest,
+    _admin_id: str = Depends(verify_admin_access),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+) -> ListAgentRunnerHostsResponse:
+    """Choose the agent CLI version this deployment runs for one runtime.
+
+    Bounded by what the pool's images actually contain: build time decides the
+    menu, this decides which item on it is active. A version no host offers is
+    refused rather than stored, because the claim would fall back to the
+    default and the page would then display a version that never runs.
+
+    Non-retroactive, like the host pin, and for a sharper reason. A thread is a
+    live harness session whose checkpoint is refused — silently, into replay —
+    when the version moves under it. So this applies to threads that start
+    after it; conversations already in flight keep the version they began on.
+    """
+    job_store = _require_store(store)
+    _, _, previous = await job_store.runner_pool()
+
+    if not await job_store.set_runtime_version(runtime=payload.runtime, version=payload.version):
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No host in the pool offers {payload.runtime} {payload.version!r}. "
+                "A version has to be built into the sandbox image before it can be "
+                "selected — add it to that host's *_EXTRA_VERSIONS and redeploy."
+            ),
+        )
+
+    await log_admin_action(
+        job_store,
+        get_client_ip(request),
+        "agent.runtime_version.set",
+        None,
+        {
+            "runtime": payload.runtime,
+            "old_version": previous.get(payload.runtime),
+            "new_version": payload.version,
+        },
     )
     return await _snapshot(job_store)
 

@@ -134,6 +134,19 @@ PI_VERSION="$(env_or_dotenv PI_VERSION)"
 OPENCODE_VERSION="$(env_or_dotenv OPENCODE_VERSION)"
 KILO_VERSION="$(env_or_dotenv KILO_VERSION)"
 
+# Extra versions the image also carries, comma-separated, so an admin can switch
+# this deployment between them from the admin page without a rebuild. Empty is
+# the normal case and means the image holds exactly the pins above.
+#
+# Build time decides the menu; the admin page decides which item is active. The
+# control plane cannot offer a version this image does not contain, so what goes
+# here is the ceiling on what an admin can pick.
+CLAUDE_CODE_EXTRA_VERSIONS="$(env_or_dotenv CLAUDE_CODE_EXTRA_VERSIONS)"
+CODEX_EXTRA_VERSIONS="$(env_or_dotenv CODEX_EXTRA_VERSIONS)"
+PI_EXTRA_VERSIONS="$(env_or_dotenv PI_EXTRA_VERSIONS)"
+OPENCODE_EXTRA_VERSIONS="$(env_or_dotenv OPENCODE_EXTRA_VERSIONS)"
+KILO_EXTRA_VERSIONS="$(env_or_dotenv KILO_EXTRA_VERSIONS)"
+
 require_env() {
   # Named up front, because each of these fails much later and much less
   # legibly: a missing token as a 401 per claim, a missing key as a container
@@ -296,7 +309,9 @@ cmd_up() {
   # job behaves differently here than elsewhere, and the build log is where
   # somebody looks before the database.
   local build_args=() name
-  for name in CLAUDE_CODE_VERSION CODEX_VERSION PI_VERSION OPENCODE_VERSION KILO_VERSION; do
+  for name in CLAUDE_CODE_VERSION CODEX_VERSION PI_VERSION OPENCODE_VERSION KILO_VERSION \
+              CLAUDE_CODE_EXTRA_VERSIONS CODEX_EXTRA_VERSIONS PI_EXTRA_VERSIONS \
+              OPENCODE_EXTRA_VERSIONS KILO_EXTRA_VERSIONS; do
     [[ -n "${!name}" ]] || continue
     log "runtime pin: ${name}=${!name} (overrides the Dockerfile default)"
     build_args+=(--build-arg "${name}=${!name}")

@@ -15,7 +15,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { useAuth } from '@/components/providers';
 import { hasRole } from '@/components/providers/AuthProvider';
-import type { AgentRunnerHost } from '@/lib/api/admin';
+import type { AgentRunnerHost, AgentRunnerHostPool } from '@/lib/api/admin';
 import {
   drainAgentRunnerHost,
   forgetAgentRunnerHost,
@@ -23,11 +23,12 @@ import {
   issueHostEnrollToken,
   removeAgentRunnerHost,
   setActiveAgentRunnerHost,
+  setAgentRuntimeVersion,
   undrainAgentRunnerHost,
 } from '@/lib/api/admin';
 import { getErrorMessage } from '@/lib/utils/errors';
 
-import { formatAge, formatSlots } from './format';
+import { formatAge, formatImage, formatSlots, formatVersions, runtimeMenu } from './format';
 
 // A runner polls only between jobs, so silence can mean "busy for an hour" as
 // easily as "gone". Carried over from the gateway's section along with the
@@ -66,6 +67,7 @@ export default function AdminHostsPage() {
   const { state } = useAuth();
   const [hosts, setHosts] = useState<AgentRunnerHost[]>([]);
   const [activeHost, setActiveHost] = useState<string | null>(null);
+  const [runtimeVersions, setRuntimeVersions] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -84,6 +86,7 @@ export default function AdminHostsPage() {
       if (!mounted.current) return;
       setHosts(next.hosts);
       setActiveHost(next.active_host);
+      setRuntimeVersions(next.runtime_versions ?? {});
     } catch (e) {
       if (!mounted.current) return;
       // A failed background poll leaves the last good pool on screen rather
@@ -117,27 +120,22 @@ export default function AdminHostsPage() {
   }, [load, isAdmin]);
 
   // Every action returns the whole pool, so they all end the same way.
-  const run = useCallback(
-    async (
-      action: () => Promise<{ hosts: AgentRunnerHost[]; active_host: string | null }>,
-      ok: string,
-    ) => {
-      setBusy(true);
-      setNotice(null);
-      try {
-        const next = await action();
-        if (!mounted.current) return;
-        setHosts(next.hosts);
-        setActiveHost(next.active_host);
-        setNotice(ok);
-      } catch (e) {
-        if (mounted.current) setNotice(getErrorMessage(e));
-      } finally {
-        if (mounted.current) setBusy(false);
-      }
-    },
-    [],
-  );
+  const run = useCallback(async (action: () => Promise<AgentRunnerHostPool>, ok: string) => {
+    setBusy(true);
+    setNotice(null);
+    try {
+      const next = await action();
+      if (!mounted.current) return;
+      setHosts(next.hosts);
+      setActiveHost(next.active_host);
+      setRuntimeVersions(next.runtime_versions ?? {});
+      setNotice(ok);
+    } catch (e) {
+      if (mounted.current) setNotice(getErrorMessage(e));
+    } finally {
+      if (mounted.current) setBusy(false);
+    }
+  }, []);
 
   const handlePin = (host: string | null) =>
     run(
@@ -145,6 +143,20 @@ export default function AdminHostsPage() {
       host
         ? `New agent jobs now go to ${host}. Jobs already running elsewhere keep running there.`
         : 'Agent jobs unpinned — any runner may claim.',
+    );
+
+  // Unioned across the pool, because the selection is deployment-wide while
+  // the menus are per-image. Derived on render rather than held in state: it is
+  // a view of `hosts`, and a second copy could disagree with the table beside
+  // it after a poll.
+  const menu = runtimeMenu(hosts);
+
+  const handleVersion = (runtime: string, version: string) =>
+    run(
+      () => setAgentRuntimeVersion(runtime, version || null),
+      version
+        ? `New ${runtime} threads will run ${version}. Threads already running keep theirs.`
+        : `${runtime} is back on each host's image default.`,
     );
 
   const handleRemove = (host: string, slotsUsed: number) => {
@@ -250,6 +262,46 @@ export default function AdminHostsPage() {
           </span>
         </div>
 
+        {/* Harness versions.
+            Two layers, and the wording has to keep them apart: the *menu* is
+            built into each sandbox image, so it changes only by rebuilding;
+            this picks which item on it new work runs. A runtime with one
+            option is an image holding one version — add more through that
+            host's `*_EXTRA_VERSIONS`. */}
+        {menu.length > 0 && (
+          <div className="mt-5 border-t border-gray-100 pt-4 dark:border-white/10">
+            <div className="flex items-baseline gap-2">
+              <h2 className="text-[13px] font-medium text-gray-900 dark:text-gray-50">
+                Harness version
+              </h2>
+              <span className="text-[12px] text-gray-500 dark:text-gray-400">
+                Applies to new threads. A conversation already running keeps the version it started
+                on.
+              </span>
+            </div>
+            <div className="mt-3 flex flex-wrap gap-4">
+              {menu.map(([runtime, versions]) => (
+                <label key={runtime} className="flex items-center gap-2 text-[12px]">
+                  <span className="text-gray-700 dark:text-gray-300">{runtime}</span>
+                  <select
+                    disabled={busy}
+                    value={runtimeVersions[runtime] ?? ''}
+                    onChange={(event) => void handleVersion(runtime, event.target.value)}
+                    className="rounded-md border border-gray-200 px-2 py-1 text-[12px] text-gray-700 disabled:opacity-40 dark:border-white/20 dark:bg-transparent dark:text-gray-200"
+                  >
+                    <option value="">Image default</option>
+                    {versions.map((version) => (
+                      <option key={version} value={version}>
+                        {version}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ))}
+            </div>
+          </div>
+        )}
+
         {loading ? (
           <p className="mt-6 text-[12px] text-gray-500 dark:text-gray-400">Loading…</p>
         ) : hosts.length === 0 ? (
@@ -266,6 +318,8 @@ export default function AdminHostsPage() {
                   <th className="py-2 pr-4 font-medium">Slots</th>
                   <th className="py-2 pr-4 font-medium">Capabilities</th>
                   <th className="py-2 pr-4 font-medium">Runner</th>
+                  <th className="py-2 pr-4 font-medium">CLI versions</th>
+                  <th className="py-2 pr-4 font-medium">Image</th>
                   <th className="py-2 pr-4 font-medium">Last polled</th>
                   <th className="py-2 pr-4 font-medium">Actions</th>
                 </tr>
@@ -304,6 +358,16 @@ export default function AdminHostsPage() {
                     </td>
                     <td className="py-2.5 pr-4 text-gray-700 dark:text-gray-300">
                       {host.runner_version ?? '—'}
+                    </td>
+                    <td className="py-2.5 pr-4 text-gray-700 dark:text-gray-300">
+                      {formatVersions(host)}
+                    </td>
+                    <td className="py-2.5 pr-4 font-mono text-[11px] text-gray-500 dark:text-gray-400">
+                      {/* The digest, not the tag: two hosts on
+                          `...-job:staging` can be running different builds,
+                          and that is exactly the confusion worth resolving on
+                          sight. */}
+                      {formatImage(host)}
                     </td>
                     <td className="py-2.5 pr-4 text-gray-700 dark:text-gray-300">
                       {formatAge(host.seconds_since_seen)}

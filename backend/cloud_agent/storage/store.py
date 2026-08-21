@@ -106,6 +106,53 @@ def _load_json(value: Any) -> Any:
     return value
 
 
+def resolve_runtime_version(
+    *,
+    runtime: str,
+    thread_version: str | None,
+    selected: dict[str, Any],
+    available: dict[str, Any],
+    host_default: dict[str, Any],
+) -> str | None:
+    """Which CLI version this attempt runs, in priority order.
+
+    1. **The version its thread already runs.** A thread is a live harness
+       session, and ``checkpoints.gate_for_claim`` refuses to restore one whose
+       exported ``driver_version`` differs from the attempt's stamp — silently,
+       into replay. So an admin changing the selection must not reach into
+       conversations already in flight: it applies to new threads, and existing
+       ones keep the version they started on.
+    2. **The deployment's selection**, but only if this host's image actually
+       holds it. A selection the host cannot serve falls through rather than
+       failing the claim — an image rebuilt with a shorter menu drops versions
+       out from under a stored choice, and a queue that parks on that is a
+       worse outcome than a job running the default.
+    3. **The host's default**, which is what every claim did before selection
+       existed.
+
+    ``None`` means the host has never reported a version for this runtime, and
+    is stamped as-is: "unknown" is a truthful record, and inventing one would
+    make the attempt row lie about what ran.
+    """
+    if thread_version:
+        return thread_version
+    choice = selected.get(runtime)
+    if isinstance(choice, str) and choice:
+        offered = available.get(runtime)
+        if isinstance(offered, list) and choice in offered:
+            return choice
+        logger.warning(
+            "Runtime version selection not offered by the claiming host",
+            extra={
+                "event": "agent_runtime_version_unavailable",
+                "runtime": runtime,
+                "selected": choice,
+            },
+        )
+    default = host_default.get(runtime)
+    return default if isinstance(default, str) and default else None
+
+
 def _job_row_to_dict(row: Any) -> dict[str, Any]:
     """Convert an ``agent_jobs`` row to a plain dict."""
     return {
@@ -177,6 +224,7 @@ _HOST_COLUMN_NAMES = (
     "sandbox_runtime",
     "sandbox_image_digest",
     "runtime_versions",
+    "runtime_versions_available",
 )
 _HOST_COLUMNS = ", ".join(_HOST_COLUMN_NAMES) + ", (credential_hash IS NOT NULL) AS enrolled"
 # The same list qualified with ``h.``. Required wherever the query joins
@@ -1332,16 +1380,20 @@ class AgentJobStore:
         async with self._pool.acquire() as conn:
             return await conn.fetchval("SELECT active_host FROM agent_runner_policy WHERE id")
 
-    async def runner_pool(self) -> tuple[list[dict[str, Any]], str | None]:
-        """The pool and the pinned host, read together.
+    async def runner_pool(self) -> tuple[list[dict[str, Any]], str | None, dict[str, str]]:
+        """The pool, the pinned host and the version selection, read together.
 
-        One transaction because the two are shown side by side: read
+        One transaction because all three are shown side by side: read
         separately, a switch landing between them renders a page whose list and
         whose header name different hosts, which reads as a bug in the thing
-        the operator is using to fix a bug.
+        the operator is using to fix a bug. The version selection joined that
+        for the same reason — a page offering a menu that no longer contains
+        the selection it displays is the same failure wearing a different hat.
         """
         async with self._pool.acquire() as conn, conn.transaction():
-            active = await conn.fetchval("SELECT active_host FROM agent_runner_policy WHERE id")
+            policy = await conn.fetchrow(
+                "SELECT active_host, runtime_versions FROM agent_runner_policy WHERE id"
+            )
             rows = await conn.fetch(
                 f"""
                 SELECT {_HOST_COLUMNS}
@@ -1349,14 +1401,63 @@ class AgentJobStore:
                 ORDER BY last_seen_at DESC
                 """
             )
-        return [
-            {**self._host_row_to_dict(row), "is_active": row["host"] == active} for row in rows
-        ], active
+        active = None if policy is None else policy["active_host"]
+        selected = {} if policy is None else _load_json(policy["runtime_versions"]) or {}
+        return (
+            [{**self._host_row_to_dict(row), "is_active": row["host"] == active} for row in rows],
+            active,
+            selected,
+        )
 
     async def list_runner_hosts(self) -> list[dict[str, Any]]:
         """Return every host seen polling, most recent poll first."""
-        hosts, _ = await self.runner_pool()
+        hosts, _, _ = await self.runner_pool()
         return hosts
+
+    async def set_runtime_version(self, *, runtime: str, version: str | None) -> bool:
+        """Choose the CLI version this deployment runs for one runtime.
+
+        ``version=None`` clears the choice, which returns that runtime to
+        whatever its claiming host reports as the image default.
+
+        Returns ``False`` when no host in the pool offers ``version``. Storing a
+        selection nothing can serve is not harmless: the claim would fall back
+        silently, so the admin page would show a version that never runs — the
+        pin's "switching to a typo" failure, one layer along.
+
+        Same lock order as ``set_active_runner_host`` — policy row first, then
+        the host rows it is checked against — so the two admin writes and the
+        claim's shared read serialize with no cycle to deadlock on.
+        """
+        async with self._pool.acquire() as conn, conn.transaction():
+            current = await conn.fetchval(
+                "SELECT runtime_versions FROM agent_runner_policy WHERE id FOR UPDATE"
+            )
+            if version is not None:
+                offered = await conn.fetch(
+                    "SELECT runtime_versions_available FROM agent_runner_hosts "
+                    "WHERE runtime_versions_available IS NOT NULL FOR SHARE"
+                )
+                menus = (_load_json(row[0]) or {} for row in offered)
+                if not any(version in (menu.get(runtime) or []) for menu in menus):
+                    return False
+            selection = dict(_load_json(current) or {})
+            if version is None:
+                selection.pop(runtime, None)
+            else:
+                selection[runtime] = version
+            # Upsert for the same reason the host pin is one: against a database
+            # whose singleton row is missing, a bare UPDATE touches nothing and
+            # still reports success.
+            await conn.execute(
+                """
+                INSERT INTO agent_runner_policy (id, runtime_versions) VALUES (TRUE, $1::jsonb)
+                ON CONFLICT (id) DO UPDATE
+                SET runtime_versions = EXCLUDED.runtime_versions, updated_at = NOW()
+                """,
+                json.dumps(selection),
+            )
+            return True
 
     async def set_active_runner_host(self, *, host: str | None) -> bool:
         """Pin agent jobs to one host, or unpin with ``None``.
@@ -1445,6 +1546,7 @@ class AgentJobStore:
         host["capabilities"] = _load_json(host.get("capabilities")) or []
         # None (never reported) and {} (reported: no labels) stay distinct.
         host["runtime_versions"] = _load_json(host.get("runtime_versions"))
+        host["runtime_versions_available"] = _load_json(host.get("runtime_versions_available"))
         return host
 
     async def issue_enroll_token(
@@ -1609,6 +1711,7 @@ class AgentJobStore:
         sandbox_runtime: str | None = None,
         sandbox_image_digest: str | None = None,
         runtime_versions: dict[str, str] | None = None,
+        runtime_versions_available: dict[str, list[str]] | None = None,
     ) -> dict[str, Any] | None:
         """Record a heartbeat, promoting the host to ``online`` when it may.
 
@@ -1639,7 +1742,9 @@ class AgentJobStore:
                     capabilities = COALESCE($5::jsonb, capabilities),
                     sandbox_runtime = COALESCE($6, sandbox_runtime),
                     sandbox_image_digest = COALESCE($7, sandbox_image_digest),
-                    runtime_versions = COALESCE($8::jsonb, runtime_versions)
+                    runtime_versions = COALESCE($8::jsonb, runtime_versions),
+                    runtime_versions_available =
+                        COALESCE($9::jsonb, runtime_versions_available)
                 WHERE host = $1
                 RETURNING {_HOST_COLUMNS}
                 """,
@@ -1653,6 +1758,11 @@ class AgentJobStore:
                 sandbox_runtime,
                 sandbox_image_digest,
                 None if runtime_versions is None else json.dumps(runtime_versions),
+                (
+                    None
+                    if runtime_versions_available is None
+                    else json.dumps(runtime_versions_available)
+                ),
             )
         return None if row is None else self._host_row_to_dict(row)
 
@@ -1866,12 +1976,24 @@ class AgentJobStore:
         runtime_versions = attestation.get("runtime_versions")
         if not isinstance(runtime_versions, dict):
             runtime_versions = {}
+        # The menu, from the same place and for the same reason as the default
+        # beside it: the attestation is *this replica's* image, and the
+        # heartbeat row is not evidence about it during a rolling deployment.
+        # A selection is only honoured when the machine about to run it says it
+        # can.
+        runtime_versions_available = attestation.get("runtime_versions_available")
+        if not isinstance(runtime_versions_available, dict):
+            runtime_versions_available = {}
         host_kernel = attestation.get("host_kernel")
         guest_kernel = attestation.get("guest_kernel")
         await self.touch_runner_host(host=host, worker_id=worker_id)
         async with self._pool.acquire() as conn, conn.transaction():
-            active_host = await conn.fetchval(
-                "SELECT active_host FROM agent_runner_policy WHERE id FOR SHARE"
+            policy = await conn.fetchrow(
+                "SELECT active_host, runtime_versions FROM agent_runner_policy WHERE id FOR SHARE"
+            )
+            active_host = None if policy is None else policy["active_host"]
+            selected_versions = (
+                {} if policy is None else _load_json(policy["runtime_versions"]) or {}
             )
             if active_host is not None and host != active_host:
                 # Fail closed, including for a runner that reports no host:
@@ -2013,7 +2135,30 @@ class AgentJobStore:
                 "SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM agent_attempts WHERE job_id = $1",
                 job_id,
             )
-            runtime_version = runtime_versions.get(job_row["runtime"])
+            # A thread keeps the version it started on; see
+            # ``resolve_runtime_version``. Read here, inside the claim, because
+            # the answer must be the one the attempt is stamped with — the
+            # TOCTOU that stamping exists to close.
+            thread_version = None
+            if job_row["thread_id"]:
+                thread_version = await conn.fetchval(
+                    """
+                    SELECT a.runtime_version
+                    FROM agent_attempts a
+                    JOIN agent_jobs j ON j.id = a.job_id
+                    WHERE j.thread_id = $1 AND a.runtime_version IS NOT NULL
+                    ORDER BY a.started_at DESC
+                    LIMIT 1
+                    """,
+                    job_row["thread_id"],
+                )
+            runtime_version = resolve_runtime_version(
+                runtime=job_row["runtime"],
+                thread_version=thread_version,
+                selected=selected_versions,
+                available=runtime_versions_available,
+                host_default=runtime_versions,
+            )
             attempt = await conn.fetchrow(
                 """
                 INSERT INTO agent_attempts

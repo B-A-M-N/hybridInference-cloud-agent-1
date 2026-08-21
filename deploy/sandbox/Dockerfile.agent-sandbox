@@ -55,6 +55,38 @@ ARG PI_VERSION=0.73.1
 ARG OPENCODE_VERSION=1.18.9
 ARG KILO_VERSION=7.4.17
 
+# Extra versions this image also carries, comma-separated, so an admin can
+# switch a deployment between them from the admin page without a rebuild
+# (`agent_runner_policy.runtime_versions`; the runner selects one by PATH).
+#
+# Empty by default, and an empty list means this image holds exactly the pins
+# above — the shape every deployment is in today, byte for byte.
+#
+# Separate from the pin rather than folded into one list because the pin
+# answers a different question and must keep answering it alone: it is the
+# *default*, what a job runs when nothing has selected anything, and what the
+# `.version` label below reports. A single list would make "the default" the
+# first element of a string, which nothing downstream could read.
+#
+# **Every extra version is a version the event parser must handle.**
+# `runtimes.py` normalizes one shape per runtime, and offering a version is a
+# claim that it parses — see the conformance suite in `tests/external/`. Adding
+# an entry here without running it is how a broken option reaches the menu.
+ARG CLAUDE_CODE_EXTRA_VERSIONS=
+ARG CODEX_EXTRA_VERSIONS=
+ARG PI_EXTRA_VERSIONS=
+ARG OPENCODE_EXTRA_VERSIONS=
+ARG KILO_EXTRA_VERSIONS=
+
+# The menu: default first, extras after. Derived, never passed — a caller that
+# could set these directly could put a version in a label that the install
+# below never installed.
+ARG CLAUDE_CODE_VERSIONS=${CLAUDE_CODE_VERSION}${CLAUDE_CODE_EXTRA_VERSIONS:+,${CLAUDE_CODE_EXTRA_VERSIONS}}
+ARG CODEX_VERSIONS=${CODEX_VERSION}${CODEX_EXTRA_VERSIONS:+,${CODEX_EXTRA_VERSIONS}}
+ARG PI_VERSIONS=${PI_VERSION}${PI_EXTRA_VERSIONS:+,${PI_EXTRA_VERSIONS}}
+ARG OPENCODE_VERSIONS=${OPENCODE_VERSION}${OPENCODE_EXTRA_VERSIONS:+,${OPENCODE_EXTRA_VERSIONS}}
+ARG KILO_VERSIONS=${KILO_VERSION}${KILO_EXTRA_VERSIONS:+,${KILO_EXTRA_VERSIONS}}
+
 # Tools an agent legitimately needs to understand and change a repository.
 # Deliberately not installed: anything that would let it reach the host
 # (docker CLI) or persist beyond the job.
@@ -70,13 +102,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g \
-        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
-        "@openai/codex@${CODEX_VERSION}" \
-        "@mariozechner/pi-coding-agent@${PI_VERSION}" \
-        "opencode-ai@${OPENCODE_VERSION}" \
-        "@kilocode/cli@${KILO_VERSION}" \
-    && npm cache clean --force
+# One prefix per version, the default symlinked onto PATH, and each version
+# checked against its own binary. See the script's header for why the layout is
+# what it does the work — the runner selects a version by prepending
+# `/opt/runtimes/<runtime-id>/<version>/bin`, and nothing in the adapters or the
+# wrappers has to know that happened.
+#
+# Removed afterwards: an agent that can install another CLI version into its own
+# sandbox is an agent that can step outside the version its attempt is stamped
+# with.
+COPY deploy/sandbox/install-runtimes.sh /tmp/install-runtimes.sh
+RUN chmod 0755 /tmp/install-runtimes.sh \
+    && /tmp/install-runtimes.sh claude-code @anthropic-ai/claude-code claude "${CLAUDE_CODE_VERSIONS}" \
+    && /tmp/install-runtimes.sh codex @openai/codex codex "${CODEX_VERSIONS}" \
+    && /tmp/install-runtimes.sh pi @mariozechner/pi-coding-agent pi "${PI_VERSIONS}" \
+    && /tmp/install-runtimes.sh opencode opencode-ai opencode "${OPENCODE_VERSIONS}" \
+    && /tmp/install-runtimes.sh kilo @kilocode/cli kilo "${KILO_VERSIONS}" \
+    && npm cache clean --force \
+    && rm /tmp/install-runtimes.sh
 
 # The version stamp the runner reads (issue #54): image labels, keyed by
 # registry id, derived from the pins above so a label can never disagree with
@@ -84,11 +127,29 @@ RUN npm install -g \
 # each attempt, and the checkpoint gate compares them before handing a session
 # to a resumed turn — an unlabeled image degrades every one of those to
 # "unknown", which is a replay, not an error.
+#
+# Two labels per runtime, answering two questions that diverge the moment an
+# image carries more than one version:
+#
+#   .version   what a job gets when nothing selected anything — the default,
+#              and the only one an older control plane knows how to read.
+#   .versions  the whole menu, which is what the admin page offers and what the
+#              claim checks a selection against before honouring it.
+#
+# `.version` is deliberately still a single exact version rather than the first
+# element of `.versions`: every existing reader parses it as one, and a reader
+# that has not been taught about menus must degrade to "the default", not to a
+# comma-separated string it will happily stamp onto an attempt.
 LABEL org.freeinference.runtime.claude-code.version="${CLAUDE_CODE_VERSION}" \
       org.freeinference.runtime.codex.version="${CODEX_VERSION}" \
       org.freeinference.runtime.pi.version="${PI_VERSION}" \
       org.freeinference.runtime.opencode.version="${OPENCODE_VERSION}" \
-      org.freeinference.runtime.kilo.version="${KILO_VERSION}"
+      org.freeinference.runtime.kilo.version="${KILO_VERSION}" \
+      org.freeinference.runtime.claude-code.versions="${CLAUDE_CODE_VERSIONS}" \
+      org.freeinference.runtime.codex.versions="${CODEX_VERSIONS}" \
+      org.freeinference.runtime.pi.versions="${PI_VERSIONS}" \
+      org.freeinference.runtime.opencode.versions="${OPENCODE_VERSIONS}" \
+      org.freeinference.runtime.kilo.versions="${KILO_VERSIONS}"
 
 # pi, OpenCode, and Kilo all ignore OPENAI_BASE_URL; each one's supported
 # route to a custom gateway is a provider config file whose content (gateway
@@ -151,6 +212,13 @@ ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 #
 # So the rule is: the pin must be an exact version, and this proves it before
 # the image exists.
+#
+# `install-runtimes.sh` already made this check against *every* version under
+# its own prefix. This one is not a duplicate: it runs each binary the way a job
+# does, through PATH, and so proves the separate claim that the symlinked
+# default is the version `.version` advertises. An extras list that shadowed the
+# default — a bad symlink, an install ordering mistake — passes there and fails
+# here.
 RUN set -eu; \
     check() { \
         got="$("$1" --version 2>&1 | tail -1)"; \
