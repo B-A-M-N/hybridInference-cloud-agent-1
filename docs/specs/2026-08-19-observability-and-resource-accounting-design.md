@@ -440,6 +440,12 @@ semantics, caps, hook contract), and with the egress stage withdrawn it is
 the next row in this table. The phase names are kept stable rather than
 renumbered, so CHAT-3 is simply absent.
 
+CHAT-4's product requirements — what the surfaces have to show, and what the
+production measurement actually makes possible — are written up separately in
+`2026-08-28-per-tool-resource-accounting-requirements.md`. That document is
+where the sampling-resolution question (D1) is put, because it changes what
+can be promised rather than how it is built.
+
 ## 11. Product surfaces
 
 What a person actually sees. The DS harness's user-facing observability is
