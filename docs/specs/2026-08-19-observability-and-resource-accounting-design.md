@@ -6,6 +6,9 @@
   emit() seam — is **deferred**. §10 carries the re-cut phases; deferred
   sections remain in this document as the agreed direction for when the
   admin layer is picked up.
+- **Withdrawn (2026-08-28, Murphy):** the egress/network stage — formerly
+  CHAT-3 — is off the roadmap, and the network panel, `egress_flows`, the
+  byte-ledger classification and their alerts go with it. O5 records why.
 - **Date:** 2026-08-19
 - **Companion:** `2026-08-17-session-resident-harness-threads-design.md`
   (continuity ladder, `continuity_mode` column, §9's promised admin
@@ -30,7 +33,7 @@ run today:
 | `agent_job_events` | Normalized + raw driver events per attempt, idempotent on `(attempt_id, client_seq)` | Written for UI replay; no aggregation, no export, no alerting; payloads unindexed |
 | `agent_attempts` columns | `continuity_mode`, runtime/image version stamps, lease state | Facts exist per row; §9's promised aggregates (HOT hit-rate, export-failure rate, degradation reasons) were never built |
 | Gateway `api_logs` | Tokens/cost per inference call, attempt- or thread-attributed (billing authority) | Lives in the gateway; no joined read path on our side (#57) |
-| Squid egress proxy | **Already logs one line per CONNECT** — `ts`, `src`, allow/deny verdict, target host, `bytes=%<st` — to stdout | Nobody collects it; denied CONNECTs (a security signal) fall on the floor |
+| Sandbox egress | Nothing. Production runs `platform_only` for both phases (`AGENT_EGRESS_SETUP_TIER`, `AGENT_EGRESS_AGENT_TIER`), so a sandbox has no route off the internal network and the allowlist proxy is not deployed — `Dockerfile.agent-egress-proxy` says as much itself | Nothing to collect, and nothing missing: an out-of-tier connection fails at the network layer, so no CONNECT line is ever written, allowed or denied |
 | `docker stats`, `journalctl`, ssh | Ad-hoc | Not recorded; runner prints are block-buffered and unsearchable (a real incident-response cost, already bitten during staging acceptance) |
 
 There are zero metrics: no counter, no histogram, no dashboard, no alert on
@@ -150,26 +153,45 @@ honest window model of §6.
   overlapped call records the shared delta plus `overlap_n`, and rollups
   keep `exclusive` and `shared` fields apart. A shared number is never
   presented as exact.
-- **O5 — Network is classified at the choke points we own.** Two of three
-  are *already exactly attributed*: inference (gateway `api_logs`, grant →
-  attempt/thread) and MCP (relay token is per-attempt). Only generic egress
-  needs windows: the Squid access log (extended with `%>st` upload bytes and
-  `%tr` duration so a connection's window is reconstructable) is collected
-  and attributed like any other windowed signal. The sandbox's veth totals
-  bound the sum: `veth − (gateway + mcp + egress)` is published as
-  `unclassified`, and its growth alerts — a hole in the byte ledger is a
-  hole in the egress story. Denied CONNECT verdicts become a counter and an
-  alert today, not just a stdout line. Windowed inference display for
-  resident turns already works this way (§14 of the resident design brackets
-  `api_logs` by attempt window), so this adds no new attribution philosophy.
+- **O5 — Network is attributed at the two choke points that already carry
+  an identity; generic egress is out of scope.** Inference (gateway
+  `api_logs`, grant → attempt/thread) and MCP (relay token is per-attempt)
+  are *already exactly attributed*, and they join by attempt rather than by
+  time window. Windowed inference display for resident turns already works
+  this way (§14 of the resident design brackets `api_logs` by attempt
+  window), so this adds no new attribution philosophy.
+
+  **Withdrawn 2026-08-28 (Murphy).** The third class — generic egress
+  parsed from the allowlist proxy's access log, `egress_flows`, the
+  `veth − (gateway + mcp + egress)` byte ledger, the per-domain network
+  panel and the denied-CONNECT counter — is dropped, not deferred. Two
+  independent reasons, either one sufficient:
+
+  1. **It answers a question nobody asked.** The observability request on
+     record (2026-08-13, #freeinference-deployment) is sandbox CPU / DRAM /
+     I/O, LLM usage, a log of all LLM and tool-call activity, and — asked
+     twice — per-tool-call resource granularity, to be met with "the least
+     intrusive approach". Network appears nowhere in it, nor anywhere else
+     in the project's discussion. This stage was ours, not the platform's.
+  2. **Its input does not exist.** Production runs `platform_only` for both
+     phases, so there is no proxy, no access log, and no denied CONNECT to
+     count (§1). Making that log exist means deploying the `trusted` tier —
+     giving the sandbox reach it does not have today, which is the opposite
+     direction from the hardening the request came wrapped in, and the
+     opposite of least intrusive.
+
+  If the `trusted` tier is ever deployed, the two logging fields this would
+  have needed (`%>st`, `%tr`) are one line of the config that
+  `cloud_agent_host.egress_proxy` renders, and belong in *that* change —
+  not carried here as a standing plan against a proxy that does not run.
 - **O6 — Idle residency is a first-class series.** Workspace bytes (sampled
   at establish/release and daily), idle sandbox memory, and idle share of
   each host's budget — the data that prices the LRU budget, the TTL default,
   and #61.
 - **O7 — Cardinality budget.** Metric labels are bounded enums only: host,
-  runtime, continuity mode, floor event kind, egress verdict, tool *name*
-  (bounded per runtime registry). `thread_id`/`attempt_id`/domain names
-  never label a metric; they live in Postgres rows (and later exemplars).
+  runtime, continuity mode, floor event kind, tool *name* (bounded per
+  runtime registry). `thread_id`/`attempt_id` never label a metric; they
+  live in Postgres rows (and later exemplars).
   A lint-style test enforces the label allowlist.
 - **O8 — Failure honesty.** Sampler or exporter death never fails a turn.
   Every attempt rollup carries `coverage` (fraction of the attempt window
@@ -182,10 +204,10 @@ honest window model of §6.
   via telemetry. The redaction stage is the DS waterfall shape — orderable
   rules, fail-closed per record, exported copy only — with the default rule
   set present rather than empty.
-- **O10 — Retention.** Squid raw log 7 d after parsing; Postgres rollups
-  and parsed flow rows indefinite (paper dataset); raw 1 Hz samples are a
-  runner-side ring buffer only — rollups are computed at window close and
-  the samples discarded. One retention tier, no second estate (O1).
+- **O10 — Retention.** Postgres rollups are kept indefinitely (paper
+  dataset); raw 1 Hz samples are a runner-side ring buffer only — rollups
+  are computed at window close and the samples discarded. One retention
+  tier, no second estate (O1).
 
 ### O3 amendment — measured through the daemon, not through cgroupfs (2026-08-19)
 
@@ -251,8 +273,7 @@ harness + tool children              ResourceSampler (1 Hz, via the      worker 
   [claude: hook markers ——►          daemon's /containers/{id}/stats)     events, continuity,
    state mount, append-only]         │                                    + NEW resource rollups
                                      ├─► window rollup at turn/idle close ─► Postgres rows
-squid egress                         │                                    agent_job_events (exists)
-  access log (bytes/verdict) ──►     egress log parser ─────────────────► net flow rows
+                                     │                                    agent_job_events (exists)
                                      │
                                      emit() seam (default no-op;          aggregate API ─► console admin pages
                                      OTLP-attachable later, O1)           alert checker ─► Slack webhook
@@ -290,7 +311,7 @@ sandbox image's settings gain PreToolUse/PostToolUse hooks that append one
 JSON line `{tool, tool_use_id, phase, t_mono}` to an append-only file on the
 state mount; the runner tails it. Hooks are **passive by contract**: log-only
 command, short timeout, exit 0 always; a hook that cannot write must not
-block the tool (contract test 7). Hook config lives in the sandbox image /
+block the tool (contract test 5). Hook config lives in the sandbox image /
 injected home — platform infrastructure, never the user's repository, and
 patch-gated out of any diff like the rest of the injected home.
 
@@ -303,10 +324,10 @@ calls (the model streaming, the CLI's own work) accrues to the attempt, not
 to any tool — visible as `attempt − Σ exclusive`, which is itself a useful
 series (harness overhead).
 
-**Network per tool** is windowed the same way from parsed egress flows
-(connection window = [log time − duration, log time]), and only for the
-egress class; gateway/MCP bytes are exactly attributed already (O5) and join
-by attempt, not window.
+**Network per tool** is not attributed. Gateway and MCP bytes are exact but
+join by attempt rather than by window (O5), and generic egress — the only
+class a window could have split — is out of scope. The sandbox's total in
+and out for the attempt stays on the attempt row.
 
 **Rollup rows** (Postgres, new; names final at review):
 
@@ -314,27 +335,23 @@ by attempt, not window.
 attempt_resources: attempt_id PK, cpu_usec, mem_peak_bytes, mem_avg_bytes,
   io_read_bytes, io_write_bytes, net_rx_bytes, net_tx_bytes,
   sample_count, coverage, sampler_version, created_at
-  — the four classification columns (net_gateway_bytes, net_mcp_bytes,
-  net_egress_bytes, net_unclassified_bytes) land with CHAT-3, which is what
-  parses the egress log; adding them earlier would ship four columns that
-  nothing can populate and that a reader could not distinguish from
-  measured zeroes
+  — network stays one in/out pair. The four classification columns
+  (gateway / mcp / egress / unclassified) were only ever populatable by the
+  withdrawn egress parser (O5), so they are not planned: a column nothing
+  can fill reads exactly like a measured zero
 
 tool_call_resources: attempt_id, tool_use_id, tool_name, source(exact|message),
   started_at, ended_at, overlap_n_max,
   cpu_usec_shared, cpu_usec_exclusive, mem_peak_shared_bytes,
-  net_egress_bytes_windowed, truncated bool
+  truncated bool
   — capped at 500 rows per attempt; the cap sets `truncated` and increments a
   counter (no silent caps)
 
-egress_flows: attempt_id nullable (idle flows keep residency ids), ts_start,
-  ts_end, target_host, verdict, bytes_in, bytes_out
 ```
 
 **Costs, honestly.** 1 Hz × a handful of sandboxes is negligible CPU and no
 sandbox-visible overhead. Postgres grows by one row per attempt, ≤500 per
-attempt for tools, one per egress connection; all bounded, all indexed by
-attempt. The hook file grows within a turn and is truncated at turn close.
+attempt for tools; all bounded, all indexed by attempt. The hook file grows within a turn and is truncated at turn close.
 The standing cost of having eyes is one checker loop, one aggregate API,
 and a few console pages — zero new services (O1).
 
@@ -347,9 +364,8 @@ turn duration histogram ×
 reason); continuity mode counter (the §9 aggregate, finally); checkpoint
 export outcome + size histogram; residency establish/evict/takeover counters
 × reason; claim-loop lag gauge; event upload queue depth; attempt cpu/mem/io/
-net totals as histograms × runtime; egress verdict counter × (allowed |
-denied); unclassified-bytes gauge; sampler coverage histogram; tool duration
-histogram × (tool_name, source).
+net totals as histograms × runtime; sampler coverage histogram; tool
+duration histogram × (tool_name, source).
 
 **Ops records** (alert-on): attempt terminal failures with error class;
 checkpoint export failure (already an event — projected, not re-emitted);
@@ -364,8 +380,8 @@ checker over Postgres/CP state, posting to its own Slack webhook — the
 `alert_slack` pattern, deliberately never wired into the status-monitor
 control plane): claim loop silent > 2 min; turn
 failure rate; export failure streak (design §6 says a thread quietly loses
-cold resume — now it pages); denied-CONNECT burst; unclassified-bytes growth;
-sampler coverage < 0.9 sustained; host hot-sandbox budget saturation.
+cold resume — now it pages); sampler coverage < 0.9 sustained; host
+hot-sandbox budget saturation.
 
 ## 8. Degradation matrix
 
@@ -376,9 +392,8 @@ sampler coverage < 0.9 sustained; host hot-sandbox budget saturation.
 | Hook file absent / harness without hooks | `source = message` windows; no error |
 | Hook cannot execute | Tool proceeds (passive contract); coverage of `exact` windows only |
 | Parallel tool calls | `overlap_n > 1`, shared fields only |
-| Squid log rotation / parse gap | Flow gap; `unclassified` absorbs it; gap counter |
 | Attempt with zero samples (sub-second turn) | `coverage = 0`, `sample_count = 0` — never fabricated zeros |
-| Idle residency (no attempt) | Samples tagged idle; egress flows keep residency ids (idle egress should be ~0 — its growth alerts) |
+| Idle residency (no attempt) | Samples tagged idle; no attempt attribution |
 | Clock skew runner↔CP | Windows are runner-local monotonic; only display joins use wall clock |
 
 ## 9. Contract tests
@@ -389,22 +404,18 @@ sampler coverage < 0.9 sustained; host hot-sandbox budget saturation.
    the attempt's cpu delta to that tool's exclusive window.
 3. Parallel calls: overlapping windows all carry `overlap_n`, and no shared
    delta appears in an `exclusive_*` field.
-4. Byte ledger: veth totals ≥ gateway + mcp + egress sums; `unclassified`
-   equals the residual and is exported.
-5. Sampler killed mid-turn: attempt succeeds; `coverage < 1` recorded; ops
+4. Sampler killed mid-turn: attempt succeeds; `coverage < 1` recorded; ops
    record emitted.
-6. Hook contract: a hook that hangs or fails never delays or blocks the tool
+5. Hook contract: a hook that hangs or fails never delays or blocks the tool
    call (pinned against the stamped CLI, like the capability matrix).
-7. Denied CONNECT increments the verdict counter with the attempt attributed
-   when one is live.
-8. Dimension allowlist: no aggregate-API dimension (nor any attached
+6. Dimension allowlist: no aggregate-API dimension (nor any attached
    exporter's label) is unbounded (lint-style walk).
-9. Ledger export: tool arguments/results and prompt text never appear in an
+7. Ledger export: tool arguments/results and prompt text never appear in an
    exported record (deny-body default), while types/sizes/ids do.
-10. Rollup idempotency: re-POSTing a window rollup upserts, never doubles.
-11. Idle series: an established residency with no live attempt still
-    produces idle-tagged samples and zero attempt attribution.
-12. `coverage = 0` (unreadable backend) is distinguishable from "measured
+8. Rollup idempotency: re-POSTing a window rollup upserts, never doubles.
+9. Idle series: an established residency with no live attempt still
+   produces idle-tagged samples and zero attempt attribution.
+10. `coverage = 0` (unreadable backend) is distinguishable from "measured
     zero usage" in both row and metric form.
 
 ## 10. Implementation plan
@@ -416,17 +427,18 @@ experience) ship first; everything admin-facing is deferred wholesale.
 |---|---|---|
 | **CHAT-1** | The footer's free half + the resource spine: continuity badge + tooltip and turn duration (from `continuity_mode` and attempt timestamps — **already recorded**; API exposure + UI only) and the per-tool duration table derived from stored `tool_use`/`tool_result` events (`message` windows, labelled approximate); plus ResourceSampler + attempt windows + `attempt_resources` + veth totals → footer CPU / peak-mem / net numbers | One PR, one repo (host + backend + web). The DS-alignment payoff — the honest-degradation badge — costs zero new measurement |
 | **CHAT-2** | The Trajectory view — a second tab beside Chat on a thread: full event list (user / assistant / tool / context) with per-call drill-down (payload, result, duration, timing-source label), session minimap strip, bottom stats bar (turns, steps, model-time vs tool-time split, TTFT, tok/s where usage events carry counts), search, session-log export | Pure read of `agent_job_events` — no schema changes, frontend-heavy. The DS-parity surface (§11) |
-| **CHAT-3** | Squid logformat extension (`%>st`, `%tr`) + flow parser + `egress_flows` → network panel (per-domain bytes, denied highlighted) + blocked count in the footer | The security dividend, made user-visible |
-| **CHAT-4** | Per-tool resource correlation (windowed attribution, `tool_call_resources`, shared/overlap labelling) + claude-code hook `exact` upgrade — upgrades both the footer expand and the Trajectory timing tab | The precision rung; contract tests 2, 3, 6 |
+| **CHAT-4** | Per-tool resource correlation (windowed attribution, `tool_call_resources`, shared/overlap labelling) + claude-code hook `exact` upgrade — upgrades both the footer expand and the Trajectory timing tab | The precision rung; contract tests 2, 3, 5 |
 | **CHAT-5** | Per-turn $ in the footer via the #57 gateway read path (bracketed `api_logs` view) | Footer ships without $ until the gateway join exists |
 | **DEFERRED — admin layer** | emit() seam + severity mapping + ops projection; CP aggregate API + console admin pages; alert checker + §7 seed set | Direction agreed in this doc; picked up when admin observability is prioritized |
 | **Later candidates** | Standard metrics stack (OTLP → Prometheus/Grafana) behind the seam; claude-code native OTel passthrough (verify against pinned CLI); MCP relay byte counters; pi native `tool_execution_*` boundaries; spans; gateway-side paper events (other repo) | Not committed by this doc |
 
 Ordered so the user-visible chat experience lands first. CHAT-1's badge and
 duration columns and the whole of CHAT-2 are pure exposure of data the
-platform already records, so the only genuinely new machinery before CHAT-3
-is the sampler. CHAT-4 is where review skepticism belongs (window
-semantics, caps, hook contract).
+platform already records, so the sampler is the only genuinely new
+machinery in them. CHAT-4 is where review skepticism belongs (window
+semantics, caps, hook contract), and with the egress stage withdrawn it is
+the next row in this table. The phase names are kept stable rather than
+renumbered, so CHAT-3 is simply absent.
 
 ## 11. Product surfaces
 
@@ -440,16 +452,14 @@ product, not ports.
 **End user (thread UI).** v1 settles per turn, at turn close:
 
 - **Turn footer, one line:** continuity badge + duration + inference cost +
-  CPU seconds + peak memory + network in/out + blocked-connection count.
-  Example: `hot · 42s · $0.031 · CPU 18.2s · peak 1.2GB · net ↓34MB ↑2MB ·
-  2 blocked`.
-- **Expanded:** a per-tool table (tool, duration, CPU, peak mem, windowed
-  net; parallel calls labelled *shared — upper bound*), and a network panel
-  (per-domain bytes, allowed/denied verdicts, denied highlighted).
+  CPU seconds + peak memory + network in/out.
+  Example: `hot · 42s · $0.031 · CPU 18.2s · peak 1.2GB · net ↓34MB ↑2MB`.
+- **Expanded:** a per-tool table (tool, duration, CPU, peak mem; parallel
+  calls labelled *shared — upper bound*).
 - **The "explain the weird" surfaces** — the highest-value part: a `replay`
   badge with a tooltip saying this turn was rebuilt from transcript and why
-  (export failure / host move); the footer separating compute-slow from
-  network-slow; the denied list answering "is it phoning home".
+  (export failure / host move), and the footer separating compute-slow from
+  network-slow.
 - **The Trajectory view — the DS-parity surface.** A second tab beside the
   chat, mirroring the DS harness's own Trajectory page: the full event list
   (user / assistant / tool / context rows) with a per-call drill-down panel
@@ -472,9 +482,8 @@ user-facing turn views, pointed at the CP aggregate API; no third-party
 dashboard (O1), and the same pages serve future org admins, who would never
 be handed a Grafana anyway: health pulse (claim lag, queues), continuity
 funnel (HOT hit-rate per host — #61's data), capacity (hot-sandbox budget
-water-line, idle cost), consumption leaderboard (outlier turns), security
-(denied-CONNECT bursts, unclassified-bytes growth). Slack alerts from the §7
-checker. Per-attempt detail exposes coverage, sampler version, and
+water-line, idle cost), consumption leaderboard (outlier turns). Slack
+alerts from the §7 checker. Per-attempt detail exposes coverage, sampler version, and
 degradation reason — the support answer to "why did my thread replay".
 
 **Alignment with DS, stated as product:** we adopt its three philosophies —
@@ -482,8 +491,8 @@ transcript fidelity (our floor contract guarantees a never-blank turn;
 Tier-2 remains a raw tail, honestly below their bar), honest degradation
 (they never degrade so never say; we degrade, so we badge it), and
 say-what-you-record (their consent disclosure becomes our transparency
-statement: events, resources, and egress are recorded; tool arguments and
-prompt text never leave the database via telemetry).
+statement: events and resources are recorded; tool arguments and prompt
+text never leave the database via telemetry).
 
 **Doors opened, not committed:** runaway protection (live samples make "this
 turn has burned 30 CPU-minutes" a promptable/limitable signal), org usage
@@ -503,8 +512,6 @@ reports, compute-based pricing or quotas.
    — likely `other` bucket to protect O7).
 5. Whether `message` windows for claude-code should subtract streaming time
    using per-block timing available in stream-json, or wait for hooks.
-6. Postgres partitioning for `egress_flows` if volume demands it (start
-   unpartitioned, telemetry decides).
 
 ---
 
