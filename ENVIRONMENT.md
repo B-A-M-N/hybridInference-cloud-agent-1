@@ -37,7 +37,7 @@ need a gateway secret here, the design is wrong — stop and escalate.
 | Production values provisioned | ☐ not yet |
 | Secret storage | deploy host environment / unit env files, and read-only file mounts for keys. **Never** in git. |
 
-## Control plane (`backend/cloud_agent`)
+## Control plane (`cloud_agent`)
 
 ### Database
 
@@ -103,7 +103,7 @@ the attempt fence, so it is the only place that can decide a tool call. The
 gateway serves models and answers nothing about MCP.
 
 **Which servers exist is not configuration.** The catalogue is a reviewed,
-in-code list (`backend/cloud_agent/mcp_catalogue.py`) and a user connects their
+in-code list (`cloud_agent/mcp_catalogue.py`) and a user connects their
 own account to an entry in it; there is no variable that adds a server, and no
 variable that grants one to somebody. Credentials live per user in
 `agent_mcp_connections`, wrapped with
@@ -129,7 +129,7 @@ are all about *reaching* the relay, never about what it may reach.
 | `AGENT_TIMEOUT_S` | existing | |
 | `AGENT_RUNNER_HOST` | existing | The name this runner reports at claim time. **Only until the host enrols.** After enrolment the control plane reads the host from the runner's credential, not from the claim body, so editing this renames nothing — what keeps two stacks on one machine apart is a separate `AGENT_HOST_STATE_ROOT` each, since the credential lives there. Phase G extends the `agent_runner_hosts` row it creates with status, capacity and capabilities rather than replacing it with a second table, so a runner that only sets this keeps working exactly as before — unmetered, online, and claimable. |
 
-## Host agent (`host/cloud_agent_host`)
+## Host agent (`cloud_agent_host`)
 
 ### The stack's own identity
 
@@ -207,7 +207,7 @@ gate compares before letting a thread resume its session. A label that does not
 match the installed binary makes all three false at once.
 
 Bumping one is a real change, not a config tweak: an agent CLI that alters its
-event format alters what `host/cloud_agent_host/runtimes.py` can parse. Re-run
+event format alters what `cloud_agent_host/runtimes.py` can parse. Re-run
 the agent-loop conformance suite before shipping one.
 
 | Variable | New? | Notes |

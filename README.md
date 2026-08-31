@@ -38,12 +38,12 @@ the service", not "fine".
                  └───────────┬─────────────┘
                              │ session cookie
                  ┌───────────▼─────────────┐      identity JWT (JWKS)
-                 │  backend/cloud_agent    │◀──── inference grants ────┐
+                 │  cloud_agent            │◀──── inference grants ────┐
                  │  control plane          │      grant usage          │
                  └───────────┬─────────────┘                           │
                              │ claim / heartbeat / terminal            │
                  ┌───────────▼─────────────┐                  ┌────────┴────────┐
-                 │  host/cloud_agent_host  │                  │   FreeInference │
+                 │  cloud_agent_host       │                  │   FreeInference │
                  │  runner + broker        │                  │   gateway       │
                  └───────────┬─────────────┘                  └────────▲────────┘
                              │ spawns                                  │
@@ -58,14 +58,14 @@ Three deployment units, one repository:
 | Unit | Path | Runs where |
 |---|---|---|
 | Web + BFF | `web/` | alongside the control plane |
-| Control plane | `backend/cloud_agent/` | one service, owns the Postgres database |
-| Host agent | `host/cloud_agent_host/` | every machine in the host pool |
+| Control plane | `cloud_agent/` | one service, owns the Postgres database |
+| Host agent | `cloud_agent_host/` | every machine in the host pool |
 
 ## Repository layout
 
 ```text
-backend/cloud_agent/   control plane: API, auth adapter, scheduler, publishing
-host/cloud_agent_host/ runner, sandbox, runtimes, workspace broker
+cloud_agent/           control plane: API, auth adapter, scheduler, publishing
+cloud_agent_host/      runner, sandbox, runtimes, workspace broker
 web/                   Next.js app (user UI + admin dashboard)
 contracts/             OpenAPI documents for the three gateway contracts
 migrations/            Alembic migrations for the agent-owned database

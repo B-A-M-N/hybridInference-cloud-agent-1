@@ -4,7 +4,7 @@
 // call. The callback page exchanges its authorization code at the gateway, and
 // immediately hands the resulting token here; the control plane verifies it
 // against the gateway's JWKS and replies with an HttpOnly cookie
-// (`backend/cloud_agent/identity.py`). From then on the token is spent and the
+// (`cloud_agent/identity.py`). From then on the token is spent and the
 // cookie is the only credential in play.
 //
 // These three routes are task **E8**'s to implement. The shapes below are the

@@ -4,7 +4,7 @@
 // access token in `sessionStorage`, attached it as a bearer header, and ran its
 // own refresh loop. This service has no bearer token to keep: sign-in ends in
 // an HttpOnly session cookie minted by the control plane (see
-// `backend/cloud_agent/identity.py`), which JavaScript cannot read and
+// `cloud_agent/identity.py`), which JavaScript cannot read and
 // therefore cannot leak. Every request simply carries `credentials: 'include'`
 // and the browser attaches the cookie.
 //
