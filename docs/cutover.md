@@ -36,7 +36,10 @@ for.
 > host as the undo net — hybridInference#1235 has the record). The run did not
 > follow this file step by step — the log at the bottom records what actually
 > happened, including the steps that were skipped and why. The runbook stays
-> as the template for any future stack-to-stack move.
+> as the template for any future stack-to-stack move. The migration tooling it
+> drove (`deploy/migrate/`, step 5) was **deleted on 2026-08-31** — never run,
+> and its source tables no longer exist. A future move that wants the template
+> recovers it from history: `git show 36767ea:deploy/migrate/migrate_connections.py`.
 
 ---
 
@@ -56,7 +59,7 @@ Do not start until every one of these is true.
       involved.
 - [ ] The gateway's key material is available as a **file** on whatever machine
       runs step 5, and the machine has been decided (see
-      [deploy/migrate/README.md](../deploy/migrate/README.md) § Where it runs).
+      `deploy/migrate/README.md` § Where it runs).
 - [ ] Backups of both databases are taken, and a restore has been rehearsed at
       least once. `pg_dump` of the gateway database and of the new one.
 - [ ] Step 5 has been rehearsed end to end on a copy, with `--apply` and a
@@ -208,7 +211,7 @@ a queue nothing will ever serve again. Draining means *waiting*.
 
 ## 5. Migrate the connections
 
-This is [deploy/migrate/migrate_connections.py](../deploy/migrate/migrate_connections.py).
+This is `deploy/migrate/migrate_connections.py`.
 It moves `agent_repo_grants` and `agent_gitlab_connections` and nothing else,
 **decrypting with the gateway's key and re-encrypting with this service's**.
 A copy would produce connections that list correctly and fail at first use.

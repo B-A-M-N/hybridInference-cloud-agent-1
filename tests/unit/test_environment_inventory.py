@@ -24,9 +24,8 @@ Three invariants, and the first is the only cheap one:
   running container.
 
 Only the control plane gets the compose check. Host variables are set by an
-operator on the machine, migration variables are set at a shell for one run and
-deliberately belong in no unit file, and a check that demanded compose keys for
-those would be demanding the wrong thing.
+operator on the machine, and a check that demanded compose keys for those would
+be demanding the wrong thing.
 """
 
 from __future__ import annotations
@@ -61,11 +60,6 @@ _WEB_SOURCES = ("web/src/**/*.ts", "web/src/**/*.tsx", "web/*.js")
 #: Each entry needs a reason, because "add it to the exemption list" is the
 #: obvious way to make this test stop failing without fixing anything.
 _COMPOSE_EXEMPT = {
-    # Named by `deploy/migrate/`, which a human runs once at a shell against a
-    # database this service will never open again. ENVIRONMENT.md says these
-    # belong in no unit file or image; a compose key would contradict it.
-    "AGENT_MIGRATION_SOURCE_URL",
-    "AGENT_MIGRATION_OLD_KEY_FILE",
     # Deliberately not offered by this compose file, which mounts the key as a
     # read-only file instead. The code still accepts an inline PEM for
     # deployments that do not use this stack; wiring it here would put a
@@ -163,7 +157,6 @@ def test_every_variable_read_has_an_inventory_row() -> None:
             "backend/**/*.py",
             "host/**/*.py",
             "migrations/**/*.py",
-            "deploy/migrate/*.py",
         )
     ) | _vars_read(_sources(*_WEB_SOURCES), _PUBLIC_VAR)
     inventory = INVENTORY.read_text()
