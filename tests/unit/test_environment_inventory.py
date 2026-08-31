@@ -101,7 +101,7 @@ def _compose_environment_keys() -> set[str]:
 
 def test_control_plane_variables_are_wired_into_compose() -> None:
     """A variable the control plane reads can be set on the deployed stack."""
-    read = _vars_read(_sources("backend/**/*.py")) - _COMPOSE_EXEMPT
+    read = _vars_read(_sources("cloud_agent/**/*.py")) - _COMPOSE_EXEMPT
     unreachable = sorted(read - _compose_environment_keys())
     assert not unreachable, (
         "the control plane reads these, but they are not keys under "
@@ -154,8 +154,8 @@ def test_every_variable_read_has_an_inventory_row() -> None:
     """A variable an operator might need to set is written down."""
     read = _vars_read(
         _sources(
-            "backend/**/*.py",
-            "host/**/*.py",
+            "cloud_agent/**/*.py",
+            "cloud_agent_host/**/*.py",
             "migrations/**/*.py",
         )
     ) | _vars_read(_sources(*_WEB_SOURCES), _PUBLIC_VAR)

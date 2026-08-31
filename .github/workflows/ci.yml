@@ -118,7 +118,7 @@ jobs:
           # Docker: the deploy files and what they COPY. README.md is here
           # because Dockerfile.agent-runner COPYs it alongside pyproject/uv.lock,
           # so deleting or renaming it breaks the build and nothing else notices.
-          if matches '^(deploy/|host/)' || matches '^(pyproject\.toml|uv\.lock|README\.md)$'; then
+          if matches '^(deploy/|cloud_agent_host/)' || matches '^(pyproject\.toml|uv\.lock|README\.md)$'; then
             docker=true
           else
             docker=false
@@ -208,7 +208,7 @@ jobs:
       - name: Pydocstyle
         id: pydocstyle
         continue-on-error: true
-        run: uv run pydocstyle backend host
+        run: uv run pydocstyle cloud_agent cloud_agent_host
 
       # `continue-on-error` keeps a failed check from failing the job, so
       # without this the job would be green with a red step inside it. Same

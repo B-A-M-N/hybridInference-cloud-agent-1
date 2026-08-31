@@ -17,7 +17,7 @@ deliberate choice, and two facts make it the honest one:
   step.
 - **Terminal sessions are process memory.** `WorkspaceBroker` keeps live
   sessions in a dict on the broker process
-  (`host/cloud_agent_host/workspace_broker.py:430`). They are not in any
+  (`cloud_agent_host/workspace_broker.py:430`). They are not in any
   database, so there is nothing to migrate and no honest way to preserve them.
   They are closed deliberately, and the announcement says so.
 
@@ -95,7 +95,7 @@ blocker that vanishes without a record reads as one that was never real.
 | ~~The runner sends control-plane calls and the sandbox's inference calls to one base URL~~ | ~~`runner.py` `TODO(E9)`~~ | ✅ **resolved** — the sandbox now carries two addresses and two credentials (`AGENT_GATEWAY_URL` + `agr`, `AGENT_SANDBOX_MCP_URL` + an `mcp`-scoped token), and a runtime asked for MCP with no relay address refuses rather than resolving it against the inference host. |
 | ~~Inference grants (C5–C8) are not on the gateway~~ | ~~unmerged #1180~~ | ✅ **resolved** — #1180 through #1183, #1191 and #1195 are all on the gateway's `dev`. |
 | ~~`/internal/model-catalog`, `/internal/users/{id}/status`, `/internal/mcp-registry` do not exist upstream~~ | ~~`gateway.py`~~ | ✅ **resolved for two of the three, and the third was removed by design.** The catalog and user-status routes exist and carry an alias table; `/internal/mcp-registry` is gone — MCP belongs to this service now, so there is nothing to ask the gateway about. |
-| ~~Host enrollment exists on the control plane but **the runner does not use it**~~ | ~~`grep -rn AGENT_ENROLL_TOKEN host/` returns nothing~~ | ✅ **resolved** — `host/cloud_agent_host/enrollment.py` redeems the token and `runner.py` calls `ensure_enrolled` at startup. Staging's runner host carries a stored credential and heartbeats as `online`, so step 6 is enrolment, not environment variables. |
+| ~~Host enrollment exists on the control plane but **the runner does not use it**~~ | ~~`grep -rn AGENT_ENROLL_TOKEN host/` returns nothing~~ | ✅ **resolved** — `cloud_agent_host/enrollment.py` redeems the token and `runner.py` calls `ensure_enrolled` at startup. Staging's runner host carries a stored credential and heartbeats as `online`, so step 6 is enrolment, not environment variables. |
 | **The pool's broker token must be the *same value* on the control plane and on every host** — and nothing checks that it is. Discovered 2026-08-06: with the reverse tunnel up and the address advertised correctly, every broker call still failed, because the two machines had been configured with two different 64-character secrets. | Each host's `.env` and the control plane's | `broker_routing.py` states the design — one shared `AGENT_WORKSPACE_BROKER_TOKEN` for the whole pool — but a mismatch is not refused anywhere, it is a **401 on every file listing, terminal and git status** for jobs on that host. It reads like the tunnel is broken, and it is not; nothing distinguishes the two from the control plane's logs. Compare fingerprints (`sha256` of the value, never the value) on both machines before step 6, and re-check after any host is re-provisioned. |
 
 ---
@@ -109,7 +109,7 @@ blocker that vanishes without a record reads as one that was never real.
 - [ ] Say that open terminal sessions will be closed and any unfinished job
       will not be resumed on the other side.
 - [ ] Ask that no long job be started inside the six hours before the window —
-      the default agent timeout is 3600 s (`host/cloud_agent_host/runner.py:59`), and step 3 waits for
+      the default agent timeout is 3600 s (`cloud_agent_host/runner.py:59`), and step 3 waits for
       whatever is running.
 
 ## 2. Freeze new-job creation on the old stack — T+0
@@ -173,7 +173,7 @@ curl -s https://<gateway>/openapi.json \
 ## 3. Drain the old runner
 
 The runner has **no drain mode**. `run_forever` claims in a loop and exits only
-on `KeyboardInterrupt` (`host/cloud_agent_host/runner.py:1230`), and stopping it mid-job does not
+on `KeyboardInterrupt` (`cloud_agent_host/runner.py:1230`), and stopping it mid-job does not
 finish the job: the lease expires after `AGENT_LEASE_TTL` (default 120 s), the
 reaper supersedes the attempt within 30 s of that, and the job is requeued into
 a queue nothing will ever serve again. Draining means *waiting*.
@@ -256,7 +256,7 @@ A copy would produce connections that list correctly and fail at first use.
 ## 6. Point the runner host at the new control plane
 
 The control plane can enrol hosts (`POST /v1/agent/host/register`, then
-`/heartbeat`), but the runner in `host/cloud_agent_host/` does not call either
+`/heartbeat`), but the runner in `cloud_agent_host/` does not call either
 endpoint yet — it claims with `AGENT_DISPATCHER_TOKEN` and reports its name in
 the claim body. So re-pointing is an environment edit, and enrollment is
 something to fold in when the host half lands.

@@ -57,7 +57,7 @@ WORKDIR /app
 COPY --from=builder /app/.venv .venv
 ENV PATH="/app/.venv/bin:$PATH"
 
-COPY host/cloud_agent_host/ cloud_agent_host/
+COPY cloud_agent_host/ cloud_agent_host/
 
 # Root on purpose, and only here. The runner chowns each job worktree to the
 # sandbox user before mounting it — an unprivileged runner cannot, and falls

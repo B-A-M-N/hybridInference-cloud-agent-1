@@ -183,7 +183,7 @@ workspace_browser.py   workspace_paths.py     workspace_snapshot.py
 > manifest as "rewritten, not moved", but the rewrite happened *here* — this
 > repository asks the gateway over HTTP instead. On the gateway side the module
 > is the natural implementation of the `/internal/model-catalog` contract this
-> service already calls (`backend/cloud_agent/gateway.py:120`), and
+> service already calls (`cloud_agent/gateway.py:120`), and
 > MIGRATION.md's discarded-test record says so explicitly: the
 > published/role/disabled/chat-type filters "stayed behind". It imports only
 > `serving.config.settings.has_role` and `serving.model_access`, so it has no

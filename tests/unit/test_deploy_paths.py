@@ -40,11 +40,22 @@ _COPY = re.compile(r"^COPY(?:\s+--\S+)*\s+(\S+)\s+\S+\s*$", re.MULTILINE)
 # resolve. The list is the actual tree, not a sample: an earlier version checked
 # four prefixes while claiming to verify every path, and missed real breakage in
 # `distributions/` and `docs/` references precisely because they were not on it.
-_OWN_DIRS = ("backend", "contracts", "deploy", "docs", "host", "migrations", "tests", "web")
+_OWN_DIRS = (
+    "cloud_agent",
+    "cloud_agent_host",
+    "contracts",
+    "deploy",
+    "docs",
+    "migrations",
+    "tests",
+    "web",
+)
 
-# Top-level directories that exist only in the SOURCE repository. Any occurrence
-# is stale by construction — there is nothing here for it to resolve to.
-_SOURCE_ONLY_DIRS = ("apps", "ops", "config", "distributions", "services")
+# Top-level directories that exist only in the SOURCE repository — plus
+# `backend` and `host`, the one-package src roots this tree carried until the
+# flatten moved both packages to the top level. Any occurrence is stale by
+# construction — there is nothing here for it to resolve to.
+_SOURCE_ONLY_DIRS = ("apps", "ops", "config", "distributions", "services", "backend", "host")
 
 # Trailing dots are excluded: these paths are frequently named mid-prose in
 # comments, and a sentence-ending period is not part of the filename.
@@ -106,7 +117,7 @@ def test_every_dockerfile_copy_source_exists(dockerfile: Path) -> None:
 
 def test_the_runner_image_runs_the_host_package() -> None:
     text = (HOST / "Dockerfile.agent-runner").read_text(encoding="utf-8")
-    assert "COPY host/cloud_agent_host/ cloud_agent_host/" in text
+    assert "COPY cloud_agent_host/ cloud_agent_host/" in text
     assert '"cloud_agent_host.runner"' in text
 
 
@@ -176,7 +187,7 @@ def test_the_workflow_targets_this_repository() -> None:
     text = (REPO / ".github/workflows/agent-job-runner.yml").read_text(encoding="utf-8")
     assert "HarvardMadSys/freeinference-cloud-agent" in text
     assert "HarvardMadSys/hybridInference" not in text
-    assert "PYTHONPATH=host python -m cloud_agent_host.runner" in text
+    assert "PYTHONPATH=. python -m cloud_agent_host.runner" in text
 
 
 @pytest.mark.parametrize(

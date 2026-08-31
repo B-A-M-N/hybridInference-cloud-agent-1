@@ -176,7 +176,7 @@ jobs:
         run: |
           set -euo pipefail
           WORKER_ID="${WORKER_ID_INPUT:-actions-${GITHUB_RUN_ID}}"
-          PYTHONPATH=host python -m cloud_agent_host.runner \
+          PYTHONPATH=. python -m cloud_agent_host.runner \
             --base-url "$AGENT_CONTROL_PLANE_URL" \
             --gateway-url "$AGENT_GATEWAY_URL" \
             --worker-id "$WORKER_ID" \

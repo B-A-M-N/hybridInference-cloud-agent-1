@@ -32,7 +32,7 @@ lint:  ## Run linters (ruff format check, ruff lint, pydocstyle)
 	@echo "$(YELLOW)Running linters...$(RESET)"
 	$(UV_RUN) ruff format --check .
 	$(UV_RUN) ruff check --no-fix .
-	$(UV_RUN) pydocstyle backend host
+	$(UV_RUN) pydocstyle cloud_agent cloud_agent_host
 	@echo "$(GREEN)OK Linting passed$(RESET)"
 
 test:  ## Run tests (exclude external and db-dependent)

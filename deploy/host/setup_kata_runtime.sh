@@ -59,7 +59,7 @@ known_sha256() {
   esac
 }
 
-# Must match KATA_RUNTIME in host/cloud_agent_host/sandbox.py. The
+# Must match KATA_RUNTIME in cloud_agent_host/sandbox.py. The
 # sandbox passes this to `docker run --runtime`; the daemon resolves it to a
 # `containerd-shim-kata-v2` binary on its own PATH.
 KATA_RUNTIME="io.containerd.kata.v2"

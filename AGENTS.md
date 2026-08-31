@@ -18,9 +18,9 @@ repo, with the file-level manifest in `cloud-agent-split-manifest.md` beside it.
 ## 2. Repo map
 
 ```text
-backend/cloud_agent/    control plane (FastAPI): API, auth adapter, scheduler,
+cloud_agent/            control plane (FastAPI): API, auth adapter, scheduler,
                         source-control integrations, publishing, storage
-host/cloud_agent_host/  host agent: runner, sandbox, runtimes, workspace broker
+cloud_agent_host/       host agent: runner, sandbox, runtimes, workspace broker
 web/                    Next.js user UI + admin dashboard
 contracts/              OpenAPI mirrors of the gateway contracts we consume
 migrations/             Alembic migrations (agent-owned database only)
@@ -90,7 +90,7 @@ needs an unchanged baseline to be worth anything.
   capabilities for. Hosts are added and removed without redeploying the control
   plane.
 - **Sandbox.** Per-task container with **two egress phases**, enforced by the
-  code in `host/cloud_agent_host/egress.py` and `egress_proxy.py`:
+  code in `cloud_agent_host/egress.py` and `egress_proxy.py`:
   - *Setup phase* — dependency installation may reach package registries, but
     only through the Squid allowlist proxy, which permits CONNECT to an
     allowlisted host by name and refuses everything else.

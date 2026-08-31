@@ -19,7 +19,7 @@ const API_BASE = config.apiBase;
 const HOSTS = '/admin/agent/runner-hosts';
 const RUNTIME_VERSIONS = '/admin/agent/runtime-versions';
 
-/** Status values the control plane stores; see `backend/cloud_agent/host_pool.py`. */
+/** Status values the control plane stores; see `cloud_agent/host_pool.py`. */
 export type AgentHostStatus = 'enrolling' | 'online' | 'draining' | 'disabled';
 
 export interface AgentRunnerHost {
