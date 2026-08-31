@@ -129,17 +129,6 @@ are all about *reaching* the relay, never about what it may reach.
 | `AGENT_TIMEOUT_S` | existing | |
 | `AGENT_RUNNER_HOST` | existing | The name this runner reports at claim time. **Only until the host enrols.** After enrolment the control plane reads the host from the runner's credential, not from the claim body, so editing this renames nothing — what keeps two stacks on one machine apart is a separate `AGENT_HOST_STATE_ROOT` each, since the credential lives there. Phase G extends the `agent_runner_hosts` row it creates with status, capacity and capabilities rather than replacing it with a second table, so a runner that only sets this keeps working exactly as before — unmetered, online, and claimable. |
 
-### Cutover migration (`deploy/migrate/`, read once and never again)
-
-Set only for the length of one run of `migrate_connections.py` (task H1), and
-by a human at a shell. **Nothing in the deployed service reads these**, and
-neither belongs in any unit file, `.env`, or image.
-
-| Variable | New? | Value / who provisions |
-|---|---|---|
-| `AGENT_MIGRATION_SOURCE_URL` | **NEW** | DSN of the *gateway's* database, read-only for the length of the import. Env rather than a flag because a DSN carries a password and `argv` is readable by every process on the host. |
-| `AGENT_MIGRATION_OLD_KEY_FILE` | **NEW** | **Path**, not a value: the file holding the gateway's old key material, which the script reads once to decrypt credentials before re-encrypting them under `AGENT_SOURCE_CONTROL_ENCRYPTION_KEY`. Deleted immediately afterwards. The script deliberately refuses to read `API_KEY_SECRET` from its own environment — see [the one rule](#the-one-rule); this is the narrowest shape that still lets a re-key happen at all, and MIGRATION.md's open-decisions register says which machine may run it. |
-
 ## Host agent (`host/cloud_agent_host`)
 
 ### The stack's own identity
