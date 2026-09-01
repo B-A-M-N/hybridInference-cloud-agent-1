@@ -134,6 +134,45 @@ def get_log_store(request: Request) -> Any | None:
 #: unknown *required* role; an unknown *user* role ranks as ``free``.
 ROLE_RANK: dict[str, int] = {"free": 0, "pro": 1, "internal": 2, "admin": 3}
 
+
+#: The statuses the gateway may report that still mean "may use this service".
+#: Anything else — suspended, banned, deleted, unknown — is refused, because an
+#: allowlist is the only version of this check that fails closed when the
+#: gateway grows a new status nobody here has heard of.
+ACTIVE_STATUSES = frozenset({"active", "ok", "enabled"})
+
+
+def may_sign_in(status: dict[str, Any]) -> bool:
+    """Read the gateway's status record as a yes or a no.
+
+    One reader, used at sign-in and again when a privileged action
+    revalidates, so the two cannot come to disagree about what the gateway's
+    answer means.
+
+    Written against the shape the client's own tests pin —
+    ``{"user_id", "exists", "active", "role"}`` — and tolerant of a record that
+    says the same thing with a ``status`` string instead.
+
+    Args:
+        status: The gateway's status record.
+
+    Returns:
+        Whether the account may use this service. Every branch that cannot find
+        an affirmative answer returns ``False``.
+    """
+    if status.get("exists") is False:
+        return False
+    active = status.get("active")
+    if isinstance(active, bool):
+        return active
+    named = status.get("status")
+    if isinstance(named, str):
+        return named.lower() in ACTIVE_STATUSES
+    # No recognizable statement either way. Refuse: a record this service
+    # cannot read is not a record that granted anything.
+    return False
+
+
 #: The namespace :func:`cloud_agent.tokens.mint_worker_token` mints into. Kept
 #: as a literal rather than imported, because the token module's prefix is
 #: private; ``test_the_agent_token_prefix_still_matches_what_tokens_mints``

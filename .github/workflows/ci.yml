@@ -863,7 +863,7 @@ jobs:
           # part of what this step checks.
           AGENT_WEB_BASE_PATH=/agents
           AGENT_WEB_API_URL=/agents/api
-          AGENT_WEB_GATEWAY_AUTHORIZE_URL=https://gateway.invalid/authorize
+          AGENT_WEB_GATEWAY_URL=https://gateway.invalid
           ENVFILE
           docker compose \
             -f deploy/control-plane/docker-compose.yml \

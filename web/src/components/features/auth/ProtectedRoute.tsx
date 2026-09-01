@@ -2,12 +2,23 @@
 
 // Recreated. The source repo's version pushed unauthenticated visitors at its
 // own `/login` page; this service has no login page and no password to check.
-// An unauthenticated visitor is sent to the gateway's consent page instead,
-// with a PKCE challenge, and comes back through `/callback`.
+// An unauthenticated visitor is handed to the control plane, which runs the
+// whole round trip to the gateway's consent page and brings them back signed
+// in — no PKCE, no code, and no callback route in this app.
 
 import { useEffect, useRef, useState } from 'react';
 import { useAuth } from '@/components/providers';
 import { beginSignIn, SignInNotConfigured } from '@/lib/auth/signin';
+
+/**
+ * Set by the control plane when it cannot sign anyone in.
+ *
+ * **This is what keeps a misconfigured deployment from looping.** The browser
+ * cannot see the server's configuration, so the only way it learns that
+ * sign-in is impossible is being told on the way back — and if it asked again
+ * it would be told again, forever.
+ */
+const SIGN_IN_ERROR_PARAM = 'sign_in_error';
 
 export function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { state } = useAuth();
@@ -22,6 +33,10 @@ export function ProtectedRoute({ children }: { children: React.ReactNode }) {
     // Read from `location` rather than `useSearchParams`, which would force
     // every page under this layout behind a Suspense boundary at build time.
     // The effect is client-only, so `location` is always the current route.
+    if (new URLSearchParams(window.location.search).has(SIGN_IN_ERROR_PARAM)) {
+      setError('Sign-in is not configured for this deployment.');
+      return;
+    }
     const returnTo = `${window.location.pathname}${window.location.search}`;
     beginSignIn(returnTo).catch((err) => {
       started.current = false;

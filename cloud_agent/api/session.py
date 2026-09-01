@@ -1,25 +1,44 @@
 """The session BFF — this service's own half of sign-in (task E8).
 
-Sign-in happens at the gateway. What arrives here is the *result*: a
-short-lived RS256 identity token, audience ``cloud-agent``, signed by a key
-this service only ever holds the public half of. Three routes trade it for a
-cookie and answer questions about that cookie:
+Sign-in happens at the gateway. This service owns the round trip to it, and
+owns it **end to end on the server**: two browser-facing routes park a flow,
+send the user to the gateway's consent page, and trade the returned code for a
+session cookie.
 
-- ``POST /v1/session/login`` — verify the identity token, ask the gateway
-  whether this account may sign in, and set the cookie.
+- ``GET  /v1/session/login`` — mint a PKCE verifier and a CSRF ``state``, park
+  both in a short-lived HttpOnly cookie, redirect to the gateway.
+- ``GET  /v1/session/callback`` — validate ``state``, exchange the code here,
+  verify the identity token, ask the gateway whether the account may sign in,
+  set the session cookie, redirect into the app.
 - ``POST /v1/session/logout`` — clear it.
 - ``GET  /v1/session/me`` — who the cookie says we are, or 401.
 
-**Why the gateway is asked at login.** Verifying the identity token proves who
-someone is, not that they may use anything: the token is minted at
-authentication time and says nothing about a suspension that happened since, or
-about a role that changed. The cookie it buys lasts seven days. So login is the
-one moment where a status call is both cheap (once per sign-in, not once per
-request) and load-bearing (a suspended account must not walk away with a
-week-long credential), and the role written into the session comes from the
-gateway's answer rather than from a claim in the token — the role is what gates
-the internal-only dogfood surface, so it should come from the service that owns
-it.
+**Why the exchange is here and not in the page.** An earlier revision had the
+callback *page* redeem the code: the browser held the PKCE verifier in
+``localStorage`` and the gateway's identity token in JavaScript, however
+briefly. Both are bearer credentials, and "we call it a BFF" should mean the
+browser never holds one. Here the verifier lives in an HttpOnly cookie no page
+script can read, and the identity token never leaves this process.
+
+**``state`` is generated and verified here, and nowhere else.** It is the
+client's CSRF value, and a callback that accepts any ``code`` a victim's
+browser can be made to arrive with is login CSRF — an attacker's account
+silently occupying the victim's session, or the victim's code redeemed into the
+attacker's. The parked flow is consumed on use, so a replayed callback finds
+nothing.
+
+**The callback is a ``GET``.** The gateway finishes by redirecting the browser
+to ``redirect_uri?code=…``, and a redirect is a GET navigation.
+
+**Why the gateway is asked about the account.** Verifying the identity token
+proves who someone is, not that they may use anything: it is minted at
+authentication time and says nothing about a suspension since. So the status
+call happens at sign-in, and the role written into the session is the gateway's
+answer rather than a claim in the token — the role is what gates the
+internal-only surface, so it should come from the service that owns it. The
+session it buys is hours long, not days, and privileged actions revalidate
+(``require_agent_owner``); it is a cache of an authorization decision and
+expires like one.
 
 It **fails closed**, like every other gateway call in this service: a gateway
 that cannot be reached mints no session. That is a worse day for someone trying
@@ -38,14 +57,16 @@ from __future__ import annotations
 
 import os
 from typing import Any
+from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import RedirectResponse
 
 from cloud_agent import identity
-from cloud_agent.api.deps import get_current_user, get_gateway_client
+from cloud_agent.api.deps import get_current_user, get_gateway_client, may_sign_in
 from cloud_agent.gateway import GatewayError
 from cloud_agent.logging_utils import get_logger
-from cloud_agent.schemas import SessionLoginRequest, SessionUserResponse
+from cloud_agent.schemas import SessionUserResponse
 
 logger = get_logger(__name__)
 
@@ -57,11 +78,25 @@ router = APIRouter(prefix="/v1/session")
 #: where that is not true, and they have to say so out loud.
 ENV_COOKIE_SECURE = "AGENT_SESSION_COOKIE_SECURE"
 
-#: The statuses the gateway may report that still mean "may sign in". Anything
-#: else — suspended, banned, deleted, unknown — is refused, because an
-#: allowlist is the only version of this check that fails closed when the
-#: gateway grows a new status nobody here has heard of.
-_ACTIVE_STATUSES = frozenset({"active", "ok", "enabled"})
+#: The gateway's consent page, server-side. The web app had its own
+#: ``NEXT_PUBLIC_`` copy while it built the authorize URL itself; the flow is
+#: assembled here now, so this is the one that has to be set.
+ENV_AUTHORIZE_URL = "GATEWAY_AUTHORIZE_URL"
+
+#: The callback URL **as the gateway must see it**, verbatim.
+#:
+#: Configured rather than derived from the request, and that is not
+#: fastidiousness: the gateway matches ``IDENTITY_ALLOWED_REDIRECTS`` as an
+#: exact string, and deriving this from ``Host``/``X-Forwarded-*`` would let
+#: whatever sits in front of this service decide where sign-in returns to.
+ENV_REDIRECT_URI = "AGENT_SESSION_REDIRECT_URI"
+
+#: Where the browser lands once the cookie is set — the web app's public origin
+#: including any base path, e.g. ``https://example.org/agents``.
+ENV_WEB_BASE_URL = "AGENT_WEB_BASE_URL"
+
+#: This service's client id at the gateway.
+OAUTH_CLIENT_ID = "cloud-agent"
 
 
 def _cookie_is_secure() -> bool:
@@ -70,42 +105,255 @@ def _cookie_is_secure() -> bool:
     return raw not in ("0", "false", "no")
 
 
-def _may_sign_in(status: dict[str, Any]) -> bool:
-    """Read the gateway's status record as a yes or a no.
-
-    Written against the shape the client's own tests pin —
-    ``{"user_id", "exists", "active", "role"}`` — and tolerant of a record that
-    says the same thing with a ``status`` string instead. Every branch that
-    cannot find an affirmative answer returns ``False``.
-    """
-    if status.get("exists") is False:
-        return False
-    active = status.get("active")
-    if isinstance(active, bool):
-        return active
-    named = status.get("status")
-    if isinstance(named, str):
-        return named.lower() in _ACTIVE_STATUSES
-    # No recognizable statement either way. Refuse: a record this service
-    # cannot read is not a record that granted anything.
-    return False
+def _env(name: str) -> str:
+    """Return a trimmed environment value."""
+    return (os.environ.get(name) or "").strip()
 
 
-@router.post("/login", response_model=SessionUserResponse)
-async def session_login(
-    body: SessionLoginRequest,
-    response: Response,
-    gateway=Depends(get_gateway_client),
-) -> SessionUserResponse:
-    """Trade a gateway identity token for this service's session cookie.
+def safe_return_to(candidate: str | None) -> str:
+    """Reduce a caller-supplied ``return_to`` to a same-site path.
+
+    A ``return_to`` survives a round trip through another origin, so it is
+    attacker-influenced: anything that is not a single-slash-rooted path — an
+    absolute URL, a protocol-relative ``//evil.example``, a backslash the
+    browser normalizes to one — becomes ``/``. That is what stops sign-in from
+    being usable as an open redirect.
 
     Args:
-        body: Carries the identity token the callback page obtained.
-        response: The response the cookie is set on.
-        gateway: The gateway's internal contracts.
+        candidate: The requested landing path, if any.
 
     Returns:
-        The signed-in user, in the shape ``session.ts`` expects.
+        A path safe to append to this deployment's own web base URL.
+    """
+    if not candidate or not candidate.startswith("/"):
+        return "/"
+    if candidate.startswith("//") or candidate.startswith("/\\"):
+        return "/"
+    return candidate
+
+
+def _web_destination(return_to: str) -> str:
+    """Return the absolute URL to land the browser on after sign-in.
+
+    Args:
+        return_to: An already-validated same-site path.
+
+    Returns:
+        The web base URL with the path appended, or the bare path when this
+        deployment shares an origin and has configured no base URL.
+    """
+    base = _env(ENV_WEB_BASE_URL).rstrip("/")
+    return f"{base}{return_to}" if base else return_to
+
+
+#: Told to the app when this deployment cannot sign anyone in, so it can say so
+#: instead of asking again. Without it the refusal is a redirect loop: the app
+#: sends an unauthenticated visitor here, and here sends them straight back.
+SIGN_IN_ERROR_PARAM = "sign_in_error"
+
+
+def _sign_in_unavailable(reason: str) -> HTTPException:
+    """Refuse a sign-in this deployment is not configured to perform.
+
+    503 rather than 500: the caller did nothing wrong, and retrying with
+    another credential will not help.
+    """
+    return HTTPException(status_code=503, detail=reason)
+
+
+def _unavailable_response(reason: str) -> RedirectResponse:
+    """Send an unsignable-in visitor back to the app with something to show.
+
+    A misconfigured deployment is an operator's problem, but the person in
+    front of it still deserves a sentence rather than a raw 503 body. When no
+    web base URL is configured there is nowhere to send them, and the 503 is
+    the honest answer.
+
+    Args:
+        reason: What is missing, for the log.
+
+    Returns:
+        A redirect carrying :data:`SIGN_IN_ERROR_PARAM`.
+
+    Raises:
+        HTTPException: 503 when this deployment has no app to redirect to.
+    """
+    logger.warning(
+        "agent_sign_in_unconfigured",
+        extra={"event": "agent_sign_in_unconfigured", "reason": reason},
+    )
+    if not _env(ENV_WEB_BASE_URL):
+        raise _sign_in_unavailable(reason)
+    return RedirectResponse(
+        f"{_web_destination('/')}?{urlencode({SIGN_IN_ERROR_PARAM: 'unavailable'})}",
+        status_code=303,
+    )
+
+
+@router.get("/login")
+async def session_login(
+    return_to: str = Query(default="/"),
+) -> RedirectResponse:
+    """Start a sign-in: park the PKCE flow and redirect to the gateway.
+
+    Args:
+        return_to: Where in the app to land afterwards. Reduced to a same-site
+            path before it is parked.
+
+    Returns:
+        A redirect to the gateway's consent page.
+
+    Raises:
+        HTTPException: 503 if this deployment cannot sign anyone in.
+    """
+    authorize_url = _env(ENV_AUTHORIZE_URL)
+    redirect_uri = _env(ENV_REDIRECT_URI)
+    if not authorize_url or not redirect_uri:
+        return _unavailable_response(
+            f"{ENV_AUTHORIZE_URL} and {ENV_REDIRECT_URI} must both be set to sign anyone in."
+        )
+
+    verifier = identity.new_verifier()
+    state = identity.new_state()
+    try:
+        flow = identity.mint_login_flow(
+            verifier=verifier, state=state, return_to=safe_return_to(return_to)
+        )
+    except identity.IdentityNotConfigured as exc:
+        raise _sign_in_unavailable(str(exc)) from None
+
+    query = urlencode(
+        {
+            "client_id": OAUTH_CLIENT_ID,
+            "redirect_uri": redirect_uri,
+            "code_challenge": identity.challenge_for(verifier),
+            "code_challenge_method": "S256",
+            "state": state,
+        }
+    )
+    separator = "&" if "?" in authorize_url else "?"
+    # 303, not 302: this is a redirect to a different resource after a request
+    # that is itself not the destination, and 303 is unambiguous about the
+    # browser issuing a GET.
+    response = RedirectResponse(f"{authorize_url}{separator}{query}", status_code=303)
+    response.set_cookie(
+        identity.LOGIN_FLOW_COOKIE,
+        flow,
+        max_age=identity.LOGIN_FLOW_TTL_S,
+        httponly=True,
+        # Lax, not Strict: the return leg is a top-level navigation back from
+        # the gateway, and Strict would drop the cookie on exactly that
+        # request — the one it exists for.
+        samesite="lax",
+        secure=_cookie_is_secure(),
+        path="/",
+    )
+    return response
+
+
+@router.get("/callback")
+async def session_callback(
+    request: Request,
+    code: str = Query(default=""),
+    state: str = Query(default=""),
+    gateway=Depends(get_gateway_client),
+) -> RedirectResponse:
+    """Finish a sign-in: validate, exchange, and set the session cookie.
+
+    Args:
+        request: The incoming request, for the parked login-flow cookie.
+        code: The one-time authorization code the gateway sent back.
+        state: The CSRF value the gateway echoed.
+        gateway: The gateway's contracts.
+
+    Returns:
+        A redirect into the app, carrying the session cookie.
+
+    Raises:
+        HTTPException: 400 if the flow is missing, mismatched, replayed or
+            unredeemable, 403 if the account may not sign in, 503 if this
+            deployment cannot verify identity or could not reach the gateway.
+    """
+    redirect_uri = _env(ENV_REDIRECT_URI)
+    if not redirect_uri:
+        raise _sign_in_unavailable(f"{ENV_REDIRECT_URI} must be set to sign anyone in.")
+
+    try:
+        flow = identity.verify_login_flow(request.cookies.get(identity.LOGIN_FLOW_COOKIE) or "")
+    except identity.IdentityNotConfigured as exc:
+        raise _sign_in_unavailable(str(exc)) from None
+    except identity.IdentityError:
+        raise HTTPException(
+            status_code=400,
+            detail="This sign-in has expired. Please start again.",
+        ) from None
+
+    # Checked before the code is spent: a callback naming a state this service
+    # did not mint is not a callback worth redeeming.
+    if not identity.state_matches(state, str(flow.get("state") or "")):
+        raise HTTPException(
+            status_code=400,
+            detail="This sign-in response did not match the request that started it.",
+        )
+    if not code:
+        raise HTTPException(status_code=400, detail="The gateway returned no authorization code.")
+
+    try:
+        identity_token = await gateway.exchange_authorization_code(
+            code=code,
+            verifier=str(flow.get("verifier") or ""),
+            client_id=OAUTH_CLIENT_ID,
+            redirect_uri=redirect_uri,
+        )
+    except GatewayError as exc:
+        logger.warning(
+            "agent_session_code_exchange_failed",
+            exc_info=True,
+            extra={"event": "agent_session_code_exchange_failed"},
+        )
+        # A refused exchange is the caller's problem (a stale or replayed
+        # code); an unreachable gateway is this deployment's.
+        status_code = 400 if exc.definitive else 503
+        raise HTTPException(
+            status_code=status_code,
+            detail=(
+                "This sign-in could not be completed. Please start again."
+                if status_code == 400
+                else "Cannot reach the gateway to complete sign-in; try again shortly."
+            ),
+        ) from exc
+
+    session, user = await _establish_session(identity_token, gateway)
+
+    response = RedirectResponse(
+        _web_destination(safe_return_to(str(flow.get("return_to") or "/"))), status_code=303
+    )
+    _set_session_cookie(response, session)
+    # Consumed on use: a replayed callback finds nothing parked, so a code that
+    # failed to exchange cannot be retried against the same verifier.
+    response.delete_cookie(
+        identity.LOGIN_FLOW_COOKIE,
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=_cookie_is_secure(),
+    )
+    logger.info(
+        "agent_session_established",
+        extra={"event": "agent_session_established", "user_id": user["id"]},
+    )
+    return response
+
+
+async def _establish_session(identity_token: str, gateway: Any) -> tuple[str, dict[str, Any]]:
+    """Verify an identity token and mint this service's session from it.
+
+    Args:
+        identity_token: The gateway's RS256 identity token.
+        gateway: The gateway's contracts, for the account's status.
+
+    Returns:
+        The signed session, and the user record the routes answer with.
 
     Raises:
         HTTPException: 401 if the identity token does not verify, 403 if the
@@ -113,7 +361,7 @@ async def session_login(
             cannot verify identity or could not reach the gateway.
     """
     try:
-        claims = identity.verify_identity_token(body.identity_token)
+        claims = identity.verify_identity_token(identity_token)
     except identity.IdentityNotConfigured as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
     except identity.IdentityError:
@@ -139,7 +387,7 @@ async def session_login(
             detail="Cannot confirm this account with the gateway; try again shortly.",
         ) from exc
 
-    if not _may_sign_in(status):
+    if not may_sign_in(status):
         raise HTTPException(status_code=403, detail="This account cannot sign in.")
 
     # The gateway's role, not the token's. The identity token proves who; the
@@ -151,10 +399,10 @@ async def session_login(
     # session is the only thing ``/me`` can read. Sourcing it here and returning
     # it without minting it is what made the two routes disagree: login answered
     # with a name and ``/me`` answered ``null`` for the same signed-in person,
-    # for the whole seven days the cookie lasts. Today no gateway contract
-    # reports a name at all, so both answer ``null`` — but they now do so for
-    # the same reason, and a gateway that grows the field is answered
-    # consistently without a second change here.
+    # for the whole life of the cookie. Today no gateway contract reports a name
+    # at all, so both answer ``null`` — but they now do so for the same reason,
+    # and a gateway that grows the field is answered consistently without a
+    # second change here.
     user_name = status.get("user_name") or claims.get("user_name")
     user_name = str(user_name) if user_name else None
 
@@ -165,6 +413,16 @@ async def session_login(
     except identity.IdentityNotConfigured as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
 
+    return session, {"id": user_id, "email": email, "role": role, "user_name": user_name}
+
+
+def _set_session_cookie(response: Response, session: str) -> None:
+    """Attach the session cookie to a response.
+
+    Args:
+        response: The response to set the cookie on.
+        session: The signed session token.
+    """
     response.set_cookie(
         identity.SESSION_COOKIE,
         session,
@@ -178,7 +436,6 @@ async def session_login(
         secure=_cookie_is_secure(),
         path="/",
     )
-    return SessionUserResponse(id=user_id, email=email, role=role, user_name=user_name)
 
 
 @router.post("/logout")
@@ -207,14 +464,14 @@ async def session_logout(response: Response) -> dict[str, bool]:
 async def session_me(request: Request) -> SessionUserResponse:
     """Return the current user, or 401 when there is no valid session.
 
-    No gateway call. The account was checked at login and the session's own
-    expiry bounds how stale that answer can get; putting a gateway round trip
-    on the call every page load makes the whole app unavailable whenever the
-    gateway is, for a question already answered.
+    No gateway call. The account was checked at sign-in, privileged actions
+    revalidate, and the session's own expiry bounds how stale this answer can
+    get; putting a gateway round trip on the call every page load makes the
+    whole app unavailable whenever the gateway is, for a question already
+    answered.
 
-    **Every field here comes out of the session ``/login`` minted**, which is
-    what makes the two routes answer the same thing for the same person. They
-    disagreed about ``user_name`` until login started minting it.
+    **Every field here comes out of the session sign-in minted**, which is what
+    makes the two answers agree for the same person.
     """
     user = await get_current_user(
         request=request, authorization=request.headers.get("authorization")

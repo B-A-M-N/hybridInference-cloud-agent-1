@@ -254,6 +254,73 @@ class GatewayClient:
         """
         return await self._get(f"/internal/users/{user_id}/status")
 
+    async def exchange_authorization_code(
+        self, *, code: str, verifier: str, client_id: str, redirect_uri: str
+    ) -> str:
+        """Redeem a one-time authorization code for an identity token.
+
+        The one gateway call in this service that sends **no dispatch token**,
+        and deliberately so: PKCE is what authenticates the exchange. Presenting
+        a service credential here would make the redemption something this
+        deployment can do rather than something the holder of the verifier can,
+        which is the property the whole flow rests on.
+
+        It runs here rather than in the browser because that is what makes this
+        a backend-for-frontend: the identity token is a bearer credential, and
+        page JavaScript that holds one — even for a single call — is one XSS
+        away from handing it to somebody else, along with the verifier it was
+        redeemed with.
+
+        Args:
+            code: The one-time code the gateway sent back through the browser.
+            verifier: The PKCE verifier parked when the flow started.
+            client_id: This service's client id, as registered at the gateway.
+            redirect_uri: The redirect URI the code was issued for. Compared as
+                an exact string on the far side, so it must be byte-identical
+                to the one sent to ``/authorize``.
+
+        Returns:
+            The identity token.
+
+        Raises:
+            GatewayError: If the exchange is refused, unreachable, or answers
+                without a token.
+        """
+        if not self._base_url:
+            raise GatewayError(f"{ENV_BASE_URL} must be set to exchange authorization codes")
+        body = {
+            "code": code,
+            "code_verifier": verifier,
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+        }
+        timeout = httpx.Timeout(_TIMEOUT_S, connect=_CONNECT_TIMEOUT_S)
+        path = "/v1/identity/token"
+        try:
+            if self._client is not None:
+                response = await self._client.post(
+                    f"{self._base_url}{path}", json=body, timeout=timeout
+                )
+            else:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await client.post(f"{self._base_url}{path}", json=body)
+        except httpx.HTTPError as exc:
+            raise GatewayError(f"gateway unreachable: {exc}") from exc
+
+        if response.status_code != 200:
+            raise GatewayError(
+                f"gateway answered {response.status_code} for {path}",
+                status_code=response.status_code,
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise GatewayError(f"gateway returned unparsable JSON for {path}") from exc
+        token = payload.get("access_token") if isinstance(payload, dict) else None
+        if not token or not isinstance(token, str):
+            raise GatewayError("gateway returned no identity token")
+        return token
+
     # There was an `mcp_registry()` here, calling `/internal/mcp-registry`.
     # The ownership amendment moved the registry, its credentials and its proxy
     # to this service, and the gateway's endpoint went with them — so the

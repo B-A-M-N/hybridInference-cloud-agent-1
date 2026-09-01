@@ -1060,6 +1060,15 @@ class _FakeGateway:
     async def model_catalog(self, user_id: str) -> list[str]:
         return list(_TEST_MODELS)
 
+    #: What the gateway says about the account. Read by ``require_agent_owner``
+    #: on every write, so a fake without it sends every mutating route down an
+    #: ``AttributeError`` — the same trap ``model_catalog_with_aliases``
+    #: documents below. Overridden per-test to exercise a refusal.
+    status: ClassVar[dict[str, Any]] = {"exists": True, "active": True, "role": "internal"}
+
+    async def user_status(self, user_id: str) -> dict[str, Any]:
+        return dict(self.status)
+
     aliases: ClassVar[dict[str, str]] = {}
 
     async def model_catalog_with_aliases(self, user_id: str) -> tuple[list[str], dict[str, str]]:

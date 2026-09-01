@@ -65,6 +65,20 @@ services:
       # under a different name than it mints under, and pinning `iss` wrongly
       # locks every user out.
       GATEWAY_ISSUER: ${GATEWAY_ISSUER:-}
+      # The consent page a sign-in starts at. Server-side: the whole PKCE round
+      # trip is assembled in the control plane now, so the web app no longer
+      # needs its own copy of this.
+      GATEWAY_AUTHORIZE_URL: ${GATEWAY_AUTHORIZE_URL:?the gateway origin plus /authorize}
+      # Where the gateway sends the browser back — this service's callback, as
+      # the public internet addresses it, and **byte-identical to an entry in
+      # the gateway's IDENTITY_ALLOWED_REDIRECTS**, which is matched as an exact
+      # string. Configured rather than derived from request headers so that
+      # whatever sits in front of this service cannot decide where sign-in
+      # returns to.
+      AGENT_SESSION_REDIRECT_URI: ${AGENT_SESSION_REDIRECT_URI:?public URL of /v1/session/callback, allowlisted at the gateway}
+      # Where the browser lands once the cookie is set: the web app's public
+      # origin including any base path, e.g. https://example.org/agents.
+      AGENT_WEB_BASE_URL: ${AGENT_WEB_BASE_URL:?public origin of the web app, including any base path}
 
       # --- This service's own secrets ---------------------------------------
       # Required, never defaulted. A default here is a deployment that looks
@@ -227,7 +241,9 @@ services:
         # host has to be known at build time. Under a base path this is that
         # base path plus `/api`, which the reverse proxy strips.
         NEXT_PUBLIC_AGENT_API_URL: ${AGENT_WEB_API_URL:?control-plane base URL as the browser calls it, e.g. /agents/api}
-        NEXT_PUBLIC_GATEWAY_AUTHORIZE_URL: ${AGENT_WEB_GATEWAY_AUTHORIZE_URL:?the gateway's consent page; without it this deployment cannot sign anyone in}
+        # The gateway's origin, for links this app does not host. Sign-in does
+        # not pass through the browser any more, so nothing here starts one.
+        NEXT_PUBLIC_GATEWAY_URL: ${AGENT_WEB_GATEWAY_URL:-}
         NEXT_PUBLIC_APP_NAME: ${AGENT_WEB_APP_NAME:-}
         # The rest of the header's identity. Optional — empty hides the link or
         # the name rather than rendering a blank one — but they have to be

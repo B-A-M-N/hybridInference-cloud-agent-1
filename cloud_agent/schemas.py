@@ -1635,18 +1635,6 @@ class HostHeartbeatResponse(BaseModel):  # type: ignore[no-any-unimported]
 # ── Session (E8) ───────────────────────────────────────────────────────
 
 
-class SessionLoginRequest(BaseModel):  # type: ignore[no-any-unimported]
-    """The gateway identity token, traded once for a session cookie.
-
-    The browser holds this for exactly one call: the callback page redeems its
-    authorization code at the gateway and hands the result straight here. After
-    that the token is spent and the cookie is the only credential in play, so a
-    token intercepted afterwards buys nothing.
-    """
-
-    identity_token: str = Field(..., min_length=1, max_length=8192)
-
-
 class SessionUserResponse(BaseModel):  # type: ignore[no-any-unimported]
     """Who the session says the caller is.
 
