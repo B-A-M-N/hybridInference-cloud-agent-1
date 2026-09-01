@@ -25,7 +25,7 @@ import pytest_asyncio
 from fastapi import Depends, FastAPI
 from httpx import ASGITransport, AsyncClient
 
-from cloud_agent.api import routes as agent_jobs_router
+from cloud_agent.api import admin_hosts as admin_hosts_router, routes as agent_jobs_router
 from cloud_agent.api.deps import get_gateway_client
 from cloud_agent.gateway import GatewayError
 
@@ -156,10 +156,23 @@ def _gates(route: Any) -> set[str]:
 #: wrong thing. Named by the call each route actually makes, not by URL prefix:
 #: a prefix exempts whatever is put under it, which is the same "the next one
 #: falls off the list" failure this test exists to catch.
-MACHINE_GATES = frozenset({"_worker_claims", "verify_dispatcher_access", "verify_admin_access"})
+#: **``verify_admin_access`` is deliberately not in here**, and was, briefly.
+#: It reads as a machine gate because of ``ADMIN_TOKEN``, but it is two doors:
+#: the other one is a browser session whose role claim says ``admin``, which is
+#: how the dashboard authenticates. Exempting it left every admin write —
+#: draining a host, pinning a runtime version — trusting a role that was true
+#: only whenever the session happened to be minted.
+MACHINE_GATES = frozenset({"_worker_claims", "verify_dispatcher_access"})
+
+#: Both routers a browser reaches with a session. The admin router is a second
+#: mount point, not a second kind of caller.
+SESSION_ROUTERS = (agent_jobs_router.router, admin_hosts_router.router)
+
+#: Gates that re-ask the gateway before they allow a write.
+REVALIDATING_GATES = frozenset({"require_agent_owner", "verify_admin_access"})
 
 
-async def test_every_mutating_route_on_the_owner_surface_revalidates():
+async def test_every_mutating_route_a_session_can_reach_revalidates():
     """No route gets to skip this by being added later.
 
     The method rule is only as good as its coverage: a mutating route wired to
@@ -169,23 +182,145 @@ async def test_every_mutating_route_on_the_owner_surface_revalidates():
     mutating = {"POST", "PUT", "PATCH", "DELETE"}
 
     unguarded = []
-    for route in agent_jobs_router.router.routes:
-        methods = getattr(route, "methods", set()) or set()
-        if not (methods & mutating):
-            continue
-        if "require_agent_owner" in _gates(route):
-            continue
-        # Worker routes verify their capability token in the handler rather
-        # than through a dependency, so the dependency tree cannot see it.
-        try:
-            body = inspect.getsource(route.endpoint)
-        except (OSError, TypeError):  # pragma: no cover - defensive
-            body = ""
-        if any(gate in body for gate in MACHINE_GATES):
-            continue
-        unguarded.append(f"{sorted(methods)} {route.path}")
+    for router in SESSION_ROUTERS:
+        for route in router.routes:
+            methods = getattr(route, "methods", set()) or set()
+            if not (methods & mutating):
+                continue
+            if _gates(route) & REVALIDATING_GATES:
+                continue
+            # Worker routes verify their capability token in the handler rather
+            # than through a dependency, so the dependency tree cannot see it.
+            try:
+                body = inspect.getsource(route.endpoint)
+            except (OSError, TypeError):  # pragma: no cover - defensive
+                body = ""
+            if any(gate in body for gate in MACHINE_GATES):
+                continue
+            unguarded.append(f"{sorted(methods)} {route.path}")
 
     assert not unguarded, (
         "these mutating routes authenticate nothing that can go stale — wire "
-        f"them to require_agent_owner or to a machine credential: {unguarded}"
+        f"them to a revalidating gate or to a machine credential: {unguarded}"
     )
+
+
+# ── The admin door, which is two doors ────────────────────────────────────
+
+
+def _admin_app(gateway: _StatusGateway) -> FastAPI:
+    """A read and a write behind the admin gate, with no identity override.
+
+    The session is real here — `verify_admin_access` verifies it itself, so
+    stubbing it out would test nothing.
+    """
+    from cloud_agent.api.deps import verify_admin_access
+
+    app = FastAPI()
+
+    @app.get("/admin/probe")
+    async def read(actor: str = Depends(verify_admin_access)):
+        return {"actor": actor}
+
+    @app.post("/admin/probe")
+    async def write(actor: str = Depends(verify_admin_access)):
+        return {"actor": actor}
+
+    app.dependency_overrides[get_gateway_client] = lambda: gateway
+    return app
+
+
+def _admin_session(role: str = "admin") -> str:
+    """A session this service would have minted at sign-in."""
+    from cloud_agent import identity
+
+    return identity.mint_session(user_id=_OWNER, email=None, role=role)
+
+
+@pytest_asyncio.fixture()
+def admin_env(monkeypatch):
+    from cloud_agent import identity
+    from cloud_agent.api.deps import ENV_ADMIN_TOKEN
+
+    monkeypatch.setenv(identity.ENV_SESSION_SECRET, "admin-test-secret-long-enough-for-hs256")
+    monkeypatch.setenv(ENV_ADMIN_TOKEN, "the-machine-token")
+    return None
+
+
+async def test_a_demoted_admin_cannot_change_anything(admin_env):
+    """The hole one door over from the owner surface.
+
+    `require_agent_owner` re-asked; this gate did not, so an administrator the
+    gateway had demoted kept the power to drain hosts and pin runtime versions
+    until the session expired.
+    """
+    from cloud_agent import identity
+
+    gateway = _StatusGateway({"exists": True, "active": True, "role": "internal"})
+    transport = ASGITransport(app=_admin_app(gateway))
+    async with AsyncClient(transport=transport, base_url="https://test") as client:
+        client.cookies.set(identity.SESSION_COOKIE, _admin_session())
+        response = await client.post("/admin/probe")
+
+    assert response.status_code == 403
+    assert gateway.asked == [_OWNER]
+
+
+async def test_a_suspended_admin_cannot_change_anything(admin_env):
+    """Active is checked as well as the role — a banned admin is not an admin."""
+    from cloud_agent import identity
+
+    gateway = _StatusGateway({"exists": True, "active": False, "role": "admin"})
+    transport = ASGITransport(app=_admin_app(gateway))
+    async with AsyncClient(transport=transport, base_url="https://test") as client:
+        client.cookies.set(identity.SESSION_COOKIE, _admin_session())
+        response = await client.post("/admin/probe")
+
+    assert response.status_code == 403
+
+
+async def test_an_admin_the_gateway_still_vouches_for_may_write(admin_env):
+    """And the ordinary case keeps working, which is the other half."""
+    from cloud_agent import identity
+
+    gateway = _StatusGateway({"exists": True, "active": True, "role": "admin"})
+    transport = ASGITransport(app=_admin_app(gateway))
+    async with AsyncClient(transport=transport, base_url="https://test") as client:
+        client.cookies.set(identity.SESSION_COOKIE, _admin_session())
+        response = await client.post("/admin/probe")
+
+    assert response.status_code == 200
+    assert response.json()["actor"] == f"admin:{_OWNER}"
+
+
+async def test_an_admin_read_is_not_re_asked(admin_env):
+    """Same trade as the owner surface: an outage must not close every page."""
+    from cloud_agent import identity
+
+    gateway = _StatusGateway({"exists": True, "active": False, "role": "free"})
+    transport = ASGITransport(app=_admin_app(gateway))
+    async with AsyncClient(transport=transport, base_url="https://test") as client:
+        client.cookies.set(identity.SESSION_COOKIE, _admin_session())
+        response = await client.get("/admin/probe")
+
+    assert response.status_code == 200
+    assert gateway.asked == []
+
+
+async def test_the_machine_token_is_untouched_by_any_of_this(admin_env):
+    """`ADMIN_TOKEN` has no user behind it to go stale, and no gateway to ask.
+
+    It must keep working when the gateway is unreachable — a deployment that
+    authenticates machines only has no session secret and no gateway at all,
+    and this door is what it uses.
+    """
+    gateway = _StatusGateway(error=True)
+    transport = ASGITransport(app=_admin_app(gateway))
+    async with AsyncClient(transport=transport, base_url="https://test") as client:
+        response = await client.post(
+            "/admin/probe", headers={"Authorization": "Bearer the-machine-token"}
+        )
+
+    assert response.status_code == 200
+    assert response.json()["actor"] == "admin-token"
+    assert gateway.asked == [], "the machine door must not depend on the gateway"

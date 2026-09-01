@@ -288,11 +288,6 @@ async def authenticate_agent_owner(
     return await get_current_user(request=request, authorization=authorization)
 
 
-#: Methods that only read. Everything else is a privileged action and
-#: revalidates the account against the gateway before it is allowed to happen.
-_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
-
-
 async def require_agent_owner(
     request: Request,
     user: dict[str, Any] = Depends(authenticate_agent_owner),
@@ -335,12 +330,12 @@ async def require_agent_owner(
         HTTPException: 403 if the account may no longer use this surface, 503
             if the gateway could not be asked.
     """
-    from cloud_agent.api.deps import has_role, may_sign_in
+    from cloud_agent.api.deps import SAFE_METHODS, has_role, may_sign_in
 
     if not has_role(user.get("role", "free"), "internal"):
         raise HTTPException(status_code=403, detail="Agent access requires role 'internal'.")
 
-    if request.method.upper() in _SAFE_METHODS:
+    if request.method.upper() in SAFE_METHODS:
         return user
 
     try:

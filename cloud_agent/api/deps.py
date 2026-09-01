@@ -49,7 +49,7 @@ import os
 from typing import TYPE_CHECKING, Any
 
 import jwt
-from fastapi import Header, HTTPException, Request
+from fastapi import Depends, Header, HTTPException, Request
 
 from cloud_agent import identity
 
@@ -140,6 +140,43 @@ ROLE_RANK: dict[str, int] = {"free": 0, "pro": 1, "internal": 2, "admin": 3}
 #: allowlist is the only version of this check that fails closed when the
 #: gateway grows a new status nobody here has heard of.
 ACTIVE_STATUSES = frozenset({"active", "ok", "enabled"})
+
+
+#: Methods that only read. Everything else is a privileged action, and
+#: revalidates the account that is about to perform it.
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+async def assert_still_admin(gateway: Any, user_id: str) -> None:
+    """Refuse a session admin the gateway no longer vouches for.
+
+    Args:
+        gateway: The gateway's contracts.
+        user_id: The account the session names.
+
+    Raises:
+        HTTPException: 403 if the account is inactive or no longer an admin,
+            503 if the gateway could not be asked — fail closed, because an
+            authority that cannot be reached has not granted anything.
+    """
+    from cloud_agent.gateway import GatewayError
+    from cloud_agent.logging_utils import get_logger
+
+    try:
+        status = await gateway.user_status(user_id)
+    except GatewayError as exc:
+        get_logger(__name__).warning(
+            "agent_admin_revalidation_unavailable",
+            exc_info=True,
+            extra={"event": "agent_admin_revalidation_unavailable", "user_id": user_id},
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Cannot confirm this account with the gateway; try again shortly.",
+        ) from exc
+
+    if not may_sign_in(status) or str(status.get("role") or "") != "admin":
+        raise HTTPException(status_code=403, detail="This account is not an administrator.")
 
 
 def may_sign_in(status: dict[str, Any]) -> bool:
@@ -327,6 +364,7 @@ async def get_current_user(
 async def verify_admin_access(
     request: Request,
     authorization: str | None = Header(None),
+    gateway: Any = Depends(get_gateway_client),
 ) -> str:
     """Authenticate an admin caller, returning an identifier for the audit log.
 
@@ -339,6 +377,19 @@ async def verify_admin_access(
     - A session whose role claim is ``admin``. That is how the dashboard
       authenticates, and the role comes from the gateway's own answer at login
       rather than from anything the browser can edit.
+
+    **A session admin is re-checked at the gateway before it may change
+    anything**, the same way ``require_agent_owner`` re-checks an owner. The
+    role in the session was true when it was minted and says nothing about a
+    demotion since; without this, an administrator the gateway suspends or
+    downgrades keeps the power to drain hosts and pin runtime versions for the
+    rest of the session's life. The ``ADMIN_TOKEN`` door is deliberately left
+    alone: it is a machine credential with no user behind it to go stale, and
+    it must keep working on a deployment that has no gateway configured.
+
+    Reads are not re-checked, for the reason they are not on the owner surface:
+    an outage would otherwise close every admin page, and the session's own
+    expiry already bounds how stale a read can be.
 
     **A missing ``AGENT_SESSION_SECRET`` is answered the same way here as at
     :func:`get_current_user`: 503.** It used to be a 401, because the broader
@@ -374,7 +425,10 @@ async def verify_admin_access(
         except identity.IdentityError:
             claims = None
         if claims is not None and str(claims.get("role") or "") == "admin":
-            return f"admin:{claims.get('sub')}"
+            user_id = str(claims.get("sub") or "")
+            if request.method.upper() not in SAFE_METHODS:
+                await assert_still_admin(gateway, user_id)
+            return f"admin:{user_id}"
 
     if not presented and token is None:
         raise HTTPException(
