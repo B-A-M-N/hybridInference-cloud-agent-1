@@ -50,7 +50,8 @@ from cloud_agent.api.deps import (
     looks_like_agent_token,
     verify_admin_access,
 )
-from cloud_agent.broker_routing import broker_for_attempt, broker_for_job
+from cloud_agent.api.hosts import RESIDENCY_TTL_S, _mint_residency_grant
+from cloud_agent.broker_routing import broker_for_attempt, broker_for_job, hydrate_shared_broker
 from cloud_agent.checkpoints import (
     CHECKPOINT_KIND,
     MAX_CHECKPOINT_CONTENT_BYTES,
@@ -65,7 +66,9 @@ from cloud_agent.entitlement import (
     require_entitled_repo,
 )
 from cloud_agent.execution_profiles import (
+    ENV_SHARED_LIVE_SANDBOX,
     RESERVED_EXECUTION_METADATA_KEYS,
+    SHARED_SANDBOX_CAPABILITY,
     default_execution_profile,
 )
 from cloud_agent.gateway import GatewayError
@@ -111,6 +114,7 @@ from cloud_agent.schemas import (
     AttemptResources,
     GitHubConnectionResponse,
     GitHubConnectRequest,
+    HostResidencyEstablishResponse,
     McpIntegrationResponse,
     McpServerSummary,
     OAuthConnectRequest,
@@ -131,7 +135,15 @@ from cloud_agent.schemas import (
     WorkerHeartbeatRequest,
     WorkerHeartbeatResponse,
     WorkerResourcesRequest,
+    WorkerSandboxAbandonRequest,
+    WorkerSandboxAdmissionRequest,
+    WorkerSandboxProcessRequest,
+    WorkerSandboxReserveRequest,
+    WorkerSandboxResidencyRequest,
+    WorkerSandboxRunningRequest,
+    WorkerSandboxSettleRequest,
     WorkerTerminalSuspendRequest,
+    WorkerThreadSandbox,
 )
 from cloud_agent.source_control import (
     OAuthStateError,
@@ -192,6 +204,11 @@ logger = get_logger(__name__)
 #: no address, and a runtime asked for servers anyway refuses rather than
 #: resolving them against the inference gateway, which does not answer for MCP.
 ENV_SANDBOX_MCP_URL = "AGENT_SANDBOX_MCP_URL"
+# The host fork request is bounded to 180s. Keep one short recovery margin so
+# a second API worker cannot take over while the first is still recording its
+# receipt; a crashed worker becomes retryable without waiting for the 15-minute
+# stalled-saga reconciler.
+SESSION_FORK_COORDINATOR_LEASE_S = 210.0
 
 
 router = APIRouter(prefix="/v1/agent")
@@ -393,6 +410,18 @@ def _job_response(
     base_ref = metadata.pop(BASE_REF_METADATA_KEY, None)
     if not isinstance(base_ref, str):
         base_ref = None
+    sandbox = job.get("thread_sandbox") or {}
+    native_fork_available = bool(
+        (not sandbox and job.get("state") in TERMINAL_STATES)
+        or (
+            sandbox.get("shared_live") is True
+            and sandbox.get("native_fork_capable") is True
+            and sandbox.get("native_state") == "ready"
+            and sandbox.get("fork_operation_id") is None
+            and sandbox.get("last_settled_job_id") == job.get("id")
+            and job.get("state") in TERMINAL_STATES
+        )
+    )
     return AgentJobResponse(
         id=job["id"],
         thread_id=job.get("thread_id"),
@@ -406,7 +435,9 @@ def _job_response(
         reasoning_effort=job.get("reasoning_effort"),
         base_ref=base_ref,
         base_sha=job["base_sha"],
-        output_branch=branch_name_for(job.get("thread_id") or job["id"]),
+        output_branch=branch_name_for(
+            sandbox.get("origin_thread_id") or job.get("thread_id") or job["id"]
+        ),
         state=job["state"],
         cancel_requested=job["cancel_requested"],
         current_attempt_id=job["current_attempt_id"],
@@ -426,6 +457,15 @@ def _job_response(
         setup_egress_tier=setup_tier,
         agent_egress_tier=agent_tier,
         continuity_mode=(telemetry or {}).get("continuity_mode"),
+        context_status=(telemetry or {}).get("context_status"),
+        resident_state=sandbox.get("resident_state"),
+        sandbox_id=sandbox.get("sandbox_id"),
+        workspace_shared=bool(sandbox.get("shared_live")),
+        native_state=sandbox.get("native_state"),
+        fork_anchor_job_id=sandbox.get("fork_anchor_job_id"),
+        native_fork_available=native_fork_available,
+        workspace_publication_state=sandbox.get("workspace_publication_state"),
+        workspace_epoch=sandbox.get("workspace_epoch"),
         duration_ms=_attempt_duration_ms(telemetry),
         resources=_attempt_resources(telemetry),
     )
@@ -515,7 +555,12 @@ async def get_agent_config(
         # the environment: an App the platform can mint tokens from, and at
         # least one repository this user may work on. Either alone leaves a
         # composer that cannot produce a runnable job.
-        github_connected=bool(app_credentials is not None and repos),
+        # The historical field name is narrower than its meaning in the UI:
+        # it gates whether the composer can create a runnable job. An
+        # operator-allowlisted public repository is runnable without a GitHub
+        # App (the runner clones it anonymously), so requiring App credentials
+        # here made the API accept the job while the browser disabled the form.
+        github_connected=bool(repos),
         # OAuth must start on the authenticated integrations page so the
         # server can issue state bound to this user. Never expose the old raw
         # operator URL here: it had no CSRF binding.
@@ -1329,6 +1374,17 @@ async def _create_job_as(
         metadata[BASE_REF_METADATA_KEY] = body.base_ref
     for key, value in (reserved_metadata or {}).items():
         metadata[key] = value
+    # Shared-live is a host protocol, not merely a runner-side preference. A
+    # new chat in this mode must only be claimed by a host that proved the
+    # image, CLI pins, broker, and capacity needed to honor it. Follow-ups
+    # inherit this server-owned requirement from their parent.
+    if os.environ.get(ENV_SHARED_LIVE_SANDBOX, "") not in ("", "0"):
+        requirements = metadata.get("requires")
+        if not isinstance(requirements, list):
+            requirements = []
+        if SHARED_SANDBOX_CAPABILITY not in requirements:
+            requirements.append(SHARED_SANDBOX_CAPABILITY)
+        metadata["requires"] = requirements
     mcp_servers = await _resolve_mcp_servers(
         body.mcp_servers, runtime=body.runtime, store=job_store, user_id=user["user_id"]
     )
@@ -1558,6 +1614,22 @@ async def unpin_agent_thread(
     return await _set_agent_thread_pinned(job_id=job_id, pinned=False, user=user, store=store)
 
 
+def _sandbox_context_lost_error() -> HTTPException:
+    """Return the stable owner-facing error for an unrunnable retained chat."""
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": {
+                "type": "sandbox_context_lost",
+                "message": (
+                    "This chat's retained sandbox has an indeterminate or lost "
+                    "context and cannot safely accept another message."
+                ),
+            }
+        },
+    )
+
+
 @router.post("/jobs/{job_id}/follow-ups", response_model=AgentJobResponse, status_code=201)
 async def create_agent_follow_up(
     job_id: str,
@@ -1570,6 +1642,12 @@ async def create_agent_follow_up(
     """Append a turn to a task thread and queue its next isolated run."""
     job_store = _require_store(store)
     parent = await _owned_job(job_store, job_id, user)
+    retained = parent.get("thread_sandbox")
+    if isinstance(retained, dict) and (
+        retained.get("context_status") == "lost"
+        or retained.get("state") in {"stopped_dirty", "lost"}
+    ):
+        raise _sandbox_context_lost_error()
     # The harness is fixed per thread (design D2): continuity is the harness
     # session, and no other harness can continue it. The field survives as an
     # explicit no-op so existing callers that echo the thread's runtime keep
@@ -1662,6 +1740,11 @@ async def create_agent_follow_up(
             status_code=404,
             detail={"error": {"type": "not_found", "message": f"No such agent job: {job_id}"}},
         )
+    if job.get("error") == "sandbox_context_lost":
+        # The durable store repeats the check under its thread/sandbox locks.
+        # It can legitimately disagree with the advisory read above when the
+        # active attempt becomes indeterminate during entitlement/tool checks.
+        raise _sandbox_context_lost_error()
     # Jobs published before thread support have no recorded commit SHA. Their
     # migrated thread id preserves the old branch name, so resolve that branch
     # once and pin the new turn to it before any worker can claim the turn.
@@ -1702,16 +1785,12 @@ async def create_agent_follow_up(
 @router.post("/jobs/{job_id}/fork", response_model=AgentJobResponse, status_code=201)
 async def fork_agent_job(
     job_id: str,
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key", max_length=256),
     user: dict[str, Any] = Depends(require_agent_owner),
     store: AgentJobStore | None = Depends(get_agent_job_store),
+    grants: Any = Depends(get_grant_client),
 ) -> AgentJobResponse:
-    """Copy the conversation up to this settled turn into a new thread.
-
-    The fork is a duplicate of durable history only: nothing is queued and
-    nothing is published until the owner sends the next turn there, and a
-    still-running turn cannot be an anchor — its output is not history yet.
-    Returns the copied anchor turn, which is where the caller navigates.
-    """
+    """Fork one settled native session into the same shared Docker workspace."""
     job_store = _require_store(store)
     job = await _owned_job(job_store, job_id, user)
     not_settled = HTTPException(
@@ -1719,16 +1798,336 @@ async def fork_agent_job(
         detail={
             "error": {
                 "type": "not_settled",
-                "message": "This turn is still active; fork an earlier turn or stop the run first.",
+                "message": "This turn is still active; wait for it to settle before forking it.",
             }
         },
     )
     if job["state"] not in TERMINAL_STATES:
         raise not_settled
-    forked = await job_store.fork_thread(source_job_id=job_id, user_id=user["user_id"])
+    if job.get("thread_sandbox") is None:
+        forked = await job_store.fork_thread(source_job_id=job_id, user_id=user["user_id"])
+        if forked is None:
+            # The settled-check above raced a concurrent transition; same answer.
+            raise not_settled
+        logger.info(
+            "agent_job_forked",
+            extra={
+                "event": "agent_job_forked",
+                "job_id": forked["id"],
+                "thread_id": forked.get("thread_id"),
+                "source_job_id": job_id,
+                "sandbox_clone": False,
+            },
+        )
+        return _job_response(forked)
+
+    sandbox = job.get("thread_sandbox") or {}
+    if sandbox.get("shared_live") is not True:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": {
+                    "type": "native_fork_unavailable",
+                    "message": (
+                        "This historical retained chat predates shared native-session "
+                        "forks. Start a new chat to use same-workspace Fork."
+                    ),
+                }
+            },
+        )
+
+    operation = await job_store.prepare_session_fork(
+        source_job_id=job_id,
+        user_id=user["user_id"],
+        idempotency_key=idempotency_key or f"generated:{secrets.token_urlsafe(24)}",
+    )
+    if operation is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": {"type": "not_found", "message": f"No such agent job: {job_id}"}},
+        )
+    error = operation.get("error")
+    if error:
+        error_contract = {
+            "idempotency_conflict": (
+                "idempotency_conflict",
+                "This Idempotency-Key was already used for a different fork source.",
+            ),
+            "not_settled": (
+                "not_settled",
+                "This turn is still active; stop the run before forking it.",
+            ),
+            "not_latest_settled": (
+                "historical_snapshot_unavailable",
+                "Native Fork is available only at this chat's latest settled turn.",
+            ),
+            "not_shared_live": (
+                "native_fork_unavailable",
+                "This chat does not use a shared-native sandbox.",
+            ),
+            "sandbox_not_ready": (
+                "native_context_unavailable",
+                "This chat's retained native context is not safe to fork.",
+            ),
+            "source_busy": (
+                "sandbox_busy",
+                "This chat is currently running a turn; retry after it settles.",
+            ),
+            "fork_in_progress": (
+                "fork_in_progress",
+                "Another native fork is already being prepared from this chat.",
+            ),
+            "resident_capacity_exhausted": (
+                "resident_capacity_exhausted",
+                "This shared sandbox has no free resident Agent CLI slot.",
+            ),
+            "native_context_unavailable": (
+                "native_context_unavailable",
+                "This chat has no settled native session to fork.",
+            ),
+            "runtime_mismatch": (
+                "native_fork_unavailable",
+                "The retained runtime no longer matches this chat.",
+            ),
+        }
+        error_type, message = error_contract.get(
+            str(error),
+            ("native_fork_unavailable", "The retained native session cannot be forked now."),
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={"error": {"type": error_type, "message": message}},
+        )
+
+    operation_id = str(operation["id"])
+
+    if operation["state"] == "failed":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": {
+                    "type": "native_fork_failed",
+                    "message": str(
+                        operation.get("last_error") or "Native Fork could not complete."
+                    ),
+                }
+            },
+        )
+
+    async def release_failed_fork_residencies(rows: dict[str, Any]) -> None:
+        for role in ("source", "target"):
+            residency = rows[role]
+            grant_id = await job_store.release_residency(
+                thread_id=str(residency["thread_id"]),
+                generation=int(residency["generation"]),
+                host=str(operation["host"]),
+            )
+            if grant_id and grants is not None:
+                with contextlib.suppress(Exception):
+                    await grants.revoke(grant_id)
+
+    if operation["state"] == "preparing":
+        # Resolve the host only for the state that still needs a native
+        # mutation.  READY and MATERIALIZED are durable control-plane states:
+        # a retry after a lost HTTP response must return/finalize the same
+        # child even when the retaining host has since become unreachable.
+        broker = await broker_for_job(job_store, job_id)
+        if broker is None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": {
+                        "type": "sandbox_host_unavailable",
+                        "message": (
+                            "The host retaining this chat is not reachable for native Fork."
+                        ),
+                    }
+                },
+            )
+        # Validate every immutable host input before minting or rotating either
+        # residency. A malformed manifest is a control-plane defect, not a
+        # reason to leak two renewable grants into an uncallable saga.
+        source_job = operation.get("source_job") or {}
+        source_thread_id = str(operation["source_thread_id"])
+        members: list[dict[str, Any]] = []
+        for member in operation.get("group_members") or []:
+            manifest = {
+                key: member.get(key)
+                for key in (
+                    "thread_id",
+                    "native_session_id",
+                    "context_status",
+                    "activation_generation",
+                    "process_generation",
+                    "residency_generation",
+                    "resident_state",
+                    "resident_slot_id",
+                    "last_settled_job_id",
+                )
+            }
+            members.append(manifest)
+        source_member = next(
+            (member for member in members if member["thread_id"] == source_thread_id),
+            None,
+        )
+        if source_member is None or operation.get("resident_slot_id") is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": {
+                        "type": "native_context_unavailable",
+                        "message": "The shared sandbox manifest is incomplete.",
+                    }
+                },
+            )
+        launch_common = {
+            "runtime_id": str(operation["runtime_id"]),
+            "runtime_version": operation.get("runtime_version"),
+            "model": str(source_job.get("model") or ""),
+            "reasoning_effort": source_job.get("reasoning_effort"),
+            # Replaced by the broker's host-local, sandbox-reachable relay.
+            "gateway_base_url": "",
+            # Fork-only does not need a tool credential. A later turn whose
+            # MCP set is non-empty performs a member-only native restart.
+            "mcp_server_ids": [],
+            "mcp_base_url": "",
+            "mcp_credential": "",
+        }
+        coordinator_token = secrets.token_urlsafe(32)
+        claimed = await job_store.claim_session_fork_materialization(
+            operation_id=operation_id,
+            coordinator_token=coordinator_token,
+            lease_seconds=SESSION_FORK_COORDINATOR_LEASE_S,
+        )
+        if not claimed:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": {
+                        "type": "fork_in_progress",
+                        "message": "This native Fork is already being materialized; retry shortly.",
+                    }
+                },
+                headers={"Retry-After": "2"},
+            )
+        residencies = await job_store.establish_session_fork_residencies(
+            operation_id=operation_id,
+            coordinator_token=coordinator_token,
+            ttl_seconds=RESIDENCY_TTL_S,
+        )
+        if residencies is None:
+            await job_store.release_session_fork_materialization(
+                operation_id=operation_id,
+                coordinator_token=coordinator_token,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": {
+                        "type": "fork_fence_changed",
+                        "message": "The source session changed before Fork could start.",
+                    }
+                },
+            )
+        for role in ("source", "target"):
+            previous_grant = residencies[role].get("previous_grant_id")
+            if previous_grant and grants is not None:
+                with contextlib.suppress(Exception):
+                    await grants.revoke(previous_grant)
+        source_credential = await _mint_residency_grant(
+            job_store,
+            grants,
+            row=residencies["source"],
+        )
+        target_credential = await _mint_residency_grant(
+            job_store,
+            grants,
+            row=residencies["target"],
+        )
+        if not source_credential or not target_credential:
+            await release_failed_fork_residencies(residencies)
+            await job_store.release_session_fork_materialization(
+                operation_id=operation_id,
+                coordinator_token=coordinator_token,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": {
+                        "type": "residency_grant_unavailable",
+                        "message": "Fork could not obtain two independent resident credentials.",
+                    }
+                },
+            )
+
+        source_member["residency_generation"] = int(residencies["source"]["generation"])
+        source_member["resident_state"] = "restarting"
+        try:
+            receipt = await broker.fork_shared_session(
+                source_thread_id,
+                sandbox_id=str(operation["sandbox_id"]),
+                generation=int(operation["sandbox_generation"]),
+                origin_thread_id=str(operation["origin_thread_id"]),
+                runtime_id=str(operation["runtime_id"]),
+                runtime_version=operation.get("runtime_version"),
+                sandbox_image_digest=operation.get("sandbox_image_digest"),
+                expected_container_id=str(operation["container_id"]),
+                resident_slot_capacity=int(operation["resident_slot_capacity"]),
+                memory_limit=str(operation["memory_limit"]),
+                cpu_limit=str(operation["cpu_limit"]),
+                stop_timeout_s=int(operation["stop_timeout_seconds"]),
+                members=members,
+                operation_id=operation_id,
+                source_native_session_id=str(operation["source_native_session_id"]),
+                target_thread_id=str(operation["target_thread_id"]),
+                target_slot_id=int(operation["target_resident_slot_id"]),
+                source_launch={
+                    **launch_common,
+                    "native_session_id": str(operation["source_native_session_id"]),
+                    "credential": source_credential,
+                    "slot_id": int(operation["resident_slot_id"]),
+                    "residency_generation": int(residencies["source"]["generation"]),
+                },
+                target_launch={
+                    **launch_common,
+                    "native_session_id": None,
+                    "credential": target_credential,
+                    "slot_id": int(operation["target_resident_slot_id"]),
+                    "residency_generation": int(residencies["target"]["generation"]),
+                },
+            )
+        except WorkspaceBrokerError as exc:
+            # PREPARING is intentionally retained: a retry with the same key
+            # recovers the in-container journal or safely resumes before the
+            # native mutation was reached.
+            raise _workspace_broker_http_error(exc) from exc
+        materialized = await job_store.record_session_fork_materialized(
+            operation_id=operation_id,
+            coordinator_token=coordinator_token,
+            receipt=receipt,
+        )
+        if materialized is None:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": {
+                        "type": "invalid_native_fork_receipt",
+                        "message": "The sandbox host returned a mismatched native Fork receipt.",
+                    }
+                },
+            )
+
+    forked = await job_store.finalize_session_fork(operation_id=operation_id)
     if forked is None:
-        # The settled-check above raced a concurrent transition; same answer.
-        raise not_settled
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": {
+                    "type": "native_fork_fence_changed",
+                    "message": "The source chat changed before native Fork finalization.",
+                }
+            },
+        )
     logger.info(
         "agent_job_forked",
         extra={
@@ -1736,6 +2135,9 @@ async def fork_agent_job(
             "job_id": forked["id"],
             "thread_id": forked.get("thread_id"),
             "source_job_id": job_id,
+            "sandbox_clone": False,
+            "workspace_shared": True,
+            "fork_operation_id": operation_id,
         },
     )
     return _job_response(forked)
@@ -1884,7 +2286,9 @@ async def get_agent_job_artifact(
 
 
 def _workspace_id(job: dict[str, Any]) -> str:
-    """Return the durable directory identity for this job's worktree."""
+    """Address either the thread container or the legacy job worktree."""
+    if job.get("thread_sandbox") is not None and job.get("thread_id"):
+        return str(job["thread_id"])
     return str(job["id"])
 
 
@@ -1895,6 +2299,18 @@ def _workspace_broker_http_error(exc: WorkspaceBrokerError) -> HTTPException:
         status_code=status,
         detail={"error": {"type": "workspace_unavailable", "message": exc.message}},
     )
+
+
+async def _workspace_broker_for_job(
+    store: AgentJobStore,
+    job: dict[str, Any],
+) -> WorkspaceBrokerClient | None:
+    """Resolve the owning broker and restore shared aliases before use."""
+    broker = await broker_for_job(store, job["id"])
+    try:
+        return await hydrate_shared_broker(job, broker)
+    except WorkspaceBrokerError as exc:
+        raise _workspace_broker_http_error(exc) from exc
 
 
 def _terminal_broker_http_error(exc: WorkspaceBrokerError) -> HTTPException:
@@ -1910,6 +2326,27 @@ def _terminal_broker_http_error(exc: WorkspaceBrokerError) -> HTTPException:
             },
         )
     return _workspace_broker_http_error(exc)
+
+
+def _workspace_not_ready() -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": {
+                "type": "workspace_not_ready",
+                "message": "The workspace is temporarily locked while the agent prepares or saves it.",
+            }
+        },
+    )
+
+
+async def _require_mutable_workspace_ready(*, job: dict[str, Any], store: AgentJobStore) -> None:
+    """Fence retained mutations through the durable thread-wide barrier."""
+    if job.get("thread_sandbox") is None:
+        return
+    thread_id = job.get("thread_id")
+    if not thread_id or not await store.thread_workspace_ready(thread_id=str(thread_id)):
+        raise _workspace_not_ready()
 
 
 async def _require_workspace_entitlement(
@@ -1954,21 +2391,18 @@ async def _terminal_owner_workspace(
     """
     job_store = _require_store(store)
     job = await _owned_job(job_store, job_id, user)
-    if require_ready and job["state"] not in {*TERMINAL_STATES, PUBLISHING}:
-        eligible = job["state"] == RUNNING and job["current_attempt_id"] is not None
-        ready = eligible and await job_store.terminal_workspace_ready(
-            attempt_id=job["current_attempt_id"]
-        )
-        if not ready:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": {
-                        "type": "workspace_not_ready",
-                        "message": "The terminal workspace is still being prepared.",
-                    }
-                },
+    if require_ready:
+        if job.get("thread_sandbox") is not None:
+            ready = await job_store.thread_workspace_ready(thread_id=str(job["thread_id"]))
+        elif job["state"] in {*TERMINAL_STATES, PUBLISHING}:
+            ready = True
+        else:
+            eligible = job["state"] == RUNNING and job["current_attempt_id"] is not None
+            ready = eligible and await job_store.terminal_workspace_ready(
+                attempt_id=job["current_attempt_id"]
             )
+        if not ready:
+            raise _workspace_not_ready()
     if recheck_entitlement:
         await _require_workspace_entitlement(
             job=job,
@@ -1976,7 +2410,7 @@ async def _terminal_owner_workspace(
             store=job_store,
             app_credentials=app_credentials,
         )
-    broker = await broker_for_attempt(job_store, job.get("current_attempt_id"))
+    broker = await _workspace_broker_for_job(job_store, job)
     if broker is None:
         raise HTTPException(
             status_code=409,
@@ -2038,7 +2472,7 @@ async def get_agent_job_workspace_file(
     # New self-hosted runners retain one real worktree per job. Prefer it
     # before consulting GitHub/snapshots; only a pre-broker job falls through
     # to the archived view.
-    broker = await broker_for_attempt(job_store, job.get("current_attempt_id"))
+    broker = await _workspace_broker_for_job(job_store, job)
     if broker is not None:
         try:
             return AgentWorkspaceResponse(**(await broker.files(_workspace_id(job), safe_path)))
@@ -2184,7 +2618,8 @@ async def write_agent_job_workspace_file(
     await _require_workspace_entitlement(
         job=job, user=user, store=job_store, app_credentials=app_credentials
     )
-    broker = await broker_for_attempt(job_store, job.get("current_attempt_id"))
+    await _require_mutable_workspace_ready(job=job, store=job_store)
+    broker = await _workspace_broker_for_job(job_store, job)
     if broker is None:
         raise HTTPException(
             status_code=409,
@@ -2227,7 +2662,8 @@ async def run_agent_job_terminal_command(
     await _require_workspace_entitlement(
         job=job, user=user, store=job_store, app_credentials=app_credentials
     )
-    broker = await broker_for_attempt(job_store, job.get("current_attempt_id"))
+    await _require_mutable_workspace_ready(job=job, store=job_store)
+    broker = await _workspace_broker_for_job(job_store, job)
     if broker is None:
         raise HTTPException(status_code=409, detail="This deployment has no live workspace broker.")
     try:
@@ -2389,6 +2825,7 @@ async def resize_agent_job_terminal(
         user=user,
         store=store,
         app_credentials=app_credentials,
+        require_ready=True,
         recheck_entitlement=False,
     )
     try:
@@ -2443,7 +2880,7 @@ async def get_agent_job_git_workspace(
     await _require_workspace_entitlement(
         job=job, user=user, store=job_store, app_credentials=app_credentials
     )
-    broker = await broker_for_attempt(job_store, job.get("current_attempt_id"))
+    broker = await _workspace_broker_for_job(job_store, job)
     if broker is None:
         return AgentGitWorkspaceResponse(available=False)
     try:
@@ -2704,7 +3141,7 @@ def _match_job(claims: dict[str, Any], job_id: str) -> None:
 async def _restore_terminal_suspension(
     broker: WorkspaceBrokerClient | None,
     *,
-    job_id: str,
+    workspace_id: str,
     lease_generation: int,
 ) -> None:
     """Best-effort compensation after a worker fails to finalize a resume."""
@@ -2712,7 +3149,7 @@ async def _restore_terminal_suspension(
         return
     try:
         await broker.suspend_terminals(
-            job_id,
+            workspace_id,
             lease_generation=lease_generation,
         )
     except WorkspaceBrokerError:
@@ -2721,7 +3158,7 @@ async def _restore_terminal_suspension(
             exc_info=True,
             extra={
                 "event": "agent_terminal_resume_compensation_failed",
-                "job_id": job_id,
+                "workspace_id": workspace_id,
                 "lease_generation": lease_generation,
             },
         )
@@ -3073,6 +3510,7 @@ async def worker_claim(
         execution_profile=claim.get("execution_profile", "trusted-v1"),
         reasoning_effort=claim.get("reasoning_effort"),
         runtime_version=claim.get("runtime_version"),
+        thread_sandbox=claim.get("thread_sandbox"),
         worker_token=token,
         sandbox_token=sandbox_token,
         mcp_token=mcp_token,
@@ -3182,10 +3620,288 @@ async def worker_report_continuity(
         attempt_id=claims["attempt_id"],
         lease_generation=claims["lease_generation"],
         mode=body.mode,
+        context_status=body.context_status,
     )
     if not recorded:
         raise _lease_lost()
     return WorkerAckResponse(ok=True)
+
+
+async def _worker_thread_id(job_store: AgentJobStore, job_id: str) -> str:
+    """Resolve the claimed job's thread for restartable-sandbox writes."""
+    job = await job_store.get_job(job_id)
+    thread_id = None if job is None else job.get("thread_id")
+    if not thread_id:
+        raise HTTPException(status_code=409, detail="this job has no chat thread")
+    return str(thread_id)
+
+
+@router.post(
+    "/worker/jobs/{job_id}/sandbox/reserve",
+    response_model=WorkerThreadSandbox,
+)
+async def worker_reserve_thread_sandbox(
+    job_id: str,
+    body: WorkerSandboxReserveRequest,
+    authorization: str | None = Header(None),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+) -> WorkerThreadSandbox:
+    """Reserve immutable one-chat/one-container identity before Docker create."""
+    job_store = _require_store(store)
+    claims = _worker_claims(authorization)
+    _match_job(claims, job_id)
+    thread_id = await _worker_thread_id(job_store, job_id)
+    try:
+        row = await job_store.reserve_thread_sandbox(
+            thread_id=thread_id,
+            attempt_id=claims["attempt_id"],
+            lease_generation=claims["lease_generation"],
+            host=body.host,
+            sandbox_id=body.sandbox_id,
+            container_name=body.container_name,
+            runtime_id=body.runtime_id,
+            runtime_version=body.runtime_version,
+            sandbox_image_digest=body.sandbox_image_digest,
+            execution_profile=body.execution_profile.value,
+            shared_live=body.shared_live,
+            resident_slot_capacity=body.resident_slot_capacity,
+            memory_limit=body.memory_limit,
+            cpu_limit=body.cpu_limit,
+            stop_timeout_seconds=body.stop_timeout_seconds,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if row is None:
+        raise _lease_lost()
+    return WorkerThreadSandbox(**row)
+
+
+@router.post(
+    "/worker/jobs/{job_id}/sandbox/running",
+    response_model=WorkerThreadSandbox,
+)
+async def worker_mark_thread_sandbox_running(
+    job_id: str,
+    body: WorkerSandboxRunningRequest,
+    authorization: str | None = Header(None),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+) -> WorkerThreadSandbox:
+    """Confirm the exact retained container reached RUNNING."""
+    job_store = _require_store(store)
+    claims = _worker_claims(authorization)
+    _match_job(claims, job_id)
+    thread_id = await _worker_thread_id(job_store, job_id)
+    row = await job_store.mark_thread_sandbox_running(
+        thread_id=thread_id,
+        attempt_id=claims["attempt_id"],
+        lease_generation=claims["lease_generation"],
+        sandbox_generation=body.sandbox_generation,
+        activation_generation=body.activation_generation,
+        container_id=body.container_id,
+        context_status=body.context_status,
+    )
+    if row is None:
+        raise _lease_lost()
+    return WorkerThreadSandbox(**row)
+
+
+@router.post(
+    "/worker/jobs/{job_id}/sandbox/residency",
+    response_model=HostResidencyEstablishResponse,
+)
+async def worker_establish_shared_sandbox_residency(
+    job_id: str,
+    body: WorkerSandboxResidencyRequest,
+    authorization: str | None = Header(None),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+    grants: Any = Depends(get_grant_client),
+) -> HostResidencyEstablishResponse:
+    """Mint the renewable member grant before the supervisor opens a CLI."""
+    job_store = _require_store(store)
+    claims = _worker_claims(authorization)
+    _match_job(claims, job_id)
+    thread_id = await _worker_thread_id(job_store, job_id)
+    host = await job_store.host_for_job(job_id=job_id)
+    if host is None or not host.get("host"):
+        raise _lease_lost()
+    row = await job_store.establish_residency(
+        thread_id=thread_id,
+        host=str(host["host"]),
+        runtime_id=body.runtime_id,
+        runtime_version=body.runtime_version,
+        sandbox_id=body.sandbox_id,
+        ttl_seconds=RESIDENCY_TTL_S,
+    )
+    if row is None:
+        raise _lease_lost()
+    credential = await _mint_residency_grant(job_store, grants, row=row)
+    if not credential:
+        # Shared-live processes cannot safely outlive an attempt on its token.
+        # Unlike legacy HOT this mode is therefore all-or-nothing at admission.
+        await job_store.release_residency(
+            thread_id=thread_id,
+            generation=int(row["generation"]),
+            host=str(host["host"]),
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="a renewable shared-session credential could not be minted",
+        )
+    recorded = await job_store.record_shared_thread_residency(
+        thread_id=thread_id,
+        attempt_id=claims["attempt_id"],
+        lease_generation=claims["lease_generation"],
+        sandbox_id=body.sandbox_id,
+        residency_generation=int(row["generation"]),
+    )
+    if not recorded:
+        released = await job_store.release_residency(
+            thread_id=thread_id,
+            generation=int(row["generation"]),
+            host=str(host["host"]),
+        )
+        if released and grants is not None:
+            await grants.revoke(released)
+        raise _lease_lost()
+    return HostResidencyEstablishResponse(
+        thread_id=thread_id,
+        generation=int(row["generation"]),
+        ttl_seconds=RESIDENCY_TTL_S,
+        credential=credential,
+        model=row.get("model"),
+    )
+
+
+@router.post(
+    "/worker/jobs/{job_id}/sandbox/process",
+    response_model=WorkerAckResponse,
+)
+async def worker_record_thread_sandbox_process(
+    job_id: str,
+    body: WorkerSandboxProcessRequest,
+    authorization: str | None = Header(None),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+) -> WorkerAckResponse:
+    """Fence and record a replacement Agent CLI process generation."""
+    job_store = _require_store(store)
+    claims = _worker_claims(authorization)
+    _match_job(claims, job_id)
+    thread_id = await _worker_thread_id(job_store, job_id)
+    recorded = await job_store.record_thread_sandbox_process(
+        thread_id=thread_id,
+        attempt_id=claims["attempt_id"],
+        lease_generation=claims["lease_generation"],
+        sandbox_generation=body.sandbox_generation,
+        activation_generation=body.activation_generation,
+        process_generation=body.process_generation,
+    )
+    if not recorded:
+        raise _lease_lost()
+    return WorkerAckResponse(ok=True)
+
+
+@router.post(
+    "/worker/jobs/{job_id}/sandbox/admit",
+    response_model=WorkerAckResponse,
+)
+async def worker_admit_thread_sandbox_turn(
+    job_id: str,
+    body: WorkerSandboxAdmissionRequest,
+    authorization: str | None = Header(None),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+) -> WorkerAckResponse:
+    """Persist at-most-once admission before the prompt reaches the CLI."""
+    job_store = _require_store(store)
+    claims = _worker_claims(authorization)
+    _match_job(claims, job_id)
+    thread_id = await _worker_thread_id(job_store, job_id)
+    recorded = await job_store.admit_thread_sandbox_turn(
+        thread_id=thread_id,
+        job_id=job_id,
+        attempt_id=claims["attempt_id"],
+        lease_generation=claims["lease_generation"],
+        sandbox_generation=body.sandbox_generation,
+        activation_generation=body.activation_generation,
+    )
+    if not recorded:
+        raise _lease_lost()
+    return WorkerAckResponse(ok=True)
+
+
+@router.post(
+    "/worker/jobs/{job_id}/sandbox/settle",
+    response_model=WorkerThreadSandbox,
+)
+async def worker_settle_thread_sandbox(
+    job_id: str,
+    body: WorkerSandboxSettleRequest,
+    authorization: str | None = Header(None),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+) -> WorkerThreadSandbox:
+    """Persist the native context boundary before arming idle deactivation."""
+    job_store = _require_store(store)
+    claims = _worker_claims(authorization)
+    _match_job(claims, job_id)
+    thread_id = await _worker_thread_id(job_store, job_id)
+    row = await job_store.settle_thread_sandbox(
+        thread_id=thread_id,
+        attempt_id=claims["attempt_id"],
+        lease_generation=claims["lease_generation"],
+        sandbox_generation=body.sandbox_generation,
+        activation_generation=body.activation_generation,
+        job_id=job_id,
+        context_status=body.context_status,
+        native_session_id=body.native_session_id,
+        base_sha=body.base_sha,
+        idle_timeout_seconds=body.idle_timeout_seconds,
+    )
+    if row is None:
+        raise _lease_lost()
+    return WorkerThreadSandbox(**row)
+
+
+@router.post(
+    "/worker/jobs/{job_id}/sandbox/abandon",
+    response_model=WorkerThreadSandbox,
+)
+async def worker_abandon_thread_sandbox(
+    job_id: str,
+    body: WorkerSandboxAbandonRequest,
+    authorization: str | None = Header(None),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+    grants: Any = Depends(get_grant_client),
+) -> WorkerThreadSandbox:
+    """Release a failed activation; ambiguous admission becomes LOST."""
+    job_store = _require_store(store)
+    claims = _worker_claims(authorization)
+    _match_job(claims, job_id)
+    thread_id = await _worker_thread_id(job_store, job_id)
+    row = await job_store.abandon_thread_sandbox(
+        thread_id=thread_id,
+        attempt_id=claims["attempt_id"],
+        lease_generation=claims["lease_generation"],
+        sandbox_generation=body.sandbox_generation,
+        activation_generation=body.activation_generation,
+        lost=body.lost,
+        detail=body.detail,
+        idle_timeout_seconds=body.idle_timeout_seconds,
+    )
+    if row is None:
+        raise _lease_lost()
+    if row.get("shared_live") and int(row.get("residency_generation") or 0) > 0:
+        # The shared supervisor closes this member's process on abandon. End
+        # its matching renewable capability now instead of leaving a dead
+        # process's grant live until the residency TTL. The generation fence
+        # makes a concurrent successor immune to this cleanup.
+        released = await job_store.release_residency(
+            thread_id=thread_id,
+            generation=int(row["residency_generation"]),
+            host=str(row["host"]),
+        )
+        if released and grants is not None:
+            with contextlib.suppress(Exception):
+                await grants.revoke(released)
+    return WorkerThreadSandbox(**row)
 
 
 @router.post("/worker/jobs/{job_id}/resources", response_model=WorkerAckResponse)
@@ -3225,6 +3941,10 @@ async def worker_suspend_terminals(
     job_store = _require_store(store)
     claims = _worker_claims(authorization)
     _match_job(claims, job_id)
+    job = await job_store.get_job(job_id)
+    if job is None:
+        raise _lease_lost()
+    workspace_id = _workspace_id(job)
     event_id = await job_store.append_event(
         attempt_id=claims["attempt_id"],
         lease_generation=claims["lease_generation"],
@@ -3237,7 +3957,7 @@ async def worker_suspend_terminals(
     if broker is not None:
         try:
             await broker.suspend_terminals(
-                job_id,
+                workspace_id,
                 lease_generation=claims["lease_generation"],
             )
         except WorkspaceBrokerError as exc:
@@ -3263,6 +3983,10 @@ async def worker_resume_terminals(
     job_store = _require_store(store)
     claims = _worker_claims(authorization)
     _match_job(claims, job_id)
+    job = await job_store.get_job(job_id)
+    if job is None:
+        raise _lease_lost()
+    workspace_id = _workspace_id(job)
     fenced = await job_store.fence_terminal_workspace(
         attempt_id=claims["attempt_id"],
         lease_generation=claims["lease_generation"],
@@ -3273,13 +3997,13 @@ async def worker_resume_terminals(
     if broker is not None:
         try:
             await broker.resume_terminals(
-                job_id,
+                workspace_id,
                 lease_generation=claims["lease_generation"],
             )
         except WorkspaceBrokerError as exc:
             await _restore_terminal_suspension(
                 broker,
-                job_id=job_id,
+                workspace_id=workspace_id,
                 lease_generation=claims["lease_generation"],
             )
             raise HTTPException(
@@ -3301,14 +4025,14 @@ async def worker_resume_terminals(
     except Exception:
         await _restore_terminal_suspension(
             broker,
-            job_id=job_id,
+            workspace_id=workspace_id,
             lease_generation=claims["lease_generation"],
         )
         raise
     if event_id is None:
         await _restore_terminal_suspension(
             broker,
-            job_id=job_id,
+            workspace_id=workspace_id,
             lease_generation=claims["lease_generation"],
         )
         raise _lease_lost()
@@ -3384,6 +4108,10 @@ async def worker_finish(
     job_store = _require_store(store)
     claims = _worker_claims(authorization)
     _match_job(claims, job_id)
+    job = await job_store.get_job(job_id)
+    if job is None:
+        raise _lease_lost()
+    workspace_id = _workspace_id(job)
     if body.state not in TERMINAL_STATES:
         raise HTTPException(
             status_code=400,
@@ -3404,13 +4132,13 @@ async def worker_finish(
     if broker is not None:
         try:
             await broker.resume_terminals(
-                job_id,
+                workspace_id,
                 lease_generation=claims["lease_generation"],
             )
         except WorkspaceBrokerError as exc:
             await _restore_terminal_suspension(
                 broker,
-                job_id=job_id,
+                workspace_id=workspace_id,
                 lease_generation=claims["lease_generation"],
             )
             raise HTTPException(
@@ -3435,14 +4163,14 @@ async def worker_finish(
     except Exception:
         await _restore_terminal_suspension(
             broker,
-            job_id=job_id,
+            workspace_id=workspace_id,
             lease_generation=claims["lease_generation"],
         )
         raise
     if not ok:
         await _restore_terminal_suspension(
             broker,
-            job_id=job_id,
+            workspace_id=workspace_id,
             lease_generation=claims["lease_generation"],
         )
         raise _lease_lost()

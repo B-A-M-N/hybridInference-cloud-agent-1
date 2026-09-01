@@ -95,6 +95,9 @@ services:
       AGENT_TRUST_PROXY_HEADERS: ${AGENT_TRUST_PROXY_HEADERS:-false}
       AGENT_LOG_LEVEL: ${AGENT_LOG_LEVEL:-INFO}
       AGENT_DEFAULT_EXECUTION_PROFILE: ${AGENT_DEFAULT_EXECUTION_PROFILE:-trusted-v1}
+      # New chats require a host that advertises the complete shared-live
+      # protocol; unset/0 preserves the legacy disposable scheduling path.
+      AGENT_SHARED_LIVE_SANDBOX: ${AGENT_SHARED_LIVE_SANDBOX:-0}
 
       # --- Publishing and source control ------------------------------------
       # The only component that holds a git credential, which is precisely what
@@ -215,8 +218,10 @@ services:
         # for the other, and the wrongness does not show at start: the stack
         # comes up healthy with the app mounted at the wrong path, calling the
         # gateway instead of the control plane, and unable to sign anyone in.
-        # A `:?` makes the deployment say which shape it is.
-        NEXT_PUBLIC_BASE_PATH: ${AGENT_WEB_BASE_PATH:?the prefix this app is mounted under; empty string for a deployment that owns its own hostname}
+        # `?` (without `:`) requires an explicit choice while still accepting
+        # the empty string, which is the value for a deployment that owns its
+        # hostname. `:?` would contradict that contract by rejecting empty.
+        NEXT_PUBLIC_BASE_PATH: ${AGENT_WEB_BASE_PATH?the prefix this app is mounted under; empty string for a deployment that owns its own hostname}
         # Relative on purpose when mounted under a prefix: a same-origin path
         # means the cookie is sent without `SameSite=None`, and no absolute
         # host has to be known at build time. Under a base path this is that

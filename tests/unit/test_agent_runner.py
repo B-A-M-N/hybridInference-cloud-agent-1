@@ -23,7 +23,7 @@ from cloud_agent_host.runner import (
     run_agent,
 )
 from cloud_agent_host.runtimes import ClaudeCodeRuntime, GenericRuntime, RuntimeMCPConfig
-from cloud_agent_host.sandbox import ProcessBackend
+from cloud_agent_host.sandbox import ContainerBackend, ProcessBackend, SandboxError
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
@@ -61,6 +61,107 @@ def test_follow_up_prompt_replays_runtime_neutral_conversation():
     assert prompt.endswith("NEW USER REQUEST:\nnow add tests")
 
 
+@pytest.mark.parametrize("runtime", ["claude-code", "codex", "pi", "opencode", "kilo"])
+def test_restartable_preview_defaults_to_every_native_session_driver(monkeypatch, runtime):
+    """Turning on the topology gate must not silently leave four CLIs legacy."""
+    monkeypatch.setenv("AGENT_RESTARTABLE_SANDBOX", "1")
+    monkeypatch.delenv("AGENT_RESTARTABLE_RUNTIMES", raising=False)
+    job = ClaimedJob(**{**_JOB.__dict__, "runtime": runtime})
+
+    assert runner_mod._restartable_runtime_enabled(job) is True
+
+
+def test_shared_live_capability_attests_clis_and_non_menu_helpers(monkeypatch):
+    monkeypatch.setenv("AGENT_SHARED_LIVE_SANDBOX", "1")
+    monkeypatch.setenv("AGENT_HOST_SLOTS", "2")
+    monkeypatch.setenv("AGENT_SHARED_RESIDENT_CAPACITY", "8")
+    monkeypatch.setenv("AGENT_WORKSPACE_BROKER_URL", "http://broker:8082")
+    monkeypatch.setenv("AGENT_WORKSPACE_BROKER_TOKEN", "broker-token")
+    backend = ContainerBackend(image="img")
+    stamp = {
+        "sandbox_image_digest": "sha256:shared-image",
+        "shared_sandbox_protocol": "v1",
+        "runtime_versions": dict(runner_mod.SHARED_SANDBOX_RUNTIME_PINS),
+        "helper_versions": dict(runner_mod.SHARED_SANDBOX_HELPER_PINS),
+    }
+
+    assert runner_mod._shared_live_host_capabilities(backend, stamp) == ["shared-sandbox-v1"]
+    assert "claude-agent-sdk" not in stamp["runtime_versions"]
+
+    stamp["helper_versions"]["claude-agent-sdk"] = "0.2.147"
+    assert runner_mod._shared_live_host_capabilities(backend, stamp) == []
+
+
+@pytest.mark.parametrize("capacity", ["nope", "1", "129"])
+def test_shared_live_capability_rejects_invalid_resident_capacity(monkeypatch, capacity):
+    monkeypatch.setenv("AGENT_SHARED_LIVE_SANDBOX", "1")
+    monkeypatch.setenv("AGENT_HOST_SLOTS", "2")
+    monkeypatch.setenv("AGENT_SHARED_RESIDENT_CAPACITY", capacity)
+    monkeypatch.setenv("AGENT_WORKSPACE_BROKER_URL", "http://broker:8082")
+    monkeypatch.setenv("AGENT_WORKSPACE_BROKER_TOKEN", "broker-token")
+
+    assert (
+        runner_mod._shared_live_host_capabilities(
+            ContainerBackend(image="img"),
+            {
+                "sandbox_image_digest": "sha256:shared-image",
+                "shared_sandbox_protocol": "v1",
+                "runtime_versions": dict(runner_mod.SHARED_SANDBOX_RUNTIME_PINS),
+                "helper_versions": dict(runner_mod.SHARED_SANDBOX_HELPER_PINS),
+            },
+        )
+        == []
+    )
+
+
+def test_partial_restartable_rollout_keeps_the_legacy_mount_preflight(monkeypatch):
+    """A staged runtime subset is not a Docker-only runner yet."""
+    monkeypatch.setenv("AGENT_RESTARTABLE_SANDBOX", "1")
+    monkeypatch.setenv("AGENT_RESTARTABLE_RUNTIMES", "claude-code")
+
+    assert runner_mod._restartable_mode_covers_every_runtime() is False
+
+    monkeypatch.setenv("AGENT_RESTARTABLE_RUNTIMES", "claude-code,codex,pi,opencode,kilo")
+    assert runner_mod._restartable_mode_covers_every_runtime() is True
+
+
+def test_chat_idle_timeout_prefers_canonical_name_but_accepts_legacy_alias(monkeypatch):
+    monkeypatch.setenv("AGENT_SESSION_IDLE_TIMEOUT_S", "123")
+    monkeypatch.delenv("AGENT_CHAT_IDLE_TIMEOUT_S", raising=False)
+    assert runner_mod._chat_idle_timeout_s() == 123
+
+    monkeypatch.setenv("AGENT_CHAT_IDLE_TIMEOUT_S", "456")
+    assert runner_mod._chat_idle_timeout_s() == 456
+
+
+def test_retained_resume_requires_the_cli_to_keep_the_exact_native_session():
+    """A CLI that silently starts over must never be recorded as RESTORED."""
+    assert (
+        runner_mod._verified_native_session_id(
+            previous_session_id="session-one",
+            observed_session_id="session-one",
+            has_context=True,
+        )
+        == "session-one"
+    )
+
+    with pytest.raises(SandboxError, match="resumed a different native session"):
+        runner_mod._verified_native_session_id(
+            previous_session_id="session-one",
+            observed_session_id="session-two",
+            has_context=True,
+        )
+
+
+def test_retained_first_turn_requires_a_native_session_locator():
+    with pytest.raises(SandboxError, match="without a native session locator"):
+        runner_mod._verified_native_session_id(
+            previous_session_id=None,
+            observed_session_id=None,
+            has_context=False,
+        )
+
+
 @pytest.fixture(autouse=True)
 def _allow_unisolated_sandbox(monkeypatch):
     """These tests exercise runner logic, not sandbox policy.
@@ -81,13 +182,19 @@ class FakeControl:
         self.finished: tuple[str, str | None] | None = None
         self.job_id = "ajob_1"
         self.continuity: str | None = None
+        self.context_status: str | None = None
         self.resources: list[dict] = []
 
     def append_event(self, event) -> None:
         self.events.append((event.event_type, event.payload))
 
-    def report_continuity(self, mode: str) -> None:
+    def report_continuity(self, mode: str, *, context_status: str | None = None) -> None:
         self.continuity = mode
+        if context_status is not None:
+            self.context_status = context_status
+
+    def report_context_status(self, context_status: str) -> None:
+        self.context_status = context_status
 
     def report_resources(self, rollup: dict) -> None:
         self.resources.append(rollup)
@@ -163,6 +270,27 @@ def test_agent_output_streams_back_as_events(tmp_path):
         "line 1",
         "line 2",
     ]
+
+
+def test_a_new_chat_reports_context_without_calling_it_replay(tmp_path):
+    """A first turn has no earlier memory to restore or reconstruct."""
+    control = FakeControl()
+
+    code, _tail, _errors = run_agent(
+        _echo_runtime(1),
+        job=_JOB,
+        workdir=str(tmp_path),
+        gateway_base_url="http://gw",
+        control=control,
+        heart=FakeHeart(),
+        timeout_s=30,
+        backend=ProcessBackend(acknowledged_unsafe=True),
+        context_status="new",
+    )
+
+    assert code == 0
+    assert control.context_status == "new"
+    assert control.continuity is None
 
 
 def test_runner_supplies_trusted_runtime_boundaries(tmp_path):
@@ -415,6 +543,273 @@ def test_live_runner_reuses_one_durable_workspace_per_job(monkeypatch, tmp_path)
     ) in control.events
 
 
+def test_retained_claim_dispatches_without_materializing_a_host_worktree(monkeypatch, tmp_path):
+    """Once a thread owns Docker state, the legacy host path is never created."""
+
+    class Backend(ContainerBackend):
+        def version_stamp(self):
+            return {}
+
+    job = ClaimedJob(
+        **{
+            **_JOB.__dict__,
+            "runtime": "claude-code",
+            "thread_id": "athr_retained",
+            "thread_sandbox": {
+                "sandbox_id": "asbx_retained",
+                "container_name": "freeinference-chat-existing",
+                "host": "host-a",
+                "generation": 1,
+            },
+        }
+    )
+    control = FakeControl()
+    dispatched: list[dict] = []
+    monkeypatch.setattr(runner_mod, "claim", lambda **_kwargs: job)
+    monkeypatch.setattr(runner_mod, "ControlPlane", lambda *_args, **_kwargs: control)
+    monkeypatch.setattr(runner_mod, "Heartbeater", lambda *_args, **_kwargs: FakeHeart())
+    monkeypatch.setattr(
+        runner_mod,
+        "_run_retained_attempt",
+        lambda **kwargs: dispatched.append(kwargs) or 0,
+    )
+    workspace_root = tmp_path / "legacy-workspaces"
+
+    code = runner_mod.run_once(
+        base_url="http://control",
+        gateway_url="http://gateway",
+        dispatcher_token="dispatcher",
+        worker_id="runner-1",
+        workdir=str(tmp_path / "unused"),
+        workspace_root=str(workspace_root),
+        host="host-a",
+        backend=Backend(image="agent:pin", network="agent-net"),
+    )
+
+    assert code == 0
+    assert len(dispatched) == 1
+    assert dispatched[0]["job"] is job
+    assert dispatched[0]["gateway_base_url"] == "http://gateway"
+    assert not (workspace_root / job.job_id).exists()
+
+
+def test_new_retained_chat_refuses_an_unpinned_sandbox_image():
+    """A transient image-inspect failure cannot turn a mutable tag into identity."""
+
+    class Backend(ContainerBackend):
+        def version_stamp(self):
+            return {}
+
+    job = ClaimedJob(
+        **{
+            **_JOB.__dict__,
+            "runtime": "claude-code",
+            "thread_id": "athr_retained",
+        }
+    )
+    finished: list[tuple[str, str | None]] = []
+
+    code = runner_mod._run_retained_attempt(
+        runtime=ClaudeCodeRuntime(),
+        job=job,
+        control=FakeControl(),
+        heart=FakeHeart(),
+        backend=Backend(image="agent:mutable-tag", network="agent-net"),
+        host="host-a",
+        gateway_base_url="http://gateway",
+        agent_timeout_s=30,
+        finish_attempt=lambda state, detail=None, **_kwargs: finished.append((state, detail)),
+    )
+
+    assert code == 2
+    assert finished == [
+        (
+            "failed",
+            "restartable chat creation requires an inspected sandbox image digest",
+        )
+    ]
+
+
+def test_first_activation_keeps_setup_egress_until_admission_is_durable(monkeypatch):
+    """A retryable control-plane failure must not consume setup egress forever."""
+
+    timeline: list[str] = []
+    job = ClaimedJob(
+        **{
+            **_JOB.__dict__,
+            "runtime": "claude-code",
+            "runtime_version": "2.1.220",
+            "thread_id": "athr_retained",
+        }
+    )
+
+    class Backend(ContainerBackend):
+        def version_stamp(self):
+            return {"sandbox_image_digest": "sha256:image"}
+
+    class Manager:
+        def __init__(self, backend):
+            self.backend = backend
+
+        def reset_unsettled_state(self, _spec):
+            timeline.append("reset")
+
+        def transition_to_agent_network(self, _spec):
+            timeline.append("network-transition")
+
+    class Retained:
+        def sandbox_metadata(self):
+            return {}
+
+        def has_binary(self, _binary):
+            return True
+
+    class Supervisor:
+        def acquire(self, spec, **_kwargs):
+            return {
+                "token": "lease-token",
+                "activation_generation": 1,
+                "container_id": "container-one",
+                "container_name": spec.container_name,
+                "context_status": "new",
+            }
+
+        def process_started(self, _thread_id, *, token):
+            assert token == "lease-token"
+            timeline.append("process-generation")
+            return {"process_generation": 1}
+
+        def abandon(self, *_args, **_kwargs):
+            timeline.append("local-abandon")
+
+        def close(self):
+            pass
+
+    class Control:
+        def reserve_chat_sandbox(self, body):
+            return {
+                **body,
+                "generation": 1,
+                "activation_generation": 1,
+                "container_id": None,
+                "last_settled_job_id": None,
+                "native_session_id": None,
+            }
+
+        def mark_chat_sandbox_running(self, **_kwargs):
+            pass
+
+        def append_event(self, _event):
+            pass
+
+        def suspend_terminals(self, _phase):
+            pass
+
+        def resume_terminals(self):
+            pass
+
+        def record_chat_process(self, **_kwargs):
+            timeline.append("process-recorded")
+
+        def admit_chat_turn(self, **_kwargs):
+            timeline.append("admission-attempt")
+            raise SandboxError("control plane unavailable before admission")
+
+        def abandon_chat_sandbox(self, **_kwargs):
+            timeline.append("durable-abandon")
+
+    monkeypatch.setattr(runner_mod, "ChatSandboxManager", Manager)
+    monkeypatch.setattr(runner_mod, "RetainedChatBackend", lambda *_args: Retained())
+    monkeypatch.setattr(runner_mod, "_session_supervisor_from_env", Supervisor)
+    monkeypatch.setattr(
+        runner_mod,
+        "_prepare_retained_checkout",
+        lambda **_kwargs: "a" * 40,
+    )
+    monkeypatch.setattr(runner_mod, "runtime_version_unavailable", lambda *_args: None)
+    finished: list[tuple[str, str | None]] = []
+
+    code = runner_mod._run_retained_attempt(
+        runtime=ClaudeCodeRuntime(),
+        job=job,
+        control=Control(),
+        heart=FakeHeart(),
+        backend=Backend(image="agent:pin", network="agent-net"),
+        host="host-a",
+        gateway_base_url="http://gateway",
+        agent_timeout_s=30,
+        finish_attempt=lambda state, detail=None, **_kwargs: finished.append((state, detail)),
+    )
+
+    assert code == 2
+    assert "admission-attempt" in timeline
+    assert "network-transition" not in timeline
+    assert finished and finished[0][0] == "failed"
+
+
+def test_retained_heartbeat_reports_activity_and_host_monotonic_idle_remaining(monkeypatch):
+    class Client:
+        def list(self):
+            return [
+                {
+                    "thread_id": "athr_1",
+                    "sandbox_id": "asbx_1",
+                    "container_id": "0123456789abcdef",
+                    "generation": 1,
+                    "activation_generation": 4,
+                    "running": True,
+                    "busy": False,
+                    "terminal_count": 0,
+                    "operation_count": 0,
+                    "workspace_suspended": False,
+                    "idle_deadline_monotonic": 130.0,
+                },
+                {
+                    "thread_id": "athr_reconciled",
+                    "sandbox_id": "asbx_2",
+                    "container_id": "fedcba9876543210",
+                    "generation": 1,
+                    "activation_generation": 0,
+                    "running": True,
+                    "busy": False,
+                    "terminal_count": 0,
+                    "operation_count": 0,
+                    "workspace_suspended": False,
+                    "idle_deadline_monotonic": None,
+                },
+                {
+                    "thread_id": "athr_terminal_wakeup",
+                    "sandbox_id": "asbx_3",
+                    "container_id": "0011223344556677",
+                    "generation": 1,
+                    "activation_generation": 0,
+                    "running": True,
+                    "busy": False,
+                    "terminal_count": 1,
+                    "operation_count": 0,
+                    "workspace_suspended": False,
+                    "idle_deadline_monotonic": None,
+                },
+            ]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(runner_mod, "_session_supervisor_from_env", Client)
+    monkeypatch.setattr(runner_mod.time, "monotonic", lambda: 100.0)
+    monkeypatch.setenv("AGENT_CHAT_IDLE_TIMEOUT_S", "1800")
+
+    rows = runner_mod._retained_sandbox_heartbeat_rows()
+
+    assert rows is not None
+    assert rows[0]["activity_active"] is False
+    assert rows[0]["idle_remaining_seconds"] == 30.0
+    assert rows[1]["activity_active"] is False
+    assert rows[1]["idle_remaining_seconds"] == 1800.0
+    assert rows[2]["activity_active"] is True
+    assert rows[2]["idle_remaining_seconds"] is None
+
+
 def test_workspace_ready_follows_context_restore_and_setup(monkeypatch, tmp_path):
     """Terminal readiness is emitted only after trusted workspace preparation."""
 
@@ -568,9 +963,11 @@ class _CountingBackend:
 
     def __init__(self) -> None:
         self.preflights = 0
+        self.preflight_roots: list[str | None] = []
 
     def preflight(self, workdir_root: str | None = None) -> None:
         self.preflights += 1
+        self.preflight_roots.append(workdir_root)
 
     def has_binary(self, _name: str) -> bool:
         return True
@@ -606,7 +1003,7 @@ def test_a_supplied_backend_is_not_preflighted_per_claim(monkeypatch, tmp_path):
 
 
 def test_a_self_built_backend_is_still_preflighted_before_claiming(monkeypatch, tmp_path):
-    """The one-shot path keeps failing fast on a misconfigured host."""
+    """The one-shot path proves its real bind source before taking a job."""
     backend = _CountingBackend()
     monkeypatch.setattr(runner_mod, "build_backend_from_env", lambda: backend)
     claims: list[bool] = []
@@ -617,15 +1014,38 @@ def test_a_self_built_backend_is_still_preflighted_before_claiming(monkeypatch, 
 
     monkeypatch.setattr(runner_mod, "claim", _claim)
 
+    workdir = tmp_path / "one-shot"
     runner_mod.run_once(
         base_url="http://gw",
         dispatcher_token="d",
         worker_id="w",
-        workdir=str(tmp_path),
+        workdir=str(workdir),
     )
 
     assert backend.preflights == 1
+    assert backend.preflight_roots == [str(workdir.resolve())]
+    assert workdir.is_dir()
     assert claims, "preflight must not have replaced the claim"
+
+
+def test_a_fully_restartable_one_shot_does_not_require_a_legacy_bind(monkeypatch, tmp_path):
+    """Docker-owned chats never address the runner image's local workdir."""
+    backend = _CountingBackend()
+    monkeypatch.setattr(runner_mod, "build_backend_from_env", lambda: backend)
+    monkeypatch.setattr(runner_mod, "claim", lambda **_kwargs: None)
+    monkeypatch.setenv("AGENT_RESTARTABLE_SANDBOX", "1")
+    monkeypatch.setenv("AGENT_RESTARTABLE_RUNTIMES", "claude-code,codex,pi,opencode,kilo")
+
+    workdir = tmp_path / "runner-only"
+    runner_mod.run_once(
+        base_url="http://gw",
+        dispatcher_token="d",
+        worker_id="w",
+        workdir=str(workdir),
+    )
+
+    assert backend.preflight_roots == [None]
+    assert not workdir.exists()
 
 
 def test_only_the_claim_call_reports_an_unreachable_gateway(monkeypatch):
@@ -843,6 +1263,32 @@ def test_an_enrolled_host_claims_with_its_own_credential(monkeypatch, tmp_path) 
 def test_a_host_with_no_pool_still_claims_with_the_dispatcher_token(monkeypatch, tmp_path) -> None:
     """The single-host shape predates the pool and must keep working."""
     assert _drive_loop(monkeypatch, tmp_path, identity=None) == "pool-wide-dispatcher-token"
+
+
+def test_restartable_mode_refuses_an_unenrolled_host_before_claim(monkeypatch, tmp_path) -> None:
+    """Retained Docker state needs authenticated heartbeat reconciliation."""
+    monkeypatch.setenv("AGENT_RESTARTABLE_SANDBOX", "1")
+    monkeypatch.setattr(runner_mod, "ensure_enrolled", lambda **_kwargs: None)
+
+    class _Backend:
+        name = "container"
+
+        def preflight(self, workdir_root):
+            pass
+
+        def check_gateway_reachable(self, _url):
+            pass
+
+    with pytest.raises(RuntimeError, match="requires an enrolled host identity"):
+        runner_mod.run_forever(
+            gateway_url="http://gw",
+            base_url="http://cp",
+            dispatcher_token="pool-wide-dispatcher-token",
+            worker_id="w1",
+            workdir_root=str(tmp_path),
+            backend=_Backend(),
+            host="h1",
+        )
 
 
 def test_a_lost_lease_drops_the_residency_before_unwinding(tmp_path):
@@ -1158,10 +1604,12 @@ def test_the_first_live_turn_spawns_on_the_residency_grant(tmp_path):
         resident=entry,
         residents=_DetachPool(),
         live_out=live_out,
+        context_status="restored",
     )
 
     assert exit_code == 0
     assert control.continuity == "warm_native"
+    assert control.context_status == "restored"
     (spec,) = backend.specs
     assert spec.live_input is True
     assert spec.argv[spec.argv.index("--resume") + 1] == "sess-prev"

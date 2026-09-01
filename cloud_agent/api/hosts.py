@@ -264,12 +264,93 @@ async def heartbeat_host(
             # and a thread-id-only loss would let the stale answer kill the
             # successor. The host drops only on an exact generation match.
             lost.append(beat)
+    # Docker is the lifecycle authority for retained chat containers; the
+    # database is the scheduling/fencing authority.  Heartbeats join those
+    # views without treating absence as deletion. In particular, a broker's
+    # settled idle sweep can stop Docker after the worker token that settled
+    # the turn has expired, so host authentication is the durable path for
+    # recording that STOPPED transition.
+    retained_stops: list[dict[str, Any]] = []
+    for beat in body.retained_sandboxes or []:
+        await job_store.reconcile_thread_sandbox_observation(
+            thread_id=beat.thread_id,
+            host=updated["host"],
+            sandbox_id=beat.sandbox_id,
+            container_id=beat.container_id,
+            sandbox_generation=beat.generation,
+            activation_generation=beat.activation_generation,
+            running=beat.running,
+            activity_active=beat.activity_active,
+            idle_remaining_seconds=beat.idle_remaining_seconds,
+            shared_live=beat.shared_live,
+            members=[member.model_dump() for member in beat.members],
+        )
+        if beat.shared_live:
+            for member in beat.members:
+                if member.residency_generation <= 0:
+                    continue
+                # A stopped group has no process that can legitimately use a
+                # residency credential. Release and revoke it instead of
+                # renewing it forever. The database performs this release
+                # under the group's operation and member-attempt fences: this
+                # heartbeat was sampled earlier and must not revoke a grant a
+                # concurrent fork/start minted after that sample.
+                if not beat.running or member.resident_state in {"stopped", "lost"}:
+                    released = await job_store.release_shared_residency_if_quiescent(
+                        thread_id=member.thread_id,
+                        generation=member.residency_generation,
+                        process_generation=member.process_generation,
+                        host=updated["host"],
+                        sandbox_id=beat.sandbox_id,
+                    )
+                    if released and grants is not None:
+                        with contextlib.suppress(Exception):
+                            await grants.revoke(released)
+                    continue
+                # ``starting`` and ``restarting`` are bounded launch windows.
+                # Do not race an in-flight process launch by revoking its new
+                # grant, but also do not renew an old, unattached credential;
+                # it expires naturally unless the member proves LIVE later.
+                if member.resident_state != "live":
+                    continue
+                extended = await job_store.heartbeat_residency(
+                    thread_id=member.thread_id,
+                    generation=member.residency_generation,
+                    host=updated["host"],
+                    ttl_seconds=RESIDENCY_TTL_S,
+                )
+                if extended and grants is not None:
+                    with contextlib.suppress(Exception):
+                        await grants.renew(extended)
+                if extended is None and not any(
+                    item.thread_id == member.thread_id
+                    and item.generation == member.residency_generation
+                    for item in lost
+                ):
+                    lost.append(
+                        ResidencyBeat(
+                            thread_id=member.thread_id,
+                            generation=member.residency_generation,
+                        )
+                    )
+        if beat.running:
+            due = await job_store.due_thread_sandbox_stop(
+                thread_id=beat.thread_id,
+                host=updated["host"],
+                sandbox_id=beat.sandbox_id,
+                container_id=beat.container_id,
+                sandbox_generation=beat.generation,
+                shared_live=beat.shared_live,
+            )
+            if due is not None:
+                retained_stops.append(due)
     return HostHeartbeatResponse(
         host=updated["host"],
         status=updated["status"],
         slots_total=updated["slots_total"],
         slots_used=updated["slots_used"],
         residencies_lost=lost,
+        retained_sandboxes_stop=retained_stops,
         heartbeat_interval_seconds=HEARTBEAT_INTERVAL_S,
         # Rate-limited inside the probe. Heartbeats are this host's liveness
         # signal and must not come to depend on a second service answering, but

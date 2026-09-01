@@ -32,10 +32,12 @@ import os
 import pathlib
 import queue
 import re
+import secrets
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field, replace
@@ -43,6 +45,13 @@ from typing import Any
 
 import httpx
 
+from cloud_agent_host.chat_sandbox import (
+    CHAT_STATE_DIR,
+    CHAT_WORKDIR,
+    ChatSandboxManager,
+    ChatSandboxSpec,
+    RetainedChatBackend,
+)
 from cloud_agent_host.drivers import (
     LINE,
     DriverError,
@@ -60,6 +69,7 @@ from cloud_agent_host.enrollment import (
 from cloud_agent_host.logging_utils import configure_process_logging
 from cloud_agent_host.patch_gate import branch_name_for, validate_patch
 from cloud_agent_host.residency import ResidentEntry, ResidentPool
+from cloud_agent_host.resident_transport import ResidentLaunch
 from cloud_agent_host.resources import ResourceSampler, daemon_reachable
 from cloud_agent_host.runtimes import (
     EMPTY_RUNTIME_MCP_CONFIG,
@@ -67,9 +77,11 @@ from cloud_agent_host.runtimes import (
     NormalizedEvent,
     RuntimeMCPConfig,
     get_runtime,
+    registered_runtimes,
 )
 from cloud_agent_host.sandbox import (
     SANDBOX_PATH,
+    ContainerBackend,
     SandboxBackend,
     SandboxError,
     SandboxProcess,
@@ -77,9 +89,23 @@ from cloud_agent_host.sandbox import (
     build_backend_from_env,
     runtime_bin_dir,
 )
+from cloud_agent_host.session_supervisor import DEFAULT_CHAT_IDLE_TIMEOUT_S
+from cloud_agent_host.session_supervisor_client import (
+    SessionSupervisorClient,
+    SessionSupervisorError,
+)
 from cloud_agent_host.setup import build_cache_from_env, run_setup
+from cloud_agent_host.shared_protocol import (
+    SHARED_SANDBOX_HELPER_PINS,
+    SHARED_SANDBOX_PROTOCOL,
+    SHARED_SANDBOX_RUNTIME_PINS,
+)
+from cloud_agent_host.source_archive import build_base_bundle, build_source_archive
 from cloud_agent_host.workspace_paths import purge_stale_workspaces, workspace_path
-from cloud_agent_host.workspace_snapshot import build_workspace_snapshot
+from cloud_agent_host.workspace_snapshot import (
+    build_retained_workspace_snapshot,
+    build_workspace_snapshot,
+)
 
 DEFAULT_LEASE_TTL_S = 120.0
 HEARTBEAT_INTERVAL_S = 30.0
@@ -98,6 +124,11 @@ _PATCH_MAX_BYTES = 8 * 1024 * 1024
 # well as at the API edge: this process holds the dispatcher credential.
 _COMMIT_SHA = re.compile(r"[0-9a-fA-F]{7,64}")
 _REPO_SLUG = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
+
+# Trusted-runner override for local development and self-hosted Git mirrors.
+# The default remains GitHub. This is deliberately read only by the runner: a
+# job request cannot choose where the platform sends a repository credential.
+ENV_REPO_CLONE_BASE_URL = "AGENT_REPO_CLONE_BASE_URL"
 
 # Hermetic git for anything the *runner* runs: no user config, no hooks, no
 # credential helpers, no prompts.
@@ -232,6 +263,9 @@ class ClaimedJob:
     # ``None`` from a control plane that predates selection — the image's
     # symlinked default then applies, which is what that control plane means.
     runtime_version: str | None = None
+    # Durable one-chat/one-container mapping. Null is the legacy/new-thread
+    # path; once present the scheduler pins this thread to its owning host.
+    thread_sandbox: dict[str, Any] | None = None
 
     @classmethod
     def from_response(cls, body: dict[str, Any]) -> ClaimedJob:
@@ -265,6 +299,11 @@ class ClaimedJob:
             context_checkpoint=body.get("context_checkpoint") or None,
             mcp_servers=list(body.get("mcp_servers") or []),
             runtime_version=body.get("runtime_version") or None,
+            thread_sandbox=(
+                dict(body["thread_sandbox"])
+                if isinstance(body.get("thread_sandbox"), dict)
+                else None
+            ),
         )
 
 
@@ -324,10 +363,25 @@ class ControlPlane:
             {"kind": kind, "content": content},
         )
 
-    def report_continuity(self, mode: str) -> None:
+    def report_continuity(self, mode: str, *, context_status: str | None = None) -> None:
         """Record this attempt's continuity rung. Best-effort observability."""
         try:
-            self._post(f"/v1/agent/worker/jobs/{self.job_id}/continuity", {"mode": mode})
+            body = {"mode": mode}
+            if context_status is not None:
+                body["context_status"] = context_status
+            self._post(f"/v1/agent/worker/jobs/{self.job_id}/continuity", body)
+        except LeaseLost:
+            raise
+        except Exception:
+            pass
+
+    def report_context_status(self, context_status: str) -> None:
+        """Record NEW/LIVE/RESTORED/LOST without inventing a continuity rung."""
+        try:
+            self._post(
+                f"/v1/agent/worker/jobs/{self.job_id}/continuity",
+                {"context_status": context_status},
+            )
         except LeaseLost:
             raise
         except Exception:
@@ -345,6 +399,125 @@ class ControlPlane:
             raise
         except Exception:
             pass
+
+    def reserve_chat_sandbox(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Reserve immutable thread/container identity under this attempt fence."""
+        return self._post(
+            f"/v1/agent/worker/jobs/{self.job_id}/sandbox/reserve",
+            payload,
+        )
+
+    def mark_chat_sandbox_running(
+        self,
+        *,
+        sandbox_generation: int,
+        activation_generation: int,
+        container_id: str,
+        context_status: str,
+    ) -> dict[str, Any]:
+        """Record that Docker started the reserved activation."""
+        return self._post(
+            f"/v1/agent/worker/jobs/{self.job_id}/sandbox/running",
+            {
+                "sandbox_generation": sandbox_generation,
+                "activation_generation": activation_generation,
+                "container_id": container_id,
+                "context_status": context_status,
+            },
+        )
+
+    def record_chat_process(
+        self,
+        *,
+        sandbox_generation: int,
+        activation_generation: int,
+        process_generation: int,
+    ) -> None:
+        """Record a CLI process rotation inside the same chat container."""
+        self._post(
+            f"/v1/agent/worker/jobs/{self.job_id}/sandbox/process",
+            {
+                "sandbox_generation": sandbox_generation,
+                "activation_generation": activation_generation,
+                "process_generation": process_generation,
+            },
+        )
+
+    def establish_shared_residency(
+        self,
+        *,
+        sandbox_id: str,
+        runtime_id: str,
+        runtime_version: str | None,
+    ) -> dict[str, Any]:
+        """Obtain the member-scoped renewable credential owned by the broker."""
+        return self._post(
+            f"/v1/agent/worker/jobs/{self.job_id}/sandbox/residency",
+            {
+                "sandbox_id": sandbox_id,
+                "runtime_id": runtime_id,
+                "runtime_version": runtime_version,
+            },
+        )
+
+    def admit_chat_turn(
+        self,
+        *,
+        sandbox_generation: int,
+        activation_generation: int,
+    ) -> None:
+        """Reserve this job before its prompt may reach Agent CLI stdin."""
+        self._post(
+            f"/v1/agent/worker/jobs/{self.job_id}/sandbox/admit",
+            {
+                "sandbox_generation": sandbox_generation,
+                "activation_generation": activation_generation,
+            },
+        )
+
+    def settle_chat_sandbox(
+        self,
+        *,
+        sandbox_generation: int,
+        activation_generation: int,
+        context_status: str,
+        native_session_id: str | None,
+        idle_timeout_seconds: float,
+        base_sha: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist a native context boundary before the host starts its idle timer."""
+        return self._post(
+            f"/v1/agent/worker/jobs/{self.job_id}/sandbox/settle",
+            {
+                "sandbox_generation": sandbox_generation,
+                "activation_generation": activation_generation,
+                "context_status": context_status,
+                "native_session_id": native_session_id,
+                "base_sha": base_sha,
+                "idle_timeout_seconds": idle_timeout_seconds,
+            },
+        )
+
+    def abandon_chat_sandbox(
+        self,
+        *,
+        sandbox_generation: int,
+        activation_generation: int,
+        lost: bool,
+        detail: str | None,
+        idle_timeout_seconds: float,
+    ) -> dict[str, Any]:
+        """Release a failed activation without claiming context continuity."""
+        return self._post(
+            f"/v1/agent/worker/jobs/{self.job_id}/sandbox/abandon",
+            {
+                "sandbox_generation": sandbox_generation,
+                "activation_generation": activation_generation,
+                "lost": lost,
+                "detail": detail,
+                "idle_timeout_seconds": idle_timeout_seconds,
+            },
+        )
 
     def suspend_terminals(self, phase: str) -> None:
         """Freeze owner PTYs before workspace preparation or artifact capture."""
@@ -620,6 +793,35 @@ def prepare_worktree(
     return resolved or (base_sha or "")
 
 
+def repo_clone_base_url(
+    env: dict[str, str] | None = None, *, clone_token: str | None = None
+) -> str:
+    """Return the operator-selected repository origin, safely.
+
+    A local Docker stack serves a tiny read-only ``git://`` repository so it
+    can run without a GitHub account or a host bind mount. Production keeps
+    using GitHub unless its trusted runner explicitly selects another origin.
+    A repository credential is never sent over plaintext HTTP or the git
+    protocol: those transports provide no confidentiality.
+    """
+    from urllib.parse import urlparse
+
+    source = env if env is not None else os.environ
+    configured = (source.get(ENV_REPO_CLONE_BASE_URL) or "").strip()
+    base = configured or "https://github.com"
+    parsed = urlparse(base)
+    if parsed.scheme not in {"https", "http", "git"} or not parsed.hostname:
+        raise WorktreeError(
+            f"{ENV_REPO_CLONE_BASE_URL} must be an http(s) or git URL, got {base!r}"
+        )
+    if clone_token and parsed.scheme != "https":
+        raise WorktreeError(
+            f"refusing to send a repository credential over {parsed.scheme!r}; "
+            f"{ENV_REPO_CLONE_BASE_URL} must use https when clone_token is present"
+        )
+    return base.rstrip("/")
+
+
 def existing_checkout_sha(workdir: str, repo: str) -> str | None:
     """Return the checked-out commit if ``workdir`` already holds ``repo``.
 
@@ -816,7 +1018,13 @@ def _read_bounded(process: Any, *, deadline_s: float, max_bytes: int) -> str:
     return "".join(chunks)
 
 
-def save_workspace_snapshot(control: ControlPlane, *, workdir: str, patch: str) -> bool:
+def save_workspace_snapshot(
+    control: ControlPlane,
+    *,
+    workdir: str,
+    patch: str,
+    retained_backend: RetainedChatBackend | None = None,
+) -> bool:
     """Store the changed-file overlay without making it job-critical.
 
     The patch remains the authoritative publishing artifact. Files are a
@@ -825,7 +1033,11 @@ def save_workspace_snapshot(control: ControlPlane, *, workdir: str, patch: str) 
     different: the attempt is fenced and must stop immediately.
     """
     try:
-        content = build_workspace_snapshot(workdir, patch)
+        content = (
+            build_retained_workspace_snapshot(retained_backend, patch)
+            if retained_backend is not None
+            else build_workspace_snapshot(workdir, patch)
+        )
         control.save_artifact("workspace_snapshot", content)
     except LeaseLost:
         raise
@@ -1071,6 +1283,9 @@ def run_agent(
     resident: ResidentEntry | None = None,
     residents: ResidentPool | None = None,
     live_out: dict[str, Any] | None = None,
+    context_status: str | None = None,
+    strict_native_resume: bool = False,
+    export_checkpoint: bool = True,
 ) -> tuple[int, str, list[str]]:
     """Run the agent, streaming its output back as normalized events.
 
@@ -1102,6 +1317,9 @@ def run_agent(
             resident=resident,
             residents=residents,
             live_out=live_out,
+            context_status=context_status,
+            strict_native_resume=strict_native_resume,
+            export_checkpoint=export_checkpoint,
             sampler=sampler,
         )
     finally:
@@ -1125,6 +1343,9 @@ def _run_agent(
     resident: ResidentEntry | None = None,
     residents: ResidentPool | None = None,
     live_out: dict[str, Any] | None = None,
+    context_status: str | None = None,
+    strict_native_resume: bool = False,
+    export_checkpoint: bool = True,
     sampler: ResourceSampler,
 ) -> tuple[int, str, list[str]]:
     """Run the agent, streaming its output back as normalized events.
@@ -1146,6 +1367,13 @@ def _run_agent(
     a live session it created itself; one borrowed from the pool is closed by
     the pool teardown its failure triggers.
     """
+
+    def _report_continuity(mode: str) -> None:
+        """Keep the pre-context-status control-client seam source-compatible."""
+        if context_status is None:
+            control.report_continuity(mode)
+        else:
+            control.report_continuity(mode, context_status=context_status)
 
     def _spawn_sampled(process: SandboxProcess) -> SandboxProcess:
         """Point the sampler at the sandbox this turn is about to use.
@@ -1312,7 +1540,7 @@ def _run_agent(
                 # ``hot`` only when the process predates the turn — a fresh
                 # spawn is warm_native whatever transport it runs on, and a
                 # label that overclaims makes the hit-rate lie.
-                control.report_continuity("hot" if was_alive else "warm_native")
+                _report_continuity("hot" if was_alive else "warm_native")
     if session is None and resident is not None:
         # The restart rung over the resident workspace (design §7): a fresh
         # process resumed with ``--resume``, on this attempt's own token —
@@ -1324,6 +1552,8 @@ def _run_agent(
                 raise DriverError(f"the {job.runtime!r} driver has no resident turns")
             session = launch_resident(context, session_id=resident.session_id)
         except DriverError as exc:
+            if strict_native_resume:
+                raise
             # Fall through to the ladder in the same tree.
             control.append_event(
                 NormalizedEvent("lifecycle", {"phase": "warm_fallback", "detail": str(exc)[:200]})
@@ -1335,7 +1565,7 @@ def _run_agent(
                 model=job.model,
                 reasoning_effort=job.reasoning_effort,
             )
-            control.report_continuity("warm_native")
+            _report_continuity("warm_native")
     if session is None and state is not None:
         try:
             session = driver.launch(context, state)
@@ -1353,7 +1583,7 @@ def _run_agent(
                 model=job.model,
                 reasoning_effort=job.reasoning_effort,
             )
-            control.report_continuity("cold_native")
+            _report_continuity("cold_native")
     if session is None:
         session = driver.launch(context)
         turn_input = TurnInput(
@@ -1361,7 +1591,15 @@ def _run_agent(
             model=job.model,
             reasoning_effort=job.reasoning_effort,
         )
-        control.report_continuity("replay")
+        if context_status == "new":
+            # A first turn has no earlier context to replay or restore. Keep
+            # the diagnostic rung empty instead of showing a false "replay"
+            # warning in the existing UI.
+            report_context = getattr(control, "report_context_status", None)
+            if report_context is not None:
+                report_context("new")
+        else:
+            _report_continuity("replay")
     if turn is None:
         assert turn_input is not None
         if state_dir is not None:
@@ -1456,7 +1694,12 @@ def _run_agent(
             live_out["session_id"] = getattr(session.runtime, "session_id", None)
             if bool(getattr(session, "process_alive", lambda: False)()):
                 live_out["session"] = session
-        if result.status == "completed" and state_dir is not None:
+        if (
+            result.status == "completed"
+            and state_dir is not None
+            and export_checkpoint
+            and driver.capabilities().checkpoint_export
+        ):
             # Every settled turn exports (design §6): this is COLD's substrate and
             # HOT's crash insurance. Failure is non-fatal — the user's work is the
             # patch, and losing a checkpoint costs one replay, not the turn — but
@@ -1487,6 +1730,1422 @@ def _run_agent(
                 fresh_live.close()
 
 
+def _configured_restartable_runtimes() -> set[str]:
+    """Return the explicit retained-runtime gate, defaulting to every adapter."""
+    raw = os.environ.get("AGENT_RESTARTABLE_RUNTIMES")
+    if not raw:
+        return set(registered_runtimes())
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _configured_shared_live_runtimes() -> set[str]:
+    """Return the exact runtimes explicitly admitted to the shared protocol."""
+    raw = os.environ.get("AGENT_SHARED_LIVE_RUNTIMES")
+    if not raw:
+        return set(registered_runtimes())
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _shared_live_feature_enabled() -> bool:
+    """Whether this host opted into creating new shared-live sandbox groups."""
+    return os.environ.get("AGENT_SHARED_LIVE_SANDBOX", "") not in ("", "0")
+
+
+def _shared_live_host_capabilities(
+    backend: SandboxBackend,
+    stamp: dict[str, Any],
+) -> list[str]:
+    """Advertise shared-v1 only when this exact host can honor its contract."""
+    if not _shared_live_feature_enabled() or not isinstance(backend, ContainerBackend):
+        return []
+    try:
+        slots = int(os.environ.get("AGENT_HOST_SLOTS") or 0)
+    except ValueError:
+        return []
+    if slots < 2:
+        return []
+    try:
+        resident_capacity = int(os.environ.get("AGENT_SHARED_RESIDENT_CAPACITY") or 8)
+    except ValueError:
+        return []
+    if not 2 <= resident_capacity <= 128:
+        return []
+    if not (os.environ.get("AGENT_WORKSPACE_BROKER_URL") or "").strip():
+        return []
+    if not (os.environ.get("AGENT_WORKSPACE_BROKER_TOKEN") or "").strip():
+        return []
+    digest = stamp.get("sandbox_image_digest")
+    if not isinstance(digest, str) or not digest.strip():
+        return []
+    if stamp.get("shared_sandbox_protocol") != SHARED_SANDBOX_PROTOCOL:
+        return []
+    versions = stamp.get("runtime_versions")
+    if not isinstance(versions, dict) or any(
+        versions.get(runtime_id) != version
+        for runtime_id, version in SHARED_SANDBOX_RUNTIME_PINS.items()
+    ):
+        return []
+    helpers = stamp.get("helper_versions")
+    if not isinstance(helpers, dict) or any(
+        helpers.get(helper_id) != version
+        for helper_id, version in SHARED_SANDBOX_HELPER_PINS.items()
+    ):
+        return []
+    for runtime_id in _configured_shared_live_runtimes():
+        try:
+            capabilities = driver_for(get_runtime(runtime_id)).capabilities()
+        except KeyError:
+            return []
+        if (
+            capabilities.resident_transport != "supervisor_live"
+            or capabilities.fork != "latest_immediate"
+            or not capabilities.concurrent_shared_workspace
+        ):
+            return []
+    return ["shared-sandbox-v1"]
+
+
+def _claim_attestation(backend: SandboxBackend) -> dict[str, Any]:
+    """Build the exact-replica claim proof, including local rollout config."""
+    stamper = getattr(backend, "version_stamp", None)
+    stamp: dict[str, Any] = stamper() if stamper is not None else {}
+    # ``version_stamp`` proves the immutable image. This separately proves the
+    # polling process has the feature flag, broker, slots and driver surfaces
+    # needed to use it; a sibling replica's host heartbeat cannot stand in for
+    # those process-local facts during a rolling deployment.
+    stamp["runner_capabilities"] = _shared_live_host_capabilities(backend, stamp)
+    return stamp
+
+
+def _retained_lifecycle_enabled() -> bool:
+    """Whether either retained protocol needs host lifecycle reconciliation."""
+    return _shared_live_feature_enabled() or os.environ.get(
+        "AGENT_RESTARTABLE_SANDBOX", ""
+    ) not in ("", "0")
+
+
+def _shared_live_runtime_enabled(job: ClaimedJob) -> bool:
+    """Route an existing shared member or a capability-gated new chat."""
+    existing = job.thread_sandbox or {}
+    if job.thread_sandbox is not None:
+        # Durable ownership wins over a later rollout-flag change. Silently
+        # switching either direction would create a second workspace.
+        return existing.get("shared_live") is True
+    return _shared_live_feature_enabled() and job.runtime in _configured_shared_live_runtimes()
+
+
+def _restartable_mode_covers_every_runtime() -> bool:
+    """Whether this runner has no legacy job path that needs a host bind."""
+    if _shared_live_feature_enabled() and set(registered_runtimes()) <= (
+        _configured_shared_live_runtimes()
+    ):
+        return True
+    if os.environ.get("AGENT_RESTARTABLE_SANDBOX", "") in ("", "0"):
+        return False
+    return set(registered_runtimes()) <= _configured_restartable_runtimes()
+
+
+def _restartable_runtime_enabled(job: ClaimedJob) -> bool:
+    """Whether this turn belongs on the staged retained-container path."""
+    if _shared_live_runtime_enabled(job):
+        return True
+    if job.thread_sandbox is not None:
+        # Once a thread owns Docker-only local state, falling back to a fresh
+        # legacy worktree would be silent context loss. The durable row wins
+        # over a later flag change; rollback must drain/migrate explicitly.
+        return True
+    if os.environ.get("AGENT_RESTARTABLE_SANDBOX", "") in ("", "0"):
+        return False
+    return job.runtime in _configured_restartable_runtimes()
+
+
+def _session_supervisor_from_env() -> SessionSupervisorClient:
+    url = (os.environ.get("AGENT_WORKSPACE_BROKER_URL") or "").strip()
+    token = (os.environ.get("AGENT_WORKSPACE_BROKER_TOKEN") or "").strip()
+    if not url or not token:
+        raise SandboxError(
+            "restartable chat execution needs AGENT_WORKSPACE_BROKER_URL and "
+            "AGENT_WORKSPACE_BROKER_TOKEN"
+        )
+    return SessionSupervisorClient(url, token, timeout=180)
+
+
+def _retained_sandbox_heartbeat_rows() -> list[dict[str, Any]] | None:
+    """Read Docker truth from the host singleton without breaking host beats.
+
+    The host heartbeat must remain a liveness signal even while the workspace
+    broker is restarting. Returning ``None`` means "not observed this beat";
+    it must never be confused with an authoritative empty list or deletion.
+    """
+    client: SessionSupervisorClient | None = None
+    try:
+        client = _session_supervisor_from_env()
+        rows = client.list()
+        observations: list[dict[str, Any]] = []
+        now = time.monotonic()
+        idle_timeout_s = _chat_idle_timeout_s()
+        for row in rows[:4096]:
+            shared_live = bool(row.get("shared_live"))
+            members = (
+                [dict(item) for item in row.get("members") or [] if isinstance(item, dict)]
+                if shared_live
+                else []
+            )
+            activation_generation = int(row["activation_generation"])
+            running = bool(row["running"])
+            active = (bool(row.get("group_busy")) if shared_live else bool(row.get("busy"))) or int(
+                row.get("terminal_count") or 0
+            ) > 0
+            active = active or int(row.get("operation_count") or 0) > 0
+            active = active or bool(row.get("workspace_suspended"))
+            deadline = row.get("idle_deadline_monotonic")
+            # A reconstructed generation-zero entry is unknown while merely
+            # RUNNING.  Its empty local token set nevertheless needs one
+            # durable recovery window: a broker may have restarted after a
+            # terminal cleared the database deadline, and reporting nothing
+            # forever would leak that container in RUNNING. The control plane
+            # accepts this generation-zero idle window only when no attempt
+            # owns the sandbox and its deadline is still NULL, so repeated
+            # heartbeats neither stop an active turn nor extend the window.
+            reconstructed_idle = (
+                activation_generation == 0 and running and not active and deadline is None
+            )
+            activity_known = (
+                activation_generation > 0 or active or deadline is not None or reconstructed_idle
+            )
+            idle_remaining = None
+            if activity_known and deadline is not None:
+                idle_remaining = max(0.0, float(deadline) - now)
+            elif reconstructed_idle:
+                idle_remaining = idle_timeout_s
+            observations.append(
+                {
+                    "thread_id": str(row["thread_id"]),
+                    "sandbox_id": str(row["sandbox_id"]),
+                    "container_id": str(row["container_id"]),
+                    "generation": int(row["generation"]),
+                    "activation_generation": activation_generation,
+                    "running": running,
+                    "activity_active": active if activity_known else None,
+                    "idle_remaining_seconds": idle_remaining,
+                    "shared_live": shared_live,
+                    "members": members,
+                }
+            )
+        return observations
+    except (KeyError, TypeError, ValueError, SandboxError, SessionSupervisorError) as exc:
+        print(
+            f"agent runner: retained sandbox observation unavailable: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+    finally:
+        if client is not None:
+            client.close()
+
+
+def _stop_retained_sandboxes(commands: list[dict[str, Any]]) -> None:
+    """Apply durable settled-idle stop commands without breaking host beats."""
+    client: SessionSupervisorClient | None = None
+    try:
+        client = _session_supervisor_from_env()
+        for command in commands:
+            try:
+                if command.get("shared_live"):
+                    client.stop_shared_idle(
+                        str(command["thread_id"]),
+                        generation=int(command["generation"]),
+                        reason=str(command.get("reason") or "idle"),
+                    )
+                else:
+                    client.stop_idle(
+                        str(command["thread_id"]),
+                        generation=int(command["generation"]),
+                        activation_generation=int(command["activation_generation"]),
+                        reason=str(command.get("reason") or "idle"),
+                    )
+            except (KeyError, TypeError, ValueError, SessionSupervisorError) as exc:
+                # A stale command is expected during a racing acquire. The
+                # next heartbeat reports fresh Docker state and the durable
+                # predicate decides again; never fail host liveness for it.
+                print(
+                    f"agent runner: retained idle stop was not applied: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+    except (SandboxError, SessionSupervisorError) as exc:
+        print(
+            f"agent runner: retained idle stop unavailable: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+    finally:
+        if client is not None:
+            client.close()
+
+
+def _handle_host_residencies_lost(
+    residents: ResidentPool,
+    lost: list[dict[str, Any]],
+) -> None:
+    """Fence both legacy runner entries and supervisor-owned shared members."""
+    residents.handle_lost(lost)
+    client: SessionSupervisorClient | None = None
+    try:
+        client = _session_supervisor_from_env()
+        shared_members = {
+            str(member.get("thread_id"))
+            for row in client.list()
+            if row.get("shared_live")
+            for member in row.get("members") or []
+            if isinstance(member, dict) and member.get("thread_id")
+        }
+        for item in lost:
+            thread_id = str(item.get("thread_id") or "")
+            generation = item.get("generation")
+            if thread_id not in shared_members or not isinstance(generation, int):
+                continue
+            with contextlib.suppress(SessionSupervisorError):
+                client.shared_residency_lost(thread_id, generation=generation)
+    except (SandboxError, SessionSupervisorError) as exc:
+        print(
+            f"agent runner: shared residency cleanup unavailable: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+    finally:
+        if client is not None:
+            client.close()
+
+
+def _prepare_retained_checkout(
+    *,
+    job: ClaimedJob,
+    manager: ChatSandboxManager,
+    spec: ChatSandboxSpec,
+) -> str:
+    """Clone outside the chat, scrub credentials, then stream a normalized tar."""
+    with tempfile.TemporaryDirectory(prefix="freeinference-source-") as source:
+        base_sha = prepare_worktree(
+            workdir=source,
+            repo=job.repo,
+            base_sha=job.base_sha,
+            clone_token=job.clone_token,
+            remote_base=repo_clone_base_url(clone_token=job.clone_token),
+        )
+        checkout_output_branch(source, job.thread_id or job.job_id)
+        archive = build_source_archive(
+            source,
+            uid=manager.backend.uid,
+            gid=manager.backend.gid,
+        )
+        manager.import_archive(spec, CHAT_WORKDIR, archive)
+    return base_sha
+
+
+def _import_retained_base(
+    *,
+    job: ClaimedJob,
+    manager: ChatSandboxManager,
+    spec: ChatSandboxSpec,
+) -> str:
+    """Fetch a follow-up base outside the sandbox and import objects only."""
+    with tempfile.TemporaryDirectory(prefix="freeinference-base-") as source:
+        resolved = prepare_worktree(
+            workdir=source,
+            repo=job.repo,
+            base_sha=job.base_sha,
+            clone_token=job.clone_token,
+            remote_base=repo_clone_base_url(clone_token=job.clone_token),
+        )
+        bundle = build_base_bundle(source, commit=resolved)
+        manager.import_base_bundle(
+            spec,
+            bundle,
+            commit=resolved,
+            env=dict(_SAFE_DIRECTORY_ENV),
+        )
+    return resolved
+
+
+def _retained_head(backend: RetainedChatBackend) -> str:
+    process = backend.spawn(
+        SandboxSpec(
+            argv=["git", "rev-parse", "HEAD"],
+            workdir=CHAT_WORKDIR,
+            env=dict(_SAFE_DIRECTORY_ENV),
+        )
+    )
+    return _read_bounded(process, deadline_s=_GIT_TIMEOUT_S, max_bytes=65536).strip()
+
+
+def _verified_native_session_id(
+    *,
+    previous_session_id: str | None,
+    observed_session_id: str | None,
+    has_context: bool,
+) -> str:
+    """Return the exact CLI locator only when native continuity was proved.
+
+    A successful exit is not enough for a retained follow-up: some CLIs can
+    recover from an invalid ``resume`` argument by creating a fresh session.
+    Accepting that process would silently turn RESTORED/LIVE into transcript-
+    free context loss. Every supported adapter reports its native locator, so
+    resumed turns must report the same one they were asked to continue.
+    """
+    observed = str(observed_session_id or "").strip()
+    if not observed:
+        raise SandboxError("Agent CLI completed without a native session locator")
+    previous = str(previous_session_id or "").strip()
+    if has_context and observed != previous:
+        raise SandboxError(
+            "Agent CLI resumed a different native session "
+            f"(expected {previous!r}, observed {observed!r})"
+        )
+    return observed
+
+
+def _shared_group_manifest(reservation: dict[str, Any], *, thread_id: str) -> list[dict[str, Any]]:
+    """Project the durable member manifest onto the broker's strict wire shape."""
+    raw = reservation.get("group_members")
+    members = [dict(item) for item in raw or [] if isinstance(item, dict)]
+    if not members:
+        members = [dict(reservation)]
+    allowed = {
+        "thread_id",
+        "native_session_id",
+        "context_status",
+        "activation_generation",
+        "process_generation",
+        "residency_generation",
+        "resident_state",
+        "resident_slot_id",
+        "last_settled_job_id",
+    }
+    projected = [
+        {key: value for key, value in member.items() if key in allowed} for member in members
+    ]
+    if not any(member.get("thread_id") == thread_id for member in projected):
+        raise SandboxError("shared sandbox manifest omitted the claimed chat")
+    for member in projected:
+        if member.get("resident_slot_id") is None:
+            raise SandboxError("shared sandbox manifest contains an unassigned resident slot")
+    return projected
+
+
+def _stream_shared_agent_turn(
+    *,
+    supervisor: SessionSupervisorClient,
+    job: ClaimedJob,
+    control: ControlPlane,
+    heart: Heartbeater,
+    lease_token: str,
+    timeout_s: float,
+) -> tuple[int, str, list[str], dict[str, Any] | None]:
+    """Relay exactly one broker-framed member turn under its attempt fence."""
+    stream = supervisor.start_shared_turn(
+        job.thread_id or "",
+        token=lease_token,
+        prompt=job.task_prompt,
+        model=job.model,
+        reasoning_effort=job.reasoning_effort,
+    )
+    frames: queue.Queue[dict[str, Any] | None] = queue.Queue()
+
+    def pump() -> None:
+        try:
+            for frame in stream.frames():
+                frames.put(frame)
+        except Exception as exc:
+            frames.put({"kind": "client_error", "detail": str(exc)[:1000]})
+        finally:
+            frames.put(None)
+
+    reader = threading.Thread(target=pump, daemon=True, name="shared-agent-stream")
+    reader.start()
+    deadline = time.monotonic() + timeout_s
+    tail: list[str] = []
+    tool_errors: list[str] = []
+    denied_hosts: set[str] = set()
+    result_frame: dict[str, Any] | None = None
+    try:
+        while True:
+            if heart.lease_lost:
+                with contextlib.suppress(Exception):
+                    supervisor.interrupt_shared(job.thread_id or "", token=lease_token)
+                raise LeaseLost("lease lost while the shared Agent CLI was running")
+            if heart.cancel_requested:
+                with contextlib.suppress(Exception):
+                    supervisor.interrupt_shared(job.thread_id or "", token=lease_token)
+                control.append_event(NormalizedEvent("lifecycle", {"phase": "cancelled_by_owner"}))
+                return 130, "".join(tail), tool_errors, result_frame
+            if time.monotonic() > deadline:
+                with contextlib.suppress(Exception):
+                    supervisor.interrupt_shared(job.thread_id or "", token=lease_token)
+                control.append_event(
+                    NormalizedEvent("error", {"text": f"agent exceeded {timeout_s:.0f}s"})
+                )
+                return 124, "".join(tail), tool_errors, result_frame
+            try:
+                frame = frames.get(timeout=_POLL_INTERVAL_S)
+            except queue.Empty:
+                continue
+            if frame is None:
+                break
+            kind = frame.get("kind")
+            if kind == "event":
+                raw_line = frame.get("raw_line")
+                if isinstance(raw_line, str):
+                    tail.append(raw_line)
+                    del tail[:-40]
+                event_type = str(frame.get("event_type") or "")
+                payload = frame.get("payload")
+                if not isinstance(payload, dict):
+                    payload = {}
+                if event_type == "tool_result" and payload.get("is_error"):
+                    content = str(payload.get("content") or "")
+                    tool_errors.append(content[:200])
+                    blocked = detect_blocked_egress(content)
+                    if blocked and blocked not in denied_hosts:
+                        denied_hosts.add(blocked)
+                        control.append_event(NormalizedEvent("error", {"host": blocked}))
+                if event_type and event_type != LINE:
+                    control.append_event(NormalizedEvent(event_type, payload))
+                continue
+            if kind == "result":
+                result_frame = frame
+                stderr = str(frame.get("stderr") or "")
+                if stderr.strip():
+                    tail.append(stderr[-2000:])
+                continue
+            if kind in {"error", "client_error"}:
+                raise SessionSupervisorError(502, str(frame.get("detail") or "shared turn failed"))
+            raise SessionSupervisorError(502, "shared turn returned an unknown frame")
+        if result_frame is None:
+            raise SessionSupervisorError(502, "shared turn ended without a result")
+        status = str(result_frame.get("status") or "failed")
+        exit_code = int(result_frame.get("exit_code") or 0)
+        if status == "cancelled":
+            exit_code = 130
+        elif status != "completed" and exit_code == 0:
+            exit_code = 1
+        if tool_errors:
+            control.append_event(
+                NormalizedEvent(
+                    "error",
+                    {
+                        "detail": f"{len(tool_errors)} tool call(s) failed",
+                        "first": tool_errors[0],
+                    },
+                )
+            )
+        return exit_code, "".join(tail), tool_errors, result_frame
+    finally:
+        stream.close()
+
+
+def _run_shared_live_attempt(
+    *,
+    runtime: AgentRuntime,
+    job: ClaimedJob,
+    control: ControlPlane,
+    heart: Heartbeater,
+    backend: SandboxBackend,
+    host: str | None,
+    gateway_base_url: str,
+    agent_timeout_s: float,
+    finish_attempt: Any,
+) -> int:
+    """Deliver one chat turn to its supervisor-owned resident CLI member."""
+    if not isinstance(backend, ContainerBackend):
+        finish_attempt("failed", "shared live chats require the container or kata backend")
+        return 2
+    if not host or not job.thread_id:
+        finish_attempt("failed", "shared live chats require an enrolled host and thread id")
+        return 2
+    driver = driver_for(runtime)
+    if getattr(driver, "launch_live", None) is None:
+        finish_attempt("failed", f"runtime {job.runtime!r} has no shared live transport")
+        return 2
+
+    manager = ChatSandboxManager(backend)
+    stamp = backend.version_stamp()
+    existing = job.thread_sandbox or {}
+    if existing and existing.get("shared_live") is not True:
+        finish_attempt(
+            "failed", "a legacy retained chat cannot be upgraded to shared-live in place"
+        )
+        return 2
+    if not existing and not str(stamp.get("sandbox_image_digest") or "").strip():
+        finish_attempt("failed", "shared live chat creation requires an inspected image digest")
+        return 2
+    if existing and existing.get("runtime_id") != job.runtime:
+        finish_attempt(
+            "failed",
+            f"this shared chat is pinned to runtime {existing.get('runtime_id')!r}",
+        )
+        return 2
+    if existing and existing.get("execution_profile") != job.execution_profile:
+        finish_attempt("failed", "shared chat execution profile cannot change in place")
+        return 2
+
+    capacity = int(
+        existing.get("resident_slot_capacity")
+        or os.environ.get("AGENT_SHARED_RESIDENT_CAPACITY")
+        or 8
+    )
+    if not 2 <= capacity <= 128:
+        finish_attempt("failed", "shared resident capacity must be between 2 and 128")
+        return 2
+    sandbox_id = str(existing.get("sandbox_id") or f"asbx_{secrets.token_hex(16)}")
+    origin_thread_id = str(existing.get("origin_thread_id") or job.thread_id)
+    seed_spec = ChatSandboxSpec(
+        thread_id=origin_thread_id,
+        sandbox_id=sandbox_id,
+        generation=int(existing.get("generation") or 1),
+        runtime_id=str(existing.get("runtime_id") or job.runtime),
+        runtime_version=(existing.get("runtime_version") if existing else job.runtime_version),
+        sandbox_image_digest=(
+            existing.get("sandbox_image_digest")
+            if existing
+            else (stamp.get("sandbox_image_digest") or None)
+        ),
+        shared_live=True,
+        resident_slot_capacity=capacity,
+    )
+    if existing:
+        if existing.get("host") != host:
+            finish_attempt("failed", "shared chat was claimed on the wrong host")
+            return 2
+        if existing.get("container_name") != seed_spec.container_name:
+            finish_attempt("failed", "shared chat container identity does not match its labels")
+            return 2
+
+    try:
+        reservation = control.reserve_chat_sandbox(
+            {
+                "sandbox_id": seed_spec.sandbox_id,
+                "container_name": seed_spec.container_name,
+                "runtime_id": seed_spec.runtime_id,
+                "runtime_version": seed_spec.runtime_version,
+                "sandbox_image_digest": seed_spec.sandbox_image_digest,
+                "execution_profile": job.execution_profile,
+                "host": host,
+                "shared_live": True,
+                "resident_slot_capacity": capacity,
+                "memory_limit": seed_spec.memory_limit,
+                "cpu_limit": seed_spec.cpu_limit,
+                "stop_timeout_seconds": seed_spec.stop_timeout_s,
+            }
+        )
+    except LeaseLost:
+        return 3
+    except Exception as exc:
+        finish_attempt("failed", f"could not reserve shared chat sandbox: {exc}")
+        return 2
+
+    spec = ChatSandboxSpec(
+        thread_id=str(reservation.get("origin_thread_id") or origin_thread_id),
+        sandbox_id=str(reservation["sandbox_id"]),
+        generation=int(reservation["generation"]),
+        runtime_id=str(reservation["runtime_id"]),
+        runtime_version=reservation.get("runtime_version"),
+        sandbox_image_digest=reservation.get("sandbox_image_digest"),
+        shared_live=True,
+        resident_slot_capacity=int(reservation.get("resident_slot_capacity") or capacity),
+        memory_limit=str(reservation.get("memory_limit") or seed_spec.memory_limit),
+        cpu_limit=str(reservation.get("cpu_limit") or seed_spec.cpu_limit),
+        stop_timeout_s=int(reservation.get("stop_timeout_seconds") or seed_spec.stop_timeout_s),
+    )
+    activation_generation = int(reservation["activation_generation"])
+    has_context = bool(reservation.get("last_settled_job_id"))
+    native_session_id = str(reservation.get("native_session_id") or "").strip() or None
+    manifest = _shared_group_manifest(reservation, thread_id=job.thread_id)
+    supervisor: SessionSupervisorClient | None = None
+    lease_token: str | None = None
+    settled = False
+    abandoned = False
+    turn_admitted = False
+    terminals_suspended = False
+    context_invalid = False
+    failure_detail: str | None = None
+    context_status = "restored" if has_context else "new"
+    idle_timeout_s = _chat_idle_timeout_s()
+
+    def abandon_before_finish(*, lost: bool, detail: str | None) -> None:
+        nonlocal abandoned
+        if abandoned or settled:
+            return
+        if supervisor is not None and lease_token is not None:
+            with contextlib.suppress(Exception):
+                supervisor.abandon_shared(job.thread_id or "", token=lease_token, lost=lost)
+        with contextlib.suppress(Exception):
+            control.abandon_chat_sandbox(
+                sandbox_generation=spec.generation,
+                activation_generation=activation_generation,
+                lost=lost,
+                detail=detail,
+                idle_timeout_seconds=idle_timeout_s,
+            )
+        abandoned = True
+
+    try:
+        supervisor = _session_supervisor_from_env()
+        try:
+            lease = supervisor.acquire_shared(
+                spec,
+                thread_id=job.thread_id,
+                activation_generation=activation_generation,
+                owner=f"attempt:{job.attempt_id}",
+                has_settled_context=has_context,
+                members=manifest,
+                expected_container_id=reservation.get("container_id"),
+            )
+        except SessionSupervisorError as exc:
+            context_invalid = has_context and exc.status_code == 410
+            raise
+        lease_token = str(lease["token"])
+        if int(lease["activation_generation"]) != activation_generation:
+            raise SandboxError("shared supervisor returned the wrong activation generation")
+        if reservation.get("container_id") not in {None, lease.get("container_id")}:
+            raise SandboxError("shared supervisor returned a replacement chat container")
+        context_status = str(lease.get("context_status") or context_status)
+        if context_status not in {"new", "live", "restored"}:
+            raise SandboxError(f"shared supervisor returned invalid context {context_status!r}")
+        running = control.mark_chat_sandbox_running(
+            sandbox_generation=spec.generation,
+            activation_generation=activation_generation,
+            container_id=str(lease["container_id"]),
+            context_status=context_status,
+        )
+        retained = RetainedChatBackend(manager, spec)
+        control.append_event(
+            NormalizedEvent(
+                "lifecycle",
+                {
+                    "phase": "started",
+                    "runtime": job.runtime,
+                    "attempt_no": job.attempt_no,
+                    "context_status": context_status,
+                    "resident_state": lease.get("resident_state"),
+                    "workspace_shared": True,
+                    "container_id": lease["container_id"],
+                    "activation_generation": activation_generation,
+                    **retained.sandbox_metadata(),
+                },
+            )
+        )
+        control.suspend_terminals("workspace_preparing")
+        terminals_suspended = True
+
+        if not has_context:
+            manager.reset_unsettled_state(spec)
+            base_sha = _prepare_retained_checkout(job=job, manager=manager, spec=spec)
+            reused_workspace = False
+            if job.setup_script:
+                setup = run_setup(
+                    script=job.setup_script,
+                    workdir=CHAT_WORKDIR,
+                    repo=job.repo,
+                    backend=retained,
+                    cache=None,
+                )
+                control.append_event(
+                    NormalizedEvent(
+                        "lifecycle",
+                        {"phase": "setup", "cached": False, "ran": setup.ran},
+                    )
+                )
+                if setup.exit_code != 0:
+                    failure_detail = f"setup failed ({setup.exit_code}): {setup.detail}"
+                    abandon_before_finish(lost=False, detail=failure_detail)
+                    finish_attempt("failed", failure_detail, base_sha=base_sha)
+                    return 1
+            manager.prepare_shared_workspace(spec)
+        else:
+            if not native_session_id:
+                context_invalid = True
+                raise SandboxError("shared chat has no native Agent CLI session locator")
+            if not _resident_base_ready(CHAT_WORKDIR, job, retained):
+                imported_base = _import_retained_base(job=job, manager=manager, spec=spec)
+                if not _resident_base_ready(CHAT_WORKDIR, job, retained):
+                    context_invalid = True
+                    raise SandboxError("shared chat cannot resolve its pinned base commit")
+                control.append_event(
+                    NormalizedEvent(
+                        "lifecycle",
+                        {
+                            "phase": "base_imported",
+                            "base_sha": imported_base,
+                            "workspace_head_preserved": True,
+                        },
+                    )
+                )
+            base_sha = job.base_sha or _retained_head(retained)
+            reused_workspace = True
+        control.append_event(
+            NormalizedEvent(
+                "lifecycle",
+                {
+                    "phase": "checked_out",
+                    "base_sha": base_sha,
+                    "reused": reused_workspace,
+                    "storage": "docker_writable_layer",
+                    "workspace_shared": True,
+                },
+            )
+        )
+
+        version_problem = runtime_version_unavailable(job, retained)
+        if version_problem is not None:
+            failure_detail = version_problem
+            abandon_before_finish(lost=False, detail=failure_detail)
+            finish_attempt("failed", failure_detail, base_sha=base_sha)
+            return 1
+        if not retained.has_binary(runtime.binary):
+            failure_detail = f"runtime binary {runtime.binary!r} is not installed"
+            abandon_before_finish(lost=False, detail=failure_detail)
+            finish_attempt("failed", failure_detail, base_sha=base_sha)
+            return 2
+
+        if has_context:
+            manager.require_network_phase(spec, "agent")
+        else:
+            manager.transition_to_agent_network(spec)
+        control.resume_terminals()
+        terminals_suspended = False
+
+        slot_id = int(running.get("resident_slot_id") or reservation.get("resident_slot_id") or 0)
+        launch = ResidentLaunch(
+            thread_id=job.thread_id,
+            runtime_id=job.runtime,
+            runtime_version=job.runtime_version,
+            native_session_id=native_session_id,
+            model=job.model,
+            reasoning_effort=job.reasoning_effort,
+            gateway_base_url=gateway_base_url,
+            credential=None,
+            mcp_server_ids=tuple(job.mcp_servers),
+            # The MCP relay token is attempt-fenced. It is process-fixed only
+            # when this turn actually exposes MCP endpoints; carrying an
+            # otherwise-unused fresh token here would restart every ordinary
+            # no-MCP chat and falsely erase HOT continuity.
+            mcp_base_url=job.mcp_base_url if job.mcp_servers else "",
+            mcp_credential=job.mcp_token if job.mcp_servers else "",
+            slot_id=slot_id,
+            residency_generation=int(running.get("residency_generation") or 0),
+        )
+        resident_descriptor: dict[str, Any] | None = None
+        if lease.get("resident_state") == "live":
+            try:
+                resident_descriptor = supervisor.ensure_shared_resident(
+                    job.thread_id,
+                    token=lease_token,
+                    launch=launch,
+                )
+            except SessionSupervisorError:
+                # A process-fixed model/MCP setting changed, the process died,
+                # or this broker restarted. Rotate only this member's grant and
+                # resume its exact native session below.
+                resident_descriptor = None
+        if resident_descriptor is None:
+            residency = control.establish_shared_residency(
+                sandbox_id=spec.sandbox_id,
+                runtime_id=job.runtime,
+                runtime_version=job.runtime_version,
+            )
+            credential = str(residency.get("credential") or "")
+            if not credential:
+                raise SandboxError("control plane returned no shared residency credential")
+            grant_model = residency.get("model")
+            if grant_model not in {None, job.model}:
+                raise SandboxError("shared residency grant model does not match this turn")
+            launch = replace(
+                launch,
+                credential=credential,
+                residency_generation=int(residency["generation"]),
+            )
+            resident_descriptor = supervisor.ensure_shared_resident(
+                job.thread_id,
+                token=lease_token,
+                launch=launch,
+            )
+        context_status = str(resident_descriptor.get("context_status") or context_status)
+        if context_status not in {"new", "live", "restored"}:
+            raise SandboxError(
+                f"shared supervisor returned invalid resident context {context_status!r}"
+            )
+        process_generation = int(resident_descriptor["process_generation"])
+        control.record_chat_process(
+            sandbox_generation=spec.generation,
+            activation_generation=activation_generation,
+            process_generation=process_generation,
+        )
+        if context_status == "live":
+            control.report_continuity("hot", context_status="live")
+        elif has_context:
+            control.report_continuity("warm_native", context_status="restored")
+        else:
+            control.report_context_status("new")
+
+        control.admit_chat_turn(
+            sandbox_generation=spec.generation,
+            activation_generation=activation_generation,
+        )
+        turn_admitted = True
+        sampler = ResourceSampler(None)
+        try:
+            exit_code, tail, tool_errors, _ = _stream_shared_agent_turn(
+                supervisor=supervisor,
+                job=job,
+                control=control,
+                heart=heart,
+                lease_token=lease_token,
+                timeout_s=agent_timeout_s,
+            )
+        finally:
+            # Container totals include concurrent siblings and must not be
+            # duplicated as this member's usage. Report explicit zero coverage
+            # until process-tree accounting lands.
+            with contextlib.suppress(Exception):
+                control.report_resources(sampler.stop())
+        if exit_code == 130:
+            failure_detail = "cancelled by owner after shared-session admission"
+            abandon_before_finish(lost=True, detail=failure_detail)
+            finish_attempt("cancelled", "cancelled by owner", base_sha=base_sha)
+            return 0
+        if exit_code == 124:
+            failure_detail = "shared Agent CLI turn exceeded its execution timeout"
+            abandon_before_finish(lost=True, detail=failure_detail)
+            finish_attempt("failed", failure_detail, base_sha=base_sha)
+            return 1
+        if exit_code != 0:
+            failure_detail = f"agent exited {exit_code}: {tail[-500:]}"
+            abandon_before_finish(lost=True, detail=failure_detail)
+            finish_attempt("failed", failure_detail, base_sha=base_sha)
+            return 1
+        if tool_errors:
+            # Match the existing conservative no-change rule only after a
+            # publication snapshot can attribute the shared diff. A successful
+            # shared turn may race a sibling, so tool errors alone do not prove
+            # this member produced no useful state.
+            control.append_event(
+                NormalizedEvent(
+                    "lifecycle",
+                    {"phase": "shared_tool_errors_observed", "count": len(tool_errors)},
+                )
+            )
+
+        local_settle = supervisor.settle_shared(
+            job.thread_id,
+            token=lease_token,
+            job_id=job.job_id,
+            context_status=context_status,
+        )
+        settled_session_id = str(local_settle.get("native_session_id") or "").strip()
+        if not settled_session_id:
+            raise SandboxError("shared supervisor settled without a native session locator")
+        control.settle_chat_sandbox(
+            sandbox_generation=spec.generation,
+            activation_generation=activation_generation,
+            context_status=context_status,
+            native_session_id=settled_session_id,
+            base_sha=base_sha,
+            idle_timeout_seconds=idle_timeout_s,
+        )
+        settled = True
+        control.append_event(
+            NormalizedEvent(
+                "lifecycle",
+                {
+                    "phase": "shared_workspace_settled",
+                    "workspace_shared": True,
+                    "publication": "pending_snapshot",
+                },
+            )
+        )
+        finish_attempt(
+            "succeeded",
+            "agent completed (shared workspace; publication snapshot pending)",
+            base_sha=base_sha,
+        )
+        return 0
+    except LeaseLost:
+        failure_detail = "attempt lease lost during shared live execution"
+        return 3
+    except (DriverError, SandboxError, SessionSupervisorError, WorktreeError) as exc:
+        failure_detail = str(exc)
+        abandon_before_finish(lost=turn_admitted or context_invalid, detail=failure_detail)
+        with contextlib.suppress(Exception):
+            control.append_event(NormalizedEvent("error", {"text": failure_detail[:1000]}))
+            finish_attempt("failed", failure_detail[:1000])
+        return 2
+    except Exception as exc:
+        failure_detail = f"shared live chat failed unexpectedly: {exc}"
+        abandon_before_finish(lost=turn_admitted, detail=failure_detail)
+        with contextlib.suppress(Exception):
+            control.append_event(NormalizedEvent("error", {"text": failure_detail[:1000]}))
+            finish_attempt("failed", failure_detail[:1000])
+        return 2
+    finally:
+        if not settled and not abandoned:
+            abandon_before_finish(lost=turn_admitted or context_invalid, detail=failure_detail)
+        if supervisor is not None:
+            supervisor.close()
+        if terminals_suspended:
+            with contextlib.suppress(Exception):
+                control.resume_terminals()
+
+
+def _run_retained_attempt(
+    *,
+    runtime: AgentRuntime,
+    job: ClaimedJob,
+    control: ControlPlane,
+    heart: Heartbeater,
+    backend: SandboxBackend,
+    host: str | None,
+    gateway_base_url: str,
+    agent_timeout_s: float,
+    finish_attempt: Any,
+) -> int:
+    """Run one turn in its thread's Docker-owned retained container.
+
+    This is intentionally capability-gated to the five pinned native-session
+    drivers. A runtime that cannot prove native resume is left on the legacy
+    path before it creates a sandbox row; an existing retained row that loses
+    that capability fails loudly instead of rebuilding from transcript.
+    """
+    if not isinstance(backend, ContainerBackend):
+        finish_attempt("failed", "restartable chats require the container or kata backend")
+        return 2
+    if not host or not job.thread_id:
+        finish_attempt("failed", "restartable chats require an enrolled host and thread id")
+        return 2
+    if driver_for(runtime).capabilities().continuity == "replay":
+        finish_attempt(
+            "failed",
+            f"runtime {job.runtime!r} has not passed the restartable native-resume gate",
+        )
+        return 2
+
+    manager = ChatSandboxManager(backend)
+    stamp = backend.version_stamp()
+    existing = job.thread_sandbox or {}
+    if not existing and not str(stamp.get("sandbox_image_digest") or "").strip():
+        # Heartbeats may degrade an unavailable image inspection to an empty
+        # stamp, but a new retained chat cannot: its writable layer is the
+        # only local copy and every retry must recreate from the exact image
+        # that first owned it. Falling back to a mutable tag here would make
+        # the supposedly immutable container identity change across a
+        # pre-creation retry.
+        finish_attempt(
+            "failed",
+            "restartable chat creation requires an inspected sandbox image digest",
+        )
+        return 2
+    if existing and existing.get("runtime_id") != job.runtime:
+        finish_attempt(
+            "failed",
+            "this restartable chat is pinned to runtime "
+            f"{existing.get('runtime_id')!r}; switch Agent CLI by starting a new chat",
+        )
+        return 2
+    if existing and existing.get("execution_profile") != job.execution_profile:
+        finish_attempt("failed", "retained chat execution profile cannot change in place")
+        return 2
+    sandbox_id = str(existing.get("sandbox_id") or f"asbx_{secrets.token_hex(16)}")
+    seed_spec = ChatSandboxSpec(
+        thread_id=job.thread_id,
+        sandbox_id=sandbox_id,
+        generation=int(existing.get("generation") or 1),
+        runtime_id=str(existing.get("runtime_id") or job.runtime),
+        runtime_version=(existing.get("runtime_version") if existing else job.runtime_version),
+        sandbox_image_digest=(
+            existing.get("sandbox_image_digest")
+            if existing
+            else (stamp.get("sandbox_image_digest") or None)
+        ),
+    )
+    if existing:
+        if existing.get("host") != host:
+            finish_attempt("failed", "retained chat was claimed on the wrong host")
+            return 2
+        if existing.get("container_name") != seed_spec.container_name:
+            finish_attempt("failed", "retained chat container identity does not match its labels")
+            return 2
+
+    try:
+        reservation = control.reserve_chat_sandbox(
+            {
+                "sandbox_id": seed_spec.sandbox_id,
+                "container_name": seed_spec.container_name,
+                "runtime_id": seed_spec.runtime_id,
+                "runtime_version": seed_spec.runtime_version,
+                "sandbox_image_digest": (
+                    existing.get("sandbox_image_digest")
+                    if existing
+                    else (stamp.get("sandbox_image_digest") or None)
+                ),
+                "execution_profile": (
+                    str(existing.get("execution_profile")) if existing else job.execution_profile
+                ),
+                "host": host,
+            }
+        )
+    except LeaseLost:
+        return 3
+    except Exception as exc:
+        finish_attempt("failed", f"could not reserve retained chat sandbox: {exc}")
+        return 2
+
+    spec = ChatSandboxSpec(
+        thread_id=job.thread_id,
+        sandbox_id=str(reservation["sandbox_id"]),
+        generation=int(reservation["generation"]),
+        runtime_id=str(reservation["runtime_id"]),
+        runtime_version=reservation.get("runtime_version"),
+        sandbox_image_digest=reservation.get("sandbox_image_digest"),
+    )
+    activation_generation = int(reservation["activation_generation"])
+    has_context = bool(reservation.get("last_settled_job_id"))
+    native_session_id = reservation.get("native_session_id")
+    supervisor: SessionSupervisorClient | None = None
+    lease_token: str | None = None
+    settled = False
+    abandoned = False
+    turn_admitted = False
+    terminals_suspended = False
+    failure_detail: str | None = None
+    context_invalid = False
+    context_status = "restored" if has_context else "new"
+    idle_timeout_s = _chat_idle_timeout_s()
+
+    def abandon_before_finish(*, lost: bool, detail: str | None) -> None:
+        """Quiesce this activation before its attempt becomes terminal."""
+        nonlocal abandoned
+        if abandoned or settled:
+            return
+        if supervisor is not None and lease_token is not None:
+            with contextlib.suppress(Exception):
+                supervisor.abandon(job.thread_id, token=lease_token, lost=lost)
+        with contextlib.suppress(Exception):
+            control.abandon_chat_sandbox(
+                sandbox_generation=spec.generation,
+                activation_generation=activation_generation,
+                lost=lost,
+                detail=detail,
+                idle_timeout_seconds=idle_timeout_s,
+            )
+        abandoned = True
+
+    try:
+        supervisor = _session_supervisor_from_env()
+        try:
+            lease = supervisor.acquire(
+                spec,
+                activation_generation=activation_generation,
+                owner=f"attempt:{job.attempt_id}",
+                has_settled_context=has_context,
+                expected_container_id=reservation.get("container_id"),
+            )
+        except SessionSupervisorError as exc:
+            context_invalid = has_context and exc.status_code == 410
+            raise
+        lease_token = str(lease["token"])
+        if int(lease["activation_generation"]) != activation_generation:
+            raise SandboxError("Session Supervisor returned the wrong activation generation")
+        if reservation.get("container_id") not in {None, lease.get("container_id")}:
+            raise SandboxError("Session Supervisor returned a replacement chat container")
+        context_status = str(lease.get("context_status") or context_status)
+        if context_status not in {"new", "live", "restored"}:
+            raise SandboxError(f"Session Supervisor returned invalid context {context_status!r}")
+        control.mark_chat_sandbox_running(
+            sandbox_generation=spec.generation,
+            activation_generation=activation_generation,
+            container_id=str(lease["container_id"]),
+            context_status=context_status,
+        )
+        retained = RetainedChatBackend(manager, spec)
+        control.append_event(
+            NormalizedEvent(
+                "lifecycle",
+                {
+                    "phase": "started",
+                    "runtime": job.runtime,
+                    "attempt_no": job.attempt_no,
+                    "context_status": context_status,
+                    "container_id": lease["container_id"],
+                    "activation_generation": activation_generation,
+                    **retained.sandbox_metadata(),
+                },
+            )
+        )
+        control.suspend_terminals("workspace_preparing")
+        terminals_suspended = True
+
+        if not has_context:
+            # A checkout or setup failure before prompt admission is retryable
+            # on the same immutable chat/container identity. Remove any
+            # partial import from that failed preparation so Docker's archive
+            # extraction cannot merge it into the next clean checkout.
+            manager.reset_unsettled_state(spec)
+            base_sha = _prepare_retained_checkout(job=job, manager=manager, spec=spec)
+            reused_workspace = False
+        else:
+            if not native_session_id:
+                context_invalid = True
+                raise SandboxError("retained chat has no native Agent CLI session locator")
+            if not _resident_base_ready(CHAT_WORKDIR, job, retained):
+                imported_base = _import_retained_base(job=job, manager=manager, spec=spec)
+                if not _resident_base_ready(CHAT_WORKDIR, job, retained):
+                    context_invalid = True
+                    raise SandboxError(
+                        "retained chat cannot resolve its pinned base commit after import"
+                    )
+                control.append_event(
+                    NormalizedEvent(
+                        "lifecycle",
+                        {
+                            "phase": "base_imported",
+                            "base_sha": imported_base,
+                            "workspace_head_preserved": True,
+                        },
+                    )
+                )
+            base_sha = job.base_sha or _retained_head(retained)
+            reused_workspace = True
+        control.append_event(
+            NormalizedEvent(
+                "lifecycle",
+                {
+                    "phase": "checked_out",
+                    "base_sha": base_sha,
+                    "reused": reused_workspace,
+                    "storage": "docker_writable_layer",
+                },
+            )
+        )
+
+        if job.setup_script and not has_context:
+            setup = run_setup(
+                script=job.setup_script,
+                workdir=CHAT_WORKDIR,
+                repo=job.repo,
+                backend=retained,
+                # A retained chat already keeps its dependency tree. Sharing a
+                # host tar cache would reintroduce the host-state dependency
+                # this mode removes.
+                cache=None,
+            )
+            control.append_event(
+                NormalizedEvent(
+                    "lifecycle",
+                    {"phase": "setup", "cached": False, "ran": setup.ran},
+                )
+            )
+            if setup.exit_code != 0:
+                failure_detail = f"setup failed ({setup.exit_code}): {setup.detail}"
+                abandon_before_finish(lost=False, detail=failure_detail)
+                finish_attempt("failed", failure_detail, base_sha=base_sha)
+                return 1
+
+        version_problem = runtime_version_unavailable(job, retained)
+        if version_problem is not None:
+            failure_detail = version_problem
+            abandon_before_finish(lost=False, detail=failure_detail)
+            finish_attempt("failed", version_problem, base_sha=base_sha)
+            return 1
+        if not retained.has_binary(runtime.binary):
+            failure_detail = f"runtime binary {runtime.binary!r} is not installed"
+            abandon_before_finish(lost=False, detail=failure_detail)
+            finish_attempt("failed", failure_detail, base_sha=base_sha)
+            return 2
+
+        process = supervisor.process_started(job.thread_id, token=lease_token)
+        process_generation = int(process["process_generation"])
+        control.record_chat_process(
+            sandbox_generation=spec.generation,
+            activation_generation=activation_generation,
+            process_generation=process_generation,
+        )
+        resident = (
+            ResidentEntry(
+                thread_id=job.thread_id,
+                generation=spec.generation,
+                session_id=str(native_session_id),
+                workdir=CHAT_WORKDIR,
+                state_dir=CHAT_STATE_DIR,
+                runtime_id=job.runtime,
+                model=job.model,
+            )
+            if has_context
+            else None
+        )
+        live_out: dict[str, Any] = {}
+        control.admit_chat_turn(
+            sandbox_generation=spec.generation,
+            activation_generation=activation_generation,
+        )
+        turn_admitted = True
+        # Setup egress is removed exactly once and never restored. Keep every
+        # failure that is still classified as a safe pre-admission retry on
+        # the setup network; otherwise a transient control-plane error after
+        # this irreversible transition would retry checkout/setup on the
+        # agent-only network and fail for an unrelated reason. From this point
+        # onward the durable admission receipt makes every failure conservative
+        # (STOPPED_DIRTY/LOST), even if stdin was not reached.
+        if has_context:
+            manager.require_network_phase(spec, "agent")
+        else:
+            manager.transition_to_agent_network(spec)
+
+        # Never unfreeze a user terminal while setup egress is still present.
+        control.resume_terminals()
+        terminals_suspended = False
+        exit_code, tail, tool_errors = run_agent(
+            runtime,
+            job=job,
+            workdir=CHAT_WORKDIR,
+            gateway_base_url=gateway_base_url,
+            control=control,
+            heart=heart,
+            timeout_s=agent_timeout_s,
+            backend=retained,
+            mcp_config=RuntimeMCPConfig(
+                server_ids=tuple(job.mcp_servers),
+                base_url=job.mcp_base_url,
+                credential=job.mcp_token,
+            ),
+            state_dir=CHAT_STATE_DIR,
+            resident=resident,
+            live_out=live_out,
+            context_status=context_status,
+            strict_native_resume=has_context,
+            export_checkpoint=False,
+        )
+        live = live_out.pop("session", None)
+        if live is not None:
+            # The reconnectable bridge is the later HOT optimization. Until it
+            # owns the CLI independently of a runner replica, close cleanly and
+            # prove native restore on the next turn (warm_native).
+            with contextlib.suppress(Exception):
+                live.close()
+        next_session_id = live_out.get("session_id") or getattr(runtime, "session_id", None)
+        if exit_code == 130:
+            # Cancellation currently uses the retained process kill backstop,
+            # which stops the whole activation. There is no clean context
+            # boundary to capture after that stop, so do not pretend a patch
+            # exec can run or that the session remains resumable.
+            failure_detail = "cancelled by owner after retained-session admission"
+            abandon_before_finish(lost=True, detail=failure_detail)
+            finish_attempt("cancelled", "cancelled by owner", base_sha=base_sha)
+            return 0
+        if exit_code == 124:
+            failure_detail = "retained agent turn exceeded its execution timeout"
+            abandon_before_finish(lost=True, detail=failure_detail)
+            finish_attempt("failed", failure_detail, base_sha=base_sha)
+            return 1
+        if exit_code == 0:
+            next_session_id = _verified_native_session_id(
+                previous_session_id=(str(native_session_id) if native_session_id else None),
+                observed_session_id=(str(next_session_id) if next_session_id else None),
+                has_context=has_context,
+            )
+
+        control.suspend_terminals("workspace_finalizing")
+        terminals_suspended = True
+        patch = build_patch(CHAT_WORKDIR, retained, base_sha=job.base_sha or base_sha)
+        if patch.strip():
+            control.save_artifact("patch", patch)
+            control.append_event(
+                NormalizedEvent("diff", {"bytes": len(patch.encode()), "stored": True})
+            )
+        else:
+            control.append_event(NormalizedEvent("diff", {"bytes": 0, "stored": False}))
+
+        save_workspace_snapshot(
+            control,
+            workdir=CHAT_WORKDIR,
+            patch=patch,
+            retained_backend=retained,
+        )
+
+        if exit_code != 0:
+            failure_detail = f"agent exited {exit_code}: {tail[-500:]}"
+            abandon_before_finish(lost=True, detail=failure_detail)
+            finish_attempt("failed", failure_detail, base_sha=base_sha)
+            return 1
+        if not patch.strip() and tool_errors:
+            failure_detail = (
+                f"agent produced no changes after {len(tool_errors)} failed tool call(s): "
+                f"{tool_errors[0]}"
+            )
+            abandon_before_finish(lost=True, detail=failure_detail)
+            finish_attempt("failed", failure_detail, base_sha=base_sha)
+            return 1
+
+        # The local lifecycle owner must accept the exact activation before
+        # the control plane advertises a settled/resumable boundary. If the
+        # broker restarted and forgot this lease token, fail closed as LOST;
+        # writing the durable row first would let a failed job masquerade as a
+        # clean native checkpoint.
+        supervisor.settle(
+            job.thread_id,
+            token=lease_token,
+            job_id=job.job_id,
+            context_status=context_status,
+        )
+        control.settle_chat_sandbox(
+            sandbox_generation=spec.generation,
+            activation_generation=activation_generation,
+            context_status=context_status,
+            native_session_id=str(next_session_id),
+            idle_timeout_seconds=idle_timeout_s,
+        )
+        settled = True
+        finish_attempt(
+            "succeeded",
+            "agent completed" if patch.strip() else "agent completed (no changes)",
+            base_sha=base_sha,
+        )
+        terminals_suspended = False
+        return 0
+    except LeaseLost:
+        failure_detail = "attempt lease lost during retained chat execution"
+        return 3
+    except (DriverError, SandboxError, SessionSupervisorError, WorktreeError) as exc:
+        failure_detail = str(exc)
+        abandon_before_finish(
+            lost=turn_admitted or context_invalid,
+            detail=failure_detail,
+        )
+        with contextlib.suppress(Exception):
+            control.append_event(NormalizedEvent("error", {"text": failure_detail[:1000]}))
+        with contextlib.suppress(Exception):
+            finish_attempt("failed", failure_detail[:1000])
+        return 2
+    except Exception as exc:
+        failure_detail = f"retained chat failed unexpectedly: {exc}"
+        abandon_before_finish(lost=turn_admitted, detail=failure_detail)
+        with contextlib.suppress(Exception):
+            control.append_event(NormalizedEvent("error", {"text": failure_detail[:1000]}))
+            finish_attempt("failed", failure_detail[:1000])
+        return 2
+    finally:
+        if not settled and not abandoned:
+            abandon_before_finish(
+                lost=turn_admitted or context_invalid,
+                detail=failure_detail,
+            )
+        if supervisor is not None:
+            supervisor.close()
+        if terminals_suspended:
+            with contextlib.suppress(Exception):
+                control.resume_terminals()
+
+
 def run_once(
     *,
     base_url: str,
@@ -1515,12 +3174,32 @@ def run_once(
     polling every 5s spent ~17k probes and 17k warning lines a day doing
     nothing — found by watching an idle runner, not by reading it.
     """
+    # Docker resolves bind sources in the daemon's namespace, not relative to
+    # the runner container.  Keep the one-shot path honest: ``--workdir .``
+    # inside the runner image used to become ``/app`` only after a job had
+    # already been claimed, and every sandbox command then failed with exit
+    # 125.  Normalising first also makes the path that preflight proves exactly
+    # the path later passed to ``docker run --mount``.
+    workdir = str(pathlib.Path(workdir).resolve())
     if backend is None:
         backend = build_backend_from_env()
-        backend.preflight()
+        preflight_root = None if _restartable_mode_covers_every_runtime() else workdir
+        if preflight_root is not None:
+            # The normal clone path creates this directory after claim.  A
+            # bind probe has to run before claim, so materialise only the
+            # trusted operator-selected root first.  This also matters under
+            # Docker Desktop/Colima: a child created inside the outer runner
+            # becomes visible to the daemon, while the same child created by
+            # the macOS client may exist only in its file-sharing namespace.
+            try:
+                pathlib.Path(preflight_root).mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise SandboxError(
+                    f"could not prepare one-shot workdir {preflight_root!r}: {exc}"
+                ) from exc
+        backend.preflight(workdir_root=preflight_root)
 
-    stamper = getattr(backend, "version_stamp", None)
-    attestation: dict[str, Any] = stamper() if stamper is not None else {}
+    attestation = _claim_attestation(backend)
     job = claim(
         base_url=base_url,
         dispatcher_token=dispatcher_token,
@@ -1533,11 +3212,17 @@ def run_once(
         print("no queued agent job; nothing to do")
         return 0
 
+    restartable = _restartable_runtime_enabled(job)
     # Long-lived runners give every job a durable worktree.  The browser and
     # terminal broker address this same directory after the agent exits;
     # follow-up jobs receive their own worktree and are rehydrated through the
     # existing, validated context-patch path.
-    if workspace_root is not None:
+    #
+    # A restartable chat is the inverse: its only durable workspace is the
+    # retained container's writable layer. Creating a host worktree here would
+    # silently retain a second source of truth and defeat the Docker-only
+    # ownership invariant even if it were never mounted.
+    if workspace_root is not None and not restartable:
         durable = workspace_path(workspace_root, job.job_id)
         durable.mkdir(parents=True, exist_ok=True)
         workdir = str(durable)
@@ -1568,6 +3253,36 @@ def run_once(
         finish_attempt("failed", str(exc))
         control.close()
         return 2
+
+    if restartable:
+        heart.start()
+        try:
+            if _shared_live_runtime_enabled(job):
+                return _run_shared_live_attempt(
+                    runtime=runtime,
+                    job=job,
+                    control=control,
+                    heart=heart,
+                    backend=backend,
+                    host=host,
+                    gateway_base_url=gateway_url,
+                    agent_timeout_s=agent_timeout_s,
+                    finish_attempt=finish_attempt,
+                )
+            return _run_retained_attempt(
+                runtime=runtime,
+                job=job,
+                control=control,
+                heart=heart,
+                backend=backend,
+                host=host,
+                gateway_base_url=gateway_url,
+                agent_timeout_s=agent_timeout_s,
+                finish_attempt=finish_attempt,
+            )
+        finally:
+            heart.stop()
+            control.close()
 
     # Session persistence, for runtimes whose driver has real continuity. The
     # state dir is a sibling of the worktree — never inside it, so session
@@ -1681,6 +3396,7 @@ def run_once(
                     repo=job.repo,
                     base_sha=job.base_sha,
                     clone_token=job.clone_token,
+                    remote_base=repo_clone_base_url(clone_token=job.clone_token),
                 )
                 if workspace_root is not None:
                     checkout_output_branch(workdir, job.thread_id or job.job_id)
@@ -2079,7 +3795,13 @@ def run_forever(
     root.mkdir(parents=True, exist_ok=True)
     # Pass the workdir root so a backend that bind-mounts it can prove the
     # mount works now, rather than failing every job with an opaque error.
-    backend.preflight(workdir_root=str(root))
+    # Restartable chats keep the repository in the sandbox container's Docker
+    # writable layer. There is no host worktree to bind-mount, and requiring
+    # one here would defeat the Docker-only storage topology this mode exists
+    # to provide (it also fails for a runner that itself runs in Docker, where
+    # its filesystem path does not exist in the host daemon's namespace).
+    restartable_only = _restartable_mode_covers_every_runtime()
+    backend.preflight(workdir_root=None if restartable_only else str(root))
     # Whether this runner can measure at all, checked once and said out loud.
     # The first sampler assumed it ran on the host and read cgroupfs through a
     # pid; deployed as a container beside its sandboxes, every read failed and
@@ -2111,13 +3833,23 @@ def run_forever(
     # The heartbeat runs whether or not jobs do. A host with nothing to do
     # must still report, or the reaper marks it offline and stops sending it
     # work: a pool that empties whenever it is idle.
+    initial_stamper = getattr(backend, "version_stamp", None)
+    initial_stamp: dict[str, Any] = initial_stamper() if initial_stamper is not None else {}
+    host_capabilities = _shared_live_host_capabilities(backend, initial_stamp)
     identity = ensure_enrolled(
         base_url=base_url,
         host=host or worker_id,
         broker_url=_broker_url_from_env(),
         slots_total=int(os.environ.get("AGENT_HOST_SLOTS") or 0) or None,
+        capabilities=host_capabilities,
         runner_version=_runner_version(),
     )
+    if _retained_lifecycle_enabled() and identity is None:
+        raise RuntimeError(
+            "restartable/shared-live sandbox mode requires an enrolled host identity; "
+            "configure AGENT_ENROLL_TOKEN or a persisted host credential before "
+            "enabling retained chats"
+        )
     pool: HostHeartbeat | None = None
     residents: ResidentPool | None = None
     if identity is not None:
@@ -2127,7 +3859,7 @@ def run_forever(
         # ``getattr`` for the same reason as ``check_gateway_reachable`` above:
         # a deployment-owned backend that predates the hook must keep running.
         stamper = getattr(backend, "version_stamp", None)
-        stamp: dict[str, Any] = stamper() if stamper is not None else {}
+        stamp: dict[str, Any] = stamper() if stamper is not None else initial_stamp
         # Residency needs an enrolled identity twice over: establish/release
         # authenticate with the host credential, and the beats ride the same
         # heartbeat. A pool-less runner (the pre-enrollment shape) simply
@@ -2147,16 +3879,28 @@ def run_forever(
             identity=identity,
             broker_url=_broker_url_from_env(),
             slots_total=int(os.environ.get("AGENT_HOST_SLOTS") or 0) or None,
+            capabilities=host_capabilities,
             runner_version=_runner_version(),
             sandbox_runtime=stamp.get("sandbox_runtime"),
             sandbox_image_digest=stamp.get("sandbox_image_digest"),
             runtime_versions=stamp.get("runtime_versions"),
             runtime_versions_available=stamp.get("runtime_versions_available"),
             residency_beats=residents.beats,
-            on_residencies_lost=residents.handle_lost,
+            retained_sandbox_beats=(
+                _retained_sandbox_heartbeat_rows if _retained_lifecycle_enabled() else None
+            ),
+            on_residencies_lost=lambda lost: _handle_host_residencies_lost(residents, lost),
+            on_retained_sandboxes_stop=(
+                _stop_retained_sandboxes if _retained_lifecycle_enabled() else None
+            ),
         )
         pool.start()
         where = f" on host {identity.host} (enrolled)"
+
+    # The durable sandbox row is pinned to the enrolled host identity. The
+    # configured value is only an enrollment hint; after enrollment the
+    # server-returned identity is authoritative.
+    claim_host = identity.host if identity is not None else host
 
     _drain_on_sigterm()
 
@@ -2227,7 +3971,7 @@ def run_forever(
                 generic_command=generic_command,
                 backend=backend,
                 workspace_root=str(root),
-                host=host,
+                host=claim_host,
                 residents=residents,
             )
         except KeyboardInterrupt:
@@ -2277,6 +4021,20 @@ def _env_float(name: str, fallback: float) -> float:
     except ValueError:
         print(f"ignoring {name}={raw!r}: not a number", file=sys.stderr)
         return fallback
+
+
+def _chat_idle_timeout_s() -> float:
+    """Read the one product-level chat inactivity clock.
+
+    ``AGENT_SESSION_IDLE_TIMEOUT_S`` shipped with the restartable preview and
+    remains a compatibility alias.  The canonical name says what this value
+    actually controls: the delay before an otherwise-settled chat container
+    is stopped.  Agent-turn and terminal limits are independent watchdogs and
+    must never be used to decide that a healthy chat is inactive.
+    """
+    if os.environ.get("AGENT_CHAT_IDLE_TIMEOUT_S"):
+        return _env_float("AGENT_CHAT_IDLE_TIMEOUT_S", DEFAULT_CHAT_IDLE_TIMEOUT_S)
+    return _env_float("AGENT_SESSION_IDLE_TIMEOUT_S", DEFAULT_CHAT_IDLE_TIMEOUT_S)
 
 
 def default_worker_id() -> str:
