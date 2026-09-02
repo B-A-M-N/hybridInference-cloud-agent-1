@@ -9,8 +9,6 @@ and child processes.
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import http.cookiejar
 import json
 import secrets
@@ -69,59 +67,56 @@ class Client:
             raise RuntimeError(f"{method} {path} answered {exc.code}: {detail}") from exc
 
     def login(self) -> dict[str, Any]:
-        verifier = secrets.token_urlsafe(64)
-        challenge = (
-            base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
-            .rstrip(b"=")
-            .decode()
-        )
-        redirect_uri = f"{self.base}/callback"
-        state = secrets.token_urlsafe(24)
-        params = {
-            "client_id": "cloud-agent",
-            "redirect_uri": redirect_uri,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-            "state": state,
-        }
+        """Sign in the way a browser does: navigate, consent, come back.
 
-        # First prove the explicit local consent page is actually served.
-        consent = (
-            self.opener.open(f"{self.base}/authorize?{urllib.parse.urlencode(params)}", timeout=30)
-            .read()
-            .decode()
+        The client builds no PKCE pair and never sees an identity token — the
+        control plane owns the whole round trip now. What this drives is
+        exactly what a person would: follow the redirect to the consent page,
+        click through it, and let the callback set the cookie.
+        """
+        no_redirect = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.cookies), NoRedirect()
         )
+
+        # 1. The control plane parks the flow and points at the consent page.
+        try:
+            no_redirect.open(f"{self.base}/api/v1/session/login?return_to=/", timeout=30)
+            raise RuntimeError("sign-in did not redirect to the gateway")
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (302, 303):
+                raise
+            authorize = exc.headers.get("Location") or ""
+        if not self.cookies:
+            raise RuntimeError("sign-in parked no flow cookie")
+
+        # 2. The consent page really is served, and really is explicit.
+        consent = self.opener.open(authorize, timeout=30).read().decode()
         if "Continue locally" not in consent:
             raise RuntimeError("the local OAuth consent page did not render")
 
-        no_redirect = urllib.request.build_opener(NoRedirect())
+        # 3. Clicking through redirects to the *control plane's* callback.
+        query = urllib.parse.urlparse(authorize).query
         try:
-            no_redirect.open(
-                f"{self.base}/authorize/continue?{urllib.parse.urlencode(params)}", timeout=30
-            )
+            no_redirect.open(f"{self.base}/authorize/continue?{query}", timeout=30)
             raise RuntimeError("local authorization did not redirect")
         except urllib.error.HTTPError as exc:
             if exc.code != 302:
                 raise
-            location = exc.headers.get("Location") or ""
-        callback = urllib.parse.urlparse(location)
-        callback_params = urllib.parse.parse_qs(callback.query)
-        code = (callback_params.get("code") or [""])[0]
-        returned_state = (callback_params.get("state") or [""])[0]
-        if not code or returned_state != state:
-            raise RuntimeError("local authorization returned an invalid code or state")
+            callback = exc.headers.get("Location") or ""
+        if "/api/v1/session/callback" not in callback:
+            raise RuntimeError(f"authorization returned to {callback!r}, not the control plane")
 
-        token = self.request(
-            "/v1/identity/token",
-            method="POST",
-            body={
-                "code": code,
-                "code_verifier": verifier,
-                "client_id": "cloud-agent",
-                "redirect_uri": redirect_uri,
-            },
-        )["access_token"]
-        return self.request("/api/v1/session/login", method="POST", body={"identity_token": token})
+        # 4. The callback exchanges the code server-side and sets the session.
+        try:
+            no_redirect.open(callback, timeout=30)
+            raise RuntimeError("the callback did not redirect into the app")
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (302, 303):
+                raise
+        if not any(cookie.name == "cloud_agent_session" for cookie in self.cookies):
+            raise RuntimeError("sign-in completed without setting a session cookie")
+
+        return self.request("/api/v1/session/me")
 
 
 def wait_job(client: Client, job_id: str) -> dict[str, Any]:

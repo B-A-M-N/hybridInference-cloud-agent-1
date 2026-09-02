@@ -71,9 +71,12 @@ ensure_env() {
       'AGENT_WEB_BIND=127.0.0.1' \
       'AGENT_WEB_PORT=13003' \
       'LOCAL_EDGE_PORT=13002' \
+      'GATEWAY_AUTHORIZE_URL=http://localhost:13002/authorize' \
+      'AGENT_SESSION_REDIRECT_URI=http://localhost:13002/api/v1/session/callback' \
+      'AGENT_WEB_BASE_URL=http://localhost:13002' \
       'AGENT_WEB_BASE_PATH=' \
       'AGENT_WEB_API_URL=/api' \
-      'AGENT_WEB_GATEWAY_AUTHORIZE_URL=/authorize' \
+      'AGENT_WEB_GATEWAY_URL=' \
       'AGENT_WEB_APP_NAME=FreeInference Cloud Agent (local)' \
       'LOCAL_CHAT_IDLE_TIMEOUT_S=15' \
       'LOCAL_AGENT_TIMEOUT_S=600' \

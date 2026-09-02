@@ -102,7 +102,14 @@ def _allowed_redirects() -> set[str]:
     edge_port = os.environ.get("LOCAL_EDGE_PORT", "13002").strip() or "13002"
     raw = (os.environ.get("LOCAL_IDENTITY_ALLOWED_REDIRECTS") or "").strip()
     if not raw:
-        raw = f"http://127.0.0.1:{edge_port}/callback,http://localhost:{edge_port}/callback"
+        # The control plane's callback, not a page in the web app: the code is
+        # redeemed server-side, so the browser never lands on a route of its
+        # own. Both spellings, because a developer may reach the edge by
+        # either name and this list is matched as an exact string.
+        raw = (
+            f"http://127.0.0.1:{edge_port}/api/v1/session/callback,"
+            f"http://localhost:{edge_port}/api/v1/session/callback"
+        )
     return {entry.strip() for entry in raw.split(",") if entry.strip()}
 
 

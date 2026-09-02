@@ -289,14 +289,81 @@ async def authenticate_agent_owner(
 
 
 async def require_agent_owner(
+    request: Request,
     user: dict[str, Any] = Depends(authenticate_agent_owner),
+    gateway=Depends(get_gateway_client),
 ) -> dict[str, Any]:
-    """Keep the P0 Agent surface restricted to internal/admin dogfood users."""
-    from cloud_agent.api.deps import has_role
+    """Keep the P0 Agent surface restricted to internal/admin dogfood users.
+
+    **Writes revalidate against the gateway; reads do not.** The session is a
+    cache of an authorization decision the gateway made at sign-in, and a cache
+    is only as good as what re-checks it: without this, a user suspended or
+    downgraded on the gateway keeps this service's privileges until their
+    cookie expires. Bounding that to the session TTL alone would mean a TTL of
+    minutes, which is why the two halves are designed together.
+
+    It hangs on the **method** rather than a list of privileged paths because a
+    list is a thing the next route added quietly falls off. Reads stay a pure
+    session check so that a gateway outage costs nobody their open pages, and
+    so that polling this surface is not an amplifier on the gateway.
+
+    The check is here rather than in ``get_current_user`` because this is the
+    dependency the whole owner surface already goes through, and there is one
+    owner credential to check.
+
+    **Grant minting is not listed here, and does not need to be.** The gateway
+    re-reads the account inside ``POST /internal/agent-grants`` itself, so the
+    check and the credential it guards are one call — there is no window
+    between them for this service to widen by asking first.
+
+    Args:
+        request: The incoming request, for its method.
+        user: The authenticated owner, from the session.
+        gateway: The gateway's contracts.
+
+    Returns:
+        The owner, carrying the gateway's current role on a revalidated
+        request so a downgrade takes effect on the request in hand rather than
+        only on the next one.
+
+    Raises:
+        HTTPException: 403 if the account may no longer use this surface, 503
+            if the gateway could not be asked.
+    """
+    from cloud_agent.api.deps import SAFE_METHODS, has_role, may_sign_in
 
     if not has_role(user.get("role", "free"), "internal"):
         raise HTTPException(status_code=403, detail="Agent access requires role 'internal'.")
-    return user
+
+    if request.method.upper() in SAFE_METHODS:
+        return user
+
+    try:
+        status = await gateway.user_status(user["user_id"])
+    except GatewayError as exc:
+        # Fail closed, per AGENTS.md rule 4: an authority that cannot be
+        # reached has not granted anything.
+        logger.warning(
+            "agent_owner_revalidation_unavailable",
+            exc_info=True,
+            extra={
+                "event": "agent_owner_revalidation_unavailable",
+                "user_id": user["user_id"],
+            },
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Cannot confirm this account with the gateway; try again shortly.",
+        ) from exc
+
+    if not may_sign_in(status):
+        raise HTTPException(status_code=403, detail="This account cannot sign in.")
+
+    role = str(status.get("role") or "free")
+    if not has_role(role, "internal"):
+        raise HTTPException(status_code=403, detail="Agent access requires role 'internal'.")
+
+    return {**user, "role": role, "is_admin": role == "admin"}
 
 
 def _sse_frame(event: dict[str, Any]) -> str:

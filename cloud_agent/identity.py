@@ -21,7 +21,11 @@ publishing.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import os
+import secrets
 import time
 from typing import Any
 
@@ -50,10 +54,34 @@ AUDIENCE = "cloud-agent"
 #: reaching one host and getting different answers is the bug this prevents.
 USER_AGENT = "freeinference-cloud-agent"
 
-#: Our own session. Long enough to be useful, short enough that a stolen cookie
-#: expires without anyone having to notice.
-SESSION_TTL_S = 7 * 24 * 60 * 60
+#: Our own session, and **hours rather than days on purpose**.
+#:
+#: The session is a cache of an authorization decision, so it has to expire like
+#: one. At seven days a user the gateway suspends or downgrades keeps this
+#: service's privileges for a week, because nothing re-asks; that is the window
+#: this bounds. It is deliberately *not* extended on use — a sliding expiry
+#: rebuilds the week it replaces — and the other half of the answer is
+#: revalidation against the gateway on privileged actions
+#: (``require_agent_owner``), which is what keeps the window from having to be
+#: minutes.
+SESSION_TTL_S = 8 * 60 * 60
 SESSION_COOKIE = "cloud_agent_session"
+
+#: The parked half of a sign-in: the PKCE verifier and the CSRF ``state``,
+#: signed and handed to the browser as an HttpOnly cookie for the length of one
+#: round trip to the gateway's consent page.
+#:
+#: **A cookie rather than a server-side table** because it is exactly one
+#: round trip's worth of state, it is useless to anyone who cannot also present
+#: it back, and a table would need reaping. **HttpOnly rather than
+#: ``localStorage``** because that is the whole point: page JavaScript cannot
+#: read it, so an XSS cannot walk off with a verifier and complete somebody
+#: else's login.
+LOGIN_FLOW_COOKIE = "cloud_agent_login"
+
+#: How long a parked sign-in stays valid. Long enough to read a consent screen,
+#: short enough that an abandoned flow is not a credential lying around.
+LOGIN_FLOW_TTL_S = 10 * 60
 
 
 class IdentityError(Exception):
@@ -242,3 +270,120 @@ def verify_session(token: str) -> dict[str, Any]:
         )
     except jwt.PyJWTError as exc:
         raise IdentityError(f"invalid session: {exc}") from exc
+
+
+#: Domain separation for the two things this service signs. Both are HS256
+#: under one configured secret, and a login-flow token that could be presented
+#: as a session (or the reverse) is a confused deputy waiting to happen. Two
+#: keys derived from the one secret make that structurally impossible instead
+#: of relying on a claim being checked everywhere.
+_LOGIN_FLOW_KEY_INFO = b"cloud-agent/login-flow/v1"
+
+
+def _login_flow_secret() -> str:
+    """Return the key the parked-sign-in cookie is signed with.
+
+    Raises:
+        IdentityNotConfigured: If no session secret is set.
+    """
+    return hmac.new(_session_secret().encode(), _LOGIN_FLOW_KEY_INFO, hashlib.sha256).hexdigest()
+
+
+def new_verifier() -> str:
+    """Return a fresh PKCE code verifier.
+
+    Returns:
+        43 characters of base64url, the minimum RFC 7636 allows and the
+        minimum the gateway's ``code_verifier`` field accepts.
+    """
+    # 32 bytes → 43 base64url characters with no padding.
+    return base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
+
+
+def challenge_for(verifier: str) -> str:
+    """Return the S256 challenge for a verifier.
+
+    Args:
+        verifier: The PKCE code verifier.
+
+    Returns:
+        The base64url-encoded SHA-256 of the verifier, unpadded.
+    """
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+
+def new_state() -> str:
+    """Return a fresh CSRF ``state`` value."""
+    return secrets.token_urlsafe(32)
+
+
+def mint_login_flow(*, verifier: str, state: str, return_to: str) -> str:
+    """Park one in-flight sign-in in a signed, short-lived token.
+
+    Args:
+        verifier: The PKCE verifier the callback will redeem the code with.
+        state: The CSRF value the callback must see come back.
+        return_to: Where in the app to land afterwards. Already validated as a
+            same-site path by the caller.
+
+    Returns:
+        A signed token for the login-flow cookie.
+
+    Raises:
+        IdentityNotConfigured: If no session secret is set.
+    """
+    now = int(time.time())
+    claims = {
+        "verifier": verifier,
+        "state": state,
+        "return_to": return_to,
+        "iat": now,
+        "exp": now + LOGIN_FLOW_TTL_S,
+    }
+    return jwt.encode(claims, _login_flow_secret(), algorithm="HS256")
+
+
+def verify_login_flow(token: str) -> dict[str, Any]:
+    """Verify a parked sign-in and return its claims.
+
+    Args:
+        token: The login-flow cookie's value.
+
+    Returns:
+        The verified claims.
+
+    Raises:
+        IdentityNotConfigured: If no session secret is set.
+        IdentityError: If the token is missing, malformed, or expired.
+    """
+    if not token:
+        raise IdentityError("no sign-in is in progress")
+    try:
+        return jwt.decode(
+            token,
+            _login_flow_secret(),
+            algorithms=["HS256"],
+            options={"require": ["exp", "state", "verifier"]},
+        )
+    except jwt.PyJWTError as exc:
+        raise IdentityError(f"invalid sign-in state: {exc}") from exc
+
+
+def state_matches(presented: str, expected: str) -> bool:
+    """Whether the returned ``state`` is the one this flow was started with.
+
+    Constant-time: the comparison is of a secret this service minted, and a
+    timing oracle on it would let a caller discover a valid ``state`` a
+    character at a time.
+
+    Args:
+        presented: The ``state`` the callback arrived with.
+        expected: The ``state`` parked at login.
+
+    Returns:
+        Whether they match. Empty values never match.
+    """
+    if not presented or not expected:
+        return False
+    return hmac.compare_digest(presented, expected)

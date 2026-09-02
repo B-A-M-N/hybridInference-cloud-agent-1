@@ -69,6 +69,12 @@ class _FakeGateway:
         # is exactly what an older gateway answers.
         return [_TEST_MODEL], {}
 
+    async def user_status(self, user_id: str) -> dict[str, Any]:
+        # Read by `require_agent_owner` on every write. A fake missing it fails
+        # the whole mutating surface with an AttributeError rather than a
+        # refusal — which is how it was found.
+        return {"exists": True, "active": True, "role": "internal"}
+
     # No `mcp_registry` here any more. A fake that answers a question the real
     # client cannot ask is a test passing against an interface nothing has —
     # and it would have kept this suite green through the whole amendment.
