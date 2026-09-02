@@ -45,9 +45,9 @@ export function safeReturnTo(candidate: string | undefined): string {
  * function that only ever calls `location.assign` has nothing to check.
  */
 export function signInUrl(returnTo: string): string {
-  if (!agentApiBase && typeof window === 'undefined') {
-    throw new SignInNotConfigured('No control plane origin is configured.');
-  }
+  // An empty `agentApiBase` is not a missing one: it is the same-origin
+  // deployment (DR4), and the result is a relative URL the browser resolves
+  // against the page. There is nothing here to refuse.
   const params = new URLSearchParams({ return_to: safeReturnTo(returnTo) });
   return `${agentApiBase}/v1/session/login?${params.toString()}`;
 }

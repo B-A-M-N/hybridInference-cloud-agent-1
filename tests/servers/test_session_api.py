@@ -394,6 +394,30 @@ async def test_a_return_to_pointing_off_site_lands_on_the_app(client_and_gateway
     assert response.headers["location"] == f"{_WEB_BASE_URL}/"
 
 
+async def test_an_account_the_gateway_refuses_at_exchange_is_told_so(key):
+    """A 403 at the exchange is a verdict on the account, not a stale code.
+
+    The gateway re-reads status when it redeems the code, precisely so a
+    suspension between consent and here takes effect at once. Reporting that
+    as "please start again" sends the person round the loop forever — consent,
+    callback, refusal — with no sentence anywhere that says why.
+    """
+    gateway = _FakeGateway(
+        {"exists": True, "active": True, "role": "internal"},
+        identity_token=_identity_token(key),
+        exchange_error=GatewayError("gateway answered 403 for /v1/identity/token", status_code=403),
+    )
+    transport = ASGITransport(app=_app(gateway))
+    async with AsyncClient(
+        transport=transport, base_url="https://test", follow_redirects=False
+    ) as client:
+        response = await _sign_in(client)
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "This account cannot sign in."
+    assert not client.cookies.get(identity.SESSION_COOKIE)
+
+
 async def test_a_refused_exchange_is_a_400_and_an_unreachable_gateway_a_503(key):
     """A stale code is the caller's problem; an outage is the deployment's."""
     for error, expected in (

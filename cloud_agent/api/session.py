@@ -311,8 +311,15 @@ async def session_callback(
             exc_info=True,
             extra={"event": "agent_session_code_exchange_failed"},
         )
-        # A refused exchange is the caller's problem (a stale or replayed
-        # code); an unreachable gateway is this deployment's.
+        # Three different answers, because they ask for three different things.
+        # A 403 is the gateway's verdict on the *account* — it re-reads status
+        # at exchange time precisely so a suspension between consent and here
+        # takes effect at once — and "please start again" would send that
+        # person round the loop forever. Any other refusal is about the code
+        # (stale, replayed, mismatched), and starting again is the fix. An
+        # unreachable gateway is this deployment's problem, not theirs.
+        if exc.status_code == 403:
+            raise HTTPException(status_code=403, detail="This account cannot sign in.") from exc
         status_code = 400 if exc.definitive else 503
         raise HTTPException(
             status_code=status_code,
