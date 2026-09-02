@@ -637,25 +637,33 @@ jobs:
     #
     # `push: false` still: nothing here publishes. The point is that the build
     # resolves *where it matters*.
-    runs-on: ${{ fromJSON(matrix.image.runner) }}
+    # Pull requests, including forks, build on GitHub-hosted runners. The
+    # architecture-specific self-hosted pools are for trusted pushes and
+    # dispatches only.
+    runs-on: ${{ github.event_name == 'pull_request' && matrix.image.pull_request_runner || fromJSON(matrix.image.runner) }}
     strategy:
       fail-fast: false
       matrix:
         image:
           - name: runner
             dockerfile: deploy/host/Dockerfile.agent-runner
+            pull_request_runner: ubuntu-latest
             runner: '["self-hosted","Linux","X64","image-verify-x64"]'
           - name: sandbox
             dockerfile: deploy/sandbox/Dockerfile.agent-sandbox
+            pull_request_runner: ubuntu-latest
             runner: '["self-hosted","Linux","X64","image-verify-x64"]'
           - name: egress-proxy
             dockerfile: deploy/host/Dockerfile.agent-egress-proxy
+            pull_request_runner: ubuntu-latest
             runner: '["self-hosted","Linux","X64","image-verify-x64"]'
           - name: gateway-tunnel
             dockerfile: deploy/host/Dockerfile.agent-gateway-tunnel
+            pull_request_runner: ubuntu-latest
             runner: '["self-hosted","Linux","X64","image-verify-x64"]'
           - name: control-plane
             dockerfile: deploy/control-plane/Dockerfile
+            pull_request_runner: ubuntu-24.04-arm
             runner: '["self-hosted","Linux","ARM64","image-verify-arm64"]'
     steps:
       - uses: actions/checkout@v6

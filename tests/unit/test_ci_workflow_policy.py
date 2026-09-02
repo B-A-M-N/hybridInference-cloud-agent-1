@@ -33,7 +33,7 @@ def test_every_ci_job_a_pull_request_can_reach_runs_hosted():
         bare_pool = isinstance(runs_on, list) and "self-hosted" in runs_on
         unconditional = (
             isinstance(runs_on, str)
-            and "self-hosted" in runs_on
+            and ("self-hosted" in runs_on or "fromJSON(" in runs_on)
             and "github.event_name == 'pull_request'" not in runs_on
         )
         if bare_pool or unconditional:
@@ -41,6 +41,19 @@ def test_every_ci_job_a_pull_request_can_reach_runs_hosted():
     assert not offenders, (
         f"these jobs would run untrusted pull_request code on a self-hosted runner: {offenders}"
     )
+
+
+def test_docker_build_matrix_routes_pull_requests_to_hosted_runners():
+    """An indirect matrix runner must not bypass the pull-request split."""
+    build = _jobs("ci.yml")["build"]
+    runs_on = build["runs-on"]
+    assert "github.event_name == 'pull_request'" in runs_on
+    assert "matrix.image.pull_request_runner" in runs_on
+
+    images = build["strategy"]["matrix"]["image"]
+    assert images
+    assert all(image["pull_request_runner"].startswith("ubuntu-") for image in images)
+    assert all("self-hosted" not in image["pull_request_runner"] for image in images)
 
 
 def test_staging_deploys_refuse_anything_not_on_dev():
