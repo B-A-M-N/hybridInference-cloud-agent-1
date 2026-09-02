@@ -32,9 +32,12 @@ def test_every_ci_job_a_pull_request_can_reach_runs_hosted():
         runs_on = spec.get("runs-on")
         if isinstance(runs_on, list) and "self-hosted" in runs_on:
             offenders.append(job)
-        elif isinstance(runs_on, str) and "self-hosted" in runs_on:
-            if "github.event_name == 'pull_request'" not in runs_on:
-                offenders.append(job)
+        elif (
+            isinstance(runs_on, str)
+            and "self-hosted" in runs_on
+            and "github.event_name == 'pull_request'" not in runs_on
+        ):
+            offenders.append(job)
     assert not offenders, (
         f"these jobs would run untrusted pull_request code on a self-hosted runner: {offenders}"
     )
