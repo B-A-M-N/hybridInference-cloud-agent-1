@@ -68,6 +68,22 @@ jobs:
         run: |
           set -euo pipefail
           sha="${INPUT_SHA:-${RUN_SHA:-${GITHUB_SHA}}}"
+          # Staging deploys dev, and nothing else. The dispatch form defaults
+          # to the repository's default branch, which is main — and main lags
+          # dev by weeks. A dispatch left on that default deployed main to
+          # staging on 2026-09-02: the control plane happened to refuse
+          # (an env variable the older compose still required was gone), the
+          # runner host did not, and it ran a checkout from before the
+          # layout flatten until a second dispatch put it back. The
+          # server-side deployment-branch policy on the environment is the
+          # real fence; this refuses the honest misfire before a host is
+          # touched. Only workflow_dispatch can pick a ref; the CI-driven path
+          # is always a dev push.
+          git fetch --quiet --depth=200 origin dev
+          if ! git merge-base --is-ancestor "${sha}" origin/dev 2>/dev/null; then
+            echo "::error title=Deploy Staging::${sha} is not on dev; staging deploys dev only (re-run with the branch set to dev)"
+            exit 1
+          fi
           echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
           echo "deploying ${sha}"
 
@@ -126,6 +142,22 @@ jobs:
         run: |
           set -euo pipefail
           sha="${INPUT_SHA:-${RUN_SHA:-${GITHUB_SHA}}}"
+          # Staging deploys dev, and nothing else. The dispatch form defaults
+          # to the repository's default branch, which is main — and main lags
+          # dev by weeks. A dispatch left on that default deployed main to
+          # staging on 2026-09-02: the control plane happened to refuse
+          # (an env variable the older compose still required was gone), the
+          # runner host did not, and it ran a checkout from before the
+          # layout flatten until a second dispatch put it back. The
+          # server-side deployment-branch policy on the environment is the
+          # real fence; this refuses the honest misfire before a host is
+          # touched. Only workflow_dispatch can pick a ref; the CI-driven path
+          # is always a dev push.
+          git fetch --quiet --depth=200 origin dev
+          if ! git merge-base --is-ancestor "${sha}" origin/dev 2>/dev/null; then
+            echo "::error title=Deploy Staging::${sha} is not on dev; staging deploys dev only (re-run with the branch set to dev)"
+            exit 1
+          fi
           echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
           echo "deploying ${sha}"
 

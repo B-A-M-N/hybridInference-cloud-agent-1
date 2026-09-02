@@ -39,7 +39,11 @@ env:
 jobs:
   changes:
     name: Classify Changes
-    runs-on: [self-hosted, Linux, ci-general]
+    # PR events run GitHub-hosted: on a public repository a pull_request
+    # carries code nobody here has vetted, and a self-hosted runner is a
+    # machine of ours. Every trusted event (push, dispatch) keeps the
+    # self-hosted pool unchanged. Same split as the gateway repository.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "ci-general"]') }}
     outputs:
       backend: ${{ steps.classify.outputs.backend }}
       web: ${{ steps.classify.outputs.web }}
@@ -150,7 +154,11 @@ jobs:
     name: Lint
     needs: changes
     if: needs.changes.outputs.backend == 'true'
-    runs-on: [self-hosted, Linux, ci-general]
+    # PR events run GitHub-hosted: on a public repository a pull_request
+    # carries code nobody here has vetted, and a self-hosted runner is a
+    # machine of ours. Every trusted event (push, dispatch) keeps the
+    # self-hosted pool unchanged. Same split as the gateway repository.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "ci-general"]') }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -237,7 +245,11 @@ jobs:
     name: Tests
     needs: changes
     if: needs.changes.outputs.backend == 'true'
-    runs-on: [self-hosted, Linux, ci-general]
+    # PR events run GitHub-hosted: on a public repository a pull_request
+    # carries code nobody here has vetted, and a self-hosted runner is a
+    # machine of ours. Every trusted event (push, dispatch) keeps the
+    # self-hosted pool unchanged. Same split as the gateway repository.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "ci-general"]') }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -291,7 +303,11 @@ jobs:
     # ci-general is spark2 (aarch64), whose runner user is in the `docker`
     # group — service containers need that socket, and this is the pool that
     # has it. postgres:15 publishes an arm64 manifest.
-    runs-on: [self-hosted, Linux, ci-general]
+    # PR events run GitHub-hosted: on a public repository a pull_request
+    # carries code nobody here has vetted, and a self-hosted runner is a
+    # machine of ours. Every trusted event (push, dispatch) keeps the
+    # self-hosted pool unchanged. Same split as the gateway repository.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "ci-general"]') }}
 
     services:
       postgres:
@@ -440,7 +456,11 @@ jobs:
     name: Web
     needs: changes
     if: needs.changes.outputs.web == 'true'
-    runs-on: [self-hosted, Linux, ci-general]
+    # PR events run GitHub-hosted: on a public repository a pull_request
+    # carries code nobody here has vetted, and a self-hosted runner is a
+    # machine of ours. Every trusted event (push, dispatch) keeps the
+    # self-hosted pool unchanged. Same split as the gateway repository.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "ci-general"]') }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -553,7 +573,11 @@ jobs:
   # ------------------------------------------------------------------ secret
   gitleaks:
     name: Gitleaks
-    runs-on: [self-hosted, Linux, ci-general]
+    # PR events run GitHub-hosted: on a public repository a pull_request
+    # carries code nobody here has vetted, and a self-hosted runner is a
+    # machine of ours. Every trusted event (push, dispatch) keeps the
+    # self-hosted pool unchanged. Same split as the gateway repository.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "ci-general"]') }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -680,7 +704,8 @@ jobs:
     # opening its logs is exactly the kind of failure that could differ by base
     # image layer, so proving it on the other architecture would prove the
     # wrong one.
-    runs-on: [self-hosted, Linux, X64, image-verify-x64]
+    # PR events run GitHub-hosted; see the fork-safety note on the first job.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "X64", "image-verify-x64"]') }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -783,7 +808,8 @@ jobs:
     # The one docker job with no architecture to match: `docker compose config`
     # parses and interpolates, it does not build or start anything. Left on the
     # larger pool so it does not queue behind the x86 image builds.
-    runs-on: [self-hosted, Linux, ARM64, image-verify-arm64]
+    # PR events run GitHub-hosted (arm); see the fork-safety note on the first job.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04-arm' || fromJSON('["self-hosted", "Linux", "ARM64", "image-verify-arm64"]') }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -955,7 +981,11 @@ jobs:
     # keys on this workflow's conclusion, so this is what stands between a merge
     # to dev and a rebuild of the staging stack.
     if: always()
-    runs-on: [self-hosted, Linux, ci-general]
+    # PR events run GitHub-hosted: on a public repository a pull_request
+    # carries code nobody here has vetted, and a self-hosted runner is a
+    # machine of ours. Every trusted event (push, dispatch) keeps the
+    # self-hosted pool unchanged. Same split as the gateway repository.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "ci-general"]') }}
     needs:
       - changes
       - lint
