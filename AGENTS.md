@@ -64,7 +64,7 @@ needs an unchanged baseline to be worth anything.
    break — report it. Adapting fixtures and imports is fine; changing an
    assertion is not.
 4. **No gateway secrets here.** This service never sees the gateway's
-   gateway's `API_KEY_SECRET` or `JWT_SECRET_KEY`. Grant tokens are minted *and*
+   `API_KEY_SECRET` or `JWT_SECRET_KEY`. Grant tokens are minted *and*
    verified by the gateway. Our own tokens use our own secrets
    (`AGENT_CONTROL_TOKEN_SECRET`, `AGENT_SESSION_SECRET`).
 5. **The gateway is reached over HTTP only.** No Python import of `serving.*`,

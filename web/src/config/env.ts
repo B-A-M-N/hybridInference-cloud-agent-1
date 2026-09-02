@@ -8,7 +8,7 @@
 //
 //   * `agentApiBase` is *this* service's control plane. It is the only origin
 //     the session cookie is sent to.
-//   * `gatewayUrl` is the FreeInference gateway's origin, for the links this
+//   * `gatewayUrl` is the HybridInference gateway's origin, for the links this
 //     app does not host itself. It owns login; we never see a password, never
 //     hold its keys, and — since the sign-in round trip moved into the control
 //     plane — never build an authorize URL here either.
