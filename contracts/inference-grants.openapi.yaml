@@ -44,9 +44,9 @@ info:
     accepts, so a leaked grant buys models and no tools.
 
 servers:
-  - url: https://freeinference.org
+  - url: https://gateway.example.org
     description: Production
-  - url: https://staging.freeinference.org
+  - url: https://staging.gateway.example.org
     description: Staging
 
 tags:
