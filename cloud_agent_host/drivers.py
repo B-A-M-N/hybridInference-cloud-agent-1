@@ -26,9 +26,11 @@ meaningful with the live-input transport and arrive with it.
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import pathlib
+import sys
 import tarfile
 import time
 from dataclasses import dataclass, field
@@ -49,6 +51,7 @@ from cloud_agent_host.runtimes import (
     get_runtime,
 )
 from cloud_agent_host.sandbox import STATE_MOUNT_TARGET
+from cloud_agent_host.tool_windows import TOOL_MARK_FILE, hook_settings
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -214,6 +217,10 @@ class LaunchContext:
     #: Private per-membership tmpfs root for generated provider configuration.
     #: It is never the durable native session store.
     activation_dir: str | None = None
+    #: Retained containers own their state inside Docker rather than at a host
+    #: path. They provide this trusted writer so Claude's passive hooks are
+    #: installed in the filesystem the CLI will actually read.
+    install_tool_hooks: Callable[[dict[str, Any]], None] | None = None
 
 
 class HarnessTurn:
@@ -392,6 +399,18 @@ class HarnessSession:
     def process_exit_code(self) -> int | None:
         """Return a resident process status when this session owns one."""
         return None
+
+    def begin_guest_observation(self) -> Any | None:
+        """Fence a new turn on an observer-aware resident process."""
+        process = getattr(self, "_process", None)
+        begin = getattr(process, "begin_guest_observation", None)
+        return begin() if begin is not None else None
+
+    def finish_guest_observation(self, _cursor: Any | None = None) -> Any | None:
+        """Close a resident process fence without ending the process."""
+        process = getattr(self, "_process", None)
+        finish = getattr(process, "finish_guest_observation", None)
+        return finish() if finish is not None else None
 
 
 class HarnessDriver:
@@ -1314,6 +1333,11 @@ class HttpAgentLiveSession(_JsonResidentSession):
 #: ``/workspace`` workdir, which keeps the project-dir encoding stable).
 CLAUDE_STATE_CONFIG_DIR = f"{STATE_MOUNT_TARGET}/claude"
 
+#: The sandbox-side hooks append exact tool boundaries here. Keeping this on
+#: the state mount makes it platform data rather than part of the repository,
+#: and lets resident turns share one append-only stream safely.
+CLAUDE_TOOL_MARKS = f"{STATE_MOUNT_TARGET}/{TOOL_MARK_FILE}"
+
 
 class ClaudeCodeSession(HarnessSession):
     """A claude-code session: persistable, restorable, still one turn (COLD)."""
@@ -1331,10 +1355,30 @@ class ClaudeCodeSession(HarnessSession):
     def _extra_prepare_kwargs(self) -> dict[str, Any]:
         if self._context.state_dir is None:
             return {}
+        self._install_tool_hooks()
         return {
             "config_dir": CLAUDE_STATE_CONFIG_DIR,
             "resume_session_id": self._resume_session_id,
         }
+
+    def _install_tool_hooks(self) -> None:
+        """Install passive Claude hooks that mark exact tool-call boundaries."""
+        try:
+            settings_update = hook_settings(CLAUDE_TOOL_MARKS)
+            if self._context.install_tool_hooks is not None:
+                self._context.install_tool_hooks(settings_update)
+                return
+            config = pathlib.Path(self._context.state_dir) / "claude"
+            config.mkdir(parents=True, exist_ok=True)
+            settings_path = config / "settings.json"
+            settings: dict[str, Any] = {}
+            if settings_path.exists():
+                with contextlib.suppress(Exception):
+                    settings = json.loads(settings_path.read_text()) or {}
+            settings.update(settings_update)
+            settings_path.write_text(json.dumps(settings, indent=2))
+        except Exception as exc:  # pragma: no cover - defence, not behaviour
+            print(f"tool hooks not installed: {exc}", file=sys.stderr)
 
     def export_state(self) -> HarnessState:
         """Package the session tree the turn just wrote (design §6).

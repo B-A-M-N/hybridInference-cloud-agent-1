@@ -1060,6 +1060,15 @@ class _FakeGateway:
     async def model_catalog(self, user_id: str) -> list[str]:
         return list(_TEST_MODELS)
 
+    #: What the gateway says about the account. Read by ``require_agent_owner``
+    #: on every write, so a fake without it sends every mutating route down an
+    #: ``AttributeError`` — the same trap ``model_catalog_with_aliases``
+    #: documents below. Overridden per-test to exercise a refusal.
+    status: ClassVar[dict[str, Any]] = {"exists": True, "active": True, "role": "internal"}
+
+    async def user_status(self, user_id: str) -> dict[str, Any]:
+        return dict(self.status)
+
     aliases: ClassVar[dict[str, str]] = {}
 
     async def model_catalog_with_aliases(self, user_id: str) -> tuple[list[str], dict[str, str]]:
@@ -5041,6 +5050,167 @@ async def test_the_owner_sees_what_their_turn_consumed(
     assert job["resources"]["cpu_usec"] == 18_200_000
     assert job["resources"]["mem_peak_bytes"] == 1_288_490_188
     assert job["resources"]["coverage"] == 1.0
+
+
+async def test_per_call_rows_survive_the_wire_in_both_directions(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """Posted by the runner, read by the owner, over the real request models.
+
+    Written against the wire rather than the store because that is where this
+    kind of field is lost: a model missing the attribute accepts the post,
+    answers 200, and drops it silently — which no test that hands a dict to
+    the store can see.
+    """
+    job_id = await _create_job(client)
+    claim = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+    auth = {"Authorization": f"Bearer {claim['worker_token']}"}
+
+    ack = await client.post(
+        f"/v1/agent/worker/jobs/{job_id}/resources",
+        json={
+            "cpu_usec": 5_000_000,
+            "sample_count": 12,
+            "coverage": 1.0,
+            "sampler_version": "2",
+            "tool_time_ms": 9_543,
+            "tool_calls": [
+                {
+                    "call_seq": 1,
+                    "tool_use_id": "toolu_long",
+                    "tool_name": "Bash",
+                    "timing_source": "exact",
+                    "duration_ms": 9_523,
+                    "sample_count": 9,
+                    "overlap_n": 1,
+                    "measured_span_ms": 8_000,
+                    "cpu_usec_exclusive": 4_400_000,
+                    "mem_peak_exclusive_bytes": 270_000_000,
+                    "process_count": 1,
+                    "process_cpu_usec": 15_000,
+                    "process_mem_peak_bytes": 2_228_224,
+                    "process_io_read_bytes": 0,
+                    "process_io_write_bytes": 8_388_608,
+                    "process_resources_partial": True,
+                },
+                {
+                    "call_seq": 2,
+                    "tool_use_id": "toolu_short",
+                    "tool_name": "Read",
+                    "duration_ms": 20,
+                    "sample_count": 0,
+                    "overlap_n": 1,
+                },
+            ],
+            "tool_calls_truncated": False,
+            "process_observer": "kata-guest-ebpf-v1",
+            "process_observation_complete": True,
+            "process_events_lost": 0,
+            "processes": [
+                {
+                    "process_seq": 1,
+                    "uid": 11003,
+                    "pid": 42,
+                    "tgid": 42,
+                    "ppid": 7,
+                    "comm": "tiny",
+                    "executable": "/bin/tiny",
+                    "started_offset_ms": 12,
+                    "duration_ms": 1,
+                    "exit_code": 0,
+                    "observed_fork": True,
+                    "observed_exec": True,
+                    "observed_exit": True,
+                    "tool_call_seqs": [1],
+                    "cpu_usec": 15_000,
+                    "mem_peak_bytes": 2_228_224,
+                    "io_read_bytes": 0,
+                    "io_write_bytes": 8_388_608,
+                    "io_rchar_bytes": 8_390_683,
+                    "io_wchar_bytes": 8_388_701,
+                }
+            ],
+        },
+        headers=auth,
+    )
+    assert ack.status_code == 200, ack.text
+
+    resources = (await client.get(f"/v1/agent/jobs/{job_id}")).json()["resources"]
+    assert resources["tool_calls_truncated"] is False
+    assert resources["tool_time_ms"] == 9_543
+    long_call, short_call = resources["tool_calls"]
+    assert long_call["tool_name"] == "Bash"
+    assert long_call["timing_source"] == "exact"
+    assert short_call["timing_source"] == "message", "an unmarked call claimed precision"
+    assert long_call["cpu_usec_exclusive"] == 4_400_000
+    assert long_call["measured_span_ms"] == 8_000
+    assert long_call["process_count"] == 1
+    assert long_call["process_cpu_usec"] == 15_000
+    assert long_call["process_mem_peak_bytes"] == 2_228_224
+    assert long_call["process_io_write_bytes"] == 8_388_608
+    assert long_call["process_resources_partial"] is True
+    assert short_call["process_cpu_usec"] is None
+    assert short_call["process_resources_partial"] is False
+    assert resources["process_observer"] == "kata-guest-ebpf-v1"
+    assert resources["process_observation_complete"] is True
+    assert resources["process_events_lost"] == 0
+    (process,) = resources["processes"]
+    assert process["executable"] == "/bin/tiny"
+    assert process["duration_ms"] == 1
+    assert process["tool_call_seqs"] == [1]
+    assert process["cpu_usec"] == 15_000
+    assert process["mem_peak_bytes"] == 2_228_224
+    assert process["io_write_bytes"] == 8_388_608
+    assert process["io_rchar_bytes"] == 8_390_683
+    # The 97 % case, all the way to the reader: a row, a duration, and no
+    # counters at all. A zero here would be a number nobody measured.
+    assert short_call["sample_count"] == 0
+    assert short_call["cpu_usec_exclusive"] is None
+    assert short_call["cpu_usec_shared"] is None
+    assert short_call["mem_peak_exclusive_bytes"] is None
+
+
+async def test_a_turn_with_no_per_call_rows_reads_as_an_empty_list(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """Every turn recorded before this shipped, and every unmeasured one."""
+    job_id = await _create_job(client)
+    claim = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+    auth = {"Authorization": f"Bearer {claim['worker_token']}"}
+    await client.post(
+        f"/v1/agent/worker/jobs/{job_id}/resources",
+        json={"sample_count": 0, "coverage": 0.0, "sampler_version": "2"},
+        headers=auth,
+    )
+
+    resources = (await client.get(f"/v1/agent/jobs/{job_id}")).json()["resources"]
+    assert resources["tool_calls"] == []
+    assert resources["tool_calls_truncated"] is False
+    # Null, not zero: a turn nobody measured did not spend no time in tools.
+    assert resources["tool_time_ms"] is None
+
+
+async def test_more_calls_than_the_cap_are_refused_rather_than_truncated_server_side(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """The runner caps and flags; the server must not quietly cap a second time."""
+    job_id = await _create_job(client)
+    claim = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+    auth = {"Authorization": f"Bearer {claim['worker_token']}"}
+
+    response = await client.post(
+        f"/v1/agent/worker/jobs/{job_id}/resources",
+        json={
+            "sample_count": 1,
+            "coverage": 1.0,
+            "sampler_version": "2",
+            "tool_calls": [
+                {"call_seq": i + 1, "tool_use_id": f"t{i}", "tool_name": "Read"} for i in range(501)
+            ],
+        },
+        headers=auth,
+    )
+    assert response.status_code == 422
 
 
 async def test_a_rollup_is_the_same_window_said_twice_not_two_windows(

@@ -6,6 +6,7 @@ composed command rather than trusted to a container runtime being installed.
 
 from __future__ import annotations
 
+import io
 import logging
 import signal
 import subprocess
@@ -16,6 +17,7 @@ import pytest
 from cloud_agent_host import sandbox as sandbox_mod
 from cloud_agent_host.egress import EgressPolicyError
 from cloud_agent_host.egress_proxy import CANARY_HOST
+from cloud_agent_host.guest_observer import GuestObservation, GuestObserverCursor
 from cloud_agent_host.sandbox import (
     KATA_RUNTIME,
     ContainerBackend,
@@ -100,6 +102,170 @@ def test_container_command_carries_the_isolation_flags():
     assert "--network agent-net" in joined
     # The agent's argv comes after the image, never before it.
     assert command[command.index("img:1") + 1 :] == ["claude", "-p", "hi"]
+
+
+def test_observed_kata_turn_starts_ebpf_before_agent_and_drains_before_remove(monkeypatch):
+    """A throwaway guest must exist on both sides of the agent lifecycle."""
+    events: list[str] = []
+    run_commands: list[list[str]] = []
+    popen_commands: list[list[str]] = []
+
+    class FakePopen:
+        def __init__(self, command, **_kwargs) -> None:
+            events.append("agent-start")
+            popen_commands.append(list(command))
+            self.stdin = None
+            self.stdout = io.StringIO("")
+            self.stderr = io.StringIO("")
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            events.append("agent-wait")
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    def fake_run(command, **_kwargs):
+        run_commands.append(list(command))
+        if command[1] == "run":
+            events.append("guest-start")
+            return SimpleNamespace(returncode=0, stdout="container-id\n", stderr="")
+        if command[1:3] == ["rm", "--force"]:
+            events.append("guest-remove")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def begin(_controller, *, user_uid):
+        events.append("observer-begin")
+        return GuestObserverCursor(uid=user_uid, available=True)
+
+    def finish(_controller, _cursor):
+        events.append("observer-finish")
+        return GuestObservation(
+            source="kata-guest-ebpf-v1",
+            complete=True,
+            lost_events=0,
+            truncated=False,
+        )
+
+    monkeypatch.setattr(sandbox_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(sandbox_mod.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(sandbox_mod.GuestObserverController, "begin", begin)
+    monkeypatch.setattr(sandbox_mod.GuestObserverController, "finish", finish)
+    backend = ContainerBackend(image="img:1", network="agent-net", runtime=KATA_RUNTIME)
+
+    process = backend.spawn(
+        SandboxSpec(
+            argv=["claude", "-p", "hi"],
+            workdir="/tmp/wd",
+            env={"TOKEN": "turn-secret"},
+            observe_processes=True,
+        )
+    )
+
+    assert events[:3] == ["guest-start", "observer-begin", "agent-start"]
+    launch = run_commands[0]
+    assert "--detach" in launch and "--rm" not in launch
+    assert launch[launch.index("--runtime") + 1] == KATA_RUNTIME
+    assert launch[launch.index("--user") + 1] == "10001:10001"
+    assert launch[launch.index("--cap-add") + 1] == "BPF"
+    assert "sleep 2147483647 & child=$!" in launch[-1]
+    assert not any(value == "TOKEN=turn-secret" for value in launch)
+    agent_exec = popen_commands[0]
+    assert agent_exec[:2] == ["docker", "exec"]
+    assert "TOKEN=turn-secret" in agent_exec
+    assert agent_exec[-3:] == ["claude", "-p", "hi"]
+
+    assert process.wait() == 0
+    assert events[-3:] == ["agent-wait", "observer-finish", "guest-remove"]
+
+
+def test_observed_live_kata_turn_refences_without_destroying_the_guest(monkeypatch):
+    """Closing one HOT turn must not kill the process needed by the next."""
+    events: list[str] = []
+    process_holder: list[object] = []
+
+    class FakePopen:
+        def __init__(self, _command, **_kwargs) -> None:
+            self.stdin = io.StringIO()
+            self.stdout = io.StringIO("")
+            self.stderr = io.StringIO("")
+            self.returncode = None
+            process_holder.append(self)
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.returncode = 143
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    def fake_run(command, **_kwargs):
+        if command[1] == "run":
+            return SimpleNamespace(returncode=0, stdout="container-id\n", stderr="")
+        if command[1:3] == ["rm", "--force"]:
+            events.append("remove")
+        elif command[1] == "exec":
+            events.append("terminate")
+            process_holder[0].returncode = 143
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def begin(_controller, *, user_uid):
+        events.append("begin")
+        return GuestObserverCursor(uid=user_uid, available=True)
+
+    def finish(_controller, _cursor):
+        events.append("finish")
+        return GuestObservation(
+            source="kata-guest-ebpf-v1",
+            complete=True,
+            lost_events=0,
+            truncated=False,
+        )
+
+    def rotate(_controller, *, threshold):
+        assert threshold == sandbox_mod.GUEST_OBSERVER_ROTATE_BYTES
+        events.append("rotate")
+        return False
+
+    monkeypatch.setattr(sandbox_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(sandbox_mod.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(sandbox_mod.GuestObserverController, "begin", begin)
+    monkeypatch.setattr(sandbox_mod.GuestObserverController, "finish", finish)
+    monkeypatch.setattr(sandbox_mod.GuestObserverController, "rotate_if_needed", rotate)
+    backend = ContainerBackend(image="img:1", network="agent-net", runtime=KATA_RUNTIME)
+    process = backend.spawn(
+        SandboxSpec(
+            argv=["claude"],
+            workdir="/tmp/wd",
+            live_input=True,
+            observe_processes=True,
+        )
+    )
+
+    process.finish_guest_observation()
+    assert events == ["begin", "finish"]
+    process.begin_guest_observation()
+    process.finish_guest_observation()
+    assert events == ["begin", "finish", "rotate", "begin", "finish"]
+
+    process.begin_guest_observation()
+    process.kill()
+    assert events[-5:] == ["rotate", "begin", "terminate", "finish", "remove"]
+
+    stale_cursor = process.begin_guest_observation()
+    stale_result = process.finish_guest_observation()
+    assert stale_cursor.available is False
+    assert stale_result.complete is False
+    assert stale_result.source is None
+    assert events[-1] == "remove"
 
 
 def test_container_terminal_keeps_isolation_and_adds_a_named_tty():
@@ -615,7 +781,15 @@ def test_container_preflight_proves_guest_kernel_with_the_exact_runtime_and_imag
     def fake_run(argv, **kwargs):
         calls.append(argv)
         if argv[1] == "run":
-            return SimpleNamespace(returncode=0, stdout="guest-kernel\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="container-id\n", stderr="")
+        if argv[1] == "exec":
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "guest-kernel\nfreeinference-guest-observer-v1\nfreeinference-tool-mark-v1\n"
+                ),
+                stderr="",
+            )
         if argv[1:3] == ["network", "inspect"]:
             return SimpleNamespace(returncode=0, stdout="true\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="27.0\n", stderr="")
@@ -629,9 +803,19 @@ def test_container_preflight_proves_guest_kernel_with_the_exact_runtime_and_imag
 
     backend.preflight()
 
-    probe = next(argv for argv in calls if argv[1] == "run")
-    assert probe[probe.index("--runtime") + 1] == KATA_RUNTIME
-    assert probe[probe.index("--entrypoint") + 2] == "registry.example/sandbox@sha256:abc"
+    launch = next(argv for argv in calls if argv[1] == "run")
+    assert launch[launch.index("--runtime") + 1] == KATA_RUNTIME
+    assert launch[launch.index("--user") + 1] != "0:0"
+    assert "--cap-drop" in launch and launch[launch.index("--cap-drop") + 1] == "ALL"
+    assert "--cap-add" in launch and launch[launch.index("--cap-add") + 1] == "BPF"
+    assert "--security-opt" in launch
+    assert launch[launch.index("--entrypoint") + 2] == "registry.example/sandbox@sha256:abc"
+    probe = next(argv for argv in calls if argv[1] == "exec")
+    assert "--privileged" in probe
+    assert probe[probe.index("--user") + 1] == "0:0"
+    assert "freeinference-guest-observer" in probe[-1]
+    assert "freeinference-tool-mark" in probe[-1]
+    assert any(argv[1:3] == ["rm", "--force"] for argv in calls)
     stamp = backend.version_stamp()
     assert stamp["host_kernel"] == "host-kernel"
     assert stamp["guest_kernel"] == "guest-kernel"
@@ -658,6 +842,38 @@ def test_container_preflight_refuses_an_unproved_kernel_boundary(
 
     with pytest.raises(SandboxError, match=message):
         backend._probe_kernel_boundary()
+
+
+def test_kata_preflight_refuses_a_guest_without_the_ebpf_observer_contract(monkeypatch):
+    monkeypatch.setattr(sandbox_mod.os, "uname", lambda: SimpleNamespace(release="host-kernel"))
+    monkeypatch.setattr(
+        sandbox_mod.subprocess,
+        "run",
+        lambda argv, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="guest-kernel\n",
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(SandboxError, match="debug/eBPF kernel with BTF"):
+        ContainerBackend(image="img:1", runtime=KATA_RUNTIME)._probe_kernel_boundary()
+
+
+def test_kata_preflight_refuses_when_the_real_privileged_exec_cannot_load_bpf(monkeypatch):
+    monkeypatch.setattr(sandbox_mod.os, "uname", lambda: SimpleNamespace(release="host-kernel"))
+
+    def fake_run(argv, **_kwargs):
+        if argv[1] == "run":
+            return SimpleNamespace(returncode=0, stdout="container-id\n", stderr="")
+        if argv[1] == "exec":
+            return SimpleNamespace(returncode=1, stdout="", stderr="Operation not permitted")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox_mod.subprocess, "run", fake_run)
+
+    with pytest.raises(SandboxError, match="privileged exec path: Operation not permitted"):
+        ContainerBackend(image="img:1", runtime=KATA_RUNTIME)._probe_kernel_boundary()
 
 
 def test_plain_runc_cannot_fabricate_a_guest_kernel_attestation(monkeypatch):
@@ -1171,6 +1387,8 @@ def _inspect_json(**overrides):
                 "org.freeinference.runtime.claude-code.version": "1.2.3",
                 "org.freeinference.runtime.codex.version": "0.5.0",
                 "org.freeinference.helper.claude-agent-sdk.version": "0.2.148",
+                "org.freeinference.helper.guest-observer.version": "1",
+                "org.freeinference.helper.tool-mark.version": "1",
                 "org.freeinference.runtime..version": "nameless",
                 "org.opencontainers.image.source": "irrelevant",
             }
@@ -1197,7 +1415,11 @@ def test_version_stamp_reads_runtime_digest_and_baked_versions(monkeypatch):
     assert stamp["sandbox_image_digest"] == "registry.example/sandbox@sha256:pinned"
     # Only well-formed version labels count; a nameless runtime id is dropped.
     assert stamp["runtime_versions"] == {"claude-code": "1.2.3", "codex": "0.5.0"}
-    assert stamp["helper_versions"] == {"claude-agent-sdk": "0.2.148"}
+    assert stamp["helper_versions"] == {
+        "claude-agent-sdk": "0.2.148",
+        "guest-observer": "1",
+        "tool-mark": "1",
+    }
     backend.version_stamp()
     assert len(calls) == 1  # cached — the image is pinned for this process
 

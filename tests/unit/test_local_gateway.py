@@ -30,8 +30,8 @@ def test_default_identity_redirects_follow_the_configured_edge_port(monkeypatch)
     monkeypatch.setenv("LOCAL_EDGE_PORT", "23002")
 
     assert gateway._allowed_redirects() == {
-        "http://127.0.0.1:23002/callback",
-        "http://localhost:23002/callback",
+        "http://127.0.0.1:23002/api/v1/session/callback",
+        "http://localhost:23002/api/v1/session/callback",
     }
 
 

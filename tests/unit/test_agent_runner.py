@@ -11,10 +11,18 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from cloud_agent_host import enrollment, runner as runner_mod
+from cloud_agent_host.guest_observer import (
+    GUEST_OBSERVER_SOURCE,
+    MAX_OBSERVED_PROCESSES,
+    GuestObservation,
+    GuestObserverCursor,
+    GuestProcess,
+)
 from cloud_agent_host.runner import (
     ClaimedJob,
     LeaseLost,
@@ -23,7 +31,12 @@ from cloud_agent_host.runner import (
     run_agent,
 )
 from cloud_agent_host.runtimes import ClaudeCodeRuntime, GenericRuntime, RuntimeMCPConfig
-from cloud_agent_host.sandbox import ContainerBackend, ProcessBackend, SandboxError
+from cloud_agent_host.sandbox import (
+    KATA_RUNTIME,
+    ContainerBackend,
+    ProcessBackend,
+    SandboxError,
+)
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
@@ -381,6 +394,248 @@ def test_agent_timeout_is_enforced(tmp_path):
     )
     assert code == 124
     assert any(kind == "error" for kind, _ in control.events)
+
+
+def test_retained_hooks_are_installed_before_the_guest_process_fence(tmp_path):
+    """Platform hook setup must not be counted as an agent-created process."""
+    events: list[str] = []
+
+    class Process:
+        @staticmethod
+        def lines():
+            return iter([_result_line()])
+
+        @staticmethod
+        def kill():
+            return None
+
+        @staticmethod
+        def wait():
+            return 0
+
+        @staticmethod
+        def stderr_text():
+            return ""
+
+    class Backend:
+        provides_isolation = True
+        is_vm_isolated = True
+
+        @staticmethod
+        def base_env():
+            return {"PATH": "/usr/bin"}
+
+        @staticmethod
+        def adopt_workdir(_path):
+            return None
+
+        @staticmethod
+        def install_tool_hooks(_update):
+            events.append("hooks")
+
+        @staticmethod
+        def begin_guest_observation():
+            events.append("begin")
+            return GuestObserverCursor(uid=10001, available=True)
+
+        @staticmethod
+        def finish_guest_observation(_cursor):
+            events.append("finish")
+            return GuestObservation(
+                source="kata-guest-ebpf-v1",
+                complete=True,
+                lost_events=0,
+                truncated=False,
+            )
+
+        @staticmethod
+        def tool_mark_reader():
+            return SimpleNamespace(read=lambda: [])
+
+        @staticmethod
+        def spawn(_spec):
+            events.append("spawn")
+            return Process()
+
+    control = FakeControl()
+    code, _tail, _errors = run_agent(
+        ClaudeCodeRuntime(),
+        job=ClaimedJob(**{**_JOB.__dict__, "runtime": "claude-code"}),
+        workdir=str(tmp_path),
+        gateway_base_url="http://gw",
+        control=control,
+        heart=FakeHeart(),
+        timeout_s=30,
+        backend=Backend(),
+        state_dir="/agent-state",
+        export_checkpoint=False,
+    )
+
+    assert code == 0
+    assert events == ["hooks", "begin", "spawn", "finish"]
+    assert control.resources[0]["process_observation_complete"] is True
+
+
+def test_merging_more_process_rows_than_the_wire_cap_is_never_complete(tmp_path):
+    def observed_process(sequence: int) -> GuestProcess:
+        return GuestProcess(
+            process_seq=sequence,
+            uid=10001,
+            pid=sequence + 10,
+            tgid=sequence + 10,
+            ppid=1,
+            comm="tiny",
+            executable="/bin/tiny",
+            started_guest_mono_ns=sequence,
+            exited_guest_mono_ns=sequence + 1,
+            started_host_mono=0.0,
+            exited_host_mono=0.0,
+            exit_code=0,
+            observed_fork=True,
+            observed_exec=True,
+            observed_exit=True,
+        )
+
+    class Process:
+        @staticmethod
+        def lines():
+            return iter([_result_line()])
+
+        @staticmethod
+        def kill():
+            return None
+
+        @staticmethod
+        def wait():
+            return 0
+
+        @staticmethod
+        def stderr_text():
+            return ""
+
+        @staticmethod
+        def finish_guest_observation():
+            return GuestObservation(
+                source="kata-guest-ebpf-v1",
+                complete=True,
+                lost_events=0,
+                truncated=False,
+                processes=(observed_process(MAX_OBSERVED_PROCESSES + 1),),
+            )
+
+    class Backend:
+        provides_isolation = True
+        is_vm_isolated = True
+
+        @staticmethod
+        def base_env():
+            return {"PATH": "/usr/bin"}
+
+        @staticmethod
+        def adopt_workdir(_path):
+            return None
+
+        @staticmethod
+        def begin_guest_observation():
+            return GuestObserverCursor(uid=10001, available=True)
+
+        @staticmethod
+        def finish_guest_observation(_cursor):
+            return GuestObservation(
+                source="kata-guest-ebpf-v1",
+                complete=True,
+                lost_events=0,
+                truncated=False,
+                processes=tuple(
+                    observed_process(sequence) for sequence in range(1, MAX_OBSERVED_PROCESSES + 1)
+                ),
+            )
+
+        @staticmethod
+        def spawn(_spec):
+            return Process()
+
+    control = FakeControl()
+    code, _tail, _errors = run_agent(
+        ClaudeCodeRuntime(),
+        job=ClaimedJob(**{**_JOB.__dict__, "runtime": "claude-code"}),
+        workdir=str(tmp_path),
+        gateway_base_url="http://gw",
+        control=control,
+        heart=FakeHeart(),
+        timeout_s=30,
+        backend=Backend(),
+        export_checkpoint=False,
+    )
+
+    assert code == 0
+    resources = control.resources[0]
+    assert len(resources["processes"]) == MAX_OBSERVED_PROCESSES
+    assert resources["processes_truncated"] is True
+    assert resources["process_observation_complete"] is False
+
+
+@pytest.mark.parametrize(
+    ("heart", "timeout_s", "expected_code"),
+    [
+        (FakeHeart(cancel=True), 30.0, 130),
+        (FakeHeart(), -1.0, 124),
+    ],
+)
+def test_shared_cancel_and_timeout_drain_the_terminal_resource_frame(
+    heart,
+    timeout_s,
+    expected_code,
+):
+    """Interrupt first, then preserve the broker's closed eBPF observation."""
+    resources = {
+        "process_observer": "kata-guest-ebpf-v1",
+        "process_observation_complete": True,
+        "processes": [{"pid": 412}],
+    }
+
+    class Stream:
+        closed = False
+
+        @staticmethod
+        def frames():
+            yield {
+                "kind": "result",
+                "status": "cancelled",
+                "exit_code": 130,
+                "resources": resources,
+            }
+
+        def close(self):
+            self.closed = True
+
+    class Supervisor:
+        def __init__(self) -> None:
+            self.stream = Stream()
+            self.interrupts = 0
+
+        def start_shared_turn(self, *_args, **_kwargs):
+            return self.stream
+
+        def interrupt_shared(self, *_args, **_kwargs):
+            self.interrupts += 1
+
+    supervisor = Supervisor()
+    job = ClaimedJob(**{**_JOB.__dict__, "thread_id": "athr_shared"})
+
+    code, _tail, _errors, result = runner_mod._stream_shared_agent_turn(
+        supervisor=supervisor,
+        job=job,
+        control=FakeControl(),
+        heart=heart,
+        lease_token="lease-token",
+        timeout_s=timeout_s,
+    )
+
+    assert code == expected_code
+    assert result is not None and result["resources"] is resources
+    assert supervisor.interrupts == 1
+    assert supervisor.stream.closed is True
 
 
 def test_agent_environment_is_hermetic(tmp_path, monkeypatch):
@@ -953,6 +1208,74 @@ def test_failed_tool_calls_are_reported_not_swallowed(tmp_path):
     assert "permission denied" in errors[0]
     # The owner sees it in the stream, not only in the final detail string.
     assert any(kind == "error" for kind, _payload in control.events)
+
+
+def test_the_turn_reports_one_row_per_tool_call_it_actually_made(tmp_path):
+    """The forward wiring: driver events in, per-call rows out.
+
+    Asserted through ``run_agent`` rather than against the tracker, because
+    the tracker being correct is not the thing that broke last time — the
+    thing that broke was nobody calling it. A test that drives the parser and
+    reads what the control plane was handed fails if the seam is removed,
+    which no unit test of the pure function can.
+
+    The counters are null here and that is the assertion, not a gap in it: a
+    process backend has no container to read, so a row carrying numbers would
+    mean the runner had invented them.
+    """
+    lines = [
+        '{"type":"assistant","message":{"content":'
+        '[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}',
+        '{"type":"user","message":{"content":'
+        '[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}',
+    ]
+    script = f"import json;[print(line, flush=True) for line in json.loads({json.dumps(lines)!r})]"
+
+    class _ScriptedClaude(ClaudeCodeRuntime):
+        """Claude Code's event parsing, driven by a scripted stdout."""
+
+        def prepare(self, **_kwargs):
+            return [sys.executable, "-c", script], {}
+
+    control = FakeControl()
+    code, _tail, _errors = run_agent(
+        _ScriptedClaude(),
+        job=_JOB,
+        workdir=str(tmp_path),
+        gateway_base_url="http://gw",
+        control=control,
+        heart=FakeHeart(),
+        timeout_s=30,
+        backend=ProcessBackend(acknowledged_unsafe=True),
+    )
+
+    assert code == 0
+    (rollup,) = control.resources
+    (call,) = rollup["tool_calls"]
+    assert call["tool_name"] == "Bash"
+    assert call["tool_use_id"] == "t1"
+    assert call["duration_ms"] is not None, "the call was never closed against its result"
+    assert call["sample_count"] == 0
+    assert call["cpu_usec_exclusive"] is None
+    assert rollup["tool_calls_truncated"] is False
+
+
+def test_a_turn_that_called_no_tools_reports_an_empty_list_not_a_missing_key(tmp_path):
+    """The reader distinguishes "no calls" from "this runner never reported"."""
+    control = FakeControl()
+    run_agent(
+        _echo_runtime(1),
+        job=_JOB,
+        workdir=str(tmp_path),
+        gateway_base_url="http://gw",
+        control=control,
+        heart=FakeHeart(),
+        timeout_s=30,
+        backend=ProcessBackend(acknowledged_unsafe=True),
+    )
+
+    (rollup,) = control.resources
+    assert rollup["tool_calls"] == []
 
 
 class _CountingBackend:
@@ -1579,6 +1902,154 @@ def test_a_turn_on_the_surviving_process_reports_hot(tmp_path):
     assert not process.killed
 
 
+def test_a_hot_kata_turn_does_not_report_hypervisor_stats_as_agent_usage(
+    tmp_path,
+    monkeypatch,
+):
+    """HOT bypasses spawn, but must keep the same Kata sampler policy."""
+    bindings: list[str | None] = []
+
+    class Sampler:
+        def __init__(self, container):
+            bindings.append(container)
+
+        def rebind(self, container):
+            bindings.append(container)
+
+        @staticmethod
+        def stop():
+            return {"sample_count": 0, "coverage": 0.0, "sampler_version": "test"}
+
+        @staticmethod
+        def samples():
+            return []
+
+    class KataBackend(_LiveSpawnBackend):
+        is_vm_isolated = True
+
+    class ContainerProcess(_ResidentProcess):
+        container = "kata-container"
+
+    monkeypatch.setattr(runner_mod, "ResourceSampler", Sampler)
+    runtime = ClaudeCodeRuntime()
+    process = ContainerProcess()
+    entry = _resident_entry(tmp_path)
+    entry.live_session = _spawned_live_session(runtime, process, entry.state_dir)
+    process.feed = [_result_line()]
+
+    exit_code, _tail, _errors = run_agent(
+        runtime,
+        job=_hot_job(),
+        workdir=entry.workdir,
+        gateway_base_url="http://gw",
+        control=FakeControl(),
+        heart=FakeHeart(),
+        timeout_s=30,
+        backend=KataBackend(process),
+        state_dir=entry.state_dir,
+        resident=entry,
+        residents=_DetachPool(),
+        live_out={},
+    )
+
+    assert exit_code == 0
+    assert bindings == [None, None]
+
+
+def test_a_live_process_that_dies_before_hot_admission_does_not_open_a_cursor(tmp_path):
+    """A cursor belongs to an attempted prompt, not the preceding idle turn."""
+
+    class DiedBetweenChecks:
+        def __init__(self) -> None:
+            self.alive_checks = 0
+            self.observation_begins = 0
+            self.observation_finishes = 0
+
+        def process_alive(self) -> bool:
+            self.alive_checks += 1
+            return self.alive_checks == 1
+
+        def begin_guest_observation(self):
+            self.observation_begins += 1
+            return GuestObserverCursor(uid=10001, available=True)
+
+        def finish_guest_observation(self, _cursor):
+            self.observation_finishes += 1
+            return GuestObservation(
+                source="prior-turn-observation",
+                complete=True,
+                lost_events=0,
+                truncated=False,
+            )
+
+    runtime = ClaudeCodeRuntime()
+    process = _ResidentProcess()
+    process.feed = [_result_line()]
+    stale = DiedBetweenChecks()
+    entry = _resident_entry(tmp_path)
+    entry.live_session = stale
+    pool = _DetachPool()
+    control = FakeControl()
+
+    exit_code, _tail, _errors = run_agent(
+        runtime,
+        job=_hot_job(),
+        workdir=entry.workdir,
+        gateway_base_url="http://gw",
+        control=control,
+        heart=FakeHeart(),
+        timeout_s=30,
+        backend=_LiveSpawnBackend(process),
+        state_dir=entry.state_dir,
+        resident=entry,
+        residents=pool,
+        live_out={},
+    )
+
+    assert exit_code == 0
+    assert pool.detached == ["t-hot"]
+    assert stale.observation_begins == 0
+    assert stale.observation_finishes == 0
+    assert control.resources[0].get("process_observer") is None
+
+
+def test_a_hot_turn_reports_an_observer_start_failure_as_incomplete(tmp_path):
+    class KataBackend(_LiveSpawnBackend):
+        runtime = KATA_RUNTIME
+        is_vm_isolated = True
+
+    runtime = ClaudeCodeRuntime()
+    process = _ResidentProcess()
+    entry = _resident_entry(tmp_path)
+    entry.live_session = _spawned_live_session(runtime, process, entry.state_dir)
+
+    def fail_observation():
+        raise RuntimeError("observer fence failed")
+
+    entry.live_session.begin_guest_observation = fail_observation
+    process.feed = [_result_line()]
+    control = FakeControl()
+
+    exit_code, _tail, _errors = run_agent(
+        runtime,
+        job=_hot_job(),
+        workdir=entry.workdir,
+        gateway_base_url="http://gw",
+        control=control,
+        heart=FakeHeart(),
+        timeout_s=30,
+        backend=KataBackend(process),
+        state_dir=entry.state_dir,
+        resident=entry,
+        residents=_DetachPool(),
+        live_out={},
+    )
+
+    assert exit_code == 0
+    assert control.resources[0]["process_observation_complete"] is False
+    assert control.resources[0]["process_observer"] == GUEST_OBSERVER_SOURCE
+
+
 def test_the_first_live_turn_spawns_on_the_residency_grant(tmp_path):
     """No process yet: the turn spawns one over the resident workspace, on the
     residency's credential and with a live stdin — warm_native this turn
@@ -1612,6 +2083,7 @@ def test_the_first_live_turn_spawns_on_the_residency_grant(tmp_path):
     assert control.context_status == "restored"
     (spec,) = backend.specs
     assert spec.live_input is True
+    assert spec.observe_processes is True
     assert spec.argv[spec.argv.index("--resume") + 1] == "sess-prev"
     assert live_out["session"] is not None
     assert live_out["session_id"] == "sess-new"

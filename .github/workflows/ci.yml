@@ -856,6 +856,13 @@ jobs:
           AGENT_SOURCE_CONTROL_ENCRYPTION_KEY=ci-placeholder-value-not-real
           AGENT_POSTGRES_PASSWORD=ci-placeholder
           AGENT_DISPATCHER_TOKEN=ci-placeholder
+          # Sign-in is assembled server-side now, so the control plane needs
+          # the consent page, its own callback as the gateway must see it
+          # (byte-identical to an IDENTITY_ALLOWED_REDIRECTS entry there),
+          # and where to land the browser afterwards.
+          GATEWAY_AUTHORIZE_URL=https://gateway.invalid/authorize
+          AGENT_SESSION_REDIRECT_URI=https://agents.invalid/agents/api/v1/session/callback
+          AGENT_WEB_BASE_URL=https://agents.invalid/agents
           # The web build arguments are required rather than defaulted to
           # empty: empty is a real answer for a deployment that owns its
           # hostname and silently wrong for one mounted under a prefix, and
@@ -863,7 +870,7 @@ jobs:
           # part of what this step checks.
           AGENT_WEB_BASE_PATH=/agents
           AGENT_WEB_API_URL=/agents/api
-          AGENT_WEB_GATEWAY_AUTHORIZE_URL=https://gateway.invalid/authorize
+          AGENT_WEB_GATEWAY_URL=https://gateway.invalid
           ENVFILE
           docker compose \
             -f deploy/control-plane/docker-compose.yml \

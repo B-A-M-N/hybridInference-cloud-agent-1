@@ -65,6 +65,20 @@ services:
       # under a different name than it mints under, and pinning `iss` wrongly
       # locks every user out.
       GATEWAY_ISSUER: ${GATEWAY_ISSUER:-}
+      # The consent page a sign-in starts at. Server-side: the whole PKCE round
+      # trip is assembled in the control plane now, so the web app no longer
+      # needs its own copy of this.
+      GATEWAY_AUTHORIZE_URL: ${GATEWAY_AUTHORIZE_URL:?the gateway origin plus /authorize}
+      # Where the gateway sends the browser back — this service's callback, as
+      # the public internet addresses it, and **byte-identical to an entry in
+      # the gateway's IDENTITY_ALLOWED_REDIRECTS**, which is matched as an exact
+      # string. Configured rather than derived from request headers so that
+      # whatever sits in front of this service cannot decide where sign-in
+      # returns to.
+      AGENT_SESSION_REDIRECT_URI: ${AGENT_SESSION_REDIRECT_URI:?public URL of /v1/session/callback, allowlisted at the gateway}
+      # Where the browser lands once the cookie is set: the web app's public
+      # origin including any base path, e.g. https://example.org/agents.
+      AGENT_WEB_BASE_URL: ${AGENT_WEB_BASE_URL:?public origin of the web app, including any base path}
 
       # --- This service's own secrets ---------------------------------------
       # Required, never defaulted. A default here is a deployment that looks
@@ -227,7 +241,9 @@ services:
         # host has to be known at build time. Under a base path this is that
         # base path plus `/api`, which the reverse proxy strips.
         NEXT_PUBLIC_AGENT_API_URL: ${AGENT_WEB_API_URL:?control-plane base URL as the browser calls it, e.g. /agents/api}
-        NEXT_PUBLIC_GATEWAY_AUTHORIZE_URL: ${AGENT_WEB_GATEWAY_AUTHORIZE_URL:?the gateway's consent page; without it this deployment cannot sign anyone in}
+        # The gateway's origin, for links this app does not host. Sign-in does
+        # not pass through the browser any more, so nothing here starts one.
+        NEXT_PUBLIC_GATEWAY_URL: ${AGENT_WEB_GATEWAY_URL:-}
         NEXT_PUBLIC_APP_NAME: ${AGENT_WEB_APP_NAME:-}
         # The rest of the header's identity. Optional — empty hides the link or
         # the name rather than rendering a blank one — but they have to be
@@ -248,6 +264,31 @@ services:
       control-plane:
         condition: service_started
     networks: [control-plane]
+
+  # --- Optional: the edge for a deployment that owns its own hostname -------
+  # Under the gateway's hostname the console proxies `/agents/*` to these two
+  # services and this one has no job, which is why it sits behind a profile:
+  # those deployments never run it. On a standalone hostname
+  # (agents.example.org) the tunnel or load balancer in front points at this
+  # one port and nginx splits the origin — `/api/*` to the control plane with
+  # the prefix stripped, everything else to the web app. One origin for both
+  # is what lets the session cookie travel; two hostnames would not.
+  #
+  # Enable with `COMPOSE_PROFILES=edge` in .env, and build the web app for the
+  # root: AGENT_WEB_BASE_PATH= (empty) and AGENT_WEB_API_URL=/api. Loopback by
+  # default, like every other published port here: the tunnel is on this host.
+  edge:
+    profiles: [edge]
+    image: nginx:1.27.5-alpine
+    volumes:
+      - ./edge.nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "${AGENT_EDGE_BIND:-127.0.0.1}:${AGENT_EDGE_PORT:-3003}:80"
+    depends_on:
+      - control-plane
+      - web
+    networks: [control-plane]
+    restart: unless-stopped
 
   postgres:
     image: postgres:16-alpine
