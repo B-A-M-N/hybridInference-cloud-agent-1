@@ -134,7 +134,7 @@ HybridInference 不再负责：
 - sandbox、workspace、terminal 与 native Agent session；
 - source-control connection、patch publication 与 PR lifecycle；
 - MCP catalog、用户 MCP connection、tool relay 与 tool allowlist；
-- Agent per-attempt resource telemetry；
+- Agent per-attempt resource telemetry 与 Kata guest process observer；
 - Agent frontend 的业务页面。
 
 ### 4.3 上游中立性
@@ -237,7 +237,7 @@ Cloud Agent 当前拥有：
 - repository connection 与 source preparation；
 - per-user MCP connection、registry、credential encryption、relay 与 tool filtering；
 - patch capture、secret scan coordination 与 trusted publisher；
-- Agent resource sampler 与 attempt telemetry；
+- Agent resource sampler、Kata guest process observer 与 attempt telemetry；
 - standalone `/agents` web application。
 
 ### 6.3 Gateway owner

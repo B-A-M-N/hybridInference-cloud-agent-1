@@ -2,7 +2,9 @@
 
 **日期：** 2026-09-01
 
-**状态：** 分层设计；Attempt 级 Docker Engine 采样已落地，operation/eBPF 归属尚未实现
+**修订：** 2026-09-03，对齐 [#89](https://github.com/HarvardMadSys/hybridInference-cloud-agent/pull/89) / [#102](https://github.com/HarvardMadSys/hybridInference-cloud-agent/pull/102) 落地的 Kata guest eBPF
+
+**状态：** 分层设计。Attempt 级 Docker Engine 采样、Claude Code exact hook 边界、Kata guest-root CO-RE 进程普查与 exit-time CPU/RSS/I/O 已落地。通用 operation ledger、host-side BPF、网络/文件 eBPF 仍是提案。Staging Kata/KVM 验收尚未关闭。
 
 **实现仓库：** `freeinference-cloud-agent`；Inference cost truth 位于 `hybridInference`
 
@@ -10,7 +12,7 @@
 
 - [Agent 会话连续性与共享沙盒架构](2026-09-01-agent-session-continuity-architecture.zh.md)
 - [Agent 沙盒安全模型与能力边界](2026-09-01-agent-sandbox-security-model.zh.md)
-- [Observability 与资源核算规范](2026-08-19-observability-and-resource-accounting-design.md)
+- [Observability 与资源核算规范](2026-08-19-observability-and-resource-accounting-design.md)（实现契约；已含 guest observer）
 - [Native session fork 与 shared workspace 设计](2026-08-31-native-session-fork-shared-workspace-design.md)
 
 ## 1. 实现状态
@@ -23,14 +25,27 @@
 | Attempt 资源采样 | 已实现 | Host 通过 Docker Engine stats 采样，写 `agent_attempt_resources` |
 | Measurement coverage | 已实现 | `coverage` + nullable counter；不可读不伪造为零 |
 | Gateway token/cost attribution | 已实现 | Gateway `api_logs.agent_job_id` 与 grant usage contract |
-| Shared sandbox per-member CPU/memory/I/O | 未实现 | 明确 `coverage=0`，不能复制 container total |
-| Per-tool resource window | 设计中 | Runtime event/hook boundary 与 overlap 规则已定义 |
-| Egress flow parsing 与 unclassified byte ledger | 设计中 | Proxy log 存在，完整 projection 尚未落地 |
+| Shared sandbox per-member periodic CPU/memory/I/O | 未实现 | Kata 下 hypervisor/container total 不能诚实分给 member；明确 `coverage=0`，禁止复制 group total |
+| Per-tool timing window | 已实现 | Claude Code 用平台 PreToolUse/PostToolUse hook 得 `exact`；其余 runtime 为 `message`；overlap 记 `shared_*` |
+| Per-tool process census | 已实现（Kata） | Guest-root CO-RE observer 记录 process-leader `fork`/`exec`/`exit`；线程折入 leader；marker helper 不计 workload |
+| Per-tool exit-time CPU/RSS/I/O | 已实现（Kata） | `sched_process_exit` 取 peak RSS 与 I/O；`sched_switch` 在 `TASK_DEAD` 取 `se.sum_exec_runtime`；缺 BTF 字段报 absent，不报 0 |
+| Egress flow parsing 与 unclassified byte ledger | 未实现 | 生产 `platform_only` 没有可解析的 CONNECT 日志；不是当前 eBPF 范围 |
 | General operation ledger | 本文提案 | 需要统一 turn/tool/terminal/file/Git/Fork/snapshot identity |
-| eBPF process/operation sensor | 本文提案 | 当前代码中没有 eBPF collector 或 BPF program |
+| Host-side OperationSensor / 网络与文件 eBPF | 本文提案 | 未被采用。生产路径是 guest observer，不是 host BPF daemon |
 | Admin aggregate、alert checker、OTLP export | 延后 | 不属于当前 per-chat 首发范围 |
 
-因此，当前可以回答“某个 attempt 的 container-level 资源大约是多少”；还不能普遍回答“共享容器内某个 operation 的每一段 CPU、I/O 与网络分别属于谁”。
+因此，当前可以回答：
+
+- 某个 attempt 的 container-level 资源大约是多少（Docker stats；Kata 下 periodic 覆盖常为不可用）；
+- 某个 Kata turn 在 cursor 之后新出现了哪些进程，以及其中已结算进程的 CPU、peak RSS 与 I/O；
+- 某个只归属一个 tool window、且 thread group 已结算的调用，其子进程消耗了多少（floor；lossy/overlap/未结算则标 `process_resources_partial`）。
+
+仍不能回答：
+
+- 共享容器内把同一 periodic total 精确拆给多个 member；
+- Agent 常驻进程内部、未派生 child 的工作属于哪个 tool；
+- 通用 operation（terminal/file/Git/Fork/snapshot）级 ledger；
+- 用 eBPF 做网络/文件授权或计费。
 
 ## 2. 问题定义
 
@@ -74,7 +89,7 @@ HTTP request
 5. Sensor 故障不影响 turn 正确性，但必须显式产生 gap。
 6. Kernel/process telemetry 不复制 prompt、tool result 或 credential。
 7. Gateway inference ledger、Agent event ledger 与 resource telemetry 各自保持单一 truth。
-8. eBPF 只作为增强 sensor；无 eBPF 时系统仍能以较低精度工作。
+8. eBPF 只作为 observation sensor，不是 isolation 或 authorization。非 Kata 路径无 guest observer 也能以 Docker stats 工作；已 advertise 的 Kata host 则必须通过 observer preflight，不能悄悄降级后仍宣称 VM-isolated process 级精度。
 
 ### 3.2 非目标
 
@@ -171,18 +186,27 @@ Ops 用于告警与诊断，不能与可求和 ledger event 混为一类。
 ## 6. 当前采样架构
 
 ```text
-sandbox container                  runner/host                    control plane
-─────────────────                 ───────────                    ─────────────
+sandbox (Kata guest)               runner/host                    control plane
+────────────────────               ───────────                    ─────────────
 Agent CLI + children              ResourceSampler               worker report API
-                                  1 Hz                           │
-Docker writable layer      <── Docker Engine stats API ────────┤
+  │                               1 Hz Docker stats              │
+  ├─ tool-mark helper ─┐                                         │
+  └─ fork/exec/exit ───┴─► guest-root eBPF observer              │
+                           /run/freeinference-observer           │
+                                  │ privileged exec read          │
+                                  ├─ journal + cursor/loss fence  │
+                                  └─ window rollup ──────────────┤
                                                                   ▼
 event stream  ───────────────────────────────────────────> agent_job_events
 attempt window ── resource rollup ───────────────────────> agent_attempt_resources
+tool windows + process rows ─────────────────────────────> agent_tool_call_resources
+                                                           agent_process_observations
 
 gateway model calls ─────────────────────────────────────> gateway api_logs
                                                           joined by external job id
 ```
+
+Guest observer 只存在于 Kata。非 Kata 开发路径仍用 Docker stats；Claude Code 的 mark 退回旧的 bounded state-file reader。Kata 从不把 agent-writable 文件当作归属权威。
 
 ### 6.1 为什么通过 Docker daemon 采样
 
@@ -292,182 +316,176 @@ agent_operations
 
 不能回答：共享 group 内 member/operation split。
 
-### Layer 1：Runtime/event windows（部分已有，资源关联待实现）
+### Layer 1：Runtime/event windows（已实现）
 
-数据源：Agent CLI event、tool_use/tool_result、passive runtime hooks。
+数据源：Agent CLI event、`tool_use`/`tool_result`、Claude Code 的被动 PreToolUse/PostToolUse hook。
 
 Boundary capability：
 
-| Capability | 边界 |
-|---|---|
-| `exact` | Runtime/tool hook 明确发出 execution start/end |
-| `message` | 从 tool_use arrival 到 matching tool_result arrival |
-| `none` | 无可靠 tool boundary，只保留 turn/member/group total |
+| Capability | 边界 | 当前 runtime |
+|---|---|---|
+| `exact` | 平台 hook 在 sandbox 内标记 execution start/end | Claude Code：image-bundled helper 向 guest observer socket 发 bounded mark |
+| `message` | 从 `tool_use` arrival 到 matching `tool_result` arrival | Codex、无 hook 的 Claude、Pi 等 |
+| `none` | 无可靠 tool boundary，只保留 turn/member/group total | Kilo / OpenCode |
 
-`message` 包含 transport 和模型等待时间，必须显示为 approximate。
+`message` 包含 transport 和模型等待时间，必须显示为 approximate。Hook 必须 fail-open：记不上 mark 时窗口降为 `message`，不能挡住 tool。
 
-### Layer 2：Member/process-tree sampler（Shared mode 的最低补全）
+Claude Code 的 helper 是 immutable、非 root；observer 用内核提供的 peer credential，并核对 `/proc/<pid>/exe` 是固定 helper inode。同一 UID 的 Agent 代码仍能自己调用 helper，因此 exact timing 是诊断，不是安全或计费边界。进程普查仍是“出现过哪些进程”的权威。
+
+### Layer 2：Member/process-tree sampler（Shared mode 的最低补全，仍部分未实现）
+
+Kata 已用 guest UID 过滤进程事件，因此 shared-live 的进程普查是 per-member 的。Periodic CPU/memory/I/O 仍不能从 hypervisor/container total 诚实拆给 member；该层的 periodic 补全仍未做。
 
 数据源可组合：
 
-- member UID process census；
-- `/proc/<pid>/stat` + start time；
-- taskstats/process accounting；
-- runtime wrapper 的 root/child receipt；
-- cgroup 或 pidfd-backed host collector（部署允许时）。
+- 已落地：member UID 的 guest 进程普查 + exit-time counters；
+- 未落地：host `/proc` 或 cgroup 级 per-member periodic sampler（Kata 上本来就看不到 guest `/proc`）。
 
-它首先解决 per-member，而不是 per-tool。Memory/page cache 和跨进程 FD 仍可能只能 group-scoped。
+Memory/page cache 和跨进程 FD 仍可能只能 group-scoped。
 
-### Layer 3：eBPF operation sensor（提案）
+### Layer 3：eBPF process sensor（Kata guest 已落地；host sensor 仍是提案）
 
-eBPF 用于补足 process lineage、exec/exit、network connect、OOM 与部分 I/O 事实。它不替换上面三层，也不自动解决业务边界。
+生产路径是 **guest-root CO-RE observer**，不是本文初稿里的 host OperationSensor daemon。这与沙盒安全模型一致：Kata 上 Host eBPF 只能看到 VMM/virtio，process/syscall 级观测必须进入 guest。
 
-## 10. eBPF 架构提案
+它补足短进程可见性与 exit-time 计数，不替换 Layer 0/1，也不推进 operation lifecycle。BPF 不知道 `thread_id` / `operation_id`；归属发生在 host parser：turn cursor + member UID + tool window。
 
-### 10.1 部署位置
+## 10. eBPF：已落地的 guest observer
+
+### 10.1 为什么不是 host daemon
+
+初稿把 sensor 放在宿主机，假设 runner 能看见工具进程的 syscall。生产执行档位是 probed Kata：
+
+- 工具 syscall 由 guest Linux 执行；
+- Host eBPF 看不到 guest PID、comm、RSS 或 I/O；
+- 给 runner 加 `pid: host` / `CAP_BPF` 既解决不了 guest 不可见，也会扩大 TCB。
+
+因此落地形态是：审核过的 guest 镜像 helper，由 Kata-only privileged exec 拉起；Agent 进程保持 drop-capability 的 member UID，永不持有 `CAP_BPF`。
+
+### 10.2 已落地部署位置
 
 ```text
-host kernel
-  └── BPF programs/maps/ring buffer
-           ▲
-           │ read-only telemetry stream
-  host OperationSensor daemon
-           ▲
-           │ narrow registration protocol
-  Supervisor / Workspace Broker
+Kata guest kernel
+  └── CO-RE BPF programs + ring buffer
+           │ fork / exec / exit / TASK_DEAD sched_switch
+  /usr/local/libexec/freeinference-guest-observer  (guest root)
+           │ root-only JSONL journal + status + tool-mark socket
+           │ /run/freeinference-observer
+  privileged Docker exec (host, fixed argv)
+           │
+  GuestObserverController  (cloud_agent_host/guest_observer.py)
+           │ cursor / UID / loss / inode fence
+           │
+  worker report → agent_attempt_resources
+                  agent_tool_call_resources
+                  process observation rows
 ```
 
-Sensor 运行在 host trusted domain，不在 sandbox 内。建议独立 daemon，而不是给 runner container 增加广泛 host namespace/capability：
+约束：
 
-- Sensor 持有运行 BPF 所需的 `CAP_BPF`、`CAP_PERFMON` 或该内核要求的最小权限；
-- Runner/Supervisor 只通过受限 Unix socket 注册 operation root 与 generation；
-- Sensor 不接受任意 BPF program、path 或 filter；
-- Sandbox network/filesystem 不可达 sensor socket；
-- Sensor 不需要 model、MCP、source-control credential。
+- Controller 只接收两个固定 exec seam，不接受 job argv；
+- Journal 为 root-only、append-only、UID 过滤，带 byte/event/inode fence；
+- 硬顶 64 MiB；retained/shared 在无 turn cursor 时于 48 MiB 轮转；单次 turn 最多读 4 MiB / 4096 进程 / 1000 marks；
+- Ring-buffer 丢失、畸形记录、重启、截断都使结果 **partial**，从不渲染成“完整的零进程普查”或独占资源数；
+- `source` 固定为 `kata-guest-ebpf-v1`。
 
-### 10.2 业务 identity 注入
+一次性、retained/HOT、shared-live / native-fork 共用同一 cursor/loss 契约。Shared turn 按 per-member guest UID 划界。
 
-eBPF 无法从 PID 自己推断 `thread_id`。绑定协议为：
+### 10.3 已落地事件与计数
 
-1. Control plane/Supervisor 创建 `operation_id` 与 generation；
-2. Supervisor 启动可信 wrapper 或得到 runtime child receipt；
-3. 使用 pidfd + process start time 验证 root process 未退出/复用；
-4. 向 sensor 注册短整型 `operation_key`、sandbox key、member slot 与 generation；
-5. Sensor 将 key 写入 task-local map；
-6. fork/clone 时 BPF 继承 parent task context；
-7. exec/exit event 与 resource delta 携带短 key；
-8. Userspace collector 再把短 key join 回数据库业务 id。
+四个 probe：
 
-BPF map 不保存完整 UUID、repository path、prompt 或用户 email。
+| Probe | 记录 | 读什么 |
+|---|---|---|
+| `sched_process_fork` | `FI_PROCESS_FORK` | 新 process-leader 的 pid/tgid/ppid/uid/comm |
+| `sched_process_exec` | `FI_PROCESS_EXEC` | basename / executable path（长度受限） |
+| `sched_process_exit` | `FI_PROCESS_EXIT` | `exit_code`、group `maxrss`、`task_io_accounting`、`signal->live == 0` |
+| `sched_switch`（仅 `TASK_DEAD`） | `FI_PROCESS_DONE` | `se.sum_exec_runtime` |
 
-优先使用 `bpf_task_storage` 绑定 task instance；不支持时，key 至少包含 `(tgid, task start_boottime)`，不能只用 PID/TGID。
+CPU **不** 从 `utime`/`stime` 读：tick accounting 会让亚毫秒进程报 0。`sum_exec_runtime` 只在任务最后一次出队后才最终，所以放在 `TASK_DEAD`。`sched_switch` 上其余切换只做这个谓词。
 
-### 10.3 Process lineage
+每个字段用 `bpf_core_field_exists` 守卫。内核没有 task I/O accounting 时程序仍能加载，该计数记为 absent，不是 0。
 
-最低事件集合：
+Host 把同一 thread group 的线程折入 leader：CPU 与 bytes 求和，peak 取最大。`signal->utime` 故意不加，避免死线程被算两次。Group 只在 **已死且每个见过 exit 的 task 都有 `done`** 时结算——Linux 允许 leader 先退、线程继续跑，leader 的 exit 不是进程结束。
 
-- `sched_process_fork` / clone；
-- `sched_process_exec`；
-- `sched_process_exit`；
-- OOM kill tracepoint；
-- 可选 signal/ptrace denial ops record。
+线程本身不进入普查表。Marker helper 的生命周期可见，但其 executable identity 排除在 per-tool workload 计数之外。
 
-用途：
+`--self-test` / Kata preflight 必须经过 ring buffer 看到一个真实的短命非 root child 的 fork、exec、exit，并且 `done` 带非零 CPU、exit 带非零 peak RSS 且 group dead。BTF 无法重定位这些字段的 guest kernel 不能宣称可接活。Storage/byte accounting 缺失只警告。
 
-- 继承 operation context；
-- 识别 `setsid`/double-fork 后仍属于原 operation 的 descendants；
-- 记录 command basename、executable identity 与 exit status；
-- 对比 Supervisor census，发现 untracked writer/process；
-- PID reuse 时按 task instance 区分。
+### 10.4 已落地归属
 
-Command argv 与 environment 默认不采集。
+Census 是 **turn cursor 之后观察到的进程启动**，不是“当时已经住在容器里的进程快照”。
 
-### 10.4 CPU
+`add_process_resources` 规则：
 
-可选实现：
+1. 进程只归属恰好一个 tool window 且 group 已结算 → 整段消耗记入该 call；
+2. 多个重叠 window 都说得通、group 未结算、或 census 丢过事件 → 不记入任何一个 call，相关 call 标 `process_resources_partial`；
+3. CPU/I/O 对已归属进程求和；peak 取单个进程最大值（峰值不必同时发生）；
+4. Agent 常驻进程内部的工作不属于任何 call，UI 必须说明；
+5. 截断的 tool list 禁止 per-call 资源与 time split：被省略的 call 可能与每个保留窗口重叠。
 
-- 在 `sched_switch` 上累积 operation/member task runtime；或
-- 在 process exit/periodic taskstats 中读取 CPU counter；
-- 与 Docker group total 做 conservation check。
+这修复的是 **短进程可观测性** 和 **任意时长调用的 exit-time 计数**。它不把 Docker 1 Hz 采样伪装成亚秒测量。Sampler 仍是 turn-level total 与 runc 的来源。
 
-高频 `sched_switch` program 必须做 host-level overhead benchmark。若开销或内核兼容性不满足门禁，退回 periodic process sampler，不影响 turn。
+展示：
 
-### 10.5 Memory
+- 计时写明 `exact` sandbox timing 还是 `message` 外括号；
+- Shared periodic counter 从不写成独占；
+- Lossy process count 写成下界（`>=N`）；
+- Footer 是 tool-bracketed time vs outside-tool time（model + harness/platform），不宣称 remainder 是纯模型时间；
+- 只表面 **longest** call，不面 **heaviest**——多数 call 没有可辩护的 CPU/memory 排序；
+- 模糊 block I/O 继续隐藏。
 
-eBPF 不应宣称能低成本、精确地把 shared address space、page cache 与 allocator memory 分给 tool operation。
+### 10.5 与初稿 host-sensor 提案的差异
 
-目标分层：
+| 初稿提案 | 实际落地 |
+|---|---|
+| Host kernel BPF + host OperationSensor daemon | Guest kernel CO-RE BPF + guest-root loader |
+| `operation_id` → 短 `operation_key` 写入 `bpf_task_storage` | BPF 不持有业务 id；host 用 UID + cursor + tool window join |
+| pidfd + start-time 注册 operation root | Privileged exec 拉起固定 helper；无 per-operation BPF map |
+| 计划中的 connect/OOM/VFS 探针 | 未做。四个 sched probe + tool-mark socket |
+| “当前代码中没有 BPF program” | `deploy/sandbox/guest-observer.{bpf.c,c,h}` |
 
-- container memory：Docker stats，group truth；
-- member process RSS/PSS：periodic process-tree sample，近似；
-- operation peak：只对独立 process subtree 给出 `process_rss_peak`；
-- resident Agent CLI 自身 memory：member-scoped，不硬分到重叠 tool；
-- page cache/shared memory：group-only 或 unclassified。
+初稿里“eBPF 不能从 PID 推断 `thread_id`”仍然成立，所以 **没有** 把业务 identity 推进 BPF map。绑定留在 userspace。这比提案更窄，也更诚实。
+
+### 10.6 Memory 与 I/O 诚实边界（仍适用）
+
+eBPF 仍不应宣称能把 shared address space、page cache 与 allocator memory 低成本精确分给 tool。
+
+当前分层：
+
+- container / VM memory：Docker stats，group truth；Kata periodic 常为 unavailable；
+- 已退出 child 的 peak RSS：exit-time `maxrss`，按 call 独占归属或标 partial；
+- resident Agent CLI 自身 memory：不属于任何 tool call；
+- page cache / shared memory：group-only；
+- `read_bytes`/`write_bytes`：落到存储的字节；page cache 命中的读可以是 `rchar > 0` 且 `read_bytes = 0`，UI 必须区分。
 
 禁止为了“完整”而让 operation memory 总和超过真实 container peak 并仍标记 exact。
 
-### 10.6 File 与 block I/O
+### 10.7 仍属提案
 
-建议分两种信号：
+这些没有随 #89/#102 落地，也不应写成已交付：
 
-- **Resource counter：** 按 process tree 的 read/write bytes；
-- **Security/audit event：** open/write/rename/unlink 的 bounded metadata。
+- 通用 `agent_operations` ledger 与 `operation_id` 注入 BPF；
+- Host-side OperationSensor（runc 上理论上仍可做，生产 Kata 不需要）；
+- 网络 connect/skb eBPF、egress flow parser、unclassified byte ledger；
+- 全量 VFS path event / OOM tracepoint；
+- 把 resident CLI 内部线程拆到重叠 tool。
 
-全量 VFS path event 成本和敏感性高，默认只启用：
+网络仍只有三种已有 authority：Gateway ledger、MCP relay、allowlist/proxy。eBPF 网络字节不能推导模型费用。
 
-- workspace root 内的 mutation class；
-- credential/tmpfs boundary 的 denial；
-- snapshot census 期间的未知 writer；
-- executable load/exec identity。
+### 10.8 Long-lived resident process
 
-不采集文件内容。Path 在 userspace 规范化、相对 workspace root 存储，并应用长度限制与 redaction。Async I/O、shared FD 与 kernel writeback 无法总是精确归属时进入 `shared` 或 `unclassified`。
+已落地策略比初稿更窄，也更可执行：
 
-### 10.7 Network
-
-网络有三种已有 authority：
-
-- Gateway model bytes/cost：Gateway ledger；
-- MCP request：MCP relay 与 attempt token；
-- Generic setup egress：allowlist proxy log。
-
-eBPF 用于 host-side residual 与 process association：
-
-- `cgroup/connect4`、`connect6` 记录连接目的地 class；
-- socket/process context 关联 operation/member；
-- cgroup skb/sock accounting 统计 byte delta；
-- DNS/name 与 allow/deny truth 仍来自 relay/proxy，不从 IP 反推 authorization；
-- socket handoff、long-lived connection 或未知 owner 记为 shared/unclassified。
-
-Byte conservation：
-
-```text
-group_net_total
-  >= gateway_bytes + mcp_bytes + proxy_egress_bytes + attributed_other
-
-unclassified = group_net_total - classified_total
-```
-
-由于不同层计数口径可能包含 framing/retransmission，比较需要定义 tolerance；出现负 residual 时记录 accounting mismatch，不能 clamp 后假装一致。
-
-### 10.8 Long-lived resident process 的特殊情况
-
-Resident Agent CLI 跨多个 turn 存活，不能永久绑定到一个 operation。
-
-采用混合策略：
-
-- Process 固定绑定 member/residency identity；
-- Activation window 绑定当前 `agent_turn operation_id`；
-- Resident root 在窗口内的 CPU/network 归到 turn/member，quality=`member_window`；
-- Runtime hook 能返回具体 tool child root 时，把 child subtree 精确绑定 `tool_call operation_id`；
-- 没有 child root 时，tool 只使用 event window attribution；
-- Turn 后仍存活的未授权 child 被 Supervisor reaper 清除；
-- 明确允许的 terminal/dev server 使用独立 operation identity，而不是继承旧 turn。
-
-这避免了把数小时的 idle resident process 消耗错误记到最后一个 prompt。
+- 进程事件按 member UID 过滤；cursor 在 prompt 发出前打上；
+- cursor 之前已存在的 resident CLI 不进入本 turn 普查；
+- 它在窗口内派生的 child 进入普查，并按 tool window 归属；
+- 它自己的 CPU/RSS 不记入任何 tool call；
+- Turn 后仍存活的未授权 child 仍由 Supervisor reaper 清理；
+- terminal / dev server 若跨 turn 存活，不会仅仅因为还在跑就被算进下一个 prompt。
 
 ## 11. Window 与 overlap 规则
 
-Sampler interval 可能同时覆盖多个 operation。归属规则：
+Sampler interval 可能同时覆盖多个 operation。Periodic 归属规则：
 
 - 一个 exact process owner：记入 `exclusive_*`；
 - 多个 message window 重叠：每个记录同一 shared delta，并携带 `overlap_n`；
@@ -475,6 +493,8 @@ Sampler interval 可能同时覆盖多个 operation。归属规则：
 - 没有 operation boundary：留在 attempt/member/group residual；
 - Agent CLI/model streaming 本身的资源归到 turn，不强塞给最近 tool；
 - Fork/snapshot 等平台 operation 与 Agent turn 并发时，按 process owner 或 group operation ref 分开；无法区分则 shared。
+
+Kata exit-time 计数另走 §10.4：只给“恰好一个 window 且 group 已结算”的进程收费；重叠或丢失标 partial，不写成 exclusive。
 
 展示层必须使用以下词义：
 
@@ -510,7 +530,7 @@ agent_attempt_resources
   created_at
 ```
 
-### 12.2 Operation rollup
+### 12.2 Operation rollup（仍属提案）
 
 ```text
 agent_operation_resources
@@ -530,23 +550,28 @@ agent_operation_resources
   truncated
 ```
 
-### 12.3 Process projection
+### 12.3 Process projection（已落地，挂在 attempt 上）
+
+当前没有 `agent_operations`，进程行挂在 attempt 资源上，不挂不存在的 `operation_id`。
 
 ```text
-agent_operation_processes
-  operation_id
-  process_instance_key
-  parent_process_instance_key nullable
-  member_slot
-  executable_class
-  exec_count
-  exit_class
-  first_seen_at / last_seen_at
-  cpu_usec nullable
-  io_bytes nullable
+ProcessObservation / WorkerProcessObservation
+  process_seq
+  uid, pid, tgid, ppid nullable
+  comm, executable nullable
+  started_offset_ms          # 相对 turn cursor，不是 wall clock
+  duration_ms nullable
+  exit_code nullable
+  observed_fork / observed_exec / observed_exit
+  tool_call_seqs[]           # 重叠时保留所有说得通的 call，不发明唯一 owner
+  cpu_usec / mem_peak_bytes / io_* nullable
 ```
 
-不建议永久存储每次 `sched_switch` 或每个 syscall。Kernel event 在 host collector 中 roll up，只有 bounded lifecycle/security event 和窗口结果写入 Postgres。
+`ToolCallResources` 另有 `process_count`、`process_cpu_usec`、`process_mem_peak_bytes`、`process_io_*`、`process_resources_partial`。没有 observed exit 不能带 counters；没有 attributed process 不能带 per-call totals；两者都要求 named observer。
+
+不建议永久存储每次 `sched_switch` 或每个 syscall。Kernel event 在 guest loader 中写成 bounded JSONL，host 再 roll up；只有窗口结果写入 Postgres。
+
+通用 `agent_operation_processes`（按 `operation_id`）仍是提案。
 
 ### 12.4 Egress flow
 
@@ -620,33 +645,33 @@ Metrics/aggregate label 只允许 bounded enum：
 |---|---|---|
 | Docker sampler 中途失败 | 不影响 turn | `measurement_coverage < 1`，counter 按已测部分或 null |
 | Shared mode 无 member sampler | 不影响 turn | per-member `coverage=0`；group total 保留 |
-| eBPF 不可加载/BTF 不兼容 | 不影响 turn | Layer 0/1 fallback，ops event，quality 降级 |
-| Sensor daemon restart | 不影响 turn | map/sequence gap；不得猜补历史 |
-| Operation root 注册晚到 | 不影响 turn | 注册前数据 member/group-only，attribution coverage 降低 |
-| PID reuse | 不影响 turn | start-time/task-storage identity 防止串账；无法证明则 unclassified |
-| Hook 缺失 | Tool 正常执行 | `message_window` 或 `none` |
-| Hook 写失败/超时 | Tool 必须继续 | exact coverage 缺口；hook 不能成为执行依赖 |
-| Parallel tool calls | 正常 | shared fields + `overlap_n`，不记 exclusive |
-| Egress log parse gap | 正常 | unclassified residual 增大并产生 ops signal |
-| Sub-second operation 无 sample | 正常 | sample_count 0、coverage 0，不伪造零资源 |
+| Guest eBPF 不可加载/BTF 不兼容 | Kata host 不能 advertise 可接活 | Preflight `--self-test` fail closed；非 Kata 仍走 Layer 0/1 |
+| Observer journal 丢失/截断/restart | 不影响 turn | `process_observation_complete=false`；counts 为下界；不得渲染完整零普查 |
+| Tool list 被截断 | 不影响 turn | 禁止 per-call 资源与 time split |
+| PID reuse | 不影响 turn | cursor + journal inode/dev + start offset；无法证明则不归属 |
+| Hook 缺失 | Tool 正常执行 | `message` 或 `none` |
+| Hook 写失败/超时 | Tool 必须继续 | 降为 `message`；helper 25 ms stdin + 1 s CLI timeout，fail-open |
+| Parallel tool calls | 正常 | sampler 用 `shared_*` + `overlap_n`；exit-time 对重叠进程不收费并标 partial |
+| Egress log parse gap | 正常 | 当前无 parser；不假装有 unclassified ledger |
+| Sub-second call 无 Docker sample | 正常 | `sample_count < 2` 则 periodic 为 null；Kata 仍可用 exit-time counters |
 | Container OOM | Group failure | OOM event + 最后可用 sample；所有 member 受影响 |
 | Collector queue 满 | 正常 | 丢低优先级 raw event、保留 gap counter，不 block sandbox |
 | Postgres report 重试 | 正常 | `(operation_id, kind/version)` 幂等 upsert |
 
 ## 16. 安全约束
 
-eBPF/host sensor 增加 TCB，必须满足：
+Guest eBPF 把一小块特权放进 Kata guest，必须满足：
 
-1. 不把 BPF capability、host `/proc`、cgroupfs 或 sensor socket交给 sandbox。
-2. Runner 不可上传任意 BPF program 或修改 filter code。
-3. Registration 验证 sandbox/container/member/generation 与 process start identity。
-4. Stale Supervisor 不能给新 process generation 绑定旧 operation。
-5. Map key 使用短内部 id，ring buffer 不含 secret/body。
-6. Sensor failure 不放宽 network、credential 或 process isolation。
-7. File/network observation 不被解释为 authorization；authorization 仍由 relay/broker/policy enforcement。
-8. Kernel compatibility 与 program verifier failure 必须可见且可安全 fallback。
-9. Overhead 有 host-level budget，超限自动停用高频 probe 并报告 degradation。
-10. BPF program、loader 与 CO-RE artifact 纳入供应链签名、版本 pin 和升级回滚。
+1. Agent 进程永不持有 `CAP_BPF`、host `/proc`、cgroupfs 或任意 BPF loader。
+2. 只有审核过的镜像 helper 能通过 Kata-only privileged exec 启动；exec argv 固定，不来自 job。
+3. Journal 与 mark socket 对 member UID 不可写；mark 必须核内核 peer cred 与固定 helper inode。
+4. Runner 不可上传任意 BPF program 或修改 filter code。
+5. Ring buffer / JSONL 不含 prompt、tool result、credential、argv 或 environment。
+6. Sensor failure 不放宽 network、credential 或 process isolation；hook failure 不挡住 tool。
+7. File/network observation（若未来增加）不被解释为 authorization。
+8. Kernel compatibility 与 verifier failure 必须可见：Kata preflight fail closed，不得 advertise 不存在的精度。
+9. Journal 有硬顶与轮转；单次 turn 有读上限；超限报 incomplete，不静默丢进程。
+10. BPF program、loader 与 CO-RE artifact 纳入镜像 pin、attestation 和升级回滚。
 
 ## 17. Product 与运维 surface
 
@@ -656,21 +681,25 @@ eBPF/host sensor 增加 TCB，必须满足：
 
 - context status；
 - duration；
-- Gateway inference cost；
-- CPU、peak memory、network；
-- blocked connection count；
+- Gateway inference cost（若 join 可用）；
+- CPU、peak memory（periodic；Kata 常为 unavailable）；
+- tool-bracketed time vs outside-tool time；
 - measurement/attribution badge。
 
-展开后：
+展开后（已落地）：
 
-- operation/tool timeline；
-- per-tool duration/resource，标明 exact/approximate/shared；
-- process tree 摘要；
-- network destination class 与 denied event；
-- group-only/unclassified residual；
+- per-tool 表：duration、`exact`/`message`、periodic 值或 dash、exit-time CPU/peak（标记 `ᵖ`）、lossy 前缀 `≥`；
+- guest process 表：comm、CPU、peak RSS、I/O；不完整 census 的 count 为下界；
+- longest call，不是 heaviest；
 - sampler gap 与 missing reason。
 
-Shared workspace 下，container group total 与 member/turn total必须分开展示。
+未落地、不得假装已有：
+
+- 通用 operation timeline；
+- per-domain network panel 与 denied CONNECT 计数；
+- 把 shared periodic total 写成 member exclusive。
+
+Shared workspace 下，container group total 与 member/turn total 必须分开展示。
 
 ### 17.2 Ops/Admin（延后）
 
@@ -711,56 +740,56 @@ Shared workspace 下，container group total 与 member/turn total必须分开�
 - 与 Docker group total conservation；
 - shared-mode per-member coverage 从 0 提升。
 
-### OBS-3：Runtime/tool boundary
+### OBS-3：Runtime/tool boundary（已落地）
 
-- 支持 runtime-native exact event 的 adapter；
-- passive hook；
-- message window fallback；
+- Claude Code exact hook + 其余 runtime 的 message fallback；
 - overlap/shared rollup；
-- per-tool rows 与 UI。
+- `agent_tool_call_resources` 与 footer UI。
 
-### OBS-4：eBPF proof of concept
+### OBS-4：Kata guest eBPF（代码已落地，staging 验收未关）
 
-- 独立 host sensor；
-- process lineage/exec/exit/OOM；
-- operation registration 与 task identity；
-- CPU/network 最小 counter；
-- overhead、kernel matrix、安全 review；
-- fallback 与 gap tests。
+- Guest-root CO-RE observer：fork/exec/exit/`TASK_DEAD`；
+- Exit-time CPU/RSS/I/O 与 per-call 独占归属；
+- Cursor/loss/inode fence；shared-live UID 划界；
+- Preflight `--self-test` fail closed；
+- 仍缺：一台真实 staging Kata/KVM、debug/BTF guest kernel 上的验收。
 
-### OBS-5：eBPF production gate
+初稿的 host OperationSensor / `operation_key` map **不再是本阶段目标**。
 
-- 真实 host 与隔离 runtime 验证；
-- rolling upgrade/map compatibility；
-- collector crash/backpressure；
-- file/network privacy；
-- shared resident process 与 simultaneous operation stress；
-- signed artifact 与 rollback。
+### OBS-5：eBPF production gate（未关）
 
-### OBS-6：Egress 与 ops surface
+- 真实 Kata host 与隔离 runtime 验证；
+- journal 轮转、crash、backpressure；
+- shared resident 与并行 tool stress；
+- 镜像 pin 与 rollback。
 
-- Proxy flow parser；
-- Gateway/MCP/egress/unclassified byte ledger；
-- per-chat network panel；
+### OBS-6：仍属提案
+
+- 通用 operation ledger；
+- Host-side sensor（仅当需要 runc process 级观测时）；
+- Proxy flow parser 与 unclassified byte ledger；
 - 后续 admin aggregate/alerts。
 
 ## 19. 验收标准
 
+已由 #89 / #102 与现有 sampler 覆盖：
+
 1. 一个未测量的 turn 返回 null counters + coverage 0，不返回全 0。
 2. Shared A/B 并发时，container total 不会复制到两个 attempt。
-3. Serial CPU tool 的 exact subtree 可解释大部分 operation CPU，并与 group delta 在 tolerance 内。
-4. Parallel tool 的 shared delta 永不进入 exclusive sum。
-5. PID reuse、`setsid` 与 double-fork 不导致跨 operation 串账。
-6. Resident process 跨两个 turn 时，idle interval 不归到上一个 turn。
-7. Terminal/dev server 使用自己的 operation id，不继承过期 activation。
-8. Sensor/collector 被 kill 后 turn 继续，coverage/gap 明确。
-9. eBPF 不可用的 host 自动降级，且不会 advertise 不存在的精度 capability。
-10. File/network telemetry 不包含 prompt、credential、argv/environment 或 file content。
+3. Parallel / 重叠 call 的进程不进入任何一个 call 的独占 exit-time 总和，并标 `process_resources_partial`。
+4. Census 丢失、journal 截断或 observer 不可用时，不渲染完整零进程表，也不 advertise exact。
+5. Cursor 之前已存在的 resident CLI 不进入本 turn 普查；其内部工作不属于任何 call。
+6. Hook 失败不挡住 tool；窗口降为 `message`。
+7. Kata preflight 看不到真实短进程的 fork/exec/exit/`done` 时，host 不得宣称可接活。
+8. File/network/process telemetry 不包含 prompt、credential、argv/environment 或 file content。
+9. Raw kernel event 不无限写 Postgres；journal 与 per-turn 读上限生效。
+
+仍属提案或 staging 门禁：
+
+10. 一台真实 staging Kata/KVM 上跑通 observer + debug/BTF guest kernel。
 11. Gateway inference cost 与 Agent resource row join 后仍各自可追溯到原 authority。
-12. Byte/resource conservation mismatch 可见，不通过 clamp 或 duplication 隐藏。
-13. BPF overhead 在目标并发下低于约定 budget；超过时可独立关闭高频 probe。
-14. Stale generation 的 process registration 被拒绝。
-15. Raw kernel event 不无限写 Postgres，rollup 与 retention 上限生效。
+12. 通用 operation id（terminal/dev server/Fork/snapshot）不继承过期 activation。
+13. 若未来加 host sensor：stale generation 的 process registration 被拒绝；BPF overhead 可独立关闭。
 
 ## 20. 实现导航
 
@@ -770,20 +799,22 @@ Shared workspace 下，container group total 与 member/turn total必须分开�
 |---|---|
 | Docker Engine sampler | `cloud_agent_host/resources.py` |
 | Runner window/report | `cloud_agent_host/runner.py` |
-| Attempt resource schema/API | `cloud_agent/schemas.py`、`cloud_agent/api/routes.py` |
-| Resource store | `cloud_agent/storage/store.py` |
+| Tool window / hook marks | `cloud_agent_host/tool_windows.py`、`deploy/sandbox/tool-mark.c` |
+| Kata guest observer | `deploy/sandbox/guest-observer.{bpf.c,c,h}` |
+| Host journal parser / 归属 | `cloud_agent_host/guest_observer.py` |
+| Sandbox start / preflight | `cloud_agent_host/sandbox.py`、`cloud_agent_host/chat_sandbox.py` |
+| Shared-live UID 划界 | `cloud_agent_host/shared_session_supervisor.py` |
+| Attempt / tool / process schema | `cloud_agent/schemas.py`（`AttemptResources`、`ToolCallResources`、`ProcessObservation`） |
+| Store + migrations | `cloud_agent/storage/store.py`、`migrations/versions/0021_tool_call_resources.py`、`0022_process_exit_counters.py` |
+| Footer UI | `web/src/components/features/agents/TurnFooter.tsx` |
 | Canonical Agent event | `cloud_agent/storage/store.py` |
-| Shared Supervisor/process census | `cloud_agent_host/shared_session_supervisor.py` |
-| Gateway job cost attribution | `apps/backend/serving/storage/log_schema.py`、`apps/backend/serving/servers/routers/agent_grants.py` |
+| Gateway job cost attribution | HybridInference `apps/backend/serving/storage/log_schema.py`、`apps/backend/serving/servers/routers/agent_grants.py` |
 
-### 需要新增
+### 仍需新增
 
-- `agent_operations` 与 operation resource schema；
-- Supervisor/Workspace Broker operation registration protocol；
-- Member process sampler；
-- Runtime boundary adapter 与 hook journal；
-- Host OperationSensor daemon、BPF programs、loader 与 map schema；
+- `agent_operations` 与跨 turn/tool/terminal/file/Git/Fork/snapshot 的统一 identity；
+- Host-side sensor（仅 runc 需要 process 级观测时）；
 - Egress flow parser 与 byte conservation projection；
-- Coverage/quality-aware API 与 UI。
+- Staging Kata/KVM 上关闭 OBS-5。
 
-在这些组件落地并通过验收前，对外只能声明 Attempt/container-level 资源观测，不能声明 eBPF operation 级精确归属。
+对外可以声明：Kata 上有 guest eBPF 进程普查与 exit-time 子进程资源，且丢失会显式标 partial。不能声明：通用 operation 级精确归属、host BPF、或把 periodic container total 拆给 shared member。

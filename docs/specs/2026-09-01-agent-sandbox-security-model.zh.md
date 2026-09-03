@@ -271,7 +271,8 @@ Kata 为沙盒创建轻量虚拟机。工具进程运行在 guest 中，syscall 
 当前 `cloud_agent_host/sandbox.py` 只定义三个 backend：`process`、`container` 和 `kata`。
 
 - `container` 且 `runtime=None` 表示普通 runc 共享内核。Preflight 记录 `agent_sandbox_shared_kernel`，该档位只适合可信仓库或已有外层 VM 隔离的场景。
-- `kata` 使用 `io.containerd.kata.v2`。Preflight 会启动 exact-image probe 执行 `uname -r`；若 guest kernel 与 host kernel 相同，则拒绝把该 host 宣告为 VM-isolated。
+- `kata` 使用 `io.containerd.kata.v2`。Preflight 会启动 exact-image probe 执行 `uname -r`；若 guest kernel 与 host kernel 相同，则拒绝把该 host 宣告为 VM-isolated。同一 probe 还要跑 `freeinference-guest-observer --self-test`：必须经过 guest ring buffer 看到一个短命非 root child 的 fork、exec、exit 与带非零 CPU 的 `done`。BTF 对不上的 guest kernel 不能 advertise 可接活。
+- 进程级观测因此走 **guest-root CO-RE observer**（`deploy/sandbox/guest-observer.*`），不是 host eBPF。Agent 进程不持有 `CAP_BPF`；helper 只由 Kata-only privileged exec 以固定 argv 拉起。详见 [Operation 可观测性](2026-09-01-agent-operation-observability-design.zh.md)。
 - gVisor 当前没有独立 backend、执行档位或安全 probe。管理员能够填写 runtime 字符串不等于平台已经验证 gVisor 隔离；面向不可信仓库的强制档位当前只接受经过 probe 的 Kata。
 
 `is_vm_isolated` 当前以“配置了非空 runtime”表达非默认 runtime，而不是独立的安全证明。安全决策不得单独依赖该字段；准入必须依赖明确的 profile、runtime allowlist 与 exact-image probe。
@@ -431,6 +432,7 @@ Publisher 不能信任沙盒声明的目标 repository、branch 或 base；必�
 | Snapshot writer census 不一致 | 宣称 quiescent/publish | 保持 pending/dirty |
 | Publisher external result 不确定 | 自动重推 | 等待人工 reconcile |
 | Required strong isolation 不可用 | 普通 Docker fallback | 拒绝 job |
+| Kata guest observer `--self-test` 失败 | 宣称该 host 可接 Kata 活 | Host 不 advertise capability |
 
 ## 16. 审计与观测
 
@@ -444,7 +446,8 @@ Publisher 不能信任沙盒声明的目标 repository、branch 或 base；必�
 - Native resume/Fork receipt validation；
 - Container OOM、unexpected exit、missing object；
 - Snapshot gate、secret scan、publisher result；
-- Sampler coverage 与 sensor gap。
+- Sampler coverage 与 sensor gap；
+- Kata guest observer 的 cursor/loss/incomplete 标记，不是“完整的零进程普查”。
 
 日志属性只使用 bounded identifiers/enums。Prompt、tool argument/result、credential、repository token 与完整环境变量不得进入共享 telemetry sink。
 
@@ -509,5 +512,6 @@ Publisher 不能信任沙盒声明的目标 repository、branch 或 base；必�
 | Inference grant client | `cloud_agent/grants.py`、`cloud_agent/gateway.py` |
 | Publisher | `cloud_agent/publisher.py`、`cloud_agent/publish_worker.py` |
 | Resource sampling | `cloud_agent_host/resources.py` |
+| Kata guest eBPF observer | `deploy/sandbox/guest-observer.{bpf.c,c,h}`、`cloud_agent_host/guest_observer.py` |
 
 任何放宽 network、credential、UID、capability、seccomp、publisher 或 Docker API 边界的变更，都需要安全评审与对应 acceptance test，不能作为普通兼容修复静默落地。
