@@ -24,9 +24,9 @@
 | Canonical Agent event ledger | 已实现 | `agent_job_events`，按 `(attempt_id, client_seq)` 幂等 |
 | Attempt 资源采样 | 已实现 | Host 通过 Docker Engine stats 采样，写 `agent_attempt_resources` |
 | Measurement coverage | 已实现 | `coverage` + nullable counter；不可读不伪造为零 |
-| Gateway token/cost attribution | 已实现 | Gateway `api_logs.agent_job_id` 与 grant usage contract |
+| Gateway token/cost ledger attribution | Gateway 已实现；Cloud Agent 读取未接通 | Gateway 写 `api_logs.agent_job_id` 且提供 grant usage contract；当前 `GrantClient` 没有 usage read，job response 不返回 join 后 projection |
 | Shared sandbox per-member periodic CPU/memory/I/O | 未实现 | Kata 下 hypervisor/container total 不能诚实分给 member；明确 `coverage=0`，禁止复制 group total |
-| Per-tool timing window | 已实现 | Claude Code 用平台 PreToolUse/PostToolUse hook 得 `exact`；其余 runtime 为 `message`；overlap 记 `shared_*` |
+| Per-tool timing window | 已实现（按 runtime capability） | Claude Code 用平台 PreToolUse/PostToolUse hook 得 `exact`；Codex/无 hook Claude/Pi 为 `message`；Kilo/OpenCode 为 `none`；overlap 记 `shared_*` |
 | Per-tool process census | 已实现（Kata） | Guest-root CO-RE observer 记录 process-leader `fork`/`exec`/`exit`；线程折入 leader；marker helper 不计 workload |
 | Per-tool exit-time CPU/RSS/I/O | 已实现（Kata） | `sched_process_exit` 取 peak RSS 与 I/O；`sched_switch` 在 `TASK_DEAD` 取 `se.sum_exec_runtime`；缺 BTF 字段报 absent，不报 0 |
 | Egress flow parsing 与 unclassified byte ledger | 未实现 | 生产 `platform_only` 没有可解析的 CONNECT 日志；不是当前 eBPF 范围 |
@@ -203,7 +203,8 @@ tool windows + process rows ─────────────────�
                                                            agent_process_observations
 
 gateway model calls ─────────────────────────────────────> gateway api_logs
-                                                          joined by external job id
+                                                          external job id 是 join key；
+                                                          Cloud Agent read path 尚未接通
 ```
 
 Guest observer 只存在于 Kata。非 Kata 开发路径仍用 Docker stats；Claude Code 的 mark 退回旧的 bounded state-file reader。Kata 从不把 agent-writable 文件当作归属权威。
@@ -303,18 +304,22 @@ agent_operations
 
 ## 9. 分层测量方案
 
-### Layer 0：Group/container totals（已实现）
+### Layer 0：Group/container counter window（部分已实现）
 
-数据源：Docker Engine stats、container inspect/size、lifecycle timestamps。
+当前数据源是 Docker Engine stats。
 
-回答：
+已实现：
 
-- sandbox group 总 CPU/memory/I/O；
-- running-idle 与 stopped duration；
-- retained writable-layer storage；
-- container OOM/exit。
+- 可诚实绑定一个 attempt window 时的 CPU/memory/PID/I/O/network counter；
+- group/container scope total 与 measurement coverage；
+- shared member 无法独占归属时返回 nullable counter + `coverage=0`，不复制 group total。
 
-不能回答：共享 group 内 member/operation split。
+尚未实现：
+
+- running-idle 与 stopped duration rollup；
+- retained writable-layer size/增长量；
+- 独立的 container OOM/exit event 与 reason；
+- 共享 group 内 periodic member/operation split。
 
 ### Layer 1：Runtime/event windows（已实现）
 
@@ -431,7 +436,7 @@ Census 是 **turn cursor 之后观察到的进程启动**，不是“当时已�
 - Shared periodic counter 从不写成独占；
 - Lossy process count 写成下界（`>=N`）；
 - Footer 是 tool-bracketed time vs outside-tool time（model + harness/platform），不宣称 remainder 是纯模型时间；
-- 只表面 **longest** call，不面 **heaviest**——多数 call 没有可辩护的 CPU/memory 排序；
+- 只标出 **longest** call，不标 **heaviest**——多数 call 没有可辩护的 CPU/memory 排序；
 - 模糊 block I/O 继续隐藏。
 
 ### 10.5 与初稿 host-sensor 提案的差异
@@ -635,7 +640,7 @@ Metrics/aggregate label 只允许 bounded enum：
 - Raw 1 Hz / kernel event：host ring buffer，窗口关闭后丢弃；
 - Process lifecycle/security event：短期保留；
 - Attempt/operation rollup：长期保留；
-- Proxy raw log：短期保留，解析后删除；
+- Proxy raw log（setup allowlist proxy 接线后）：短期保留，解析后删除；
 - Gateway billing ledger：按 Gateway retention policy；
 - 研究数据集导出必须再做去标识化与访问控制。
 
@@ -654,7 +659,7 @@ Metrics/aggregate label 只允许 bounded enum：
 | Parallel tool calls | 正常 | sampler 用 `shared_*` + `overlap_n`；exit-time 对重叠进程不收费并标 partial |
 | Egress log parse gap | 正常 | 当前无 parser；不假装有 unclassified ledger |
 | Sub-second call 无 Docker sample | 正常 | `sample_count < 2` 则 periodic 为 null；Kata 仍可用 exit-time counters |
-| Container OOM | Group failure | OOM event + 最后可用 sample；所有 member 受影响 |
+| Container OOM | Group failure | 当前只有 container 终止与最后可用 sample，没有独立 OOM event；该 event/reason 仍需新增，所有 member 均受影响 |
 | Collector queue 满 | 正常 | 丢低优先级 raw event、保留 gap counter，不 block sandbox |
 | Postgres report 重试 | 正常 | `(operation_id, kind/version)` 幂等 upsert |
 

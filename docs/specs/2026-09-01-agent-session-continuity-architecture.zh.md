@@ -164,7 +164,7 @@ Fork 不创建第二个 container、第二份 workspace 或第二条 Git publica
 2. 验证 resident process generation 与 native locator；
 3. 直接向 live transport 发送新 prompt；
 4. 只把该 activation 的 framed events 返回给对应 runner；
-5. Turn 结算后保留 resident process idle，不刷新 group activity deadline。
+5. Turn 结算后保留 resident process idle，并把 group activity/deadline 刷新到这次 settle；之后仅仅保持 idle 不会持续续期 deadline。
 
 恢复路径允许替换该 membership 的 process，但必须先 native resume。兄弟 membership 不应被重启、撤销 credential 或重标状态。
 

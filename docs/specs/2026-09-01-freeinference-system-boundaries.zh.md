@@ -2,6 +2,8 @@
 
 **日期：** 2026-09-01
 
+**修订：** 2026-09-03，对齐 residency grant、usage wiring 与 standalone edge 的当前实现
+
 **状态：** 当前架构；Cloud Agent 已完成独立服务切换，网关保持契约端
 
 **覆盖仓库：** `hybridInference`、`freeinference-cloud-agent` 与 deployment distribution overlay
@@ -289,10 +291,15 @@ Gateway 提供：
 
 | Endpoint | 语义 |
 |---|---|
-| `POST /internal/agent-grants` | 幂等 mint 一个 attempt 的短期 model capability |
+| `POST /internal/agent-grants` | 按 external job/attempt identity 幂等 mint 短期 model capability |
 | `POST /internal/agent-grants/{id}/renew` | 在 owner/状态仍有效时延长一个 bounded TTL step |
 | `GET /internal/agent-grants/{id}/usage` | 读取 billing ledger 中该 external job 的 cost/token/call projection |
 | `POST /internal/agent-grants/{id}/revoke` | 加速失效；安全性仍由短 TTL 兜底 |
+
+Cloud Agent 当前有两种 mint identity：
+
+- activation grant 使用真实 job/attempt id，随该 attempt settle、cancel 或 supersede 撤销；
+- residency grant 的 external job id 是 `thread:<thread_id>`，external attempt id 是建立 residency 时的 attempt。Control plane 只在当前 attempt/host fence 仍成立且 resident process live 时续期；普通 turn settle 不撤销，process replacement、idle stop、takeover 或 release 才撤销。
 
 Grant 包含：
 
@@ -320,7 +327,7 @@ Sandbox 使用 `agr` grant 调用普通 inference surface。Gateway 验证：
 5. account active API key 对应的 daily quota；
 6. per-user concurrency 等直接路径同样适用的 policy。
 
-请求最终以 owner user 计费，并把 external job id 写入 `api_logs.agent_job_id`。Usage endpoint 读取该 ledger；Agent 自报 token/cost 不是计费 authority。
+请求最终以 owner user 计费，并把 external job id 写入 `api_logs.agent_job_id`。Gateway usage endpoint 能读取该 ledger，但 Cloud Agent 当前 `GrantClient` 只实现 mint/renew/revoke，尚未接通 usage read；真实部署中的 job response 因而省略 spend/token，而不是伪造为零。Agent 自报 token/cost 不是计费 authority。
 
 ### 7.5 Internal dispatch authentication
 
@@ -356,7 +363,7 @@ Gateway 不再签发或接受 MCP token，也不回答 MCP catalog。把 MCP lis
 | Users、API keys、roles、status | Gateway | Cloud Agent 只存 external user id；按需查询状态 |
 | Model registry/visibility | Gateway config/store | Cloud Agent 缓存只能短期，授权时以 Gateway answer 为准 |
 | Inference grants | Gateway | Cloud Agent 存 grant id/token 生命周期，不验证签名真值 |
-| Inference billing logs | Gateway | Cloud Agent 通过 usage contract 读取 projection |
+| Inference billing logs | Gateway | Usage contract 已存在；Cloud Agent 当前尚未接通读取，job response 省略该 projection |
 | Threads/jobs/attempts/events | Cloud Agent | Gateway 不保存或查询 Agent lifecycle |
 | Runner hosts/capability | Cloud Agent | Gateway 不参与 scheduling |
 | Sandbox/session/workspace metadata | Cloud Agent | Gateway 不创建第二份 residency state |
@@ -368,7 +375,9 @@ Gateway 不再签发或接受 MCP token，也不回答 MCP catalog。把 MCP lis
 
 ## 10. Edge 与 console routing
 
-Public edge 只需暴露 Next.js console。Console 的 `rewrites()` 是 public path table 的真值：
+当前支持两种互斥的部署形态。
+
+Gateway-hosted 形态只暴露 HybridInference Next.js console；console 的 `rewrites()` 是 public path table 的真值：
 
 ```text
 client -> external edge -> Next.js console
@@ -387,6 +396,16 @@ Cloud Agent proxy 规则只有在 web 与 control-plane 两个 destination 都�
 
 Rewrite 在 frontend build 时写入 routes manifest。部署或回滚 Cloud Agent proxy 需要重新构建 console，不能只在运行时修改 environment。
 
+Standalone-hostname 形态不经过 gateway console。启用 control-plane compose 的 `edge` profile 后，同源 nginx edge 把 `/api/*` 去前缀后转发到 control plane，把其余路径转发到 Cloud Agent web：
+
+```text
+client -> TLS tunnel/load balancer -> Cloud Agent edge
+                                      ├── /api/* -> control plane /*
+                                      └── /*     -> Cloud Agent web /*
+```
+
+此形态要求 web 以空 `AGENT_WEB_BASE_PATH` 和 `AGENT_WEB_API_URL=/api` 构建；edge 默认只绑定 loopback，由前置 tunnel/load balancer 终止 TLS。Gateway-hosted 部署不启用该 profile。
+
 ## 11. Failure semantics
 
 | 故障 | Owner | 对外行为 |
@@ -400,7 +419,8 @@ Rewrite 在 frontend build 时写入 routes manifest。部署或回滚 Cloud Age
 | Gateway store/ledger 不可用 | Gateway | Grant auth/usage fail closed；不返回“零消费” |
 | Cloud Agent DB 不可用 | Cloud Agent | Job/fence 不可判定，停止 admission；Gateway 现有 inference 不受影响 |
 | Runner pool 不可用 | Cloud Agent | Job queued/unavailable；Gateway inference 不受影响 |
-| Agent web/control URL 未配置 | Console build | `/agents` 404；其他 Gateway 路径正常 |
+| Agent web/control URL 未配置 | Gateway console build | `/agents` 404；其他 Gateway 路径正常 |
+| Standalone edge 未启用或 web base/API path 构建错误 | Cloud Agent deployment | 独立 hostname 不可用或路由失败；不得回退到跨源 session cookie |
 | Cloud Agent deployment rollback | Cloud Agent | 停止创建新任务或回到兼容版本，不重新启用已删除的 in-gateway Agent store |
 
 独立故障域是拆分的直接收益：Agent scheduler/sandbox 故障不应阻断普通 inference，Provider 路由故障也不应损坏 Agent job ledger。

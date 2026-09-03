@@ -2,7 +2,9 @@
 
 **日期：** 2026-09-01
 
-**状态：** 当前安全契约；部分强化隔离与生产对抗测试仍是 rollout gate
+**修订：** 2026-09-03，区分已接通的安全边界与尚未关闭的部署门禁
+
+**状态：** 当前安全契约；`trusted` setup allowlist proxy 尚未接入默认 host compose，Docker writable-layer quota 也未实现，二者仍是 rollout gate
 
 **实现仓库：** `freeinference-cloud-agent`
 
@@ -155,14 +157,18 @@ Credential 只通过以下临时路径进入执行：
 - in-memory bridge local-control credential；
 - Supervisor 与 relay 间的受控请求 metadata。
 
-每个 activation/residency 的 credential：
+Activation credential 与 residency grant 共同遵守：
 
 1. 在 generation 确认后签发；
 2. 只绑定一个 subject、scope 和 execution identity；
 3. 使用短 TTL；
 4. 由 heartbeat 在 fence 仍有效时续期；
-5. turn settle、cancel、supersede、process replacement 或 idle stop 时撤销；
-6. 即使 revoke 请求丢失，也会在 TTL 到期后失效。
+5. 即使 revoke 请求丢失，也会在 TTL 到期后失效。
+
+两类 credential 的撤销边界不同：
+
+- activation credential 绑定当前 job/attempt；turn settle、cancel 或 supersede 后撤销；
+- residency grant 绑定一个 thread 的常驻 membership，Gateway external job id 为 `thread:<thread_id>`。当前 attempt 只负责证明 owner/fence 并驱动 mint/renew；一次 turn settle **不会**撤销它。只要同一个 resident process 仍 live，它可以跨该 thread 的后续 turn 保留；process replacement、idle stop、takeover 或 release 时撤销。
 
 长 TTL + 仅依赖远程 revoke 不是可接受设计，因为 control plane 故障时 abandoned attempt 会继续持有能力。
 
@@ -193,13 +199,15 @@ Source preparer 的临时目录不是 checkpoint，也不能作为恢复或 Fork
 
 ## 8. 两阶段网络策略
 
+代码已经定义 phase/tier policy 和 Squid 配置 renderer，但当前 host compose 对 setup/agent 都默认 `platform_only`，也没有启动或连接 setup allowlist proxy。所以下述 `trusted` setup 路径是尚待部署接线和验收的目标，不是当前默认部署已经具备的能力。
+
 ### 8.1 Setup phase
 
 目的：允许安装依赖，但不提供开放互联网。
 
-- 所有访问通过 allowlist proxy；
+- 启用 `trusted` setup tier 后，所有外部访问必须通过 allowlist proxy；
 - CONNECT 按 hostname 与端口策略校验；
-- proxy 记录 allow/deny、目标、字节与时长；
+- 当前 renderer 可记录 allow/deny、来源、目标、状态与字节；parser、ledger 与告警尚未实现；
 - 不允许 caller 把 proxy 变成任意目标 relay；
 - repository credential 不进入 setup process；
 - setup 完成后 detach network，并验证 detach 成功。
@@ -287,7 +295,7 @@ Runtime capability 必须由 preflight 与 exact-image probe 证明。配置要�
 
 ### 9.4 基线 hardening
 
-所有执行 profile 至少要求：
+生产准入目标要求所有执行 profile 至少具备：
 
 - 非 root user；
 - `no-new-privileges`；
@@ -299,9 +307,11 @@ Runtime capability 必须由 preflight 与 exact-image probe 证明。配置要�
 - credential-free immutable base image；
 - 精确 runtime/helper pin 与 image digest attestation。
 
+当前 retained/shared container create path 已设置 non-root、capability drop、`no-new-privileges`、默认 seccomp、CPU/memory/PID 与 stop timeout；它没有设置 Docker writable-layer quota。Disk limit 因而仍是明确缺口，不能把 host data-root 容量或 admission 告警写成 per-container enforcement。
+
 ## 10. Docker-owned storage boundary
 
-Host service 只通过 Docker Engine API 操作 chat state：
+Retained/shared-live 路径只通过 Docker Engine API 操作 chat state：
 
 - create/start/stop/inspect/exec/stats/archive；
 - 不读取 `/var/lib/docker`；
@@ -310,6 +320,8 @@ Host service 只通过 Docker Engine API 操作 chat state：
 - 不为 `/workspace` 或 native state 配置 bind/named/anonymous volume。
 
 这减少 host-path 攻击面和路径漂移，但不提供 host-independent persistence。删除 container、误运行 prune、丢失 data root 或丢失 host 仍会使 session `lost`。
+
+在 retained-only cutover 完成前，legacy disposable runner 仍保留 host worktree/snapshot 路径；上面的 Docker-only 声明只描述已经门禁的 retained/shared-live topology，不能外推到 legacy fallback。
 
 Session host 禁止 generic container/system prune。Disk pressure 通过 admission 与告警处理，不能通过静默删除 retained sandbox 处理。
 
@@ -441,7 +453,7 @@ Publisher 不能信任沙盒声明的目标 repository、branch 或 base；必�
 - Job/Attempt/lease/generation transition；
 - Grant mint/renew/revoke/expiry，不记录 token；
 - Network phase transition 与 relay probe；
-- Egress allow/deny verdict 与 unclassified bytes；
+- Egress allow/deny verdict 与 unclassified bytes（setup proxy 接线和 parser 落地后；当前没有该 ledger）；
 - Slot allocation、process cleanup 与 ambiguity；
 - Native resume/Fork receipt validation；
 - Container OOM、unexpected exit、missing object；
@@ -468,7 +480,7 @@ Publisher 不能信任沙盒声明的目标 repository、branch 或 base；必�
 - Agent phase 不能访问 package registry、control plane、Docker daemon 或任意公网地址；
 - gateway/MCP relay 只能到固定 upstream；
 - 未配置 relay 时请求明确失败；
-- denied CONNECT 可归属、计数与告警；
+- `trusted` setup proxy 接线后，denied CONNECT 可归属、计数与告警；当前默认部署尚未通过此项；
 - phase transition 后 setup network 不可重新出现。
 
 ### 17.3 Runtime isolation
@@ -492,6 +504,8 @@ Publisher 不能信任沙盒声明的目标 repository、branch 或 base；必�
 ## 18. 已知剩余风险
 
 - Docker writable layer 仍是单一持久副本；host/data-root 丢失导致 `lost`。
+- 当前没有 per-container writable-layer quota；disk-pressure admission 不能替代资源隔离。
+- `trusted` setup allowlist proxy 仍未接入默认 host compose；现有 `platform_only` 默认档位不能安装需要公网 registry 的依赖。
 - Shared workspace 允许同一授权域内的 sibling 相互影响文件和项目级 state。
 - 普通 Docker 共享宿主内核，只适合相应信任等级。
 - Runtime-native state format 与并发行为受精确版本影响，升级必须重新 attestation。
