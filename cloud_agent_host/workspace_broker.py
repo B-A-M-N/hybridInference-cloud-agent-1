@@ -42,8 +42,15 @@ from cloud_agent_host.chat_sandbox import (
     RetainedChatLost,
 )
 from cloud_agent_host.drivers import DriverError
+from cloud_agent_host.guest_observer import (
+    GuestObservation,
+    add_process_counts,
+    add_process_resources,
+    attribute_processes,
+)
 from cloud_agent_host.logging_utils import get_logger
 from cloud_agent_host.resident_transport import ResidentLaunch
+from cloud_agent_host.resources import ResourceSampler
 from cloud_agent_host.retained_workspace import (
     RetainedWorkspaceError,
     read_retained_file,
@@ -68,8 +75,11 @@ from cloud_agent_host.session_supervisor import (
 from cloud_agent_host.shared_session_supervisor import (
     SharedChatSessionSupervisor,
     SharedMemberManifest,
+    SharedTurnBoundaryError,
+    SharedTurnTelemetry,
 )
 from cloud_agent_host.source_archive import DEFAULT_MAX_BASE_BUNDLE_BYTES
+from cloud_agent_host.tool_windows import ToolWindowTracker, attribute, tool_time_ms
 from cloud_agent_host.workspace_browser import (
     MAX_FILE_PREVIEW_BYTES,
     WorkspacePathError,
@@ -1697,9 +1707,65 @@ def create_app(
             raise supervisor_error(exc) from exc
 
         def frames():
-            turn_completed = False
+            turn_boundary_closed = False
+            tool_windows = ToolWindowTracker()
+            sampler = ResourceSampler(None)
+            resources: dict[str, Any] | None = None
+
+            def close_resources(value: Any) -> dict[str, Any]:
+                nonlocal resources
+                if resources is not None:
+                    return resources
+                telemetry = (
+                    value
+                    if isinstance(value, SharedTurnTelemetry)
+                    else SharedTurnTelemetry(
+                        observation=(
+                            value
+                            if isinstance(value, GuestObservation)
+                            else GuestObservation.unavailable(
+                                "shared turn returned no process telemetry"
+                            )
+                        )
+                    )
+                )
+                tool_windows.apply_marks(list(telemetry.tool_marks))
+                windows = tool_windows.windows()
+                resources = sampler.stop()
+                tool_calls = attribute(
+                    sampler.samples(),
+                    windows,
+                    windows_complete=not tool_windows.truncated,
+                )
+                processes, process_counts = attribute_processes(
+                    telemetry.observation,
+                    windows,
+                )
+                resources.update(
+                    {
+                        "tool_calls": add_process_resources(
+                            add_process_counts(tool_calls, process_counts),
+                            processes,
+                            observation_complete=telemetry.observation.complete,
+                        ),
+                        "tool_calls_truncated": tool_windows.truncated,
+                        "tool_time_ms": (None if tool_windows.truncated else tool_time_ms(windows)),
+                        "process_observer": telemetry.observation.source,
+                        "process_observation_complete": telemetry.observation.complete,
+                        "process_events_lost": telemetry.observation.lost_events,
+                        "processes_truncated": telemetry.observation.truncated,
+                        "processes": processes,
+                    }
+                )
+                return resources
+
             try:
                 for event in turn.lines():
+                    tool_windows.observe(
+                        event.event_type,
+                        event.payload,
+                        mono=time.monotonic(),
+                    )
                     yield (
                         json.dumps(
                             {
@@ -1718,8 +1784,9 @@ def create_app(
                 # normalizes shared writes; if either fails the runner must
                 # receive an error frame instead of a result followed by an
                 # opaque settle failure.
-                owner.complete_turn(thread_id, body.token, turn)
-                turn_completed = True
+                telemetry = owner.complete_turn(thread_id, body.token, turn)
+                turn_boundary_closed = True
+                resources = close_resources(telemetry)
                 yield (
                     json.dumps(
                         {
@@ -1730,22 +1797,39 @@ def create_app(
                             "usage": result.usage,
                             "raw": result.raw,
                             "stderr": turn.stderr_text()[-4000:],
+                            "resources": resources,
                         },
                         separators=(",", ":"),
                     )
                     + "\n"
                 )
             except Exception as exc:
+                telemetry = exc.telemetry if isinstance(exc, SharedTurnBoundaryError) else None
+                if telemetry is not None:
+                    turn_boundary_closed = True
+                if not turn_boundary_closed:
+                    try:
+                        telemetry = owner.abort_turn(thread_id, body.token, turn)
+                        turn_boundary_closed = True
+                    except SharedTurnBoundaryError as boundary_exc:
+                        telemetry = boundary_exc.telemetry
+                        turn_boundary_closed = True
+                    except Exception:
+                        telemetry = None
                 yield (
                     json.dumps(
-                        {"kind": "error", "detail": str(exc)[:1000]},
+                        {
+                            "kind": "error",
+                            "detail": str(exc)[:1000],
+                            "resources": close_resources(telemetry),
+                        },
                         separators=(",", ":"),
                     )
                     + "\n"
                 )
             finally:
                 with contextlib.suppress(Exception):
-                    if not turn_completed:
+                    if not turn_boundary_closed:
                         owner.abort_turn(thread_id, body.token, turn)
 
         return StreamingResponse(

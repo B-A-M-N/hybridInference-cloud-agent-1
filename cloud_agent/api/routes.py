@@ -118,11 +118,13 @@ from cloud_agent.schemas import (
     McpIntegrationResponse,
     McpServerSummary,
     OAuthConnectRequest,
+    ProcessObservation,
     RepoBranchesResponse,
     SourceControlAccount,
     SourceControlIntegrationsResponse,
     SourceControlProviderResponse,
     SourceControlRepository,
+    ToolCallResources,
     WorkerAckResponse,
     WorkerArtifactRequest,
     WorkerArtifactResponse,
@@ -462,6 +464,14 @@ def _attempt_resources(telemetry: dict[str, Any] | None) -> AttemptResources | N
         sample_count=telemetry.get("sample_count") or 0,
         coverage=float(telemetry.get("coverage") or 0.0),
         sampler_version=telemetry.get("sampler_version"),
+        tool_time_ms=telemetry.get("tool_time_ms"),
+        tool_calls=[ToolCallResources(**call) for call in telemetry.get("tool_calls") or []],
+        tool_calls_truncated=bool(telemetry.get("tool_calls_truncated")),
+        process_observer=telemetry.get("process_observer"),
+        process_observation_complete=bool(telemetry.get("process_observation_complete")),
+        process_events_lost=int(telemetry.get("process_events_lost") or 0),
+        processes_truncated=bool(telemetry.get("processes_truncated")),
+        processes=[ProcessObservation(**process) for process in telemetry.get("processes") or []],
     )
 
 

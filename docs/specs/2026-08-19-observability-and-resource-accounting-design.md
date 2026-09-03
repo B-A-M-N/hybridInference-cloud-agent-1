@@ -289,9 +289,10 @@ Consequences:
 sandbox (docker, per residency)      runner (a container beside it)     control plane host
 ─────────────────────────────       ───────────────────────────        ──────────────────
 harness + tool children              ResourceSampler (1 Hz, via the      worker API (exists):
-  [claude: hook markers ——►          daemon's /containers/{id}/stats)     events, continuity,
-   container-local journal]          │                                    + NEW resource rollups
-                                     ├─► window rollup at turn/idle close ─► Postgres rows
+  │                                  daemon's /containers/{id}/stats)     events, continuity,
+  ├─ claude marker ─┐                │                                    + NEW resource rollups
+  └─ fork/exec/exit ┴─► guest-root   ├─ process/mark journal reader
+                       eBPF observer ├─► window rollup at turn/idle close ─► Postgres rows
 squid egress                         │                                    agent_job_events (exists)
   access log (bytes/verdict) ──►     egress log parser ─────────────────► net flow rows
                                      │
@@ -326,16 +327,31 @@ runtime; an unreadable backend yields `coverage = 0`, honestly, not zeros.
 
 **Per-tool mechanics.** For `message`-level drivers, a call's window is
 [`tool_use` arrival, matching `tool_result` arrival] joined on
-`tool_use_id` — includes model "thinking" time before execution starts, which
-is why it is labelled `message`, not `exact`. For claude-code `exact`: the
-sandbox image's settings gain PreToolUse/PostToolUse hooks that append one
-JSON line `{tool, tool_use_id, phase, t_mono}` to an append-only file on the
-container writable layer; the supervisor tails it through Docker exec. Hooks
-are **passive by contract**: log-only command, short timeout, exit 0 always; a
-hook that cannot write must not block the tool (contract test 7). Hook config
-lives in the sandbox image / injected home — platform infrastructure, never
-the user's repository, and patch-gated out of any diff like the rest of the
-injected home.
+`tool_use_id`. The model has already produced the call by the opening event;
+the wider window is labelled `message`, not `exact`, because it also contains
+the harness/platform delay around the actual execution. For claude-code
+`exact`, each
+PreToolUse/PostToolUse hook `exec`s one immutable, image-bundled helper. The
+helper timestamps before reading stdin and sends one bounded mark to a Unix
+datagram socket owned by the Kata guest-root observer. The observer requires
+kernel-supplied peer credentials, verifies `/proc/<pid>/exe` names the fixed
+helper inode, and appends the mark to the same root-only, loss-accounted journal
+as eBPF fork/exec/exit events. Its lifecycle remains visible in the complete
+census, but that exact executable identity excludes it from per-tool workload
+counts. Trusted
+non-Kata development falls back to the old bounded state-file reader; Kata
+never treats that agent-writable file as an attribution authority.
+
+Hooks remain **passive by contract**: one bounded helper, a 25 ms non-blocking
+stdin deadline plus a one-second outer CLI timeout, and exit 0 for every
+invalid input or output failure. A hook that cannot record a mark leaves the
+window message-level and must not block the tool. The root-only
+journal prevents repository code from editing, truncating, or directly
+injecting records. Exact tool attribution is still diagnostic rather than a
+security or billing boundary: code running as the Agent CLI's UID can invoke
+the marker helper itself. That limitation cannot be removed while hooks and
+tools intentionally share one UID; the independent eBPF process census remains
+the authoritative record of which processes existed.
 
 **Attribution.** A delta between two samples is assigned to the tool windows
 open during that interval. One open window: exclusive. `n` overlapping
@@ -345,6 +361,38 @@ windows: each records the shared delta with `overlap_n = n`; sums over
 calls (the model streaming, the CLI's own work) accrues to the attempt, not
 to any tool — visible as `attempt − Σ exclusive`, which is itself a useful
 series (harness overhead).
+
+**Exit-time accounting (Kata).** The sampler's grid is coarser than 97 % of
+calls, so under Kata the per-call numbers come from the guest kernel instead,
+from two records per task. `sched_process_exit` carries the group's settled
+`maxrss`, the task's `task_io_accounting` bytes, and whether this exit
+emptied the thread group (`signal->live` reached zero, which `do_exit`
+decrements before the tracepoint). CPU is deliberately *not* read there:
+`utime`/`stime` are tick accounted, and a 400 µs process that never received
+a tick reads zero — exactly the case this exists for. The scheduler's own
+runtime (`se.sum_exec_runtime`, the number `cputime_adjust` scales the tick
+split to, so the total `/proc` and `wait4()` report) is final only once the
+task has been dequeued for the last time, which is where `sched_switch` sees
+it in `TASK_DEAD`; a fourth probe emits a `done` record with it there, and the
+predicate is the only work on every other context switch. Each task reports
+only its own share; the host sums a group's threads into its leader and never
+adds `signal->utime` on top, which would count dead threads twice. A group's
+numbers are settled only when the group is dead *and* every task whose exit
+was seen has also reported `done` — Linux lets a leader exit while its
+threads live on, and a leader's exit must not be mistaken for the process's.
+Every counter is guarded by its presence in the guest's BTF and arrives as
+absent, never as zero, on a kernel built without that accounting; the
+preflight self-test requires a sub-millisecond child's `done` to carry
+non-zero CPU. A process is charged to a call only when its start fell inside
+that call's window alone; one that overlapping windows make plausible for
+several calls, one whose group is not settled, or any process at all in a
+census that lost events, is charged to none of them and marks every call it
+may belong to as `process_resources_partial`, so a per-call sum presented as
+exact never contains another call's work or hides a gap. CPU and I/O are sums
+over a call's processes, the peak is the largest single process (their peaks
+need not have coincided), and work the agent did inside its own resident
+process belongs to no call. This answers the "fine-grained tool call resource
+usage" question for a call of any length, including the 35 ms median.
 
 **Network per tool** is windowed the same way from parsed egress flows
 (connection window = [log time − duration, log time]), and only for the
@@ -377,9 +425,12 @@ egress_flows: attempt_id nullable (idle flows keep residency ids), ts_start,
 **Costs, honestly.** 1 Hz × a handful of sandboxes is negligible CPU and no
 sandbox-visible overhead. Postgres grows by one row per attempt, ≤500 per
 attempt for tools, one per egress connection; all bounded, all indexed by
-attempt. The hook file grows within a turn and is truncated at turn close.
+attempt. The trusted non-Kata fallback mark file has a 1 MiB lifetime cap.
 The standing cost of having eyes is one checker loop, one aggregate API,
-and a few console pages — zero new services (O1).
+and a few console pages — zero new services (O1). The guest journal has a
+64 MiB hard cap. Any reusable guest rotates it at 48 MiB only when no turn
+cursor is active; a single process storm that exhausts the remaining reserve
+is reported incomplete rather than silently losing processes.
 
 ## 7. Signal catalog (initial; the allowlist test pins it)
 
@@ -420,7 +471,7 @@ or stopped-container disk/admission saturation.
 |---|---|
 | Sampler crashes mid-turn | Turn unaffected; rollup ships with `coverage < 1`; ops record |
 | Attached export backend down (if any) | emit() drops per SDK policy; Postgres facts, console, and checker unaffected (O1) |
-| Hook file absent / harness without hooks | `source = message` windows; no error |
+| Marker unavailable / harness without hooks | `source = message` windows; no error |
 | Hook cannot execute | Tool proceeds (passive contract); coverage of `exact` windows only |
 | Parallel tool calls | `overlap_n > 1`, shared fields only |
 | Squid log rotation / parse gap | Flow gap; `unclassified` absorbs it; gap counter |

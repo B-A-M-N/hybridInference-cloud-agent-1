@@ -461,6 +461,54 @@ containerd finds it without a unit-file edit. The version is pinned in the
 script; upgrading is a two-line change there, and `--check` then fails on every
 host still carrying the old one.
 
+The setup also selects the release's packaged `vmlinuz-debug.container` for
+the default Kata configuration. That kernel is built with Kata's reviewed
+eBPF/BTF debug fragment; the ordinary guest kernel is not sufficient for the
+process observer. `--check` verifies both the asset and the active config, and
+runner preflight goes further: it starts a disposable sandbox with the same
+non-root, capability-dropped and `no-new-privileges` shape as a real retained
+guest, then exercises the same fixed privileged exec used to start the bundled
+observer. Its self-test requires all three lifecycle probes to attach, executes
+one short-lived child, and requires that child's fork, exec, and exit records to
+arrive through the ring buffer. A missing BPF syscall, BTF image, tracepoint,
+event-delivery path, or exec-time permission is therefore a deployment failure
+before the runner can claim work, not an empty process list under a completed
+turn. The same probe also requires the fixed tool-marker helper used by Claude's
+exact boundaries. See Kata's
+[debug-kernel build contract](https://github.com/kata-containers/kata-containers/blob/main/tools/packaging/kernel/README.md#debug-kernel).
+
+Only that fixed, image-bundled observer runs as guest root. Agent CLIs and
+repository code still run under their per-member UIDs with all capabilities
+dropped and `no-new-privileges`; they cannot read, edit, or directly inject
+records into the root-only journal. Claude's fixed non-root marker helper talks
+to it over a credential-checked Unix socket. A same-UID tool can still execute
+that helper, so exact per-tool association is diagnostic, never a security or
+billing authority; the eBPF lifecycle census itself is independent of marks.
+Kata containers retain `CAP_BPF` in the bounding set only so Docker's
+creation-time seccomp profile admits the later helper syscall. Non-root agent
+processes still have empty permitted and effective capability sets, and
+`no-new-privileges` prevents them from promoting that bounding bit. Turn-level
+CPU and memory remain conservative periodic container statistics. Process
+existence is separate, event-driven telemetry: fork/exec/exit survives even
+when a process begins and ends entirely between two statistics samples, and
+the kernel's records carry what that process consumed — the group's peak RSS
+and the bytes it read from and dirtied to storage at exit, and its scheduler
+runtime once it left the CPU for the last time (tick-based CPU time reads
+zero for most sub-millisecond processes, so it is not used). Those are the
+per-call CPU, memory and I/O numbers under Kata: a process is charged to the
+tool call whose window alone contains its start, and a process that
+overlapping calls could both own, one whose thread group has not fully
+settled, or any process in a census that lost events, is charged to no call
+and marks those calls as partial. Work done inside the Agent CLI's own
+process belongs to no call. The self-test in preflight also requires a
+sub-millisecond child's records to carry non-zero CPU, a non-zero peak RSS
+and a group-exit flag, so a guest kernel whose BTF does not relocate them
+fails deployment rather than reporting zeros; storage and read/write byte
+accounting are kernel configuration and arrive as unavailable when absent.
+The per-turn table is therefore a lifecycle census of process starts observed
+after that turn's cursor, not a point-in-time snapshot of resident processes
+that were already running before the turn.
+
 Requirements: an x86_64 Linux host, bare metal or with nested virtualization
 enabled. Kata cannot run without KVM.
 

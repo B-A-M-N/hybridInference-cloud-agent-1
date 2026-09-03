@@ -14,12 +14,17 @@ from cloud_agent_host.chat_sandbox import (
     ChatSandboxSpec,
     ChatSandboxStatus,
 )
+from cloud_agent_host.guest_observer import (
+    GUEST_OBSERVER_SOURCE,
+    GuestObservation,
+    GuestObserverCursor,
+)
 from cloud_agent_host.resident_transport import (
     ResidentLaunch,
     ResidentTransport,
     ResidentTransportFactory,
 )
-from cloud_agent_host.sandbox import SandboxError
+from cloud_agent_host.sandbox import KATA_RUNTIME, SandboxError
 from cloud_agent_host.session_supervisor import SessionBusy
 from cloud_agent_host.shared_session_supervisor import (
     SharedChatSessionSupervisor,
@@ -105,6 +110,23 @@ class _Manager:
 
     def normalize_member_files(self, spec: ChatSandboxSpec, **kwargs) -> None:
         self.events.append(("normalize", kwargs["slot_id"]))
+
+    def begin_guest_observation(
+        self, spec: ChatSandboxSpec, *, user_uid: int
+    ) -> GuestObserverCursor:
+        self.events.append(("observe-begin", user_uid))
+        return GuestObserverCursor(uid=user_uid, available=True)
+
+    def finish_guest_observation(
+        self, spec: ChatSandboxSpec, cursor: GuestObserverCursor | None
+    ) -> GuestObservation:
+        self.events.append(("observe-finish", None if cursor is None else cursor.uid))
+        return GuestObservation(
+            source="kata-guest-ebpf-v1",
+            complete=True,
+            lost_events=0,
+            truncated=False,
+        )
 
 
 class _Turn:
@@ -922,3 +944,274 @@ def test_turn_boundary_preserves_reviewed_resident_tree_and_reaps_new_processes(
         ("normalize", 0),
     ]
     assert supervisor.status("athr_source").resident_state == "live"
+
+
+def test_kata_turn_observation_is_uid_scoped_and_closes_before_platform_cleanup():
+    class Manager(_Manager):
+        def finish_guest_observation(self, spec, cursor):
+            observation = super().finish_guest_observation(spec, cursor)
+            return replace(
+                observation,
+                tool_marks=(
+                    (10.0, "pre", "toolu_1"),
+                    (10.1, "post", "toolu_1"),
+                ),
+            )
+
+        def tool_mark_reader(self, _spec):
+            raise AssertionError("Kata must not trust the agent-owned mark file")
+
+    manager = Manager()
+    manager.backend.runtime = KATA_RUNTIME
+    factory = _TransportFactory()
+    supervisor = SharedChatSessionSupervisor(manager, transport_factory=factory)
+    lease = supervisor.acquire(
+        _spec(),
+        thread_id="athr_source",
+        owner="attempt:1",
+        activation_generation=1,
+        has_settled_context=True,
+        manifest=_members(),
+    )
+    supervisor.ensure_resident(
+        "athr_source",
+        lease.token,
+        _launch("athr_source", native_session_id="native-source", slot=0),
+    )
+
+    turn = supervisor.start_turn(
+        "athr_source",
+        lease.token,
+        prompt="run a sub-millisecond command",
+        model="glm-5.1",
+        reasoning_effort=None,
+    )
+    telemetry = supervisor.complete_turn("athr_source", lease.token, turn)
+
+    assert telemetry.complete is True
+    assert telemetry.tool_marks == (
+        (10.0, "pre", "toolu_1"),
+        (10.1, "post", "toolu_1"),
+    )
+    assert manager.events[-5:] == [
+        ("census", 0),
+        ("observe-begin", 11001),
+        ("observe-finish", 11001),
+        ("reap-except", 0, ((41, 400),)),
+        ("normalize", 0),
+    ]
+
+
+def test_kata_observer_failure_keeps_the_source_and_reports_a_gap():
+    class Manager(_Manager):
+        def finish_guest_observation(self, _spec, _cursor):
+            return GuestObservation.unavailable("observer stopped")
+
+    manager = Manager()
+    manager.backend.runtime = KATA_RUNTIME
+    supervisor = SharedChatSessionSupervisor(manager, transport_factory=_TransportFactory())
+    lease = supervisor.acquire(
+        _spec(),
+        thread_id="athr_source",
+        owner="attempt:1",
+        activation_generation=1,
+        has_settled_context=True,
+        manifest=_members(),
+    )
+    supervisor.ensure_resident(
+        "athr_source",
+        lease.token,
+        _launch("athr_source", native_session_id="native-source", slot=0),
+    )
+    turn = supervisor.start_turn(
+        "athr_source",
+        lease.token,
+        prompt="work",
+        model="glm-5.1",
+        reasoning_effort=None,
+    )
+
+    telemetry = supervisor.complete_turn("athr_source", lease.token, turn)
+
+    assert telemetry.source == GUEST_OBSERVER_SOURCE
+    assert telemetry.complete is False
+
+
+def test_lost_shared_residency_preserves_observation_until_turn_closes():
+    manager = _Manager()
+    manager.backend.runtime = KATA_RUNTIME
+    factory = _TransportFactory()
+    supervisor = SharedChatSessionSupervisor(manager, transport_factory=factory)
+    lease = supervisor.acquire(
+        _spec(),
+        thread_id="athr_source",
+        owner="attempt:1",
+        activation_generation=1,
+        has_settled_context=True,
+        manifest=_members(),
+    )
+    supervisor.ensure_resident(
+        "athr_source",
+        lease.token,
+        _launch("athr_source", native_session_id="native-source", slot=0),
+    )
+    turn = supervisor.start_turn(
+        "athr_source",
+        lease.token,
+        prompt="work",
+        model="glm-5.1",
+        reasoning_effort=None,
+    )
+
+    supervisor.residency_lost("athr_source", generation=1)
+
+    assert turn.interrupted is True
+    assert manager.events[-1] == ("observe-begin", 11001)
+
+    telemetry = supervisor.complete_turn("athr_source", lease.token, turn)
+
+    assert telemetry.complete is True
+    assert manager.events[-3:] == [
+        ("observe-finish", 11001),
+        ("reap-except", 0, ((41, 400),)),
+        ("normalize", 0),
+    ]
+
+
+def test_supervisor_close_releases_an_active_turn_observation_and_member_lock():
+    manager = _Manager()
+    manager.backend.runtime = KATA_RUNTIME
+    supervisor = SharedChatSessionSupervisor(manager, transport_factory=_TransportFactory())
+    lease = supervisor.acquire(
+        _spec(),
+        thread_id="athr_source",
+        owner="attempt:1",
+        activation_generation=1,
+        has_settled_context=True,
+        manifest=_members(),
+    )
+    supervisor.ensure_resident(
+        "athr_source",
+        lease.token,
+        _launch("athr_source", native_session_id="native-source", slot=0),
+    )
+    supervisor.start_turn(
+        "athr_source",
+        lease.token,
+        prompt="work",
+        model="glm-5.1",
+        reasoning_effort=None,
+    )
+    member = supervisor._members["athr_source"].members["athr_source"]
+
+    supervisor.close()
+
+    assert manager.events[-1] == ("observe-finish", 11001)
+    assert member.turn_lock.locked() is False
+    assert member.activation_processes is None
+
+
+def test_supervisor_close_does_not_steal_an_initialization_lock():
+    manager = _Manager()
+    supervisor = SharedChatSessionSupervisor(manager, transport_factory=_TransportFactory())
+    supervisor.acquire(
+        _spec(),
+        thread_id="athr_source",
+        owner="attempt:1",
+        activation_generation=1,
+        has_settled_context=False,
+        manifest=_members(),
+    )
+    member = supervisor._members["athr_source"].members["athr_source"]
+    member.turn_lock.acquire()
+
+    supervisor.close()
+
+    assert member.turn_lock.locked() is True
+    member.turn_lock.release()
+
+
+def test_abandon_releases_observation_when_normal_turn_cleanup_fails(monkeypatch):
+    manager = _Manager()
+    manager.backend.runtime = KATA_RUNTIME
+    supervisor = SharedChatSessionSupervisor(manager, transport_factory=_TransportFactory())
+    lease = supervisor.acquire(
+        _spec(),
+        thread_id="athr_source",
+        owner="attempt:1",
+        activation_generation=1,
+        has_settled_context=True,
+        manifest=_members(),
+    )
+    supervisor.ensure_resident(
+        "athr_source",
+        lease.token,
+        _launch("athr_source", native_session_id="native-source", slot=0),
+    )
+    supervisor.start_turn(
+        "athr_source",
+        lease.token,
+        prompt="work",
+        model="glm-5.1",
+        reasoning_effort=None,
+    )
+
+    def fail_cleanup(*_args, **_kwargs):
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(supervisor, "complete_turn", fail_cleanup)
+    supervisor.abandon("athr_source", lease.token, lost=True)
+
+    assert manager.events[-1] == ("observe-finish", 11001)
+
+
+def test_shared_claude_turn_fences_and_returns_exact_tool_marks():
+    """The supervisor must carry the retained hook slice to the broker."""
+
+    class Manager(_Manager):
+        def tool_mark_reader(self, _spec):
+            self.events.append(("marks-begin",))
+
+            def read():
+                self.events.append(("marks-finish",))
+                return [(10.0, "pre", "toolu_1"), (10.1, "post", "toolu_1")]
+
+            return SimpleNamespace(read=read)
+
+    manager = Manager()
+    factory = _TransportFactory()
+    supervisor = SharedChatSessionSupervisor(manager, transport_factory=factory)
+    lease = supervisor.acquire(
+        _spec(),
+        thread_id="athr_source",
+        owner="attempt:1",
+        activation_generation=1,
+        has_settled_context=True,
+        manifest=_members(),
+    )
+    supervisor.ensure_resident(
+        "athr_source",
+        lease.token,
+        _launch("athr_source", native_session_id="native-source", slot=0),
+    )
+
+    turn = supervisor.start_turn(
+        "athr_source",
+        lease.token,
+        prompt="work",
+        model="glm-5.1",
+        reasoning_effort=None,
+    )
+    telemetry = supervisor.complete_turn("athr_source", lease.token, turn)
+
+    assert telemetry.tool_marks == (
+        (10.0, "pre", "toolu_1"),
+        (10.1, "post", "toolu_1"),
+    )
+    assert manager.events[-5:] == [
+        ("census", 0),
+        ("marks-begin",),
+        ("marks-finish",),
+        ("reap-except", 0, ((41, 400),)),
+        ("normalize", 0),
+    ]

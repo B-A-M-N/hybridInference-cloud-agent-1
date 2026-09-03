@@ -3736,9 +3736,18 @@ class AgentJobStore:
 
         Absent counters stay NULL: a backend the sampler could not read is not
         a machine that used nothing, and ``coverage`` says which happened.
+
+        The per-call rows ride the same fence and the same transaction: they
+        describe spans inside this window, so a caller that could not write
+        the window must not be able to write its parts. They are replaced
+        rather than merged, because the list is one statement about the whole
+        attempt — a retry reporting fewer calls than a previous post means
+        fewer calls, not a set to union with.
         """
-        async with self._pool.acquire() as conn:
-            return bool(
+        tool_calls = rollup.get("tool_calls") or []
+        processes = rollup.get("processes") or []
+        async with self._pool.acquire() as conn, conn.transaction():
+            recorded = bool(
                 await conn.fetchval(
                     """
                     WITH live AS (
@@ -3750,9 +3759,12 @@ class AgentJobStore:
                     INSERT INTO agent_attempt_resources (
                         attempt_id, job_id, cpu_usec, mem_peak_bytes, mem_avg_bytes,
                         io_read_bytes, io_write_bytes, net_rx_bytes, net_tx_bytes,
-                        sample_count, coverage, sampler_version
+                        sample_count, coverage, sampler_version, tool_calls_truncated,
+                        tool_time_ms, process_observer, process_observation_complete,
+                        process_events_lost, processes_truncated
                     )
-                    SELECT live.id, live.job_id, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+                    SELECT live.id, live.job_id, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                           $13, $14, $15, $16, $17, $18
                     FROM live
                     ON CONFLICT (attempt_id) DO UPDATE SET
                         cpu_usec = EXCLUDED.cpu_usec,
@@ -3764,7 +3776,13 @@ class AgentJobStore:
                         net_tx_bytes = EXCLUDED.net_tx_bytes,
                         sample_count = EXCLUDED.sample_count,
                         coverage = EXCLUDED.coverage,
-                        sampler_version = EXCLUDED.sampler_version
+                        sampler_version = EXCLUDED.sampler_version,
+                        tool_calls_truncated = EXCLUDED.tool_calls_truncated,
+                        tool_time_ms = EXCLUDED.tool_time_ms,
+                        process_observer = EXCLUDED.process_observer,
+                        process_observation_complete = EXCLUDED.process_observation_complete,
+                        process_events_lost = EXCLUDED.process_events_lost,
+                        processes_truncated = EXCLUDED.processes_truncated
                     RETURNING attempt_id
                     """,
                     attempt_id,
@@ -3779,26 +3797,132 @@ class AgentJobStore:
                     int(rollup.get("sample_count") or 0),
                     float(rollup.get("coverage") or 0.0),
                     str(rollup.get("sampler_version") or "unknown"),
+                    bool(rollup.get("tool_calls_truncated")),
+                    rollup.get("tool_time_ms"),
+                    rollup.get("process_observer"),
+                    bool(rollup.get("process_observation_complete")),
+                    int(rollup.get("process_events_lost") or 0),
+                    bool(rollup.get("processes_truncated")),
                 )
             )
+            if not recorded:
+                return False
+            await conn.execute(
+                "DELETE FROM agent_tool_call_resources WHERE attempt_id = $1",
+                attempt_id,
+            )
+            if tool_calls:
+                await conn.executemany(
+                    """
+                    INSERT INTO agent_tool_call_resources (
+                        attempt_id, call_seq, tool_use_id, tool_name, timing_source,
+                        duration_ms, sample_count, overlap_n, measured_span_ms,
+                        cpu_usec_exclusive, cpu_usec_shared,
+                        mem_peak_exclusive_bytes, mem_peak_shared_bytes, process_count,
+                        process_cpu_usec, process_mem_peak_bytes,
+                        process_io_read_bytes, process_io_write_bytes,
+                        process_resources_partial
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                            $15, $16, $17, $18, $19)
+                    """,
+                    [
+                        (
+                            attempt_id,
+                            int(call["call_seq"]),
+                            str(call["tool_use_id"]),
+                            str(call["tool_name"]),
+                            str(call.get("timing_source") or "message"),
+                            call.get("duration_ms"),
+                            int(call.get("sample_count") or 0),
+                            int(call.get("overlap_n") or 1),
+                            call.get("measured_span_ms"),
+                            call.get("cpu_usec_exclusive"),
+                            call.get("cpu_usec_shared"),
+                            call.get("mem_peak_exclusive_bytes"),
+                            call.get("mem_peak_shared_bytes"),
+                            int(call.get("process_count") or 0),
+                            call.get("process_cpu_usec"),
+                            call.get("process_mem_peak_bytes"),
+                            call.get("process_io_read_bytes"),
+                            call.get("process_io_write_bytes"),
+                            bool(call.get("process_resources_partial")),
+                        )
+                        for call in tool_calls
+                    ],
+                )
+            await conn.execute(
+                "DELETE FROM agent_process_observations WHERE attempt_id = $1",
+                attempt_id,
+            )
+            if processes:
+                await conn.executemany(
+                    """
+                    INSERT INTO agent_process_observations (
+                        attempt_id, process_seq, uid, pid, tgid, ppid, comm, executable,
+                        started_offset_ms, duration_ms, exit_code,
+                        observed_fork, observed_exec, observed_exit, tool_call_seqs,
+                        cpu_usec, mem_peak_bytes, io_read_bytes, io_write_bytes,
+                        io_rchar_bytes, io_wchar_bytes
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                            $14, $15, $16, $17, $18, $19, $20, $21)
+                    """,
+                    [
+                        (
+                            attempt_id,
+                            int(process["process_seq"]),
+                            int(process["uid"]),
+                            int(process["pid"]),
+                            int(process["tgid"]),
+                            process.get("ppid"),
+                            str(process["comm"]),
+                            process.get("executable"),
+                            int(process.get("started_offset_ms") or 0),
+                            process.get("duration_ms"),
+                            process.get("exit_code"),
+                            bool(process.get("observed_fork")),
+                            bool(process.get("observed_exec")),
+                            bool(process.get("observed_exit")),
+                            [int(seq) for seq in process.get("tool_call_seqs") or []],
+                            process.get("cpu_usec"),
+                            process.get("mem_peak_bytes"),
+                            process.get("io_read_bytes"),
+                            process.get("io_write_bytes"),
+                            process.get("io_rchar_bytes"),
+                            process.get("io_wchar_bytes"),
+                        )
+                        for process in processes
+                    ],
+                )
+            return True
 
     async def job_turn_telemetry(self, *, job_id: str) -> dict[str, Any] | None:
         """Read how a job's newest attempt ran: continuity, window, resources.
 
         Newest attempt rather than the current one: a retried turn's earlier
         attempts each have their own window, and the one a reader wants is the
-        one that produced the result in front of them. One round trip, because
-        this rides the job-detail read that the thread view already makes.
+        one that produced the result in front of them. One connection, because
+        this rides the job-detail read that the thread view already makes; the
+        per-call rows are a second statement on it rather than an aggregate in
+        the first, so the counters arrive as numbers rather than as JSON this
+        pool would hand back as text.
         """
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT a.continuity_mode, a.context_status,
+                SELECT a.id AS attempt_id, a.continuity_mode, a.context_status,
                        a.started_at, a.finished_at,
                        r.cpu_usec, r.mem_peak_bytes, r.mem_avg_bytes,
                        r.io_read_bytes, r.io_write_bytes,
                        r.net_rx_bytes, r.net_tx_bytes,
-                       r.sample_count, r.coverage, r.sampler_version
+                       r.sample_count, r.coverage, r.sampler_version, r.tool_time_ms,
+                       r.process_observer,
+                       COALESCE(r.process_observation_complete, FALSE)
+                           AS process_observation_complete,
+                       COALESCE(r.process_events_lost, 0) AS process_events_lost,
+                       COALESCE(r.processes_truncated, FALSE) AS processes_truncated,
+                       COALESCE(r.tool_calls_truncated, FALSE) AS tool_calls_truncated
                 FROM agent_attempts a
                 LEFT JOIN agent_attempt_resources r ON r.attempt_id = a.id
                 WHERE a.job_id = $1
@@ -3807,7 +3931,40 @@ class AgentJobStore:
                 """,
                 job_id,
             )
-            return dict(row) if row else None
+            if row is None:
+                return None
+            telemetry = dict(row)
+            calls = await conn.fetch(
+                """
+                SELECT call_seq, tool_use_id, tool_name, timing_source, duration_ms,
+                       sample_count, overlap_n, measured_span_ms,
+                       cpu_usec_exclusive, cpu_usec_shared,
+                       mem_peak_exclusive_bytes, mem_peak_shared_bytes, process_count,
+                       process_cpu_usec, process_mem_peak_bytes,
+                       process_io_read_bytes, process_io_write_bytes,
+                       process_resources_partial
+                FROM agent_tool_call_resources
+                WHERE attempt_id = $1
+                ORDER BY call_seq
+                """,
+                telemetry["attempt_id"],
+            )
+            telemetry["tool_calls"] = [dict(call) for call in calls]
+            processes = await conn.fetch(
+                """
+                SELECT process_seq, uid, pid, tgid, ppid, comm, executable,
+                       started_offset_ms, duration_ms, exit_code,
+                       observed_fork, observed_exec, observed_exit, tool_call_seqs,
+                       cpu_usec, mem_peak_bytes, io_read_bytes, io_write_bytes,
+                       io_rchar_bytes, io_wchar_bytes
+                FROM agent_process_observations
+                WHERE attempt_id = $1
+                ORDER BY process_seq
+                """,
+                telemetry.pop("attempt_id"),
+            )
+            telemetry["processes"] = [dict(process) for process in processes]
+            return telemetry
 
     async def terminal_workspace_ready(self, *, attempt_id: int) -> bool:
         """Return whether the live attempt currently permits terminal writes.

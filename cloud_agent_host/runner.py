@@ -66,6 +66,14 @@ from cloud_agent_host.enrollment import (
     establish_residency,
     release_residency,
 )
+from cloud_agent_host.guest_observer import (
+    GUEST_OBSERVER_SOURCE,
+    MAX_OBSERVED_PROCESSES,
+    GuestObservation,
+    add_process_counts,
+    add_process_resources,
+    attribute_processes,
+)
 from cloud_agent_host.logging_utils import configure_process_logging
 from cloud_agent_host.patch_gate import branch_name_for, validate_patch
 from cloud_agent_host.residency import ResidentEntry, ResidentPool
@@ -80,6 +88,7 @@ from cloud_agent_host.runtimes import (
     registered_runtimes,
 )
 from cloud_agent_host.sandbox import (
+    KATA_RUNTIME,
     SANDBOX_PATH,
     ContainerBackend,
     SandboxBackend,
@@ -101,6 +110,12 @@ from cloud_agent_host.shared_protocol import (
     SHARED_SANDBOX_RUNTIME_PINS,
 )
 from cloud_agent_host.source_archive import build_base_bundle, build_source_archive
+from cloud_agent_host.tool_windows import (
+    ToolMarkReader,
+    ToolWindowTracker,
+    attribute,
+    tool_time_ms,
+)
 from cloud_agent_host.workspace_paths import purge_stale_workspaces, workspace_path
 from cloud_agent_host.workspace_snapshot import (
     build_retained_workspace_snapshot,
@@ -113,6 +128,13 @@ DEFAULT_AGENT_TIMEOUT_S = 3600.0
 DEFAULT_WORKSPACE_TTL_S = 7 * 24 * 60 * 60
 # How often the control checks run while the agent is silent.
 _POLL_INTERVAL_S = 0.5
+_TURN_INTERRUPT_DRAIN_S = 15.0
+# Shared turns close their observer and then enforce a broker-side activation
+# boundary whose reviewed filesystem normalization is allowed up to 120 s.
+# Keep reading within the supervisor client's 180 s timeout so cancellation
+# does not discard the already-closed guest telemetry merely because cleanup
+# took longer than a local CLI needs to exit.
+_SHARED_TURN_INTERRUPT_DRAIN_S = 180.0
 _GIT_TIMEOUT_S = 300.0
 # Bounds on the final in-sandbox `git diff`. Generous for a real patch, finite
 # because the worktree's git configuration belongs to the agent by then.
@@ -1301,6 +1323,83 @@ def run_agent(
     exists to preserve.
     """
     sampler = ResourceSampler(None)
+    tool_windows = ToolWindowTracker()
+    turn_started_mono = time.monotonic()
+    observed_processes: list[SandboxProcess] = []
+    observation_cursor = None
+    observation_started = False
+    live_observation_cursor = None
+    live_observation_error: str | None = None
+    live_observation_owner = (
+        resident.live_session
+        if resident is not None
+        and resident.credential is not None
+        and job.model == resident.grant_model
+        and not mcp_config.server_ids
+        and resident.live_session is not None
+        and bool(getattr(resident.live_session, "process_alive", lambda: False)())
+        else None
+    )
+    begin_observation = getattr(backend, "begin_guest_observation", None)
+
+    def begin_turn_observation() -> None:
+        """Fence after platform preparation and immediately before agent exec."""
+        nonlocal observation_cursor, observation_started
+        if observation_started or begin_observation is None:
+            return
+        observation_started = True
+        try:
+            observation_cursor = begin_observation()
+        except Exception as exc:
+            observation_cursor = None
+            print(f"guest process observer unavailable: {exc}", file=sys.stderr)
+
+    def begin_live_turn_observation(owner: Any) -> None:
+        """Fence a surviving one-shot guest only when its prompt is attempted.
+
+        The outer frame identifies the owner early so it can always close the
+        cursor, but starting the cursor here avoids charging idle activity (or
+        a previous turn's terminal observation) when the process dies before
+        ``_run_agent`` reaches the HOT rung and falls back to a fresh process.
+        """
+        nonlocal live_observation_cursor, live_observation_error
+        if (
+            owner is not live_observation_owner
+            or live_observation_cursor is not None
+            or live_observation_error is not None
+        ):
+            return
+        begin_live_observation = getattr(
+            live_observation_owner,
+            "begin_guest_observation",
+            None,
+        )
+        if begin_live_observation is not None:
+            try:
+                live_observation_cursor = begin_live_observation()
+            except Exception as exc:
+                live_observation_error = str(exc)
+                print(f"resident guest process observer unavailable: {exc}", file=sys.stderr)
+
+    # Constructed before the turn so it remembers where the mark file already
+    # ended: a resident session writes every turn's marks to the same file.
+    kata_tool_marks = getattr(backend, "runtime", None) == KATA_RUNTIME
+    mark_reader = (
+        getattr(backend, "tool_mark_reader", None)
+        if runtime.name == "claude-code" and not kata_tool_marks
+        else None
+    )
+    try:
+        tool_marks = (
+            mark_reader()
+            if mark_reader is not None
+            else ToolMarkReader(
+                state_dir if runtime.name == "claude-code" and not kata_tool_marks else None
+            )
+        )
+    except Exception as exc:
+        print(f"exact tool marks unavailable: {exc}", file=sys.stderr)
+        tool_marks = ToolMarkReader(None)
     try:
         return _run_agent(
             runtime,
@@ -1321,10 +1420,129 @@ def run_agent(
             strict_native_resume=strict_native_resume,
             export_checkpoint=export_checkpoint,
             sampler=sampler,
+            tool_windows=tool_windows,
+            observed_processes=observed_processes,
+            begin_guest_observation=begin_turn_observation,
+            begin_live_guest_observation=begin_live_turn_observation,
         )
     finally:
         with contextlib.suppress(Exception):
-            control.report_resources(sampler.stop())
+            rollup = sampler.stop()
+            observations: list[GuestObservation] = []
+            finish_observation = getattr(backend, "finish_guest_observation", None)
+            if finish_observation is not None and observation_started:
+                try:
+                    observation = finish_observation(observation_cursor)
+                except Exception as exc:
+                    observation = GuestObservation.unavailable(str(exc))
+                if observation is not None:
+                    observations.append(observation)
+            if live_observation_error is not None:
+                observations.append(GuestObservation.unavailable(live_observation_error))
+            elif live_observation_owner is not None and live_observation_cursor is not None:
+                finish_live_observation = getattr(
+                    live_observation_owner,
+                    "finish_guest_observation",
+                    None,
+                )
+                if finish_live_observation is not None:
+                    try:
+                        observation = finish_live_observation(live_observation_cursor)
+                    except Exception as exc:
+                        observation = GuestObservation.unavailable(str(exc))
+                    if observation is not None:
+                        observations.append(observation)
+            for process in observed_processes:
+                finish_process_observation = getattr(
+                    process,
+                    "finish_guest_observation",
+                    None,
+                )
+                if finish_process_observation is None:
+                    continue
+                try:
+                    observation = finish_process_observation()
+                except Exception as exc:
+                    observation = GuestObservation.unavailable(str(exc))
+                if observation is not None:
+                    observations.append(observation)
+            # Kata marks come from the guest-root journal under the same UID
+            # and loss fence as process events. Never mix in the agent-writable
+            # legacy file there; it remains only the trusted-runc fallback.
+            marks = list(tool_marks.read())
+            for observation in observations:
+                marks.extend(observation.tool_marks)
+            tool_windows.apply_marks(marks)
+            windows = tool_windows.windows()
+            # After ``stop``, because it takes the window's closing reading:
+            # attributing before it would hide whatever the last call did.
+            tool_calls = attribute(
+                sampler.samples(),
+                windows,
+                windows_complete=not tool_windows.truncated,
+            )
+            if observations:
+                processes: list[dict[str, Any]] = []
+                merged_processes_truncated = False
+                process_counts = dict.fromkeys(range(1, len(windows) + 1), 0)
+                for observation in observations:
+                    rows, counts = attribute_processes(
+                        observation,
+                        windows,
+                        origin_host_mono=turn_started_mono,
+                    )
+                    for row in rows:
+                        if len(processes) >= MAX_OBSERVED_PROCESSES:
+                            merged_processes_truncated = True
+                            continue
+                        row["process_seq"] = len(processes) + 1
+                        processes.append(row)
+                    for call_seq, count in counts.items():
+                        process_counts[call_seq] += count
+                sources = {
+                    observation.source
+                    for observation in observations
+                    if observation.source is not None
+                }
+                process_observer = (
+                    next(iter(sources))
+                    if len(sources) == 1
+                    else GUEST_OBSERVER_SOURCE
+                    if kata_tool_marks
+                    else None
+                )
+                observation_complete = (
+                    not merged_processes_truncated
+                    and len(sources) == 1
+                    and all(observation.complete for observation in observations)
+                )
+                # A lossy census may have missed a process a call started, so
+                # its exit-accounted numbers are floors, whatever survived.
+                tool_calls = add_process_resources(
+                    add_process_counts(tool_calls, process_counts),
+                    processes,
+                    observation_complete=observation_complete,
+                )
+                rollup.update(
+                    {
+                        "process_observer": process_observer,
+                        "process_observation_complete": observation_complete,
+                        "process_events_lost": sum(
+                            observation.lost_events for observation in observations
+                        ),
+                        "processes_truncated": any(
+                            observation.truncated for observation in observations
+                        )
+                        or merged_processes_truncated,
+                        "processes": processes,
+                    }
+                )
+            rollup["tool_calls"] = tool_calls
+            rollup["tool_calls_truncated"] = tool_windows.truncated
+            # The union, so the reader can see tool-bracketed versus non-tool
+            # time. An incomplete call list cannot support that split.
+            rollup["tool_time_ms"] = None if tool_windows.truncated else tool_time_ms(windows)
+            control.report_resources(rollup)
 
 
 def _run_agent(
@@ -1347,6 +1565,10 @@ def _run_agent(
     strict_native_resume: bool = False,
     export_checkpoint: bool = True,
     sampler: ResourceSampler,
+    tool_windows: ToolWindowTracker,
+    observed_processes: list[SandboxProcess],
+    begin_guest_observation: Any,
+    begin_live_guest_observation: Any,
 ) -> tuple[int, str, list[str]]:
     """Run the agent, streaming its output back as normalized events.
 
@@ -1399,7 +1621,13 @@ def _run_agent(
             )
         except Exception as exc:
             print(f"resource sampler unavailable: {exc}", file=sys.stderr)
+        observed_processes.append(process)
         return process
+
+    def _spawn_turn(spec: SandboxSpec) -> SandboxProcess:
+        """Fence after driver preparation, before the agent can execute."""
+        begin_guest_observation()
+        return _spawn_sampled(backend.spawn(spec))
 
     # Hermetic environment, and the *backend's* idea of it rather than the
     # runner's. For an isolated backend the runner's PATH and HOME name paths
@@ -1428,8 +1656,14 @@ def _run_agent(
         provides_isolation=backend.provides_isolation,
         # The platform places the process inside the sandbox (design D7);
         # the driver owns everything on the returned handle's transport.
-        spawn=lambda argv, env: _spawn_sampled(
-            backend.spawn(SandboxSpec(argv=argv, workdir=workdir, env=env, state_dir=state_dir))
+        spawn=lambda argv, env: _spawn_turn(
+            SandboxSpec(
+                argv=argv,
+                workdir=workdir,
+                env=env,
+                state_dir=state_dir,
+                observe_processes=True,
+            )
         ),
         base_env=base_env,
         # The runner is the only source of this value. Repository contents
@@ -1437,6 +1671,7 @@ def _run_agent(
         # gateway-mediated path reject a non-empty set.
         mcp_config=mcp_config,
         state_dir=state_dir,
+        install_tool_hooks=getattr(backend, "install_tool_hooks", None),
     )
     session = None
     turn = None
@@ -1456,7 +1691,11 @@ def _run_agent(
         # rung that reuses a process is exactly the rung whose consumption is
         # least obvious, so it is measured through the session it inherits.
         with contextlib.suppress(Exception):
-            sampler.rebind(getattr(resident.live_session, "container", None))
+            sampler.rebind(
+                None
+                if getattr(backend, "is_vm_isolated", False)
+                else getattr(resident.live_session, "container", None)
+            )
     stale_process = resident is not None and not hot_ok and resident.live_session is not None
     if stale_process and residents is not None and job.thread_id:
         # This turn will advance the thread past the idle process's memory —
@@ -1487,15 +1726,14 @@ def _run_agent(
                     # Sampled through the same seam as any other spawn: a
                     # resident process is still a container this turn runs
                     # work in, and it was the one rung nothing measured.
-                    spawn_live=lambda argv, env: _spawn_sampled(
-                        backend.spawn(
-                            SandboxSpec(
-                                argv=argv,
-                                workdir=workdir,
-                                env=env,
-                                state_dir=state_dir,
-                                live_input=True,
-                            )
+                    spawn_live=lambda argv, env: _spawn_turn(
+                        SandboxSpec(
+                            argv=argv,
+                            workdir=workdir,
+                            env=env,
+                            state_dir=state_dir,
+                            live_input=True,
+                            observe_processes=True,
                         )
                     ),
                 )
@@ -1509,6 +1747,8 @@ def _run_agent(
             if state_dir is not None:
                 backend.adopt_workdir(state_dir)
             try:
+                begin_live_guest_observation(live)
+                begin_guest_observation()
                 turn = live.start_turn(
                     TurnInput(
                         prompt=job.task_prompt,
@@ -1621,6 +1861,8 @@ def _run_agent(
         # One row per host, not per retry: an agent that retries a blocked address
         # ten times tried to reach one place.
         denied_hosts: set[str] = set()
+        forced_exit_code: int | None = None
+        interrupt_deadline: float | None = None
 
         # Read stdout on a separate thread and poll for it here, so cancellation
         # and the deadline are honoured even when the agent goes quiet. Iterating
@@ -1650,16 +1892,21 @@ def _run_agent(
                     # idempotent and generation-scoped.
                     residents.drop(job.thread_id, release=True, generation=resident.generation)
                 raise LeaseLost("lease lost while the agent was running")
-            if heart.cancel_requested:
+            now = time.monotonic()
+            if heart.cancel_requested and forced_exit_code is None:
                 turn.cancel()
                 control.append_event(NormalizedEvent("lifecycle", {"phase": "cancelled_by_owner"}))
-                return 130, "".join(tail), tool_errors
-            if time.monotonic() > deadline:
+                forced_exit_code = 130
+                interrupt_deadline = now + _TURN_INTERRUPT_DRAIN_S
+            if forced_exit_code is None and now > deadline:
                 turn.cancel()
                 control.append_event(
                     NormalizedEvent("error", {"text": f"agent exceeded {timeout_s:.0f}s"})
                 )
-                return 124, "".join(tail), tool_errors
+                forced_exit_code = 124
+                interrupt_deadline = now + _TURN_INTERRUPT_DRAIN_S
+            if interrupt_deadline is not None and now > interrupt_deadline:
+                return forced_exit_code or 1, "".join(tail), tool_errors
 
             try:
                 line = lines.get(timeout=_POLL_INTERVAL_S)
@@ -1672,6 +1919,10 @@ def _run_agent(
             tail.append(line)
             del tail[:-40]
             item = turn.event_for_line(line)
+            # Stamped here rather than at the control plane, which is where
+            # every duration the footer shows today is stamped: that clock
+            # includes the runner's upload queue, this one does not.
+            tool_windows.observe(item.event_type, item.payload, mono=time.monotonic())
             if item.event_type != LINE:
                 if item.event_type == "tool_result" and (item.payload or {}).get("is_error"):
                     content = str((item.payload or {}).get("content", ""))
@@ -1685,8 +1936,8 @@ def _run_agent(
                 control.append_event(NormalizedEvent(item.event_type, item.payload))
 
         result = turn.wait()
-        exit_code = result.exit_code
-        if live_out is not None and result.status == "completed":
+        exit_code = forced_exit_code if forced_exit_code is not None else result.exit_code
+        if live_out is not None and result.status == "completed" and forced_exit_code is None:
             # What the caller needs to keep the thread resident: the announced
             # session id (captured by the session's own runtime — for a borrowed
             # live session that is a previous turn's instance, not this turn's),
@@ -1696,6 +1947,7 @@ def _run_agent(
                 live_out["session"] = session
         if (
             result.status == "completed"
+            and forced_exit_code is None
             and state_dir is not None
             and export_checkpoint
             and driver.capabilities().checkpoint_export
@@ -2169,24 +2421,31 @@ def _stream_shared_agent_turn(
     tool_errors: list[str] = []
     denied_hosts: set[str] = set()
     result_frame: dict[str, Any] | None = None
+    forced_exit_code: int | None = None
+    interrupt_deadline: float | None = None
     try:
         while True:
             if heart.lease_lost:
                 with contextlib.suppress(Exception):
                     supervisor.interrupt_shared(job.thread_id or "", token=lease_token)
                 raise LeaseLost("lease lost while the shared Agent CLI was running")
-            if heart.cancel_requested:
+            now = time.monotonic()
+            if heart.cancel_requested and forced_exit_code is None:
                 with contextlib.suppress(Exception):
                     supervisor.interrupt_shared(job.thread_id or "", token=lease_token)
                 control.append_event(NormalizedEvent("lifecycle", {"phase": "cancelled_by_owner"}))
-                return 130, "".join(tail), tool_errors, result_frame
-            if time.monotonic() > deadline:
+                forced_exit_code = 130
+                interrupt_deadline = now + _SHARED_TURN_INTERRUPT_DRAIN_S
+            if forced_exit_code is None and now > deadline:
                 with contextlib.suppress(Exception):
                     supervisor.interrupt_shared(job.thread_id or "", token=lease_token)
                 control.append_event(
                     NormalizedEvent("error", {"text": f"agent exceeded {timeout_s:.0f}s"})
                 )
-                return 124, "".join(tail), tool_errors, result_frame
+                forced_exit_code = 124
+                interrupt_deadline = now + _SHARED_TURN_INTERRUPT_DRAIN_S
+            if interrupt_deadline is not None and now > interrupt_deadline:
+                return forced_exit_code or 1, "".join(tail), tool_errors, result_frame
             try:
                 frame = frames.get(timeout=_POLL_INTERVAL_S)
             except queue.Empty:
@@ -2219,11 +2478,20 @@ def _stream_shared_agent_turn(
                 if stderr.strip():
                     tail.append(stderr[-2000:])
                 continue
-            if kind in {"error", "client_error"}:
+            if kind == "error":
+                result_frame = frame
+                detail = str(frame.get("detail") or "shared turn failed")
+                tail.append(detail[-2000:])
+                return forced_exit_code or 1, "".join(tail), tool_errors, result_frame
+            if kind == "client_error":
+                if result_frame is not None:
+                    break
                 raise SessionSupervisorError(502, str(frame.get("detail") or "shared turn failed"))
             raise SessionSupervisorError(502, "shared turn returned an unknown frame")
         if result_frame is None:
             raise SessionSupervisorError(502, "shared turn ended without a result")
+        if forced_exit_code is not None:
+            return forced_exit_code, "".join(tail), tool_errors, result_frame
         status = str(result_frame.get("status") or "failed")
         exit_code = int(result_frame.get("exit_code") or 0)
         if status == "cancelled":
@@ -2595,8 +2863,9 @@ def _run_shared_live_attempt(
         )
         turn_admitted = True
         sampler = ResourceSampler(None)
+        result_frame: dict[str, Any] | None = None
         try:
-            exit_code, tail, tool_errors, _ = _stream_shared_agent_turn(
+            exit_code, tail, tool_errors, result_frame = _stream_shared_agent_turn(
                 supervisor=supervisor,
                 job=job,
                 control=control,
@@ -2605,11 +2874,15 @@ def _run_shared_live_attempt(
                 timeout_s=agent_timeout_s,
             )
         finally:
-            # Container totals include concurrent siblings and must not be
-            # duplicated as this member's usage. Report explicit zero coverage
-            # until process-tree accounting lands.
+            # Container totals include concurrent siblings and still remain
+            # unusable here.  The broker instead returns UID-filtered lifecycle
+            # events from the Kata guest; even a process shorter than one stats
+            # tick is represented.  If the stream failed before that result,
+            # retain the explicit zero-coverage fallback.
             with contextlib.suppress(Exception):
-                control.report_resources(sampler.stop())
+                fallback = sampler.stop()
+                observed = result_frame.get("resources") if isinstance(result_frame, dict) else None
+                control.report_resources(observed if isinstance(observed, dict) else fallback)
         if exit_code == 130:
             failure_detail = "cancelled by owner after shared-session admission"
             abandon_before_finish(lost=True, detail=failure_detail)
