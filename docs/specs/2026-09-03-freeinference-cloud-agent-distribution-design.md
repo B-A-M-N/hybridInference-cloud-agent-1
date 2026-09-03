@@ -1,5 +1,6 @@
 # Cloud Agent upstream / FreeInference distribution boundary
 
+- **Language:** English · [简体中文](2026-09-03-freeinference-cloud-agent-distribution-design.zh-CN.md)
 - **Status:** proposed v1 — for review (Murphy, Juncheng)
 - **Date:** 2026-09-03
 - **Applies to:**
