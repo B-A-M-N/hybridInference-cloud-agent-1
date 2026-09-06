@@ -52,7 +52,7 @@ AUDIENCE = "cloud-agent"
 #: differ: `httpx` announces itself in a shape CDNs accept, `urllib` announces
 #: `Python-urllib/3.x`, which they routinely refuse. Two clients in one service
 #: reaching one host and getting different answers is the bug this prevents.
-USER_AGENT = "freeinference-cloud-agent"
+USER_AGENT = "hybridinference-cloud-agent"
 
 #: Our own session, and **hours rather than days on purpose**.
 #:

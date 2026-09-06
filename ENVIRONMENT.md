@@ -50,7 +50,7 @@ need a gateway secret here, the design is wrong — stop and escalate.
 
 | Variable | New? | Value / who provisions |
 |---|---|---|
-| `GATEWAY_BASE_URL` | **NEW** | Origin of the FreeInference gateway this deployment federates with, e.g. `https://gateway.example.org`. |
+| `GATEWAY_BASE_URL` | **NEW** | Origin of the HybridInference gateway this deployment federates with, e.g. `https://gateway.example.org`. |
 | `GATEWAY_JWKS_URL` | **NEW** | `${GATEWAY_BASE_URL}/v1/identity/jwks` (task C1). Publishes the current signing key plus any retiring ones, so cache by `kid` and re-fetch on a miss rather than pinning a single key. |
 | `GATEWAY_GRANT_DISPATCH_TOKEN` | **NEW** | Bearer token authorizing this service to mint and revoke inference grants (task C5). Random 32 bytes, the same value on both sides, and distinct per environment — one shared across staging and production makes a staging compromise a production one. |
 | `GATEWAY_ISSUER` | **NEW** | Optional. The `iss` an identity token must carry, checked only when set. Left optional on purpose: a deployment may front the gateway at a different name than it mints under, and pinning it wrongly locks every user out. |
@@ -181,7 +181,7 @@ compose, because they name the stack rather than configure it.
 |---|---|---|
 | `AGENT_SANDBOX_BACKEND` | existing | |
 | `AGENT_SANDBOX_RUNTIME` | existing | Unset or `runc` for trusted internal repos. The enforced public/untrusted profile currently requires exactly `io.containerd.kata.v2`; gVisor needs its own future execution profile and is not accepted as Kata evidence. |
-| `AGENT_SANDBOX_IMAGE` | existing | Tag it per environment (`freeinference-cloud-agent-job:staging` / `:prod`) on a machine that runs both, or a rebuild on one side replaces the image the other is running. `-job` and not `-sandbox`, so it cannot be read as `…-sandbox-<env>-runner`, the image the runner container itself is built from. |
+| `AGENT_SANDBOX_IMAGE` | existing | Tag it per environment (`cloud-agent-job:staging` / `:prod`) on a machine that runs both, or a rebuild on one side replaces the image the other is running. `-job` and not `-sandbox`, so it cannot be read as `…-sandbox-<env>-runner`, the image the runner container itself is built from. |
 | `AGENT_SANDBOX_NETWORK` | existing | |
 | `AGENT_SANDBOX_DOCKER` | existing | |
 | `AGENT_SANDBOX_HOME` | existing | |
@@ -271,7 +271,7 @@ none.
 | `NEXT_PUBLIC_BASE_PATH` | **NEW** | `AGENT_WEB_BASE_PATH` | Prefix the app is mounted under. `/agents` serves it inside the gateway's own hostname — same origin, so the session cookie needs no CORS and no DNS record is involved, and a rollback is a reverse-proxy edit rather than a DNS change waiting out a TTL. Empty for a deployment that owns its hostname. The redirect URI the gateway allowlists is no longer derived from this: sign-in returns to the control plane's `AGENT_SESSION_REDIRECT_URI`, not to a page in this app. This value still has to match `AGENT_WEB_BASE_URL`, which is where the control plane sends the browser afterwards. |
 | `NEXT_PUBLIC_AGENT_API_URL` | **NEW** | `AGENT_WEB_API_URL` | Control plane base URL. Empty means same-origin, which is the DR4 shape (one host, API under `/api`). Under a base path, the same-origin value is a relative prefix — `/agents/api` — which the reverse proxy strips before forwarding. A cross-origin value additionally needs CORS-with-credentials on the control plane, because the session is a cookie. |
 | `NEXT_PUBLIC_GATEWAY_URL` | **NEW** | `AGENT_WEB_GATEWAY_URL` | `${GATEWAY_BASE_URL}`. The gateway's origin, for the links this app does not host itself — nothing to do with sign-in. It replaced `NEXT_PUBLIC_GATEWAY_AUTHORIZE_URL`, which the browser needed only while it built the authorize URL and redeemed the code itself; both are the control plane's job now (`GATEWAY_AUTHORIZE_URL`). Empty hides those links. |
-| `NEXT_PUBLIC_APP_NAME` | **NEW** | `AGENT_WEB_APP_NAME` | Product name in the header and the document title. Defaults to `FreeInference Cloud Agent`. |
+| `NEXT_PUBLIC_APP_NAME` | **NEW** | `AGENT_WEB_APP_NAME` | Product name in the header and the document title. Defaults to `Cloud Agent`; a deployment sets its own product name here. |
 | `NEXT_PUBLIC_ORG_NAME` | **NEW** | `AGENT_WEB_ORG_NAME` | Optional organisation name beside the product name. Empty hides it. |
 | `NEXT_PUBLIC_ORG_URL` | **NEW** | `AGENT_WEB_ORG_URL` | Link target for `NEXT_PUBLIC_ORG_NAME`. |
 | `NEXT_PUBLIC_STATUS_URL` | **NEW** | `AGENT_WEB_STATUS_URL` | Status page, opened in a new tab from the header. Empty hides the link — an empty `href` resolves to the current page, so a Status link that is rendered anyway reopens the page the user is standing on. |

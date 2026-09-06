@@ -3,7 +3,7 @@ Moved from the source repository at the freeze commit `764a6f97`
 (`docs/developer/agent-sandbox-operations.md`), task H5. Paths were updated for
 this repository's layout and nothing else was rewritten; every deviation from
 the source text is listed in the "What changed when this moved" section at the
-end. "The gateway" still means the FreeInference gateway; after the split, the
+end. "The gateway" still means the HybridInference gateway; after the split, the
 job API, the store, the publisher and the admin host switch belong to *this*
 service's control plane, and the gateway keeps inference, MCP and identity.
 -->
