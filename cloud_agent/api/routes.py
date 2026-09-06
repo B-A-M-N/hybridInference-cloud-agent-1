@@ -83,6 +83,8 @@ from cloud_agent.schemas import (
     EVENT_TYPE_PATTERN,
     PLATFORM_REASONING_EFFORTS,
     RESET_REASONING_EFFORT,
+    AgentAttemptSummary,
+    AgentAttemptTelemetry,
     AgentConfigResponse,
     AgentFollowUpRequest,
     AgentGitWorkspaceResponse,
@@ -446,7 +448,7 @@ def _egress_tiers() -> tuple[str | None, str | None]:
 
 
 def _attempt_duration_ms(telemetry: dict[str, Any] | None) -> int | None:
-    """How long the newest attempt ran, or None while it still is."""
+    """How long the selected attempt ran, or None while it still is."""
     if not telemetry:
         return None
     started, finished = telemetry.get("started_at"), telemetry.get("finished_at")
@@ -486,10 +488,22 @@ def _attempt_resources(telemetry: dict[str, Any] | None) -> AttemptResources | N
     )
 
 
+def _attempt_summary_response(telemetry: dict[str, Any]) -> AgentAttemptSummary:
+    """Shape one attempt without losing its identity at the API boundary."""
+    return AgentAttemptSummary(
+        attempt_id=telemetry["attempt_id"],
+        attempt_no=telemetry["attempt_no"],
+        continuity_mode=telemetry.get("continuity_mode"),
+        context_status=telemetry.get("context_status"),
+        duration_ms=_attempt_duration_ms(telemetry),
+    )
+
+
 def _job_response(
     job: dict[str, Any],
     usage: dict[str, Any] | None = None,
     telemetry: dict[str, Any] | None = None,
+    attempt_telemetry: list[dict[str, Any]] | None = None,
 ) -> AgentJobResponse:
     """Shape a store job row for the owner-facing API."""
     usage = usage or {}
@@ -556,6 +570,10 @@ def _job_response(
         workspace_epoch=sandbox.get("workspace_epoch"),
         duration_ms=_attempt_duration_ms(telemetry),
         resources=_attempt_resources(telemetry),
+        telemetry_attempt_id=(telemetry or {}).get("attempt_id"),
+        attempt_telemetry=[
+            _attempt_summary_response(attempt) for attempt in (attempt_telemetry or [])
+        ],
     )
 
 
@@ -1571,6 +1589,7 @@ async def list_agent_projects(
 @router.get("/jobs/{job_id}", response_model=AgentJobResponse)
 async def get_agent_job(
     job_id: str,
+    include_resources: bool = Query(True),
     user: dict[str, Any] = Depends(require_agent_owner),
     store: AgentJobStore | None = Depends(get_agent_job_store),
     log_store=Depends(get_log_store),
@@ -1578,10 +1597,38 @@ async def get_agent_job(
     """Fetch one of the caller's agent jobs, with what it has spent so far."""
     job_store = _require_store(store)
     job = await _owned_job(job_store, job_id, user)
+    attempt_telemetry = await job_store.job_attempts_telemetry(job_id=job_id)
+    telemetry = attempt_telemetry[-1] if attempt_telemetry else None
+    # Existing clients keep the newest detail. The retry-aware client opts out
+    # and requests heavy rows only for the attempt currently selected.
+    if telemetry and include_resources:
+        telemetry = await job_store.job_turn_telemetry(
+            job_id=job_id, attempt_id=attempt_telemetry[-1]["attempt_id"]
+        )
     return _job_response(
         job,
         await _job_usage(log_store, job_id),
-        await job_store.job_turn_telemetry(job_id=job_id),
+        telemetry,
+        attempt_telemetry,
+    )
+
+
+@router.get("/jobs/{job_id}/attempts/{attempt_id}/telemetry", response_model=AgentAttemptTelemetry)
+async def get_agent_attempt_telemetry(
+    job_id: str,
+    attempt_id: int = Path(..., ge=1),
+    user: dict[str, Any] = Depends(require_agent_owner),
+    store: AgentJobStore | None = Depends(get_agent_job_store),
+) -> AgentAttemptTelemetry:
+    """Read measurements for one attempt belonging to the caller's job."""
+    job_store = _require_store(store)
+    await _owned_job(job_store, job_id, user)
+    telemetry = await job_store.job_turn_telemetry(job_id=job_id, attempt_id=attempt_id)
+    if telemetry is None:
+        raise HTTPException(status_code=404, detail="Attempt not found")
+    return AgentAttemptTelemetry(
+        **_attempt_summary_response(telemetry).model_dump(),
+        resources=_attempt_resources(telemetry),
     )
 
 

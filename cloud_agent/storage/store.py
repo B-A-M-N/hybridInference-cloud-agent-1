@@ -3916,21 +3916,35 @@ class AgentJobStore:
                 )
             return True
 
-    async def job_turn_telemetry(self, *, job_id: str) -> dict[str, Any] | None:
-        """Read how a job's newest attempt ran: continuity, window, resources.
+    async def job_attempts_telemetry(self, *, job_id: str) -> list[dict[str, Any]]:
+        """Read lightweight attempt summaries without tool or process rows."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id AS attempt_id, attempt_no, continuity_mode, context_status,
+                       started_at, finished_at
+                FROM agent_attempts
+                WHERE job_id = $1
+                ORDER BY attempt_no
+                """,
+                job_id,
+            )
+            return [dict(row) for row in rows]
 
-        Newest attempt rather than the current one: a retried turn's earlier
-        attempts each have their own window, and the one a reader wants is the
-        one that produced the result in front of them. One connection, because
-        this rides the job-detail read that the thread view already makes; the
-        per-call rows are a second statement on it rather than an aggregate in
-        the first, so the counters arrive as numbers rather than as JSON this
-        pool would hand back as text.
+    async def job_turn_telemetry(
+        self, *, job_id: str, attempt_id: int | None = None
+    ) -> dict[str, Any] | None:
+        """Read one attempt's measurements, defaulting to the newest attempt.
+
+        Job detail uses the newest window for its existing top-level fields;
+        the attempt detail endpoint selects a specific window. Both queries
+        are job-scoped, including when an attempt id is supplied.
         """
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT a.id AS attempt_id, a.continuity_mode, a.context_status,
+                SELECT a.id AS attempt_id, a.attempt_no,
+                       a.continuity_mode, a.context_status,
                        a.started_at, a.finished_at,
                        r.cpu_usec, r.mem_peak_bytes, r.mem_avg_bytes,
                        r.io_read_bytes, r.io_write_bytes,
@@ -3945,17 +3959,20 @@ class AgentJobStore:
                 FROM agent_attempts a
                 LEFT JOIN agent_attempt_resources r ON r.attempt_id = a.id
                 WHERE a.job_id = $1
+                  AND ($2::bigint IS NULL OR a.id = $2)
                 ORDER BY a.attempt_no DESC
                 LIMIT 1
                 """,
                 job_id,
+                attempt_id,
             )
             if row is None:
                 return None
             telemetry = dict(row)
             calls = await conn.fetch(
                 """
-                SELECT call_seq, tool_use_id, tool_name, timing_source, duration_ms,
+                SELECT call_seq, tool_use_id, tool_name,
+                       timing_source, duration_ms,
                        sample_count, overlap_n, measured_span_ms,
                        cpu_usec_exclusive, cpu_usec_shared,
                        mem_peak_exclusive_bytes, mem_peak_shared_bytes, process_count,
@@ -3980,7 +3997,7 @@ class AgentJobStore:
                 WHERE attempt_id = $1
                 ORDER BY process_seq
                 """,
-                telemetry.pop("attempt_id"),
+                telemetry["attempt_id"],
             )
             telemetry["processes"] = [dict(process) for process in processes]
             return telemetry
