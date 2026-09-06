@@ -40,6 +40,7 @@ def _host(
 printf "%s\\n" "$*" >> "$DOCKER_LOG"
 case " $* " in
   *" config --environment "*)
+    cat >/dev/null
     printf "%s\\n" "$COMPOSE_ENVIRONMENT"
     ;;
 esac

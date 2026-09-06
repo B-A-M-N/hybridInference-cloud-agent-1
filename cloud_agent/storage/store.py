@@ -3319,10 +3319,6 @@ class AgentJobStore:
             if released_row is None:
                 return False
             released = released_row["job_id"]
-            # Hung off the guarded UPDATE above, not off entering this method:
-            # the predicate is what makes an abort happen once, so the slot
-            # release inherits that and cannot double-count.
-            await self._release_host_slot(conn, released_row["host_id"])
             # The store's own answer, not the caller's. `agent_job_events.job_id`
             # has no foreign key, so a mismatched (job_id, attempt_id) pair would
             # write a control event into a different job's stream — potentially a
@@ -3354,6 +3350,13 @@ class AgentJobStore:
                 released,
                 attempt_id,
             )
+            # All close-attempt paths take locks in attempt -> job -> host
+            # order. Previously transition took job -> attempt while this path
+            # took attempt -> host -> job, so concurrent finishes and aborts
+            # could form a cycle across two jobs. Hung off the guarded attempt
+            # UPDATE above, this still runs once and cannot double-count even
+            # when the job UPDATE changed no row.
+            await self._release_host_slot(conn, released_row["host_id"])
         return True
 
     async def heartbeat(
@@ -3420,6 +3423,22 @@ class AgentJobStore:
         but never overwrite the base it was given.
         """
         async with self._pool.acquire() as conn, conn.transaction():
+            # Lock the attempt before its job, matching release_claim and the
+            # reaper. Without an explicit first lock, the job UPDATE below and
+            # a concurrent abort can each hold the row the other needs.
+            live_attempt = await conn.fetchval(
+                """
+                SELECT id
+                FROM agent_attempts
+                WHERE id = $1 AND lease_generation = $2
+                  AND status = 'running' AND lease_expires_at > NOW()
+                FOR UPDATE
+                """,
+                attempt_id,
+                lease_generation,
+            )
+            if live_attempt is None:
+                return False
             updated = await conn.fetchrow(
                 """
                 UPDATE agent_jobs j

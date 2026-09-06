@@ -178,6 +178,7 @@ def _up(tmp_path: Path, dotenv: str) -> str:
 printf "%s\\n" "$*" >> "$DOCKER_LOG"
 case " $* " in
   *" config --environment "*)
+    cat >/dev/null
     printf "%s\\n" "$COMPOSE_ENVIRONMENT"
     exit 0
     ;;
