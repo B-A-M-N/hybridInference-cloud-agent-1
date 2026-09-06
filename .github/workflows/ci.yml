@@ -105,7 +105,7 @@ jobs:
           printf '%s\n' "${files}"
           echo "---------------------"
 
-          matches() { printf '%s\n' "${files}" | grep -qE "$1"; }
+          matches() { printf '%s\n' "${files}" | grep -E "$1" >/dev/null; }
 
           # Backend: everything that is not purely docs or the web app. This is
           # the old `paths-ignore` inverted, so it stays true by default — a new
@@ -114,7 +114,7 @@ jobs:
           if printf '%s\n' "${files}" \
              | grep -vE '^(docs/|web/)' \
              | grep -vE '(\.md|LICENSE|\.gitignore)$' \
-             | grep -q .; then
+             | grep . >/dev/null; then
             backend=true
           else
             backend=false
@@ -756,7 +756,7 @@ jobs:
           fi
           # Up is not the same as listening: a squid that started and then
           # failed to bind would still read as `running` for a moment.
-          docker logs "$cid" 2>&1 | grep -q "Accepting HTTP Socket connections" || {
+          docker logs "$cid" 2>&1 | grep -F "Accepting HTTP Socket connections" >/dev/null || {
             echo "::error::the proxy is up but never accepted connections"
             exit 1
           }
