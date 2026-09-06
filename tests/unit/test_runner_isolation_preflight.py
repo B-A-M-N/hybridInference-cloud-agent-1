@@ -75,16 +75,17 @@ def _host(
         "#!/bin/sh\n" + ("exit 0\n" if kata_check_passes else "echo 'not installed' >&2\nexit 1\n"),
     )
 
-    return {
+    env = {
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "APP_DIR": str(app_dir),
         "KATA_SETUP_SCRIPT": str(kata_script),
         "DOCKER_LOG": str(tmp_path / "docker.log"),
-        # Otherwise the caller's own environment decides the backend and the
-        # .env precedence under test never runs.
-        "AGENT_SANDBOX_BACKEND": "",
     }
+    # Absence matters: Compose gives even an exported empty value precedence
+    # over dotenv, so an empty fixture would no longer exercise the file.
+    env.pop("AGENT_SANDBOX_BACKEND", None)
+    return env
 
 
 def _run(env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:

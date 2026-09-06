@@ -1483,9 +1483,10 @@ def _extract_below(archive: tarfile.TarFile, root: pathlib.Path) -> None:
             raise DriverError(f"checkpoint entry escapes the state dir: {member.name!r}")
         if not (member.isfile() or member.isdir()):
             raise DriverError(f"checkpoint entry has a refused type: {member.name!r}")
-    # The loop above is the filter: only plain files and directories, only
-    # below the state dir. Works on every Python this repo supports.
-    archive.extractall(base)
+    # The loop above is the primary allowlist: only plain files and directories,
+    # only below the state dir. Let the standard data filter recheck each write
+    # during extraction as defense in depth.
+    archive.extractall(base, filter="data")
 
 
 class ClaudeCodeLiveTurn(HarnessTurn):

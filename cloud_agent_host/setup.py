@@ -204,9 +204,28 @@ class SnapshotCache:
         os.close(handle)
         staging = Path(staged_name)
         try:
+            # Materialize repeated inodes as regular files while preserving
+            # symbolic links. Restore rejects hard-link archive members to
+            # avoid the Python 3.12 extraction-filter bypass, so writing
+            # LNKTYPE entries here would make a legitimate pnpm/uv-style tree
+            # save successfully but never restore. TarFile.add opens the
+            # original path after this filter, so changing the header to a
+            # sized regular file copies its bytes into the archive.
+            def materialize_hardlink(member: tarfile.TarInfo) -> tarfile.TarInfo:
+                if member.islnk():
+                    member.type = tarfile.REGTYPE
+                    member.linkname = ""
+                    member.size = Path(workdir, *member.name.split("/")).stat().st_size
+                return member
+
             with tarfile.open(staging, "w") as archive:
                 for entry in capture:
-                    archive.add(os.path.join(workdir, entry), arcname=entry, recursive=True)
+                    archive.add(
+                        os.path.join(workdir, entry),
+                        arcname=entry,
+                        recursive=True,
+                        filter=materialize_hardlink,
+                    )
             if staging.stat().st_size > self.max_bytes:
                 staging.unlink(missing_ok=True)
                 logger.warning(
@@ -231,20 +250,39 @@ class SnapshotCache:
             return False
         try:
             with tarfile.open(path, "r") as archive:
+                members: list[tarfile.TarInfo] = []
                 for member in archive.getmembers():
                     # A snapshot is ours, but it was produced by running the
                     # repository's own setup script — so it is treated as
                     # untrusted input like everything else that tree touched.
-                    if member.issym() or member.islnk():
-                        continue
-                    resolved = Path(workdir, member.name).resolve()
-                    if not str(resolved).startswith(str(Path(workdir).resolve())):
+                    # Reject hard links even when data_filter accepts them:
+                    # vulnerable Python 3.12 patch releases can recreate a
+                    # referenced symlink at the hard link's shallower path and
+                    # thereby point it outside the extraction root
+                    # (CVE-2026-11940). Snapshot creation does not need hard
+                    # links; regular files and contained symlinks are enough.
+                    if member.islnk():
+                        logger.warning(
+                            "agent_snapshot_hardlink_rejected",
+                            extra={
+                                "event": "agent_snapshot_hardlink_rejected",
+                                "member": member.name,
+                            },
+                        )
+                        return False
+                    try:
+                        filtered = tarfile.data_filter(member, workdir)
+                    except tarfile.FilterError:
                         logger.warning(
                             "agent_snapshot_path_escape",
                             extra={"event": "agent_snapshot_path_escape", "member": member.name},
                         )
                         return False
-                archive.extractall(workdir)
+                    if filtered is not None:
+                        members.append(filtered)
+                # Filter again during extraction: an earlier member can create
+                # a symlink that changes where a later path resolves.
+                archive.extractall(workdir, members=members, filter="data")
         except (OSError, tarfile.TarError):
             logger.warning("agent_snapshot_restore_failed", exc_info=True)
             return False
