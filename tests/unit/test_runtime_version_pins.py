@@ -145,6 +145,7 @@ _BASE_ENV = "\n".join(
     [
         "COMPOSE_PROJECT=freeinference-cloud-agent-sandbox-staging",
         "AGENT_DISPATCHER_TOKEN=t",
+        "AGENT_WORKSPACE_BROKER_TOKEN=b",
         "AGENT_SANDBOX_IMAGE=freeinference-cloud-agent-job:staging",
         "AGENT_TUNNEL_SSH_DESTINATION=user@gateway",
         "AGENT_TUNNEL_SSH_KEY=/dev/null",
@@ -173,23 +174,35 @@ def _up(tmp_path: Path, dotenv: str) -> str:
     fake_bin.mkdir(exist_ok=True)
     docker = fake_bin / "docker"
     docker.write_text(
-        '#!/bin/sh\nprintf "%s\\n" "$*" >> "$DOCKER_LOG"\n[ "$1" = compose ] && exit 1\nexit 0\n'
+        """#!/bin/sh
+printf "%s\\n" "$*" >> "$DOCKER_LOG"
+case " $* " in
+  *" config --environment "*)
+    printf "%s\\n" "$COMPOSE_ENVIRONMENT"
+    exit 0
+    ;;
+esac
+[ "$1" = compose ] && exit 1
+exit 0
+"""
     )
     docker.chmod(0o755)
 
     log = tmp_path / "docker.log"
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "APP_DIR": str(app_dir),
+        "DOCKER_LOG": str(log),
+        "COMPOSE_ENVIRONMENT": dotenv,
+    }
+    # Absence, not exported emptiness: Compose correctly gives even an empty
+    # shell value precedence over the dotenv file.
+    for name in ("COMPOSE_PROJECT", *_pins()):
+        environment.pop(name, None)
     subprocess.run(
         ["bash", str(SANDBOX_HOST), "up"],
-        env={
-            **os.environ,
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "APP_DIR": str(app_dir),
-            "DOCKER_LOG": str(log),
-            # The caller's own environment must not stand in for the .env
-            # under test — every pin is read through the same precedence.
-            "COMPOSE_PROJECT": "",
-            **dict.fromkeys(_pins(), ""),
-        },
+        env=environment,
         capture_output=True,
         text=True,
         check=False,

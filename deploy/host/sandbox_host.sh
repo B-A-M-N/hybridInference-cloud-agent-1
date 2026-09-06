@@ -24,6 +24,7 @@
 #
 #   COMPOSE_PROJECT                this stack's compose project, unique on this machine
 #   AGENT_DISPATCHER_TOKEN         same value as on the gateway
+#   AGENT_WORKSPACE_BROKER_TOKEN   distinct secret for workspace access
 #   AGENT_SANDBOX_IMAGE            image the sandboxes run
 #   AGENT_TUNNEL_SSH_DESTINATION   user@gateway-host
 #   AGENT_TUNNEL_SSH_KEY           path to this host's tunnel key (mounted ro)
@@ -46,7 +47,11 @@ env_or_dotenv() {
   # A value may come from the environment or from .env; compose reads both, so
   # the preflight has to look in both or it rejects working configurations.
   local name="$1"
-  if [[ -n "${!name:-}" ]]; then
+  if [[ "$_COMPOSE_ENVIRONMENT_LOADED" == "1" ]]; then
+    compose_env_value "$name"
+    return 0
+  fi
+  if [[ -v "$name" ]]; then
     printf '%s' "${!name}"
     return 0
   fi
@@ -66,6 +71,39 @@ env_or_dotenv() {
   value="${value%\'}"; value="${value#\'}"
   printf '%s' "$value"
 }
+
+# Ask Compose itself to parse the interpolation environment used by the stack.
+# Reimplementing dotenv here is unsafe-by-disagreement: Compose resolves
+# references, quotes and inline comments, and an exported empty value still
+# outranks the file. A tiny stdin model avoids evaluating this stack's required
+# substitutions before require_env can report them clearly.
+_COMPOSE_ENVIRONMENT=""
+_COMPOSE_ENVIRONMENT_LOADED=0
+load_compose_environment() {
+  [[ "$_COMPOSE_ENVIRONMENT_LOADED" == "0" ]] || return 0
+  local command=(docker compose)
+  [[ -f .env ]] && command+=(--env-file .env)
+  if ! _COMPOSE_ENVIRONMENT="$(
+    printf 'services: {}\n' | "${command[@]}" -f - config --environment
+  )"; then
+    die "docker compose could not resolve the environment used by this stack"
+  fi
+  _COMPOSE_ENVIRONMENT_LOADED=1
+}
+
+compose_env_value() {
+  local name="$1" line
+  while IFS= read -r line; do
+    if [[ "${line%%=*}" == "$name" ]]; then
+      printf '%s' "${line#*=}"
+      return 0
+    fi
+  done <<< "$_COMPOSE_ENVIRONMENT"
+}
+
+case "${1:-}" in
+  up|check|status|down) load_compose_environment ;;
+esac
 
 # Read through env_or_dotenv, and therefore only after it exists. Taking these
 # from the shell environment alone silently ignored `.env` — the file this
@@ -153,18 +191,26 @@ require_env() {
   # that restarts forever, a missing known_hosts as a refusal nobody reads.
   local missing=() name
   for name in AGENT_DISPATCHER_TOKEN AGENT_SANDBOX_IMAGE \
+              AGENT_WORKSPACE_BROKER_TOKEN \
               AGENT_TUNNEL_SSH_DESTINATION AGENT_TUNNEL_SSH_KEY \
               AGENT_TUNNEL_SSH_KNOWN_HOSTS; do
-    [[ -n "$(env_or_dotenv "$name")" ]] || missing+=("$name")
+    [[ -n "$(compose_env_value "$name")" ]] || missing+=("$name")
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
     die "missing in .env: ${missing[*]} (see ENVIRONMENT.md)"
   fi
 
-  # On a machine running two environments, the three state roots must be said
-  # out loud. They are host paths bind-mounted into the containers, and they
-  # default to the same three directories for every stack — so two stacks that
-  # accept the defaults do not merely sit beside each other, they share:
+  local dispatcher broker
+  dispatcher="$(compose_env_value AGENT_DISPATCHER_TOKEN)"
+  broker="$(compose_env_value AGENT_WORKSPACE_BROKER_TOKEN)"
+  [[ "$dispatcher" != "$broker" ]] || die \
+    "AGENT_DISPATCHER_TOKEN and AGENT_WORKSPACE_BROKER_TOKEN must differ — one credential must not open both the job-claim and workspace-broker surfaces."
+
+  # On a machine running two environments, the three state roots and the closed
+  # egress network must be said out loud. The roots are host paths bind-mounted
+  # into the containers, and all four values otherwise default identically for
+  # every stack — so two stacks that accept the defaults do not merely sit
+  # beside each other, they share:
   #
   #   AGENT_HOST_STATE_ROOT   the enrolment credential. The control plane reads
   #                           the host *from the credential*, not from the claim
@@ -172,23 +218,38 @@ require_env() {
   #                           one — `AGENT_RUNNER_HOST` cannot correct it.
   #   AGENT_WORKDIR_ROOT      every job's checkout, patch and workspace.
   #   AGENT_SNAPSHOT_ROOT     the same, kept for a week.
+  #   AGENT_EGRESS_NETWORK_PLATFORM_ONLY
+  #                           both gateway/MCP tunnels and their DNS aliases.
   #
   # Required only when a sibling is named, because that is exactly when the
   # defaults stop being safe — a single-stack host has nothing to collide with
   # and should not have to configure paths it does not care about.
-  if [[ -n "$(env_or_dotenv SIBLING_COMPOSE_PROJECTS)" ]]; then
-    local shared=() path
-    for name in AGENT_HOST_STATE_ROOT AGENT_WORKDIR_ROOT AGENT_SNAPSHOT_ROOT; do
-      [[ -n "$(env_or_dotenv "$name")" ]] || shared+=("$name")
+  if [[ -n "$(compose_env_value SIBLING_COMPOSE_PROJECTS)" ]]; then
+    local shared=() path unsafe
+    for name in AGENT_HOST_STATE_ROOT AGENT_WORKDIR_ROOT AGENT_SNAPSHOT_ROOT \
+                AGENT_EGRESS_NETWORK_PLATFORM_ONLY; do
+      path="$(compose_env_value "$name")"
+      case "$name" in
+        AGENT_HOST_STATE_ROOT) unsafe="/var/lib/hybridinference/agent-host" ;;
+        AGENT_WORKDIR_ROOT) unsafe="/var/lib/hybridinference/agent-jobs" ;;
+        AGENT_SNAPSHOT_ROOT) unsafe="/var/lib/hybridinference/agent-snapshots" ;;
+        AGENT_EGRESS_NETWORK_PLATFORM_ONLY) unsafe="agent-egress" ;;
+      esac
+      if [[ "$name" != "AGENT_EGRESS_NETWORK_PLATFORM_ONLY" && -n "$path" ]]; then
+        path="$(realpath -m -- "$path")"
+      fi
+      if [[ -z "$path" || "$path" == "$unsafe" ]]; then
+        shared+=("$name")
+      fi
     done
     if [[ ${#shared[@]} -gt 0 ]]; then
-      die "this host runs another environment (SIBLING_COMPOSE_PROJECTS is set), so ${shared[*]} must name paths of this stack's own — unset they default to /var/lib/hybridinference/*, which both stacks would then share: one environment's jobs reading the other's workspaces, and both claiming as whichever host enrolled first."
+      die "this host runs another environment (SIBLING_COMPOSE_PROJECTS is set), so ${shared[*]} must be unique to this stack — unset values and legacy shared defaults mix credentials, jobs, snapshots or tunnel aliases across environments."
     fi
   fi
 
   local key known
-  key="$(env_or_dotenv AGENT_TUNNEL_SSH_KEY)"
-  known="$(env_or_dotenv AGENT_TUNNEL_SSH_KNOWN_HOSTS)"
+  key="$(compose_env_value AGENT_TUNNEL_SSH_KEY)"
+  known="$(compose_env_value AGENT_TUNNEL_SSH_KNOWN_HOSTS)"
   [[ -r "$key" ]] || die "AGENT_TUNNEL_SSH_KEY=$key is not readable on this host"
   [[ -s "$known" ]] || die \
     "AGENT_TUNNEL_SSH_KNOWN_HOSTS=$known is missing or empty. Create it with

@@ -144,7 +144,7 @@ compose, because they name the stack rather than configure it.
 | Variable | New? | Value / who provisions |
 |---|---|---|
 | `COMPOSE_PROJECT` | **NEW** | This stack's compose project — the prefix on every container, image and network it creates, and therefore what keeps two environments on one machine apart. **Required, no default.** Sharing it is silent: the second `up` does not refuse, it adopts the first stack's containers and recreates them with its own configuration. `freeinference-cloud-agent-sandbox-staging` / `-prod`. |
-| `SIBLING_COMPOSE_PROJECTS` | **NEW** | Comma-separated projects on this machine that are the *other* environment rather than a stray copy of this one. Setting it also makes `AGENT_HOST_STATE_ROOT`, `AGENT_WORKDIR_ROOT` and `AGENT_SNAPSHOT_ROOT` required: they are host paths that default to the same directories for every stack, and sharing them means shared enrolment credentials and shared job workspaces. The deploy's guard reports containers of this stack's shape under any project it does not know — which is what caught six runners and two brokers here once — and a legitimate sibling has to be named or it trips that guard forever. |
+| `SIBLING_COMPOSE_PROJECTS` | **NEW** | Comma-separated projects on this machine that are the *other* environment rather than a stray copy of this one. Setting it also makes `AGENT_HOST_STATE_ROOT`, `AGENT_WORKDIR_ROOT`, `AGENT_SNAPSHOT_ROOT` and `AGENT_EGRESS_NETWORK_PLATFORM_ONLY` required and stack-specific: sharing the host paths means shared enrolment credentials and job workspaces, while sharing the closed network mixes the stacks' gateway/MCP tunnel aliases. The deploy's guard reports containers of this stack's shape under any project it does not know — which is what caught six runners and two brokers here once — and a legitimate sibling has to be named or it trips that guard forever. |
 
 | Variable | New? | Notes |
 |---|---|---|
@@ -192,7 +192,7 @@ compose, because they name the stack rather than configure it.
 | `AGENT_EGRESS_SETUP_TIER` | existing | Egress during dependency setup. |
 | `AGENT_EGRESS_AGENT_TIER` | existing | Egress during the agent run. `platform_only` is the safe default; `custom` grants untrusted code general internet access. |
 | `AGENT_EGRESS_ALLOWLIST` | existing | |
-| `AGENT_EGRESS_NETWORK_PLATFORM_ONLY` | existing | |
+| `AGENT_EGRESS_NETWORK_PLATFORM_ONLY` | existing | Closed Docker network used by platform-only sandboxes and the gateway/MCP tunnels. Defaults to `agent-egress` on a single-stack host; must be named per environment when `SIBLING_COMPOSE_PROJECTS` is set so duplicate service aliases cannot route one stack to the other's tunnel. |
 | `AGENT_EGRESS_NETWORK_TRUSTED` | existing | |
 | `AGENT_EGRESS_NETWORK_CUSTOM` | existing | |
 | `AGENT_EGRESS_NETWORK_FULL` | existing | |

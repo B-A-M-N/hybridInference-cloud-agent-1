@@ -7,6 +7,7 @@ cached result so a retry does not reinstall.
 
 from __future__ import annotations
 
+import io
 import os
 import tarfile
 import time
@@ -129,6 +130,109 @@ def test_an_archive_cannot_write_outside_the_worktree(tmp_path: Path):
     work.mkdir()
     assert SnapshotCache(str(cache_root)).restore("k", str(work)) is False
     assert victim.read_text() == "original\n"
+
+
+def test_an_archive_cannot_escape_into_a_prefix_sibling(tmp_path: Path):
+    """A string-prefix check mistakes a sibling for a child of the worktree."""
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir()
+    hostile = cache_root / "k.tar"
+    payload = tmp_path / "payload.txt"
+    payload.write_text("overwritten\n")
+    sibling = tmp_path / "job-other"
+    sibling.mkdir()
+    with tarfile.open(hostile, "w") as archive:
+        archive.add(payload, arcname="../job-other/pwn.txt")
+
+    work = tmp_path / "job"
+    work.mkdir()
+    assert SnapshotCache(str(cache_root)).restore("k", str(work)) is False
+    assert not (sibling / "pwn.txt").exists()
+
+
+def test_an_archive_cannot_escape_through_a_symlink(tmp_path: Path):
+    """Links are validated and extracted; skipping only validation is unsafe."""
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir()
+    hostile = cache_root / "k.tar"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    with tarfile.open(hostile, "w") as archive:
+        directory = tarfile.TarInfo("deps")
+        directory.type = tarfile.DIRTYPE
+        directory.mode = 0o755
+        archive.addfile(directory)
+        link = tarfile.TarInfo("deps/link")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "../../outside"
+        archive.addfile(link)
+        content = b"overwritten\n"
+        nested = tarfile.TarInfo("deps/link/pwn.txt")
+        nested.size = len(content)
+        archive.addfile(nested, io.BytesIO(content))
+
+    work = tmp_path / "job"
+    work.mkdir()
+    assert SnapshotCache(str(cache_root)).restore("k", str(work)) is False
+    assert not (outside / "pwn.txt").exists()
+
+
+def test_an_archive_rejects_the_hardlink_symlink_fallback(tmp_path: Path):
+    """CVE-2026-11940 can move a safe deep symlink to an unsafe shallow path."""
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir()
+    hostile = cache_root / "k.tar"
+    with tarfile.open(hostile, "w") as archive:
+        link = tarfile.TarInfo("a/b/s")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "../escape"
+        archive.addfile(link)
+        hardlink = tarfile.TarInfo("s")
+        hardlink.type = tarfile.LNKTYPE
+        hardlink.linkname = "a/b/s"
+        archive.addfile(hardlink)
+
+    work = tmp_path / "job"
+    work.mkdir()
+    assert SnapshotCache(str(cache_root)).restore("k", str(work)) is False
+    assert not (work / "s").is_symlink()
+
+
+def test_snapshot_save_materializes_hard_links_for_safe_restore(tmp_path: Path):
+    """Dependency stores use hard links, but the archive need not preserve them."""
+    work = tmp_path / "job1"
+    package = work / "node_modules" / "pkg"
+    package.mkdir(parents=True)
+    original = package / "module.js"
+    original.write_text("module.exports = 1\n")
+    os.link(original, package / "module-copy.js")
+    cache = SnapshotCache(str(tmp_path / "cache"))
+    assert cache.save("k", str(work), entries=["node_modules"]) is True
+
+    restored = tmp_path / "job2"
+    restored.mkdir()
+    assert cache.restore("k", str(restored)) is True
+    restored_package = restored / "node_modules" / "pkg"
+    assert (restored_package / "module.js").read_text() == "module.exports = 1\n"
+    assert (restored_package / "module-copy.js").read_text() == "module.exports = 1\n"
+
+
+def test_a_snapshot_preserves_an_internal_symlink(tmp_path: Path):
+    """Dependency trees legitimately use links, so safe ones still round-trip."""
+    work = tmp_path / "job1"
+    package = work / "node_modules" / "pkg"
+    package.mkdir(parents=True)
+    (package / "cli.js").write_text("console.log('ok')\n")
+    (work / "node_modules" / "cli").symlink_to("pkg/cli.js")
+    cache = SnapshotCache(str(tmp_path / "cache"))
+    assert cache.save("k", str(work), entries=["node_modules"]) is True
+
+    restored = tmp_path / "job2"
+    restored.mkdir()
+    assert cache.restore("k", str(restored)) is True
+    link = restored / "node_modules" / "cli"
+    assert link.is_symlink()
+    assert link.read_text() == "console.log('ok')\n"
 
 
 def test_purging_removes_only_what_expired(tmp_path: Path):
