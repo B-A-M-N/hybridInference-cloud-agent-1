@@ -274,6 +274,27 @@ jobs:
       - name: Pytest
         run: uv run pytest -n 4 --dist loadfile -q -m "not external and not dbtest"
 
+      # Completion can precede the native CLI's history flush. Unit doubles
+      # cannot catch that race; exercise the shipped pin before CI can deploy.
+      # Inference is a loopback protocol fixture, with no API key or model cost.
+      - name: Set up Node for native CLI regression
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install the sandbox's pinned Claude CLI
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^ARG CLAUDE_CODE_VERSION=//p' deploy/sandbox/Dockerfile.agent-sandbox)
+          [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          npm install --no-audit --no-fund --prefix "${RUNNER_TEMP}/claude-context" \
+            "@anthropic-ai/claude-code@${version}"
+          echo "CLOUD_AGENT_TEST_CLAUDE_BINARY=${RUNNER_TEMP}/claude-context/node_modules/.bin/claude" >> "${GITHUB_ENV}"
+
+      - name: Native history survives close, restore and failed-turn retry
+        timeout-minutes: 10
+        run: uv run pytest -q -m external tests/external/test_claude_driver_context.py
+
   # The other half of that command. `test` above deselects `dbtest`, and until
   # this job existed nothing selected it — 158 tests that are written, green,
   # and were never once executed by CI. The cost of that is on the record: the
@@ -810,11 +831,10 @@ jobs:
           # behaviour being checked: a required variable that stopped being
           # required would silently weaken the deployment.
           cat > .env <<'ENVFILE'
-          AGENT_DISPATCHER_TOKEN=ci-placeholder-token
-          # Distinct from the dispatcher token above, and distinct here on
-          # purpose: the stack refuses to render when they are one value, and
-          # a placeholder that reused it would make this check pass on the
-          # arrangement it exists to forbid.
+          # Broker authorization is distinct from enrollment-issued host
+          # credentials. The latter are persisted after one-time enrollment
+          # and therefore are not a Compose secret.
+          COMPOSE_PROJECT=freeinference-cloud-agent-sandbox-ci
           AGENT_WORKSPACE_BROKER_TOKEN=ci-placeholder-broker-token
           AGENT_SANDBOX_IMAGE=cloud-agent-sandbox:ci
           AGENT_GATEWAY_URL=http://agent-gateway:8080
@@ -852,8 +872,9 @@ jobs:
           AGENT_SESSION_SECRET=ci-placeholder-value-not-a-real-secret
           AGENT_CONTROL_TOKEN_SECRET=ci-placeholder-value-not-a-real-secret
           AGENT_SOURCE_CONTROL_ENCRYPTION_KEY=ci-placeholder-value-not-real
+          AGENT_DEPLOYMENT_SHA=ci-deployment-sha
           AGENT_POSTGRES_PASSWORD=ci-placeholder
-          AGENT_DISPATCHER_TOKEN=ci-placeholder
+          AGENT_WORKSPACE_BROKER_TOKEN=ci-placeholder-broker-token
           # Sign-in is assembled server-side now, so the control plane needs
           # the consent page, its own callback as the gateway must see it
           # (byte-identical to an IDENTITY_ALLOWED_REDIRECTS entry there),
@@ -883,10 +904,9 @@ jobs:
         run: |
           set -euo pipefail
           # Each fails for its own reason: a session secret left blank signs
-          # cookies with nothing; a missing dispatcher token means every claim
-          # 401s and the queue never drains; a missing broker token used to
-          # fall back to the dispatcher token, which handed one secret two
-          # permissions.
+          # cookies with nothing; a missing broker token leaves the control
+          # plane unable to route files, terminals, Fork, snapshots or native
+          # session operations to an enrolled host.
           check() {
             local stack="$1" envfile="$2" required="$3"
             grep -v "^${required}=" "$envfile" > .env.missing
@@ -899,10 +919,10 @@ jobs:
 
           CP=deploy/control-plane/docker-compose.yml
           HOST=deploy/host/docker-compose.sandbox.yml
-          for required in AGENT_SESSION_SECRET AGENT_DISPATCHER_TOKEN; do
+          for required in AGENT_SESSION_SECRET AGENT_WORKSPACE_BROKER_TOKEN AGENT_DEPLOYMENT_SHA; do
             check "$CP" .env.control-plane "$required"
           done
-          for required in AGENT_DISPATCHER_TOKEN AGENT_WORKSPACE_BROKER_TOKEN; do
+          for required in AGENT_WORKSPACE_BROKER_TOKEN; do
             check "$HOST" .env "$required"
           done
 

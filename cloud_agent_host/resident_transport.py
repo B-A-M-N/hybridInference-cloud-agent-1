@@ -137,9 +137,9 @@ class ResidentTransport:
         return bool(getattr(self.session, "process_alive", lambda: False)())
 
     @property
-    def container(self) -> str | None:
-        """Container name used by resource/process accounting."""
-        return self.session.container
+    def retire_after_turn(self) -> bool:
+        """Whether native history requires EOF before accepting another user."""
+        return self.session.retire_after_turn
 
     def stderr_text(self) -> str:
         """Return a bounded diagnostic tail without exposing launch secrets."""
@@ -259,7 +259,7 @@ class ResidentTransportFactory:
         launch: ResidentLaunch,
         state_dir: str,
     ) -> None:
-        """Create a member-owned provider home, importing legacy state once."""
+        """Create the member-owned provider home used by this shared group."""
         if launch.runtime_id == "codex":
             self._prepare_codex_member_state(spec, launch, state_dir)
             return
@@ -271,26 +271,16 @@ class ResidentTransportFactory:
         launch: ResidentLaunch,
         state_dir: str,
     ) -> None:
-        """Create an isolated OpenCode/Kilo XDG root for one membership.
-
-        Pre-fork retained containers stored each HTTP runtime directly below
-        ``/agent-state``. Import that tree only when resuming a known native
-        session. New memberships start empty, while native-fork children are
-        populated by :meth:`_clone_private_member_state` before they open.
-        """
+        """Create an isolated OpenCode/Kilo XDG root for one membership."""
         runtime_id = launch.runtime_id
         if runtime_id not in {"opencode", "kilo"}:
             raise DriverError(f"runtime {runtime_id!r} has no private HTTP state home")
         uid = MEMBER_UID_BASE + launch.slot_id
-        source_dir = f"{CHAT_STATE_DIR}/{runtime_id}"
         script = (
-            'set -eu; source="$1"; target="$2"; native="$3"; runtime="$4"; '
+            'set -eu; target="$1"; runtime="$2"; '
             'marker="$target/.freeinference-member-state-v1"; umask 0007; '
             'mkdir -p -- "$target"; '
             'if test ! -e "$marker"; then '
-            '  if test -n "$native" && test -d "$source"; then '
-            '    cp -R -- "$source" "$target/"; '
-            "  fi; "
             '  rm -rf -- "$target/$runtime/state/$runtime/locks"; '
             '  : > "$marker"; '
             "fi"
@@ -302,9 +292,7 @@ class ResidentTransportFactory:
                 "-c",
                 script,
                 "sh",
-                source_dir,
                 state_dir,
-                launch.native_session_id or "",
                 runtime_id,
             ],
             workdir="/",
@@ -324,33 +312,14 @@ class ResidentTransportFactory:
         launch: ResidentLaunch,
         state_dir: str,
     ) -> None:
-        """Create one UID-owned Codex home, importing a legacy root once.
-
-        Older retained containers stored Codex directly under /agent-state.
-        When such a chat is resumed after rollout, copy only provider state and
-        deliberately exclude platform journals, other runtimes, and ephemeral
-        lock/temp directories. New chats copy just the harmless bootstrap
-        config and let Codex initialize the rest itself.
-        """
+        """Create one UID-owned Codex home from the image bootstrap config."""
         uid = MEMBER_UID_BASE + launch.slot_id
         script = (
-            'set -eu; source="$1"; target="$2"; native="$3"; '
+            'set -eu; source="$1"; target="$2"; '
             'marker="$target/.freeinference-member-state-v1"; umask 0007; '
             'mkdir -p -- "$target"; '
             'if test ! -e "$marker"; then '
-            "  imported=0; "
-            '  if test -n "$native" && test -d "$source/sessions" && '
-            '     find "$source/sessions" -type f -name "rollout-*-$native.jsonl" '
-            "       -print -quit | grep -q .; then "
-            '    for entry in "$source"/* "$source"/.[!.]* "$source"/..?*; do '
-            '      test -e "$entry" || continue; name=${entry##*/}; '
-            '      case "$name" in '
-            "        codex-members|.platform|tmp|.tmp|claude|pi|opencode|kilo) continue;; "
-            "      esac; "
-            '      cp -R -- "$entry" "$target/"; '
-            "    done; imported=1; "
-            "  fi; "
-            '  if test "$imported" -eq 0 && test -f "$source/config.toml"; then '
+            '  if test -f "$source/config.toml"; then '
             '    cp -- "$source/config.toml" "$target/config.toml"; '
             "  fi; "
             '  mkdir -p -- "$target/tmp" "$target/.tmp"; : > "$marker"; '
@@ -365,7 +334,6 @@ class ResidentTransportFactory:
                 "sh",
                 CHAT_STATE_DIR,
                 state_dir,
-                launch.native_session_id or "",
             ],
             workdir="/",
             timeout_s=120,
@@ -521,14 +489,6 @@ class ResidentTransportFactory:
             gateway_base_url=launch.gateway_base_url,
             credential=launch.credential,
             provides_isolation=True,
-            spawn=lambda argv, env: self._manager.spawn(
-                spec,
-                argv,
-                env=env,
-                workdir=CHAT_WORKDIR,
-                user_uid=uid,
-                user_gid=self._manager.backend.gid,
-            ),
             spawn_live=spawn_live,
             base_env=base_env,
             mcp_config=RuntimeMCPConfig(
@@ -548,6 +508,7 @@ class ResidentTransportFactory:
         source: ResidentTransport,
         operation_id: str,
         target_launch: ResidentLaunch,
+        source_native_turn_no: int,
     ) -> str:
         """Materialize or recover one prompt-free, journaled native fork."""
         source_id = source.native_session_id
@@ -555,6 +516,8 @@ class ResidentTransportFactory:
             raise DriverError("native fork source has no settled session id")
         if not operation_id:
             raise DriverError("native fork operation id is required")
+        if source_native_turn_no < 1:
+            raise DriverError("native fork turn must be positive")
         if source.launch.runtime_id != target_launch.runtime_id:
             raise DriverError("native fork cannot change runtime")
         if source.launch.runtime_version != target_launch.runtime_version:
@@ -569,6 +532,7 @@ class ResidentTransportFactory:
             "runtime_id": source.launch.runtime_id,
             "runtime_version": source.launch.runtime_version,
             "source_session_id": source_id,
+            "source_native_turn_no": source_native_turn_no,
             "target_thread_id": target_launch.thread_id,
             "target_slot_id": target_launch.slot_id,
         }
@@ -606,12 +570,19 @@ class ResidentTransportFactory:
             self._write_fork_journal(spec, operation_id, preparing)
             child_id = ""
 
-        if not child_id and runtime_id in {"codex", "opencode", "kilo"}:
+        if not child_id and runtime_id in {"codex", "pi", "opencode", "kilo"}:
             fork = getattr(source.session, "fork_native", None)
             if fork is None:
                 raise DriverError(f"runtime {runtime_id!r} has no live native fork")
             try:
-                child_id = str(fork(source_session_id=source_id, operation_id=operation_id) or "")
+                child_id = str(
+                    fork(
+                        source_session_id=source_id,
+                        operation_id=operation_id,
+                        source_native_turn_no=source_native_turn_no,
+                    )
+                    or ""
+                )
             except Exception:
                 if runtime_id != "codex" or codex_baseline is None:
                     raise
@@ -630,9 +601,12 @@ class ResidentTransportFactory:
                     raise
                 child_id = next(iter(recovered))
         elif not child_id and runtime_id == "claude-code":
-            child_id = self._fork_claude(spec, source_id, source.launch.slot_id)
-        elif not child_id and runtime_id == "pi":
-            child_id = self._fork_pi(spec, source_id, target_launch)
+            child_id = self._fork_claude(
+                spec,
+                source_id,
+                source.launch.slot_id,
+                source_native_turn_no,
+            )
         elif not child_id:
             raise DriverError(f"runtime {runtime_id!r} has no native fork path")
         if not child_id or child_id == source_id:
@@ -664,7 +638,13 @@ class ResidentTransportFactory:
             )
             normalization_slot = target_launch.slot_id
         elif runtime_id == "pi":
-            normalization_slot = target_launch.slot_id
+            # Pi's RPC fork/clone switches the process itself onto the child.
+            # Close that probe so the supervisor resumes the source locator;
+            # the child is opened independently in its reserved slot.  The
+            # child session file was written by the source UID, so expose that
+            # UID's new files to the shared member group before target resume.
+            source.close()
+            normalization_slot = source.launch.slot_id
         else:
             normalization_slot = source.launch.slot_id
 
@@ -796,11 +776,17 @@ print(json.dumps(sorted(children), separators=(",", ":")))
             raise DriverError("Codex native fork journal recovery baseline is not canonical")
         return set(value)
 
-    def _fork_claude(self, spec: ChatSandboxSpec, source_id: str, source_slot: int) -> str:
+    def _fork_claude(
+        self,
+        spec: ChatSandboxSpec,
+        source_id: str,
+        source_slot: int,
+        source_native_turn_no: int,
+    ) -> str:
         uid = MEMBER_UID_BASE + source_slot
         result = self._manager.exec_capture(
             spec,
-            ["claude-session-fork", source_id],
+            ["claude-session-fork", source_id, str(source_native_turn_no)],
             env={
                 "HOME": f"/home/agent-member-{source_slot}",
                 "CLAUDE_CONFIG_DIR": f"{CHAT_STATE_DIR}/claude",
@@ -822,33 +808,6 @@ print(json.dumps(sorted(children), separators=(",", ":")))
         if not isinstance(receipt, dict) or receipt.get("source_session_id") != source_id:
             raise DriverError("Claude native fork returned the wrong source session")
         return str(receipt.get("session_id") or "")
-
-    def _fork_pi(
-        self,
-        spec: ChatSandboxSpec,
-        source_id: str,
-        target_launch: ResidentLaunch,
-    ) -> str:
-        driver = get_driver("pi")
-        opener = getattr(driver, "launch_fork_live", None)
-        if opener is None:
-            raise DriverError("pi driver has no prompt-free fork transport")
-        probe = opener(self._launch_context(spec, target_launch), source_session_id=source_id)
-        try:
-            ensure_started = getattr(probe, "ensure_started", None)
-            if ensure_started is None:
-                raise DriverError("pi fork transport cannot prove readiness")
-            ensure_started(
-                model=target_launch.model,
-                reasoning_effort=target_launch.reasoning_effort,
-            )
-            child_id = str(getattr(probe.runtime, "session_id", None) or "")
-            if not child_id or child_id == source_id:
-                raise DriverError("pi --fork returned an invalid child session id")
-            return child_id
-        finally:
-            with contextlib.suppress(Exception):
-                probe.close()
 
     @staticmethod
     def _journal_key(operation_id: str) -> str:

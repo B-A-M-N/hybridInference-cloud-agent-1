@@ -20,6 +20,7 @@ const RESOURCES: TurnResources = {
   netRxBytes: 35_651_584,
   netTxBytes: 2_097_152,
   sampleCount: 42,
+  samplerVersion: '2',
   coverage: 1,
   toolTimeMs: null,
   toolCalls: [],
@@ -270,17 +271,41 @@ describe('TurnFooter', () => {
       netRxBytes: null,
       netTxBytes: null,
       sampleCount: 0,
+      samplerVersion: 'shared-member-v1',
       coverage: 0,
       toolTimeMs: null,
       toolCalls: [],
       toolCallsTruncated: false,
     };
     render(<TurnFooter job={job({ resources: unmeasured })} />);
-    expect(screen.getByText('resource data unavailable')).toBeInTheDocument();
+    expect(screen.getByText('turn totals unavailable')).toBeInTheDocument();
     expect(screen.queryByText(/^0/)).toBeNull();
 
-    fireEvent.click(screen.getByRole('button', { name: 'resource data unavailable' }));
+    fireEvent.click(screen.getByRole('button', { name: 'turn totals unavailable' }));
     expect(screen.getByText(/not the same as a turn that consumed nothing/)).toBeInTheDocument();
+  });
+
+  it('keeps a historical sampler failure distinct from shared-member accounting', () => {
+    render(
+      <TurnFooter
+        job={job({
+          resources: {
+            ...RESOURCES,
+            cpuUsec: null,
+            memPeakBytes: null,
+            memAvgBytes: null,
+            netRxBytes: null,
+            netTxBytes: null,
+            sampleCount: 0,
+            coverage: 0,
+          },
+        })}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'resource data unavailable' }));
+    expect(screen.getByText(/historical sampler could not read/i)).toBeInTheDocument();
+    expect(screen.queryByText(/fork siblings/i)).toBeNull();
   });
 
   it('renders nothing at all when there is nothing honest to say', () => {
@@ -335,6 +360,7 @@ describe('the per-tool table on real data', () => {
     state: 'done',
     cancel_requested: false,
     current_attempt_id: 7,
+    telemetry_attempt_id: 7,
     published_pr_url: null,
     detail: null,
     spent_usd: null,
@@ -530,7 +556,7 @@ describe('per-call resources, through both real adapters', () => {
       net_tx_bytes: null,
       sample_count: 0,
       coverage: 0,
-      sampler_version: '2',
+      sampler_version: 'shared-member-v1',
       tool_calls: [],
       tool_calls_truncated: false,
       process_observer: 'kata-guest-ebpf-v1',
@@ -560,7 +586,7 @@ describe('per-call resources, through both real adapters', () => {
     // CPU and memory are unmeasured; process counts are also unknown because
     // this fixture predates the guest observer. None of those is a measured 0.
     expect(screen.getAllByText('—')).toHaveLength(4);
-    expect(screen.getByText(/periodic sampler did not span/)).toBeInTheDocument();
+    expect(screen.getByText(/historical periodic sampler did not span/i)).toBeInTheDocument();
     expect(screen.queryByText('0s')).toBeNull();
     expect(screen.queryByText('0B')).toBeNull();
   });
@@ -728,7 +754,7 @@ describe('per-call resources, through both real adapters', () => {
     openTable(withCalls([]));
 
     expect(screen.getAllByText('—')).toHaveLength(6);
-    expect(screen.getByText(/periodic sampler did not span/)).toBeInTheDocument();
+    expect(screen.getByText(/historical periodic sampler did not span/i)).toBeInTheDocument();
   });
 
   it('renders a sub-tick process delivered by the guest observer', () => {
@@ -906,7 +932,9 @@ describe('per-call resources, through both real adapters', () => {
     expect(within(longRow).getByText('270MB')).toBeInTheDocument();
     expect(within(longRow).queryByText('ᵖ')).toBeNull();
     expect(screen.getByText(/accounted by the guest kernel/)).toBeInTheDocument();
-    expect(screen.queryByText(/periodic sampler did not span/)).toBeNull();
+    // This fixture is a historical sampled turn, so it retains the sampled
+    // aggregate instead of showing the current shared-member disclaimer.
+    expect(screen.queryByText(/current shared turns never assign/i)).toBeNull();
   });
 
   it('marks a call whose processes were not all its own as a floor', () => {
@@ -1024,5 +1052,51 @@ describe('attempt scoping', () => {
 
     expect(toolTimings(events, 2).map((t) => t.detail)).toEqual(['second try']);
     expect(toolTimings(events, 1).map((t) => t.ms)).toEqual([1_000]);
+  });
+
+  it('does not attach the newest attempt telemetry to an older attempt', () => {
+    const events: AgentEvent[] = [
+      {
+        kind: 'tool_use',
+        tool: 'Bash',
+        detail: 'first try',
+        id: 'dup',
+        attemptNo: 1,
+        durationMs: 1_000,
+      },
+      {
+        kind: 'tool_use',
+        tool: 'Bash',
+        detail: 'second try',
+        id: 'dup',
+        attemptNo: 2,
+        durationMs: 9_000,
+      },
+    ];
+    render(
+      <TurnFooter
+        attemptNo={1}
+        job={job({
+          attempts: [
+            { no: 1, status: 'superseded' },
+            { no: 2, status: 'finished' },
+          ],
+          telemetryAttemptNo: 2,
+          continuityMode: 'hot',
+          contextStatus: 'live',
+          durationMs: 42_000,
+          resources: RESOURCES,
+          events,
+        })}
+      />,
+    );
+
+    expect(screen.queryByText('hot')).not.toBeInTheDocument();
+    expect(screen.queryByText('live')).not.toBeInTheDocument();
+    expect(screen.queryByText('42s')).not.toBeInTheDocument();
+    expect(screen.queryByText('18.2s')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '1 tool call' }));
+    expect(screen.getByText('1s')).toBeInTheDocument();
+    expect(screen.queryByText('9s')).not.toBeInTheDocument();
   });
 });

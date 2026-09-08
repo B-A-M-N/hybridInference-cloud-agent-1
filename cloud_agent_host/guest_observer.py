@@ -1020,6 +1020,7 @@ def attribute_processes(
     *,
     clock_error_ns: int | None = None,
     origin_host_mono: float | None = None,
+    windows_complete: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[int, int]]:
     """Map observed process starts to every plausible tool window.
 
@@ -1028,7 +1029,10 @@ def attribute_processes(
     on the process row instead of arbitrarily picking one.  The guest/host
     clock bridge has a measured error bound; widening windows by that bound is
     conservative and prevents a boundary-adjacent process from being assigned
-    with false precision.
+    with false precision. If any tool window was dropped, no retained window
+    may claim a process: the missing call could have overlapped every one of
+    them. The process census is still returned, but its per-call links stay
+    empty and the parent ``tool_calls_truncated`` flag carries the loss.
     """
     error_s = max(0, observation.clock_error_ns if clock_error_ns is None else clock_error_ns)
     error_s /= 1_000_000_000
@@ -1043,7 +1047,7 @@ def attribute_processes(
         # not charge it to a tool's workload process count.
         platform_process = process.executable == TOOL_MARK_HELPER
         call_seqs: list[int] = []
-        if not platform_process:
+        if not platform_process and windows_complete:
             for index, window in enumerate(windows, start=1):
                 end = window.closed_mono
                 if process.started_host_mono + error_s < window.opened_mono:

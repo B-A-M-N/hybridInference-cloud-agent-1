@@ -13,10 +13,9 @@
 #    anything this container holds. There is no GitHub token here, because the
 #    agent never pushes — it emits a patch and the trusted publisher outside
 #    handles git.
-# 2. **Nothing here is trusted at run time.** Legacy jobs throw the container
-#    away after one attempt; shared-live chats retain the same stopped Docker
-#    writable layer until an explicit future cleanup policy removes it. Both
-#    modes run as non-root and (under the kata backend) have their own kernel.
+# 2. **Nothing here is trusted at run time.** Every chat uses a retained Docker
+#    container; timeout stops it without removing its writable layer. The
+#    process runs as non-root and (under the kata backend) has its own kernel.
 #
 # Runtimes are pinned rather than floating: an agent CLI that silently updates
 # changes its own event format, and the normalized event mapping in
@@ -28,7 +27,12 @@
 # untrusted runtime image.
 FROM debian:bookworm-slim AS guest-observer-build
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+ARG DEBIAN_MIRROR=http://deb.debian.org
+RUN --mount=type=cache,id=cloud-agent-sandbox-apt,target=/var/cache/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean \
+    && sed -i "s|http://deb.debian.org|${DEBIAN_MIRROR%/}|g" /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update \
+    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
         clang \
         gcc \
         libc6-dev \
@@ -71,14 +75,14 @@ FROM node:22-bookworm-slim
 # are the pair that has to agree, so the reviewed value belongs in the same
 # tree as the code it was reviewed against.
 #
-# Each is also a build argument a deployment may override
-# (`deploy/host/sandbox_host.sh` passes them from that host's `.env`), because
-# *which* reviewed version an environment runs is deployment configuration, not
-# source. Without that, "let staging soak the new CLI for a week while
-# production stays put" was a change to the code both environments build from,
-# and every version bump — including a revert at 3am — needed a pull request.
-# An override must still be an exact version; the check at the end of this file
-# is what makes that true rather than merely asked for.
+# They remain build arguments so the Dockerfile can derive labels and install
+# paths from one value, but the supported host deploy deliberately refuses a
+# per-machine override. These defaults are part of the shared protocol
+# attestation and must change in source together with
+# `SHARED_SANDBOX_RUNTIME_PINS`. To soak another reviewed CLI without changing
+# the default, add its exact version to the matching `*_EXTRA_VERSIONS` menu and
+# select it through runner policy. The check at the end still proves every
+# advertised default is exact and matches the binary on PATH.
 ARG CLAUDE_CODE_VERSION=2.1.220
 ARG CODEX_VERSION=0.145.0
 ARG PI_VERSION=0.73.1
@@ -120,7 +124,12 @@ ARG KILO_VERSIONS=${KILO_VERSION}${KILO_EXTRA_VERSIONS:+,${KILO_EXTRA_VERSIONS}}
 # Tools an agent legitimately needs to understand and change a repository.
 # Deliberately not installed: anything that would let it reach the host
 # (docker CLI) or persist beyond the job.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+ARG DEBIAN_MIRROR=http://deb.debian.org
+RUN --mount=type=cache,id=cloud-agent-sandbox-apt,target=/var/cache/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean \
+    && sed -i "s|http://deb.debian.org|${DEBIAN_MIRROR%/}|g" /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update \
+    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
         git \
         ca-certificates \
         curl \
@@ -146,19 +155,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # sandbox is an agent that can step outside the version its attempt is stamped
 # with.
 COPY deploy/sandbox/install-runtimes.sh /tmp/install-runtimes.sh
-RUN chmod 0755 /tmp/install-runtimes.sh \
+RUN --mount=type=cache,id=cloud-agent-sandbox-npm,target=/root/.npm,sharing=locked \
+    chmod 0755 /tmp/install-runtimes.sh \
     && /tmp/install-runtimes.sh claude-code @anthropic-ai/claude-code claude "${CLAUDE_CODE_VERSIONS}" \
     && /tmp/install-runtimes.sh codex @openai/codex codex "${CODEX_VERSIONS}" \
     && /tmp/install-runtimes.sh pi @mariozechner/pi-coding-agent pi "${PI_VERSIONS}" \
     && /tmp/install-runtimes.sh opencode opencode-ai opencode "${OPENCODE_VERSIONS}" \
     && /tmp/install-runtimes.sh kilo @kilocode/cli kilo "${KILO_VERSIONS}" \
-    && npm cache clean --force \
     && rm /tmp/install-runtimes.sh
 
 # Claude's CLI has a live stdin transport but no prompt-free public fork RPC.
 # The exact-version Python SDK supplies that native transcript mutation. Keep
 # it in a dedicated immutable venv so the runtime helper never depends on a
 # package from the repository or the host.
+ARG PIP_DEFAULT_TIMEOUT=120
 RUN python3 -m venv /opt/claude-agent-sdk \
     && /opt/claude-agent-sdk/bin/pip install --no-cache-dir \
         "claude-agent-sdk==0.2.148"
@@ -166,9 +176,8 @@ RUN python3 -m venv /opt/claude-agent-sdk \
 # The version stamp the runner reads (issue #54): image labels, keyed by
 # registry id, derived from the pins above so a label can never disagree with
 # what is installed. The heartbeat reports them, the claim copies them onto
-# each attempt, and the checkpoint gate compares them before handing a session
-# to a resumed turn — an unlabeled image degrades every one of those to
-# "unknown", which is a replay, not an error.
+# each attempt, and native-session admission compares them before handing a
+# session to a resumed turn. An unlabeled image is ineligible to claim work.
 #
 # Two labels per runtime, answering two questions that diverge the moment an
 # image carries more than one version:
@@ -184,6 +193,7 @@ RUN python3 -m venv /opt/claude-agent-sdk \
 # comma-separated string it will happily stamp onto an attempt.
 LABEL org.freeinference.runtime.claude-code.version="${CLAUDE_CODE_VERSION}" \
       org.freeinference.helper.claude-agent-sdk.version="0.2.148" \
+      org.freeinference.helper.http-agent-live-bridge.version="2" \
       org.freeinference.helper.guest-observer.version="1" \
       org.freeinference.helper.tool-mark.version="1" \
       org.freeinference.runtime.codex.version="${CODEX_VERSION}" \
@@ -195,7 +205,7 @@ LABEL org.freeinference.runtime.claude-code.version="${CLAUDE_CODE_VERSION}" \
       org.freeinference.runtime.pi.versions="${PI_VERSIONS}" \
       org.freeinference.runtime.opencode.versions="${OPENCODE_VERSIONS}" \
       org.freeinference.runtime.kilo.versions="${KILO_VERSIONS}" \
-      org.freeinference.shared-sandbox.protocol="v1"
+      org.freeinference.shared-sandbox.protocol="v2"
 
 # pi, OpenCode, and Kilo all ignore OPENAI_BASE_URL; each one's supported
 # route to a custom gateway is a provider config file whose content (gateway
@@ -210,6 +220,7 @@ COPY deploy/sandbox/opencode-freeinference /usr/local/bin/opencode-freeinference
 COPY deploy/sandbox/kilo-freeinference /usr/local/bin/kilo-freeinference
 COPY deploy/sandbox/http-agent-live-bridge /usr/local/bin/http-agent-live-bridge
 COPY deploy/sandbox/claude-session-fork /usr/local/bin/claude-session-fork
+COPY deploy/sandbox/member-process-reaper /usr/local/bin/member-process-reaper
 COPY --from=guest-observer-build /src/freeinference-guest-observer \
      /usr/local/libexec/freeinference-guest-observer
 COPY --from=guest-observer-build /src/freeinference-guest-observer.bpf.o \
@@ -221,6 +232,7 @@ RUN chmod 0755 /usr/local/bin/pi-freeinference /usr/local/bin/opencode-freeinfer
         /usr/local/bin/claude-session-fork \
         /usr/local/libexec/freeinference-guest-observer \
         /usr/local/libexec/freeinference-tool-mark \
+    && chmod 0555 /usr/local/bin/member-process-reaper \
     && chmod 0644 /usr/local/libexec/freeinference-guest-observer.bpf.o
 
 # `--ignore-user-config` does not suppress a trusted repository's
@@ -229,20 +241,18 @@ RUN chmod 0755 /usr/local/bin/pi-freeinference /usr/local/bin/opencode-freeinfer
 COPY deploy/sandbox/codex-requirements.toml /etc/codex/requirements.toml
 RUN chmod 0644 /etc/codex/requirements.toml
 
-# Non-root by default. Legacy jobs bind-mount a worktree; restartable chats keep
-# it in the container writable layer. Neither gives the agent a reason to have
-# root — and a kernel escape needs a much better bug when it starts
-# unprivileged.
+# Non-root by default. Retained chats keep the workspace in the container
+# writable layer; the agent has no reason to be root, and a kernel escape needs
+# a much better bug when it starts unprivileged.
 #
 # The uid is PINNED, and must match SANDBOX_UID in
-# cloud_agent_host/sandbox.py: the runner chowns each job
-# worktree to that id before mounting it. If the two drift, the agent cannot
-# write a single file in its own working tree and git refuses to run at all
+# cloud_agent_host/sandbox.py and the base retained-container user. If the two
+# drift, the agent cannot write its workspace and git refuses to run at all
 # ("dubious ownership") — a failure that looks nothing like its cause.
 #
-# Restartable chat containers keep both directories in their Docker writable
-# layer (never a host bind or named volume). Creating them while still root
-# makes this image work for both that mode and the legacy bind-mounted path.
+# Retained chat containers keep both directories in their Docker writable
+# layer (never a host bind or named volume). Create them while still root so
+# every unprivileged member can use the shared group-owned paths.
 RUN groupadd --gid 10001 agent \
     && useradd --uid 10001 --gid 10001 --create-home --shell /bin/bash agent \
     && slot=0; while [ "$slot" -lt 128 ]; do \
@@ -276,12 +286,12 @@ ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 # The second half is what makes the pins safe to hand to a deployment. The
 # labels above are derived from the build arguments, and everything downstream
 # treats a label as a statement of fact about the binary: the heartbeat reports
-# it, the claim copies it onto the attempt, and the checkpoint gate compares it
+# it, the claim copies it onto the attempt, and native-session admission compares it
 # before letting a thread resume its own session. Hand-reviewed exact pins made
 # that true by construction. An operator-supplied value does not — `latest`, a
 # range like `^2.1`, or a version npm quietly resolved elsewhere each produce an
 # image whose label is a lie, and the first symptom of that lie is a thread
-# that silently forgets its history (a version mismatch downgrades to replay).
+# that silently forgets its history (a version mismatch fails closed).
 #
 # So the rule is: the pin must be an exact version, and this proves it before
 # the image exists.

@@ -167,33 +167,38 @@ _SHARED_HOST_ENV = "\n".join(
     [
         "COMPOSE_PROJECT=freeinference-cloud-agent-sandbox-prod",
         "SIBLING_COMPOSE_PROJECTS=freeinference-cloud-agent-sandbox-staging",
-        "AGENT_DISPATCHER_TOKEN=t",
-        "AGENT_WORKSPACE_BROKER_TOKEN=b",
+        "AGENT_ENROLL_TOKEN=test-enrollment-token",
         "AGENT_SANDBOX_IMAGE=freeinference-cloud-agent-job:prod",
         "AGENT_TUNNEL_SSH_DESTINATION=user@gateway",
         "AGENT_TUNNEL_SSH_KEY=/dev/null",
         "AGENT_TUNNEL_SSH_KNOWN_HOSTS=/etc/hosts",
+        "AGENT_MCP_TUNNEL_SSH_DESTINATION=user@control",
+        "AGENT_MCP_TUNNEL_SSH_KEY=/dev/null",
+        "AGENT_MCP_TUNNEL_SSH_KNOWN_HOSTS=/etc/hosts",
+        "AGENT_CONTROL_PLANE_TUNNEL_SSH_DESTINATION=user@control",
+        "AGENT_CONTROL_PLANE_TUNNEL_SSH_KEY=/dev/null",
+        "AGENT_CONTROL_PLANE_TUNNEL_SSH_KNOWN_HOSTS=/etc/hosts",
+        "AGENT_BROKER_REVERSE_BIND=172.24.0.1",
+        "AGENT_BROKER_REVERSE_PORT=18092",
+        "AGENT_WORKSPACE_BROKER_ADVERTISE_URL=http://172.24.0.1:18092",
+        "AGENT_WORKSPACE_BROKER_TOKEN=test-broker-token",
         "",
     ]
 )
 
 
-def test_a_shared_machine_must_name_its_own_state_roots(tmp_path: Path) -> None:
-    """Two stacks accepting the default paths do not sit beside each other.
+def test_a_shared_machine_must_name_its_own_host_state_root(tmp_path: Path) -> None:
+    """Two stacks may not share the persisted host enrollment identity.
 
-    The three roots are host directories bind-mounted into the containers, and
-    they default to the same `/var/lib/hybridinference/*` for every stack. The
-    dangerous one is the enrolment credential: the control plane reads a host
-    from the credential rather than from the claim body, so a shared state root
-    means the second stack registers as the first — and `AGENT_RUNNER_HOST`
-    cannot correct it, because nothing consults it after enrolment.
+    Chat data has no host worktree/snapshot root. The one remaining host bind
+    contains the enrolment credential: the control plane reads a host from the
+    credential rather than from the claim body, so sharing it makes the second
+    stack register as the first and AGENT_RUNNER_HOST cannot correct it.
     """
     result = _run(_host(tmp_path, dotenv=_SHARED_HOST_ENV), "up")
 
     assert result.returncode != 0
     assert "AGENT_HOST_STATE_ROOT" in result.stderr
-    assert "AGENT_WORKDIR_ROOT" in result.stderr
-    assert "AGENT_SNAPSHOT_ROOT" in result.stderr
 
 
 def test_the_host_template_assigns_each_setting_once() -> None:
@@ -206,8 +211,6 @@ def test_the_host_template_assigns_each_setting_once() -> None:
     assert not duplicates, f"dotenv uses the final duplicate assignment: {duplicates}"
     for name in (
         "AGENT_HOST_STATE_ROOT",
-        "AGENT_WORKDIR_ROOT",
-        "AGENT_SNAPSHOT_ROOT",
         "AGENT_EGRESS_NETWORK_PLATFORM_ONLY",
     ):
         assert assignments[name] == [""], f"{name} must stay explicit in the template"
@@ -229,8 +232,6 @@ def test_a_shared_machine_refuses_the_legacy_shared_state_roots(tmp_path: Path) 
 
     assert result.returncode != 0
     assert "AGENT_HOST_STATE_ROOT" in result.stderr
-    assert "AGENT_WORKDIR_ROOT" in result.stderr
-    assert "AGENT_SNAPSHOT_ROOT" in result.stderr
 
 
 def test_a_shared_machine_refuses_the_legacy_shared_egress_network(tmp_path: Path) -> None:
@@ -296,16 +297,23 @@ def test_the_shared_guard_canonicalizes_state_roots(tmp_path: Path) -> None:
     assert "AGENT_HOST_STATE_ROOT" in result.stderr
 
 
-def test_dispatcher_and_broker_tokens_must_differ(tmp_path: Path) -> None:
-    """A shared secret silently combines claim and workspace permissions."""
-    dotenv = _SHARED_HOST_ENV.replace(
-        "AGENT_WORKSPACE_BROKER_TOKEN=b", "AGENT_WORKSPACE_BROKER_TOKEN=t"
+def test_ready_marker_uses_the_same_compose_resolved_root_as_up(tmp_path: Path) -> None:
+    """The post-deploy marker must reach the root mounted into the runners."""
+    state_root = tmp_path / "host-state"
+    state_root.mkdir()
+    marker = state_root / "shared-live-ready"
+    marker.write_text("pending:target-sha\n")
+    dotenv = "AGENT_HOST_STATE_ROOT=${STATE_BASE}/host-state\n"
+    resolved = f"AGENT_HOST_STATE_ROOT={state_root}\n"
+
+    result = _run(
+        _host(tmp_path, dotenv=dotenv, compose_environment=resolved),
+        "mark-ready",
+        "target-sha",
     )
 
-    result = _run(_host(tmp_path, dotenv=dotenv), "up")
-
-    assert result.returncode != 0
-    assert "AGENT_DISPATCHER_TOKEN and AGENT_WORKSPACE_BROKER_TOKEN must differ" in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == "target-sha\n"
 
 
 def test_a_lone_stack_needs_no_such_thing(tmp_path: Path) -> None:
@@ -323,7 +331,7 @@ def test_a_lone_stack_needs_no_such_thing(tmp_path: Path) -> None:
 
     result = _run(_host(tmp_path, dotenv=alone), "up")
 
-    assert "AGENT_WORKDIR_ROOT" not in result.stderr
+    assert "AGENT_HOST_STATE_ROOT" not in result.stderr
 
 
 def test_the_stray_matcher_still_recognises_this_stack(tmp_path: Path) -> None:

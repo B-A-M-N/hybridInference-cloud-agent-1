@@ -1,21 +1,15 @@
-"""Pluggable sandbox backends — where one job's agent actually executes.
+"""Sandbox primitives used to operate a retained chat container.
 
 The runner is deliberately substrate-agnostic: it claims over HTTP, executes,
 and reports over HTTP. *How* the execution is isolated is this module's job,
 selected by configuration, so the same runner code serves dogfooding on CI,
 self-hosted machines, and a multi-tenant fleet.
 
-Two topologies exist and the difference is a security property, not a
-deployment detail:
-
-- **Runner inside the sandbox** (``process`` on an ephemeral CI VM): the VM is
-  the isolation boundary and the runner shares it with the agent. Simple, and
-  what the GitHub Actions dogfood uses.
-- **Runner outside, sandbox per job** (``container`` / ``kata``): the runner is
-  a long-lived trusted process that spawns an isolated sandbox per job. Only a
-  model-scoped credential crosses into the sandbox; the full capability token
-  that can write events, artifacts and terminal states stays outside. This is
-  strictly better and is the target for anything multi-tenant.
+The production topology is runner outside, retained container per chat group
+(``container`` / ``kata``). Only scoped inference/MCP credentials cross into
+the sandbox; control-plane and repository credentials remain outside. The
+``process`` backend exists only as a deterministic test seam and cannot attest
+or claim a retained job.
 
 Backends are intentionally thin: they take an argv the runtime adapter built
 and hand back a line stream. They do not know what an agent is.
@@ -24,22 +18,14 @@ and hand back a line stream. They do not know what an agent is.
 from __future__ import annotations
 
 import contextlib
-import fcntl
-import hashlib
 import json
 import os
-import secrets
 import shlex
 import shutil
-import signal
-import struct
 import subprocess
-import termios
 import threading
-import time
-import tty
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from cloud_agent_host.egress import (
@@ -50,24 +36,14 @@ from cloud_agent_host.egress import (
     build_policy_from_env,
 )
 from cloud_agent_host.egress_proxy import CANARY_HOST
-from cloud_agent_host.guest_observer import (
-    GUEST_OBSERVER_BINARY,
-    GUEST_OBSERVER_ROOT,
-    GUEST_OBSERVER_ROTATE_BYTES,
-    GUEST_OBSERVER_VERSION,
-    GuestObservation,
-    GuestObserverController,
-    GuestObserverCursor,
-)
 from cloud_agent_host.logging_utils import get_logger
-from cloud_agent_host.tool_windows import TOOL_MARK_HELPER
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Iterator
 
 logger = get_logger(__name__)
 
-# Run inside one throwaway sandbox container on the agent phase's own network,
+# Run inside one ephemeral preflight probe on the agent phase's own network,
 # with $1 = the URL to probe and $2 = its hostname. Prints exactly one verdict.
 #
 # curl and python3 are both in the shipped sandbox image; a deployment-owned
@@ -114,18 +90,6 @@ if getent hosts "$host" >/dev/null 2>&1; then echo dns-only; else echo unresolve
 # same mechanism with a different isolation boundary underneath.
 KATA_RUNTIME = "io.containerd.kata.v2"
 
-# A one-shot Kata turn keeps one inert non-root process alive while the trusted
-# guest observer is started and the agent is attached with ``docker exec``.
-# It never respawns, so it cannot become a false same-UID process observation.
-# This is the private PID-file location used to interrupt only the agent tree
-# before the guest is destroyed on timeout/cancellation.
-_ONE_SHOT_ACTIVATION_TMPFS = "/run/freeinference-turn"
-_ONE_SHOT_PIDFILE = f"{_ONE_SHOT_ACTIVATION_TMPFS}/agent.pid"
-_ONE_SHOT_INIT_COMMAND = (
-    'trap \'kill "$child" 2>/dev/null; wait "$child"; exit 0\' TERM INT; '
-    'sleep 2147483647 & child=$!; wait "$child"'
-)
-
 # Image labels carrying the CLI versions baked into a sandbox image, e.g.
 # ``org.freeinference.runtime.claude-code.version=1.2.3``. The image build
 # writes them; the runner only reads. Unlabeled images report no versions
@@ -150,14 +114,12 @@ HELPER_VERSION_LABEL_SUFFIX = ".version"
 RUNTIME_BIN_ROOT = "/opt/runtimes"
 
 # Must match `useradd --uid` in deploy/sandbox/Dockerfile.agent-sandbox. The
-# runner chowns each job worktree to this id before mounting it, so a drift
-# between the two means the agent cannot write to its own working tree.
+# retained container creates the workspace for this id, so a drift between the
+# two means the Agent CLI cannot write its own tree.
 SANDBOX_UID = 10001
 SANDBOX_GID = 10001
 SANDBOX_HOME = "/home/agent"
 SANDBOX_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-TERMINAL_CONTAINER_LABEL = "org.hybridinference.agent-terminal"
-TERMINAL_CONTAINER_OWNER_LABEL = "org.hybridinference.agent-terminal-owner"
 
 
 def runtime_bin_dir(runtime_id: str, version: str) -> str:
@@ -229,24 +191,9 @@ class TerminalNotSupportedError(SandboxError):
     """Raised when a backend cannot safely provide persistent terminals."""
 
 
-def _walk_entries(path: str) -> Iterator[tuple[str, bool]]:
-    """Yield ``(path, is_dir)`` for the root and everything beneath it.
-
-    Symlinks are yielded but never followed, so nothing outside the worktree is
-    reached by an operation applied to the tree.
-    """
-    yield path, True
-    for root, dirs, files in os.walk(path):
-        for name in dirs:
-            yield os.path.join(root, name), True
-        for name in files:
-            yield os.path.join(root, name), False
-
-
-#: Where a job's durable harness state (agent session files) is mounted inside
-#: the sandbox. Constant on purpose: Claude Code derives its session-file path
-#: from CWD and config dir, and a path that moved between turns would strand
-#: the session a checkpoint restored (design §6, workdir/HOME stability).
+#: Where a chat's durable harness state lives in its Docker writable layer.
+#: Constant on purpose: Claude Code derives its session-file path from CWD and
+#: config dir, and a path that moved between turns would strand native state.
 STATE_MOUNT_TARGET = "/agent-state"
 
 
@@ -257,27 +204,14 @@ class SandboxSpec:
     argv: list[str]
     workdir: str
     env: dict[str, str] = field(default_factory=dict)
-    #: Host directory bind-mounted at :data:`STATE_MOUNT_TARGET` so harness
-    #: session files survive the container. ``None`` mounts nothing — the
-    #: pre-checkpoint behaviour, and what every non-session phase uses.
-    state_dir: str | None = None
-    #: Keep stdin open for a resident session (HOT, design §7): follow-up
-    #: turns are written to the process instead of spawning a new one. The
-    #: default is the one-shot world every other phase runs in.
+    #: Keep stdin open for a resident session (HOT, design §7). Bounded helper
+    #: commands such as setup/Git probes leave this false.
     live_input: bool = False
     # Which lifecycle phase this spawn belongs to. The two get different egress
     # tiers: setup installs dependencies and needs a registry, the agent turn
     # afterwards does not — and the agent turn is the one running untrusted
     # model output, so it is the one that gets the least reach.
     phase: str = "agent"
-    # Memory/CPU caps keep one runaway job from starving its neighbours on a
-    # shared host. Ignored by the process backend, which has no boundary.
-    memory_limit: str = "4g"
-    cpu_limit: str = "2"
-    #: Capture exact process lifecycle events for this agent turn when the
-    #: backend is Kata. Setup commands and terminal helpers deliberately leave
-    #: this false: their work is outside the turn telemetry boundary.
-    observe_processes: bool = False
 
 
 class SandboxProcess(ABC):
@@ -325,19 +259,6 @@ class SandboxProcess(ABC):
 
     def poll(self) -> int | None:
         """Reap-if-exited: the exit code, or ``None`` while still running."""
-        return None
-
-    def finish_guest_observation(self) -> GuestObservation | None:
-        """Close process telemetry owned by this handle, when it has any.
-
-        Retained sandboxes own their observer at the backend level. A Kata
-        one-shot process instead owns its disposable guest and must close the
-        observer before that guest is removed. Other handles return ``None``.
-        """
-        return None
-
-    def begin_guest_observation(self) -> GuestObserverCursor | None:
-        """Fence another turn on a surviving process, when supported."""
         return None
 
 
@@ -426,16 +347,7 @@ class SandboxBackend(ABC):
             f"the {self.name!r} backend cannot guarantee whole-session cleanup"
         )
 
-    def prepare_terminal_broker(self, workdir_root: str) -> None:
-        """Prepare terminal resources owned by one workspace broker.
-
-        This hook is deliberately separate from :meth:`preflight`: only the
-        private workspace broker owns persistent terminals, so ordinary agent
-        runners must never clean up terminal resources.
-        """
-        return
-
-    def preflight(self, workdir_root: str | None = None) -> None:
+    def preflight(self) -> None:
         """Raise :class:`SandboxError` if this backend cannot run here.
 
         Called before a job is claimed so a misconfigured host fails loudly
@@ -464,14 +376,6 @@ class SandboxBackend(ABC):
         user) fails the job for a reason nothing in the logs explains.
         """
         return {}
-
-    def adopt_workdir(self, path: str) -> None:
-        """Hand ``path`` and everything under it to the sandbox's user.
-
-        Called after the runner has populated the worktree and before the agent
-        runs. A no-op where the agent runs as the runner's own user.
-        """
-        return
 
 
 # ── process: no isolation ──────────────────────────────────────────────
@@ -551,129 +455,12 @@ class _PopenProcess(SandboxProcess):
         return "".join(self._stderr_chunks)
 
 
-class _ObservedContainerProcess(_PopenProcess):
-    """A one-shot Kata exec whose guest must outlive telemetry finalization."""
-
-    def __init__(
-        self,
-        process: subprocess.Popen,
-        *,
-        container: str,
-        controller: GuestObserverController,
-        cursor: GuestObserverCursor,
-        terminate_tree: Callable[[], None],
-        remove_container: Callable[[], bool],
-    ) -> None:
-        super().__init__(process, container=container)
-        self._controller = controller
-        self._cursor = cursor
-        self._cursor_uid = cursor.uid
-        self._terminate_tree = terminate_tree
-        self._remove_container = remove_container
-        self._lifecycle_lock = threading.RLock()
-        self._last_observation: GuestObservation | None = None
-        self._container_removed = False
-
-    def _close_observation(self, *, terminate: bool, destroy: bool) -> GuestObservation:
-        with self._lifecycle_lock:
-            if self._container_removed:
-                return self._last_observation or GuestObservation.unavailable(
-                    "Kata turn container was already removed"
-                )
-            if terminate and self._process.poll() is None:
-                try:
-                    self._terminate_tree()
-                except Exception as exc:
-                    logger.warning(
-                        "kata_one_shot_process_cleanup_failed",
-                        extra={
-                            "event": "kata_one_shot_process_cleanup_failed",
-                            "detail": str(exc)[:300],
-                        },
-                    )
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    self._process.wait(timeout=5)
-            if self._cursor is not None:
-                try:
-                    self._last_observation = self._controller.finish(self._cursor)
-                except Exception as exc:
-                    self._last_observation = GuestObservation.unavailable(str(exc))
-                self._cursor = None
-            if destroy:
-                removed = False
-                try:
-                    removed = self._remove_container()
-                except Exception as exc:
-                    logger.warning(
-                        "kata_one_shot_container_cleanup_failed",
-                        extra={
-                            "event": "kata_one_shot_container_cleanup_failed",
-                            "detail": str(exc)[:300],
-                        },
-                    )
-                finally:
-                    if self._process.poll() is None:
-                        self._process.kill()
-                        with contextlib.suppress(subprocess.TimeoutExpired):
-                            self._process.wait(timeout=5)
-                self._container_removed = removed
-            return self._last_observation or GuestObservation.unavailable(
-                "turn had no guest observer cursor"
-            )
-
-    def kill(self) -> None:
-        """Stop the agent tree, drain eBPF events, then destroy its guest."""
-        self._close_observation(terminate=True, destroy=True)
-
-    def begin_guest_observation(self) -> GuestObserverCursor:
-        """Fence a later turn on this still-resident Kata process."""
-        with self._lifecycle_lock:
-            if self._container_removed or self._process.poll() is not None:
-                detail = "resident Kata process is no longer running"
-                # A failed attempt to fence a new turn must not let the next
-                # finish call replay the last successful turn's observation.
-                # Preserve an existing open cursor for cleanup, but otherwise
-                # replace that stale terminal result with the current failure.
-                if self._cursor is None:
-                    self._last_observation = GuestObservation.unavailable(detail)
-                return GuestObserverCursor.unavailable(
-                    self._cursor_uid,
-                    detail,
-                )
-            if self._cursor is not None:
-                # A missing close must never silently widen the next turn to
-                # include its predecessor. Preserve an explicit incomplete
-                # result and start from a fresh fence.
-                self._last_observation = GuestObservation.unavailable(
-                    "previous resident Kata turn did not close its observer fence"
-                )
-            else:
-                self._controller.rotate_if_needed(threshold=GUEST_OBSERVER_ROTATE_BYTES)
-            self._cursor = self._controller.begin(user_uid=self._cursor_uid)
-            return self._cursor
-
-    def finish_guest_observation(self) -> GuestObservation:
-        """Close the turn fence before removing this disposable Kata guest."""
-        return self._close_observation(
-            terminate=False,
-            destroy=self._process.poll() is not None,
-        )
-
-    def wait(self) -> int:
-        """Reap the agent, then drain telemetry before its guest disappears."""
-        returncode = super().wait()
-        self._close_observation(terminate=False, destroy=True)
-        return returncode
-
-
 class ProcessBackend(SandboxBackend):
-    """Run the agent as a plain subprocess — **no isolation whatsoever**.
+    """Unisolated subprocess backend retained solely as a unit-test seam.
 
-    Legitimate only where something *else* is the boundary: an ephemeral CI VM
-    (the Actions dogfood) or a developer's own machine. On a shared host this
-    gives the agent, and anything in the repository it executes, the runner's
-    own privileges. :meth:`preflight` therefore refuses to start unless the
-    operator has explicitly acknowledged that.
+    It cannot advertise the shared-live capability and therefore cannot claim
+    a runnable job. Keeping it makes deterministic protocol tests possible
+    without leaving an executable legacy deployment topology behind.
     """
 
     name = "process"
@@ -681,14 +468,14 @@ class ProcessBackend(SandboxBackend):
     def __init__(self, *, acknowledged_unsafe: bool = False) -> None:
         self._acknowledged = acknowledged_unsafe
 
-    def preflight(self, workdir_root: str | None = None) -> None:
+    def preflight(self) -> None:
         """Refuse to run unisolated unless explicitly acknowledged."""
         if not self._acknowledged:
             raise SandboxError(
                 "the 'process' sandbox backend provides no isolation: the agent "
                 "runs as the runner's own user, which means it can read the "
-                "dispatcher credential out of /proc and claim other tenants' "
-                "jobs. Set AGENT_SANDBOX_ALLOW_UNISOLATED=1 to accept that "
+                "host and clone credentials out of /proc and act as the trusted "
+                "runner. Set AGENT_SANDBOX_ALLOW_UNISOLATED=1 to accept that "
                 "(only valid single-tenant, where an ephemeral VM is the real "
                 "boundary), or use AGENT_SANDBOX_BACKEND=container."
             )
@@ -726,219 +513,8 @@ class ProcessBackend(SandboxBackend):
 # ── container: docker / kata ───────────────────────────────────────────
 
 
-class _ContainerTerminalProcess(TerminalProcess):
-    """An interactive ``docker run -it`` process with a server-owned name."""
-
-    def __init__(
-        self,
-        process: subprocess.Popen[bytes],
-        *,
-        docker_binary: str,
-        container_name: str,
-        input_fd: int | None,
-    ) -> None:
-        self._process = process
-        self._docker_binary = docker_binary
-        self._container_name = container_name
-        self._input_fd = input_fd
-        self._state_lock = threading.Lock()
-        self._write_lock = threading.Lock()
-        self._killed = False
-        self._suspended = False
-
-    def chunks(self) -> Iterator[bytes]:
-        """Yield the raw combined PTY stream from Docker."""
-        assert self._process.stdout is not None
-        while chunk := self._process.stdout.read(64 * 1024):
-            yield chunk
-
-    def write(self, data: bytes) -> None:
-        """Forward terminal input to the attached container."""
-        with self._write_lock:
-            if self._process.poll() is not None or self._input_fd is None:
-                raise SandboxError("terminal is closed")
-            try:
-                remaining = memoryview(data)
-                while remaining:
-                    written = os.write(self._input_fd, remaining)
-                    if written == 0:
-                        raise OSError("terminal input closed")
-                    remaining = remaining[written:]
-            except OSError as exc:
-                raise SandboxError("terminal is closed") from exc
-
-    def _close_input(self) -> None:
-        """Close the host PTY exactly once, serialized against writers."""
-        with self._write_lock:
-            input_fd = self._input_fd
-            self._input_fd = None
-            if input_fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(input_fd)
-
-    def resize(self, rows: int, cols: int) -> None:
-        """Resize the named container's allocated TTY."""
-        with self._write_lock:
-            if self._input_fd is not None:
-                try:
-                    _set_pty_size(self._input_fd, rows, cols)
-                except OSError as exc:
-                    raise SandboxError("terminal cannot be resized") from exc
-        try:
-            result = subprocess.run(
-                [
-                    self._docker_binary,
-                    "container",
-                    "resize",
-                    "--height",
-                    str(rows),
-                    "--width",
-                    str(cols),
-                    self._container_name,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise SandboxError("terminal cannot be resized") from exc
-        if result.returncode != 0:
-            raise SandboxError("terminal cannot be resized: " + result.stderr.strip()[:200])
-
-    def _set_suspended(self, suspended: bool) -> None:
-        """Pause or resume the named container with input serialized around it."""
-        action = "pause" if suspended else "unpause"
-        with self._state_lock, self._write_lock:
-            if self._killed or self._process.poll() is not None:
-                return
-            if self._suspended is suspended:
-                return
-            try:
-                result = subprocess.run(
-                    [self._docker_binary, action, self._container_name],
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                    check=False,
-                )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                raise SandboxError(f"terminal cannot be {action}d") from exc
-            stderr = result.stderr.strip()
-            already_stopped = any(
-                message in stderr.lower() for message in ("is not running", "no such container")
-            )
-            if result.returncode != 0 and not already_stopped:
-                raise SandboxError(f"terminal cannot be {action}d: " + result.stderr.strip()[:200])
-            self._suspended = suspended
-
-    def suspend(self) -> None:
-        """Freeze the complete container process tree without closing its PTY."""
-        self._set_suspended(True)
-
-    def resume(self) -> None:
-        """Resume a container previously frozen for workspace coordination."""
-        self._set_suspended(False)
-
-    def kill(self) -> None:
-        """Kill the named container and confirm both sides are gone.
-
-        ``docker kill`` is only the first attempt: it can race startup or fail
-        transiently.  ``rm --force`` is the authoritative cleanup operation,
-        and the local Docker client must also have exited before this method is
-        allowed to report success.  A failed attempt deliberately leaves
-        ``_killed`` false so the broker can retry the same opaque session id.
-        """
-        with self._state_lock:
-            if self._killed:
-                return
-            try:
-                killed = subprocess.run(
-                    [self._docker_binary, "kill", self._container_name],
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                    check=False,
-                )
-                if killed.returncode != 0:
-                    logger.warning(
-                        "agent_sandbox_terminal_docker_kill_failed",
-                        extra={"event": "agent_sandbox_terminal_docker_kill_failed"},
-                    )
-            except (OSError, subprocess.TimeoutExpired):
-                logger.warning(
-                    "agent_sandbox_terminal_docker_kill_failed",
-                    extra={"event": "agent_sandbox_terminal_docker_kill_failed"},
-                    exc_info=True,
-                )
-
-            client_stopped = self._process.poll() is not None
-            if not client_stopped:
-                try:
-                    os.killpg(self._process.pid, signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    with contextlib.suppress(OSError):
-                        self._process.kill()
-                try:
-                    self._process.wait(timeout=5)
-                    client_stopped = True
-                except subprocess.TimeoutExpired:
-                    with contextlib.suppress(OSError):
-                        self._process.kill()
-                    try:
-                        self._process.wait(timeout=2)
-                        client_stopped = True
-                    except subprocess.TimeoutExpired:
-                        pass
-
-            # ``docker kill`` can race container creation, natural exit, or
-            # ``docker run --rm`` removing the container asynchronously. Retry
-            # only that known transitional response; every other failure still
-            # retains the session so a later kill can confirm cleanup.
-            for attempt in range(20):
-                try:
-                    removed = subprocess.run(
-                        [self._docker_binary, "rm", "--force", self._container_name],
-                        capture_output=True,
-                        text=True,
-                        timeout=15,
-                        check=False,
-                    )
-                except (OSError, subprocess.TimeoutExpired) as exc:
-                    raise SandboxError("terminal container cleanup could not be confirmed") from exc
-                stderr = removed.stderr.lower()
-                missing = "no such container" in stderr
-                if removed.returncode == 0 or missing:
-                    break
-                removal_in_progress = (
-                    "removal of container" in stderr and "is already in progress" in stderr
-                )
-                if not removal_in_progress or attempt == 19:
-                    raise SandboxError(
-                        "terminal container cleanup could not be confirmed: "
-                        + removed.stderr.strip()[:200]
-                    )
-                time.sleep(0.05)
-            if not client_stopped or self._process.poll() is None:
-                raise SandboxError("terminal Docker client could not be stopped")
-            self._close_input()
-            self._killed = True
-
-    def wait(self) -> int:
-        """Wait for the attached Docker client and return its status."""
-        try:
-            return self._process.wait()
-        finally:
-            self._close_input()
-
-
-def _set_pty_size(fd: int, rows: int, cols: int) -> None:
-    """Set a host PTY size using the platform's native winsize structure."""
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-
-
 class ContainerBackend(SandboxBackend):
-    """Run the agent in a throwaway container, optionally VM-isolated.
+    """Configure and attest retained chat containers, optionally VM-isolated.
 
     ``runtime=None`` gives an ordinary (shared-kernel) container, which is a
     reasonable boundary for repositories you already trust. ``runtime`` set to
@@ -948,9 +524,9 @@ class ContainerBackend(SandboxBackend):
     means one kernel bug reaches every tenant.
 
     Networking is a policy input rather than a default: the sandbox must reach
-    the gateway (models + event reporting) and, during setup, package
-    registries — but nothing else. ``network`` names the docker network that
-    encodes that policy for this deployment.
+    the fixed inference and MCP relays and, during setup, package registries —
+    but nothing else. ``network`` names the docker network that encodes that
+    policy for this deployment; event reporting stays in the trusted runner.
     """
 
     name = "container"
@@ -965,6 +541,8 @@ class ContainerBackend(SandboxBackend):
         extra_args: list[str] | None = None,
         allow_open_network: bool = False,
         egress: EgressPolicy | None = None,
+        chat_network_pool: str = "10.240.0.0/16",
+        sandbox_namespace: str = "default",
         uid: int = SANDBOX_UID,
         gid: int = SANDBOX_GID,
         home: str = SANDBOX_HOME,
@@ -976,13 +554,19 @@ class ContainerBackend(SandboxBackend):
         self.extra_args = extra_args or []
         self.allow_open_network = allow_open_network
         self.egress = egress
+        # Per-chat internal bridges must not consume Docker's tiny default
+        # address pools (commonly only 31 networks). ChatSandboxManager splits
+        # this operator-overridable RFC1918 pool into /29 phase networks.
+        self.chat_network_pool = chat_network_pool
+        if not sandbox_namespace or "\x00" in sandbox_namespace or len(sandbox_namespace) > 128:
+            raise ValueError("sandbox_namespace must be a non-empty value of at most 128 bytes")
+        # A Docker daemon may host sibling staging/production or local checkout
+        # stacks. Their control-plane databases are independent, so lifecycle
+        # discovery must never adopt another stack's retained containers.
+        self.sandbox_namespace = sandbox_namespace
         self.uid = uid
         self.gid = gid
         self.home = home
-        # Replaced with a stable, root-scoped value when the workspace broker
-        # starts. The ephemeral value prevents accidental broad cleanup if a
-        # backend is constructed outside that broker-owned lifecycle.
-        self._terminal_owner_id = "unscoped-" + secrets.token_hex(12)
         # Filled by the first version_stamp() call. The image is pinned for
         # this backend's lifetime, so one inspect answers for every heartbeat.
         self._version_stamp: dict[str, Any] | None = None
@@ -996,7 +580,7 @@ class ContainerBackend(SandboxBackend):
 
     @property
     def provides_isolation(self) -> bool:
-        """The disposable container, not the agent CLI, is the boundary."""
+        """The retained container, not the Agent CLI process, is the boundary."""
         return True
 
     def sandbox_metadata(self) -> dict[str, str]:
@@ -1109,126 +693,11 @@ class ContainerBackend(SandboxBackend):
         """
         return {"HOME": self.home, "PATH": SANDBOX_PATH, "LANG": "C.UTF-8"}
 
-    def prepare_terminal_broker(self, workdir_root: str) -> None:
-        """Adopt a stable owner scope and remove only this broker's crash orphans.
-
-        One resolved workdir root may have exactly one active workspace broker.
-        That single-active-broker invariant lets a restarted broker reclaim its
-        own terminal containers without touching peers that share the Docker
-        daemon under a different root. This runs only from broker lifespan,
-        never from general runner preflight.
-        """
-        resolved_root = os.path.realpath(workdir_root)
-        digest = hashlib.sha256(os.fsencode(resolved_root)).hexdigest()[:32]
-        owner_id = f"workdir-{digest}"
-        try:
-            listed = subprocess.run(
-                [
-                    self.docker_binary,
-                    "container",
-                    "ls",
-                    "--all",
-                    "--quiet",
-                    "--filter",
-                    f"label={TERMINAL_CONTAINER_LABEL}=true",
-                    "--filter",
-                    f"label={TERMINAL_CONTAINER_OWNER_LABEL}={owner_id}",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise SandboxError("terminal crash cleanup could not inspect containers") from exc
-        if listed.returncode != 0:
-            raise SandboxError(
-                "terminal crash cleanup could not inspect containers: "
-                + listed.stderr.strip()[:200]
-            )
-        container_ids = listed.stdout.split()
-        if container_ids:
-            try:
-                removed = subprocess.run(
-                    [self.docker_binary, "rm", "--force", *container_ids],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    check=False,
-                )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                raise SandboxError("terminal crash cleanup could not remove containers") from exc
-            if removed.returncode != 0:
-                raise SandboxError(
-                    "terminal crash cleanup could not remove containers: "
-                    + removed.stderr.strip()[:200]
-                )
-        self._terminal_owner_id = owner_id
-
-    def adopt_workdir(self, path: str) -> None:
-        """Give the job worktree to the sandbox user before the agent runs.
-
-        The runner creates and populates this tree as itself (root, in the
-        Compose deployment) while the sandbox runs unprivileged. Without this
-        the agent cannot write a single file — and git refuses to operate at
-        all, because a repository owned by another user is "dubious ownership".
-        """
-        try:
-            for target, _is_dir in _walk_entries(path):
-                # lchown, not chown: a symlink in the tree must not be followed
-                # to whatever it points at outside the worktree.
-                with contextlib.suppress(FileNotFoundError):
-                    os.lchown(target, self.uid, self.gid)
-        except PermissionError:
-            # An unprivileged runner cannot give the tree away. World-writable
-            # is the only remaining way for the sandbox user to work, and it is
-            # only defensible on a dedicated single-purpose host.
-            #
-            # It has to be the whole tree. Opening up only the root leaves every
-            # checked-out file at its original mode and owner, so the agent can
-            # create new files and cannot edit any existing one — which is most
-            # of what an agent does. That fallback reads as working and is not.
-            self._make_world_writable(path)
-            logger.warning(
-                "agent_sandbox_workdir_world_writable",
-                extra={
-                    "event": "agent_sandbox_workdir_world_writable",
-                    "detail": (
-                        "the runner is not root and cannot chown the job worktree to "
-                        f"uid {self.uid}; the tree was made world-writable instead. "
-                        "Run the runner as root, or accept that any local user can "
-                        "read and modify job worktrees on this host — including "
-                        "planting code the agent will then execute."
-                    ),
-                },
-            )
-
-    @staticmethod
-    def _make_world_writable(path: str) -> None:
-        """Grant everyone read/write on the tree, and traverse on directories."""
-        for target, is_dir in _walk_entries(path):
-            # chmod follows symlinks and there is no lchmod on Linux, so a link
-            # in the worktree would otherwise let the agent widen permissions
-            # on a file outside it.
-            if os.path.islink(target):
-                continue
-            try:
-                mode = os.stat(target).st_mode & 0o7777
-                # `a+rwX`: the execute bit only where it already means something
-                # (directories, and files that were already executable), so this
-                # does not turn every data file into a program.
-                mode |= 0o666 | (0o111 if is_dir or mode & 0o111 else 0)
-                os.chmod(target, mode)
-            except OSError:
-                continue
-
-    def preflight(self, workdir_root: str | None = None) -> None:
+    def preflight(self) -> None:
         """Verify the container runtime is usable before accepting jobs.
 
-        ``workdir_root``, when given, is test-mounted: a path the daemon cannot
-        bind (a macOS temp dir under colima, a directory outside the VM's
-        shared mounts) otherwise fails every single job with an opaque exit 125
-        instead of failing once at startup.
+        Retained chat workspaces live in Docker's writable layer, so this
+        preflight deliberately has no host-path or bind-mount probe.
         """
         try:
             result = subprocess.run(
@@ -1244,8 +713,6 @@ class ContainerBackend(SandboxBackend):
             raise SandboxError(f"{self.docker_binary} is not usable: {result.stderr.strip()[:200]}")
         self._probe_kernel_boundary()
         self._check_networks_are_closed()
-        if workdir_root is not None:
-            self._check_bind_mountable(workdir_root)
         if not self.is_vm_isolated:
             logger.warning(
                 "agent_sandbox_shared_kernel",
@@ -1265,41 +732,31 @@ class ContainerBackend(SandboxBackend):
         # shared-kernel boundary, not a failed VM probe.
         if not self.runtime or self.runtime == "runc":
             return
-        if self.runtime == KATA_RUNTIME:
-            probe = self._probe_kata_observer_exec()
-        else:
-            argv = [
-                self.docker_binary,
-                "run",
-                "--rm",
-                "--network",
-                "none",
-                "--runtime",
-                self.runtime,
-                "--entrypoint",
-                "/bin/sh",
-                self.image,
-                "-c",
-                "uname -r",
-            ]
-            try:
-                probe = subprocess.run(
-                    argv,
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                    check=False,
-                )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                raise SandboxError(
-                    f"could not probe sandbox runtime {self.runtime!r}: {exc}"
-                ) from exc
+        argv = [
+            self.docker_binary,
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--runtime",
+            self.runtime,
+            "--entrypoint",
+            "/bin/sh",
+            self.image,
+            "-c",
+            "uname -r",
+        ]
+        try:
+            probe = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SandboxError(f"could not probe sandbox runtime {self.runtime!r}: {exc}") from exc
         if probe.returncode != 0:
-            if self.runtime == KATA_RUNTIME:
-                raise SandboxError(
-                    "the Kata guest could not load the eBPF process observer through the "
-                    f"sandbox's privileged exec path: {probe.stderr.strip()[:200]}"
-                )
             raise SandboxError(
                 f"could not start sandbox image {self.image!r} under runtime "
                 f"{self.runtime!r}: {probe.stderr.strip()[:200]}"
@@ -1309,7 +766,7 @@ class ContainerBackend(SandboxBackend):
             raise SandboxError(
                 f"sandbox runtime {self.runtime!r} returned no guest kernel from uname -r"
             )
-        guest_kernel = lines[0] if self.runtime == KATA_RUNTIME else lines[-1]
+        guest_kernel = lines[-1]
         host_kernel = str(self._kernel_probe["host_kernel"])
         if guest_kernel == host_kernel:
             if self.runtime == KATA_RUNTIME:
@@ -1318,124 +775,7 @@ class ContainerBackend(SandboxBackend):
                     f"{host_kernel!r}; refusing to claim VM isolation"
                 )
             return
-        if self.runtime == KATA_RUNTIME:
-            expected_observer = f"freeinference-guest-observer-v{GUEST_OBSERVER_VERSION}"
-            if (
-                len(lines) != 3
-                or lines[1] != expected_observer
-                or lines[2] != "freeinference-tool-mark-v1"
-            ):
-                raise SandboxError(
-                    "the Kata guest could not start the eBPF process observer and "
-                    "trusted tool-marker helper; install the matching sandbox image "
-                    "and a Kata debug/eBPF kernel with BTF support"
-                )
         self._kernel_probe["guest_kernel"] = guest_kernel
-
-    def _probe_kata_observer_exec(self) -> subprocess.CompletedProcess[str]:
-        """Prove the exact non-root-container/privileged-exec BPF path works.
-
-        ``docker exec --privileged`` expands the new process's capabilities but
-        retains the container's seccomp filter. A standalone privileged
-        ``docker run`` therefore proves the wrong thing: it can load BPF while
-        the retained sandbox path still receives ``EPERM``. The disposable
-        container below has the same capability and no-new-privileges shape as
-        a real chat sandbox. ``CAP_BPF`` stays only in its bounding set because
-        the init and agent UIDs are non-root; it also causes Docker's default
-        seccomp profile to admit the BPF syscall for the fixed privileged exec.
-        """
-        container_name = f"hyi-kata-observer-probe-{secrets.token_hex(12)}"
-        launch = [
-            self.docker_binary,
-            "run",
-            "--rm",
-            "--detach",
-            "--name",
-            container_name,
-            "--network",
-            "none",
-            "--runtime",
-            KATA_RUNTIME,
-            "--user",
-            f"{self.uid}:{self.gid}",
-            "--cap-drop",
-            "ALL",
-            "--cap-add",
-            "BPF",
-            "--security-opt",
-            "no-new-privileges",
-            "--entrypoint",
-            "/bin/sh",
-            self.image,
-            "-c",
-            "exec sleep 300",
-        ]
-        try:
-            started = subprocess.run(
-                launch,
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise SandboxError(f"could not probe sandbox runtime {KATA_RUNTIME!r}: {exc}") from exc
-        if started.returncode != 0:
-            raise SandboxError(
-                f"could not start sandbox image {self.image!r} under runtime "
-                f"{KATA_RUNTIME!r}: {started.stderr.strip()[:200]}"
-            )
-        try:
-            return subprocess.run(
-                [
-                    self.docker_binary,
-                    "exec",
-                    "--privileged",
-                    "--user",
-                    "0:0",
-                    "--workdir",
-                    "/",
-                    container_name,
-                    "/bin/sh",
-                    "-c",
-                    f"uname -r && {GUEST_OBSERVER_BINARY} --self-test "
-                    f"&& exec {TOOL_MARK_HELPER} --self-test",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise SandboxError(f"could not probe sandbox runtime {KATA_RUNTIME!r}: {exc}") from exc
-        finally:
-            # Exact generated name, and --rm on the container as a second fence.
-            # Cleanup failure is logged rather than masking the observer verdict;
-            # the five-minute sleep still bounds the disposable guest's life.
-            try:
-                removed = subprocess.run(
-                    [self.docker_binary, "rm", "--force", container_name],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    check=False,
-                )
-                if removed.returncode != 0:
-                    logger.warning(
-                        "kata_observer_probe_cleanup_failed",
-                        extra={
-                            "event": "kata_observer_probe_cleanup_failed",
-                            "detail": removed.stderr.strip()[:200],
-                        },
-                    )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                logger.warning(
-                    "kata_observer_probe_cleanup_failed",
-                    extra={
-                        "event": "kata_observer_probe_cleanup_failed",
-                        "detail": str(exc)[:200],
-                    },
-                )
 
     def _check_networks_are_closed(self) -> None:
         """Check every network a phase can run on, not just the default one.
@@ -1624,12 +964,12 @@ class ContainerBackend(SandboxBackend):
     def check_gateway_reachable(self, base_url: str) -> None:
         """Fail startup if the sandbox cannot reach the gateway it will be given.
 
-        `platform_only` means "our gateway and nothing else", which quietly
-        assumes the gateway is *on that network* — true when it is the compose
-        `backend` service, false the moment an operator points
-        AGENT_GATEWAY_URL at a remote one. The sandbox then resolves nothing,
-        every job dies at its first model call, and the error reads like a
-        broken model rather than a network that was never going to work.
+        `platform_only` means only the platform's fixed inference and MCP
+        relays. This method proves the inference half and therefore assumes the
+        gateway relay is *on that network*. If an operator points
+        AGENT_GATEWAY_URL at an unreachable remote address, every job dies at
+        its first model call and the error reads like a broken model rather
+        than a network that was never going to work.
 
         Probed rather than inferred: one container on the phase's real network,
         making a real request. A heuristic on the URL would be wrong for every
@@ -1697,8 +1037,8 @@ class ContainerBackend(SandboxBackend):
         detail = {
             "unresolved": (
                 f"cannot resolve {host!r}. A closed `platform_only` network only works "
-                "when the gateway is on it (the compose `backend` service); for a "
-                "gateway on another machine, put a relay for it on this network or give "
+                "when the fixed inference relay is on it; for a gateway on another "
+                "machine, put its fixed relay on this network or give "
                 "the agent phase a network that routes there (AGENT_EGRESS_AGENT_TIER="
                 "custom with AGENT_EGRESS_NETWORK_CUSTOM)."
             ),
@@ -1715,475 +1055,19 @@ class ContainerBackend(SandboxBackend):
             "first model call."
         )
 
-    def _check_bind_mountable(self, workdir_root: str) -> None:
-        """Fail startup if the daemon cannot bind-mount the job workdir root."""
-        # Under the runtime jobs will actually use. Without `--runtime` the
-        # probe ran under the daemon's default (runc) while the shipped default
-        # backend is kata — so it passed on a host with no Kata shim, and every
-        # job then died at spawn, which is exactly what this check exists to
-        # turn into one startup failure.
-        argv = [self.docker_binary, "run", "--rm"]
-        if self.runtime:
-            argv += ["--runtime", self.runtime]
-        argv += [
-            "--mount",
-            f"type=bind,source={workdir_root},target=/probe",
-            "--user",
-            f"{self.uid}:{self.gid}",
-            "--entrypoint",
-            "true",
-            self.image,
-        ]
-        probe = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            check=False,
-        )
-        if probe.returncode != 0:
-            raise SandboxError(
-                f"the container runtime {self.runtime or 'default'} could not start a "
-                f"container mounting {workdir_root!r}: "
-                f"{probe.stderr.strip()[:200]}. Job worktrees must live on a path "
-                "the daemon can see (inside the VM for colima/Lima, or a shared "
-                "mount) — otherwise every job fails at spawn."
-            )
-
-    def _build_command(
-        self,
-        spec: SandboxSpec,
-        *,
-        terminal_name: str | None = None,
-        job_name: str | None = None,
-        detached: bool = False,
-        observer_ready: bool = False,
-        command_argv: list[str] | None = None,
-    ) -> list[str]:
-        """Compose the shared, security-sensitive ``docker run`` argv.
-
-        A terminal differs only by a TTY and an opaque, server-generated name
-        used for resize/kill. Network, privilege, mount and resource flags
-        share this builder so future hardening applies to both execution paths.
-        """
-        argv = [self.docker_binary, "run"]
-        if detached:
-            argv.append("--detach")
-        else:
-            argv += ["--rm", "--interactive"]
-        if job_name is not None:
-            # Named for one reason: the host-side sampler resolves a
-            # container's cgroup through the daemon, and an anonymous
-            # container cannot be asked about. Server-generated like the
-            # terminal name below, and deliberately unlabelled — the terminal
-            # crash sweep must not mistake a running job for a stray TTY.
-            argv += ["--name", job_name]
-        if terminal_name is not None:
-            argv += [
-                "--tty",
-                "--name",
-                terminal_name,
-                "--label",
-                f"{TERMINAL_CONTAINER_LABEL}=true",
-                "--label",
-                f"{TERMINAL_CONTAINER_OWNER_LABEL}={self._terminal_owner_id}",
-            ]
-        argv += [
-            # The sandbox is thrown away after the job, so nothing it writes
-            # outside the mounted worktree can persist or leak to a neighbour.
-            "--mount",
-            f"type=bind,source={spec.workdir},target=/workspace",
-            "--workdir",
-            "/workspace",
-        ]
-        if spec.state_dir is not None:
-            # Deliberately outside /workspace: session files must never be
-            # able to leak into the patch the publisher pushes.
-            argv += [
-                "--mount",
-                f"type=bind,source={spec.state_dir},target={STATE_MOUNT_TARGET}",
-            ]
-        argv += [
-            # Stated rather than inherited from the image: the runner chowns
-            # the worktree to exactly this id, and a silent drift between the
-            # two leaves the agent unable to write to its own working tree.
-            "--user",
-            f"{self.uid}:{self.gid}",
-            "--network",
-            self.network_for_phase(spec.phase),
-            "--memory",
-            spec.memory_limit,
-            "--cpus",
-            spec.cpu_limit,
-            # Defence in depth for the shared-kernel case; harmless under Kata.
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
-            "--pids-limit",
-            "512",
-        ]
-        if observer_ready:
-            argv += [
-                # Keep BPF in the bounding set so Docker's creation-time
-                # seccomp profile admits the syscall. PID 1 and the agent are
-                # still non-root, cap-dropped, and under no-new-privileges;
-                # only the source-controlled privileged exec below can use it.
-                "--cap-add",
-                "BPF",
-                "--tmpfs",
-                f"{GUEST_OBSERVER_ROOT}:rw,nosuid,nodev,noexec,mode=0700,uid=0,gid=0",
-                "--tmpfs",
-                (
-                    f"{_ONE_SHOT_ACTIVATION_TMPFS}:rw,nosuid,nodev,noexec,"
-                    f"mode=0700,uid={self.uid},gid={self.gid}"
-                ),
-            ]
-        if self.runtime:
-            argv += ["--runtime", self.runtime]
-        env = dict(spec.env)
-        if self.egress is not None:
-            # Policy last. A job's own environment must not be able to unset
-            # the proxy its phase is required to use — and the setup phase in
-            # particular arrives here with an empty env, so this is where the
-            # proxy reaches it at all.
-            env.update(self.egress.sandbox_env(spec.phase))
-        for key, value in sorted(env.items()):
-            argv += ["--env", f"{key}={value}"]
-        argv += self.extra_args
-        if detached:
-            argv += ["--entrypoint", "/bin/sh"]
-        argv.append(self.image)
-        argv += spec.argv if command_argv is None else command_argv
-        return argv
-
-    def build_command(self, spec: SandboxSpec, *, name: str | None = None) -> list[str]:
-        """Compose the ``docker run`` argv for one non-terminal job."""
-        return self._build_command(spec, job_name=name)
-
-    def build_terminal_command(self, spec: SandboxSpec, *, name: str) -> list[str]:
-        """Compose a contained ``docker run -it`` argv for a terminal."""
-        return self._build_command(spec, terminal_name=name)
-
     def spawn(self, spec: SandboxSpec) -> SandboxProcess:
-        """Start the agent inside a throwaway container."""
-        if spec.observe_processes and self.runtime == KATA_RUNTIME:
-            return self._spawn_observed(spec)
-        container_name = f"hyi-job-{secrets.token_hex(12)}"
-        command = self.build_command(spec, name=container_name)
-        logger.info(
-            "agent_sandbox_spawn",
-            extra={
-                "event": "agent_sandbox_spawn",
-                "backend": self.name,
-                "vm_isolated": self.is_vm_isolated,
-                "image": self.image,
-            },
-        )
-        return _PopenProcess(
-            subprocess.Popen(
-                command,
-                # The docker client itself needs a real environment (DOCKER_HOST,
-                # certs); the agent's environment is passed via --env above and
-                # does not leak into the client's.
-                env={**os.environ},
-                # `docker run --interactive` forwards the client's stdin, so a
-                # live pipe here is a live pipe inside the sandbox (HOT). The
-                # one-shot world keeps DEVNULL: a CLI that would block on a
-                # silent open pipe must see EOF immediately.
-                stdin=subprocess.PIPE if spec.live_input else subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-            ),
-            container=container_name,
-        )
-
-    def _spawn_observed(self, spec: SandboxSpec) -> SandboxProcess:
-        """Start eBPF before one Kata agent and keep the guest until drain."""
-        container_name = f"hyi-job-{secrets.token_hex(12)}"
-        launch = self._build_command(
-            # The fixed init needs no per-attempt credential. Keep secrets out
-            # of the long-lived container config and pass them only to the
-            # attached agent exec below.
-            replace(spec, env={}),
-            job_name=container_name,
-            detached=True,
-            observer_ready=True,
-            command_argv=["-c", _ONE_SHOT_INIT_COMMAND],
-        )
-        logger.info(
-            "agent_sandbox_spawn",
-            extra={
-                "event": "agent_sandbox_spawn",
-                "backend": self.name,
-                "vm_isolated": True,
-                "image": self.image,
-                "process_observer": "kata-guest-ebpf-v1",
-            },
-        )
-        try:
-            started = subprocess.run(
-                launch,
-                env={**os.environ},
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise SandboxError(f"Kata turn container could not start: {exc}") from exc
-
-        removed = False
-        removal_lock = threading.Lock()
-
-        def remove_container() -> bool:
-            nonlocal removed
-            with removal_lock:
-                if removed:
-                    return True
-                detail = "container removal did not complete"
-                for attempt in range(20):
-                    try:
-                        result = subprocess.run(
-                            [self.docker_binary, "rm", "--force", container_name],
-                            env={**os.environ},
-                            capture_output=True,
-                            text=True,
-                            timeout=30,
-                            check=False,
-                        )
-                    except (OSError, subprocess.TimeoutExpired) as exc:
-                        detail = str(exc)
-                        break
-                    stderr = result.stderr.strip()
-                    if result.returncode == 0 or "No such container" in stderr:
-                        removed = True
-                        return True
-                    detail = stderr or f"docker rm exited {result.returncode}"
-                    in_progress = (
-                        "removal of container" in stderr and "is already in progress" in stderr
-                    )
-                    if not in_progress or attempt == 19:
-                        break
-                    time.sleep(0.05)
-                if not removed:
-                    logger.warning(
-                        "kata_one_shot_container_cleanup_failed",
-                        extra={
-                            "event": "kata_one_shot_container_cleanup_failed",
-                            "detail": detail[:300],
-                        },
-                    )
-                return removed
-
-        if started.returncode != 0:
-            remove_container()
-            raise SandboxError(
-                "Kata turn container could not start: " + started.stderr.strip()[:300]
-            )
-
-        def capture(argv: list[str], timeout_s: float):
-            return subprocess.run(
-                [
-                    self.docker_binary,
-                    "exec",
-                    "--user",
-                    "0:0",
-                    "--workdir",
-                    "/",
-                    container_name,
-                    *argv,
-                ],
-                env={**os.environ},
-                capture_output=True,
-                timeout=timeout_s,
-                check=False,
-            )
-
-        def privileged(argv: list[str], detach: bool, timeout_s: float):
-            command = [self.docker_binary, "exec"]
-            if detach:
-                command.append("--detach")
-            command += [
-                "--privileged",
-                "--user",
-                "0:0",
-                "--workdir",
-                "/",
-                container_name,
-                *argv,
-            ]
-            return subprocess.run(
-                command,
-                env={**os.environ},
-                capture_output=True,
-                timeout=timeout_s,
-                check=False,
-            )
-
-        controller = GuestObserverController(capture=capture, privileged=privileged)
-        cursor = controller.begin(user_uid=self.uid)
-
-        # Match the retained-container kill contract: the CLI becomes a
-        # session leader and records both PID and Linux start time, so a stale
-        # numeric PID can never signal a later process after reuse.
-        wrapper = (
-            'pidfile="$1"; shift; umask 0077; '
-            'cleanup() { rm -f -- "$pidfile"; }; trap cleanup EXIT; '
-            "setsid --fork --wait /bin/sh -c '"
-            'pidfile="$1"; shift; '
-            'fields=$(sed "s/^[^)]*) //" "/proc/$$/stat") || exit 126; '
-            'started=$(set -- $fields; printf "%s" "${20:-}"); '
-            'case "$started" in ""|*[!0-9]*) exit 126;; esac; '
-            'printf "%s %s\\n" "$$" "$started" > "$pidfile" || exit 126; '
-            'exec "$@"\' sh "$pidfile" "$@"'
-        )
-        exec_argv = ["/bin/sh", "-c", wrapper, "sh", _ONE_SHOT_PIDFILE, *spec.argv]
-        command = [self.docker_binary, "exec"]
-        if spec.live_input:
-            command.append("--interactive")
-        command += [
-            "--user",
-            f"{self.uid}:{self.gid}",
-            "--workdir",
-            "/workspace",
-        ]
-        env = dict(spec.env)
-        if self.egress is not None:
-            env.update(self.egress.sandbox_env(spec.phase))
-        for key, value in sorted(env.items()):
-            if not key or "=" in key or "\x00" in key or "\x00" in value:
-                remove_container()
-                raise SandboxError(f"invalid environment entry {key!r}")
-            command += ["--env", f"{key}={value}"]
-        command += [container_name, *exec_argv]
-
-        killer = (
-            'set -eu; expected_uid="$1"; pidfile="$2"; '
-            'attempt=0; while [ ! -e "$pidfile" ]; do attempt=$((attempt + 1)); '
-            '[ "$attempt" -lt 40 ] || exit 0; sleep 0.05; done; '
-            'read -r pid started extra < "$pidfile" || { rm -f -- "$pidfile"; exit 0; }; '
-            'case "$pid" in ""|*[!0-9]*) rm -f -- "$pidfile"; exit 0;; esac; '
-            'case "$started" in ""|*[!0-9]*) rm -f -- "$pidfile"; exit 0;; esac; '
-            '[ -z "$extra" ] || { rm -f -- "$pidfile"; exit 0; }; '
-            '[ "$(stat -c %u "/proc/$pid" 2>/dev/null || :)" = "$expected_uid" ] '
-            '|| { rm -f -- "$pidfile"; exit 0; }; '
-            'fields=$(sed "s/^[^)]*) //" "/proc/$pid/stat" 2>/dev/null || :); '
-            "set -- $fields; current_pgid=${3:-}; current_started=${20:-}; "
-            '[ "$current_pgid" = "$pid" ] && [ "$current_started" = "$started" ] '
-            '|| { rm -f -- "$pidfile"; exit 0; }; '
-            'kill -TERM -- "-$pid" 2>/dev/null || :; attempt=0; '
-            'while kill -0 -- "-$pid" 2>/dev/null; do attempt=$((attempt + 1)); '
-            '[ "$attempt" -lt 40 ] || { kill -KILL -- "-$pid" 2>/dev/null || :; '
-            'attempt=0; while kill -0 -- "-$pid" 2>/dev/null; do '
-            'attempt=$((attempt + 1)); [ "$attempt" -lt 100 ] || exit 124; '
-            "sleep 0.05; done; break; }; "
-            'sleep 0.05; done; rm -f -- "$pidfile"'
-        )
-
-        def terminate_tree() -> None:
-            result = subprocess.run(
-                [
-                    self.docker_binary,
-                    "exec",
-                    "--privileged",
-                    "--user",
-                    "0:0",
-                    "--workdir",
-                    "/",
-                    container_name,
-                    "/bin/sh",
-                    "-c",
-                    killer,
-                    "sh",
-                    str(self.uid),
-                    _ONE_SHOT_PIDFILE,
-                ],
-                env={**os.environ},
-                capture_output=True,
-                text=True,
-                timeout=20,
-                check=False,
-            )
-            if result.returncode != 0:
-                raise SandboxError(
-                    "Kata turn process cleanup failed: " + result.stderr.strip()[:300]
-                )
-
-        try:
-            process = subprocess.Popen(
-                command,
-                env={**os.environ},
-                stdin=subprocess.PIPE if spec.live_input else subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-            )
-        except Exception:
-            remove_container()
-            raise
-        return _ObservedContainerProcess(
-            process,
-            container=container_name,
-            controller=controller,
-            cursor=cursor,
-            terminate_tree=terminate_tree,
-            remove_container=remove_container,
+        """Reject the removed one-container-per-turn execution topology."""
+        raise SandboxError(
+            "direct container execution was removed; commands must run through "
+            "a RetainedChatBackend inside the chat group's existing container"
         )
 
     def spawn_terminal(self, spec: SandboxSpec, *, rows: int, cols: int) -> TerminalProcess:
-        """Start an attached TTY in a throwaway, named container."""
-        # Docker names accept this alphabet and the value is never supplied by
-        # a request, so it cannot become an argv or resource-name injection.
-        container_name = f"hyi-terminal-{secrets.token_hex(12)}"
-        command = self.build_terminal_command(spec, name=container_name)
-        logger.info(
-            "agent_sandbox_terminal_spawn",
-            extra={
-                "event": "agent_sandbox_terminal_spawn",
-                "backend": self.name,
-                "vm_isolated": self.is_vm_isolated,
-                "image": self.image,
-            },
+        """Reject the removed one-container-per-terminal topology."""
+        raise SandboxError(
+            "direct container terminals were removed; terminals must run through "
+            "a RetainedChatBackend inside the chat group's existing container"
         )
-        master_fd, slave_fd = os.openpty()
-        try:
-            _set_pty_size(slave_fd, rows, cols)
-            tty.setraw(slave_fd)
-            process = subprocess.Popen(
-                command,
-                env={**os.environ},
-                # Docker refuses ``--tty`` unless its own stdin is a TTY. The
-                # browser writes to the PTY master while Docker inherits the
-                # slave; stdout remains a pipe for the broker's output pump.
-                stdin=slave_fd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=0,
-                start_new_session=True,
-            )
-        except Exception:
-            with contextlib.suppress(OSError):
-                os.close(master_fd)
-            raise
-        finally:
-            with contextlib.suppress(OSError):
-                os.close(slave_fd)
-        terminal = _ContainerTerminalProcess(
-            process,
-            docker_binary=self.docker_binary,
-            container_name=container_name,
-            input_fd=master_fd,
-        )
-        # Docker accepts resize only after the container has reached running.
-        # The frontend sends its measured size again when the pane mounts, so
-        # an initial startup race is safe to ignore.
-        with contextlib.suppress(SandboxError):
-            terminal.resize(rows, cols)
-        return terminal
 
 
 # ── selection ──────────────────────────────────────────────────────────
@@ -2192,8 +1076,9 @@ class ContainerBackend(SandboxBackend):
 def build_backend_from_env(env: dict[str, str] | None = None) -> SandboxBackend:
     """Construct the configured backend.
 
-    ``AGENT_SANDBOX_BACKEND`` is ``process`` (default, CI/dev), ``container``
-    (shared kernel) or ``kata`` (VM-isolated container). The remaining
+    ``AGENT_SANDBOX_BACKEND`` is ``kata`` by default, ``container`` is the
+    explicit trusted-repository shared-kernel downgrade, and ``process`` is a
+    non-claimable test seam. The remaining
     variables tune the container backends: ``AGENT_SANDBOX_IMAGE``,
     ``AGENT_SANDBOX_NETWORK``, ``AGENT_SANDBOX_RUNTIME`` (overrides the Kata
     shim name), ``AGENT_SANDBOX_DOCKER``, ``AGENT_SANDBOX_EXTRA_ARGS`` and
@@ -2201,7 +1086,7 @@ def build_backend_from_env(env: dict[str, str] | None = None) -> SandboxBackend:
     custom sandbox image whose user differs from the one we ship.
     """
     source = env if env is not None else dict(os.environ)
-    choice = (source.get("AGENT_SANDBOX_BACKEND") or "process").strip().lower()
+    choice = (source.get("AGENT_SANDBOX_BACKEND") or "kata").strip().lower()
 
     if choice == "process":
         return ProcessBackend(
@@ -2231,6 +1116,8 @@ def build_backend_from_env(env: dict[str, str] | None = None) -> SandboxBackend:
             extra_args=shlex.split(source.get("AGENT_SANDBOX_EXTRA_ARGS") or ""),
             allow_open_network=source.get("AGENT_SANDBOX_ALLOW_OPEN_NETWORK", "") not in ("", "0"),
             egress=build_policy_from_env(source),
+            chat_network_pool=source.get("AGENT_EGRESS_CHAT_NETWORK_POOL") or "10.240.0.0/16",
+            sandbox_namespace=source.get("AGENT_SANDBOX_NAMESPACE") or "default",
             uid=int(source.get("AGENT_SANDBOX_UID") or SANDBOX_UID),
             gid=int(source.get("AGENT_SANDBOX_GID") or SANDBOX_GID),
             home=source.get("AGENT_SANDBOX_HOME") or SANDBOX_HOME,

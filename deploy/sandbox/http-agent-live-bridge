@@ -51,6 +51,55 @@ class BridgeError(RuntimeError):
     """A local protocol or server error that must fail closed."""
 
 
+def _is_platform_user(message: Any) -> bool:
+    """Distinguish one outer prompt from provider-internal continuations."""
+    if not isinstance(message, dict):
+        return False
+    info = message.get("info")
+    if not isinstance(info, dict) or info.get("role") != "user":
+        return False
+    parts = message.get("parts")
+    if not isinstance(parts, list):
+        raise BridgeError("native user message has no parts")
+    # A compaction request is represented as a user message with a dedicated
+    # part; auto-continue is a synthetic text part. Both belong to the already
+    # active platform turn. A genuine prompt has at least one non-synthetic,
+    # non-compaction part (text, file, image, etc.).
+    if any(isinstance(part, dict) and part.get("type") == "compaction" for part in parts):
+        return False
+    return any(
+        isinstance(part, dict)
+        and part.get("type") != "compaction"
+        and part.get("synthetic") is not True
+        for part in parts
+    )
+
+
+def fork_payload(messages: Any, source_native_turn_no: int) -> dict[str, str]:
+    """Resolve one settled ordinal to the servers' exclusive fork boundary."""
+    if source_native_turn_no < 1:
+        raise BridgeError("fork source_native_turn_no must be positive")
+    if not isinstance(messages, list):
+        raise BridgeError("native message history has an invalid shape")
+    user_messages = [
+        message["info"] for message in messages if _is_platform_user(message)
+    ]
+    if source_native_turn_no > len(user_messages):
+        raise BridgeError(
+            "native history does not contain the requested fork turn "
+            f"({source_native_turn_no} of {len(user_messages)})"
+        )
+    if source_native_turn_no == len(user_messages):
+        return {}
+    # Both pinned servers define messageID as an exclusive upper bound. The
+    # next user message includes the selected completed exchange without
+    # copying the prompt Edit & rewind replaces.
+    next_message_id = user_messages[source_native_turn_no].get("id")
+    if not isinstance(next_message_id, str) or not next_message_id:
+        raise BridgeError("next native user message has no id")
+    return {"messageID": next_message_id}
+
+
 class Bridge:
     def __init__(self, runtime: str) -> None:
         if runtime not in _RUNTIMES:
@@ -270,6 +319,9 @@ class Bridge:
         part = properties.get("part")
         if not session_id and isinstance(part, dict):
             session_id = part.get("sessionID")
+        info = properties.get("info")
+        if not session_id and isinstance(info, dict):
+            session_id = info.get("sessionID")
         if session_id != self.session_id:
             return
 
@@ -363,11 +415,23 @@ class Bridge:
             with self._turn_lock:
                 if self._turn_id is not None:
                     raise BridgeError("cannot fork an active session")
+            source_native_turn_no = command.get("source_native_turn_no")
+            if (
+                not isinstance(source_native_turn_no, int)
+                or isinstance(source_native_turn_no, bool)
+                or source_native_turn_no < 1
+            ):
+                raise BridgeError("fork source_native_turn_no must be a positive integer")
+            messages = self.request(
+                "GET",
+                f"/session/{urllib.parse.quote(str(self.session_id), safe='')}/message",
+            )
+            payload = fork_payload(messages, source_native_turn_no)
             child = self.request(
                 "POST",
                 f"/session/{urllib.parse.quote(str(self.session_id), safe='')}/fork?"
                 + urllib.parse.urlencode({"directory": self.workdir}),
-                {},
+                payload,
             )
             if not isinstance(child, dict) or not child.get("id"):
                 raise BridgeError("fork did not return a child session id")

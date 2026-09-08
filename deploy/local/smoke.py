@@ -131,9 +131,22 @@ def wait_job(client: Client, job_id: str) -> dict[str, Any]:
         if state in TERMINAL_STATES:
             if state != "succeeded":
                 raise RuntimeError(f"job {job_id} ended {state}: {job.get('detail')}")
+            require_assistant_reply(client, job_id)
             return job
         time.sleep(1)
     raise RuntimeError(f"job {job_id} did not settle within {JOB_TIMEOUT_S}s")
+
+
+def require_assistant_reply(client: Client, job_id: str) -> None:
+    """A successful confirmation task must have its own nonempty reply."""
+    thread = client.request(f"/api/v1/agent/jobs/{urllib.parse.quote(job_id)}/thread")
+    if not any(
+        item.get("job_id") == job_id
+        and item.get("role") == "assistant"
+        and str(item.get("content") or "").strip()
+        for item in thread.get("messages", [])
+    ):
+        raise RuntimeError(f"job {job_id} succeeded without an assistant reply")
 
 
 def wait_concurrently_running(client: Client, source_job_id: str, child_job_id: str) -> None:
@@ -189,6 +202,49 @@ def chat_container(sandbox_id: str) -> tuple[str, str, str]:
     ).stdout.strip()
     status, mounts = inspected.split("|", 1)
     return container_id, status, mounts
+
+
+def chat_private_network(container_id: str) -> str:
+    """Require one chat-private bridge containing only this chat and two relays."""
+    inspected = subprocess.run(
+        [
+            "docker",
+            "inspect",
+            "--format",
+            "{{json .NetworkSettings.Networks}}",
+            container_id,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    networks = json.loads(inspected)
+    if len(networks) != 1:
+        raise RuntimeError(f"chat {container_id[:12]} has non-exclusive networks: {networks}")
+    network_name = next(iter(networks))
+    if not network_name.startswith("freeinference-chat-net-"):
+        raise RuntimeError(f"chat {container_id[:12]} remained on shared network {network_name!r}")
+    raw = json.loads(
+        subprocess.run(
+            ["docker", "network", "inspect", network_name],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )[0]
+    labels = raw.get("Labels") or {}
+    members = raw.get("Containers") or {}
+    options = raw.get("Options") or {}
+    if labels.get("org.freeinference.chat-sandbox-network") != "true":
+        raise RuntimeError(f"chat network {network_name!r} has no ownership label")
+    if str(options.get("com.docker.network.bridge.inhibit_ipv4", "")).lower() != "true":
+        raise RuntimeError(f"chat network {network_name!r} still exposes a host IPv4 gateway")
+    if len(members) != 3 or not any(str(member).startswith(container_id) for member in members):
+        raise RuntimeError(
+            f"chat network {network_name!r} must contain one sandbox and two relays, "
+            f"found {[item.get('Name') for item in members.values()]}"
+        )
+    return network_name
 
 
 def wait_stopped(sandbox_id: str) -> str:
@@ -253,6 +309,7 @@ def main() -> int:
 
     print("[3/7] Every pinned CLI creates NEW then continues one live process", flush=True)
     sessions: dict[str, tuple[dict[str, Any], str, str]] = {}
+    private_networks: set[str] = set()
     for runtime in RUNTIMES:
         print(f"  {runtime}: first turn", flush=True)
         created = client.request(
@@ -274,6 +331,12 @@ def main() -> int:
         original_id, status, mounts = chat_container(sandbox_id)
         if status != "running" or mounts != "[]":
             raise RuntimeError(f"{runtime} new chat container is {status} with mounts {mounts}")
+        private_network = chat_private_network(original_id)
+        if private_network in private_networks:
+            raise RuntimeError(
+                f"{runtime} shares chat network {private_network!r} with another group"
+            )
+        private_networks.add(private_network)
 
         print(f"  {runtime}: follow-up", flush=True)
         follow_up = client.request(
@@ -298,7 +361,7 @@ def main() -> int:
     print("[4/7] One inactivity clock docker-stopped every mount-free container", flush=True)
 
     print("[5/7] Every CLI starts the same container and reports RESTORED", flush=True)
-    restored_sessions: dict[str, tuple[dict[str, Any], str, str]] = {}
+    restored_sessions: dict[str, tuple[dict[str, Any], dict[str, Any], str, str]] = {}
     for runtime, (live, sandbox_id, original_id) in sessions.items():
         print(f"  {runtime}: stopped-container follow-up", flush=True)
         restored_turn = client.request(
@@ -321,19 +384,28 @@ def main() -> int:
         stopped_id = wait_stopped(sandbox_id)
         if stopped_id != original_id:
             raise RuntimeError(f"{runtime} restored container changed before its next idle stop")
-        restored_sessions[runtime] = (restored, sandbox_id, original_id)
+        # Keep turn two as a historical native anchor. At fork time the source
+        # session already has turn three, so this exercises real prefix rewind
+        # rather than the old latest-only path.
+        restored_sessions[runtime] = (restored, live, sandbox_id, original_id)
 
     print(
         "[6/7] Every CLI forks immediately into a second session in the same workspace", flush=True
     )
     forked_sessions: dict[str, tuple[dict[str, Any], str, str]] = {}
-    for runtime, (source, sandbox_id, source_container_id) in restored_sessions.items():
+    for runtime, (
+        source,
+        historical_anchor,
+        sandbox_id,
+        source_container_id,
+    ) in restored_sessions.items():
         print(
-            f"  {runtime}: prompt-free native fork + two independently admitted turns", flush=True
+            f"  {runtime}: historical native fork + two independently admitted turns",
+            flush=True,
         )
         source_thread_id = str(source["thread_id"])
         forked = client.request(
-            f"/api/v1/agent/jobs/{urllib.parse.quote(str(source['id']))}/fork",
+            f"/api/v1/agent/jobs/{urllib.parse.quote(str(historical_anchor['id']))}/fork",
             method="POST",
             headers={"Idempotency-Key": f"local-smoke-{runtime}-{secrets.token_hex(8)}"},
         )
@@ -357,12 +429,24 @@ def main() -> int:
         target_thread = client.request(
             f"/api/v1/agent/jobs/{urllib.parse.quote(str(forked['id']))}/thread"
         )
-        source_words = [(item["role"], item["content"]) for item in source_thread["messages"]]
+        anchor_turn_no = int(historical_anchor.get("turn_no") or 0)
+        source_prefix_ids = {
+            str(item["id"])
+            for item in source_thread.get("jobs") or []
+            if int(item.get("turn_no") or 0) <= anchor_turn_no
+        }
+        source_words = [
+            (item["role"], item["content"])
+            for item in source_thread["messages"]
+            if str(item["job_id"]) in source_prefix_ids
+        ]
         target_words = [(item["role"], item["content"]) for item in target_thread["messages"]]
-        if len(target_thread.get("jobs") or []) != len(source_thread.get("jobs") or []):
-            raise RuntimeError(f"{runtime} native fork did not copy the settled job prefix")
+        if len(target_thread.get("jobs") or []) != len(source_prefix_ids):
+            raise RuntimeError(f"{runtime} historical fork copied the wrong job prefix")
+        if len(source_prefix_ids) >= len(source_thread.get("jobs") or []):
+            raise RuntimeError(f"{runtime} smoke did not select a genuinely historical anchor")
         if target_words != source_words:
-            raise RuntimeError(f"{runtime} native fork did not copy the conversation prefix")
+            raise RuntimeError(f"{runtime} historical fork copied the wrong conversation prefix")
 
         # Queue both before awaiting either. With two host slots this crosses
         # the real no-group-turn-lock path: source and child own distinct
@@ -444,7 +528,8 @@ def main() -> int:
     print(
         "PASS: OAuth + all five CLIs NEW → LIVE → docker stop → RESTORED; "
         "all five native-fork source/child sessions stay LIVE in one workspace; "
-        "group stop → child RESTORED; snapshots publish; all containers keep mounts=[]",
+        "group stop → child RESTORED; snapshots publish; all containers keep mounts=[] "
+        "and unrelated groups use distinct relay-only networks",
         flush=True,
     )
     return 0

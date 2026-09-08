@@ -294,6 +294,34 @@ def test_a_heartbeat_does_not_silence_a_healthy_host(monkeypatch) -> None:
     assert beat.claimable, "the host stopped claiming the moment the pool answered"
 
 
+def test_each_heartbeat_recomputes_dynamic_host_capabilities(monkeypatch) -> None:
+    identity = enrollment.HostIdentity(host="h1", credential="c")
+    advertised = ["shared-sandbox-v1"]
+    bodies = []
+    beat = enrollment.HostHeartbeat(
+        base_url="http://cp",
+        identity=identity,
+        capabilities=lambda: list(advertised),
+    )
+
+    def record(url, body, bearer=""):
+        bodies.append(body)
+        if len(bodies) == 1:
+            advertised.append("shared-sandbox-deployment:target")
+        else:
+            beat._stop.set()
+        return {"status": "online", "heartbeat_interval_seconds": 0}
+
+    monkeypatch.setattr(enrollment, "_post", record)
+    beat._run()
+
+    assert bodies[0]["capabilities"] == ["shared-sandbox-v1"]
+    assert bodies[1]["capabilities"] == [
+        "shared-sandbox-v1",
+        "shared-sandbox-deployment:target",
+    ]
+
+
 def test_a_rejected_credential_stops_claims_for_good(monkeypatch) -> None:
     """401 and 403 name *this host*; there is nothing to retry."""
     identity = enrollment.HostIdentity(host="h1", credential="c")
@@ -483,46 +511,7 @@ def test_the_heartbeat_thread_survives_an_unexpected_exception(monkeypatch) -> N
     assert not beat.removed.is_set(), "an unexpected exception must not look like removal"
 
 
-def test_establish_residency_hands_back_the_generation_and_the_grant(monkeypatch) -> None:
-    """The wire boundary of design §14: the fence and the thread-attributed
-    credential arrive together, and a workspace-only answer (no credential)
-    collapses to ``credential=None`` rather than an empty string."""
-    identity = enrollment.HostIdentity(host="h1", credential="aht.h1.secret")
-    answers = [{"generation": 3, "credential": "tok-1", "model": "glm-5.1"}]
-    monkeypatch.setattr(enrollment, "_post", lambda *a, **kw: answers.pop(0))
-
-    got = enrollment.establish_residency(
-        base_url="http://cp", identity=identity, thread_id="t1", runtime_id="claude-code"
-    )
-    assert got == {"generation": 3, "credential": "tok-1", "model": "glm-5.1"}
-
-    answers.append({"generation": 4, "credential": None, "model": None})
-    got = enrollment.establish_residency(
-        base_url="http://cp", identity=identity, thread_id="t1", runtime_id="claude-code"
-    )
-    assert got == {"generation": 4, "credential": None, "model": None}
-
-
-def test_a_refused_or_malformed_establish_is_none(monkeypatch) -> None:
-    """Refusal keeps nothing — and an answer without a real generation is a
-    refusal, because an unfenced residency cannot be beaten for or dropped."""
-    identity = enrollment.HostIdentity(host="h1", credential="aht.h1.secret")
-
-    def refused(*_a, **_kw):
-        raise enrollment.EnrollmentError("409 from establish")
-
-    monkeypatch.setattr(enrollment, "_post", refused)
-    assert (
-        enrollment.establish_residency(
-            base_url="http://cp", identity=identity, thread_id="t1", runtime_id="claude-code"
-        )
-        is None
-    )
-
-    monkeypatch.setattr(enrollment, "_post", lambda *a, **kw: {"credential": "tok"})
-    assert (
-        enrollment.establish_residency(
-            base_url="http://cp", identity=identity, thread_id="t1", runtime_id="claude-code"
-        )
-        is None
-    )
+def test_legacy_host_residency_client_is_removed() -> None:
+    """The host cannot bypass attempt-fenced worker residency coordination."""
+    assert not hasattr(enrollment, "establish_residency")
+    assert not hasattr(enrollment, "release_residency")

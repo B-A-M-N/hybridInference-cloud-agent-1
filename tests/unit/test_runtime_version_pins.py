@@ -1,21 +1,20 @@
-"""The runtime pins are configurable, complete, and provably exact.
+"""The runtime pins and deploy-time version menus are complete and exact.
 
-Making the CLI versions build arguments moved them from source, where review
-guaranteed their shape, to a deployment's `.env`, where nothing does. Three
-things had to stay true across that move, and each fails silently:
+The five defaults are a source-level shared-protocol contract. Deployments may
+add tested versions to each image's menu, but cannot replace one host's default
+while the runner and control plane still attest the reviewed values. Three
+things have to stay true, and each otherwise fails silently:
 
-* **Complete.** A runtime pinned in the Dockerfile but not passed through by
-  `sandbox_host.sh` is unconfigurable — an operator sets it, redeploys, sees
-  the log say nothing, and gets the old version. The reverse, a pass-through
-  for an `ARG` that no longer exists, is configuration that quietly does
-  nothing.
+* **Complete.** Every extra-version argument is passed through by
+  `sandbox_host.sh`; the reverse, a pass-through for an `ARG` that no longer
+  exists, is configuration that quietly does nothing.
 * **Defaulted.** The reviewed version stays in the Dockerfile beside the event
   parser written against it. An `ARG` without a default would make the image
   depend on a value only one caller supplies, and `docker build` on its own —
   which is what CI does — would produce an image with no CLI in it.
 * **Verified.** Every pin is checked against the binary at build time. The
   labels are derived from these arguments, and the whole version-stamp
-  pipeline (heartbeat → attempt record → checkpoint gate) treats a label as
+  pipeline (heartbeat → attempt record → native-session admission) treats a label as
   fact. An unverified pin lets `latest` produce an image whose label is a lie.
 
 Read from the files rather than duplicated here on purpose: a list of the five
@@ -80,8 +79,8 @@ def _extras() -> set[str]:
 
 
 def _configurable() -> set[str]:
-    """Every build argument a deployment is allowed to set."""
-    return set(_pins()) | _extras()
+    """Every build argument a host deployment is allowed to set."""
+    return _extras()
 
 
 def test_every_pin_has_a_reviewed_default() -> None:
@@ -92,8 +91,8 @@ def test_every_pin_has_a_reviewed_default() -> None:
         assert default, f"{name} has an empty default"
 
 
-def test_the_deploy_script_passes_through_exactly_the_pins() -> None:
-    """A pin the deploy cannot set is a pin an operator will set and lose."""
+def test_the_deploy_script_passes_through_exactly_the_extra_version_menus() -> None:
+    """A menu setting the deploy cannot pass is configuration silently lost."""
     script = SANDBOX_HOST.read_text()
     read = set(_SCRIPT_READ.findall(script))
     passed = _passed_to_docker_build(script)
@@ -119,7 +118,7 @@ def test_every_pin_is_verified_against_the_installed_binary() -> None:
     )
 
 
-def test_the_example_offers_every_pin() -> None:
+def test_the_example_offers_every_deploy_time_menu_and_no_default_override() -> None:
     """An operator learns these exist by reading the example, or not at all."""
     example = (REPO / "deploy/host/.env.example").read_text()
     assigned = {
@@ -128,8 +127,8 @@ def test_the_example_offers_every_pin() -> None:
         if (match := re.match(r"\s*([A-Z0-9_]+_VERSIONS?)=", line))
     }
     assert assigned == _configurable(), (
-        f"deploy/host/.env.example offers {sorted(assigned)}, "
-        f"the Dockerfile takes {sorted(_configurable())}"
+        f"deploy/host/.env.example offers {sorted(assigned)}, but host deployments "
+        f"accept {sorted(_configurable())}"
     )
 
 
@@ -144,12 +143,21 @@ def test_the_example_offers_every_pin() -> None:
 _BASE_ENV = "\n".join(
     [
         "COMPOSE_PROJECT=freeinference-cloud-agent-sandbox-staging",
-        "AGENT_DISPATCHER_TOKEN=t",
-        "AGENT_WORKSPACE_BROKER_TOKEN=b",
+        "AGENT_ENROLL_TOKEN=test-enrollment-token",
         "AGENT_SANDBOX_IMAGE=freeinference-cloud-agent-job:staging",
         "AGENT_TUNNEL_SSH_DESTINATION=user@gateway",
         "AGENT_TUNNEL_SSH_KEY=/dev/null",
         "AGENT_TUNNEL_SSH_KNOWN_HOSTS=/etc/hosts",
+        "AGENT_MCP_TUNNEL_SSH_DESTINATION=user@control",
+        "AGENT_MCP_TUNNEL_SSH_KEY=/dev/null",
+        "AGENT_MCP_TUNNEL_SSH_KNOWN_HOSTS=/etc/hosts",
+        "AGENT_CONTROL_PLANE_TUNNEL_SSH_DESTINATION=user@control",
+        "AGENT_CONTROL_PLANE_TUNNEL_SSH_KEY=/dev/null",
+        "AGENT_CONTROL_PLANE_TUNNEL_SSH_KNOWN_HOSTS=/etc/hosts",
+        "AGENT_BROKER_REVERSE_BIND=172.24.0.1",
+        "AGENT_BROKER_REVERSE_PORT=18092",
+        "AGENT_WORKSPACE_BROKER_ADVERTISE_URL=http://172.24.0.1:18092",
+        "AGENT_WORKSPACE_BROKER_TOKEN=test-broker-token",
         # Skips the Kata preflight, which no developer machine passes. The
         # script warns loudly and continues, which is the documented behaviour
         # of this override and not something this test is asserting about.
@@ -174,18 +182,19 @@ def _up(tmp_path: Path, dotenv: str) -> str:
     fake_bin.mkdir(exist_ok=True)
     docker = fake_bin / "docker"
     docker.write_text(
-        """#!/bin/sh
-printf "%s\\n" "$*" >> "$DOCKER_LOG"
-case " $* " in
-  *" config --environment "*)
-    cat >/dev/null
-    printf "%s\\n" "$COMPOSE_ENVIRONMENT"
-    exit 0
-    ;;
-esac
-[ "$1" = compose ] && exit 1
-exit 0
-"""
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$*" >> "$DOCKER_LOG"\n'
+        'case " $* " in *" config --environment "*) cat >/dev/null; printf "%s\\n" "$COMPOSE_ENVIRONMENT"; exit 0 ;; esac\n'
+        'if [ "$*" = "info --format {{.DockerRootDir}}" ]; then\n'
+        '  printf "/var/lib/docker\\n"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [ "$1" = compose ]; then\n'
+        '  printf "compose-env image=%s replicas=%s\\n" '
+        '"${AGENT_SANDBOX_IMAGE:-}" "${AGENT_RUNNER_REPLICAS:-}" >> "$DOCKER_LOG"\n'
+        "  exit 1\n"
+        "fi\n"
+        "exit 0\n"
     )
     docker.chmod(0o755)
 
@@ -196,10 +205,12 @@ exit 0
         "APP_DIR": str(app_dir),
         "DOCKER_LOG": str(log),
         "COMPOSE_ENVIRONMENT": dotenv,
+        "AGENT_DEPLOYMENT_SHA": "test-deployment-sha",
+        "AGENT_HOST_STATE_ROOT": str(tmp_path / "host-state"),
     }
     # Absence, not exported emptiness: Compose correctly gives even an empty
     # shell value precedence over the dotenv file.
-    for name in ("COMPOSE_PROJECT", *_pins()):
+    for name in ("COMPOSE_PROJECT", *_pins(), *_extras()):
         environment.pop(name, None)
     subprocess.run(
         ["bash", str(SANDBOX_HOST), "up"],
@@ -231,14 +242,60 @@ def test_no_override_builds_the_reviewed_image(tmp_path: Path) -> None:
     )
 
 
-def test_a_pin_in_dotenv_reaches_docker_build(tmp_path: Path) -> None:
-    """The whole feature: a version in `.env` is the version that gets built."""
-    build = _build_line(_up(tmp_path, _BASE_ENV + "CLAUDE_CODE_VERSION=9.9.9\n"))
+def test_compose_receives_the_built_image_and_requested_replica_count(tmp_path: Path) -> None:
+    invocations = _up(tmp_path, _BASE_ENV + "AGENT_RUNNER_REPLICAS=4\n")
 
-    assert "--build-arg CLAUDE_CODE_VERSION=9.9.9" in build
-    # And only that one. A pin nobody set must not be passed as empty, which
+    assert "compose-env image=freeinference-cloud-agent-job:staging replicas=4" in invocations
+
+
+def test_an_extra_version_in_dotenv_reaches_docker_build(tmp_path: Path) -> None:
+    """The deployment-supported version menu reaches the image build."""
+    build = _build_line(_up(tmp_path, _BASE_ENV + "CLAUDE_CODE_EXTRA_VERSIONS=9.9.9\n"))
+
+    assert "--build-arg CLAUDE_CODE_EXTRA_VERSIONS=9.9.9" in build
+    # And only that one. A menu nobody set must not be passed as empty, which
     # would override the Dockerfile default with nothing and install `pkg@`.
     assert build.count("--build-arg") == 1, build
+
+
+def test_a_per_host_default_override_is_refused_before_build(tmp_path: Path) -> None:
+    """A mismatched default would build, then lose shared-live capability."""
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / ".env").write_text(_BASE_ENV + "CLAUDE_CODE_VERSION=9.9.9\n")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    docker_log = tmp_path / "docker.log"
+    docker = fake_bin / "docker"
+    docker.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$*" >> "$DOCKER_LOG"\n'
+        'case " $* " in *" config --environment "*) cat >/dev/null; cat .env; exit 0 ;; esac\n'
+        'if [ "$*" = "info --format {{.DockerRootDir}}" ]; then echo /var/lib/docker; fi\n'
+        "exit 0\n"
+    )
+    docker.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", str(SANDBOX_HOST), "up"],
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "APP_DIR": str(app_dir),
+            "DOCKER_LOG": str(docker_log),
+            "AGENT_DEPLOYMENT_SHA": "test-deployment-sha",
+            "AGENT_HOST_STATE_ROOT": str(tmp_path / "host-state"),
+            "COMPOSE_PROJECT": "",
+            **dict.fromkeys(set(_pins()) | _extras(), ""),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "source-level shared protocol pin" in result.stderr
+    assert not any(line.startswith("build ") for line in docker_log.read_text().splitlines())
 
 
 # ── The menu ─────────────────────────────────────────────────────────────

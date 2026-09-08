@@ -1,8 +1,7 @@
 """Docker-owned, restartable sandboxes for agent chats.
 
-This module is the storage/lifecycle boundary for the restartable execution
-mode.  A chat sandbox is deliberately different from :class:`SandboxBackend`'s
-legacy ``docker run --rm`` process:
+This module is the storage/lifecycle boundary for retained execution. A chat
+sandbox has the following invariants:
 
 * its name and ownership labels are stable for the lifetime of a chat;
 * it has no bind or volume carrying workspace/session state;
@@ -20,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -32,9 +32,12 @@ import threading
 import time
 import tty
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlparse
 
+from cloud_agent_host.egress import EgressTier
 from cloud_agent_host.guest_observer import (
     GUEST_OBSERVER_ROOT,
     GUEST_OBSERVER_ROTATE_BYTES,
@@ -59,6 +62,7 @@ if TYPE_CHECKING:
 
 
 CHAT_SANDBOX_LABEL = "org.freeinference.chat-sandbox"
+CHAT_NAMESPACE_LABEL = "org.freeinference.sandbox-namespace"
 CHAT_THREAD_LABEL = "org.freeinference.chat-thread-id"
 CHAT_SANDBOX_ID_LABEL = "org.freeinference.chat-sandbox-id"
 CHAT_GENERATION_LABEL = "org.freeinference.chat-generation"
@@ -70,13 +74,28 @@ CHAT_CPU_LIMIT_LABEL = "org.freeinference.chat-cpu-limit"
 CHAT_STOP_TIMEOUT_LABEL = "org.freeinference.chat-stop-timeout-seconds"
 CHAT_SHARED_LABEL = "org.freeinference.chat-shared-live"
 CHAT_RESIDENT_CAPACITY_LABEL = "org.freeinference.chat-resident-slot-capacity"
+CHAT_NETWORK_LABEL = "org.freeinference.chat-sandbox-network"
+CHAT_NETWORK_SANDBOX_ID_LABEL = "org.freeinference.chat-sandbox-id"
+CHAT_NETWORK_GENERATION_LABEL = "org.freeinference.chat-generation"
+CHAT_NETWORK_BASE_LABEL = "org.freeinference.chat-base-network"
+CHAT_NETWORK_TIER_LABEL = "org.freeinference.chat-egress-tier"
+CHAT_NETWORK_SERVICES_LABEL = "org.freeinference.chat-service-aliases"
+CHAT_NETWORK_POOL_LABEL = "org.freeinference.chat-network-pool"
 CHAT_CONTAINER_PREFIX = "freeinference-chat"
+CHAT_NETWORK_PREFIX = "freeinference-chat-net"
+CHAT_NETWORK_PREFIX_LENGTH = 29
+CHAT_NETWORK_PRUNE_GRACE_S = 300
+CHAT_NETWORK_INHIBIT_IPV4_OPTION = "com.docker.network.bridge.inhibit_ipv4"
+CHAT_BOOTSTRAP_NETWORK = "bridge"
+CHAT_DNS_UPSTREAM = "127.0.0.1"
 CHAT_WORKDIR = "/workspace"
 CHAT_STATE_DIR = "/agent-state"
 ACTIVATION_TMPFS = "/run/agent-activation"
 MEMBER_TMPFS_ROOT = "/run/agent-members"
 MEMBER_UID_BASE = 11001
 MEMBER_UID_LIMIT = 128
+MEMBER_REAPER_TARGET = "/usr/local/bin/member-process-reaper"
+MEMBER_REAPER_SOURCE = "/usr/local/libexec/member-process-reaper"
 _FULL_OBJECT_ID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
 
 # PID 1 contains no chat credential and owns no chat state outside the
@@ -118,11 +137,13 @@ class ChatSandboxSpec:
     memory_limit: str = "4g"
     cpu_limit: str = "2"
     stop_timeout_s: int = 10
-    shared_live: bool = False
+    shared_live: Literal[True] = True
     resident_slot_capacity: int = 8
     labels: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if self.shared_live is not True:
+            raise ValueError("retained chat sandboxes are always shared-live groups")
         for name, value in (
             ("thread_id", self.thread_id),
             ("sandbox_id", self.sandbox_id),
@@ -150,6 +171,7 @@ class ChatSandboxSpec:
             raise ValueError(f"resident_slot_capacity must be between 2 and {MEMBER_UID_LIMIT}")
         reserved = {
             CHAT_SANDBOX_LABEL,
+            CHAT_NAMESPACE_LABEL,
             CHAT_THREAD_LABEL,
             CHAT_SANDBOX_ID_LABEL,
             CHAT_GENERATION_LABEL,
@@ -188,9 +210,8 @@ class ChatSandboxSpec:
             labels[CHAT_RUNTIME_VERSION_LABEL] = self.runtime_version
         if self.sandbox_image_digest:
             labels[CHAT_IMAGE_DIGEST_LABEL] = self.sandbox_image_digest
-        if self.shared_live:
-            labels[CHAT_SHARED_LABEL] = "true"
-            labels[CHAT_RESIDENT_CAPACITY_LABEL] = str(self.resident_slot_capacity)
+        labels[CHAT_SHARED_LABEL] = "true"
+        labels[CHAT_RESIDENT_CAPACITY_LABEL] = str(self.resident_slot_capacity)
         labels.update(self.labels)
         return labels
 
@@ -207,6 +228,7 @@ class ChatSandboxInspection:
     labels: dict[str, str]
     mounts: tuple[dict[str, Any], ...]
     networks: tuple[str, ...]
+    network_ids: tuple[tuple[str, str], ...] = ()
 
 
 class ChatSandboxManager:
@@ -214,15 +236,948 @@ class ChatSandboxManager:
 
     def __init__(self, backend: ContainerBackend) -> None:
         self.backend = backend
-        # Multiple shared members may admit their first turns concurrently.
-        # Only one of them may perform the singleton helper's cleanup/start
-        # sequence; otherwise two healthy turns can restart each other's
-        # observer before either prompt reaches the resident CLI.
+        try:
+            network_pool = ipaddress.ip_network(backend.chat_network_pool, strict=True)
+        except ValueError as exc:
+            raise SandboxError(
+                "AGENT_EGRESS_CHAT_NETWORK_POOL must be one canonical IPv4 CIDR"
+            ) from exc
+        if (
+            not isinstance(network_pool, ipaddress.IPv4Network)
+            or not network_pool.is_private
+            or network_pool.prefixlen > CHAT_NETWORK_PREFIX_LENGTH
+        ):
+            raise SandboxError(
+                "AGENT_EGRESS_CHAT_NETWORK_POOL must be an RFC1918 IPv4 network "
+                f"large enough to contain /{CHAT_NETWORK_PREFIX_LENGTH} chat networks"
+            )
+        self._chat_network_pool = network_pool
+        self._member_reaper_lock = threading.Lock()
+        # Multiple fork siblings may admit turns concurrently. Singleton
+        # observer startup/rotation and its live cursors therefore need one
+        # broker-wide critical section per manager.
         self._guest_observer_lock = threading.RLock()
-        # Per-container cursors prevent journal rotation from invalidating a
-        # concurrent shared-live turn. Values retain the observer pid too, so
-        # a helper restart makes stale cursor bookkeeping self-cleaning.
         self._guest_observer_active: dict[str, dict[int, int]] = {}
+
+    def network_for_phase(self, spec: ChatSandboxSpec, phase: str) -> str:
+        """Return this chat's network for one lifecycle phase.
+
+        The compose-level egress networks are service-discovery backplanes, not
+        tenant boundaries: Docker's ``internal`` flag removes an off-host route
+        but still allows every container on the bridge to address every other
+        container.  PlatformOnly and Trusted therefore get a deterministic
+        per-chat internal bridge containing this one sandbox plus only the
+        fixed relay/proxy containers copied from the configured backplane.
+
+        Custom and Full are operator-defined escape hatches, so their network
+        topology remains exactly what the operator supplied.  A manually
+        constructed backend with no discoverable service aliases is retained
+        as a unit-test/embedding compatibility seam; production backends built
+        from environment configuration always name the gateway/MCP relays.
+        """
+        base = self.backend.network_for_phase(phase)
+        aliases = self._service_aliases_for_phase(phase)
+        if not aliases:
+            return base
+        assert self.backend.egress is not None
+        tier = self.backend.egress.tier_for(phase)
+        digest = hashlib.sha256(
+            (
+                f"{self.backend.sandbox_namespace}\0{spec.thread_id}\0{spec.sandbox_id}\0"
+                f"{spec.generation}\0"
+                f"{base}\0{tier.value}\0" + "\0".join(aliases)
+            ).encode()
+        ).hexdigest()[:24]
+        return f"{CHAT_NETWORK_PREFIX}-{digest}"
+
+    def _service_aliases_for_phase(self, phase: str) -> tuple[str, ...]:
+        """Return the trusted services copied onto a chat-private bridge."""
+        policy = self.backend.egress
+        if policy is None:
+            return ()
+        tier = policy.tier_for(phase)
+        candidates: tuple[str, ...]
+        if tier is EgressTier.PLATFORM_ONLY:
+            candidates = policy.no_proxy
+        elif tier is EgressTier.TRUSTED:
+            proxy = policy.proxies.get(tier, "")
+            candidates = (
+                # Setup may reach registries only through the allowlist proxy.
+                # The gateway/MCP relays belong exclusively to the agent
+                # phase, even when an operator opts that phase into Trusted.
+                *(policy.no_proxy if phase == "agent" else ()),
+                *((urlparse(proxy).hostname or "",) if proxy else ()),
+            )
+        else:
+            return ()
+
+        aliases: dict[str, None] = {}
+        for raw in candidates:
+            host = raw.strip().lower().rstrip(".")
+            if not host or host == "localhost":
+                continue
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError:
+                address = None
+            if address is not None:
+                if address.is_loopback:
+                    continue
+                raise SandboxError(
+                    f"the {tier.value} tier names fixed service {host!r} by IP. "
+                    "A per-chat Docker network gives services a different address; "
+                    "name the relay/proxy by its Docker network alias instead"
+                )
+            if "\x00" in host or len(host) > 253:
+                raise SandboxError(f"invalid Docker service alias {host!r}")
+            aliases[host] = None
+        return tuple(aliases)
+
+    def _network_labels(self, spec: ChatSandboxSpec, phase: str) -> dict[str, str]:
+        policy = self.backend.egress
+        if policy is None:
+            return {}
+        return {
+            CHAT_NETWORK_LABEL: "true",
+            CHAT_NAMESPACE_LABEL: self.backend.sandbox_namespace,
+            CHAT_NETWORK_SANDBOX_ID_LABEL: spec.sandbox_id,
+            CHAT_NETWORK_GENERATION_LABEL: str(spec.generation),
+            CHAT_NETWORK_BASE_LABEL: self.backend.network_for_phase(phase),
+            CHAT_NETWORK_TIER_LABEL: policy.tier_for(phase).value,
+            CHAT_NETWORK_SERVICES_LABEL: ",".join(self._service_aliases_for_phase(phase)),
+            CHAT_NETWORK_POOL_LABEL: str(self._chat_network_pool),
+        }
+
+    def _inspect_network(self, network: str) -> dict[str, Any] | None:
+        result = self._run([self.backend.docker_binary, "network", "inspect", network], timeout=30)
+        if result.returncode != 0:
+            lowered = result.stderr.lower()
+            if "no such network" in lowered or "not found" in lowered:
+                return None
+            raise SandboxError("Docker network inspect failed: " + result.stderr.strip()[:300])
+        try:
+            payload = json.loads(result.stdout)
+            raw = payload[0]
+        except (IndexError, TypeError, json.JSONDecodeError) as exc:
+            raise SandboxError("Docker returned an invalid network inspection") from exc
+        if not isinstance(raw, dict):
+            raise SandboxError("Docker returned an invalid network inspection")
+        return raw
+
+    def _verify_phase_network(
+        self,
+        network: dict[str, Any],
+        spec: ChatSandboxSpec,
+        phase: str,
+    ) -> None:
+        expected_name = self.network_for_phase(spec, phase)
+        expected_labels = self._network_labels(spec, phase)
+        labels = network.get("Labels") or {}
+        options = network.get("Options") or {}
+        mismatched = {
+            key: (labels.get(key), value)
+            for key, value in expected_labels.items()
+            if labels.get(key) != value
+        }
+        if (
+            network.get("Name") != expected_name
+            or network.get("Driver") != "bridge"
+            or network.get("Scope") not in (None, "local")
+            or network.get("Internal") is not True
+            or not isinstance(options, dict)
+            or str(options.get(CHAT_NETWORK_INHIBIT_IPV4_OPTION, "")).lower() != "true"
+            or not self._network_uses_chat_pool(network)
+            or mismatched
+        ):
+            raise SandboxError(
+                "Docker network name is occupied outside this chat/generation or is not "
+                "an internal host-isolated local bridge"
+            )
+
+    def _network_uses_chat_pool(self, network: dict[str, Any]) -> bool:
+        """Whether Docker assigned exactly one /29 from the configured pool."""
+        configs = (network.get("IPAM") or {}).get("Config") or []
+        if not isinstance(configs, list):
+            return False
+        ipv4_subnets: list[ipaddress.IPv4Network] = []
+        for config in configs:
+            if not isinstance(config, dict) or not config.get("Subnet"):
+                continue
+            try:
+                subnet = ipaddress.ip_network(str(config["Subnet"]), strict=True)
+            except ValueError:
+                return False
+            if isinstance(subnet, ipaddress.IPv4Network):
+                ipv4_subnets.append(subnet)
+        return bool(
+            len(ipv4_subnets) == 1
+            and ipv4_subnets[0].prefixlen == CHAT_NETWORK_PREFIX_LENGTH
+            and ipv4_subnets[0].subnet_of(self._chat_network_pool)
+        )
+
+    def _service_owners(self, base: str, aliases: tuple[str, ...]) -> dict[str, list[str]]:
+        """Resolve each configured service alias to one running base-network peer."""
+        network = self._inspect_network(base)
+        if network is None:
+            raise SandboxError(f"configured egress backplane {base!r} does not exist")
+        containers = network.get("Containers") or {}
+        if not isinstance(containers, dict):
+            raise SandboxError(f"configured egress backplane {base!r} is invalid")
+        matches: dict[str, list[str]] = {alias: [] for alias in aliases}
+        for container_id in containers:
+            result = self._run(
+                [self.backend.docker_binary, "container", "inspect", str(container_id)],
+                timeout=30,
+            )
+            if result.returncode != 0:
+                # Compose replacement can remove an endpoint between the two
+                # inspections. The final exact-one check below turns that race
+                # into a retryable activation failure rather than selecting a
+                # different container.
+                continue
+            try:
+                raw = json.loads(result.stdout)[0]
+                if not bool((raw.get("State") or {}).get("Running")):
+                    continue
+                endpoint = ((raw.get("NetworkSettings") or {}).get("Networks") or {}).get(
+                    base
+                ) or {}
+                names = {
+                    str(name).lower().rstrip(".")
+                    for name in [
+                        str(raw.get("Name") or "").removeprefix("/"),
+                        *((raw.get("Config") or {}).get("Hostname") or "",),
+                        *(endpoint.get("Aliases") or []),
+                        *(endpoint.get("DNSNames") or []),
+                    ]
+                    if name
+                }
+            except (IndexError, TypeError, json.JSONDecodeError):
+                continue
+            for alias in aliases:
+                if alias in names:
+                    matches[alias].append(str(container_id))
+
+        owners: dict[str, list[str]] = {}
+        for alias, candidates in matches.items():
+            unique = list(dict.fromkeys(candidates))
+            if len(unique) != 1:
+                detail = "no running container" if not unique else "multiple running containers"
+                raise SandboxError(
+                    f"fixed service alias {alias!r} has {detail} on egress backplane "
+                    f"{base!r}; refusing an ambiguous chat network"
+                )
+            owners.setdefault(unique[0], []).append(alias)
+        return owners
+
+    def _container_network_aliases(self, container_id: str, network: str) -> set[str] | None:
+        result = self._run(
+            [self.backend.docker_binary, "container", "inspect", container_id], timeout=30
+        )
+        if result.returncode != 0:
+            return None
+        try:
+            raw = json.loads(result.stdout)[0]
+            endpoint = ((raw.get("NetworkSettings") or {}).get("Networks") or {}).get(network)
+            if endpoint is None:
+                return None
+            return {
+                str(alias).lower().rstrip(".")
+                for alias in [*(endpoint.get("Aliases") or []), *(endpoint.get("DNSNames") or [])]
+                if alias
+            }
+        except (IndexError, TypeError, json.JSONDecodeError):
+            return None
+
+    def _ensure_service_connection(
+        self,
+        *,
+        network: str,
+        container_id: str,
+        aliases: list[str],
+    ) -> None:
+        existing = self._container_network_aliases(container_id, network)
+        if existing is not None:
+            if set(aliases).issubset(existing):
+                return
+            raise SandboxError(
+                f"fixed relay {container_id[:12]} is already attached to {network!r} "
+                "without the required aliases"
+            )
+        command = [self.backend.docker_binary, "network", "connect"]
+        for alias in sorted(aliases):
+            command += ["--alias", alias]
+        command += [network, container_id]
+        connected = self._run(command, timeout=30)
+        observed = self._container_network_aliases(container_id, network)
+        if connected.returncode != 0 and observed is None:
+            raise SandboxError(
+                "fixed relay could not join the chat network: " + connected.stderr.strip()[:300]
+            )
+        if observed is None or not set(aliases).issubset(observed):
+            raise SandboxError("fixed relay joined the chat network without its required aliases")
+
+    def _reconcile_phase_members(
+        self,
+        *,
+        network: str,
+        spec: ChatSandboxSpec,
+        phase: str,
+        service_ids: set[str],
+        service_aliases: tuple[str, ...],
+    ) -> None:
+        """Keep an owned bridge limited to this chat and its current services.
+
+        Compose replaces relay containers during a rollout. Their old endpoints
+        can remain on a retained chat bridge after the discovery backplane names
+        the replacement. An old endpoint carrying one of the reviewed service
+        aliases is safe to detach; any other peer is an ownership violation and
+        fails closed rather than being silently evicted.
+        """
+        inspected = self._inspect_network(network)
+        if inspected is None:
+            raise SandboxError("chat-private egress network disappeared during reconciliation")
+        self._verify_phase_network(inspected, spec, phase)
+        containers = inspected.get("Containers") or {}
+        if not isinstance(containers, dict):
+            raise SandboxError("Docker returned invalid chat-network endpoints")
+
+        permitted = set(service_ids)
+        sandbox = self.inspect(spec.container_name)
+        if sandbox is not None:
+            self._verify_identity(sandbox, spec)
+            permitted.add(sandbox.container_id)
+
+        required_aliases = set(service_aliases)
+        unexpected = set(map(str, containers)) - permitted
+        for container_id in sorted(unexpected):
+            endpoint_aliases = self._container_network_aliases(container_id, network)
+            if not endpoint_aliases or not endpoint_aliases.intersection(required_aliases):
+                raise SandboxError(
+                    f"chat-private egress network {network!r} contains an unexpected peer"
+                )
+            disconnected = self._run(
+                [
+                    self.backend.docker_binary,
+                    "network",
+                    "disconnect",
+                    network,
+                    container_id,
+                ],
+                timeout=30,
+            )
+            if disconnected.returncode != 0:
+                refreshed = self._inspect_network(network)
+                remaining = (refreshed or {}).get("Containers") or {}
+                if container_id in remaining:
+                    raise SandboxError(
+                        "stale fixed relay could not leave the chat network: "
+                        + disconnected.stderr.strip()[:300]
+                    )
+
+        refreshed = self._inspect_network(network)
+        if refreshed is None:
+            raise SandboxError("chat-private egress network disappeared during reconciliation")
+        refreshed_containers = refreshed.get("Containers") or {}
+        if not isinstance(refreshed_containers, dict):
+            raise SandboxError("Docker returned invalid chat-network endpoints")
+        actual = set(map(str, refreshed_containers))
+        if not service_ids.issubset(actual) or actual - permitted:
+            raise SandboxError("chat-private egress network membership is not exact")
+
+    def _candidate_chat_subnets(self, network_name: str) -> Iterator[ipaddress.IPv4Network]:
+        """Yield every /29 once, starting from a stable per-network hash.
+
+        Docker remains the cross-process allocator: two runner replicas may
+        race on one subnet, but only one ``network create`` can claim it. The
+        loser advances through this deterministic ring instead of relying on a
+        process-local lock that would not cover the broker and runner replicas.
+        """
+        subnet_count = 1 << (CHAT_NETWORK_PREFIX_LENGTH - self._chat_network_pool.prefixlen)
+        start = int.from_bytes(hashlib.sha256(network_name.encode()).digest()[:8], "big")
+        start %= subnet_count
+        pool_start = int(self._chat_network_pool.network_address)
+        subnet_size = 1 << (32 - CHAT_NETWORK_PREFIX_LENGTH)
+        for offset in range(subnet_count):
+            index = (start + offset) % subnet_count
+            yield ipaddress.IPv4Network(
+                (pool_start + index * subnet_size, CHAT_NETWORK_PREFIX_LENGTH)
+            )
+
+    @staticmethod
+    def _is_subnet_allocation_conflict(stderr: str) -> bool:
+        lowered = stderr.lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "pool overlaps",
+                "overlaps with other one",
+                "requested subnet is already allocated",
+                "address space is already allocated",
+            )
+        )
+
+    def _create_phase_network(
+        self,
+        expected: str,
+        spec: ChatSandboxSpec,
+        phase: str,
+    ) -> dict[str, Any]:
+        last_conflict = ""
+        for subnet in self._candidate_chat_subnets(expected):
+            command = [
+                self.backend.docker_binary,
+                "network",
+                "create",
+                "--driver",
+                "bridge",
+                "--internal",
+                "--opt",
+                f"{CHAT_NETWORK_INHIBIT_IPV4_OPTION}=true",
+                "--subnet",
+                str(subnet),
+            ]
+            for key, value in sorted(self._network_labels(spec, phase).items()):
+                command += ["--label", f"{key}={value}"]
+            command.append(expected)
+            created = self._run(command, timeout=30)
+            network = self._inspect_network(expected)
+            if network is not None:
+                # This includes a same-name create won by another process. The
+                # caller verifies every ownership label and the chosen subnet.
+                return network
+            if created.returncode == 0:
+                raise SandboxError("Docker created the chat network but it cannot be inspected")
+            if not self._is_subnet_allocation_conflict(created.stderr):
+                raise SandboxError(
+                    "chat-private egress network could not be created: "
+                    + created.stderr.strip()[:300]
+                )
+            last_conflict = created.stderr.strip()[:300]
+        raise SandboxError(
+            f"AGENT_EGRESS_CHAT_NETWORK_POOL {self._chat_network_pool} has no free "
+            f"/{CHAT_NETWORK_PREFIX_LENGTH} subnet"
+            + (f": {last_conflict}" if last_conflict else "")
+        )
+
+    def _ensure_phase_service_connections(
+        self,
+        network: str,
+        phase: str,
+        aliases: tuple[str, ...],
+    ) -> set[str]:
+        """Attach the exact currently discovered fixed endpoints for one phase."""
+        base = self.backend.network_for_phase(phase)
+        owners = self._service_owners(base, aliases)
+        for container_id, owned_aliases in owners.items():
+            self._ensure_service_connection(
+                network=network,
+                container_id=container_id,
+                aliases=owned_aliases,
+            )
+        return set(owners)
+
+    def _ensure_phase_services(
+        self,
+        network: str,
+        spec: ChatSandboxSpec,
+        phase: str,
+        aliases: tuple[str, ...],
+    ) -> None:
+        """Attach and verify the exact fixed service endpoints for one phase."""
+        service_ids = self._ensure_phase_service_connections(network, phase, aliases)
+        self._reconcile_phase_members(
+            network=network,
+            spec=spec,
+            phase=phase,
+            service_ids=service_ids,
+            service_aliases=aliases,
+        )
+
+    def _ensure_phase_network(self, spec: ChatSandboxSpec, phase: str) -> str:
+        """Create/reconcile the chat-private network and its trusted peers."""
+        expected = self.network_for_phase(spec, phase)
+        base = self.backend.network_for_phase(phase)
+        aliases = self._service_aliases_for_phase(phase)
+        if expected == base:
+            return expected
+        network = self._inspect_network(expected)
+        if network is not None and self._network_is_stale_for_prune(network):
+            sandbox = self.inspect(spec.container_name)
+            if sandbox is None or not self._phase_endpoint_is_current(sandbox, expected):
+                network_id = str(network.get("Id") or "") or None
+                self._release_owned_network(
+                    expected,
+                    spec,
+                    phase,
+                    only_if_sandbox_unattached=True,
+                    expected_network_id=network_id,
+                )
+                network = self._inspect_network(expected)
+        if network is None:
+            network = self._create_phase_network(expected, spec, phase)
+        if network is None:
+            raise SandboxError("Docker created the chat network but it cannot be inspected")
+        self._verify_phase_network(network, spec, phase)
+        self._ensure_phase_services(expected, spec, phase, aliases)
+        return expected
+
+    def _owned_network_matches_phase(
+        self,
+        network_name: str,
+        spec: ChatSandboxSpec,
+        phase: str,
+    ) -> bool:
+        network = self._inspect_network(network_name)
+        if network is None or network.get("Internal") is not True:
+            return False
+        labels = network.get("Labels") or {}
+        policy = self.backend.egress
+        return bool(
+            policy is not None
+            and labels.get(CHAT_NETWORK_LABEL) == "true"
+            and labels.get(CHAT_NAMESPACE_LABEL) == self.backend.sandbox_namespace
+            and labels.get(CHAT_NETWORK_SANDBOX_ID_LABEL) == spec.sandbox_id
+            and labels.get(CHAT_NETWORK_GENERATION_LABEL) == str(spec.generation)
+            and labels.get(CHAT_NETWORK_BASE_LABEL) == self.backend.network_for_phase(phase)
+            and labels.get(CHAT_NETWORK_TIER_LABEL) == policy.tier_for(phase).value
+        )
+
+    def _disconnect_endpoint(
+        self,
+        network: str,
+        container_id: str,
+        *,
+        network_name: str | None = None,
+    ) -> None:
+        disconnected = self._run(
+            [
+                self.backend.docker_binary,
+                "network",
+                "disconnect",
+                "--force",
+                network,
+                container_id,
+            ],
+            timeout=30,
+        )
+        if disconnected.returncode == 0:
+            return
+        if self._inspect_network(network) is None:
+            # An id-pinned cleanup can lose to another process that already
+            # removed the old bridge. A same-name replacement is unrelated.
+            return
+        aliases = self._container_network_aliases(container_id, network_name or network)
+        if aliases is not None:
+            raise SandboxError(
+                f"container {container_id[:12]} could not leave network "
+                f"{(network_name or network)!r}: " + disconnected.stderr.strip()[:300]
+            )
+
+    def _release_owned_network(
+        self,
+        network_name: str,
+        spec: ChatSandboxSpec,
+        phase: str,
+        *,
+        only_if_sandbox_unattached: bool = False,
+        expected_network_id: str | None = None,
+    ) -> None:
+        """Disconnect exact owned endpoints and delete one inactive bridge."""
+        network = self._inspect_network(network_name)
+        if network is None:
+            return
+        network_id = str(network.get("Id") or "")
+        if expected_network_id is not None and network_id != expected_network_id:
+            # The old bridge disappeared and Docker reused its deterministic
+            # name. Never let stale cleanup mutate the replacement.
+            return
+        network_ref = network_id or network_name
+        labels = network.get("Labels") or {}
+        if (
+            network.get("Driver") != "bridge"
+            or network.get("Internal") is not True
+            or labels.get(CHAT_NETWORK_LABEL) != "true"
+            or labels.get(CHAT_NAMESPACE_LABEL) != self.backend.sandbox_namespace
+            or labels.get(CHAT_NETWORK_SANDBOX_ID_LABEL) != spec.sandbox_id
+            or labels.get(CHAT_NETWORK_GENERATION_LABEL) != str(spec.generation)
+            or labels.get(CHAT_NETWORK_BASE_LABEL) != self.backend.network_for_phase(phase)
+        ):
+            raise SandboxError("refusing to remove a network outside this chat/generation")
+        containers = network.get("Containers") or {}
+        if not isinstance(containers, dict):
+            raise SandboxError("Docker returned invalid chat-network endpoints")
+        sandbox = self.inspect(spec.container_name)
+        if sandbox is not None:
+            self._verify_identity(sandbox, spec)
+        sandbox_id = sandbox.container_id if sandbox is not None else None
+        if only_if_sandbox_unattached and sandbox_id in containers:
+            # Opportunistic orphan pruning must never detach a sandbox that
+            # won the race and connected after the caller's first inspection.
+            return
+        recorded_aliases = {
+            value.strip().lower().rstrip(".")
+            for value in str(labels.get(CHAT_NETWORK_SERVICES_LABEL) or "").split(",")
+            if value.strip()
+        }
+        for container_id in sorted(map(str, containers)):
+            if container_id == sandbox_id:
+                continue
+            endpoint_aliases = self._container_network_aliases(container_id, network_name)
+            if not endpoint_aliases or not endpoint_aliases.intersection(recorded_aliases):
+                raise SandboxError(
+                    f"chat-private egress network {network_name!r} contains an unexpected peer"
+                )
+        for container_id in sorted(map(str, containers)):
+            self._disconnect_endpoint(
+                network_ref,
+                container_id,
+                network_name=network_name,
+            )
+        removed = self._run(
+            [self.backend.docker_binary, "network", "rm", network_ref],
+            timeout=30,
+        )
+        remaining = self._inspect_network(network_ref) if removed.returncode != 0 else None
+        if remaining is not None and only_if_sandbox_unattached:
+            # A runner may attach the sandbox after the endpoint snapshot above.
+            # Restore relays before deciding whether the failed opportunistic
+            # prune is now a live phase bridge.
+            self._verify_phase_network(remaining, spec, phase)
+            self._ensure_phase_services(
+                network_name,
+                spec,
+                phase,
+                self._service_aliases_for_phase(phase),
+            )
+            refreshed_sandbox = self.inspect(spec.container_name)
+            if refreshed_sandbox is not None and self._phase_endpoint_is_current(
+                refreshed_sandbox, network_name
+            ):
+                return
+        if remaining is not None:
+            raise SandboxError(
+                "inactive chat-private network could not be removed: "
+                + removed.stderr.strip()[:300]
+            )
+
+    def _release_orphan_network(self, network: dict[str, Any], phase: str) -> None:
+        """Delete one ownerless bridge by immutable ID and repair a lost attach race."""
+        network_name = str(network.get("Name") or "")
+        network_id = str(network.get("Id") or "")
+        labels = network.get("Labels") or {}
+        containers = network.get("Containers") or {}
+        recorded_aliases = tuple(
+            sorted(
+                value.strip().lower().rstrip(".")
+                for value in str(labels.get(CHAT_NETWORK_SERVICES_LABEL) or "").split(",")
+                if value.strip()
+            )
+        )
+        if not network_name or not network_id or not recorded_aliases:
+            raise SandboxError("orphan chat-private network has invalid ownership metadata")
+        if not isinstance(containers, dict):
+            raise SandboxError("orphan chat-private network has invalid ownership metadata")
+        for container_id in sorted(map(str, containers)):
+            endpoint_aliases = self._container_network_aliases(container_id, network_name)
+            if not endpoint_aliases or not endpoint_aliases.intersection(recorded_aliases):
+                raise SandboxError("orphan chat-private network contains an unexpected peer")
+        for container_id in sorted(map(str, containers)):
+            self._disconnect_endpoint(
+                network_id,
+                container_id,
+                network_name=network_name,
+            )
+        removed = self._run(
+            [self.backend.docker_binary, "network", "rm", network_id],
+            timeout=30,
+        )
+        remaining = self._inspect_network(network_id) if removed.returncode != 0 else None
+        if remaining is None:
+            return
+
+        # A new sandbox can attach to the old ID after the endpoint snapshot.
+        # Put the fixed services back before preserving that now-live bridge.
+        service_ids = self._ensure_phase_service_connections(
+            network_name,
+            phase,
+            recorded_aliases,
+        )
+        refreshed = self._inspect_network(network_id)
+        refreshed_containers = (refreshed or {}).get("Containers") or {}
+        if (
+            isinstance(refreshed_containers, dict)
+            and set(map(str, refreshed_containers)) - service_ids
+        ):
+            return
+        raise SandboxError(
+            "orphan chat-private network could not be removed: " + removed.stderr.strip()[:300]
+        )
+
+    def _release_sandbox_networks(
+        self,
+        spec: ChatSandboxSpec,
+        current: ChatSandboxInspection,
+    ) -> ChatSandboxInspection:
+        """Release private/legacy endpoints after the retained container stops."""
+        if current.running:
+            raise SandboxError("refusing to release networking from a running chat sandbox")
+        for network_name in current.networks:
+            if (
+                network_name == CHAT_BOOTSTRAP_NETWORK
+                and current.status is ChatSandboxStatus.CREATED
+            ):
+                # Recover an interrupted first create before the container ever
+                # ran. The daemon-wide bridge itself is not owned by this chat.
+                self._disconnect_endpoint(network_name, current.container_id)
+                continue
+            handled = False
+            for phase in ("agent", "setup"):
+                base = self.backend.network_for_phase(phase)
+                expected = self.network_for_phase(spec, phase)
+                if expected == base:
+                    continue
+                if network_name == base:
+                    self._disconnect_endpoint(network_name, current.container_id)
+                    handled = True
+                    break
+                if network_name == expected or self._owned_network_matches_phase(
+                    network_name, spec, phase
+                ):
+                    self._release_owned_network(network_name, spec, phase)
+                    handled = True
+                    break
+            if handled:
+                continue
+            # Custom/Full tiers deliberately keep the operator's own network
+            # topology. Everything else is an ownership violation.
+            if any(
+                self.network_for_phase(spec, phase)
+                == network_name
+                == self.backend.network_for_phase(phase)
+                for phase in ("agent", "setup")
+            ):
+                continue
+            raise SandboxError("retained chat is attached to an unknown egress network")
+        return self._require(spec)
+
+    @staticmethod
+    def _network_is_stale_for_prune(network: dict[str, Any]) -> bool:
+        """Return true only after Docker's creation timestamp clears the race window."""
+        raw_created = network.get("Created")
+        if not isinstance(raw_created, str) or not raw_created:
+            return False
+        try:
+            created = datetime.fromisoformat(raw_created.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if created.tzinfo is None:
+            return False
+        age = (datetime.now(UTC) - created.astimezone(UTC)).total_seconds()
+        return age >= CHAT_NETWORK_PRUNE_GRACE_S
+
+    def prune_orphan_networks(self, specs: list[ChatSandboxSpec]) -> None:
+        """Remove stale owned bridges without racing a create or phase transition."""
+        result = self._run(
+            [
+                self.backend.docker_binary,
+                "network",
+                "ls",
+                "--quiet",
+                "--filter",
+                f"label={CHAT_NETWORK_LABEL}=true",
+            ],
+            timeout=30,
+        )
+        if result.returncode != 0:
+            raise SandboxError(
+                "chat-private network listing failed: " + result.stderr.strip()[:300]
+            )
+        by_identity = {(spec.sandbox_id, str(spec.generation)): spec for spec in specs}
+        configured_bases = {
+            self.backend.network_for_phase(phase): phase
+            for phase in ("setup", "agent")
+            if self._service_aliases_for_phase(phase)
+        }
+        for network_id in result.stdout.split():
+            network = self._inspect_network(network_id)
+            if network is None:
+                continue
+            labels = network.get("Labels") or {}
+            namespace = labels.get(CHAT_NAMESPACE_LABEL)
+            if namespace is not None and namespace != self.backend.sandbox_namespace:
+                continue
+            base = str(labels.get(CHAT_NETWORK_BASE_LABEL) or "")
+            phase = configured_bases.get(base)
+            if (
+                phase is None
+                or network.get("Driver") != "bridge"
+                or network.get("Internal") is not True
+                or not str(network.get("Name") or "").startswith(f"{CHAT_NETWORK_PREFIX}-")
+            ):
+                continue
+            identity = (
+                str(labels.get(CHAT_NETWORK_SANDBOX_ID_LABEL) or ""),
+                str(labels.get(CHAT_NETWORK_GENERATION_LABEL) or ""),
+            )
+            spec = by_identity.get(identity)
+            if spec is not None:
+                sandbox = self.inspect(spec.container_name)
+                if sandbox is not None and str(network["Name"]) in sandbox.networks:
+                    # This is the live phase bridge of a retained container,
+                    # not an orphan. reconcile() also runs for status polling,
+                    # so pruning it here would silently disconnect an active
+                    # turn from both fixed relays.
+                    continue
+                if not self._network_is_stale_for_prune(network):
+                    # Runner and broker use separate Docker clients. During
+                    # create, wake, or setup→agent transition the next bridge
+                    # exists briefly before the sandbox endpoint is attached.
+                    continue
+                self._release_owned_network(
+                    str(network["Name"]),
+                    spec,
+                    phase,
+                    only_if_sandbox_unattached=True,
+                    expected_network_id=str(network.get("Id") or "") or None,
+                )
+                continue
+
+            # No retained container on this broker owns the labelled bridge.
+            # A runner can create the bridge just before its new container
+            # appears in the daemon-wide list, so absence alone is not enough
+            # proof that the bridge is orphaned.
+            if not self._network_is_stale_for_prune(network):
+                continue
+            self._release_orphan_network(network, phase)
+
+    def _phase_endpoint_is_current(
+        self,
+        current: ChatSandboxInspection,
+        network_name: str,
+    ) -> bool:
+        """Distinguish a live/pending endpoint from Docker's stale stopped metadata."""
+        if network_name not in current.networks:
+            return False
+        endpoint_ids = dict(current.network_ids)
+        recorded_id = endpoint_ids.get(network_name)
+        if recorded_id is None:
+            # Compatibility for synthetic embeddings and pre-field test
+            # inspections. Real Docker inspections always include this entry.
+            return True
+        if recorded_id == "":
+            # Docker records a stopped container's pending connection by name
+            # and fills NetworkID only when the container starts.
+            return True
+        network = self._inspect_network(network_name)
+        if network is None:
+            return False
+        current_id = str(network.get("Id") or "")
+        # A network connected while the container is stopped has no NetworkID
+        # until start. A non-empty, different ID is a tombstone left after the
+        # old same-name bridge was deleted and must be reconnected explicitly.
+        return bool(current_id and recorded_id == current_id)
+
+    def _move_container_to_phase_network(
+        self,
+        spec: ChatSandboxSpec,
+        current: ChatSandboxInspection,
+        phase: str,
+    ) -> ChatSandboxInspection:
+        sources = tuple(current.networks)
+        base = self.backend.network_for_phase(phase)
+        expected = self.network_for_phase(spec, phase)
+        for source in sources:
+            if source == expected:
+                continue
+            if source == CHAT_BOOTSTRAP_NETWORK and current.status is ChatSandboxStatus.CREATED:
+                continue
+            if source != base and not self._owned_network_matches_phase(source, spec, phase):
+                raise SandboxError("retained chat is attached to a network outside this chat/phase")
+        if current.running and any(
+            source not in {expected} and source in {base, CHAT_BOOTSTRAP_NETWORK}
+            for source in sources
+        ):
+            raise SandboxError(
+                "a running retained chat still uses a shared/obsolete egress network; "
+                "stop it before this deployment can isolate and resume it"
+            )
+        expected = self._ensure_phase_network(spec, phase)
+        if not self._phase_endpoint_is_current(current, expected):
+            connected = self._run(
+                [
+                    self.backend.docker_binary,
+                    "network",
+                    "connect",
+                    expected,
+                    current.container_id,
+                ],
+                timeout=30,
+            )
+            if connected.returncode != 0:
+                refreshed = self._require(spec)
+                if not self._phase_endpoint_is_current(refreshed, expected):
+                    raise SandboxError(
+                        "retained chat could not attach its private egress network: "
+                        + connected.stderr.strip()[:300]
+                    )
+        for source in sources:
+            if source == expected:
+                continue
+            self._disconnect_endpoint(source, current.container_id)
+            if source == CHAT_BOOTSTRAP_NETWORK:
+                continue
+            if source != base:
+                self._release_owned_network(source, spec, phase)
+        moved = self._require(spec)
+        if set(moved.networks) != {expected} or not self._phase_endpoint_is_current(
+            moved, expected
+        ):
+            raise SandboxError("retained chat network isolation transition was not exact")
+        return moved
+
+    def _require_phase_network(
+        self,
+        spec: ChatSandboxSpec,
+        current: ChatSandboxInspection,
+        phase: str,
+    ) -> ChatSandboxInspection:
+        expected = self.network_for_phase(spec, phase)
+        if set(current.networks) == {expected}:
+            self._ensure_phase_network(spec, phase)
+            refreshed = self._require(spec)
+            if self._phase_endpoint_is_current(refreshed, expected):
+                return refreshed
+        if len(current.networks) > 1:
+            raise SandboxError("retained chat has an unexpected network set")
+        return self._move_container_to_phase_network(spec, current, phase)
+
+    def _ensure_current_phase_network(
+        self,
+        spec: ChatSandboxSpec,
+        current: ChatSandboxInspection,
+        *,
+        preferred_phase: Literal["setup", "agent"] | None = None,
+    ) -> ChatSandboxInspection:
+        if preferred_phase is not None:
+            return self._require_phase_network(spec, current, preferred_phase)
+        if not current.networks:
+            raise SandboxError("a networkless retained chat needs an explicit lifecycle phase")
+        if len(current.networks) != 1:
+            raise SandboxError("retained chat has an unexpected network set")
+        source = current.networks[0]
+        # Agent first: every settled retained chat is already past setup. A
+        # just-created chat is on its deterministic setup network and matches
+        # that branch unambiguously.
+        for phase in ("agent", "setup"):
+            expected = self.network_for_phase(spec, phase)
+            base = self.backend.network_for_phase(phase)
+            if source == expected:
+                self._ensure_phase_network(spec, phase)
+                return current
+            if source == base or self._owned_network_matches_phase(source, spec, phase):
+                return self._require_phase_network(spec, current, phase)
+        raise SandboxError("retained chat is attached to an unknown egress network")
 
     def require_docker_data_root(self, expected: str) -> str:
         """Verify retained state is owned by the intended Docker data root.
@@ -276,19 +1231,31 @@ class ChatSandboxManager:
             spec.container_name,
             "--init",
         ]
-        for key, value in sorted(spec.docker_labels().items()):
+        labels = {
+            **spec.docker_labels(),
+            CHAT_NAMESPACE_LABEL: self.backend.sandbox_namespace,
+        }
+        for key, value in sorted(labels.items()):
             argv += ["--label", f"{key}={value}"]
         argv += [
             "--workdir",
             CHAT_WORKDIR,
             "--user",
             f"{self.backend.uid}:{self.backend.gid}",
-            # Ordinary new chats begin in setup egress. Reconstructed shared
-            # groups may already have completed setup and therefore start on
-            # the narrower agent network; widening them again would be a
-            # security regression.
+            # Docker retains the create-time network as immutable primary
+            # metadata even after disconnect. Use its daemon-stable bridge as
+            # a dormant anchor, then attach the phase bridge and disconnect
+            # this one while the container is still stopped. No untrusted code
+            # runs until start() verifies the phase bridge is the sole network.
             "--network",
-            self.backend.network_for_phase(network_phase),
+            CHAT_BOOTSTRAP_NETWORK,
+            # Docker still resolves container aliases through 127.0.0.11, but
+            # forwards unknown names to this configured upstream from the
+            # container namespace. Loopback makes arbitrary DNS fail locally
+            # and closes CVE-2024-29018 on older daemons whose default
+            # host-loopback resolver could bypass an internal network.
+            "--dns",
+            CHAT_DNS_UPSTREAM,
             "--memory",
             spec.memory_limit,
             "--cpus",
@@ -307,16 +1274,15 @@ class ChatSandboxManager:
                 f"uid={self.backend.uid},gid={self.backend.gid}"
             ),
         ]
-        if spec.shared_live:
-            for slot_id in range(spec.resident_slot_capacity):
-                uid = MEMBER_UID_BASE + slot_id
-                argv += [
-                    "--tmpfs",
-                    (
-                        f"{MEMBER_TMPFS_ROOT}/{slot_id}:rw,nosuid,nodev,noexec,"
-                        f"mode=0700,uid={uid},gid={self.backend.gid}"
-                    ),
-                ]
+        for slot_id in range(spec.resident_slot_capacity):
+            uid = MEMBER_UID_BASE + slot_id
+            argv += [
+                "--tmpfs",
+                (
+                    f"{MEMBER_TMPFS_ROOT}/{slot_id}:rw,nosuid,nodev,noexec,"
+                    f"mode=0700,uid={uid},gid={self.backend.gid}"
+                ),
+            ]
         if self.backend.runtime == KATA_RUNTIME:
             # The eBPF program is loaded by a trusted root helper *inside* the
             # Kata guest.  Its journal is root-only and ephemeral; agent UIDs
@@ -355,10 +1321,11 @@ class ChatSandboxManager:
         network_phase: Literal["setup", "agent"] = "setup",
     ) -> ChatSandboxInspection:
         """Create one chat container idempotently, never replacing an existing one."""
+        self._ensure_phase_network(spec, network_phase)
         existing = self.inspect(spec.container_name)
         if existing is not None:
             self._verify_identity(existing, spec)
-            return existing
+            return self._require_phase_network(spec, existing, network_phase)
         command = self.build_create_command(spec, image=image, network_phase=network_phase)
         created = self._run(command, timeout=120)
         if created.returncode != 0:
@@ -370,12 +1337,12 @@ class ChatSandboxManager:
                     "chat sandbox could not be created: " + created.stderr.strip()[:300]
                 )
             self._verify_identity(raced, spec)
-            return raced
+            return self._require_phase_network(spec, raced, network_phase)
         inspected = self.inspect(spec.container_name)
         if inspected is None:
             raise SandboxError("Docker created the chat sandbox but it cannot be inspected")
         self._verify_identity(inspected, spec)
-        return inspected
+        return self._require_phase_network(spec, inspected, network_phase)
 
     def require_existing(
         self,
@@ -396,7 +1363,9 @@ class ChatSandboxManager:
             )
         return current
 
-    def inspect(self, container: str) -> ChatSandboxInspection | None:
+    def inspect(
+        self, container: str, *, verify_mounts: bool = True
+    ) -> ChatSandboxInspection | None:
         """Inspect a container; missing is ``None``, daemon/protocol failures raise."""
         result = self._run(
             [self.backend.docker_binary, "container", "inspect", container], timeout=30
@@ -413,7 +1382,8 @@ class ChatSandboxManager:
             labels = config.get("Labels") or {}
             mounts = raw.get("Mounts") or []
             state = raw.get("State") or {}
-            networks = ((raw.get("NetworkSettings") or {}).get("Networks") or {}).keys()
+            network_settings = (raw.get("NetworkSettings") or {}).get("Networks") or {}
+            networks = network_settings.keys()
             status = self._status(state)
             inspection = ChatSandboxInspection(
                 container_id=str(raw["Id"]),
@@ -427,14 +1397,52 @@ class ChatSandboxManager:
                 labels={str(key): str(value) for key, value in labels.items()},
                 mounts=tuple(dict(mount) for mount in mounts),
                 networks=tuple(sorted(str(network) for network in networks)),
+                network_ids=tuple(
+                    sorted(
+                        (
+                            str(network),
+                            str((endpoint or {}).get("NetworkID") or ""),
+                        )
+                        for network, endpoint in network_settings.items()
+                    )
+                ),
             )
         except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise SandboxError("Docker returned an invalid chat sandbox inspection") from exc
-        self._verify_mounts(inspection)
+        if verify_mounts:
+            self._verify_mounts(inspection)
         return inspection
 
+    def _belongs_to_namespace(self, inspection: ChatSandboxInspection) -> bool:
+        """Fence daemon-wide discovery to this independently deployed stack.
+
+        New containers carry the immutable namespace label. During the first
+        rollout, old containers have no such label; they are adopted only while
+        attached to one of this stack's configured egress backplanes (or a
+        labelled private bridge derived from one). Pre-upgrade idle containers
+        retain that attachment, so no ambiguous daemon-wide fallback is needed.
+        """
+        namespace = inspection.labels.get(CHAT_NAMESPACE_LABEL)
+        if namespace is not None:
+            return namespace == self.backend.sandbox_namespace
+        configured_bases = {self.backend.network_for_phase(phase) for phase in ("setup", "agent")}
+        for network_name in inspection.networks:
+            if network_name in configured_bases:
+                return True
+            network = self._inspect_network(network_name)
+            if network is None:
+                continue
+            labels = network.get("Labels") or {}
+            network_namespace = labels.get(CHAT_NAMESPACE_LABEL)
+            if labels.get(CHAT_NETWORK_BASE_LABEL) in configured_bases and network_namespace in (
+                None,
+                self.backend.sandbox_namespace,
+            ):
+                return True
+        return False
+
     def list(self) -> list[ChatSandboxInspection]:
-        """List only containers explicitly owned by this lifecycle."""
+        """List retained containers owned by this deployment namespace."""
         result = self._run(
             [
                 self.backend.docker_binary,
@@ -451,14 +1459,28 @@ class ChatSandboxManager:
             raise SandboxError("chat sandbox listing failed: " + result.stderr.strip()[:300])
         found: list[ChatSandboxInspection] = []
         for container_id in result.stdout.split():
-            item = self.inspect(container_id)
-            if item is not None:
+            # A foreign namespace cannot make this broker fail startup by
+            # carrying policy-invalid mounts. Apply this stack's mount fence
+            # only after ownership is established.
+            item = self.inspect(container_id, verify_mounts=False)
+            if item is not None and self._belongs_to_namespace(item):
+                self._verify_mounts(item)
                 found.append(item)
         return found
 
-    def start(self, spec: ChatSandboxSpec) -> ChatSandboxInspection:
+    def start(
+        self,
+        spec: ChatSandboxSpec,
+        *,
+        network_phase: Literal["setup", "agent"] | None = None,
+    ) -> ChatSandboxInspection:
         """Start the exact stopped container and verify it reached RUNNING."""
         current = self._require(spec)
+        current = self._ensure_current_phase_network(
+            spec,
+            current,
+            preferred_phase=network_phase,
+        )
         if current.running:
             return current
         if current.status is ChatSandboxStatus.PAUSED:
@@ -476,12 +1498,12 @@ class ChatSandboxManager:
         return started
 
     def stop(self, spec: ChatSandboxSpec) -> ChatSandboxInspection:
-        """Deactivate with ``docker stop`` and retain the same writable layer."""
+        """Deactivate, release private networking, and retain the writable layer."""
         current = self._require(spec)
         if current.status is ChatSandboxStatus.PAUSED:
             raise SandboxError("refusing to treat a paused chat sandbox as cleanly stopped")
         if not current.running:
-            return current
+            return self._release_sandbox_networks(spec, current)
         result = self._run(
             [
                 self.backend.docker_binary,
@@ -502,11 +1524,12 @@ class ChatSandboxManager:
             raise SandboxError(
                 f"chat sandbox stopped into unexpected state {stopped.status.value!r}"
             )
-        return stopped
+        return self._release_sandbox_networks(spec, stopped)
 
     def require_network_phase(self, spec: ChatSandboxSpec, phase: str) -> None:
         """Prove this container is attached to exactly the requested network."""
-        expected = self.backend.network_for_phase(phase)
+        self._ensure_phase_network(spec, phase)
+        expected = self.network_for_phase(spec, phase)
         current = self._require(spec)
         if set(current.networks) != {expected}:
             raise SandboxError(
@@ -516,50 +1539,49 @@ class ChatSandboxManager:
 
     def transition_to_agent_network(self, spec: ChatSandboxSpec) -> ChatSandboxInspection:
         """Irreversibly replace setup egress with the agent-only network."""
-        setup_network = self.backend.network_for_phase("setup")
-        agent_network = self.backend.network_for_phase("agent")
+        self._ensure_phase_network(spec, "setup")
+        self._ensure_phase_network(spec, "agent")
+        setup_network = self.network_for_phase(spec, "setup")
+        agent_network = self.network_for_phase(spec, "agent")
         current = self._require(spec)
-        if set(current.networks) == {agent_network}:
+        if setup_network == agent_network:
+            if set(current.networks) != {agent_network}:
+                raise SandboxError(
+                    "retained chat has an unexpected network set before agent transition"
+                )
             return current
-        if set(current.networks) != {setup_network}:
+        if set(current.networks) == {agent_network}:
+            if setup_network != self.backend.network_for_phase("setup"):
+                self._release_owned_network(setup_network, spec, "setup")
+            return current
+        if set(current.networks) not in ({setup_network}, {setup_network, agent_network}):
             raise SandboxError(
                 "retained chat has an unexpected network set before agent transition"
             )
-        if setup_network == agent_network:
-            return current
-        connected = self._run(
-            [
-                self.backend.docker_binary,
-                "network",
-                "connect",
-                agent_network,
-                current.container_id,
-            ],
-            timeout=30,
-        )
-        if connected.returncode != 0:
-            raise SandboxError(
-                "retained chat could not attach agent egress: " + connected.stderr.strip()[:300]
+        if agent_network not in current.networks:
+            connected = self._run(
+                [
+                    self.backend.docker_binary,
+                    "network",
+                    "connect",
+                    agent_network,
+                    current.container_id,
+                ],
+                timeout=30,
             )
-        disconnected = self._run(
-            [
-                self.backend.docker_binary,
-                "network",
-                "disconnect",
-                setup_network,
-                current.container_id,
-            ],
-            timeout=30,
-        )
-        if disconnected.returncode != 0:
-            # Both networks may now be present, so no caller is allowed to run
-            # the Agent CLI: require_network_phase fails closed.
-            raise SandboxError(
-                "retained chat could not remove setup egress: " + disconnected.stderr.strip()[:300]
-            )
+            if connected.returncode != 0:
+                refreshed = self._require(spec)
+                if agent_network not in refreshed.networks:
+                    raise SandboxError(
+                        "retained chat could not attach agent egress: "
+                        + connected.stderr.strip()[:300]
+                    )
+        self._disconnect_endpoint(setup_network, current.container_id)
         transitioned = self._require(spec)
         if set(transitioned.networks) != {agent_network}:
             raise SandboxError("retained chat agent egress transition was not exact")
+        if setup_network != self.backend.network_for_phase("setup"):
+            self._release_owned_network(setup_network, spec, "setup")
         return transitioned
 
     def build_exec_command(
@@ -674,22 +1696,87 @@ class ChatSandboxManager:
             rf"{re.escape(MEMBER_TMPFS_ROOT)}/([0-9]+)/resident-[0-9a-f]{{32}}\.pid",
             pidfile,
         )
-        if spec.shared_live:
-            if member_match is None:
-                raise ValueError("process-scoped kill requires a shared member PID file")
-            slot_id = int(member_match.group(1))
-            if slot_id >= spec.resident_slot_capacity:
-                raise ValueError("resident PID file is outside sandbox capacity")
-            if user_uid != MEMBER_UID_BASE + slot_id:
-                raise ValueError("resident PID file does not match its member uid")
-            return slot_id
-        legacy_match = re.fullmatch(
-            rf"{re.escape(ACTIVATION_TMPFS)}/agent-[0-9a-f]{{32}}\.pid",
-            pidfile,
-        )
-        if legacy_match is None or user_uid != self.backend.uid:
-            raise ValueError("process-scoped kill requires a retained agent PID file")
-        return -1
+        if member_match is None:
+            raise ValueError("process-scoped kill requires a shared member PID file")
+        slot_id = int(member_match.group(1))
+        if slot_id >= spec.resident_slot_capacity:
+            raise ValueError("resident PID file is outside sandbox capacity")
+        if user_uid != MEMBER_UID_BASE + slot_id:
+            raise ValueError("resident PID file does not match its member uid")
+        return slot_id
+
+    def ensure_member_process_reaper(self, spec: ChatSandboxSpec) -> None:
+        """Install the immutable helper into retained pre-upgrade containers."""
+        with self._member_reaper_lock:
+            probe = self.exec_capture(
+                spec,
+                [
+                    "/bin/sh",
+                    "-c",
+                    'test "$(stat -c %u:%g:%a "$1" 2>/dev/null)" = 0:0:555',
+                    "sh",
+                    MEMBER_REAPER_TARGET,
+                ],
+                workdir="/",
+                timeout_s=20,
+                user_uid=0,
+                user_gid=0,
+            )
+            if probe.returncode == 0:
+                return
+            current = self._require(spec)
+            if not current.running:
+                raise SandboxError("chat sandbox must be started before helper installation")
+            source = os.environ.get("AGENT_MEMBER_PROCESS_REAPER_SOURCE", MEMBER_REAPER_SOURCE)
+            if not os.path.isfile(source):
+                raise SandboxError(
+                    "retained sandbox lacks member-process-reaper and the trusted "
+                    f"runner source {source!r} is unavailable"
+                )
+            temporary = f"{MEMBER_REAPER_TARGET}.install-{secrets.token_hex(8)}"
+            copied = self._run(
+                [
+                    self.backend.docker_binary,
+                    "cp",
+                    source,
+                    f"{current.container_id}:{temporary}",
+                ],
+                timeout=30,
+            )
+            if copied.returncode != 0:
+                raise SandboxError(
+                    "member-process-reaper compatibility install failed: "
+                    + copied.stderr.strip()[:300]
+                )
+            installed = self.exec_capture(
+                spec,
+                [
+                    "/bin/sh",
+                    "-c",
+                    'chown 0:0 "$1" && chmod 0555 "$1" && mv -f "$1" "$2"',
+                    "sh",
+                    temporary,
+                    MEMBER_REAPER_TARGET,
+                ],
+                workdir="/",
+                timeout_s=20,
+                user_uid=0,
+                user_gid=0,
+            )
+            if installed.returncode != 0:
+                with contextlib.suppress(Exception):
+                    self.exec_capture(
+                        spec,
+                        ["/bin/rm", "-f", temporary],
+                        workdir="/",
+                        timeout_s=10,
+                        user_uid=0,
+                        user_gid=0,
+                    )
+                raise SandboxError(
+                    "member-process-reaper compatibility activation failed: "
+                    + installed.stderr.decode("utf-8", "replace")[:300]
+                )
 
     def reap_member_processes(
         self,
@@ -700,15 +1787,21 @@ class ChatSandboxManager:
         user_gid: int,
     ) -> None:
         """Kill unattached live CLI trees in exactly one private member slot."""
-        if not spec.shared_live or not 0 <= slot_id < spec.resident_slot_capacity:
+        if not 0 <= slot_id < spec.resident_slot_capacity:
             raise ValueError("resident slot is outside this shared sandbox")
         if user_uid != MEMBER_UID_BASE + slot_id:
             raise ValueError("resident slot does not match its member uid")
         directory = f"{MEMBER_TMPFS_ROOT}/{slot_id}"
-        script = self._member_reaper_script(f"{directory}/resident-*.pid")
+        self.reap_member_processes_except(
+            spec,
+            slot_id=slot_id,
+            user_uid=user_uid,
+            user_gid=user_gid,
+            baseline=(),
+        )
         result = self.exec_capture(
             spec,
-            ["/bin/sh", "-c", script, "sh", str(user_uid)],
+            ["/bin/sh", "-c", f"rm -f -- {directory}/resident-*.pid"],
             workdir="/",
             timeout_s=20,
             user_uid=user_uid,
@@ -719,17 +1812,6 @@ class ChatSandboxManager:
                 "stale resident process cleanup failed: "
                 + result.stderr.decode("utf-8", "replace")[:300]
             )
-        # A tool can deliberately escape the resident process group with
-        # setsid/double-fork, and a broker restart can lose its pidfile. The
-        # member UID is the second, independent ownership fence: before opening
-        # a replacement transport there must be no process left under it.
-        self.reap_member_processes_except(
-            spec,
-            slot_id=slot_id,
-            user_uid=user_uid,
-            user_gid=user_gid,
-            baseline=(),
-        )
 
     def capture_member_processes(
         self,
@@ -741,19 +1823,10 @@ class ChatSandboxManager:
     ) -> tuple[tuple[int, int], ...]:
         """Capture the reviewed resident PID/start-time set before one turn."""
         self._validate_member_identity(spec, slot_id=slot_id, user_uid=user_uid)
-        script = (
-            'set -eu; expected_uid="$1"; for proc in /proc/[0-9]*; do '
-            'pid=${proc##*/}; [ "$pid" != 1 ] && [ "$pid" != "$$" ] || continue; '
-            'uid=$(stat -c %u "$proc" 2>/dev/null || :); '
-            '[ "$uid" = "$expected_uid" ] || continue; '
-            'raw=$(cat "$proc/stat" 2>/dev/null || :); fields=${raw##*) }; '
-            'started=$(set -- $fields; printf "%s" "${20:-}"); '
-            'case "$started" in ""|*[!0-9]*) continue;; esac; '
-            'printf "%s %s\n" "$pid" "$started"; done'
-        )
+        self.ensure_member_process_reaper(spec)
         result = self.exec_capture(
             spec,
-            ["/bin/sh", "-c", script, "sh", str(user_uid)],
+            [MEMBER_REAPER_TARGET, "capture", str(user_uid)],
             workdir="/",
             timeout_s=20,
             user_uid=user_uid,
@@ -782,31 +1855,11 @@ class ChatSandboxManager:
         escape merely by changing process groups or forking during cleanup.
         """
         self._validate_member_identity(spec, slot_id=slot_id, user_uid=user_uid)
+        self.ensure_member_process_reaper(spec)
         payload = self._encode_member_processes(baseline)
-        receipt = f"{MEMBER_TMPFS_ROOT}/{slot_id}/reap-{secrets.token_hex(16)}.baseline"
-        script = (
-            'set -eu; expected_uid="$1"; baseline="$2"; umask 077; '
-            'cleanup() { rm -f -- "$baseline"; }; trap cleanup EXIT HUP INT TERM; '
-            'cat > "$baseline"; '
-            'scan() { signal="$1"; extra=0; for proc in /proc/[0-9]*; do '
-            'pid=${proc##*/}; [ "$pid" != 1 ] && [ "$pid" != "$$" ] || continue; '
-            'uid=$(stat -c %u "$proc" 2>/dev/null || :); '
-            '[ "$uid" = "$expected_uid" ] || continue; '
-            'raw=$(cat "$proc/stat" 2>/dev/null || :); fields=${raw##*) }; '
-            'started=$(set -- $fields; printf "%s" "${20:-}"); '
-            'case "$started" in ""|*[!0-9]*) continue;; esac; '
-            'grep -Fqx -- "$pid $started" "$baseline" && continue; extra=1; '
-            '[ "$signal" = NONE ] || kill -"$signal" "$pid" 2>/dev/null || :; '
-            'done; [ "$extra" = 0 ]; }; '
-            'round=0; while [ "$round" -lt 20 ]; do '
-            "scan TERM && break; round=$((round + 1)); sleep 0.05; done; "
-            "round=0; while ! scan KILL; do round=$((round + 1)); "
-            '[ "$round" -lt 64 ] || exit 45; sleep 0.05; done; '
-            "scan NONE; cleanup; trap - EXIT HUP INT TERM"
-        )
         result = self.exec_capture(
             spec,
-            ["/bin/sh", "-c", script, "sh", str(user_uid), receipt],
+            [MEMBER_REAPER_TARGET, "reap", str(user_uid)],
             workdir="/",
             timeout_s=30,
             input_bytes=payload,
@@ -826,7 +1879,7 @@ class ChatSandboxManager:
         slot_id: int,
         user_uid: int,
     ) -> None:
-        if not spec.shared_live or not 0 <= slot_id < spec.resident_slot_capacity:
+        if not 0 <= slot_id < spec.resident_slot_capacity:
             raise ValueError("resident slot is outside this shared sandbox")
         if user_uid != MEMBER_UID_BASE + slot_id:
             raise ValueError("resident slot does not match its member uid")
@@ -861,8 +1914,6 @@ class ChatSandboxManager:
 
     def prepare_shared_workspace(self, spec: ChatSandboxSpec) -> None:
         """Make the imported owner tree writable through the shared group."""
-        if not spec.shared_live:
-            raise ValueError("shared workspace preparation requires shared_live")
         script = (
             "set -eu; "
             f"find {CHAT_WORKDIR} {CHAT_STATE_DIR} -xdev -type d "
@@ -892,7 +1943,7 @@ class ChatSandboxManager:
         user_gid: int,
     ) -> None:
         """Expose one member's credential-free workspace/state writes to peers."""
-        if not spec.shared_live or not 0 <= slot_id < spec.resident_slot_capacity:
+        if not 0 <= slot_id < spec.resident_slot_capacity:
             raise ValueError("resident slot is outside this shared sandbox")
         if user_uid != MEMBER_UID_BASE + slot_id:
             raise ValueError("resident slot does not match its member uid")
@@ -959,8 +2010,6 @@ class ChatSandboxManager:
         Git capture exec starts after this census and is the sole new writer;
         admissions remain blocked by the supervisor until thaw completes.
         """
-        if not spec.shared_live:
-            raise ValueError("writer freeze requires a shared-live sandbox")
         if not re.fullmatch(r"[0-9a-f]{32}", token):
             raise ValueError("snapshot freeze token is invalid")
         unique_slots = sorted(set(slot_ids))
@@ -1062,8 +2111,6 @@ class ChatSandboxManager:
         require_exact_census: bool = True,
     ) -> None:
         """Resume exactly the frozen PID/start pairs and detect new writers."""
-        if not spec.shared_live:
-            raise ValueError("writer thaw requires a shared-live sandbox")
         if not re.fullmatch(
             rf"{re.escape(ACTIVATION_TMPFS)}/snapshot-[0-9a-f]{{32}}\.pids", manifest
         ):
@@ -1295,13 +2342,12 @@ class ChatSandboxManager:
         # ``setsid`` loses this exec's controlling terminal.  Monitor mode is
         # disabled so commands launched by the shell remain in the signalable
         # group recorded in the pidfile.
-        shared_umask = "umask 0002; " if spec.shared_live else ""
         script = (
             'pidfile="$1"; '
             'printf "%s\\n" "$$" > "$pidfile" || exit 126; '
             'cleanup() { rm -f "$pidfile"; }; '
             "trap 'cleanup' EXIT; "
-            f"{shared_umask}"
+            "umask 0002; "
             '/bin/sh +m -i; status=$?; exit "$status"'
         )
         command = self.build_exec_command(
@@ -1853,14 +2899,19 @@ class ChatSandboxManager:
                     f"retained chat state path {destination!r} is mounted, not Docker-layer owned"
                 )
 
-    @staticmethod
-    def _verify_identity(inspection: ChatSandboxInspection, spec: ChatSandboxSpec) -> None:
+    def _verify_identity(self, inspection: ChatSandboxInspection, spec: ChatSandboxSpec) -> None:
         expected = spec.docker_labels()
         mismatched = {
             key: (inspection.labels.get(key), value)
             for key, value in expected.items()
             if inspection.labels.get(key) != value
         }
+        namespace = inspection.labels.get(CHAT_NAMESPACE_LABEL)
+        if namespace is not None and namespace != self.backend.sandbox_namespace:
+            mismatched[CHAT_NAMESPACE_LABEL] = (
+                namespace,
+                self.backend.sandbox_namespace,
+            )
         if spec.sandbox_image_digest is not None and inspection.image != spec.sandbox_image_digest:
             mismatched["container-image"] = (
                 inspection.image,
@@ -1995,7 +3046,7 @@ class _RetainedExecProcess(SandboxProcess):
         return self._process.poll()
 
     def kill(self) -> None:
-        """Kill only one shared member, or use the legacy container backstop."""
+        """Kill one shared member, stopping the container only as a backstop."""
         try:
             if self._process_pidfile is not None:
                 assert self._user_uid is not None and self._user_gid is not None
@@ -2152,10 +3203,9 @@ class _RetainedTerminalProcess(TerminalProcess):
 class RetainedChatBackend(SandboxBackend):
     """Present one retained container through the runner's sandbox contract.
 
-    This adapter is what lets existing runtime parsing, setup, patch building,
-    resource sampling and Agent CLI drivers execute with ``docker exec`` while
-    their orchestration is migrated incrementally.  It never interprets a
-    host ``workdir`` or ``state_dir``: both canonical paths already live in the
+    This adapter is what lets runtime parsing, setup, patch building and Agent
+    CLI drivers execute with ``docker exec``. It never interprets a host
+    ``workdir`` or ``state_dir``: both canonical paths already live in the
     container writable layer.
     """
 
@@ -2226,11 +3276,6 @@ class RetainedChatBackend(SandboxBackend):
         env = dict(spec.env)
         if self.manager.backend.egress is not None:
             env.update(self.manager.backend.egress.sandbox_env(spec.phase))
-        observed_pidfile = (
-            f"{ACTIVATION_TMPFS}/agent-{secrets.token_hex(16)}.pid"
-            if spec.observe_processes and self.runtime == KATA_RUNTIME
-            else None
-        )
         return self.manager.spawn(
             self.spec,
             spec.argv,
@@ -2239,34 +3284,8 @@ class RetainedChatBackend(SandboxBackend):
             live_input=spec.live_input,
             user_uid=self.manager.backend.uid,
             user_gid=self.manager.backend.gid,
-            process_pidfile=observed_pidfile,
+            process_pidfile=None,
         )
-
-    def begin_guest_observation(self) -> GuestObserverCursor | None:
-        """Fence this retained turn when it runs inside a Kata guest."""
-        if self.runtime != KATA_RUNTIME:
-            return None
-        return self.manager.begin_guest_observation(
-            self.spec,
-            user_uid=self.manager.backend.uid,
-        )
-
-    def finish_guest_observation(
-        self,
-        cursor: GuestObserverCursor | None,
-    ) -> GuestObservation | None:
-        """Close the retained Kata fence; non-Kata backends report no observer."""
-        if self.runtime != KATA_RUNTIME:
-            return None
-        return self.manager.finish_guest_observation(self.spec, cursor)
-
-    def tool_mark_reader(self) -> ToolMarkReader:
-        """Read exact Claude hook marks from the container-owned state layer."""
-        return self.manager.tool_mark_reader(self.spec)
-
-    def install_tool_hooks(self, update: dict[str, Any]) -> None:
-        """Install Claude's passive boundaries in Docker-owned state."""
-        self.manager.install_tool_hooks(self.spec, update)
 
     def spawn_terminal(self, spec: SandboxSpec, *, rows: int, cols: int) -> TerminalProcess:
         """Open an interactive PTY in this chat's retained workspace."""
@@ -2280,14 +3299,9 @@ class RetainedChatBackend(SandboxBackend):
             cols=cols,
         )
 
-    def adopt_workdir(self, path: str) -> None:
-        """Docker-layer paths are created for the sandbox uid in the image."""
-        if path not in {CHAT_WORKDIR, CHAT_STATE_DIR}:
-            raise SandboxError(f"retained backend does not own host path {path!r}")
-
-    def preflight(self, workdir_root: str | None = None) -> None:
+    def preflight(self) -> None:
         """Use the container backend checks without probing a host bind mount."""
-        self.manager.backend.preflight(workdir_root=None)
+        self.manager.backend.preflight()
 
     def check_gateway_reachable(self, base_url: str) -> None:
         """Delegate the backend's isolated gateway reachability probe."""
@@ -2299,6 +3313,7 @@ __all__ = [
     "CHAT_CONTAINER_PREFIX",
     "CHAT_GENERATION_LABEL",
     "CHAT_IMAGE_DIGEST_LABEL",
+    "CHAT_NAMESPACE_LABEL",
     "CHAT_RESIDENT_CAPACITY_LABEL",
     "CHAT_RUNTIME_LABEL",
     "CHAT_RUNTIME_VERSION_LABEL",

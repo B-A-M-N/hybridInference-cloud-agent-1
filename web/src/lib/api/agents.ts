@@ -26,7 +26,7 @@ export type AgentJobApiState =
   | 'failed'
   | 'cancelled';
 
-/** One tool call's slice of the turn, where the sampler's readings reach it. */
+/** One tool call's timing and attributable resource evidence. */
 export interface ToolCallResourcesApi {
   call_seq: number;
   tool_use_id: string;
@@ -34,7 +34,7 @@ export interface ToolCallResourcesApi {
   /** `exact` = the sandbox's own hooks; `message` = bracketed from outside. */
   timing_source: string;
   duration_ms: number | null;
-  /** Readings taken inside this call. Below two, nothing was measured. */
+  /** Historical sampled readings; current shared-member rows always carry 0. */
   sample_count: number;
   /** Calls that shared these readings, including this one. */
   overlap_n: number;
@@ -74,7 +74,7 @@ export interface ProcessObservationApi {
   observed_exec: boolean;
   observed_exit: boolean;
   tool_call_seqs: number[];
-  /** Exit-time accounting for the thread group; null until it exited. */
+  /** Exit-time accounting for the Linux process group; null until it exited. */
   cpu_usec?: number | null;
   mem_peak_bytes?: number | null;
   io_read_bytes?: number | null;
@@ -151,6 +151,8 @@ export interface AgentJobApi {
   model_calls: number | null;
   setup_egress_tier: string | null;
   agent_egress_tier: string | null;
+  /** Attempt whose continuity and resource telemetry is attached below. */
+  telemetry_attempt_id?: number | null;
   /** Which continuity rung this turn ran on. Null on turns that predate it. */
   continuity_mode?: 'hot' | 'warm_native' | 'cold_native' | 'replay' | null;
   /** Canonical user-facing context state for restartable chat sandboxes. */
@@ -173,13 +175,11 @@ export interface AgentJobApi {
   workspace_epoch?: number | null;
   duration_ms?: number | null;
   /**
-   * What the sandbox consumed, measured from the host. Null when no sampler
-   * reported; a present object with `coverage` below 1 is a partial
-   * measurement and must be rendered as incomplete, never as a total.
+   * Resource evidence for this attempt. Null when no accounting row exists.
+   * Current shared-member rows intentionally have no container totals;
+   * historical sampled rows with partial coverage remain lower bounds.
    */
   resources?: AttemptResourcesApi | null;
-  /** Identity of the top-level telemetry snapshot, unchanged by live events. */
-  telemetry_attempt_id?: number | null;
   /** Lightweight retry summaries; resource detail is loaded only on selection. */
   attempt_telemetry?: AgentAttemptSummaryApi[];
   /** Conversation fields are optional so pre-thread deployments remain readable. */
@@ -257,7 +257,7 @@ export interface AgentJobDirectoryApi {
   kind: 'directory';
   entries: AgentJobFileEntryApi[] | null;
   writable?: boolean;
-  source?: 'workspace' | 'snapshot';
+  source?: 'workspace';
 }
 
 export interface AgentJobFileApi {
@@ -270,7 +270,7 @@ export interface AgentJobFileApi {
   status?: AgentJobFileStatus | null;
   omitted_reason?: string | null;
   writable?: boolean;
-  source?: 'workspace' | 'snapshot';
+  source?: 'workspace';
 }
 
 export interface AgentJobSymlinkApi {
@@ -279,7 +279,7 @@ export interface AgentJobSymlinkApi {
   status?: AgentJobFileStatus | null;
   omitted_reason?: string | null;
   writable?: boolean;
-  source?: 'workspace' | 'snapshot';
+  source?: 'workspace';
 }
 
 export type AgentJobFilesApi = AgentJobDirectoryApi | AgentJobFileApi | AgentJobSymlinkApi;
@@ -622,9 +622,10 @@ export async function followUpAgentJob(
 }
 
 /**
- * Capability-gated shared chats native-fork the latest settled conversation
- * into a second live CLI session in the same sandbox/workspace. Historical
- * chats without retained sandbox state keep the DB-only compatibility path.
+ * Capability-gated shared chats native-fork the selected settled assistant
+ * boundary into a second live CLI session in the same sandbox/workspace.
+ * Chats without retained native state fail closed; transcript copying never
+ * substitutes for provider context.
  *
  * The fork-only call starts/probes the child's resident CLI but sends no
  * prompt and performs no model call. Returns the copied anchor turn — the
@@ -753,20 +754,7 @@ export async function listAllAgentThreadEvents(jobId: string): Promise<AgentThre
   }
 }
 
-export async function getAgentJobArtifact(
-  jobId: string,
-  kind: string,
-): Promise<{ content: string; attempt_id: number } | null> {
-  const resp = await fetchWithAuth(
-    API_BASE,
-    `/v1/agent/jobs/${encodeURIComponent(jobId)}/artifacts/${encodeURIComponent(kind)}`,
-  );
-  // A job that changed nothing legitimately has no patch; that is not an error.
-  if (resp.status === 404) return null;
-  return jsonOrThrow(resp);
-}
-
-/** Browse the live worktree, falling back to an archived snapshot for old jobs. */
+/** Browse the retained container's live workspace. */
 export async function getAgentJobFiles(jobId: string, path = ''): Promise<AgentJobFilesApi> {
   const query = path ? `?path=${encodeURIComponent(path)}` : '';
   const resp = await fetchWithAuth(
@@ -776,7 +764,7 @@ export async function getAgentJobFiles(jobId: string, path = ''): Promise<AgentJ
   return jsonOrThrow<AgentJobFilesApi>(resp);
 }
 
-/** Save one UTF-8 file in the live worktree. */
+/** Save one UTF-8 file in the live workspace. */
 export async function writeAgentJobFile(
   jobId: string,
   path: string,
@@ -814,7 +802,7 @@ export async function listAgentTerminals(jobId: string): Promise<AgentTerminalAp
   return Array.isArray(body) ? body : body.terminals;
 }
 
-/** Start an isolated shell that shares the job's worktree. */
+/** Start an isolated shell that shares the job's retained workspace. */
 export async function createAgentTerminal(
   jobId: string,
   size: { rows: number; cols: number } = { rows: 24, cols: 80 },
@@ -1069,7 +1057,7 @@ export interface AgentGitWorkspaceApi {
   }>;
 }
 
-/** Read Git status/diff/commits from the live worktree. */
+/** Read Git status/diff/commits from the live workspace. */
 export async function getAgentJobGit(jobId: string): Promise<AgentGitWorkspaceApi> {
   const resp = await fetchWithAuth(API_BASE, `/v1/agent/jobs/${encodeURIComponent(jobId)}/git`);
   return jsonOrThrow<AgentGitWorkspaceApi>(resp);

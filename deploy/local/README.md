@@ -19,15 +19,17 @@ not alternate code paths in the application.
 
 ## Run
 
-Prerequisites: Docker with Compose, `openssl`, `curl`, and Python 3. Give Docker
-Desktop at least 4 GiB of memory; 8 GiB is recommended for the all-five-runtime
-and concurrent-fork smoke. A roughly 2 GiB VM can OOM Kilo before the session
-protocol is exercised.
+Prerequisites: Docker with Compose, `openssl`, `curl`, and Python 3. The script
+prefers the Compose v2 plugin and falls back to the standalone command. It
+always passes `--scale runner=$LOCAL_RUNNER_REPLICAS` (default 2), so a legacy
+Compose binary cannot silently ignore `deploy.replicas` and deadlock the
+concurrent-fork smoke. Give Docker Desktop at least 4 GiB of memory; 8 GiB is
+recommended for the all-five-runtime and concurrent-fork smoke. A roughly
+2 GiB VM can OOM Kilo before the session protocol is exercised.
 
 ```bash
 ./deploy/local/dev.sh up
 ./deploy/local/dev.sh smoke
-./deploy/local/dev.sh legacy-smoke
 ```
 
 Then open <http://127.0.0.1:13002>. The first sign-in displays an explicit
@@ -41,33 +43,78 @@ callback allowlist from that value. An explicit
 `LOCAL_IDENTITY_ALLOWED_REDIRECTS` remains authoritative when testing a custom
 identity setup.
 
+For an isolated second stack, also export a distinct `LOCAL_PROJECT_NAME`,
+`LOCAL_SANDBOX_IMAGE`, `LOCAL_AGENT_EGRESS_NETWORK`, `AGENT_NETWORK_NAME`, and
+the four published ports. New env files derive a project-scoped sandbox image
+tag automatically; an explicit value remains necessary when overriding an
+existing env file. This keeps its Docker images, volumes, service discovery,
+and sandbox egress backplane separate from another checkout's local stack.
+Each retained sandbox then gets its own labelled internal
+`freeinference-chat-net-*` bridge; the backplane is used only to discover the
+local inference and MCP relay endpoints.
+`up`, `start`, and `smoke` fail before changing containers when either named
+network already belongs to a different Compose project; Compose's warning is
+not safe here because duplicate service aliases can route bootstrap or agent
+traffic into the other stack.
+
 `up` may take a while the first time because the sandbox image installs exact
 versions of Claude Code, Codex, Pi, OpenCode, and Kilo. Later builds use Docker
-layer cache.
+layer cache. The bootstrap also writes a stack-scoped completed-deployment
+marker into `local-host-state`; local runners and the control plane use that
+same marker, so local claims exercise the production exact-generation fence
+rather than bypassing it.
+
+### Building through a local proxy
+
+On Docker Desktop, a proxy listening on the host (for example Clash on port
+7890) is reachable from builds through `host.docker.internal`. Prebuild with
+Docker's standard proxy arguments, then start the stack using those cached
+images:
+
+```bash
+./deploy/local/dev.sh build \
+  --build-arg HTTP_PROXY=http://host.docker.internal:7890 \
+  --build-arg HTTPS_PROXY=http://host.docker.internal:7890 \
+  --build-arg NO_PROXY=localhost,127.0.0.1
+./deploy/local/dev.sh up --no-build
+```
+
+Use the same project, image and port environment overrides for both commands
+when running an isolated second stack. `up --no-build` starts the exact images
+you prebuilt, without rebuilding with the default mirror arguments. Re-run
+`build` after code changes before using this option. The proxy must already accept the
+Docker Desktop connection. These arguments apply to build downloads; no proxy
+environment is added to the running agent containers. Python dependency
+downloads allow 120 seconds of inactivity by default; the corresponding
+`PIP_DEFAULT_TIMEOUT` and runner `UV_HTTP_TIMEOUT` build arguments can be
+overridden for slower links. Certificate and package-signature checks remain
+enabled.
+
+If Debian's default mirror returns intermittent errors, select another Debian
+mirror at build time, for example `--build-arg
+DEBIAN_MIRROR=http://mirrors.aliyun.com`. The default remains
+`http://deb.debian.org`; the override changes both the archive and security
+mirror while preserving the distribution, components and signed keyring.
+Index downloads retry transient failures and fail the build if an index is
+still unavailable, rather than proceeding with an incomplete package list.
+The sandbox also retries package downloads and keeps Debian/npm downloads in
+BuildKit caches, so retrying a failed build can reuse completed downloads.
+These build caches are not mounted into running agent containers.
 
 `smoke` logs in through PKCE, runs a first turn and native-session follow-up
 through **each of those five real CLI binaries**, waits for every chat group to
 stop at the idle deadline, and proves each third turn restores the same
-mount-free container id. It then immediately native-forks every latest settled
-session, verifies source and child are independently LIVE inside the same
+mount-free container id. It then native-forks each session at its second turn
+while the source is already at turn three, verifies the child contains exactly
+that historical prefix, and proves source and child are independently LIVE inside the same
 container/workspace, holds the local model responses long enough to observe
 both post-fork turns simultaneously `RUNNING`, and requires both CLI processes
 to overlap at a two-party local inference barrier before either receives its
 response. It then wakes the stopped group from the child. A passing result
 therefore covers
-`NEW → LIVE → stopped → RESTORED`, prompt-free same-container Fork, concurrent
+`NEW → LIVE → stopped → RESTORED`, historical prompt-free same-container Fork, concurrent
 source/child admission, group stop/restore, and completion of the final
 quiescent publication snapshot for all five CLIs.
-
-`legacy-smoke` is a separate compatibility check for the rollout's
-default-off path. It briefly stops the retained runners, recreates the local
-control plane with the shared-live rollout gate disabled, and launches one
-explicitly default-off runner with a same-path temporary bind (the topology
-production mixed mode requires). It proves that the job reaches Claude Code,
-exports a checkpoint, and completes in-sandbox patch generation. The temporary
-bind is removed and the normal control plane/runners are restored before exit,
-including after failure; the bind is not part of the normal Docker-only local
-storage topology.
 
 Useful commands:
 

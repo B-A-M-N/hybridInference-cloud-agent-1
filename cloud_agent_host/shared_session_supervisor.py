@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import secrets
 import threading
 import time
@@ -42,7 +43,7 @@ from cloud_agent_host.resident_transport import (
     ResidentTurn,
 )
 from cloud_agent_host.sandbox import KATA_RUNTIME, SandboxError
-from cloud_agent_host.session_supervisor import (
+from cloud_agent_host.session_lifecycle import (
     DEFAULT_CHAT_IDLE_TIMEOUT_S,
     DEFAULT_SWEEP_INTERVAL_S,
     SessionBusy,
@@ -217,7 +218,7 @@ class _Group:
 
 
 NativeForker = Callable[
-    [ChatSandboxSpec, ResidentTransport, str, ResidentLaunch],
+    [ChatSandboxSpec, ResidentTransport, str, ResidentLaunch, int],
     str,
 ]
 
@@ -331,13 +332,21 @@ class SharedChatSessionSupervisor:
     def reconcile(self) -> list[SharedSessionDescriptor]:
         """Discover only containers labelled for the shared-live protocol."""
         found: list[SharedSessionDescriptor] = []
+        specs: list[ChatSandboxSpec] = []
         for inspection in self._manager.list():
             if inspection.labels.get(CHAT_SHARED_LABEL) != "true":
                 continue
             spec = self._spec_from_inspection(inspection)
+            specs.append(spec)
             with self._lock:
                 group = self._groups.get(spec.sandbox_id)
                 if group is None:
+                    # A replacement broker cannot reattach the old docker-exec
+                    # pipes. Stop only a newly discovered orphan before
+                    # adopting it; list() also calls reconcile(), so stopping a
+                    # group already managed by this process would race every
+                    # active turn with ordinary status polling.
+                    inspection = self._manager.stop(spec)
                     group = _Group(spec=spec, inspection=inspection)
                     origin = _Member(thread_id=spec.thread_id, resident_slot_id=0)
                     group.members[origin.thread_id] = origin
@@ -346,8 +355,15 @@ class SharedChatSessionSupervisor:
                 else:
                     if group.spec != spec:
                         raise SandboxError("shared sandbox immutable labels changed")
+                    if not inspection.running and inspection.networks and self._is_quiescent(group):
+                        # Retry an idempotent release after an external stop or
+                        # a prior stop whose Docker network cleanup failed.
+                        # Active member/terminal operations fence this path
+                        # from a concurrent wake or phase transition.
+                        inspection = self._manager.stop(spec)
                     group.inspection = inspection
                 found.extend(self._descriptors(group))
+        self._manager.prune_orphan_networks(specs)
         return found
 
     def register_manifest(
@@ -358,8 +374,6 @@ class SharedChatSessionSupervisor:
         expected_container_id: str | None = None,
     ) -> list[SharedSessionDescriptor]:
         """Install the control plane's authoritative member aliases."""
-        if not spec.shared_live:
-            raise ValueError("a shared supervisor requires shared_live sandbox identity")
         if not members:
             raise ValueError("a shared sandbox manifest cannot be empty")
         seen_slots: set[int] = set()
@@ -488,6 +502,11 @@ class SharedChatSessionSupervisor:
                 raise SessionBusy(f"chat {thread_id!r} already has an active turn")
             if member.current_turn is not None:
                 raise SessionBusy(f"chat {thread_id!r} already has a running turn")
+            # Fence stale attempt owners before doing anything observable to
+            # the shared container. In particular, an old lease must not wake
+            # a stopped workspace only to be rejected after ``docker start``.
+            if activation_generation < member.activation_generation:
+                raise SessionLeaseLost("member activation generation is stale")
             current = self._manager.inspect(group.spec.container_name)
             if current is None:
                 member.context_status = "lost"
@@ -497,9 +516,10 @@ class SharedChatSessionSupervisor:
                 member.context_status = "lost"
                 member.resident_state = "lost"
                 raise RetainedChatLost("shared sandbox container identity changed")
-            group.inspection = self._manager.start(group.spec)
-            if activation_generation < member.activation_generation:
-                raise SessionLeaseLost("member activation generation is stale")
+            group.inspection = self._manager.start(
+                group.spec,
+                network_phase="agent" if has_settled_context else "setup",
+            )
             member.activation_generation = activation_generation
             member.lease_token = secrets.token_urlsafe(32)
             member.lease_owner = owner
@@ -842,10 +862,20 @@ class SharedChatSessionSupervisor:
             settled_session_id = observed or native_session_id
             if not settled_session_id:
                 raise SandboxError("resident transport did not report a native session id")
+            if member.native_session_id and settled_session_id != member.native_session_id:
+                raise SandboxError("resident transport settled a different native session")
             member.native_session_id = settled_session_id
             member.last_settled_job_id = job_id
             member.context_status = context_status
-            member.resident_state = "live"
+            # Preserve the observed native locator before gracefully retiring
+            # a retry-affected CLI. Unexpected process death still fails the
+            # live-transport check above, and no subsequent turn can enter
+            # until EOF has flushed the native history.
+            if member.transport.retire_after_turn:
+                member.transport.close()
+                member.resident_state = "restarting"
+            else:
+                member.resident_state = "live"
             member.lease_token = None
             member.lease_owner = None
             self._arm_idle_if_quiescent(group)
@@ -936,6 +966,7 @@ class SharedChatSessionSupervisor:
         *,
         operation_id: str,
         source_native_session_id: str,
+        source_native_turn_no: int,
         target_thread_id: str,
         target_slot_id: int,
         source_launch: ResidentLaunch,
@@ -964,6 +995,7 @@ class SharedChatSessionSupervisor:
                         operation_id=operation_id,
                         source_thread_id=source_thread_id,
                         source_native_session_id=source_native_session_id,
+                        source_native_turn_no=source_native_turn_no,
                         target_thread_id=target_thread_id,
                         target_slot_id=target_slot_id,
                         source_launch=source_launch,
@@ -984,6 +1016,7 @@ class SharedChatSessionSupervisor:
         operation_id: str,
         source_thread_id: str,
         source_native_session_id: str,
+        source_native_turn_no: int,
         target_thread_id: str,
         target_slot_id: int,
         source_launch: ResidentLaunch,
@@ -1086,6 +1119,7 @@ class SharedChatSessionSupervisor:
                 native_session_id=None,
                 slot_id=target_slot_id,
             ),
+            source_native_turn_no,
         )
         # Some HTTP-backed CLIs persist the child successfully and then close
         # the server process that handled the fork request. A successful fork
@@ -1137,7 +1171,6 @@ class SharedChatSessionSupervisor:
                 raise SandboxError("fork target raced with another membership")
             group.members[target_thread_id] = child
             self._members[target_thread_id] = group
-            self._arm_idle_if_quiescent(group)
             return NativeSessionForkResult(
                 operation_id=operation_id,
                 sandbox_id=group.spec.sandbox_id,
@@ -1204,7 +1237,7 @@ class SharedChatSessionSupervisor:
         result: dict[str, Any] | None = None
         try:
             if not current.running:
-                started = self._manager.start(group.spec)
+                started = self._manager.start(group.spec, network_phase="agent")
                 with self._lock:
                     if group.stopping or group.lifecycle_generation != lifecycle_generation:
                         raise SessionLeaseLost(
@@ -1264,14 +1297,16 @@ class SharedChatSessionSupervisor:
             group, member = self._member(thread_id)
             if group.terminal_tokens.get(token) != thread_id:
                 raise SessionLeaseLost("shared terminal lifecycle token is stale")
-            group.terminal_tokens.pop(token, None)
             now = self._clock()
             activity_at = now
             if last_activity_monotonic is not None:
                 activity_at = float(last_activity_monotonic)
-                if activity_at < 0 or activity_at != activity_at:
+                if activity_at < 0 or not math.isfinite(activity_at):
                     raise ValueError("terminal last activity timestamp is invalid")
                 activity_at = min(activity_at, now)
+            # Validation comes first: a malformed close request is retryable
+            # and must not consume the reference that keeps this group awake.
+            group.terminal_tokens.pop(token, None)
             if self._is_quiescent(group) and group.inspection.running:
                 group.idle_deadline = activity_at + self._idle_timeout_s
             return self._descriptor(group, member)
@@ -1394,7 +1429,12 @@ class SharedChatSessionSupervisor:
             current = self._manager.inspect(group.spec.container_name)
             if current is None:
                 raise RetainedChatLost("shared sandbox container is missing")
-            inspection = self._manager.stop(group.spec) if current.running else current
+            # ``ChatSandboxManager.stop`` is deliberately idempotent: when
+            # Docker already stopped the container it still releases the
+            # retained phase network. Always delegate so an external stop, or
+            # a retry after network cleanup failed, cannot leak the chat's
+            # private subnet.
+            inspection = self._manager.stop(group.spec)
         except BaseException:
             failed_inspection: ChatSandboxInspection | None = None
             with contextlib.suppress(Exception):
@@ -1460,6 +1500,15 @@ class SharedChatSessionSupervisor:
             if current_group is not group or current_member is not member:
                 raise SessionLeaseLost("member identity changed before process launch")
             self._require_mutation_admission(group)
+            # The retained member owns the locator. An omitted field in a
+            # later activation must not turn a restart into a fresh chat.
+            if member.native_session_id:
+                if (
+                    launch.native_session_id
+                    and launch.native_session_id != member.native_session_id
+                ):
+                    raise SandboxError("activation requested a different native session")
+                launch = replace(launch, native_session_id=member.native_session_id)
             lifecycle_generation = group.lifecycle_generation
             current = member.transport
             same_residency = (
@@ -1488,6 +1537,11 @@ class SharedChatSessionSupervisor:
             with contextlib.suppress(Exception):
                 current.close()
         transport = self._transport_factory.open(group.spec, launch)
+        observed = transport.native_session_id
+        if launch.native_session_id and observed and observed != launch.native_session_id:
+            with contextlib.suppress(Exception):
+                transport.close()
+            raise SandboxError("resident transport resumed a different native session")
         if launch.residency_generation <= 0:
             with contextlib.suppress(Exception):
                 transport.close()
@@ -1524,7 +1578,15 @@ class SharedChatSessionSupervisor:
         current = self._manager.inspect(group.spec.container_name)
         if current is None:
             raise RetainedChatLost("shared sandbox container is missing")
-        group.inspection = self._manager.start(group.spec) if not current.running else current
+        network_phase = (
+            "agent"
+            if any(member.native_session_id for member in group.members.values())
+            else "setup"
+        )
+        group.inspection = self._manager.start(
+            group.spec,
+            network_phase=network_phase,
+        )
 
     def _arm_idle_if_quiescent(self, group: _Group) -> None:
         if self._is_quiescent(group) and group.inspection.running:

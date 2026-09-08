@@ -1,7 +1,9 @@
-"""Per-tool-call windows, and what the sampler may honestly attribute to them.
+"""Per-tool-call windows and the evidence honestly attributable to them.
 
-The attempt rollup answers "what did this turn cost". This module answers the
-next question — "which call cost it" — and, far more often, declines to.
+The current shared-retained topology records timing for every bounded call and
+may attach UID-filtered guest process accounting. The whole-container sampler
+arithmetic remains here for historical rows and lower-level validation, but a
+shared member never receives its group's Docker totals.
 
 Measured on production over 278 calls: the median tool call is 35 ms, 97 %
 finish inside a second, and the sampler reads once a second. Most calls begin
@@ -26,7 +28,7 @@ number of calls it shared with, and never in the ``exclusive`` ones — so a
 reader that only knows about exclusive numbers shows nothing rather than
 showing an overstatement.
 
-Timestamps are taken in the runner's own loop, where the harness line was read.
+Timestamps are taken in the workspace broker's turn loop, where the harness line was read.
 That is a different clock from the one the turn footer has shown until now,
 which is the control plane's insert time for the event and therefore carries
 the upload queue inside every duration it displays.
@@ -119,10 +121,10 @@ def _text(value: Any) -> str:
 class ToolWindowTracker:
     """Turns one attempt's driver event stream into one window per call.
 
-    Fed from the runner's event loop, so it sees exactly the events the owner
-    will later read, in the order they were parsed. It holds no payloads: a
-    window is four scalars, and the arguments and results the call carried are
-    already stored once.
+    Fed from the workspace broker's turn loop, so it sees exactly the events
+    the runner will later read, in the order they were parsed. It holds no
+    payloads: a window is four scalars, and the arguments and results the call
+    carried are already stored once.
     """
 
     def __init__(self, *, limit: int = MAX_TOOL_CALLS) -> None:
@@ -131,8 +133,13 @@ class ToolWindowTracker:
         # list in that order and let open ids point into it; moving completed
         # calls into a separate list would silently reorder parallel calls by
         # whichever result happened to arrive first.
-        self._windows: list[ToolWindow] = []
+        self._windows: list[ToolWindow | None] = []
         self._open: dict[str, int] = {}
+        # Once two concurrent calls reuse one id, no later result can say
+        # which call it closes. Tombstone the retained row and keep the id
+        # invalid for the rest of this attempt instead of pairing the first
+        # result with whichever call happened to arrive first.
+        self._ambiguous_ids: set[str] = set()
         self._dropped = 0
 
     def observe(self, event_type: str, payload: dict[str, Any] | None, *, mono: float) -> None:
@@ -147,9 +154,20 @@ class ToolWindowTracker:
                 # no row. Say explicitly that the resulting list is partial.
                 self._dropped += 1
                 return
-            if tool_use_id in self._open or len(self._windows) >= self._limit:
-                # Concurrent duplicate ids cannot be paired honestly, and an
-                # open-call storm must not grow memory past the wire cap.
+            if tool_use_id in self._ambiguous_ids:
+                self._dropped += 1
+                return
+            if tool_use_id in self._open:
+                # Neither duplicate can be retained honestly. Leaving the
+                # original row in place would let the first result close it,
+                # even though that result could belong to the second call.
+                index = self._open.pop(tool_use_id)
+                self._windows[index] = None
+                self._ambiguous_ids.add(tool_use_id)
+                self._dropped += 2
+                return
+            if len(self._windows) >= self._limit:
+                # An open-call storm must not grow memory past the wire cap.
                 self._dropped += 1
                 return
             self._open[tool_use_id] = len(self._windows)
@@ -162,11 +180,16 @@ class ToolWindowTracker:
             )
         elif event_type == "tool_result":
             tool_use_id = _text(fields.get("tool_use_id"))
+            if tool_use_id in self._ambiguous_ids:
+                return
             index = self._open.pop(tool_use_id, None) if tool_use_id else None
             if index is None:
                 return
+            window = self._windows[index]
+            if window is None:  # Defensive; ambiguous ids are handled above.
+                return
             self._windows[index] = dataclasses.replace(
-                self._windows[index],
+                window,
                 closed_mono=mono,
             )
 
@@ -190,6 +213,8 @@ class ToolWindowTracker:
             by_id.setdefault(tool_use_id, []).append((when, phase))
         upgraded = 0
         for index, window in enumerate(self._windows):
+            if window is None:
+                continue
             if window.closed_mono is None:
                 continue
             candidates = [
@@ -219,7 +244,7 @@ class ToolWindowTracker:
         with no close time. A turn that ends mid-call is the shape of a timeout
         or a cancel, and dropping those rows would delete the evidence.
         """
-        return list(self._windows)
+        return [window for window in self._windows if window is not None]
 
     @property
     def truncated(self) -> bool:

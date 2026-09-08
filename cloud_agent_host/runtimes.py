@@ -87,7 +87,7 @@ class RuntimeCapabilities:
     #: vocabulary to keep in step with the CLIs' and the models'. The order is
     #: therefore part of the declaration, and ``test_agent_runtimes`` pins it.
     reasoning_efforts: tuple[str, ...] = ()
-    # Whether this adapter can point the CLI at the gateway's MCP proxy *and*
+    # Whether this adapter can point the CLI at the platform's MCP relay *and*
     # shut out every other MCP config source. Both halves or neither: a runtime
     # that could be given servers but not stopped from picking up the
     # repository's own would be worse than one with no MCP at all.
@@ -199,12 +199,12 @@ class AgentRuntime:
     def _mcp_endpoints(
         config: RuntimeMCPConfig, *, gateway_base_url: str
     ) -> dict[str, dict[str, Any]]:
-        """Resolve opaque server ids into gateway-local endpoints.
+        """Resolve opaque server ids into sandbox-local relay endpoints.
 
-        The agent is told a URL on our own gateway, and nothing else: not the
-        upstream address, not the credential that reaches it. Both stay on the
-        gateway, which is what lets a sandbox with no egress use these servers
-        at all.
+        The agent is told this service's fixed MCP-only relay URL, and nothing
+        else: not the upstream address, not the user's credential that reaches
+        it. Both stay in the control plane, which is what lets a sandbox with
+        no general egress use these servers at all.
 
         **The token is referenced, not embedded.** ``${AGENT_MCP_TOKEN}`` is
         expanded by the CLI from the environment, so the credential never
@@ -244,10 +244,10 @@ class AgentRuntime:
         return RuntimeCapabilities()
 
     def _require_empty_mcp_config(self, config: RuntimeMCPConfig) -> None:
-        """Fail closed until this adapter has a gateway-mediated MCP path."""
+        """Fail closed until this adapter has a platform-mediated MCP path."""
         if config.server_ids:
             raise RuntimeMCPUnavailableError(
-                f"runtime {self.name!r} cannot use MCP servers until the gateway broker is enabled"
+                f"runtime {self.name!r} cannot use MCP servers until its isolated relay path is enabled"
             )
 
     @staticmethod
@@ -281,9 +281,9 @@ class ClaudeCodeRuntime(AgentRuntime):
         # One adapter instance per job (see get_runtime), so this is per-run
         # state — the suppression below cannot leak across jobs.
         self._reported_subtypes: set[str] = set()
-        #: The CLI's own session id, captured from the ``init`` event. This is
-        #: the name of the session file a checkpoint exports and a later turn
-        #: resumes (design §6); ``None`` until the CLI has announced itself.
+        #: The CLI's own session id, captured from the ``init`` event. The
+        #: retained container resumes this native locator directly; ``None``
+        #: until the CLI has announced itself.
         self.session_id: str | None = None
 
     def prepare(
@@ -302,11 +302,11 @@ class ClaudeCodeRuntime(AgentRuntime):
     ) -> tuple[list[str], dict[str, str]]:
         """Build the headless invocation and its environment.
 
-        ``config_dir`` relocates the CLI's config/session storage (the state
-        mount, so session files outlive the container); ``resume_session_id``
-        continues an earlier session with only the new prompt — the COLD
-        restore of design §6. Both are claude-specific and passed only by the
-        claude driver; the generic session never sets them.
+        ``config_dir`` relocates the CLI's config/session storage inside the
+        retained container's writable layer; ``resume_session_id`` continues
+        an earlier native session with only the new prompt after the resident
+        process was replaced. Both are Claude-specific and passed only by the
+        Claude driver; the generic session never sets them.
         """
         argv = [
             self.binary,
@@ -372,9 +372,8 @@ class ClaudeCodeRuntime(AgentRuntime):
             "DISABLE_AUTOUPDATER": "1",
         }
         if config_dir:
-            # Session files land under the state mount instead of the
-            # container's throwaway HOME, which is what makes them exportable
-            # after exit and restorable before the next turn.
+            # Session files land in the retained container layer instead of a
+            # process-private HOME, so docker stop/start can resume them.
             env["CLAUDE_CONFIG_DIR"] = config_dir
         return argv, env
 
@@ -395,9 +394,8 @@ class ClaudeCodeRuntime(AgentRuntime):
 
         ``--input-format stream-json`` keeps the process alive between turns,
         reading user messages from stdin — the terminal-never-closed shape the
-        design's HOT tier is. Everything else (flags, env, MCP pairing) is the
-        one-shot invocation verbatim, built by the same code so the two can
-        never drift.
+        design's HOT tier is. The common argv/env builder stays shared with
+        runtime conformance tests so auth, model, and MCP flags cannot drift.
         """
         argv, env = self.prepare(
             workdir=workdir,
@@ -460,7 +458,7 @@ class ClaudeCodeRuntime(AgentRuntime):
                     return None
                 self._reported_subtypes.add(subtype)
                 return self._raw(line, f"unclassified system subtype {subtype!r}")
-            if subtype == "init":
+            if subtype == "init" and not event.get("parent_tool_use_id"):
                 captured = str(event.get("session_id") or "").strip()
                 if captured:
                     self.session_id = captured
@@ -668,7 +666,7 @@ class CodexRuntime(AgentRuntime):
             "--model",
             model,
             # Beside the other -c overrides, and built by the dialect helper so
-            # the one-shot path cannot spell it differently from anywhere else.
+            # every resident launch uses exactly the same spelling.
             *self.effort_args(reasoning_effort),
             "-c",
             f'model_provider="{provider}"',
@@ -1022,17 +1020,8 @@ class PiRuntime(GenericRuntime):
         session_state_dir: str | None = None,
         resume_session_id: str | None = None,
         activation_dir: str | None = None,
-        fork_session_id: str | None = None,
     ) -> tuple[list[str], dict[str, str]]:
-        """Build pi 0.73.1's bidirectional JSONL RPC process.
-
-        ``--fork`` is a prompt-free native mutation performed by a temporary
-        RPC process.  It cannot be combined with ``--session``; keeping that
-        rule here mirrors the exact CLI validation instead of relying on a
-        later opaque exit.
-        """
-        if resume_session_id and fork_session_id:
-            raise ValueError("pi cannot resume and fork in one invocation")
+        """Build pi 0.73.1's bidirectional JSONL RPC process."""
         argv, env = self.prepare(
             workdir=workdir,
             task_prompt="",
@@ -1050,8 +1039,6 @@ class PiRuntime(GenericRuntime):
         argv[mode_at] = "rpc"
         prompt_at = argv.index("-p")
         del argv[prompt_at : prompt_at + 2]
-        if fork_session_id:
-            argv += ["--fork", fork_session_id]
         return argv, env
 
     def parse_event(self, line: str) -> NormalizedEvent | None:
@@ -1087,10 +1074,26 @@ class PiRuntime(GenericRuntime):
         if kind == "message_end":
             return self._from_message_end(event, line)
         if kind == "agent_end":
+            failure = self.agent_error(event)
+            if failure is not None:
+                return NormalizedEvent(ERROR, {"text": failure})
             return NormalizedEvent(LIFECYCLE, {"phase": "result"})
         if kind in self._SILENT_KINDS:
             return None
         return self._raw(line, f"unknown type {kind!r}")
+
+    @staticmethod
+    def agent_error(event: dict[str, Any]) -> str | None:
+        """Read the final assistant outcome from Pi's native agent-end event."""
+        messages = event.get("messages")
+        if not isinstance(messages, list):
+            return None
+        for message in reversed(messages):
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                if message.get("stopReason") in {"error", "aborted"}:
+                    return _truncate(message.get("errorMessage") or "Pi agent turn failed")
+                return None
+        return None
 
     def _from_message_update(self, event: dict[str, Any], line: str) -> NormalizedEvent | None:
         """Map a completed content block; drop the deltas that built it."""
@@ -1531,18 +1534,16 @@ def runtime_reasoning_efforts() -> dict[str, list[str]]:
     return efforts
 
 
-def get_runtime(name: str, *, generic_command: str | None = None) -> AgentRuntime:
-    """Return the adapter for a runtime id.
+def get_runtime(name: str) -> AgentRuntime:
+    """Return one of the five live-session runtime adapters.
 
-    Unknown ids fall back to :class:`GenericRuntime` when a command template is
-    supplied, so a Tier 2 runtime needs no code change — and otherwise raise,
-    because silently running the wrong agent is worse than refusing.
+    Unknown ids fail closed. A command template cannot opt a one-shot process
+    into the retained topology because it cannot attest native resume, live
+    transport, immediate fork, or concurrent shared-workspace behavior.
     """
     runtime_cls = _REGISTRY.get(name)
     if runtime_cls is not None:
         return runtime_cls()
-    if generic_command:
-        return GenericRuntime(generic_command)
     known = ", ".join(sorted(_REGISTRY))
     raise KeyError(f"Unknown agent runtime {name!r}. Known: {known}")
 

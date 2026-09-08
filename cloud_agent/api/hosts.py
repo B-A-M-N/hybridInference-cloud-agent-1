@@ -4,19 +4,11 @@ Kept out of ``routes.py``. That file is the moved gateway router and is held to
 a move-as-is diff; these are net-new phase-G surface, and mixing them in would
 make the one file nobody should be editing the file everybody edits.
 
-**Why enrollment exists at all.** Before it, a machine joined the pool by
-polling with the dispatcher credential, and the pool list was therefore a list
-of names anything holding that credential could invent — which #1158's own
-module docstring says plainly, and accepts, because the switch it was built for
-decides where *our* machines run *our* jobs. A pool that grows and shrinks
-needs more than that: a host must be something the platform issued a credential
-to, so that revoking it means something and so that a heartbeat is evidence
-rather than an assertion.
-
-The credential is deliberately **not** the dispatcher token. That token opens
-the claim door for every host; a host credential opens it for exactly one, and
-carries the machine's identity with it, so a compromised host cannot claim as
-its neighbour.
+**Why enrollment exists at all.** A host must be something the platform issued
+a credential to, so revoking it has meaning and a heartbeat/claim is evidence
+rather than a request-body assertion. The credential opens those surfaces for
+exactly one host and carries the machine identity, so a compromised host cannot
+claim as its neighbour. There is no pool-wide claim credential.
 
 Registration is unauthenticated *except* for the enrollment token, and that is
 the point: a machine being set up has no credential yet. The token is
@@ -45,11 +37,7 @@ from cloud_agent.schemas import (
     HostHeartbeatResponse,
     HostRegisterRequest,
     HostRegisterResponse,
-    HostResidencyEstablishRequest,
-    HostResidencyEstablishResponse,
-    HostResidencyReleaseRequest,
     ResidencyBeat,
-    WorkerAckResponse,
 )
 from cloud_agent.tokens import InvalidHostToken, mint_host_token, parse_host_token
 
@@ -62,7 +50,7 @@ router = APIRouter(prefix="/v1/agent/host", tags=["agent-hosts"])
 
 #: How long a residency's lease lives between beats (design §7) — and, since
 #: the lease and the thread-attributed grant are renewed by the same beat and
-#: revoked together (design §14), the cap on how long an idle resident
+#: revoked together (retained-session design §§3 and 6), the cap on how long an idle resident
 #: process keeps a live credential after its host goes quiet.
 RESIDENCY_TTL_S = float(os.environ.get("AGENT_RESIDENCY_TTL_S") or 1800.0)
 
@@ -170,6 +158,11 @@ async def register_host(
     re-issued.
     """
     job_store = _require_store(store)
+    # Validate every retryable, machine-supplied configuration field before
+    # spending the one-time token. A refused broker address is a 400 the
+    # operator can correct; consuming the token first turns that typo into a
+    # second privileged admin operation for no security benefit.
+    broker_url = _checked_broker_url(body.broker_url)
     if not await job_store.consume_enroll_token(
         token_hash=hash_secret(body.enroll_token), host=body.name
     ):
@@ -193,7 +186,7 @@ async def register_host(
         credential_hash=hash_secret(credential),
         capabilities=body.capabilities,
         slots_total=body.slots_total,
-        broker_url=_checked_broker_url(body.broker_url),
+        broker_url=broker_url,
         runner_version=body.runner_version,
         labels=dict(body.labels),
     )
@@ -278,61 +271,53 @@ async def heartbeat_host(
             sandbox_id=beat.sandbox_id,
             container_id=beat.container_id,
             sandbox_generation=beat.generation,
-            activation_generation=beat.activation_generation,
             running=beat.running,
             activity_active=beat.activity_active,
             idle_remaining_seconds=beat.idle_remaining_seconds,
-            shared_live=beat.shared_live,
             members=[member.model_dump() for member in beat.members],
         )
-        if beat.shared_live:
-            for member in beat.members:
-                if member.residency_generation <= 0:
-                    continue
-                # A stopped group has no process that can legitimately use a
-                # residency credential. Release and revoke it instead of
-                # renewing it forever. The database performs this release
-                # under the group's operation and member-attempt fences: this
-                # heartbeat was sampled earlier and must not revoke a grant a
-                # concurrent fork/start minted after that sample.
-                if not beat.running or member.resident_state in {"stopped", "lost"}:
-                    released = await job_store.release_shared_residency_if_quiescent(
-                        thread_id=member.thread_id,
-                        generation=member.residency_generation,
-                        process_generation=member.process_generation,
-                        host=updated["host"],
-                        sandbox_id=beat.sandbox_id,
-                    )
-                    if released and grants is not None:
-                        with contextlib.suppress(Exception):
-                            await grants.revoke(released)
-                    continue
-                # ``starting`` and ``restarting`` are bounded launch windows.
-                # Do not race an in-flight process launch by revoking its new
-                # grant, but also do not renew an old, unattached credential;
-                # it expires naturally unless the member proves LIVE later.
-                if member.resident_state != "live":
-                    continue
-                extended = await job_store.heartbeat_residency(
+        for member in beat.members:
+            if member.residency_generation <= 0:
+                continue
+            # A stopped group has no process that can legitimately use a
+            # residency credential. Release and revoke it instead of renewing
+            # it forever. The database fences this against concurrent starts.
+            if not beat.running or member.resident_state in {"stopped", "lost"}:
+                released = await job_store.release_shared_residency_if_quiescent(
                     thread_id=member.thread_id,
                     generation=member.residency_generation,
+                    process_generation=member.process_generation,
                     host=updated["host"],
-                    ttl_seconds=RESIDENCY_TTL_S,
+                    sandbox_id=beat.sandbox_id,
                 )
-                if extended and grants is not None:
+                if released and grants is not None:
                     with contextlib.suppress(Exception):
-                        await grants.renew(extended)
-                if extended is None and not any(
-                    item.thread_id == member.thread_id
-                    and item.generation == member.residency_generation
-                    for item in lost
-                ):
-                    lost.append(
-                        ResidencyBeat(
-                            thread_id=member.thread_id,
-                            generation=member.residency_generation,
-                        )
+                        await grants.revoke(released)
+                continue
+            # Starting/restarting is a bounded launch window. Renew only a
+            # process that has proved itself LIVE.
+            if member.resident_state != "live":
+                continue
+            extended = await job_store.heartbeat_residency(
+                thread_id=member.thread_id,
+                generation=member.residency_generation,
+                host=updated["host"],
+                ttl_seconds=RESIDENCY_TTL_S,
+            )
+            if extended and grants is not None:
+                with contextlib.suppress(Exception):
+                    await grants.renew(extended)
+            if extended is None and not any(
+                item.thread_id == member.thread_id
+                and item.generation == member.residency_generation
+                for item in lost
+            ):
+                lost.append(
+                    ResidencyBeat(
+                        thread_id=member.thread_id,
+                        generation=member.residency_generation,
                     )
+                )
         if beat.running:
             due = await job_store.due_thread_sandbox_stop(
                 thread_id=beat.thread_id,
@@ -340,7 +325,6 @@ async def heartbeat_host(
                 sandbox_id=beat.sandbox_id,
                 container_id=beat.container_id,
                 sandbox_generation=beat.generation,
-                shared_live=beat.shared_live,
             )
             if due is not None:
                 retained_stops.append(due)
@@ -361,74 +345,10 @@ async def heartbeat_host(
     )
 
 
-@router.post("/residencies", response_model=HostResidencyEstablishResponse)
-async def establish_thread_residency(
-    body: HostResidencyEstablishRequest,
-    host: dict[str, Any] = Depends(authenticate_host),
-    store: AgentJobStore | None = Depends(get_agent_job_store),
-    grants: Any = Depends(get_grant_client),
-) -> HostResidencyEstablishResponse:
-    """Take (or take over) residency for a thread this host is running.
-
-    Residency is earned, not asserted: the host must hold the thread's
-    *running* attempt right now, which is why the runner establishes at turn
-    end, before finish. Without the gate, a compromised machine could pull
-    other machines' conversations toward itself through claim affinity.
-    """
-    job_store = _require_store(store)
-    row = await job_store.establish_residency(
-        thread_id=body.thread_id,
-        host=host["host"],
-        runtime_id=body.runtime_id,
-        runtime_version=body.runtime_version,
-        sandbox_id=body.sandbox_id,
-        ttl_seconds=RESIDENCY_TTL_S,
-    )
-    if row is None:
-        # The gate lives inside the write's own transaction (store): running
-        # attempt, this host, lease unexpired — checked under a shared lock,
-        # so this answer cannot be stale by the time the row would exist.
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": {
-                    "type": "not_running_thread",
-                    "message": "residency belongs to the host running the thread's turn",
-                }
-            },
-        )
-    # A takeover is a credential rotation (design §14): the predecessor's
-    # grant dies now, not at its TTL, so a zombie host starves promptly.
-    previous_grant = row.get("previous_grant_id")
-    if previous_grant and grants is not None:
-        await grants.revoke(previous_grant)
-    credential = await _mint_residency_grant(job_store, grants, row=row)
-    return HostResidencyEstablishResponse(
-        thread_id=row["thread_id"],
-        generation=row["generation"],
-        ttl_seconds=RESIDENCY_TTL_S,
-        credential=credential,
-        model=row.get("model"),
-    )
-
-
 async def _mint_residency_grant(
     job_store: AgentJobStore, grants: Any, *, row: dict[str, Any]
 ) -> str | None:
-    """The residency's inference credential, or ``None`` for workspace-only.
-
-    Attribution is the *thread* (design §14): the grant's external job id
-    names it, so the gateway's ledger bills every resident turn to the
-    conversation rather than to whichever turn happened to establish. Every
-    failure degrades rather than refuses — a residency without a credential
-    still keeps the workspace, and turns ride warm_native on their own
-    per-attempt grants.
-
-    A grant that cannot be linked is revoked, not handed over: the link is
-    the only thing that will ever renew or revoke it, and the one way linking
-    fails is a takeover between mint and link — whose new owner must not be
-    starved by an orphan credential it cannot see.
-    """
+    """Mint the worker-fenced grant for one supervisor-owned member process."""
     if grants is None:
         return None
     try:
@@ -439,7 +359,7 @@ async def _mint_residency_grant(
             models=[row["model"]],
             ttl_seconds=int(RESIDENCY_TTL_S),
         )
-    except Exception:  # degrade to workspace-only residency
+    except Exception:
         logger.warning(
             "agent_residency_grant_unavailable",
             exc_info=True,
@@ -460,28 +380,6 @@ async def _mint_residency_grant(
         await grants.revoke(grant_id)
         return None
     return token
-
-
-@router.post("/residencies/release", response_model=WorkerAckResponse)
-async def release_thread_residency(
-    body: HostResidencyReleaseRequest,
-    host: dict[str, Any] = Depends(authenticate_host),
-    store: AgentJobStore | None = Depends(get_agent_job_store),
-    grants: Any = Depends(get_grant_client),
-) -> WorkerAckResponse:
-    """End a residency this host holds (teardown, eviction, drain).
-
-    Generation-scoped like every other residency write: releasing with a
-    stale generation is a no-op ``ok=false``, never an error — the successor
-    it would otherwise end belongs to someone else now.
-    """
-    job_store = _require_store(store)
-    released = await job_store.release_residency(
-        thread_id=body.thread_id, generation=body.generation, host=host["host"]
-    )
-    if released and grants is not None:
-        await grants.revoke(released)
-    return WorkerAckResponse(ok=released is not None)
 
 
 async def _probed_broker_error(

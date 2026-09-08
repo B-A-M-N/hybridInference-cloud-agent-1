@@ -86,14 +86,19 @@ services:
       AGENT_SESSION_SECRET: ${AGENT_SESSION_SECRET:?32+ random bytes, unique per environment}
       AGENT_CONTROL_TOKEN_SECRET: ${AGENT_CONTROL_TOKEN_SECRET:?32+ random bytes, unique per environment}
       AGENT_SOURCE_CONTROL_ENCRYPTION_KEY: ${AGENT_SOURCE_CONTROL_ENCRYPTION_KEY:?32+ random bytes, unique per environment}
+      # The API enforces the same exact host-generation capability as the
+      # deploy gate. Without this, a pending runner could claim queued work
+      # while deploy.sh correctly refused to replace the old API.
+      AGENT_DEPLOYMENT_SHA: ${AGENT_DEPLOYMENT_SHA:?exact commit this control plane serves}
       ADMIN_TOKEN: ${ADMIN_TOKEN:-}
-      # How long a hot sandbox's residency lease lives between beats (design
-      # §7). Also the cap on how long an idle resident process is kept at all.
+      # How long a member-scoped resident credential lives between runner
+      # heartbeats. Chat inactivity is a separate group clock on the host
+      # (AGENT_CHAT_IDLE_TIMEOUT_S); refreshing this lease does not keep an
+      # otherwise idle container running.
       AGENT_RESIDENCY_TTL_S: ${AGENT_RESIDENCY_TTL_S:-1800}
       # What a runner presents to claim work. Without it every claim is 401 and
       # the queue simply never drains — with nothing in the control plane's own
       # logs saying why, because the refusal is correct.
-      AGENT_DISPATCHER_TOKEN: ${AGENT_DISPATCHER_TOKEN:?the credential runners claim with}
       # The gateway alert relay's door (/v1/agent/service/oncall/*). Optional
       # as a pair: a deployment without on-call sets neither, the door answers
       # 401/503, and nothing else changes. The user id decides whose role and
@@ -109,10 +114,6 @@ services:
       AGENT_TRUST_PROXY_HEADERS: ${AGENT_TRUST_PROXY_HEADERS:-false}
       AGENT_LOG_LEVEL: ${AGENT_LOG_LEVEL:-INFO}
       AGENT_DEFAULT_EXECUTION_PROFILE: ${AGENT_DEFAULT_EXECUTION_PROFILE:-trusted-v1}
-      # New chats require a host that advertises the complete shared-live
-      # protocol; unset/0 preserves the legacy disposable scheduling path.
-      AGENT_SHARED_LIVE_SANDBOX: ${AGENT_SHARED_LIVE_SANDBOX:-0}
-
       # --- Publishing and source control ------------------------------------
       # The only component that holds a git credential, which is precisely what
       # keeps the sandbox credential-free. Unset means this deployment never
@@ -156,7 +157,7 @@ services:
       # --- Workspaces -------------------------------------------------------
       # Authorizes this service to the hosts' workspace brokers. Per-host
       # broker addresses come from each host's registration row, not from here.
-      AGENT_WORKSPACE_BROKER_TOKEN: ${AGENT_WORKSPACE_BROKER_TOKEN:-}
+      AGENT_WORKSPACE_BROKER_TOKEN: ${AGENT_WORKSPACE_BROKER_TOKEN:?shared with every enrolled host workspace broker}
       # Which hosts a registering machine may name as its broker. The token
       # above is shared across the pool, so an address accepted at
       # registration is an address that receives a credential good for every
@@ -206,6 +207,11 @@ services:
     environment:
       AGENT_DATABASE_URL: ${AGENT_DATABASE_URL:?Postgres DSN for the agent-owned database}
       AGENT_CONTROL_TOKEN_SECRET: ${AGENT_CONTROL_TOKEN_SECRET:?32+ random bytes, unique per environment}
+      # The relay resolves each owner's stored MCP connection and therefore
+      # must decrypt it under the same key/domain as the main control-plane
+      # listener. Without this, health stays green but every connected server
+      # is reported as unavailable at the first tool call.
+      AGENT_SOURCE_CONTROL_ENCRYPTION_KEY: ${AGENT_SOURCE_CONTROL_ENCRYPTION_KEY:?32 random bytes, unique per environment}
       AGENT_LOG_LEVEL: ${AGENT_LOG_LEVEL:-INFO}
     depends_on:
       migrate:

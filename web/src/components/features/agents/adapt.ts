@@ -181,8 +181,8 @@ export function toDisplayEvent(event: AgentJobEventApi): AgentEvent | null {
     return null;
   }
 
-  // Diff is rendered from the complete patch artifact rather than a stream
-  // marker that only says whether an artifact was stored.
+  // Diff is rendered from the retained workspace rather than a stream marker
+  // that only says whether files changed.
   if (type === 'diff') return null;
 
   // An unrecognized kind still appears, rather than silently disappearing.
@@ -255,7 +255,7 @@ function diffStat(patch: string): { add: number; del: number } | undefined {
 }
 
 const TIER_LABELS: Record<string, string> = {
-  platform_only: 'gateway only',
+  platform_only: 'platform relays only',
   trusted: 'allowlist',
   custom: 'custom',
   full: 'open',
@@ -421,7 +421,6 @@ function displayEvents(events: AgentJobEventApi[]): AgentEvent[] {
   return rows;
 }
 
-/** Build the UI job model from the API job plus whatever else we have. */
 /** Rename the host's rollup into the UI's shape, keeping every null a null. */
 export function toTurnResources(api: AttemptResourcesApi): TurnResources {
   const toolCallsTruncated = api.tool_calls_truncated === true;
@@ -470,6 +469,7 @@ export function toTurnResources(api: AttemptResourcesApi): TurnResources {
     netRxBytes: api.net_rx_bytes,
     netTxBytes: api.net_tx_bytes,
     sampleCount: api.sample_count,
+    samplerVersion: api.sampler_version,
     coverage: api.coverage,
     toolTimeMs: toolCallsTruncated ? null : (api.tool_time_ms ?? null),
     toolCalls: conservativeCalls,
@@ -560,6 +560,8 @@ export function toDisplayJob(job: AgentJobApi, options: AdaptOptions = {}): Agen
   const attemptIds = [...new Set(events.map((event) => event.attempt_id))].sort((a, b) => a - b);
   const currentAttemptIndex =
     job.current_attempt_id === null ? -1 : attemptIds.indexOf(job.current_attempt_id);
+  const telemetryAttemptIndex =
+    job.telemetry_attempt_id == null ? -1 : attemptIds.indexOf(job.telemetry_attempt_id);
   const supersededIds = new Set(
     events
       .filter((event) => event.event_type === 'attempt_superseded')
@@ -634,6 +636,11 @@ export function toDisplayJob(job: AgentJobApi, options: AdaptOptions = {}): Agen
     historyTurns = historicalJobs.map((threadJob) => ({
       jobId: threadJob.id,
       turnNo: threadJob.turn_no ?? 1,
+      // This is stronger than platform success: the API has also proved a
+      // settled native ordinal, compatible online host/image, and idle source
+      // membership. Showing a button from state alone creates a predictable
+      // 409 for failed rollout generations.
+      forkable: threadJob.native_fork_available === true,
       messages: (options.thread?.messages ?? [])
         .filter((message) => message.job_id === threadJob.id)
         .map(mapMessage),
@@ -697,6 +704,7 @@ export function toDisplayJob(job: AgentJobApi, options: AdaptOptions = {}): Agen
     attempts,
     attemptTelemetryAvailable: job.attempt_telemetry !== undefined,
     currentAttemptNo: currentAttemptIndex >= 0 ? currentAttemptIndex + 1 : undefined,
+    telemetryAttemptNo: telemetryAttemptIndex >= 0 ? telemetryAttemptIndex + 1 : undefined,
     events: renderedEvents,
     eventCount: events.length,
     diffFiles: toDiffFiles(patch),

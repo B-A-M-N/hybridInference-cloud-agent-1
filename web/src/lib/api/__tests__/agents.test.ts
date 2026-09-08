@@ -18,7 +18,6 @@ import {
   getAgentIntegrations,
   getAgentJob,
   getAgentAttemptTelemetry,
-  getAgentJobArtifact,
   getAgentJobFiles,
   getAgentJobGit,
   getAgentJobThread,
@@ -306,12 +305,6 @@ describe('agents api', () => {
       '/v1/agent/integrations/gitlab/connections/group%2Fid',
       { method: 'DELETE' },
     );
-  });
-
-  it('treats a missing artifact as absent rather than an error', async () => {
-    // A job that changed nothing legitimately has no patch.
-    fetchWithAuth.mockResolvedValue(jsonResponse({ detail: 'nope' }, 404));
-    await expect(getAgentJobArtifact('ajob_1', 'patch')).resolves.toBeNull();
   });
 
   it('browses a job workspace with an encoded relative path', async () => {

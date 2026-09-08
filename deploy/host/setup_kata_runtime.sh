@@ -5,9 +5,10 @@
 # Why this exists: the agent sandbox has shipped with `AGENT_SANDBOX_BACKEND=kata`
 # as its default for a while, and the `--runtime io.containerd.kata.v2` flag
 # provably reaches the Docker daemon — but no host was ever provisioned with the
-# shim, so staging carries an `AGENT_SANDBOX_BACKEND=container` override and
-# every job to date has run on a shared host kernel. The gap was never the code;
-# it was that nothing installed the runtime. This is that missing step.
+# shim, so staging historically carried an
+# `AGENT_SANDBOX_BACKEND=container` override and those jobs ran on a shared
+# host kernel. The gap was never the code; it was that nothing installed the
+# runtime. This is that missing step.
 #
 # What Kata buys: an ordinary container isolates processes, and every sandbox
 # still issues syscalls straight at the host kernel. Kata puts each job in a

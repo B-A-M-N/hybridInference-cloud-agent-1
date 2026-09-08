@@ -196,21 +196,9 @@ def test_no_file_references_a_source_repo_only_directory(path: Path) -> None:
     assert not stale, f"{path.relative_to(REPO)} references the source repo layout: {stale}"
 
 
-def test_the_workflow_targets_this_repository() -> None:
-    """A repository guard left pointing at the source repo never runs here."""
-    text = (REPO / ".github/workflows/agent-job-runner.yml").read_text(encoding="utf-8")
-    # The exact guard, quotes included. Substring checks stopped being enough
-    # on 2026-09-02: the repository was renamed to hybridInference-cloud-agent,
-    # which *contains* the source repository's slug, so "the source slug must
-    # not appear" would now fail on the correct guard and "the new slug must
-    # appear" would pass on a guard that also still names the old one.
-    assert "github.repository == 'HarvardMadSys/hybridInference-cloud-agent'" in text
-    # A guard still naming the pre-rename slug is a workflow that silently never
-    # runs — github.repository never matches it again.
-    assert "'HarvardMadSys/freeinference-cloud-agent'" not in text
-    # And one naming the source repository would run there, not here.
-    assert "'HarvardMadSys/hybridInference'" not in text
-    assert "PYTHONPATH=. python -m cloud_agent_host.runner" in text
+def test_the_legacy_actions_runner_workflow_is_removed() -> None:
+    """Manual dispatch must not reopen the removed one-shot/process backend."""
+    assert not (REPO / ".github/workflows/agent-job-runner.yml").exists()
 
 
 @pytest.mark.parametrize(

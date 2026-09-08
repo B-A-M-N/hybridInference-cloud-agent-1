@@ -536,6 +536,28 @@ def test_overlapping_tool_windows_keep_ambiguity_instead_of_picking_one():
     assert counts == {1: 1, 2: 1}
 
 
+def test_a_dropped_tool_window_prevents_false_process_ownership():
+    """An omitted call may overlap every retained call, so all links are unknown."""
+    observation = finish_observation(
+        cursor=_cursor(),
+        snapshot=_snapshot(),
+        payload=_event(1, "fork", 1_005_000_000),
+        truncated=False,
+    )
+    windows = [
+        ToolWindow("kept", "Bash", opened_mono=11.000, closed_mono=11.010),
+    ]
+
+    rows, counts = attribute_processes(
+        observation,
+        windows,
+        windows_complete=False,
+    )
+
+    assert rows[0]["tool_call_seqs"] == []
+    assert counts == {1: 0}
+
+
 def test_an_exit_only_baseline_process_is_not_manufactured_into_turn_usage():
     observation = finish_observation(
         cursor=_cursor(),

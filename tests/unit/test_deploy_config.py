@@ -9,7 +9,10 @@ runner container crash-loops in production.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -27,6 +30,7 @@ _COMPOSE = REPO_ROOT / "deploy/host/docker-compose.sandbox.yml"
 _CONTROL_PLANE_COMPOSE = REPO_ROOT / "deploy/control-plane/docker-compose.yml"
 _CONTROL_PLANE_DEPLOY = REPO_ROOT / "deploy/control-plane/deploy.sh"
 _LOCAL_COMPOSE = REPO_ROOT / "deploy/local/docker-compose.yml"
+_LOCAL_DEV_SCRIPT = REPO_ROOT / "deploy/local/dev.sh"
 _LOCAL_EDGE_DOCKERFILE = REPO_ROOT / "deploy/local/Dockerfile.edge"
 _LOCAL_NGINX = REPO_ROOT / "deploy/local/nginx.conf"
 _DOCKERFILE = Path(__file__).resolve().parents[2] / "deploy/sandbox/Dockerfile.agent-sandbox"
@@ -45,10 +49,176 @@ def local_compose() -> dict:
     return yaml.safe_load(_LOCAL_COMPOSE.read_text())
 
 
+def test_local_dev_script_upgrades_an_existing_env_without_rotating_it(tmp_path: Path) -> None:
+    """A checkout update must not require deleting local credentials first."""
+    script = tmp_path / "repo/deploy/local/dev.sh"
+    script.parent.mkdir(parents=True)
+    shutil.copy2(_LOCAL_DEV_SCRIPT, script)
+    dotenv = script.parent / ".env.local"
+    dotenv.write_text(
+        "AGENT_SESSION_SECRET=keep-this-secret\n"
+        "AGENT_WORKSPACE_BROKER_TOKEN=keep-this-broker-token\n"
+        "LOCAL_EDGE_PORT=23002\n"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    # Force the script's documented standalone fallback even on CI hosts that
+    # have a real Compose plugin. Otherwise `docker compose version` escapes
+    # this hermetic fixture and the real plugin tries to render files that the
+    # deliberately minimal temporary checkout does not contain.
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text("#!/bin/sh\nexit 1\n")
+    fake_docker.chmod(0o755)
+    fake_compose = fake_bin / "docker-compose"
+    compose_env = tmp_path / "compose-env"
+    fake_compose.write_text(
+        "#!/bin/sh\n"
+        'printf \'%s\\n\' "$GATEWAY_AUTHORIZE_URL" "$AGENT_SESSION_REDIRECT_URI" '
+        '"$AGENT_WEB_BASE_URL" >"$COMPOSE_ENV_LOG"\n'
+    )
+    fake_compose.chmod(0o755)
+
+    result = subprocess.run(
+        ["sh", str(script), "config"],
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "COMPOSE_ENV_LOG": str(compose_env),
+            # A second local stack should not inherit the URLs persisted for
+            # the first one's port.
+            "LOCAL_EDGE_PORT": "24002",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    values = dict(
+        line.split("=", 1)
+        for line in dotenv.read_text().splitlines()
+        if line and not line.startswith("#")
+    )
+    assert values["AGENT_SESSION_SECRET"] == "keep-this-secret"
+    assert values["AGENT_WORKSPACE_BROKER_TOKEN"] == "keep-this-broker-token"
+    assert values["LOCAL_PROJECT_NAME"] == "freeinference-local"
+    assert values["LOCAL_AGENT_EGRESS_NETWORK"] == "freeinference-local-agent-egress"
+    assert values["LOCAL_CHAT_NETWORK_POOL"] == "10.240.0.0/16"
+    assert values["GATEWAY_AUTHORIZE_URL"] == "http://127.0.0.1:23002/authorize"
+    assert values["AGENT_SESSION_REDIRECT_URI"] == (
+        "http://127.0.0.1:23002/api/v1/session/callback"
+    )
+    assert values["AGENT_WEB_BASE_URL"] == "http://127.0.0.1:23002"
+    assert values["AGENT_WEB_GATEWAY_URL"] == ""
+    assert compose_env.read_text().splitlines() == [
+        "http://127.0.0.1:24002/authorize",
+        "http://127.0.0.1:24002/api/v1/session/callback",
+        "http://127.0.0.1:24002",
+    ]
+
+
+def test_local_dev_refuses_to_replace_lost_credentials_for_an_existing_database(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "repo/deploy/local/dev.sh"
+    script.parent.mkdir(parents=True)
+    shutil.copy2(_LOCAL_DEV_SCRIPT, script)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_compose = fake_bin / "docker-compose"
+    fake_compose.write_text("#!/bin/sh\nexit 0\n")
+    fake_compose.chmod(0o755)
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        "  'volume ls --quiet --filter label=com.docker.compose.project=freeinference-local "
+        "--filter label=com.docker.compose.volume=agent-postgres')\n"
+        "    echo freeinference-local_agent-postgres ;;\n"
+        "  *) exit 1 ;;\n"
+        "esac\n",
+    )
+    fake_docker.chmod(0o755)
+
+    result = subprocess.run(
+        ["sh", str(script), "config"],
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert not (script.parent / ".env.local").exists()
+    assert "still owns its Postgres volume" in result.stderr
+    assert "will not delete the volume or invent a new password" in result.stderr
+
+
+@pytest.mark.parametrize("prebuilt", [False, True])
+def test_local_up_stops_before_full_stack_when_retained_database_auth_fails(
+    tmp_path: Path,
+    prebuilt: bool,
+) -> None:
+    script = tmp_path / "repo/deploy/local/dev.sh"
+    script.parent.mkdir(parents=True)
+    shutil.copy2(_LOCAL_DEV_SCRIPT, script)
+    (script.parent / ".env.local").write_text(
+        "AGENT_POSTGRES_PASSWORD=wrong-retained-password\n"
+        "AGENT_DATABASE_URL=postgresql://cloudagent:wrong-retained-password@postgres/cloudagent\n"
+        "AGENT_WORKSPACE_BROKER_TOKEN=keep\n"
+        "LOCAL_PROJECT_NAME=freeinference-local\n"
+        "LOCAL_AGENT_EGRESS_NETWORK=freeinference-local-agent-egress\n"
+        "LOCAL_CHAT_NETWORK_POOL=10.240.0.0/16\n"
+        "LOCAL_EDGE_PORT=13002\n"
+        "GATEWAY_AUTHORIZE_URL=http://127.0.0.1:13002/authorize\n"
+        "AGENT_SESSION_REDIRECT_URI=http://127.0.0.1:13002/api/v1/session/callback\n"
+        "AGENT_WEB_BASE_URL=http://127.0.0.1:13002\n"
+        "AGENT_WEB_GATEWAY_URL=\n"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    compose_log = tmp_path / "compose.log"
+    docker = fake_bin / "docker"
+    docker.write_text("#!/bin/sh\nexit 1\n")
+    docker.chmod(0o755)
+    compose = fake_bin / "docker-compose"
+    compose.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$*" >>"$COMPOSE_LOG"\n'
+        'case "$*" in\n'
+        "  *' exec -T postgres pg_isready') exit 0 ;;\n"
+        "  *' run --rm --no-deps migrate python -c '*) exit 17 ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    compose.chmod(0o755)
+
+    result = subprocess.run(
+        ["sh", str(script), "up", *(["--no-build"] if prebuilt else [])],
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "COMPOSE_LOG": str(compose_log),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    calls = compose_log.read_text()
+
+    assert result.returncode != 0
+    assert (" build sandbox-image migrate" in calls) is not prebuilt
+    assert " up --detach postgres" in calls
+    assert " run --rm --no-deps migrate python -c" in calls
+    assert " up --detach --build" not in calls
+    assert "cannot authenticate to the existing Postgres volume" in result.stderr
+
+
 def test_complete_local_stack_exposes_only_its_loopback_edge(local_compose: dict):
     services = local_compose["services"]
 
-    assert services["edge"]["ports"] == ["127.0.0.1:${LOCAL_EDGE_PORT:-13002}:8088"]
+    assert services["local-edge"]["ports"] == ["127.0.0.1:${LOCAL_EDGE_PORT:-13002}:8088"]
+    assert "edge" not in services
     assert services["local-gateway"]["environment"]["LOCAL_EDGE_PORT"] == (
         "${LOCAL_EDGE_PORT:-13002}"
     )
@@ -70,6 +240,15 @@ def test_complete_local_sandbox_network_has_only_narrow_relays(local_compose: di
     assert on_egress == {"local-gateway", "mcp-relay"}
 
 
+def test_mcp_only_listener_receives_the_connection_decryption_key() -> None:
+    """A healthy relay must be able to resolve the owner's stored connection."""
+    control_compose = yaml.safe_load(_CONTROL_PLANE_COMPOSE.read_text())
+    relay_env = control_compose["services"]["mcp-relay"]["environment"]
+
+    assert "AGENT_SOURCE_CONTROL_ENCRYPTION_KEY" in relay_env
+    assert "AGENT_SOURCE_CONTROL_ENCRYPTION_KEY" in relay_env["AGENT_SOURCE_CONTROL_ENCRYPTION_KEY"]
+
+
 def test_complete_local_host_data_is_docker_owned(local_compose: dict):
     """Runner/broker may control Docker but may not map app data from the host."""
     named = set(local_compose["volumes"])
@@ -86,11 +265,14 @@ def test_complete_local_host_data_is_docker_owned(local_compose: dict):
 
 
 def test_complete_local_stack_runs_every_native_session_driver(local_compose: dict):
-    services = local_compose["services"]
+    from cloud_agent_host.runtimes import registered_runtimes
+
     expected = {"claude-code", "codex", "pi", "opencode", "kilo"}
+    assert set(registered_runtimes()) == expected
     for service_name in ("runner", "workspace-broker"):
-        configured = services[service_name]["environment"]["AGENT_RESTARTABLE_RUNTIMES"]
-        assert set(configured.split(",")) == expected
+        configured = local_compose["services"][service_name]["environment"]
+        assert "AGENT_RESTARTABLE_RUNTIMES" not in configured
+        assert "AGENT_SHARED_LIVE_RUNTIMES" not in configured
 
 
 def test_complete_local_edge_reresolves_recreated_services():
@@ -192,10 +374,11 @@ def test_default_backend_is_vm_isolated(compose: dict):
     assert "kata" in env["AGENT_SANDBOX_BACKEND"]
 
 
-def test_dispatcher_credential_is_required_not_defaulted(compose: dict):
-    """Starting a runner without a dispatcher credential must fail loudly."""
+def test_runner_uses_enrollment_not_a_shared_claim_secret(compose: dict):
     env = compose["services"]["runner"]["environment"]
-    assert ":?" in env["AGENT_DISPATCHER_TOKEN"]
+    assert "AGENT_DISPATCHER_TOKEN" not in env
+    assert "AGENT_ENROLL_TOKEN" in env
+    assert "AGENT_HOST_CREDENTIAL_FILE" in env
 
 
 def test_compose_only_uses_flags_the_runner_implements(compose: dict):
@@ -246,9 +429,6 @@ def test_codex_mcp_is_constrained_to_an_empty_requirements_allowlist():
     requirements = tomllib.loads(_CODEX_REQUIREMENTS.read_text())
     assert requirements == {"mcp_servers": {}}
     assert "codex-requirements.toml /etc/codex/requirements.toml" in _DOCKERFILE.read_text()
-
-    workflow = Path(__file__).resolve().parents[2] / ".github/workflows/agent-job-runner.yml"
-    assert "codex-requirements.toml /etc/codex/requirements.toml" in workflow.read_text()
 
 
 # ── the chain from compose file to a running sandbox ───────────────────
@@ -416,25 +596,15 @@ def test_a_failed_tunnel_probe_is_not_reported_as_a_successful_start() -> None:
     assert "probe_ok" in script
 
 
-def test_job_worktrees_are_a_host_path_at_the_same_path_inside(compose: dict):
-    """The daemon resolves the runner's bind source on the *host*.
-
-    A named volume satisfies the runner's own file operations and then fails
-    every `docker run --mount` with an opaque exit 125, because the path exists
-    only inside the runner container.
-    """
+def test_job_worktrees_are_not_host_mounted(compose: dict):
+    """Docker writable layers are the only local chat storage."""
     volumes = compose["services"]["runner"]["volumes"]
     workdir_mounts = [v for v in volumes if "agent-jobs" in v]
-    assert workdir_mounts, "the runner needs somewhere to put job worktrees"
-    for mount in workdir_mounts:
-        source, target = _split_mount(mount)[:2]
-        assert source == target, f"bind source and target must match, got {mount}"
-        resolved = _expand(source)
-        assert resolved.startswith("/"), "must be a host path, not a named volume"
+    assert workdir_mounts == []
 
 
-def test_workspace_broker_and_runner_share_the_same_worktrees(compose: dict):
-    """Files, Terminal, and Git must inspect the runner's live job directory."""
+def test_workspace_broker_and_runner_share_no_host_worktree(compose: dict):
+    """Files, Terminal, and Git resolve the shared container through Docker."""
     services = compose["services"]
     runner_mounts = {mount for mount in services["runner"]["volumes"] if "agent-jobs" in mount}
     broker_mounts = {
@@ -442,32 +612,123 @@ def test_workspace_broker_and_runner_share_the_same_worktrees(compose: dict):
     }
 
     assert broker_mounts == runner_mounts
+    assert broker_mounts == set()
+    assert "tmpfs" not in compose["services"]["workspace-broker"]
     # The source also asserted the gateway's own `backend` service pointed at
     # the broker on :8092. Here the gateway is not a service — it is reached
     # through the tunnel — so the caller-side half of that pairing lives in the
     # control plane's configuration, not in this file.
 
 
-def test_restartable_chat_gate_and_timeout_match_between_runner_and_broker(compose: dict):
-    """A runner must not dispatch retained work to a broker with the mode disabled."""
+def test_shared_chat_timeout_matches_and_no_legacy_gate_remains(compose: dict):
     services = compose["services"]
     runner_env = services["runner"]["environment"]
     broker_env = services["workspace-broker"]["environment"]
 
-    assert runner_env["AGENT_RESTARTABLE_SANDBOX"] == broker_env["AGENT_RESTARTABLE_SANDBOX"]
+    for name in ("AGENT_RESTARTABLE_SANDBOX", "AGENT_SHARED_LIVE_SANDBOX"):
+        assert name not in runner_env
+        assert name not in broker_env
     assert runner_env["AGENT_CHAT_IDLE_TIMEOUT_S"] == broker_env["AGENT_CHAT_IDLE_TIMEOUT_S"]
-    runtime_default = (
-        runner_env["AGENT_RESTARTABLE_RUNTIMES"]
-        .removeprefix("${AGENT_RESTARTABLE_RUNTIMES:-")
-        .removesuffix("}")
+
+
+def test_runner_receives_exact_sha_rollout_metadata(compose: dict) -> None:
+    """Infrastructure metadata shares the host-state mount, never chat data."""
+    runner = compose["services"]["runner"]
+    env = runner["environment"]
+
+    assert env["AGENT_DEPLOYMENT_SHA"] == "${AGENT_DEPLOYMENT_SHA:-}"
+    assert "AGENT_HOST_STATE_ROOT" in env["AGENT_SHARED_LIVE_READY_FILE"]
+    assert env["AGENT_SHARED_LIVE_READY_FILE"].endswith("/shared-live-ready")
+    assert any("AGENT_HOST_STATE_ROOT" in str(mount) for mount in runner["volumes"])
+
+
+def test_staging_deploy_runs_both_halves_in_parallel_with_a_runtime_fence() -> None:
+    """Actions overlap, while deploy.sh still proves the target host before rollout."""
+    workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/deploy-staging.yml").read_text())
+    jobs = workflow["jobs"]
+    assert "needs" not in jobs["deploy"]
+    assert "needs" not in jobs["deploy-host"]
+    control_deploy = next(step for step in jobs["deploy"]["steps"] if step.get("name") == "Deploy")
+    host_deploy = next(
+        step for step in jobs["deploy-host"]["steps"] if step.get("name") == "Deploy"
     )
-    assert set(runtime_default.split(",")) == {
-        "claude-code",
-        "codex",
-        "pi",
-        "opencode",
-        "kilo",
-    }
+    control_env = control_deploy["env"]
+    host_env = host_deploy["env"]
+    for job in (jobs["deploy"], jobs["deploy-host"]):
+        checkouts = [step for step in job["steps"] if step.get("uses") == "actions/checkout@v6"]
+        assert [step["with"]["ref"] for step in checkouts] == [
+            "${{ github.workflow_sha }}",
+            "${{ steps.target.outputs.sha }}",
+        ]
+        assert checkouts[0]["with"]["path"] == ".deploy-orchestrator"
+        assert checkouts[1]["with"]["path"] == ".deploy-target"
+
+    for env in (control_env, host_env):
+        assert "AGENT_SHARED_LIVE_SANDBOX" not in env
+        assert "AGENT_RESTARTABLE_SANDBOX" not in env
+        assert "STAGING_SHARED_LIVE_SANDBOX" not in env
+        assert env["SOURCE_REPO"].endswith("/.deploy-target")
+    assert ".deploy-orchestrator/deploy/control-plane/deploy.sh" in control_deploy["run"]
+    assert ".deploy-orchestrator/deploy/host/deploy.sh" in host_deploy["run"]
+    assert control_env["COMPOSE_PROJECT"] == "${{ vars.STAGING_CONTROL_COMPOSE_PROJECT }}"
+    assert "STAGING_HOST_SLOTS" in host_env["AGENT_HOST_SLOTS"]
+    assert host_env["AGENT_RUNNER_REPLICAS"] == host_env["AGENT_HOST_SLOTS"]
+    assert "STAGING_RETAINED_DOCKER_DATA_ROOT" in host_env["AGENT_RETAINED_DOCKER_DATA_ROOT"]
+
+
+def test_production_deploy_uses_the_same_parallel_topology() -> None:
+    workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/deploy-prod.yml").read_text())
+    jobs = workflow["jobs"]
+    assert "needs" not in jobs["deploy"]
+    assert "needs" not in jobs["deploy-host"]
+    host_deploy = next(
+        step for step in jobs["deploy-host"]["steps"] if step.get("name") == "Deploy"
+    )
+    control_deploy = next(step for step in jobs["deploy"]["steps"] if step.get("name") == "Deploy")
+    host_env = host_deploy["env"]
+
+    for removed in (
+        "AGENT_RESTARTABLE_SANDBOX",
+        "AGENT_SHARED_LIVE_SANDBOX",
+        "STAGING_SHARED_LIVE_SANDBOX",
+    ):
+        assert removed not in host_env
+    assert "PROD_HOST_SLOTS" in host_env["AGENT_HOST_SLOTS"]
+    assert host_env["AGENT_RUNNER_REPLICAS"] == host_env["AGENT_HOST_SLOTS"]
+    assert "PROD_RETAINED_DOCKER_DATA_ROOT" in host_env["AGENT_RETAINED_DOCKER_DATA_ROOT"]
+    assert ".deploy-orchestrator/deploy/control-plane/deploy.sh" in control_deploy["run"]
+    assert ".deploy-orchestrator/deploy/host/deploy.sh" in host_deploy["run"]
+
+
+def test_staging_and_production_host_rollouts_are_independently_serialized() -> None:
+    """Namespaced host stacks can roll out concurrently without cancelling peers."""
+    staging = yaml.safe_load((REPO_ROOT / ".github/workflows/deploy-staging.yml").read_text())
+    production = yaml.safe_load((REPO_ROOT / ".github/workflows/deploy-prod.yml").read_text())
+
+    staging_jobs = staging["jobs"]
+    production_jobs = production["jobs"]
+    staging_group = staging_jobs["deploy-host"]["concurrency"]["group"]
+    production_group = production_jobs["deploy-host"]["concurrency"]["group"]
+    assert staging_group == "cloud-agent-host-deploy"
+    assert production_group == "cloud-agent-prod-host-deploy"
+    assert staging_group != production_group
+    assert "concurrency" not in staging_jobs["deploy"]
+    assert "concurrency" not in production_jobs["deploy"]
+
+
+def test_target_commit_can_activate_staging_under_the_default_branch_workflow() -> None:
+    """Readiness is unconditional and no stale feature flag can bypass it."""
+    for relative in (
+        "deploy/control-plane/deploy.sh",
+        "deploy/host/sandbox_host.sh",
+    ):
+        script = (REPO_ROOT / relative).read_text()
+        assert "STAGING_SHARED_LIVE_SANDBOX" not in script
+        assert "AGENT_SHARED_LIVE_SANDBOX" not in script
+
+    control_script = (REPO_ROOT / "deploy/control-plane/deploy.sh").read_text()
+    assert "cloud_agent.deploy_readiness" in control_script
+    assert "--expected-deployment-sha" in control_script
 
 
 def test_workspace_broker_keeps_execution_off_the_public_gateway(compose: dict):
@@ -484,11 +745,12 @@ def test_workspace_broker_keeps_execution_off_the_public_gateway(compose: dict):
     assert broker["networks"] == ["internal"]
 
 
-def test_runner_retains_live_worktrees_for_workspace_tools(compose: dict):
-    """A finished run must outlive the process long enough to remain inspectable."""
+def test_chat_container_idle_timeout_is_configured(compose: dict):
+    """A settled container remains inspectable until the one chat idle clock."""
     env = compose["services"]["runner"]["environment"]
 
-    assert int(_expand(env["AGENT_WORKSPACE_TTL_S"])) > 0
+    assert int(_expand(env["AGENT_CHAT_IDLE_TIMEOUT_S"])) > 0
+    assert "AGENT_WORKSPACE_TTL_S" not in env
 
 
 def test_the_runner_image_can_actually_start_a_sandbox():
@@ -589,17 +851,16 @@ def test_the_setup_tier_the_overlay_selects_is_one_it_actually_ships(compose: di
     assert trusted in [_expand(n) for n in proxy["networks"]], (
         "the proxy is not on the network whose traffic it is supposed to police"
     )
+    for relay in ("gateway-tunnel", "mcp-tunnel"):
+        assert "agent-egress-trusted" in compose["services"][relay]["networks"], (
+            f"{relay} is absent from trusted discovery, so NO_PROXY makes its "
+            "platform URL resolve to nowhere"
+        )
     # And the runner must actually tell the sandbox to use it.
     url = _expand(env["AGENT_EGRESS_PROXY_URL_TRUSTED"])
     assert url.startswith("http://"), "the trusted tier is selected with no proxy URL"
 
 
-@pytest.mark.skip(
-    reason="The Trusted egress tier — proxy, config renderer, tiered networks — was "
-    "declared only in the gateway repo's co-located overlay, which this repository "
-    "did not migrate. Un-skip when the standalone compose declares them; see "
-    "MIGRATION.md, Open decisions."
-)
 def test_the_proxy_url_names_the_port_the_generated_config_listens_on(compose: dict):
     """Two places hold one number, so they are checked against each other.
 
@@ -613,12 +874,6 @@ def test_the_proxy_url_names_the_port_the_generated_config_listens_on(compose: d
     assert _expand(env["AGENT_EGRESS_PROXY_URL_TRUSTED"]).endswith(f":{DEFAULT_PROXY_PORT}")
 
 
-@pytest.mark.skip(
-    reason="The Trusted egress tier — proxy, config renderer, tiered networks — was "
-    "declared only in the gateway repo's co-located overlay, which this repository "
-    "did not migrate. Un-skip when the standalone compose declares them; see "
-    "MIGRATION.md, Open decisions."
-)
 def test_the_proxy_cannot_reach_the_rest_of_the_stack(compose: dict):
     """A Squid reachable by an untrusted sandbox must not also see the database.
 
@@ -646,12 +901,6 @@ def test_the_proxy_cannot_reach_the_rest_of_the_stack(compose: dict):
     )
 
 
-@pytest.mark.skip(
-    reason="The Trusted egress tier — proxy, config renderer, tiered networks — was "
-    "declared only in the gateway repo's co-located overlay, which this repository "
-    "did not migrate. Un-skip when the standalone compose declares them; see "
-    "MIGRATION.md, Open decisions."
-)
 def test_the_proxy_config_is_generated_by_the_validating_renderer(compose: dict):
     """The allowlist reaches Squid's config only through code that checks it.
 
@@ -670,51 +919,40 @@ def test_the_proxy_config_is_generated_by_the_validating_renderer(compose: dict)
     assert proxy["depends_on"]["agent-egress-proxy-config"]["condition"] == (
         "service_completed_successfully"
     ), "the proxy may start before its config exists, i.e. with no config at all"
+    fingerprint = proxy["environment"]["AGENT_EGRESS_CONFIG_FINGERPRINT"]
+    assert "AGENT_EGRESS_ALLOWLIST" in fingerprint
+    assert "AGENT_EGRESS_PROXY_PORT" in fingerprint
     assert any(volume.endswith(":ro") for volume in proxy["volumes"]), (
         "the proxy can rewrite the allowlist it is enforcing"
     )
 
 
-def test_both_substrates_pin_the_same_agent_cli_versions():
-    """A job must not behave differently depending on which substrate claims it.
+def test_runner_and_broker_share_the_private_network_pool(compose: dict):
+    runner_pool = compose["services"]["runner"]["environment"]["AGENT_EGRESS_CHAT_NETWORK_POOL"]
+    broker_pool = compose["services"]["workspace-broker"]["environment"][
+        "AGENT_EGRESS_CHAT_NETWORK_POOL"
+    ]
 
-    The Actions runner installs the CLIs itself while the container backend
-    gets them from the sandbox image. When those drift, the same job produces
-    different results — or fails on one substrate only — for a reason nothing
-    in the job's own record explains. `latest` on the Actions side already cost
-    a real run once.
-    """
-    # One of the two substrates is the Actions workflow, and the public export
-    # replaces .github/workflows/ wholesale — so in an exported tree there is
-    # no second thing to agree with, and "they pin the same versions" is not a
-    # claim that can be false there. Skipped rather than excluding the file:
-    # the other twenty cases here assert the sandbox image and the runner
-    # compose, both of which travel and are worth running downstream.
-    path = Path(__file__).resolve().parents[2] / ".github/workflows/agent-job-runner.yml"
-    if not path.exists():
-        pytest.skip("no Actions workflow in this tree — only one substrate to check")
-    workflow = path.read_text()
-    image = _DOCKERFILE.read_text()
+    assert runner_pool == broker_pool
+    assert runner_pool.endswith("/16}")
+    runner_namespace = compose["services"]["runner"]["environment"]["AGENT_SANDBOX_NAMESPACE"]
+    broker_namespace = compose["services"]["workspace-broker"]["environment"][
+        "AGENT_SANDBOX_NAMESPACE"
+    ]
+    assert runner_namespace == broker_namespace
+    assert "COMPOSE_PROJECT" in runner_namespace
 
-    for name in (
-        "CLAUDE_CODE_VERSION",
-        "CODEX_VERSION",
-        "PI_VERSION",
-        "OPENCODE_VERSION",
-        "KILO_VERSION",
-    ):
-        pinned = re.search(rf"^ARG {name}=(\S+)$", image, re.MULTILINE)
-        assert pinned, f"{name} must be pinned in the sandbox image"
-        assert f'{name}: "{pinned.group(1)}"' in workflow, (
-            f"{name} differs between the sandbox image and the Actions workflow"
-        )
 
-    # pi, OpenCode, and Kilo are reached through wrappers, so a substrate that
-    # installs the CLI but not the wrapper produces jobs that die at spawn
-    # with "binary missing" — both substrates must ship all of them.
-    for wrapper in ("pi-freeinference", "opencode-freeinference", "kilo-freeinference"):
-        assert wrapper in image, f"the sandbox image does not install {wrapper}"
-        assert wrapper in workflow, f"the Actions runner does not install {wrapper}"
+def test_complete_local_stack_namespaces_daemon_wide_chat_discovery(local_compose: dict):
+    broker_namespace = local_compose["services"]["workspace-broker"]["environment"][
+        "AGENT_SANDBOX_NAMESPACE"
+    ]
+    assert "LOCAL_PROJECT_NAME" in broker_namespace
+    # Runner inherits the exact same anchored environment.
+    assert (
+        local_compose["services"]["runner"]["environment"]["AGENT_SANDBOX_NAMESPACE"]
+        == broker_namespace
+    )
 
 
 def test_the_runner_reads_the_bounds_the_overlay_configures(monkeypatch, compose: dict):
@@ -1199,6 +1437,10 @@ def test_remote_compose_starts_no_gateway(remote_compose: dict):
         "gateway-tunnel",
         "mcp-tunnel",
         "control-plane-tunnel",
+        # Setup dependency traffic has its own allowlist proxy and an offline
+        # renderer; neither is a gateway or control-plane service.
+        "agent-egress-proxy-config",
+        "agent-egress-proxy",
         "workspace-broker",
         "runner",
     }
@@ -1249,8 +1491,8 @@ def test_the_tunnel_credential_is_mounted_read_only(remote_compose: dict):
 def test_the_tunnel_refuses_to_skip_host_verification():
     """Encrypting the hop is pointless if anything may answer for the gateway.
 
-    The credentials this tunnel exists to protect — the dispatcher token, every
-    job capability — would go straight to an impostor.
+    The credentials this tunnel exists to protect — the enrolled-host token and
+    every job capability — would go straight to an impostor.
     """
     script = _TUNNEL_ENTRYPOINT.read_text()
     assert "StrictHostKeyChecking=yes" in script

@@ -6,9 +6,9 @@
 // Two rules run through every line of this file, both from the observability
 // design's §11, and both are the reason it is worth showing numbers at all:
 //
-//   1. A number we did not measure is never rendered as a number. The
-//      sampler reports `coverage`, and anything short of a full window is
-//      labelled a floor rather than quietly rounded into a total.
+//   1. A number we did not measure is never rendered as a number. Current
+//      shared turns do not assign whole-container totals to one member; older
+//      sampled rows use `coverage`, and incomplete values remain floors.
 //   2. Timings derived from message arrival are labelled approximate. A tool
 //      row's window starts after the model has produced the call and brackets
 //      execution with platform event-processing delay until per-call
@@ -233,8 +233,8 @@ function MeasuredCell({ value, shared }: { value: string | null; shared: boolean
 /**
  * One call's CPU or memory, from whichever source could actually say.
  *
- * The sampler's reading is shown when it spanned the call. Otherwise the
- * guest kernel's exit-time accounting of the call's own processes is shown,
+ * A historical sampler reading is shown when it spanned the call. Otherwise
+ * the guest kernel's exit-time accounting of the call's own processes is shown,
  * marked so the reader knows it counts child processes only — work the
  * agent did inside its own resident process is in neither number. A floor,
  * where a process the call may own was left out, is prefixed rather than
@@ -361,11 +361,13 @@ function ToolTimingTable({
   calls,
   truncated,
   processObservationComplete,
+  sharedMemberAccounting,
 }: {
   timings: ToolTiming[];
   calls: ToolCallResources[];
   truncated: boolean;
   processObservationComplete: boolean;
+  sharedMemberAccounting: boolean;
 }) {
   const byId = useMemo(() => {
     const index = new Map<string, ToolCallResources[]>();
@@ -508,9 +510,13 @@ function ToolTimingTable({
       ) : null}
       {anyUnmeasured ? (
         <p className="text-[11px] text-gray-500 dark:text-gray-400">
-          — in CPU or memory means the periodic sampler did not span the call and no exited child
-          process was accounted to it alone. Process-start counts come from guest-kernel lifecycle
-          events and do not have that sampling-window gap.
+          {sharedMemberAccounting
+            ? '— in CPU or memory means no exited child process was accounted to this call alone. ' +
+              'Shared turns never assign a container total to one member. Process-start counts ' +
+              'come from guest-kernel lifecycle events.'
+            : '— in CPU or memory means the historical periodic sampler did not span the call ' +
+              'and no exited child process was accounted to it alone. Process-start counts come ' +
+              'from guest-kernel lifecycle events.'}
         </p>
       ) : null}
       {anyShared ? (
@@ -641,15 +647,16 @@ export function TurnFooter({ job, attemptNo }: { job: AgentJob; attemptNo?: numb
     ? CONTEXT_LABEL[selectedTelemetry.contextStatus]
     : undefined;
   // NEW/LIVE/RESTORED/LOST is the user-facing correctness contract. The old
-  // HOT/WARM/COLD/REPLAY ladder remains useful for legacy attempts and admin
-  // diagnostics, but showing both on one turn made one fact look like two
-  // independent states. Fall back to it only for rows that predate context.
+  // HOT/WARM/COLD/REPLAY remains useful attempt telemetry and for historical
+  // rows, but showing both on one turn made one fact look like two independent
+  // states. Fall back to it only for rows that predate context status.
   const badge =
     !contextBadge && selectedTelemetry?.continuityMode
       ? CONTINUITY_LABEL[selectedTelemetry.continuityMode]
       : undefined;
   const duration = formatDuration(selectedTelemetry?.durationMs);
   const resources = selectedTelemetry?.resources;
+  const sharedMemberAccounting = resources?.samplerVersion === 'shared-member-v1';
   const stats = resources ? resourceStats(resources) : [];
   const processes = resources?.processes ?? [];
   const hasProcessObservation = Boolean(resources?.processObserver);
@@ -673,17 +680,23 @@ export function TurnFooter({ job, attemptNo }: { job: AgentJob; attemptNo?: numb
             'numbers above are lower bounds rather than totals. This happens when the sandbox ' +
             'took a while to appear, or ended before the turn did.'
           : explained === 'unmeasured'
-            ? hasProcessObservation
-              ? 'The periodic sandbox resource counters were unavailable. The guest process ' +
-                'lifecycle events below are a separate, event-driven measurement.'
-              : 'This turn ran where the platform could not read the sandbox\u2019s counters, so ' +
-                'nothing was measured. That is not the same as a turn that consumed nothing.'
+            ? sharedMemberAccounting
+              ? hasProcessObservation
+                ? 'Whole-container totals are not assigned to one chat in a shared workspace. ' +
+                  'The guest process lifecycle events below are separate, member-scoped measurements.'
+                : 'Whole-container totals are not assigned to one chat because fork siblings can ' +
+                  'run concurrently. Unavailable data is not the same as a turn that consumed nothing.'
+              : hasProcessObservation
+                ? 'The historical periodic sandbox counters were unavailable. The guest process ' +
+                  'events below are a separate measurement.'
+                : 'The historical sampler could not read this turn\u2019s sandbox counters. ' +
+                  'Unavailable data is not the same as a turn that consumed nothing.'
             : null;
   const unmeasured = Boolean(resources && stats.length === 0);
 
-  // `unmeasured` counts as something to say: a sampler that ran and could
-  // read nothing is a different fact from a turn nobody tried to measure, and
-  // only the first of the two has anything to tell the reader.
+  // `unmeasured` counts as something to say: current shared turns intentionally
+  // omit group-wide totals, while old rows with no resource object predate the
+  // reporting contract entirely.
   if (
     !badge &&
     !contextBadge &&
@@ -745,7 +758,7 @@ export function TurnFooter({ job, attemptNo }: { job: AgentJob; attemptNo?: numb
             aria-expanded={explained === 'unmeasured'}
             className="text-gray-400 dark:text-gray-500 underline-offset-2 hover:underline"
           >
-            resource data unavailable
+            {sharedMemberAccounting ? 'turn totals unavailable' : 'resource data unavailable'}
           </button>
         ) : null}
         {hasDetails ? (
@@ -780,6 +793,7 @@ export function TurnFooter({ job, attemptNo }: { job: AgentJob; attemptNo?: numb
                 calls={resources?.toolCalls ?? []}
                 truncated={resources?.toolCallsTruncated === true}
                 processObservationComplete={resources?.processObservationComplete === true}
+                sharedMemberAccounting={sharedMemberAccounting}
               />
             </>
           ) : null}

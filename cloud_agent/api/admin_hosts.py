@@ -2,33 +2,19 @@
 
 Runners pull work, so there is no gateway-side dial that points jobs at a
 machine — the only moment the platform gets to decide "not you" is the claim.
-These endpoints therefore do not move anything: they name the host whose
-runners may claim, and the switch takes effect on the losing host's next poll.
+These endpoints therefore do not move anything: they name the host that may
+materialize new chat sandboxes. Existing retained groups remain claimable only
+on their immutable owning host.
 
-A host joins the pool by polling, never by being registered here. That keeps
-the list to machines that actually exist and are actually configured, which is
-the difference between switching to a host and switching to a typo.
+A host joins by redeeming a one-time enrollment token. Its resulting credential
+names exactly one machine and is required for registration, heartbeat, and
+claim: a compromised host cannot claim as a neighbour, and revoking it removes
+exactly one machine's access. Request-body host labels and pool-wide claim
+credentials are not accepted.
 
-**A host name is a scheduling label, not a machine identity** — for a host that
-joined by polling. The runner reports it, so anything holding the dispatcher
-credential can report any name: two machines configured alike are one entry,
-and a runner that wants another host's work only has to claim its name. That is
-acceptable because the credential is already the boundary — it opens the claim
-door for every host — and this switch decides *where our own machines run our
-own jobs*. Do not build anything on it that needs to survive a hostile runner.
-
-**Enrolled hosts (phase G) are the exception, and the reason enrollment
-exists.** A host that redeemed an enrollment token holds a credential naming
-one machine, so for those the name *is* an identity: a compromised host cannot
-claim as its neighbour, and revoking it kills exactly one machine's access. The
-two kinds live in one table and one list on purpose — an operator should not
-have to know which door a machine came through to see it — and the ``enrolled``
-flag on each row says which guarantee applies.
-
-The endpoints below are therefore two generations layered: the pin and the
-sighting list from #1158, and the pool's own lifecycle (enroll, drain, remove)
-from G. They compose rather than compete. The pin decides *which* host may
-claim; the pool decides *whether* that host is in a state to.
+The pin decides *which* enrolled host may claim a chat with no sandbox; the pool
+lifecycle (drain, undrain, remove) decides whether a host is allowed to claim at
+all.
 """
 
 from __future__ import annotations
@@ -143,13 +129,15 @@ async def set_active_agent_runner_host(
     _admin_id: str = Depends(verify_admin_access),
     store: AgentJobStore | None = Depends(get_agent_job_store),
 ) -> ListAgentRunnerHostsResponse:
-    """Pin agent jobs to one host, or unpin so any runner may claim.
+    """Pin new chat placement to one host, or let any host materialize it.
 
     Non-preemptive, and worth being precise about: the new host starts claiming
-    at once, while jobs already running on the old one keep running to the end
-    — they hold a lease and their runner reports through without claiming
-    again. The two overlap. This is not a drain, which would mean waiting for
-    the old host to empty before the new one starts.
+    new chats at once, while jobs already running on the old one keep running to
+    the end. Existing retained chats also remain hard-pinned to their owning
+    host for later follow-ups because their Docker writable layer is not
+    portable in this phase. The two hosts can therefore overlap. This is not a
+    drain, which would mean waiting for the old host to empty before the new one
+    starts.
     """
     job_store = _require_store(store)
     previous = await job_store.active_runner_host()
@@ -162,7 +150,7 @@ async def set_active_agent_runner_host(
             status_code=404,
             detail=(
                 f"No runner on {payload.host!r} has ever polled. Start one there "
-                "(ops/deploy/agent_runner.sh up) and it will appear here."
+                "(deploy/host/sandbox_host.sh up) and it will appear here."
             ),
         )
 
@@ -190,10 +178,9 @@ async def set_agent_runtime_version(
     refused rather than stored, because the claim would fall back to the
     default and the page would then display a version that never runs.
 
-    Non-retroactive, like the host pin, and for a sharper reason. A thread is a
-    live harness session whose checkpoint is refused — silently, into replay —
-    when the version moves under it. So this applies to threads that start
-    after it; conversations already in flight keep the version they began on.
+    Non-retroactive, like the host pin: a chat's native CLI state is owned by
+    the exact runtime version in its retained container. This applies to new
+    groups; existing conversations keep the version they began on.
     """
     job_store = _require_store(store)
     _, _, previous = await job_store.runner_pool()
@@ -233,10 +220,12 @@ async def forget_agent_runner_host(
 
     Housekeeping only: a runner still polling on that machine re-adds itself
     within seconds. The active host cannot be dropped, because doing so would
-    silently unpin — every other machine would start claiming, which is the
-    opposite of what removing a host from a list looks like it does. That
-    refusal is decided inside the store's transaction, not by a check here: a
-    check here is a read a concurrent switch can outrun.
+    silently unpin new-chat placement, which is the opposite of what removing a
+    host from a list looks like it does. Existing retained owners are not moved
+    by forgetting their pool row; their broker routing continues to fail closed
+    until the same named host is enrolled again. The active-host refusal is
+    decided inside the store's transaction, not by a check here: a check here
+    is a read a concurrent switch can outrun.
     """
     job_store = _require_store(store)
     outcome = await job_store.forget_runner_host(host=host)
@@ -406,8 +395,8 @@ async def remove_agent_runner_host(
         description=(
             "Remove a host that is still running attempts. Those attempts are "
             "not stopped — nothing here can reach them — they are left to their "
-            "leases. Legacy one-shot work may be retried; an indeterminate "
-            "retained-chat activation is marked LOST instead of replayed."
+            "leases. An indeterminate retained-chat activation is marked LOST "
+            "instead of replayed."
         ),
     ),
     _admin_id: str = Depends(verify_admin_access),
@@ -422,10 +411,9 @@ async def remove_agent_runner_host(
     draining first and finding out afterwards.
 
     Forced removal is the deliberate version of the same thing. Lease fencing
-    rejects later writes from the superseded worker. Legacy one-shot work may
-    then follow its normal retry policy; a retained activation is not replayed
-    because the platform cannot know whether its prompt ran, so that chat is
-    marked LOST when the lease expires.
+    rejects later writes from the superseded worker. A retained activation is
+    not replayed because the platform cannot know whether its prompt ran, so
+    that chat is marked LOST when the lease expires.
 
     The row survives, disabled. ``agent_attempts.host_id`` points at it, and
     "where did this job run" should not become unanswerable because the machine
@@ -441,8 +429,8 @@ async def remove_agent_runner_host(
             status_code=409,
             detail=(
                 f"{host!r} is still running attempts. Drain it first, or repeat with "
-                "force=true to let their leases expire under the applicable "
-                "one-shot retry or retained-context fail-closed policy."
+                "force=true to let their leases expire under the retained-context "
+                "fail-closed policy."
             ),
         )
     await log_admin_action(

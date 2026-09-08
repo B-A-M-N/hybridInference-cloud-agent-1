@@ -361,15 +361,12 @@ def test_generic_runtime_streams_raw_and_never_uses_a_shell():
 
 
 def test_registry_resolution_and_refusal():
-    """Known runtimes resolve; unknown ones refuse unless Tier 2 is requested."""
+    """Only runtimes with a registered live-session transport resolve."""
     assert isinstance(get_runtime("claude-code"), ClaudeCodeRuntime)
     assert isinstance(get_runtime("codex"), CodexRuntime)
     assert isinstance(get_runtime("pi"), PiRuntime)
     assert isinstance(get_runtime("opencode"), OpencodeRuntime)
     assert isinstance(get_runtime("kilo"), KiloRuntime)
-    assert isinstance(
-        get_runtime("some-new-cli", generic_command="some-new-cli run"), GenericRuntime
-    )
     with pytest.raises(KeyError):
         get_runtime("does-not-exist")
 
@@ -444,7 +441,7 @@ def test_pi_native_session_is_persisted_and_resumed_explicitly():
     ],
     ids=["codex", "pi", "opencode", "kilo", "generic"],
 )
-def test_mcp_config_fails_closed_without_a_gateway_broker(runtime):
+def test_mcp_config_fails_closed_without_an_isolated_relay(runtime):
     """An adapter with no mediated path refuses rather than dropping servers.
 
     ``ClaudeCodeRuntime`` is excluded because it now *has* that path; the
@@ -683,16 +680,16 @@ def test_suppression_does_not_leak_between_jobs():
 
 # ── MCP wiring ported from the gateway at H4 ──────────────────────────
 #
-# These three lived in the gateway's ``test_agent_mcp.py``, whose *other* half
-# — the registry and the proxy filters — stays there because that half is the
-# gateway's code. Splitting a file is how a case gets dropped, and a sweep at
-# H4 found these three pin properties nothing here covered: the flag that shuts
+# These three lived in the gateway's ``test_agent_mcp.py``. The registry and
+# proxy filters were subsequently moved here too; this note records why the
+# runtime-specific cases remain in the adapter suite. A sweep at H4 found these
+# three pin properties nothing here covered: the flag that shuts
 # out a repository's own servers when a job requests none, the one-normalisation
 # of the gateway base url, and which runtimes may claim MCP at all. The other
 # three cases in that section were already covered here under different names
-# (``test_a_brokered_runtime_emits_only_gateway_endpoints_and_no_credential``,
+# (``test_a_brokered_runtime_emits_only_relay_endpoints_and_no_credential``,
 # ``test_runtime_credentials_stay_out_of_process_arguments``,
-# ``test_mcp_config_fails_closed_without_a_gateway_broker``) and were not
+# ``test_mcp_config_fails_closed_without_an_isolated_relay``) and were not
 # duplicated.
 
 _MCP_GATEWAY = "http://backend:8080"

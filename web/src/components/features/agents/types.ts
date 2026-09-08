@@ -70,6 +70,8 @@ export interface AgentThreadMessage {
 export interface AgentHistoryTurn {
   jobId: string;
   turnNo: number;
+  /** Only a completed native assistant boundary is a valid fork anchor. */
+  forkable: boolean;
   messages: AgentThreadMessage[];
   events: AgentEvent[];
 }
@@ -95,11 +97,10 @@ export interface AgentGate {
 /**
  * What one tool call consumed, as far as the turn's readings can say.
  *
- * Usually they cannot say anything. The sandbox is read once a second and
- * most calls are far shorter than that, so `sampleCount` is normally 0 and
- * every counter null — which the UI must render as "not measured", never as
- * zero. `overlapN` above 1 means the call ran alongside others and its
- * numbers are an upper bound shared with them.
+ * Current shared-member turns do not sample the whole container, so
+ * `sampleCount` is 0 and those sampled counters are null. Historical rows may
+ * contain periodic readings; fewer than two still means "not measured", and
+ * `overlapN` above 1 means a historical measurement was shared by calls.
  */
 export interface ToolCallResources {
   toolUseId: string;
@@ -153,7 +154,7 @@ export interface ProcessObservation {
   observedExec: boolean;
   observedExit: boolean;
   toolCallSeqs: number[];
-  /** Exit-time accounting for the whole thread group; null until it exited. */
+  /** Exit-time accounting for the Linux process group; null until it exited. */
   cpuUsec?: number | null;
   memPeakBytes?: number | null;
   ioReadBytes?: number | null;
@@ -171,6 +172,12 @@ export interface TurnResources {
   netRxBytes: number | null;
   netTxBytes: number | null;
   sampleCount: number;
+  /**
+   * Identifies the accounting semantics, not just a sampler binary. Current
+   * shared-member turns use `shared-member-v1`; historical Docker-sampled
+   * rows use their sampler version.
+   */
+  samplerVersion: string | null;
   /**
    * Share of the turn actually sampled. Below 1 means the numbers are a
    * floor, not a total, and the UI says so rather than rounding the gap away.
@@ -208,7 +215,7 @@ export interface AgentJob {
   repo: string;
   baseRef?: string;
   baseSha: string;
-  /** Output branch, agent/<thread-id> for conversations or agent/<job-id> for legacy jobs. */
+  /** Output branch for this retained conversation workspace. */
   branch: string;
   runtime: string;
   runtimeVersion?: string;
@@ -234,6 +241,8 @@ export interface AgentJob {
   attemptTelemetryAvailable?: boolean;
   /** Display number for the server-authoritative current attempt, when it has emitted an event. */
   currentAttemptNo?: number;
+  /** Display number whose continuity/resources came from the telemetry read. */
+  telemetryAttemptNo?: number;
   events: AgentEvent[];
   /** Bottom-of-stream live line while running, e.g. "turn 15 · …". */
   liveNote?: string;
@@ -245,11 +254,7 @@ export interface AgentJob {
   rawLines: string[];
   gates: AgentGate[];
   usage: { tokensIn: string; tokensOut: string; cachePct: number; turns: number };
-  /**
-   * How this turn was continued. `replay` means it was rebuilt from the
-   * transcript with the agent's working memory lost — the honest answer to
-   * "why did it forget", and the reason this is surfaced at all.
-   */
+  /** Attempt continuity telemetry; `replay` can occur only on historical rows. */
   continuityMode?: 'hot' | 'warm_native' | 'cold_native' | 'replay';
   /** Canonical user-facing context state; independent of process-id reuse. */
   contextStatus?: 'new' | 'live' | 'restored' | 'lost';

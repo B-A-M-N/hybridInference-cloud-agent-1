@@ -4,13 +4,13 @@ Two audiences, two authentication schemes:
 
 - **Owners** (users, via this service's session — the ``HttpOnly`` cookie
   ``/v1/session/login`` sets, or the same token as a bearer): create, inspect,
-  list, cancel jobs, read artifacts, and subscribe to the event stream. Every
+  list, cancel jobs, browse the retained workspace, and subscribe to the event stream. Every
   read and mutation is scoped to ``user_id`` so one user can never touch
   another's job. P0 remains dogfood-only, so the same dependency also requires
   the ``internal`` role (admins satisfy it through the normal role hierarchy).
 - **Workers** (the sandbox runner, via a per-attempt capability token minted at
-  claim time): report events, store artifacts, renew the lease, and drive the
-  fenced terminal/publish transitions. The token carries the
+  claim time): report events, renew the lease, and drive fenced Agent-turn
+  transitions. The token carries the
   ``(job_id, attempt_id, lease_generation)`` fence, so a worker whose lease was
   reaped is rejected by the store even though its token still parses. Those
   rejections surface as **409**, the agreed signal for "you lost the lease,
@@ -48,16 +48,13 @@ from cloud_agent.api.deps import (
     get_grant_client,
     get_log_store,
     looks_like_agent_token,
-    verify_admin_access,
 )
 from cloud_agent.api.hosts import RESIDENCY_TTL_S, _mint_residency_grant
-from cloud_agent.broker_routing import broker_for_attempt, broker_for_job, hydrate_shared_broker
-from cloud_agent.checkpoints import (
-    CHECKPOINT_KIND,
-    MAX_CHECKPOINT_CONTENT_BYTES,
-    checkpoint_cipher,
-    gate_for_claim,
-    open_checkpoint,
+from cloud_agent.broker_routing import (
+    ENV_BROKER_TOKEN,
+    broker_for_attempt,
+    broker_for_job,
+    hydrate_shared_broker,
 )
 from cloud_agent.entitlement import (
     REPO_PATTERN,
@@ -66,9 +63,7 @@ from cloud_agent.entitlement import (
     require_entitled_repo,
 )
 from cloud_agent.execution_profiles import (
-    ENV_SHARED_LIVE_SANDBOX,
     RESERVED_EXECUTION_METADATA_KEYS,
-    SHARED_SANDBOX_CAPABILITY,
     default_execution_profile,
 )
 from cloud_agent.gateway import GatewayError
@@ -88,7 +83,6 @@ from cloud_agent.schemas import (
     AgentConfigResponse,
     AgentFollowUpRequest,
     AgentGitWorkspaceResponse,
-    AgentJobArtifactResponse,
     AgentJobCancelResponse,
     AgentJobCreate,
     AgentJobEvent,
@@ -128,8 +122,6 @@ from cloud_agent.schemas import (
     SourceControlRepository,
     ToolCallResources,
     WorkerAckResponse,
-    WorkerArtifactRequest,
-    WorkerArtifactResponse,
     WorkerClaimRequest,
     WorkerClaimResponse,
     WorkerContinuityRequest,
@@ -156,7 +148,7 @@ from cloud_agent.source_control import (
     github_authorization_url,
     issue_oauth_state,
 )
-from cloud_agent.storage.store import PUBLISHING, RUNNING, TERMINAL_STATES
+from cloud_agent.storage.store import RUNNING, SUCCEEDED, TERMINAL_STATES
 from cloud_agent.terminal_coordination import resume_settled_terminal
 from cloud_agent.thread_stats import summarize_thread
 from cloud_agent.tokens import (
@@ -189,13 +181,7 @@ from cloud_agent_host.workspace_broker_client import (
 )
 from cloud_agent_host.workspace_browser import (
     WorkspacePathError,
-    WorkspaceSnapshotError,
-    github_file_response,
-    merge_directory_entries,
     normalize_workspace_path,
-    overlay_has_directory,
-    parse_workspace_snapshot,
-    snapshot_file_response,
 )
 
 if TYPE_CHECKING:
@@ -458,7 +444,7 @@ def _attempt_duration_ms(telemetry: dict[str, Any] | None) -> int | None:
 
 
 def _attempt_resources(telemetry: dict[str, Any] | None) -> AttemptResources | None:
-    """Shape the resource rollup, or None when no sampler ever reported.
+    """Shape the resource rollup, or None when no accounting record was reported.
 
     A row whose counters are all null is still returned: it carries
     ``coverage`` and is how a reader learns the turn was not measured, which
@@ -514,15 +500,16 @@ def _job_response(
         base_ref = None
     sandbox = job.get("thread_sandbox") or {}
     native_fork_available = bool(
-        (not sandbox and job.get("state") in TERMINAL_STATES)
-        or (
-            sandbox.get("shared_live") is True
-            and sandbox.get("native_fork_capable") is True
-            and sandbox.get("native_state") == "ready"
-            and sandbox.get("fork_operation_id") is None
-            and sandbox.get("last_settled_job_id") == job.get("id")
-            and job.get("state") in TERMINAL_STATES
-        )
+        sandbox.get("shared_live") is True
+        and sandbox.get("native_fork_capable") is True
+        and sandbox.get("native_state") == "ready"
+        and sandbox.get("fork_operation_id") is None
+        and sandbox.get("active_attempt_id") is None
+        and bool(sandbox.get("last_settled_job_id"))
+        and job.get("state") == SUCCEEDED
+        and isinstance(job.get("native_turn_no"), int)
+        and not isinstance(job.get("native_turn_no"), bool)
+        and int(job["native_turn_no"]) > 0
     )
     return AgentJobResponse(
         id=job["id"],
@@ -558,6 +545,7 @@ def _job_response(
         model_calls=usage.get("model_calls"),
         setup_egress_tier=setup_tier,
         agent_egress_tier=agent_tier,
+        telemetry_attempt_id=(telemetry or {}).get("attempt_id"),
         continuity_mode=(telemetry or {}).get("continuity_mode"),
         context_status=(telemetry or {}).get("context_status"),
         resident_state=sandbox.get("resident_state"),
@@ -570,7 +558,6 @@ def _job_response(
         workspace_epoch=sandbox.get("workspace_epoch"),
         duration_ms=_attempt_duration_ms(telemetry),
         resources=_attempt_resources(telemetry),
-        telemetry_attempt_id=(telemetry or {}).get("attempt_id"),
         attempt_telemetry=[
             _attempt_summary_response(attempt) for attempt in (attempt_telemetry or [])
         ],
@@ -1480,17 +1467,9 @@ async def _create_job_as(
         metadata[BASE_REF_METADATA_KEY] = body.base_ref
     for key, value in (reserved_metadata or {}).items():
         metadata[key] = value
-    # Shared-live is a host protocol, not merely a runner-side preference. A
-    # new chat in this mode must only be claimed by a host that proved the
-    # image, CLI pins, broker, and capacity needed to honor it. Follow-ups
-    # inherit this server-owned requirement from their parent.
-    if os.environ.get(ENV_SHARED_LIVE_SANDBOX, "") not in ("", "0"):
-        requirements = metadata.get("requires")
-        if not isinstance(requirements, list):
-            requirements = []
-        if SHARED_SANDBOX_CAPABILITY not in requirements:
-            requirements.append(SHARED_SANDBOX_CAPABILITY)
-        metadata["requires"] = requirements
+    # Shared-live is enforced globally at claim time, not represented as an
+    # optional per-job requirement. Job metadata therefore remains caller data
+    # plus server-owned execution facts, without a hidden rollout switch.
     mcp_servers = await _resolve_mcp_servers(
         body.mcp_servers, runtime=body.runtime, store=job_store, user_id=user["user_id"]
     )
@@ -1644,11 +1623,19 @@ async def cancel_agent_job(
     performs the fenced terminal transition when it next heartbeats.
     """
     job_store = _require_store(store)
-    await _owned_job(job_store, job_id, user)
+    owned = await _owned_job(job_store, job_id, user)
     state = await job_store.request_cancel(job_id=job_id, user_id=user["user_id"])
-    settled_broker = await broker_for_job(job_store, job_id)
-    if state in TERMINAL_STATES and await resume_settled_terminal(job_id, broker=settled_broker):
-        await job_store.mark_terminal_resume_complete(job_id=job_id)
+    if state in TERMINAL_STATES:
+        resumed = True
+        if owned.get("thread_sandbox") is not None:
+            settled_broker = await _workspace_broker_for_job(job_store, owned)
+            resumed = await resume_settled_terminal(
+                _workspace_id(owned),
+                job_id=job_id,
+                broker=settled_broker,
+            )
+        if resumed:
+            await job_store.mark_terminal_resume_complete(job_id=job_id)
     job = await job_store.get_job(job_id)
     return AgentJobCancelResponse(
         id=job_id,
@@ -1774,7 +1761,7 @@ async def create_agent_follow_up(
     app_credentials: Any | None = Depends(get_agent_app_credentials),
     gateway: Any = Depends(get_gateway_client),
 ) -> AgentJobResponse:
-    """Append a turn to a task thread and queue its next isolated run."""
+    """Append a turn and queue its member in the retained shared sandbox."""
     job_store = _require_store(store)
     parent = await _owned_job(job_store, job_id, user)
     retained = parent.get("thread_sandbox")
@@ -1798,7 +1785,7 @@ async def create_agent_follow_up(
                         "type": "invalid_request",
                         "message": (
                             f"this thread runs on {parent['runtime']!r} and a thread's "
-                            "harness is fixed; fork the thread to continue on "
+                            "harness is fixed; start a new chat to use "
                             f"{body.runtime!r}"
                         ),
                     }
@@ -1838,14 +1825,12 @@ async def create_agent_follow_up(
             detail={"error": {"type": "repo_not_allowed", "message": str(exc)}},
         ) from exc
     # A thread's MCP servers are inherited by every turn, so a turn can end up
-    # with tools it will not get two ways: switching harness mid-thread to a
-    # runtime that cannot load them, or having disconnected the server since the
-    # thread started. Refuse either, rather than run a turn whose tools silently
-    # vanish — the follow-up prompt was very likely written expecting them.
+    # with tools it will not get a turn after the user disconnected a server
+    # since the thread started. Refuse it rather than run a turn whose tools
+    # silently vanish — the follow-up prompt was very likely written expecting
+    # them. Runtime is fixed above; the optional field can only echo that value.
     #
-    # **Checked on every turn, not only when the runtime changes.** That
-    # narrower guard was right when the only question was runtime compatibility,
-    # which cannot change while the runtime does not. Resolution now also
+    # **Checked on every turn.** Resolution now also
     # answers "is this still connected", which changes on its own, from the
     # Integrations page, between turns — leaving a plain follow-up to return 201
     # and fail at its first tool call, which is exactly the fail-fast this
@@ -1853,8 +1838,8 @@ async def create_agent_follow_up(
     if parent.get("mcp_servers"):
         await _resolve_mcp_servers(
             list(parent["mcp_servers"]),
-            # The runtime this turn will actually run on: the switched-to one,
-            # or the parent's when the caller did not switch.
+            # The runtime this turn will actually run on: an explicit echo or
+            # the parent's value when omitted.
             runtime=body.runtime or parent["runtime"],
             store=job_store,
             user_id=user["user_id"],
@@ -1880,31 +1865,6 @@ async def create_agent_follow_up(
         # It can legitimately disagree with the advisory read above when the
         # active attempt becomes indeterminate during entitlement/tool checks.
         raise _sandbox_context_lost_error()
-    # Jobs published before thread support have no recorded commit SHA. Their
-    # migrated thread id preserves the old branch name, so resolve that branch
-    # once and pin the new turn to it before any worker can claim the turn.
-    effective_parent = await job_store.get_job(job.get("parent_job_id") or "")
-    if (
-        job["state"] == "waiting"
-        and effective_parent is not None
-        and effective_parent.get("published_pr_url")
-        and not effective_parent.get("published_commit_sha")
-    ):
-        try:
-            if app_credentials is None:
-                raise RuntimeError("the GitHub App is unavailable")
-            branch_sha = await app_credentials.resolve_ref(
-                job["repo"], branch_name_for(job.get("thread_id") or effective_parent["id"])
-            )
-            await job_store.resolve_legacy_published_commit(
-                parent_job_id=effective_parent["id"], commit_sha=branch_sha
-            )
-        except Exception as exc:
-            await job_store.fail_waiting_follow_up(
-                job_id=job["id"],
-                detail=f"could not resume the existing draft PR branch: {exc}",
-            )
-        job = await job_store.get_job(job["id"]) or job
     logger.info(
         "agent_follow_up_created",
         extra={
@@ -1939,22 +1899,26 @@ async def fork_agent_job(
     )
     if job["state"] not in TERMINAL_STATES:
         raise not_settled
-    if job.get("thread_sandbox") is None:
-        forked = await job_store.fork_thread(source_job_id=job_id, user_id=user["user_id"])
-        if forked is None:
-            # The settled-check above raced a concurrent transition; same answer.
-            raise not_settled
-        logger.info(
-            "agent_job_forked",
-            extra={
-                "event": "agent_job_forked",
-                "job_id": forked["id"],
-                "thread_id": forked.get("thread_id"),
-                "source_job_id": job_id,
-                "sandbox_clone": False,
+    if job["state"] != SUCCEEDED:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": {
+                    "type": "anchor_not_settled",
+                    "message": "Only a successfully settled turn can be used as a Fork anchor.",
+                }
             },
         )
-        return _job_response(forked)
+    if job.get("thread_sandbox") is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": {
+                    "type": "native_context_unavailable",
+                    "message": "This historical chat has no shared native-session sandbox.",
+                }
+            },
+        )
 
     sandbox = job.get("thread_sandbox") or {}
     if sandbox.get("shared_live") is not True:
@@ -1992,13 +1956,17 @@ async def fork_agent_job(
                 "not_settled",
                 "This turn is still active; stop the run before forking it.",
             ),
-            "not_latest_settled": (
+            "anchor_not_settled": (
                 "historical_snapshot_unavailable",
-                "Native Fork is available only at this chat's latest settled turn.",
+                "Native Fork requires a successfully completed assistant turn.",
             ),
             "not_shared_live": (
                 "native_fork_unavailable",
                 "This chat does not use a shared-native sandbox.",
+            ),
+            "native_fork_unavailable": (
+                "native_fork_unavailable",
+                "This retained sandbox version cannot fork from a historical turn.",
             ),
             "sandbox_not_ready": (
                 "native_context_unavailable",
@@ -2214,6 +2182,7 @@ async def fork_agent_job(
                 members=members,
                 operation_id=operation_id,
                 source_native_session_id=str(operation["source_native_session_id"]),
+                source_native_turn_no=int(operation["source_native_turn_no"]),
                 target_thread_id=str(operation["target_thread_id"]),
                 target_slot_id=int(operation["target_resident_slot_id"]),
                 source_launch={
@@ -2393,47 +2362,42 @@ async def list_agent_job_events(
     )
 
 
-@router.get("/jobs/{job_id}/artifacts/{kind}", response_model=AgentJobArtifactResponse)
-async def get_agent_job_artifact(
-    job_id: str,
-    kind: str,
-    user: dict[str, Any] = Depends(require_agent_owner),
-    store: AgentJobStore | None = Depends(get_agent_job_store),
-) -> AgentJobArtifactResponse:
-    """Fetch the latest artifact of a kind (e.g. ``patch``) for a job."""
-    job_store = _require_store(store)
-    await _owned_job(job_store, job_id, user)
-    artifact = await job_store.get_artifact(job_id=job_id, kind=kind)
-    if artifact is None:
+def _workspace_id(job: dict[str, Any]) -> str:
+    """Address the chat member inside its retained shared container."""
+    thread_id = job.get("thread_id")
+    if not thread_id:
         raise HTTPException(
-            status_code=404,
+            status_code=409,
             detail={
-                "error": {"type": "not_found", "message": f"No '{kind}' artifact for {job_id}"}
+                "error": {
+                    "type": "workspace_unavailable",
+                    "message": "This chat has no retained workspace.",
+                }
             },
         )
-    return AgentJobArtifactResponse(
-        job_id=artifact["job_id"],
-        attempt_id=artifact["attempt_id"],
-        kind=artifact["kind"],
-        content=artifact["content"],
-        created_at=_iso(artifact["created_at"]),
-    )
-
-
-def _workspace_id(job: dict[str, Any]) -> str:
-    """Address either the thread container or the legacy job worktree."""
-    if job.get("thread_sandbox") is not None and job.get("thread_id"):
-        return str(job["thread_id"])
-    return str(job["id"])
+    return str(thread_id)
 
 
 def _workspace_broker_http_error(exc: WorkspaceBrokerError) -> HTTPException:
     """Map private broker failures onto bounded owner-facing errors."""
-    status = exc.status_code if exc.status_code in {400, 404, 408, 409, 413, 429} else 503
+    missing_workspace = _workspace_not_materialized(exc)
+    status = (
+        409
+        if missing_workspace
+        else exc.status_code
+        if exc.status_code in {400, 404, 408, 409, 413, 429}
+        else 503
+    )
+    message = "This chat has no retained workspace." if missing_workspace else exc.message
     return HTTPException(
         status_code=status,
-        detail={"error": {"type": "workspace_unavailable", "message": exc.message}},
+        detail={"error": {"type": "workspace_unavailable", "message": message}},
     )
+
+
+def _workspace_not_materialized(exc: WorkspaceBrokerError) -> bool:
+    """Recognize the shared-only broker's missing-workspace response."""
+    return exc.status_code == 404 and exc.message == "shared chat workspace is not materialized"
 
 
 async def _workspace_broker_for_job(
@@ -2449,14 +2413,14 @@ async def _workspace_broker_for_job(
 
 
 def _terminal_broker_http_error(exc: WorkspaceBrokerError) -> HTTPException:
-    """Preserve terminal errors while presenting a missing worktree as a conflict."""
-    if exc.status_code == 404 and exc.message == "workspace is not materialized":
+    """Preserve terminal errors while presenting a missing workspace as a conflict."""
+    if _workspace_not_materialized(exc):
         return HTTPException(
             status_code=409,
             detail={
                 "error": {
                     "type": "workspace_unavailable",
-                    "message": "This older job has no live terminal workspace.",
+                    "message": "This chat has no live terminal workspace.",
                 }
             },
         )
@@ -2478,7 +2442,7 @@ def _workspace_not_ready() -> HTTPException:
 async def _require_mutable_workspace_ready(*, job: dict[str, Any], store: AgentJobStore) -> None:
     """Fence retained mutations through the durable thread-wide barrier."""
     if job.get("thread_sandbox") is None:
-        return
+        raise _workspace_not_ready()
     thread_id = job.get("thread_id")
     if not thread_id or not await store.thread_workspace_ready(thread_id=str(thread_id)):
         raise _workspace_not_ready()
@@ -2527,15 +2491,9 @@ async def _terminal_owner_workspace(
     job_store = _require_store(store)
     job = await _owned_job(job_store, job_id, user)
     if require_ready:
-        if job.get("thread_sandbox") is not None:
-            ready = await job_store.thread_workspace_ready(thread_id=str(job["thread_id"]))
-        elif job["state"] in {*TERMINAL_STATES, PUBLISHING}:
-            ready = True
-        else:
-            eligible = job["state"] == RUNNING and job["current_attempt_id"] is not None
-            ready = eligible and await job_store.terminal_workspace_ready(
-                attempt_id=job["current_attempt_id"]
-            )
+        ready = job.get("thread_sandbox") is not None and await job_store.thread_workspace_ready(
+            thread_id=str(job["thread_id"])
+        )
         if not ready:
             raise _workspace_not_ready()
     if recheck_entitlement:
@@ -2558,9 +2516,13 @@ async def _terminal_owner_workspace(
         )
     if job.get("terminal_resume_pending"):
         # The broker resolved a few lines up is this job's own host's, so the
-        # resume goes to the machine holding the worktree rather than to
+        # resume goes to the machine holding the retained workspace rather than to
         # whatever the deployment's single-host variable names.
-        if not await resume_settled_terminal(_workspace_id(job), broker=broker):
+        if not await resume_settled_terminal(
+            _workspace_id(job),
+            job_id=job_id,
+            broker=broker,
+        ):
             raise HTTPException(
                 status_code=503,
                 detail={
@@ -2583,13 +2545,7 @@ async def get_agent_job_workspace_file(
     store: AgentJobStore | None = Depends(get_agent_job_store),
     app_credentials: Any | None = Depends(get_agent_app_credentials),
 ) -> AgentWorkspaceResponse:
-    """Browse a live job worktree or an older job's archived snapshot.
-
-    Live reads go through the private workspace broker after owner and current
-    repository entitlement checks. For jobs created before durable worktrees,
-    GitHub is read lazily at the pinned SHA and merged with the runner's bounded
-    changed-file snapshot.
-    """
+    """Browse the chat's retained workspace through its owning host broker."""
     job_store = _require_store(store)
     job = await _owned_job(job_store, job_id, user)
     try:
@@ -2604,129 +2560,21 @@ async def get_agent_job_workspace_file(
         job=job, user=user, store=job_store, app_credentials=app_credentials
     )
 
-    # New self-hosted runners retain one real worktree per job. Prefer it
-    # before consulting GitHub/snapshots; only a pre-broker job falls through
-    # to the archived view.
     broker = await _workspace_broker_for_job(job_store, job)
-    if broker is not None:
-        try:
-            return AgentWorkspaceResponse(**(await broker.files(_workspace_id(job), safe_path)))
-        except WorkspaceBrokerError as exc:
-            if exc.status_code != 404 or exc.message != "workspace is not materialized":
-                raise _workspace_broker_http_error(exc) from exc
-
-    base_sha = job.get("base_sha")
-    if not base_sha:
+    if broker is None:
         raise HTTPException(
             status_code=409,
             detail={
                 "error": {
                     "type": "workspace_unavailable",
-                    "message": "This job does not yet have a pinned base commit.",
+                    "message": "This chat has no owning workspace broker.",
                 }
             },
-        )
-    if app_credentials is None:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": {
-                    "type": "workspace_unavailable",
-                    "message": "Repository browsing requires the GitHub App.",
-                }
-            },
-        )
-
-    snapshot_artifact = await job_store.get_artifact(job_id=job_id, kind="workspace_snapshot")
-    try:
-        overlay = parse_workspace_snapshot(
-            snapshot_artifact["content"] if snapshot_artifact else None
-        )
-    except WorkspaceSnapshotError as exc:
-        logger.warning(
-            "agent_workspace_snapshot_invalid",
-            extra={"event": "agent_workspace_snapshot_invalid", "job_id": job_id},
-        )
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": {
-                    "type": "workspace_unavailable",
-                    "message": "The changed-files snapshot could not be read.",
-                }
-            },
-        ) from exc
-
-    changed_file = snapshot_file_response(overlay, safe_path) if safe_path else None
-    replaced_file_with_directory = bool(
-        changed_file is not None
-        and changed_file.get("status") == "deleted"
-        and overlay_has_directory(overlay, safe_path)
-    )
-    if changed_file is not None and not replaced_file_with_directory:
-        return AgentWorkspaceResponse(**changed_file)
-
-    if replaced_file_with_directory:
-        baseline: dict[str, Any] | list[dict[str, Any]] = []
-    else:
-        try:
-            baseline = await app_credentials.repository_contents(
-                job["repo"], path=safe_path, ref=base_sha
-            )
-        except GitHubAppError as exc:
-            if exc.status == 404 and overlay_has_directory(overlay, safe_path):
-                baseline = []
-            elif exc.status == 404:
-                raise HTTPException(
-                    status_code=404,
-                    detail={
-                        "error": {
-                            "type": "not_found",
-                            "message": f"No such workspace path: {safe_path}",
-                        }
-                    },
-                ) from exc
-            else:
-                raise HTTPException(
-                    status_code=502,
-                    detail={
-                        "error": {
-                            "type": "repository_unavailable",
-                            "message": "The pinned repository contents are temporarily unavailable.",
-                        }
-                    },
-                ) from exc
-        except Exception as exc:
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "error": {
-                        "type": "repository_unavailable",
-                        "message": "The pinned repository contents are temporarily unavailable.",
-                    }
-                },
-            ) from exc
-
-    if isinstance(baseline, list):
-        return AgentWorkspaceResponse(
-            path=safe_path,
-            kind="directory",
-            entries=merge_directory_entries(path=safe_path, baseline=baseline, overlay=overlay),
-            writable=False,
-            source="snapshot",
         )
     try:
-        return AgentWorkspaceResponse(**github_file_response(safe_path, baseline))
-    except WorkspaceSnapshotError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "error": {
-                    "type": "repository_unavailable",
-                    "message": "GitHub returned malformed file content.",
-                }
-            },
-        ) from exc
+        return AgentWorkspaceResponse(**(await broker.files(_workspace_id(job), safe_path)))
+    except WorkspaceBrokerError as exc:
+        raise _workspace_broker_http_error(exc) from exc
 
 
 @router.put("/jobs/{job_id}/files", response_model=AgentWorkspaceResponse)
@@ -2738,7 +2586,7 @@ async def write_agent_job_workspace_file(
     store: AgentJobStore | None = Depends(get_agent_job_store),
     app_credentials: Any | None = Depends(get_agent_app_credentials),
 ) -> AgentWorkspaceResponse:
-    """Save one text file directly into the job's live worktree."""
+    """Save one text file directly into the retained chat workspace."""
     job_store = _require_store(store)
     job = await _owned_job(job_store, job_id, user)
     try:
@@ -2770,13 +2618,13 @@ async def write_agent_job_workspace_file(
             **(await broker.write_file(_workspace_id(job), safe_path, body.content))
         )
     except WorkspaceBrokerError as exc:
-        if exc.status_code == 404 and exc.message == "workspace is not materialized":
+        if _workspace_not_materialized(exc):
             raise HTTPException(
                 status_code=409,
                 detail={
                     "error": {
                         "type": "workspace_unavailable",
-                        "message": "This older job has only an archived workspace snapshot.",
+                        "message": "This retained workspace is not materialized.",
                     }
                 },
             ) from exc
@@ -2791,7 +2639,7 @@ async def run_agent_job_terminal_command(
     store: AgentJobStore | None = Depends(get_agent_job_store),
     app_credentials: Any | None = Depends(get_agent_app_credentials),
 ) -> AgentTerminalResponse:
-    """Run an owner-entered command in a disposable workspace sandbox."""
+    """Run an owner-entered command inside the retained chat sandbox."""
     job_store = _require_store(store)
     job = await _owned_job(job_store, job_id, user)
     await _require_workspace_entitlement(
@@ -2810,10 +2658,10 @@ async def run_agent_job_terminal_command(
         )
         return AgentTerminalResponse(**result)
     except WorkspaceBrokerError as exc:
-        if exc.status_code == 404 and exc.message == "workspace is not materialized":
+        if _workspace_not_materialized(exc):
             raise HTTPException(
                 status_code=409,
-                detail="This older job has no live terminal workspace.",
+                detail="This retained terminal workspace is not materialized.",
             ) from exc
         raise _workspace_broker_http_error(exc) from exc
 
@@ -3009,7 +2857,7 @@ async def get_agent_job_git_workspace(
     store: AgentJobStore | None = Depends(get_agent_job_store),
     app_credentials: Any | None = Depends(get_agent_app_credentials),
 ) -> AgentGitWorkspaceResponse:
-    """Read live worktree status, diff and recent commits."""
+    """Read live retained-workspace status, diff and recent commits."""
     job_store = _require_store(store)
     job = await _owned_job(job_store, job_id, user)
     await _require_workspace_entitlement(
@@ -3023,7 +2871,7 @@ async def get_agent_job_git_workspace(
             **(await broker.git(_workspace_id(job), base_sha=job.get("base_sha")))
         )
     except WorkspaceBrokerError as exc:
-        if exc.status_code == 404 and exc.message == "workspace is not materialized":
+        if _workspace_not_materialized(exc):
             return AgentGitWorkspaceResponse(available=False)
         raise _workspace_broker_http_error(exc) from exc
 
@@ -3117,85 +2965,37 @@ async def stream_agent_job_events(
 
 # ── Worker endpoints (capability-token authenticated) ──────────────────
 
-#: Labels a dispatcher identity that came from a host credential rather than
-#: from the shared token, for logs and audit. It is **not** what the claim
-#: reads to decide which host it is talking to — an identity string is
-#: attacker-adjacent input once E7 sources it from a JWT ``sub``, and a
-#: prefix match on it would be a way to claim as another machine. The
-#: authoritative answer is stashed on ``request.state`` below.
-_HOST_IDENTITY_PREFIX = "host:"
-
-#: Set by ``verify_dispatcher_access`` when, and only when, the caller
-#: authenticated with a host credential. Absent means "not a host", including
-#: for every dependency override a test installs.
-_HOST_REQUEST_ATTR = "agent_host"
-
-#: Hash of the exact host credential that passed authentication. The store
-#: re-checks it while taking the slot, closing the auth-to-claim race.
-_HOST_CREDENTIAL_HASH_REQUEST_ATTR = "agent_host_credential_hash"
-
 #: Cheap structural check before touching the signing key: host credentials
-#: carry their own token prefix, so a dispatcher or admin token never reaches
-#: the host parser at all.
+#: carry their own token prefix, so unrelated credentials never reach the host
+#: parser at all.
 _HOST_TOKEN_HINT = "aht."
 
 
-async def verify_dispatcher_access(
-    request: Request,
+async def verify_claiming_host(
     authorization: str | None = Header(None),
     store: AgentJobStore | None = Depends(get_agent_job_store),
-) -> str:
-    """Gate for the machine-to-machine worker claim.
+) -> dict[str, str]:
+    """Authenticate the enrolled host that is claiming retained work.
 
-    Prefers a dedicated ``AGENT_DISPATCHER_TOKEN``: the runner host executes
-    untrusted repository code next door, and the credential it holds should
-    open exactly one door — claiming work — not the whole admin surface, which
-    is what handing it ``ADMIN_TOKEN`` did (the design's own blast-radius rule
-    applied to our side of the fence). ``ADMIN_TOKEN`` (via
-    ``verify_admin_access``) still works, both for migration and because admin
-    legitimately outranks dispatcher; the point is the runner no longer *needs*
-    it.
-
-    The dedicated token opens nothing else: no other route reads it, and to
-    every other authenticator it is just an invalid credential.
-
-    **A host credential (phase G) is the third and narrowest key.** The
-    dispatcher token is shared by the whole pool, so it says "a runner" and not
-    "which"; an enrolled host presents a credential naming itself, and the
-    claim then reports the host from that credential rather than from the
-    request body. A compromised host can drain the queue either way, but it
-    cannot claim *as its neighbour* — which is what makes pinning, draining and
-    revoking mean anything against a machine that has been taken over.
-
-    Checked after the dispatcher token so the existing path is untouched, and
-    returns ``host:<name>`` so the caller can tell the two apart.
+    The credential names the host and is re-checked by ``claim_job`` in the
+    same transaction that takes a capacity slot. There is no shared claim
+    token and no request-body host name, so a machine cannot claim as a peer.
     """
-    configured = (os.environ.get("AGENT_DISPATCHER_TOKEN") or "").strip()
     presented = (
         authorization[7:].strip() if authorization and authorization.startswith("Bearer ") else ""
     )
-    if configured and presented and secrets.compare_digest(presented, configured):
-        return "dispatcher"
     if presented and store is not None and presented.startswith(_HOST_TOKEN_HINT):
         try:
             claims = parse_host_token(presented)
         except (InvalidHostToken, ValueError):
             # ValueError is the unset-``AGENT_CONTROL_TOKEN_SECRET`` case.
-            # Falling through to the admin gate — and a 401 — is right: a
-            # deployment with no signing secret cannot mint this attempt's
-            # worker token either, so the claim was never going to succeed,
-            # and 401 is a better answer than a 500 from a dependency.
             claims = None
         if claims is not None:
+            credential_hash = hash_secret(presented)
             host = await store.authenticate_host(
-                host=claims["host"], credential_hash=hash_secret(presented)
+                host=claims["host"], credential_hash=credential_hash
             )
             if host is None:
-                # Signed by us but no longer live: revoked, superseded, or
-                # naming a host that was forgotten. Refuse here rather than
-                # falling through to the admin gate, where a well-formed host
-                # credential would otherwise be read as a malformed admin one
-                # and produce a misleading answer.
                 raise HTTPException(
                     status_code=401,
                     detail={
@@ -3205,10 +3005,16 @@ async def verify_dispatcher_access(
                         }
                     },
                 )
-            request.state.__setattr__(_HOST_REQUEST_ATTR, host["host"])
-            request.state.__setattr__(_HOST_CREDENTIAL_HASH_REQUEST_ATTR, hash_secret(presented))
-            return f"{_HOST_IDENTITY_PREFIX}{host['host']}"
-    return await verify_admin_access(request=request, authorization=authorization)
+            return {"host": host["host"], "credential_hash": credential_hash}
+    raise HTTPException(
+        status_code=401,
+        detail={
+            "error": {
+                "type": "unauthorized",
+                "message": "A valid enrolled host credential is required.",
+            }
+        },
+    )
 
 
 def _worker_claims(authorization: str | None) -> dict[str, Any]:
@@ -3277,6 +3083,7 @@ async def _restore_terminal_suspension(
     broker: WorkspaceBrokerClient | None,
     *,
     workspace_id: str,
+    job_id: str,
     lease_generation: int,
 ) -> None:
     """Best-effort compensation after a worker fails to finalize a resume."""
@@ -3286,6 +3093,7 @@ async def _restore_terminal_suspension(
         await broker.suspend_terminals(
             workspace_id,
             lease_generation=lease_generation,
+            job_id=job_id,
         )
     except WorkspaceBrokerError:
         logger.warning(
@@ -3294,9 +3102,46 @@ async def _restore_terminal_suspension(
             extra={
                 "event": "agent_terminal_resume_compensation_failed",
                 "workspace_id": workspace_id,
+                "job_id": job_id,
                 "lease_generation": lease_generation,
             },
         )
+
+
+async def _worker_workspace_broker(
+    job_store: AgentJobStore,
+    job: dict[str, Any],
+    *,
+    attempt_id: int,
+    required: bool,
+) -> WorkspaceBrokerClient | None:
+    """Resolve the retained owner for worker-side terminal coordination.
+
+    A failed attempt may settle before it ever reserves Docker, in which case
+    there is genuinely no terminal state to coordinate. Once a group mapping
+    exists, however, a missing broker is a routing failure and must not be
+    treated as a successful no-op.
+    """
+    if job.get("thread_sandbox") is None:
+        if required:
+            raise _workspace_not_ready()
+        return None
+    broker = await broker_for_attempt(job_store, attempt_id)
+    try:
+        broker = await hydrate_shared_broker(job, broker)
+    except WorkspaceBrokerError as exc:
+        raise _workspace_broker_http_error(exc) from exc
+    if broker is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "type": "workspace_unavailable",
+                    "message": "The retained workspace owner is unavailable.",
+                }
+            },
+        )
+    return broker
 
 
 async def _mint_sandbox_grant(
@@ -3464,9 +3309,8 @@ async def _mint_sandbox_grant(
 
 @router.post("/worker/claim", response_model=WorkerClaimResponse | None)
 async def worker_claim(
-    request: Request,
     body: WorkerClaimRequest,
-    _dispatcher: str = Depends(verify_dispatcher_access),
+    claiming_host: dict[str, str] = Depends(verify_claiming_host),
     store: AgentJobStore | None = Depends(get_agent_job_store),
     app_credentials: Any | None = Depends(get_agent_app_credentials),
     grants: Any = Depends(get_grant_client),
@@ -3480,37 +3324,33 @@ async def worker_claim(
     is no work, not treat it as an error worth retrying differently. Which host
     is active is an admin question, answered on the admin surface.
 
-    **Dispatcher-only.** ``claim_job`` takes the oldest queued job across all
+    **Enrolled-host only.** ``claim_job`` takes the oldest queued job across all
     tenants, and the response carries that job's repo, prompt, and metadata
     plus a working capability token for it — so ordinary API-key auth here
     would let any customer dequeue and read another customer's job, and drain
     the queue besides.
 
-    ``verify_dispatcher_access`` prefers the dedicated
-    ``AGENT_DISPATCHER_TOKEN`` (so the runner host holds a credential that
-    opens only this door) and falls back to ``verify_admin_access`` — a
-    machine-to-machine gate with no "auth disabled" bypass, so the endpoint
-    does not fall open in a deployment running with user auth off. The
-    dispatcher credential stays outside the sandbox; only the returned
-    per-attempt token goes in.
+    The per-host credential opens registration/heartbeat/claim surfaces and
+    never enters the sandbox; only the returned per-attempt tokens go in.
     """
     job_store = _require_store(store)
-    # An enrolled host is named by its credential, not by what it typed in the
-    # body. The body's ``host`` is still how a runner on the shared dispatcher
-    # token reports itself — that is #1158's pool, unchanged — but a machine
-    # holding its own credential cannot claim under another machine's name.
-    #
-    # Read off ``request.state``, which only ``verify_dispatcher_access`` writes
-    # and only after verifying a signature and a stored hash. Deriving it from
-    # the identity string instead would make "which host am I" a substring
-    # match on a value E7 will source from a JWT.
-    host = getattr(request.state, _HOST_REQUEST_ATTR, None) or body.host
+    if not (os.environ.get(ENV_BROKER_TOKEN) or "").strip():
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "type": "workspace_unavailable",
+                    "message": "The retained workspace broker credential is not configured.",
+                }
+            },
+        )
     claim = await job_store.claim_job(
         worker_id=body.worker_id,
         lease_ttl_seconds=body.lease_ttl_seconds,
-        host=host,
-        host_credential_hash=getattr(request.state, _HOST_CREDENTIAL_HASH_REQUEST_ATTR, None),
+        host=claiming_host["host"],
+        host_credential_hash=claiming_host["credential_hash"],
         claim_attestation=(body.attestation.model_dump() if body.attestation is not None else None),
+        expected_deployment_sha=(os.environ.get("AGENT_DEPLOYMENT_SHA") or "").strip() or None,
     )
     if claim is None:
         return None
@@ -3522,7 +3362,7 @@ async def worker_claim(
     # Two credentials with different powers. The runner keeps the full one and
     # passes only the sandbox one inside, so a credential that leaks from inside
     # the agent can make model calls the gateway already meters but cannot touch
-    # this job's event log, artifacts, or terminal state.
+    # this job's event log, lifecycle, or terminal state.
     #
     # Only the first is ours to mint. ``SCOPE_FULL`` is this service's own
     # control credential, signed with this service's own secret and verified by
@@ -3543,8 +3383,6 @@ async def worker_claim(
     # now. A leak is bounded by whichever it was: the grant buys models it
     # names, this buys tools the job asked for, and neither buys the other.
     mcp_token = mint_worker_token(**fence, scope=SCOPE_MCP)
-    context = await job_store.follow_up_context(job_id=claim["id"])
-
     # A third credential, weaker than either: read-only, this repository only,
     # one hour. The runner needs it to check the repository out — a runner that
     # cannot clone runs the agent in an empty directory — and it is deliberately
@@ -3654,39 +3492,8 @@ async def worker_claim(
         # is nothing this process can work out for itself.
         mcp_base_url=os.environ.get(ENV_SANDBOX_MCP_URL, ""),
         clone_token=clone_token,
-        context_messages=context["messages"],
-        context_patch=context["patch"],
-        context_checkpoint=await _claimable_checkpoint(job_store, claim=claim),
         mcp_servers=list(claim.get("mcp_servers") or []),
         metadata=claim["metadata"],
-    )
-
-
-async def _claimable_checkpoint(
-    job_store: AgentJobStore, *, claim: dict[str, Any]
-) -> dict[str, Any] | None:
-    """The parent turn's checkpoint, when it matches what is about to run.
-
-    Fetch → decrypt → gate (driver, through-turn, and the CLI version the
-    claim transaction stamped onto this very attempt — never a re-read of the
-    mutable host row, which a rolling upgrade's heartbeat can move between
-    claim and here). Every failure is ``None``: the runner replays, which is
-    the design's degradation ladder, never an error.
-    """
-    parent_job_id = claim.get("parent_job_id")
-    if not parent_job_id:
-        return None
-    stored = await job_store.get_artifact(job_id=parent_job_id, kind=CHECKPOINT_KIND)
-    if stored is None:
-        return None
-    envelope = open_checkpoint(stored["content"])
-    if envelope is None:
-        return None
-    return gate_for_claim(
-        envelope,
-        runtime=claim["runtime"],
-        parent_job_id=parent_job_id,
-        stamped_runtime_version=claim.get("runtime_version"),
     )
 
 
@@ -3798,7 +3605,6 @@ async def worker_reserve_thread_sandbox(
             runtime_version=body.runtime_version,
             sandbox_image_digest=body.sandbox_image_digest,
             execution_profile=body.execution_profile.value,
-            shared_live=body.shared_live,
             resident_slot_capacity=body.resident_slot_capacity,
             memory_limit=body.memory_limit,
             cpu_limit=body.cpu_limit,
@@ -3871,8 +3677,8 @@ async def worker_establish_shared_sandbox_residency(
         raise _lease_lost()
     credential = await _mint_residency_grant(job_store, grants, row=row)
     if not credential:
-        # Shared-live processes cannot safely outlive an attempt on its token.
-        # Unlike legacy HOT this mode is therefore all-or-nothing at admission.
+        # Resident processes cannot safely outlive an attempt-scoped token, so
+        # renewable residency is all-or-nothing at admission.
         await job_store.release_residency(
             thread_id=thread_id,
             generation=int(row["generation"]),
@@ -4023,7 +3829,7 @@ async def worker_abandon_thread_sandbox(
     )
     if row is None:
         raise _lease_lost()
-    if row.get("shared_live") and int(row.get("residency_generation") or 0) > 0:
+    if int(row.get("residency_generation") or 0) > 0:
         # The shared supervisor closes this member's process on abandon. End
         # its matching renewable capability now instead of leaving a dead
         # process's grant live until the residency TTL. The generation fence
@@ -4046,11 +3852,11 @@ async def worker_report_resources(
     authorization: str | None = Header(None),
     store: AgentJobStore | None = Depends(get_agent_job_store),
 ) -> WorkerAckResponse:
-    """Record one closed attempt window's resource rollup.
+    """Record one closed attempt's resource and timing telemetry.
 
     Fenced like every other worker write, and idempotent: the rollup
-    describes a window that is already closed, so a retried post is the same
-    window said twice rather than a second window to add.
+    describes an attempt that is already closed, so a retried post is the same
+    report said twice rather than a second report to add.
     """
     job_store = _require_store(store)
     claims = _worker_claims(authorization)
@@ -4088,23 +3894,25 @@ async def worker_suspend_terminals(
     )
     if event_id is None:
         raise _lease_lost()
-    broker = await broker_for_attempt(job_store, claims["attempt_id"])
-    if broker is not None:
-        try:
-            await broker.suspend_terminals(
-                workspace_id,
-                lease_generation=claims["lease_generation"],
-            )
-        except WorkspaceBrokerError as exc:
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "error": {
-                        "type": "workspace_unavailable",
-                        "message": exc.message,
-                    }
-                },
-            ) from exc
+    broker = await _worker_workspace_broker(
+        job_store, job, attempt_id=claims["attempt_id"], required=True
+    )
+    try:
+        await broker.suspend_terminals(
+            workspace_id,
+            lease_generation=claims["lease_generation"],
+            job_id=job_id,
+        )
+    except WorkspaceBrokerError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "type": "workspace_unavailable",
+                    "message": exc.message,
+                }
+            },
+        ) from exc
     return WorkerAckResponse(ok=True)
 
 
@@ -4128,28 +3936,31 @@ async def worker_resume_terminals(
     )
     if not fenced:
         raise _lease_lost()
-    broker = await broker_for_attempt(job_store, claims["attempt_id"])
-    if broker is not None:
-        try:
-            await broker.resume_terminals(
-                workspace_id,
-                lease_generation=claims["lease_generation"],
-            )
-        except WorkspaceBrokerError as exc:
-            await _restore_terminal_suspension(
-                broker,
-                workspace_id=workspace_id,
-                lease_generation=claims["lease_generation"],
-            )
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "error": {
-                        "type": "workspace_unavailable",
-                        "message": exc.message,
-                    }
-                },
-            ) from exc
+    broker = await _worker_workspace_broker(
+        job_store, job, attempt_id=claims["attempt_id"], required=True
+    )
+    try:
+        await broker.resume_terminals(
+            workspace_id,
+            lease_generation=claims["lease_generation"],
+            job_id=job_id,
+        )
+    except WorkspaceBrokerError as exc:
+        await _restore_terminal_suspension(
+            broker,
+            workspace_id=workspace_id,
+            job_id=job_id,
+            lease_generation=claims["lease_generation"],
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "type": "workspace_unavailable",
+                    "message": exc.message,
+                }
+            },
+        ) from exc
     try:
         event_id = await job_store.append_event(
             attempt_id=claims["attempt_id"],
@@ -4161,6 +3972,7 @@ async def worker_resume_terminals(
         await _restore_terminal_suspension(
             broker,
             workspace_id=workspace_id,
+            job_id=job_id,
             lease_generation=claims["lease_generation"],
         )
         raise
@@ -4168,68 +3980,11 @@ async def worker_resume_terminals(
         await _restore_terminal_suspension(
             broker,
             workspace_id=workspace_id,
+            job_id=job_id,
             lease_generation=claims["lease_generation"],
         )
         raise _lease_lost()
     return WorkerAckResponse(ok=True)
-
-
-@router.post(
-    "/worker/jobs/{job_id}/artifacts", response_model=WorkerArtifactResponse, status_code=201
-)
-async def worker_save_artifact(
-    job_id: str,
-    body: WorkerArtifactRequest,
-    authorization: str | None = Header(None),
-    store: AgentJobStore | None = Depends(get_agent_job_store),
-) -> WorkerArtifactResponse:
-    """Store (or replace) an artifact produced by this attempt.
-
-    Checkpoints are special-cased twice: sealed (encrypted) before they touch
-    the table, and pruned to latest-per-thread after they land. A checkpoint
-    this deployment cannot seal — no key — or that exceeds the size cap is
-    *discarded*, answered with ``artifact_id=0``: losing a checkpoint costs
-    one thread a replay, which is the designed degradation, while failing the
-    attempt over it would cost the user a finished turn.
-    """
-    job_store = _require_store(store)
-    claims = _worker_claims(authorization)
-    _match_job(claims, job_id)
-    content = body.content
-    if body.kind == CHECKPOINT_KIND:
-        sealed = _sealed_checkpoint(job_id, body.content)
-        if sealed is None:
-            return WorkerArtifactResponse(artifact_id=0)
-        content = sealed
-    artifact_id = await job_store.save_artifact(
-        attempt_id=claims["attempt_id"],
-        lease_generation=claims["lease_generation"],
-        kind=body.kind,
-        content=content,
-    )
-    if artifact_id is None:
-        raise _lease_lost()
-    if body.kind == CHECKPOINT_KIND:
-        await job_store.prune_thread_checkpoints(keep_job_id=job_id)
-    return WorkerArtifactResponse(artifact_id=artifact_id)
-
-
-def _sealed_checkpoint(job_id: str, content: str) -> str | None:
-    """Encrypt a checkpoint for storage; ``None`` discards it, with the reason."""
-    if len(content.encode("utf-8")) > MAX_CHECKPOINT_CONTENT_BYTES:
-        logger.info(
-            "agent_checkpoint_discarded",
-            extra={
-                "event": "agent_checkpoint_discarded",
-                "job_id": job_id,
-                "detail": f"over the {MAX_CHECKPOINT_CONTENT_BYTES} byte cap",
-            },
-        )
-        return None
-    cipher = checkpoint_cipher()
-    if cipher is None:
-        return None
-    return cipher.encrypt(content)
 
 
 @router.post("/worker/jobs/{job_id}/finish", response_model=WorkerAckResponse)
@@ -4263,17 +4018,21 @@ async def worker_finish(
     )
     if not fenced:
         raise _lease_lost()
-    broker = await broker_for_attempt(job_store, claims["attempt_id"])
+    broker = await _worker_workspace_broker(
+        job_store, job, attempt_id=claims["attempt_id"], required=False
+    )
     if broker is not None:
         try:
             await broker.resume_terminals(
                 workspace_id,
                 lease_generation=claims["lease_generation"],
+                job_id=job_id,
             )
         except WorkspaceBrokerError as exc:
             await _restore_terminal_suspension(
                 broker,
                 workspace_id=workspace_id,
+                job_id=job_id,
                 lease_generation=claims["lease_generation"],
             )
             raise HTTPException(
@@ -4299,6 +4058,7 @@ async def worker_finish(
         await _restore_terminal_suspension(
             broker,
             workspace_id=workspace_id,
+            job_id=job_id,
             lease_generation=claims["lease_generation"],
         )
         raise
@@ -4306,6 +4066,7 @@ async def worker_finish(
         await _restore_terminal_suspension(
             broker,
             workspace_id=workspace_id,
+            job_id=job_id,
             lease_generation=claims["lease_generation"],
         )
         raise _lease_lost()

@@ -20,17 +20,23 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-async def resume_settled_terminal(job_id: str, *, broker: WorkspaceBrokerClient | None) -> bool:
+async def resume_settled_terminal(
+    workspace_id: str,
+    *,
+    job_id: str,
+    broker: WorkspaceBrokerClient | None,
+) -> bool:
     """Authoritatively resume one settled workspace, reporting confirmation.
 
-    ``broker=None`` reports success: a deployment with no broker has no
-    retained terminal to resume, and treating "nothing to do" as a failure
-    would leave the recovery marker set forever.
+    ``broker=None`` reports failure. Every runnable chat has a retained
+    broker-owned workspace; clearing the durable recovery marker without
+    reaching that owner would turn a routing/configuration fault into silent
+    state loss.
     """
     if broker is None:
-        return True
+        return False
     try:
-        await broker.resume_settled_terminals(job_id)
+        await broker.resume_settled_terminals(workspace_id, job_id=job_id)
     except WorkspaceBrokerError:
         logger.warning(
             "agent_terminal_settled_resume_failed",
@@ -38,6 +44,7 @@ async def resume_settled_terminal(job_id: str, *, broker: WorkspaceBrokerClient 
             extra={
                 "event": "agent_terminal_settled_resume_failed",
                 "job_id": job_id,
+                "workspace_id": workspace_id,
             },
         )
         return False

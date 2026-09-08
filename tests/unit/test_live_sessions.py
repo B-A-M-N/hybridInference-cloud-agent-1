@@ -15,6 +15,7 @@ import pytest
 
 from cloud_agent_host.drivers import (
     TURN_COMPLETED,
+    TURN_FAILED,
     TURN_STARTED,
     ClaudeCodeDriver,
     CodexDriver,
@@ -89,7 +90,6 @@ def _live(
         gateway_base_url="http://gw",
         credential="agr",
         provides_isolation=True,
-        spawn=lambda argv, env: (_ for _ in ()).throw(AssertionError("one-shot spawn used")),
         mcp_config=EMPTY_RUNTIME_MCP_CONFIG,
         state_dir=str(state_dir),
         spawn_live=spawn_live,
@@ -166,19 +166,97 @@ def test_a_process_dying_mid_turn_settles_as_failed(tmp_path):
     list(turn.iter_events())
 
     assert turn.wait().status == "failed"
+    assert turn.wait().native_turn_settled is False
 
 
-def test_close_ends_the_residency(tmp_path):
+@pytest.mark.parametrize("consume_events", [False, True])
+def test_claude_error_result_fails_the_turn_without_poisoning_next_turn(tmp_path, consume_events):
+    process = _LiveProcess()
+    context, spawned = _live(process, tmp_path)
+    session = ClaudeCodeDriver(ClaudeCodeRuntime()).launch_live(context)
+    process.feed = _turn_lines(
+        _ANSWER,
+        {"type": "result", "subtype": "success", "is_error": True, "result": "API Error: 403"},
+    )
+    failed = session.start_turn(TurnInput(prompt="hi", model="deepseek-v4-flash"))
+    if consume_events:
+        kinds = [event.event_type for event in failed.iter_events()]
+        assert "error" in kinds
+        assert kinds[-1] == TURN_FAILED
+        assert TURN_COMPLETED not in kinds
+    assert failed.wait().status == "failed"
+    assert failed.wait().exit_code != 0
+    assert failed.wait().native_turn_settled is True
+    assert failed.wait().final_output == ""
+
+    process.feed = _turn_lines(_ANSWER, _RESULT)
+    retried = session.start_turn(TurnInput(prompt="hi", model="deepseek-v4-flash"))
+    assert retried.wait().status == "completed"
+    assert len(spawned) == 1 and not process.killed
+
+
+def test_close_ends_the_residency(tmp_path, monkeypatch):
     process = _LiveProcess()
     session = ClaudeCodeDriver(ClaudeCodeRuntime()).launch_live(_live(process, tmp_path)[0])
     process.feed = _turn_lines(_RESULT)
     session.start_turn(TurnInput(prompt="p", model="m")).wait()
 
+    clock = iter([0.0, 3.0])
+    monkeypatch.setattr("cloud_agent_host.drivers.time.monotonic", lambda: next(clock))
     session.close()
 
     assert process.stdin_closed and process.killed
     with pytest.raises(DriverError, match="closed"):
         session.start_turn(TurnInput(prompt="again", model="m"))
+
+
+def test_settled_claude_close_allows_pending_native_history_to_flush(tmp_path, monkeypatch):
+    process = _LiveProcess()
+    session = ClaudeCodeDriver(ClaudeCodeRuntime()).launch_live(_live(process, tmp_path)[0])
+    process.feed = _turn_lines(_ANSWER, _RESULT)
+    session.start_turn(TurnInput(prompt="p", model="m")).wait()
+    flushed = False
+
+    def flush(_):
+        nonlocal flushed
+        assert process.stdin_closed
+        assert not process.killed
+        flushed = True
+
+    monkeypatch.setattr(process, "poll", lambda: 0 if flushed else None)
+    monkeypatch.setattr("cloud_agent_host.drivers.time.sleep", flush)
+    session.close()
+    session.close()
+
+    assert flushed
+    assert not process.killed
+
+
+@pytest.mark.parametrize("consume_events", [False, True])
+@pytest.mark.parametrize("settled", [False, True])
+def test_api_retry_rotates_only_after_native_result(tmp_path, monkeypatch, consume_events, settled):
+    process = _LiveProcess()
+    session = ClaudeCodeDriver(ClaudeCodeRuntime()).launch_live(_live(process, tmp_path)[0])
+    retry = {"type": "system", "subtype": "api_retry", "attempt": 1}
+    # Pre-observe the subtype: later wire notifications still require rotation
+    # even if the runtime suppresses their normalized diagnostic events.
+    session.runtime.parse_event(json.dumps(retry))
+    process.feed = _turn_lines(retry, _ANSWER, *([_RESULT] if settled else []))
+    monkeypatch.setattr(process, "poll", lambda: 0 if process.stdin_closed else None)
+    turn = session.start_turn(TurnInput(prompt="hi", model="deepseek-v4-flash"))
+    if consume_events:
+        list(turn.iter_events())
+        assert not session.closed
+    result = turn.wait()
+    assert result.native_turn_settled is settled
+    assert session.retire_after_turn is settled
+    assert not session.closed
+    assert not process.stdin_closed
+    assert not process.killed
+    assert result.status == ("completed" if settled else "failed")
+    if settled:
+        with pytest.raises(DriverError, match="native session restart"):
+            session.start_turn(TurnInput(prompt="next", model="deepseek-v4-flash"))
 
 
 def test_launch_live_without_the_live_spawn_refuses(tmp_path):
@@ -226,8 +304,49 @@ def test_launch_resident_live_resumes_the_threads_session(tmp_path):
 def test_launch_resident_live_needs_the_state_mount(tmp_path):
     context, _ = _live(_LiveProcess(), tmp_path)
     object.__setattr__(context, "state_dir", None)
-    with pytest.raises(DriverError, match="state mount"):
+    with pytest.raises(DriverError, match="native session state"):
         ClaudeCodeDriver(ClaudeCodeRuntime()).launch_resident_live(context, session_id="s")
+
+
+@pytest.mark.parametrize("kind", ["init", "assistant", "result"])
+def test_claude_rejects_a_different_root_session_before_accepting_its_output(tmp_path, kind):
+    process = _LiveProcess()
+    context, _ = _live(process, tmp_path)
+    session = ClaudeCodeDriver(ClaudeCodeRuntime()).launch_resident_live(
+        context, session_id="retained-session"
+    )
+    record = (
+        {"type": "system", "subtype": "init"}
+        if kind == "init"
+        else dict(_ANSWER if kind == "assistant" else _RESULT)
+    )
+    process.feed = _turn_lines(dict(record, session_id="unexpected-new-session"))
+    turn = session.start_turn(TurnInput(prompt="Continue our task", model="deepseek-v4-flash"))
+    with pytest.raises(DriverError, match="different native session"):
+        list(turn.iter_events())
+    assert session.runtime.session_id != "unexpected-new-session"
+
+
+def test_claude_does_not_treat_a_child_agent_session_as_a_root_reset(tmp_path):
+    process = _LiveProcess()
+    context, _ = _live(process, tmp_path)
+    session = ClaudeCodeDriver(ClaudeCodeRuntime()).launch_resident_live(context, session_id="root")
+    process.feed = _turn_lines(
+        {"type": "system", "subtype": "init", "session_id": "root"},
+        {
+            "type": "system",
+            "subtype": "init",
+            "session_id": "child",
+            "parent_tool_use_id": "tool-child",
+        },
+        dict(_ANSWER, session_id="child", parent_tool_use_id="tool-child"),
+        dict(_RESULT, session_id="root"),
+    )
+    assert (
+        session.start_turn(TurnInput(prompt="p", model="deepseek-v4-flash")).wait().status
+        == "completed"
+    )
+    assert session.runtime.session_id == "root"
 
 
 def test_the_first_turn_fixes_the_sessions_effort(tmp_path):
@@ -347,8 +466,21 @@ def test_codex_app_server_two_turns_and_prompt_free_fork(tmp_path):
     )
     assert second.wait().final_output == "second"
 
-    process.feed = _turn_lines({"id": "fork-op-5", "result": {"thread": {"id": "thread-child"}}})
-    assert session.fork_native(source_session_id="thread-a", operation_id="op") == "thread-child"
+    process.feed = _turn_lines(
+        {
+            "id": "fork-read-op-5",
+            "result": {"thread": {"id": "thread-a", "turns": [{"id": "turn-a"}, {"id": "turn-b"}]}},
+        },
+        {"id": "fork-op-6", "result": {"thread": {"id": "thread-child"}}},
+    )
+    assert (
+        session.fork_native(
+            source_session_id="thread-a",
+            operation_id="op",
+            source_native_turn_no=1,
+        )
+        == "thread-child"
+    )
     assert len(spawned) == 1
     argv, env = spawned[0]
     assert argv[-1] == "app-server"
@@ -360,6 +492,7 @@ def test_codex_app_server_two_turns_and_prompt_free_fork(tmp_path):
     ]
     fork = next(line for line in sent if line.get("method") == "thread/fork")
     assert fork["params"]["threadId"] == "thread-a"
+    assert fork["params"]["lastTurnId"] == "turn-a"
     assert fork["params"]["excludeTurns"] is True
     assert all("one" not in json.dumps(line) for line in sent if line is fork)
 
@@ -438,6 +571,61 @@ def test_pi_rpc_two_turns_and_native_abort(tmp_path):
     assert "-p" not in argv
 
 
+def test_pi_rpc_forks_before_the_next_native_prompt(tmp_path):
+    process = _LiveProcess()
+    context, _spawned = _protocol_context(process, tmp_path)
+    process.feed = _turn_lines(
+        {
+            "id": "state-1",
+            "type": "response",
+            "command": "get_state",
+            "success": True,
+            "data": {"sessionId": "pi-a"},
+        }
+    )
+    session = PiDriver(PiRuntime()).launch_live(context)
+    session.ensure_started(model="m", reasoning_effort=None)
+    process.feed = _turn_lines(
+        {
+            "id": "fork-list-op-2",
+            "type": "response",
+            "command": "get_fork_messages",
+            "success": True,
+            "data": {
+                "messages": [
+                    {"entryId": "user-one", "text": "one"},
+                    {"entryId": "user-two", "text": "two"},
+                ]
+            },
+        },
+        {
+            "id": "fork-op-3",
+            "type": "response",
+            "command": "fork",
+            "success": True,
+            "data": {"text": "two", "cancelled": False},
+        },
+        {
+            "id": "fork-state-op-4",
+            "type": "response",
+            "command": "get_state",
+            "success": True,
+            "data": {"sessionId": "pi-child"},
+        },
+    )
+
+    assert (
+        session.fork_native(
+            source_session_id="pi-a",
+            operation_id="op",
+            source_native_turn_no=1,
+        )
+        == "pi-child"
+    )
+    sent = [json.loads(line) for line in process.sent]
+    assert sent[-2] == {"id": "fork-op-3", "type": "fork", "entryId": "user-two"}
+
+
 @pytest.mark.parametrize(
     ("driver", "runtime", "runtime_name"),
     [
@@ -460,10 +648,21 @@ def test_http_server_bridge_two_turns_and_native_fork(tmp_path, driver, runtime,
             "bridge": "event",
             "turn_id": turn_id,
             "event": {
+                "type": "message.updated",
+                "properties": {
+                    "info": {"id": "assistant-1", "sessionID": "ses-a", "role": "assistant"}
+                },
+            },
+        },
+        {
+            "bridge": "event",
+            "turn_id": turn_id,
+            "event": {
                 "type": "message.part.updated",
                 "properties": {
                     "part": {
                         "id": "part-1",
+                        "messageID": "assistant-1",
                         "sessionID": "ses-a",
                         "type": "text",
                         "text": "server answer",
@@ -483,11 +682,19 @@ def test_http_server_bridge_two_turns_and_native_fork(tmp_path, driver, runtime,
             "session_id": "ses-child",
         }
     )
-    assert session.fork_native(source_session_id="ses-a", operation_id="op") == "ses-child"
+    assert (
+        session.fork_native(
+            source_session_id="ses-a",
+            operation_id="op",
+            source_native_turn_no=1,
+        )
+        == "ses-child"
+    )
     assert len(spawned) == 1
     argv, env = spawned[0]
     assert argv == ["http-agent-live-bridge", runtime_name]
     assert env["AGENT_LIVE_WORKDIR"] == "/w"
+    assert json.loads(process.sent[-1])["source_native_turn_no"] == 1
 
 
 def test_every_bundled_driver_only_advertises_shared_live_after_wiring():
@@ -501,4 +708,4 @@ def test_every_bundled_driver_only_advertises_shared_live_after_wiring():
         capabilities = driver(runtime()).capabilities()
         assert capabilities.resident_transport == "supervisor_live"
         assert capabilities.concurrent_shared_workspace is True
-        assert capabilities.fork == "latest_immediate"
+        assert capabilities.fork == "at_anchor"

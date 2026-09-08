@@ -14,10 +14,8 @@ so every consequence that hangs off a host row was inert:
   terminal and git requests are served, and a row without one answers 409 for
   every one of them.
 
-**The credential is per host, and it is not the dispatcher token.** That token
-opens the claim door for every machine in the pool; this one opens it for
-exactly one, and removing the host revokes it. A pool sharing one secret has
-no way to retire a single compromised machine.
+**The credential is per host.** It opens heartbeat and claim for exactly one
+machine, and removing the host revokes it. There is no pool-wide claim secret.
 
 Enrollment is a one-time token spent for a lasting credential. A machine being
 set up has none yet, which is the whole reason the exchange exists; the token
@@ -47,10 +45,7 @@ from typing import TYPE_CHECKING, Any
 from cloud_agent_host.logging_utils import get_logger
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
-if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 logger = get_logger(__name__)
 
@@ -58,9 +53,8 @@ ENV_ENROLL_TOKEN = "AGENT_ENROLL_TOKEN"
 ENV_HOST_CREDENTIAL = "AGENT_HOST_CREDENTIAL"
 ENV_CREDENTIAL_FILE = "AGENT_HOST_CREDENTIAL_FILE"
 
-#: Where a credential is kept when the deployment names no path. Under the
-#: workdir root so it shares that volume's lifetime: a credential that outlives
-#: the machine it identifies is a credential nobody will think to revoke.
+#: Where a credential is kept when the deployment names no path. Host
+#: infrastructure state is the only host bind in the retained topology.
 DEFAULT_CREDENTIAL_FILE = "/var/lib/hybridinference/agent-host-credential"
 
 #: Fallback cadence, used only until a heartbeat answers. The control plane
@@ -349,67 +343,6 @@ def heartbeat(
     return identity
 
 
-def establish_residency(
-    *,
-    base_url: str,
-    identity: HostIdentity,
-    thread_id: str,
-    runtime_id: str,
-    runtime_version: str | None = None,
-    sandbox_id: str | None = None,
-) -> dict[str, Any] | None:
-    """Take residency for a thread this host is running; ``None`` = refused.
-
-    Returns ``{generation, credential, model}`` — ``credential`` may be None
-    (workspace-only residency; turns ride warm_native on per-attempt grants).
-    Every failure is ``None`` rather than an exception: a runner that cannot
-    take residency simply does not keep the workspace hot, and the thread's
-    next turn goes COLD off the checkpoint it already exported — the designed
-    degradation, never an error worth crashing a turn over.
-    """
-    try:
-        answer = _post(
-            f"{base_url.rstrip('/')}/v1/agent/host/residencies",
-            {
-                "thread_id": thread_id,
-                "runtime_id": runtime_id,
-                "runtime_version": runtime_version,
-                "sandbox_id": sandbox_id,
-            },
-            bearer=identity.credential,
-        )
-    except (HostRemoved, EnrollmentError):
-        return None
-    generation = answer.get("generation")
-    if not (isinstance(generation, int) and generation >= 1):
-        return None
-    return {
-        "generation": generation,
-        "credential": answer.get("credential") or None,
-        "model": answer.get("model") or None,
-    }
-
-
-def release_residency(
-    *, base_url: str, identity: HostIdentity, thread_id: str, generation: int
-) -> None:
-    """Tell the control plane this host is done with a residency.
-
-    Best-effort: the reaper lapses whatever a lost release leaves behind.
-    """
-    try:
-        _post(
-            f"{base_url.rstrip('/')}/v1/agent/host/residencies/release",
-            {"thread_id": thread_id, "generation": generation},
-            bearer=identity.credential,
-        )
-    except (HostRemoved, EnrollmentError):
-        logger.info(
-            "agent_residency_release_unacknowledged",
-            extra={"event": "agent_residency_release_unacknowledged", "thread_id": thread_id},
-        )
-
-
 def ensure_enrolled(
     *,
     base_url: str,
@@ -518,7 +451,7 @@ class HostHeartbeat:
         identity: HostIdentity,
         slots_total: int | None = None,
         broker_url: str | None = None,
-        capabilities: list[str] | None = None,
+        capabilities: list[str] | Callable[[], list[str]] | None = None,
         runner_version: str | None = None,
         sandbox_runtime: str | None = None,
         sandbox_image_digest: str | None = None,
@@ -561,7 +494,7 @@ class HostHeartbeat:
     def credential(self) -> str:
         """This host's own claim credential, naming the machine.
 
-        What the runner presents instead of the pool-wide dispatcher token
+        What the runner presents when claiming work and heartbeating
         once enrolled. The control plane reads the host from this rather than
         from the request body, so a compromised machine can drain the queue
         but cannot claim as its neighbour — which is the whole reason drain,
@@ -595,12 +528,15 @@ class HostHeartbeat:
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
+                capabilities = (
+                    self._capabilities() if callable(self._capabilities) else self._capabilities
+                )
                 heartbeat(
                     base_url=self._base_url,
                     identity=self._identity,
                     slots_total=self._slots_total,
                     broker_url=self._broker_url,
-                    capabilities=self._capabilities,
+                    capabilities=capabilities,
                     runner_version=self._runner_version,
                     sandbox_runtime=self._sandbox_runtime,
                     sandbox_image_digest=self._sandbox_image_digest,

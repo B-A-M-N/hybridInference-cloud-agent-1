@@ -296,6 +296,16 @@ def test_a_result_with_no_matching_call_is_ignored():
     assert tracker.windows() == []
 
 
+def test_concurrent_duplicate_ids_drop_both_ambiguous_calls():
+    tracker = ToolWindowTracker()
+    tracker.observe("tool_use", {"id": "same", "name": "first"}, mono=1.0)
+    tracker.observe("tool_use", {"id": "same", "name": "second"}, mono=2.0)
+    tracker.observe("tool_result", {"tool_use_id": "same"}, mono=3.0)
+
+    assert tracker.windows() == []
+    assert tracker.truncated
+
+
 def test_a_call_without_an_id_is_not_tracked_at_all():
     """It could only ever be reported unfinished, which would be a lie."""
     tracker = ToolWindowTracker()

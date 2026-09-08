@@ -15,13 +15,23 @@ import httpx
 
 from cloud_agent_host.resources import (
     SAMPLER_VERSION,
+    SHARED_MEMBER_ACCOUNTING_VERSION,
     ContainerStats,
     ResourceSampler,
     Sample,
     daemon_reachable,
     rollup,
     sample_from_stats,
+    shared_member_resource_rollup,
 )
+
+
+def test_shared_member_rollup_never_claims_group_container_totals():
+    assert shared_member_resource_rollup() == {
+        "sample_count": 0,
+        "coverage": 0.0,
+        "sampler_version": SHARED_MEMBER_ACCOUNTING_VERSION,
+    }
 
 
 def test_rollup_reports_deltas_so_a_resident_sandbox_is_not_double_charged():
@@ -80,11 +90,6 @@ def test_an_inert_sampler_starts_stops_and_reports_zero_coverage():
     result = sampler.stop()
     assert result["coverage"] == 0.0
     assert result["sample_count"] == 0
-
-
-def test_a_sampler_without_a_container_is_inert_rather_than_failing():
-    """No container name (process backend, unresolvable daemon) measures nothing."""
-    assert not ResourceSampler.for_container(None).active
 
 
 def test_a_sampler_that_never_binds_reports_zero_coverage(tmp_path):
@@ -234,19 +239,3 @@ def test_a_daemon_that_cannot_be_reached_is_reported_by_preflight():
     # On a host with a live daemon this is None; without one it names the
     # reason. Either way it must answer rather than raise.
     assert reason is None or isinstance(reason, str)
-
-
-def test_rebinding_discards_the_previous_container_s_numbers():
-    """Every spawn is a new container; the old window is not this turn's."""
-    sampler = ResourceSampler(
-        ContainerStats("first", _client(lambda _r: httpx.Response(200, json=_stats())))
-    )
-    sampler.start()
-    time.sleep(0.02)
-
-    sampler.rebind(None)
-
-    result = sampler.stop()
-    assert result["sample_count"] == 0
-    assert result["coverage"] == 0.0
-    assert result["sampler_version"] == SAMPLER_VERSION
