@@ -78,10 +78,21 @@ def test_kata_normal_exec_explicitly_sets_no_new_privileges():
     assert "--privileged" not in command
     create = manager.build_create_command(spec)
     caps = {create[i + 1] for i, token in enumerate(create) if token == "--cap-add"}
-    assert caps == {"BPF", "PERFMON", "SETUID", "SETGID", "CHOWN", "DAC_OVERRIDE", "KILL"}
+    assert caps == {
+        "BPF",
+        "PERFMON",
+        "SETUID",
+        "SETGID",
+        "CHOWN",
+        "DAC_OVERRIDE",
+        "KILL",
+        "SYS_PTRACE",
+    }
 
 
-@pytest.mark.parametrize("failure", [None, "observer", "seccomp", "nnp", "effective", "marker"])
+@pytest.mark.parametrize(
+    "failure", [None, "observer", "seccomp", "nnp", "effective", "marker", "marker_transport"]
+)
 def test_readiness_requires_events_and_member_isolation_and_cleans_up(monkeypatch, failure):
     manager = _manager()
     calls = []
@@ -112,6 +123,19 @@ def test_readiness_requires_events_and_member_isolation_and_cleans_up(monkeypatc
     monkeypatch.setattr(manager, "_run", run)
     monkeypatch.setattr(manager, "exec_capture", capture)
     monkeypatch.setattr(manager, "_kata_privileged_exec", privileged)
+    monkeypatch.setattr(
+        manager, "begin_guest_observation", lambda spec, user_uid: SimpleNamespace(available=True)
+    )
+    monkeypatch.setattr(
+        manager,
+        "finish_guest_observation",
+        lambda spec, cursor: SimpleNamespace(
+            complete=True,
+            tool_marks=()
+            if failure == "marker_transport"
+            else ((1.0, "pre", "preflight"), (2.0, "post", "preflight")),
+        ),
+    )
     if failure is None:
         manager.probe_guest_observer()
     else:

@@ -100,7 +100,16 @@ MEMBER_REAPER_SOURCE = "/usr/local/libexec/member-process-reaper"
 # Kata exec cannot acquire capabilities outside the container's bounding set.
 # Only the fixed guest-root helpers use these: tracing, self-test UID drops,
 # socket ownership, and reading/signalling member process receipts.
-KATA_HELPER_CAPABILITIES = ("BPF", "PERFMON", "SETUID", "SETGID", "CHOWN", "DAC_OVERRIDE", "KILL")
+KATA_HELPER_CAPABILITIES = (
+    "BPF",
+    "PERFMON",
+    "SETUID",
+    "SETGID",
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "KILL",
+    "SYS_PTRACE",
+)
 _UNPRIVILEGED_EXEC = ("/usr/bin/setpriv", "--no-new-privs", "--")
 _FULL_OBJECT_ID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
 
@@ -2682,6 +2691,28 @@ class ChatSandboxManager:
             )
             if marker.returncode != 0 or marker.stdout.strip() != b"freeinference-tool-mark-v1":
                 raise SandboxError("Kata tool marker self-test failed")
+            cursor = self.begin_guest_observation(spec, user_uid=self.backend.uid)
+            if not cursor.available:
+                raise SandboxError("Kata tool marker transport observer is unavailable")
+            for phase in ("pre", "post"):
+                sent = self.exec_capture(
+                    spec,
+                    [
+                        "/usr/local/libexec/freeinference-tool-mark",
+                        phase,
+                        "/agent-state/tool-marks.log",
+                    ],
+                    input_bytes=b'{"tool_use_id":"preflight"}',
+                    workdir="/",
+                    timeout_s=30,
+                )
+                if sent.returncode != 0:
+                    raise SandboxError("Kata tool marker transport helper failed")
+            observation = self.finish_guest_observation(spec, cursor)
+            if not observation.complete or [
+                (phase, tool_id) for _, phase, tool_id in observation.tool_marks
+            ] != [("pre", "preflight"), ("post", "preflight")]:
+                raise SandboxError("Kata observer did not receive trusted tool boundaries")
         finally:
             self._run(
                 [self.backend.docker_binary, "rm", "--force", spec.container_name], timeout=30

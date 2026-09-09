@@ -505,13 +505,15 @@ to it over a credential-checked Unix socket. A same-UID tool can still execute
 that helper, so exact per-tool association is diagnostic, never a security or
 billing authority; the eBPF lifecycle census itself is independent of marks.
 Kata containers retain `BPF`, `PERFMON`, `SETUID`, `SETGID`, `CHOWN`,
-`DAC_OVERRIDE` and `KILL` in the bounding set for the fixed guest-root helpers:
-tracing, the UID-filter self-test, socket ownership and member cleanup.
+`DAC_OVERRIDE`, `KILL` and `SYS_PTRACE` in the bounding set for the fixed guest-root helpers:
+tracing, the UID-filter self-test, socket ownership, member cleanup and verifying
+the marker sender's `/proc/<pid>/exe` across member UIDs.
 Kata privileged exec cannot acquire capabilities outside that original set.
 Ordinary exec explicitly enters through `setpriv --no-new-privs`, because
 Kata 3.32 does not inherit PID 1's setting for Docker exec. Preflight requires
 non-root execution, zero effective/permitted capabilities, `NoNewPrivs=1`
-and `Seccomp=2`, then runs the observer and marker self-tests. Privileged
+and `Seccomp=2`, then runs the observer and marker self-tests and requires a
+real non-root pre/post pair to reach the trusted observer journal. Privileged
 helpers also verify the **inspected container's** Kata runtime and execute by
 that verified container ID; changing a runner setting cannot promote an old
 runc container into a guest-root target. A shared
