@@ -814,9 +814,10 @@ Both Actions jobs use the workflow commit's deployment orchestrator against a
 separate target checkout. Online rollback therefore cannot execute a
 pre-fence target's old scripts; commits without the current
 `deploy/DEPLOY_PROTOCOL`, or with an incompatible protocol value, are refused
-before changing Docker state. Protocol `shared-live-exact-sha-v2` deliberately
-excludes ancestors whose Alembic revision identifiers predate the merged
-`0021`–`0025` chain; those commits are not schema-compatible rollback targets.
+before changing Docker state. The current protocol deliberately excludes
+ancestors that predate the rewritten schema baseline (`0001_schema_baseline`,
+2026-09-10): their Alembic chain is one the database no longer records, so
+they are not schema-compatible rollback targets.
 Database changes are expand-first. Never downgrade columns underneath a
 still-running new API; roll code back to a schema-compatible commit first and
 treat any later contract migration as a separate reviewed operation.
@@ -838,6 +839,225 @@ running for diagnosis. Web does not start until the same exact-SHA fence
 succeeds. Once it does, the bootstrap peers belong to the desired target stack:
 a later final API/web probe failure leaves that stack running for diagnosis but
 does not write `.deployed-sha`.
+
+### Rebuilding the agent database
+
+The schema baseline was rewritten on 2026-09-10 (`0001_schema_baseline`), and
+a database stamped with any revision of the old chain fails
+`alembic upgrade head` with "can't locate revision". Such a database is
+rebuilt, not upgraded. The rebuild is **not** "drop the database and deploy":
+the runner keeps its host credential in a file
+(`AGENT_HOST_CREDENTIAL_FILE`, default
+`/var/lib/hybridinference/agent-host-credential`) and never re-enrols while
+that file exists, so an empty `agent_runner_hosts` turns every heartbeat into
+a 401, the runner logs `agent_host_credential_rejected` and stops claiming, and
+the control-plane deploy waits for a fresh heartbeat that never comes. The
+host's registration must survive the rebuild. So must the users' source
+control and MCP connections, which are credentials nobody can re-mint from
+the database side, and the identity-namespace binding, which says which
+Gateway minted the `user_id`s those rows are keyed by: `deploy.sh` runs
+`python -m cloud_agent.identity_namespace --check` before either listener
+starts, and that check refuses to start an API over owner data with no issuer
+to attribute it to.
+
+Rehearsed on a copy of the old schema (2026-09-10), including the ways the
+naive version fails: a positional insert lands values in the wrong columns
+because the rewritten baseline orders some differently, a host row restored
+with its old `slots_used` never claims again because the attempts that held
+those slots are gone, a restore that leaves the identity binding behind stops
+the API at startup, and a restored `draining` host never claims again because
+nothing undoes the drain. Every `docker compose` below is the
+invocation `deploy/control-plane/deploy.sh` makes — project, env file,
+compose file — and it runs in the deploy root with the target commit checked
+out. The compose project below is staging's (`cloudagent`).
+
+1. Record which hosts are taking work, then let them finish. The drain below
+   is this rebuild's own and has to be undone in step 5, but only for the
+   hosts it is applied to: a host that was already `draining`, `offline` or
+   `disabled` before the rebuild must stay that way, and the heartbeat will
+   not put one back online. So write the undo before making the change, then
+   drain from the admin page (or
+   `POST /admin/agent/runner-hosts/<host>/drain`), wait until the host holds
+   no running attempts, and only then stop the services that hold database
+   connections, leaving Postgres up:
+
+   ```bash
+   docker exec cloudagent-postgres-1 psql -U cloudagent -d cloudagent -Atc \
+     "SELECT format('UPDATE agent_runner_hosts SET status = ''online'' WHERE host = %L;', host) \
+      FROM agent_runner_hosts WHERE status = 'online'" \
+     > cloudagent-undrain-$(date +%F).sql
+   docker exec cloudagent-postgres-1 psql -U cloudagent -d cloudagent -Atc \
+     "SELECT host, status, slots_used FROM agent_runner_hosts; \
+      SELECT count(*) FROM agent_attempts WHERE status = 'running'"
+   docker stop cloudagent-control-plane-1 cloudagent-mcp-relay-1 cloudagent-web-1
+   ```
+
+2. Take the forensic dump of everything, then the data-only dump of the state
+   that survives — the host registrations, the three user connection tables,
+   and the identity-namespace binding those `user_id`s belong to — then the
+   placement policy as one statement. `--column-inserts` is load-bearing (see
+   above), and `format('%L')` is what keeps an unpinned `active_host` a SQL
+   `NULL` rather than an empty string the new foreign key would refuse:
+
+   ```bash
+   docker exec cloudagent-postgres-1 pg_dump -U cloudagent -Fc cloudagent > cloudagent-$(date +%F).dump
+   docker exec cloudagent-postgres-1 pg_dump -U cloudagent --data-only --column-inserts \
+     -t agent_runner_hosts -t agent_repo_grants -t agent_gitlab_connections \
+     -t agent_mcp_connections -t agent_identity_namespace \
+     cloudagent > cloudagent-state-$(date +%F).sql
+   docker exec cloudagent-postgres-1 psql -U cloudagent -d cloudagent -Atc \
+     "SELECT format('UPDATE agent_runner_policy SET active_host = %L, runtime_versions = %L::jsonb;', \
+                    active_host, runtime_versions) FROM agent_runner_policy" \
+     > cloudagent-policy-$(date +%F).sql
+   ```
+
+3. Build the target's `migrate` image **before** touching the database. The
+   migrations are copied into the image at build time, not mounted from the
+   checkout, so a stale image would rebuild the old chain into the empty
+   database:
+
+   ```bash
+   export AGENT_DEPLOYMENT_SHA="$(git rev-parse HEAD)"
+   docker compose -p cloudagent --env-file .env -f deploy/control-plane/docker-compose.yml config --services
+   docker compose -p cloudagent --env-file .env -f deploy/control-plane/docker-compose.yml build migrate
+   ```
+
+4. Recreate the database, apply the baseline, and check what it is stamped
+   with:
+
+   ```bash
+   docker exec cloudagent-postgres-1 psql -U cloudagent -d postgres \
+     -c 'DROP DATABASE cloudagent' -c 'CREATE DATABASE cloudagent OWNER cloudagent'
+   docker compose -p cloudagent --env-file .env -f deploy/control-plane/docker-compose.yml \
+     run --rm --no-deps migrate
+   docker exec cloudagent-postgres-1 psql -U cloudagent -d cloudagent -Atc \
+     'SELECT version_num FROM alembic_version'
+   ```
+
+   The version must be the head of the rewritten chain (`0001_schema_baseline`
+   or a later revision on it); an `00xx_…` from the old chain means step 3 ran
+   the wrong image.
+
+5. Restore the surviving state, reset the counter that described attempts
+   that no longer exist, undo this rebuild's drain, restore the policy, and
+   read back the identity binding:
+
+   ```bash
+   docker exec -i cloudagent-postgres-1 psql -U cloudagent -d cloudagent -v ON_ERROR_STOP=1 < cloudagent-state-$(date +%F).sql
+   docker exec cloudagent-postgres-1 psql -U cloudagent -d cloudagent -c 'UPDATE agent_runner_hosts SET slots_used = 0'
+   docker exec -i cloudagent-postgres-1 psql -U cloudagent -d cloudagent -v ON_ERROR_STOP=1 < cloudagent-undrain-$(date +%F).sql
+   docker exec -i cloudagent-postgres-1 psql -U cloudagent -d cloudagent -v ON_ERROR_STOP=1 < cloudagent-policy-$(date +%F).sql
+   docker exec cloudagent-postgres-1 psql -U cloudagent -d cloudagent -Atc \
+     'SELECT gateway_issuer FROM agent_identity_namespace'
+   ```
+
+   `slots_used` counts running attempts on the host, and the rebuild kept
+   none; a restored non-zero value would park every new task at "queued"
+   once it reached `slots_total`, with a runner that authenticates and
+   heartbeats normally.
+
+   The drain needs the same treatment for the same reason. `draining` is
+   written to the row and the heartbeat deliberately never clears it, so the
+   restored host authenticates, heartbeats, and still claims nothing; step 6
+   then fails readiness with `pinned host ... is not shared-live ready: ...
+   status is draining`. Replaying step 1's generated statements puts back
+   exactly the hosts that were online, and leaves a host that was already
+   drained or disabled alone.
+
+   The last statement must print the issuer the old database was bound to. If
+   it prints nothing, the old database had no binding: verify the original
+   Gateway issuer before the rebuild, then adopt it with
+   `python -m cloud_agent.identity_namespace --adopt-existing --issuer
+   <original-issuer>`. Do not adopt the currently configured issuer without
+   that check, and do not drop the check — it is what stops the rebuild from
+   silently handing one Gateway's `user_id`s to another.
+
+6. Deploy the target commit as usual. `migrate` finds the database at head,
+   the control plane starts, and the runner's next heartbeat authenticates
+   against the restored `credential_hash`; readiness then sees a fresh
+   heartbeat and the deploy completes. If the host stack was restarted
+   meanwhile and died on `agent_host_credential_rejected`, restart it after
+   step 5 — the credential it holds is valid again.
+
+7. Prove it end to end before calling it done: create a task and confirm it
+   is claimed (`SELECT state FROM agent_jobs` reaches `running`), then a
+   follow-up, a cancel, a fork, a publish, and a restart of the host stack
+   with a follow-up into the retained chat afterwards.
+
+If the host registration cannot be restored, the fallback is a controlled
+re-enrolment: remove the credential file on the host, mint an enrolment token
+from the admin surface, set `AGENT_ENROLL_TOKEN` for one start, and confirm the
+first heartbeat before enabling retained chats.
+
+Conversation history is not carried over by design; the forensic dump is read
+with a throwaway `postgres:16-alpine` when needed and never imported back.
+
+### Applying migrations that are not backwards-compatible
+
+`deploy.sh` migrates before it replaces the API, so a revision it applies has to
+keep the still-running API working for the length of that window — the script
+says so where it runs `migrate`. The revisions that follow the rewritten
+baseline do not, and are applied in a maintenance window instead of by a rolling
+deploy. (`0003_thread_level_config` and `0004_residency_on_membership` arrive in
+the revisions stacked on this one; the window covers them as well.)
+
+- `0002_request_keys_and_actors` drops the default on
+  `agent_admin_audit_log.actor_id`. The API that predates it inserts audit rows
+  without the column, and `log_admin_action` swallows the failure by design, so
+  the window would silently lose administrator audit rows rather than fail.
+- `0003_thread_level_config` drops `agent_jobs.repo`, `setup_script`,
+  `execution_profile` and `mcp_servers`, which the older API selects on every
+  job read.
+- `0004_residency_on_membership` drops `agent_thread_residencies`, which the
+  older API writes on every residency heartbeat.
+
+The runner holds no database connection — its heartbeats are HTTP calls to the
+control plane — so stopping the control plane, the MCP relay and the web tier
+leaves the database with no writer.
+
+1. Drain the hosts, keep the generated `cloudagent-undrain-*.sql`, and wait for
+   two counts to reach zero. Neither can be settled once the writers stop, so
+   both are waited out here, as in step 1 of the rebuild above:
+
+   ```bash
+   docker exec cloudagent-postgres-1 psql -U cloudagent -d cloudagent -Atc \
+     "SELECT count(*) FROM agent_attempts WHERE status = 'running'; \
+      SELECT count(*) FROM agent_session_forks WHERE state IN ('preparing', 'materialized')"
+   ```
+
+   A fork still `preparing` or `materialized` is one its coordinator has not
+   finished. `0004` refuses to run over it rather than tombstone a fork the
+   reaper might still finalize, and the reaper runs inside the API — so it has
+   to settle before anything is stopped. A stale `preparing` operation is failed
+   after the stall window (15 minutes by default).
+
+2. Stop the writers:
+
+   ```bash
+   docker stop cloudagent-control-plane-1 cloudagent-mcp-relay-1 cloudagent-web-1
+   ```
+
+3. Build and run the target's `migrate` image with nothing writing. As in step 3
+   of the rebuild above, this runs in the deploy root with the target commit
+   checked out, and the image is built before the database is touched:
+
+   ```bash
+   export AGENT_DEPLOYMENT_SHA="$(git rev-parse HEAD)"
+   docker compose -p cloudagent --env-file .env -f deploy/control-plane/docker-compose.yml build migrate
+   docker compose -p cloudagent --env-file .env -f deploy/control-plane/docker-compose.yml \
+     run --rm --no-deps migrate
+   ```
+
+4. Undrain the hosts recorded in step 1, then deploy the target commit as usual.
+   Its migration is a no-op, and readiness can now see a host that is allowed to
+   claim:
+
+   ```bash
+   docker exec -i cloudagent-postgres-1 psql -U cloudagent -d cloudagent -v ON_ERROR_STOP=1 < cloudagent-undrain-$(date +%F).sql
+   deploy/control-plane/deploy.sh "${AGENT_DEPLOYMENT_SHA}"
+   ```
+
+5. Run the acceptance sweep in step 7 of the rebuild above.
 
 ### Retained Docker storage on a host
 
