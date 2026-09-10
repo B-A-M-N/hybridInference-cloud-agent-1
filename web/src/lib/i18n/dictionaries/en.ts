@@ -27,6 +27,7 @@ export const en = {
   'shell.internalRequired.back': 'Back to Dashboard',
 
   // ── Sidebar ─────────────────────────────────────────────────────────────
+  'sidebar.pinned': 'Pinned',
   'sidebar.projects': 'Projects',
   'sidebar.addWorkspace': 'Add workspace',
   'sidebar.closeWorkspacePicker': 'Close workspace picker',

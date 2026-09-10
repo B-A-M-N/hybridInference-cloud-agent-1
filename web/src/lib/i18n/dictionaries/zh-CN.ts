@@ -28,6 +28,7 @@ export const zhCN: Record<TranslationKey, string> = {
   'shell.internalRequired.back': '返回控制台',
 
   // ── Sidebar ─────────────────────────────────────────────────────────────
+  'sidebar.pinned': '已置顶',
   'sidebar.projects': '项目',
   'sidebar.addWorkspace': '添加工作区',
   'sidebar.closeWorkspacePicker': '关闭工作区选择',

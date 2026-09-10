@@ -1658,6 +1658,7 @@ async def list_agent_conversations(
     q: str = Query("", max_length=200),
     repo: str | None = Query(None, pattern=REPO_PATTERN, max_length=140),
     include_archived: bool = Query(False),
+    pinned: bool | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
     cursor: str | None = Query(None, min_length=1, max_length=2048),
     user: dict[str, Any] = Depends(require_agent_owner),
@@ -1671,6 +1672,7 @@ async def list_agent_conversations(
             q=q.strip(),
             repo=repo,
             include_archived=include_archived,
+            pinned=pinned,
             limit=limit,
             cursor=cursor,
         )
