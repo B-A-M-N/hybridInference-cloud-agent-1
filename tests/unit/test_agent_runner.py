@@ -6,6 +6,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import httpx
 import pytest
 
 from cloud_agent_host import runner as runner_mod
@@ -292,6 +293,82 @@ def test_run_once_empty_queue_is_clean(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    "error", [SandboxError("image inspection failed"), httpx.ReadTimeout("timeout")]
+)
+@pytest.mark.parametrize("finish_unavailable", [False, True])
+def test_preparation_error_outside_shared_handler_finishes_before_stopping_heartbeat(
+    monkeypatch, error, finish_unavailable, caplog
+):
+    """Post-claim setup errors must not leave a running lease with no heartbeater."""
+    _configure_host(monkeypatch)
+    backend = ContainerBackend(image="img")
+    # The first inspection builds claim attestation; the second is post-claim.
+    monkeypatch.setattr(backend, "version_stamp", Mock(side_effect=[_stamp(), error]))
+    monkeypatch.setattr(runner_mod, "claim", Mock(return_value=_JOB))
+    control = Mock()
+    heart = Mock()
+    order = []
+
+    def finish(*args, **kwargs):
+        order.append("finish")
+        if finish_unavailable:
+            raise httpx.ReadTimeout("finish unavailable")
+
+    control.finish.side_effect = finish
+    heart.stop.side_effect = lambda: order.append("stop")
+    monkeypatch.setattr(runner_mod, "ControlPlane", Mock(return_value=control))
+    monkeypatch.setattr(runner_mod, "Heartbeater", Mock(return_value=heart))
+
+    code = runner_mod.run_once(
+        base_url="http://control",
+        host_credential="host-credential",
+        worker_id="runner-1",
+        backend=backend,
+        host="host-a",
+    )
+
+    assert code == 2
+    assert order == ["finish", "stop"]
+    control.finish.assert_called_once()
+    assert control.finish.call_args.args[0] == "failed"
+    assert type(error).__name__ in control.finish.call_args.args[1]
+    assert "operation=attempt_dispatch" in caplog.text
+    if finish_unavailable:
+        assert "operation=finish" in caplog.text
+    heart.start.assert_called_once()
+    control.close.assert_called_once()
+
+
+def test_preparation_lease_rejection_does_not_attempt_terminal_write(monkeypatch):
+    """An already fenced preparation path cannot overwrite a newer owner."""
+    _configure_host(monkeypatch)
+    backend = ContainerBackend(image="img")
+    monkeypatch.setattr(
+        backend, "version_stamp", Mock(side_effect=[_stamp(), LeaseLost("expired")])
+    )
+    monkeypatch.setattr(runner_mod, "claim", Mock(return_value=_JOB))
+    control = Mock()
+    heart = Mock()
+    monkeypatch.setattr(runner_mod, "ControlPlane", Mock(return_value=control))
+    monkeypatch.setattr(runner_mod, "Heartbeater", Mock(return_value=heart))
+
+    assert (
+        runner_mod.run_once(
+            base_url="http://control",
+            host_credential="host-credential",
+            worker_id="runner-1",
+            backend=backend,
+            host="host-a",
+        )
+        == 3
+    )
+
+    control.finish.assert_not_called()
+    heart.stop.assert_called_once()
+    control.close.assert_called_once()
+
+
 def test_historical_one_to_one_sandbox_fails_closed():
     backend = ContainerBackend(image="img")
     backend.version_stamp = _stamp  # type: ignore[method-assign]
@@ -325,7 +402,7 @@ def test_historical_one_to_one_sandbox_fails_closed():
 
 
 def _run_shared_boundary_case(
-    monkeypatch, code, frame, runtime_id, observed_session_id="native-existing"
+    monkeypatch, code, frame, runtime_id, observed_session_id="native-existing", configure=None
 ):
     backend = ContainerBackend(image="img")
     monkeypatch.setattr(backend, "version_stamp", _stamp)
@@ -366,6 +443,8 @@ def _run_shared_boundary_case(
         runner_mod, "_stream_shared_agent_turn", lambda **_kwargs: (code, "API error", [], frame)
     )
     finish = Mock()
+    if configure is not None:
+        configure(control, supervisor, finish)
 
     result = runner_mod._run_shared_live_attempt(
         runtime=get_runtime(runtime_id),
@@ -384,6 +463,120 @@ def _run_shared_boundary_case(
     )
 
     return result, control, supervisor, finish
+
+
+@pytest.mark.parametrize(
+    "failure", [SandboxError("setup failed"), httpx.ReadTimeout("setup stalled")]
+)
+def test_error_upload_failure_does_not_skip_terminal_transition(monkeypatch, failure):
+    """An unavailable event endpoint must not strand a failed attempt as running."""
+
+    def configure(control, supervisor, finish):
+        control.suspend_terminals.side_effect = failure
+
+        def append(event):
+            if event.event_type == "error":
+                raise httpx.ReadTimeout("error upload failed")
+
+        control.append_event.side_effect = append
+
+    result, control, _supervisor, finish = _run_shared_boundary_case(
+        monkeypatch, 0, None, "claude-code", configure=configure
+    )
+
+    assert result == 2
+    finish.assert_called_once()
+    assert finish.call_args.args[0] == "failed"
+    assert str(failure) in finish.call_args.args[1]
+    control.admit_chat_turn.assert_not_called()
+    assert control.abandon_chat_sandbox.call_args.kwargs["lost"] is False
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    [(httpx.ReadTimeout("completion notice unavailable"), 0), (LeaseLost("expired"), 3)],
+)
+def test_settled_success_survives_a_failed_completion_event_upload(
+    monkeypatch, error, expected_code
+):
+    """A completed native turn must not fail because its final notice is unavailable."""
+
+    def configure(control, supervisor, finish):
+        def append(event):
+            if event.payload.get("phase") == "shared_workspace_settled":
+                raise error
+
+        control.append_event.side_effect = append
+
+    result, control, supervisor, finish = _run_shared_boundary_case(
+        monkeypatch, 0, None, "claude-code", configure=configure
+    )
+
+    assert result == expected_code
+    supervisor.settle_shared.assert_called_once()
+    control.settle_chat_sandbox.assert_called_once()
+    control.abandon_chat_sandbox.assert_not_called()
+    if expected_code == 0:
+        finish.assert_called_once()
+        assert finish.call_args.args[0] == "succeeded"
+    else:
+        finish.assert_not_called()
+
+
+@pytest.mark.parametrize("stage", ["admission", "supervisor_settle", "control_settle"])
+def test_lost_lifecycle_ack_recovers_without_repeating_the_agent_turn(monkeypatch, stage):
+    from cloud_agent_host import runner as runner_mod
+
+    monkeypatch.setattr(runner_mod.time, "sleep", lambda _seconds: None)
+    stream = Mock(return_value=(0, "", [], {"kind": "result", "status": "completed"}))
+
+    def configure(control, supervisor, finish):
+        monkeypatch.setattr(runner_mod, "_stream_shared_agent_turn", stream)
+        if stage == "admission":
+            control.admit_chat_turn.side_effect = [httpx.ReadTimeout("ack lost"), None]
+        elif stage == "supervisor_settle":
+            supervisor.settle_shared.side_effect = [
+                runner_mod.SessionSupervisorError(503, "ack lost"),
+                {"native_session_id": "native-existing"},
+            ]
+        else:
+            control.settle_chat_sandbox.side_effect = [httpx.ReadTimeout("ack lost"), {}]
+
+    result, control, supervisor, finish = _run_shared_boundary_case(
+        monkeypatch, 0, None, "claude-code", configure=configure
+    )
+    assert result == 0
+    stream.assert_called_once()
+    assert control.admit_chat_turn.call_count == (2 if stage == "admission" else 1)
+    assert supervisor.settle_shared.call_count == (2 if stage == "supervisor_settle" else 1)
+    assert control.settle_chat_sandbox.call_count == (2 if stage == "control_settle" else 1)
+    supervisor.abandon_shared.assert_not_called()
+    control.abandon_chat_sandbox.assert_not_called()
+    finish.assert_called_once()
+    assert finish.call_args.args[0] == "succeeded"
+
+
+@pytest.mark.parametrize("status", [409, 410, 422, 503])
+def test_receipt_retry_is_bounded_and_does_not_retry_rejected_fences(monkeypatch, status):
+    from cloud_agent_host import runner as runner_mod
+
+    sleep = Mock()
+    monkeypatch.setattr(runner_mod.time, "sleep", sleep)
+    error = runner_mod.SessionSupervisorError(status, "rejected")
+    request = Mock(side_effect=error)
+    with pytest.raises(runner_mod.SessionSupervisorError):
+        runner_mod._retry_lifecycle_receipt("settle", "ajob_test", request)
+    assert request.call_count == (3 if status == 503 else 1)
+    assert sleep.call_count == (2 if status == 503 else 0)
+
+
+def test_control_lease_rejection_never_retries_settlement(monkeypatch):
+    from cloud_agent_host import runner as runner_mod
+
+    request = Mock(side_effect=LeaseLost("superseded"))
+    with pytest.raises(LeaseLost):
+        runner_mod._retry_lifecycle_receipt("settle", "ajob_test", request)
+    request.assert_called_once()
 
 
 @pytest.mark.parametrize(

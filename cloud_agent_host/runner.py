@@ -38,7 +38,10 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 import httpx
 
@@ -54,7 +57,7 @@ from cloud_agent_host.drivers import (
     driver_for,
 )
 from cloud_agent_host.enrollment import HostHeartbeat, ensure_enrolled
-from cloud_agent_host.logging_utils import configure_process_logging
+from cloud_agent_host.logging_utils import configure_process_logging, get_logger
 from cloud_agent_host.patch_gate import branch_name_for
 from cloud_agent_host.resident_transport import ResidentLaunch
 from cloud_agent_host.resources import shared_member_resource_rollup
@@ -89,6 +92,11 @@ from cloud_agent_host.source_archive import build_base_bundle, build_source_arch
 
 DEFAULT_LEASE_TTL_S = 120.0
 HEARTBEAT_INTERVAL_S = 30.0
+# Heartbeats use a short per-request timeout and retry promptly, so a slow
+# control request cannot consume the remaining lease in normal cadence sleeps.
+# Idempotent lifecycle receipts reuse the same short retry interval.
+_CONTROL_RETRY_INTERVAL_S = 5.0
+_HEARTBEAT_TIMEOUT_S = 10.0
 DEFAULT_AGENT_TIMEOUT_S = 3600.0
 # How often the control checks run while the agent is silent.
 _POLL_INTERVAL_S = 0.5
@@ -98,6 +106,41 @@ _POLL_INTERVAL_S = 0.5
 # report. The broker client itself has the same 180 second request ceiling.
 _SHARED_TURN_INTERRUPT_DRAIN_S = 180.0
 _GIT_TIMEOUT_S = 300.0
+
+logger = get_logger(__name__)
+
+
+def _log_control_failure(operation: str, job_id: str, exc: Exception) -> None:
+    """Keep a diagnosable failure without logging tokens or arbitrary response bodies."""
+    status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+    logger.warning(
+        "agent_control_failure operation=%s job_id=%s error_type=%s status_code=%s",
+        operation,
+        job_id,
+        type(exc).__name__,
+        status,
+    )
+
+
+def _retry_lifecycle_receipt(operation: str, job_id: str, call: Callable[[], Any]) -> Any:
+    """Retry only idempotent lifecycle receipts, never prompt delivery."""
+    for attempt in range(3):
+        try:
+            return call()
+        except (httpx.TransportError, httpx.HTTPStatusError, SessionSupervisorError) as exc:
+            status = (
+                exc.response.status_code
+                if isinstance(exc, httpx.HTTPStatusError)
+                else exc.status_code
+                if isinstance(exc, SessionSupervisorError)
+                else None
+            )
+            if attempt == 2 or (status is not None and status not in {408, 502, 503, 504}):
+                raise
+            _log_control_failure(operation, job_id, exc)
+            time.sleep(_CONTROL_RETRY_INTERVAL_S)
+    raise AssertionError("lifecycle retry exhausted without a result")
+
 
 # Both are interpolated into a URL and handed to git, which reads a leading
 # `-` as an option even where an operand belongs. Validate the shape here as
@@ -289,8 +332,18 @@ class ControlPlane:
         """Release the HTTP connection pool."""
         self._client.close()
 
-    def _post(self, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        response = self._client.post(f"{self._base}{path}", json=payload or {})
+    def _post(
+        self,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        response = self._client.post(
+            f"{self._base}{path}",
+            json=payload or {},
+            timeout=self._client.timeout if timeout is None else timeout,
+        )
         if response.status_code == 409:
             raise LeaseLost(response.text[:200])
         response.raise_for_status()
@@ -320,7 +373,9 @@ class ControlPlane:
     def heartbeat(self, ttl: float) -> dict[str, Any]:
         """Renew the lease and learn whether cancellation is pending."""
         return self._post(
-            f"/v1/agent/worker/jobs/{self.job_id}/heartbeat", {"lease_ttl_seconds": ttl}
+            f"/v1/agent/worker/jobs/{self.job_id}/heartbeat",
+            {"lease_ttl_seconds": ttl},
+            timeout=_HEARTBEAT_TIMEOUT_S,
         )
 
     def report_continuity(self, mode: str, *, context_status: str | None = None) -> None:
@@ -433,6 +488,7 @@ class ControlPlane:
                 "sandbox_generation": sandbox_generation,
                 "activation_generation": activation_generation,
             },
+            timeout=10.0,
         )
 
     def settle_chat_sandbox(
@@ -456,6 +512,7 @@ class ControlPlane:
                 "base_sha": base_sha,
                 "idle_timeout_seconds": idle_timeout_seconds,
             },
+            timeout=10.0,
         )
 
     def abandon_chat_sandbox(
@@ -530,17 +587,46 @@ class Heartbeater:
             self._thread.join(timeout=5)
 
     def _run(self) -> None:
-        while not self._stop.wait(self._interval):
+        delay = self._interval
+        last_success = time.monotonic()
+        failures = 0
+        while not self._stop.wait(delay):
             try:
                 reply = self._control.heartbeat(self._ttl)
-            except LeaseLost:
-                # Superseded or reaped: the replacement attempt owns the job now.
+            except LeaseLost as exc:
+                # The fence was lost; this does not imply a replacement exists.
+                _log_control_failure("heartbeat_fenced", self._control.job_id, exc)
                 self.lease_lost = True
                 return
-            except Exception:
+            except Exception as exc:
                 # A transient control-plane blip must not kill a healthy run;
-                # if it persists, the lease expires and the reaper takes over.
+                # the next request still has to fit inside the original lease.
+                failures += 1
+                delay = min(self._interval, _CONTROL_RETRY_INTERVAL_S)
+                # The aggregate retry line below already carries the count and
+                # timing, so log the exception detail once per outage instead of
+                # once per retry.
+                if failures == 1:
+                    _log_control_failure("heartbeat", self._control.job_id, exc)
+                logger.warning(
+                    "agent_heartbeat_retry job_id=%s consecutive_failures=%s "
+                    "seconds_since_ack=%.3f retry_in_seconds=%.3f",
+                    self._control.job_id,
+                    failures,
+                    time.monotonic() - last_success,
+                    delay,
+                )
                 continue
+            if failures:
+                logger.info(
+                    "agent_heartbeat_recovered job_id=%s failed_requests=%s seconds_since_ack=%.3f",
+                    self._control.job_id,
+                    failures,
+                    time.monotonic() - last_success,
+                )
+            failures = 0
+            last_success = time.monotonic()
+            delay = self._interval
             if reply.get("cancel_requested"):
                 self.cancel_requested = True
                 return
@@ -1472,6 +1558,7 @@ def _run_shared_live_attempt(
     terminals_suspended = False
     context_invalid = False
     failure_detail: str | None = None
+    stage = "supervisor_acquire"
     context_status = "restored" if has_context else "new"
     idle_timeout_s = _chat_idle_timeout_s()
 
@@ -1480,9 +1567,11 @@ def _run_shared_live_attempt(
         if abandoned or settled:
             return
         if supervisor is not None and lease_token is not None:
-            with contextlib.suppress(Exception):
+            try:
                 supervisor.abandon_shared(job.thread_id, token=lease_token, lost=lost)
-        with contextlib.suppress(Exception):
+            except Exception as exc:
+                _log_control_failure("supervisor_abandon", job.job_id, exc)
+        try:
             control.abandon_chat_sandbox(
                 sandbox_generation=spec.generation,
                 activation_generation=activation_generation,
@@ -1490,7 +1579,22 @@ def _run_shared_live_attempt(
                 detail=detail,
                 idle_timeout_seconds=idle_timeout_s,
             )
+        except Exception as exc:
+            _log_control_failure("sandbox_abandon", job.job_id, exc)
         abandoned = True
+
+    def report_failure() -> None:
+        # Telemetry availability must never gate the authoritative transition.
+        # Keep trying finish even when the error-event endpoint is unavailable.
+        detail = (failure_detail or "shared live execution failed")[:1000]
+        try:
+            control.append_event(NormalizedEvent("error", {"text": detail}))
+        except Exception as exc:
+            _log_control_failure("error_event", job.job_id, exc)
+        try:
+            finish_attempt("failed", detail)
+        except Exception as exc:
+            _log_control_failure("finish", job.job_id, exc)
 
     try:
         supervisor = _session_supervisor_from_env()
@@ -1515,6 +1619,7 @@ def _run_shared_live_attempt(
         context_status = str(lease.get("context_status") or context_status)
         if context_status not in {"new", "live", "restored"}:
             raise SandboxError(f"shared supervisor returned invalid context {context_status!r}")
+        stage = "sandbox_running"
         running = control.mark_chat_sandbox_running(
             sandbox_generation=spec.generation,
             activation_generation=activation_generation,
@@ -1538,14 +1643,18 @@ def _run_shared_live_attempt(
                 },
             )
         )
+        stage = "terminal_suspend"
         control.suspend_terminals("workspace_preparing")
         terminals_suspended = True
 
         if not has_context:
+            stage = "workspace_reset"
             manager.reset_unsettled_state(spec)
+            stage = "checkout"
             base_sha = _prepare_retained_checkout(job=job, manager=manager, spec=spec)
             reused_workspace = False
             if job.setup_script:
+                stage = "setup"
                 setup = run_setup(
                     script=job.setup_script,
                     workdir=CHAT_WORKDIR,
@@ -1562,8 +1671,10 @@ def _run_shared_live_attempt(
                     abandon_before_finish(lost=False, detail=failure_detail)
                     finish_attempt("failed", failure_detail, base_sha=base_sha)
                     return 1
+            stage = "workspace_permissions"
             manager.prepare_shared_workspace(spec)
         else:
+            stage = "native_workspace_resume"
             if not native_session_id:
                 context_invalid = True
                 raise SandboxError("shared chat has no native Agent CLI session locator")
@@ -1597,6 +1708,7 @@ def _run_shared_live_attempt(
             )
         )
 
+        stage = "runtime_preflight"
         version_problem = runtime_version_unavailable(job, retained)
         if version_problem is not None:
             failure_detail = version_problem
@@ -1609,10 +1721,12 @@ def _run_shared_live_attempt(
             finish_attempt("failed", failure_detail, base_sha=base_sha)
             return 2
 
+        stage = "agent_network"
         if has_context:
             manager.require_network_phase(spec, "agent")
         else:
             manager.transition_to_agent_network(spec)
+        stage = "terminal_resume"
         control.resume_terminals()
         terminals_suspended = False
 
@@ -1636,6 +1750,7 @@ def _run_shared_live_attempt(
             slot_id=slot_id,
             residency_generation=int(running.get("residency_generation") or 0),
         )
+        stage = "resident_start"
         resident_descriptor: dict[str, Any] | None = None
         if lease.get("resident_state") == "live":
             try:
@@ -1689,13 +1804,19 @@ def _run_shared_live_attempt(
         else:
             control.report_context_status("new")
 
-        control.admit_chat_turn(
-            sandbox_generation=spec.generation,
-            activation_generation=activation_generation,
+        stage = "prompt_admission"
+        _retry_lifecycle_receipt(
+            "prompt_admission_retry",
+            job.job_id,
+            lambda: control.admit_chat_turn(
+                sandbox_generation=spec.generation,
+                activation_generation=activation_generation,
+            ),
         )
         turn_admitted = True
         result_frame: dict[str, Any] | None = None
         try:
+            stage = "turn_stream"
             exit_code, tail, tool_errors, result_frame = _stream_shared_agent_turn(
                 supervisor=supervisor,
                 job=job,
@@ -1751,24 +1872,33 @@ def _run_shared_live_attempt(
                 )
             )
 
-        local_settle = supervisor.settle_shared(
-            job.thread_id,
-            token=lease_token,
-            job_id=job.job_id,
-            context_status=context_status,
+        stage = "settlement"
+        local_settle = _retry_lifecycle_receipt(
+            "supervisor_settlement_retry",
+            job.job_id,
+            lambda: supervisor.settle_shared(
+                job.thread_id,
+                token=lease_token,
+                job_id=job.job_id,
+                context_status=context_status,
+            ),
         )
         settled_session_id = _verified_native_session_id(
             previous_session_id=native_session_id,
             observed_session_id=local_settle.get("native_session_id"),
             has_context=has_context,
         )
-        control.settle_chat_sandbox(
-            sandbox_generation=spec.generation,
-            activation_generation=activation_generation,
-            context_status=context_status,
-            native_session_id=settled_session_id,
-            base_sha=base_sha,
-            idle_timeout_seconds=idle_timeout_s,
+        _retry_lifecycle_receipt(
+            "control_settlement_retry",
+            job.job_id,
+            lambda: control.settle_chat_sandbox(
+                sandbox_generation=spec.generation,
+                activation_generation=activation_generation,
+                context_status=context_status,
+                native_session_id=settled_session_id,
+                base_sha=base_sha,
+                idle_timeout_seconds=idle_timeout_s,
+            ),
         )
         settled = True
         if settled_failure:
@@ -1778,16 +1908,23 @@ def _run_shared_live_attempt(
                 "failed", f"agent failed at native turn boundary: {tail[-500:]}", base_sha=base_sha
             )
             return 1
-        control.append_event(
-            NormalizedEvent(
-                "lifecycle",
-                {
-                    "phase": "shared_workspace_settled",
-                    "workspace_shared": True,
-                    "publication": "pending_snapshot",
-                },
+        try:
+            control.append_event(
+                NormalizedEvent(
+                    "lifecycle",
+                    {
+                        "phase": "shared_workspace_settled",
+                        "workspace_shared": True,
+                        "publication": "pending_snapshot",
+                    },
+                )
             )
-        )
+        except LeaseLost:
+            raise
+        except Exception as exc:
+            # Both authoritative settlements succeeded. A missing UI notice
+            # must not turn that success into a failed terminal transition.
+            _log_control_failure("completion_event", job.job_id, exc)
         finish_attempt(
             "succeeded",
             "agent completed (shared workspace; publication snapshot pending)",
@@ -1799,17 +1936,15 @@ def _run_shared_live_attempt(
         return 3
     except (DriverError, SandboxError, SessionSupervisorError, WorktreeError) as exc:
         failure_detail = str(exc)
+        _log_control_failure(stage, job.job_id, exc)
         abandon_before_finish(lost=turn_admitted or context_invalid, detail=failure_detail)
-        with contextlib.suppress(Exception):
-            control.append_event(NormalizedEvent("error", {"text": failure_detail[:1000]}))
-            finish_attempt("failed", failure_detail[:1000])
+        report_failure()
         return 2
     except Exception as exc:
         failure_detail = f"shared live chat failed unexpectedly: {exc}"
+        _log_control_failure(stage, job.job_id, exc)
         abandon_before_finish(lost=turn_admitted, detail=failure_detail)
-        with contextlib.suppress(Exception):
-            control.append_event(NormalizedEvent("error", {"text": failure_detail[:1000]}))
-            finish_attempt("failed", failure_detail[:1000])
+        report_failure()
         return 2
     finally:
         if not settled and not abandoned:
@@ -1854,6 +1989,13 @@ def run_once(
         return 0
 
     print(f"claimed {job.job_id} attempt {job.attempt_no} runtime={job.runtime}")
+    logger.info(
+        "agent_attempt_claimed job_id=%s attempt_id=%s worker_id=%s host=%s",
+        job.job_id,
+        job.attempt_id,
+        worker_id,
+        host,
+    )
     control = ControlPlane(base_url, job.worker_token)
     control.job_id = job.job_id
     heart = Heartbeater(control, ttl=lease_ttl, interval=HEARTBEAT_INTERVAL_S)
@@ -1889,6 +2031,20 @@ def run_once(
             agent_timeout_s=agent_timeout_s,
             finish_attempt=finish_attempt,
         )
+    except LeaseLost as exc:
+        _log_control_failure("attempt_dispatch_fenced", job.job_id, exc)
+        return 3
+    except Exception as exc:
+        # Preparation before the shared handler (image inspection, manifest
+        # validation, etc.) can fail after claim. Report a terminal outcome
+        # before finally stops renewal, instead of leaving a running attempt
+        # that will later be misreported as a lease failure.
+        _log_control_failure("attempt_dispatch", job.job_id, exc)
+        try:
+            finish_attempt("failed", f"attempt dispatch failed ({type(exc).__name__})")
+        except Exception as finish_exc:
+            _log_control_failure("finish", job.job_id, finish_exc)
+        return 2
     finally:
         heart.stop()
         control.close()
