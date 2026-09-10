@@ -1,8 +1,6 @@
 name: Staging lease aggregate diagnostics
 on:
   workflow_dispatch:
-  push:
-    branches: [realtmxi/diagnostics/staging-lease-20260909]
 permissions:
   contents: read
 jobs:
