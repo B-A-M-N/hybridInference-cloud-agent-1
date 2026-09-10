@@ -32,13 +32,60 @@ it would invite someone to treat this directory as a mirror of the gateway.
 
 ## Source commits
 
-Each document names, in `info.x-source`, the branch and file it was written
-from. The identity, grant and lookup routers were all still on unmerged
-branches when these were written (see MIGRATION.md, "Cross-repo readiness"), so
-the reference is a branch rather than a commit on `dev`. **When those land,
-re-verify each document against the merge commit** — a review can change a
-contract, and these were written against the version proposed rather than the
-version accepted.
+Each document names, in `info.x-source`, the branch and file it was **written
+from**. That is a historical record, not a claim about where the code lives now,
+and it is kept because a contract's value is that it says what was *agreed* at a
+known point — a later reader can diff the two.
+
+All three are served by the gateway's `main`. Checked 2026-09-10 by reading the
+route decorators at `origin/main`, not by a schema re-review:
+
+| Document | Served by |
+|---|---|
+| `identity.openapi.yaml` | `apps/backend/serving/servers/routers/identity.py` — `/v1/identity/{jwks,code,token}`. |
+| `inference-grants.openapi.yaml` | `apps/backend/serving/servers/routers/agent_grants.py` — mint / renew / revoke / usage. |
+| `internal-lookups.openapi.yaml` | `apps/backend/serving/servers/routers/internal_lookups.py` — `/internal/model-catalog` and `/internal/users/{user_id}/agent-access`; it also still serves `/internal/users/{user_id}/status`, which this document does not describe. |
+
+**Which branch a router is on is not the durable question.** `main` is a
+fast-forward mirror of `dev` (`.github/workflows/sync-main.yml`), so an endpoint
+that is on `dev` alone is a lag of hours to days rather than a state worth
+recording — a table that says so goes stale between writing and review. What a
+reader needs is whether *the gateway they are pointing at* serves the route: an
+older deployment may not, and
+[`docs/agent-access-policy.md`](../docs/agent-access-policy.md) carries the
+rollout, the compatibility path, and the fail-closed behaviour in that case.
+
+**When the gateway changes one of these routers, re-verify the document against
+the merged source.** A review can change a contract, and a document describing
+the version proposed rather than the version accepted is exactly the silent
+drift this directory exists to prevent. Nothing here checks that for you —
+`tests/unit/test_contracts.py` pins this repository's side only.
+
+## What these do not cover
+
+Two dependencies never appear in a response body, so no schema here can check
+them:
+
+- **The gateway's own clamps.** `grants.py` mirrors `GATEWAY_MAX_TTL_S` (900)
+  and `GATEWAY_RENEWAL_STEP_S` (300) from the gateway's `serving/grants.py`. A
+  request for more than the maximum is clamped *down* silently, and every
+  renewal re-times the grant to the gateway's step — so either one would shorten
+  a live grant without any call failing. The document declares both under
+  `x-constants` — as `MAX_GRANT_TTL_S` and `DEFAULT_GRANT_TTL_S`, deliberately
+  not under this client's names — but that is a declaration rather than a check:
+  each number also lives in the gateway and in `grants.py`, and comparing the
+  copies is left to tests rather than to anything in this directory.
+- **Which refusals mean "this grant is dead".** `DEAD_GRANT_REFUSALS`
+  (`unknown_grant`, `grant_not_live`, `subject_unavailable`) mirrors the
+  gateway's error *types*. The status code alone is not enough: the gateway
+  answers 404 for both a dead grant and an unconfigured internal API, and 401
+  for a rotated dispatch token.
+
+`tests/unit/test_grant_lifecycle.py` pins both mirrors against this service's
+own cadence — the requested lifetime must fit under the maximum, and the renewal
+loop and the give-up must fit inside the step. It cannot reach the gateway, so it
+would not notice the gateway changing one of them: the symptom is a sandbox
+losing its authorization mid-run — far from the constant that moved.
 
 ## Checking them
 
