@@ -269,13 +269,26 @@ describe('admin runs list', () => {
 
   it('defaults to an anchored seven-day window and exposes only working admin sections', async () => {
     render(<AdminRunsPageComponent />);
-    expect(await screen.findByRole('link', { name: 'Inspect parser' })).toHaveAttribute(
+    expect(await screen.findByRole('link', { name: 'job-1' })).toHaveAttribute(
       'href',
       '/admin/runs/job-1',
     );
+    expect(screen.queryByText('Inspect parser')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Inspect parser')).not.toBeInTheDocument();
     const filters = vi.mocked(getAdminRuns).mock.calls[0][0];
     expect(Date.parse(filters.until!) - Date.parse(filters.since!)).toBe(7 * 86_400_000);
     expect(screen.getByLabelText('Created')).toHaveValue('7');
+    expect(screen.getByLabelText('Status')).toHaveValue('');
+    const controls = within(screen.getByRole('group', { name: 'Run filters' }));
+    expect(controls.getAllByRole('combobox')).toHaveLength(2);
+    expect(controls.getByRole('button', { name: 'Refresh' })).toBeInTheDocument();
+    expect(controls.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: /More filters|Apply filters|Clear filters/ }),
+    ).not.toBeInTheDocument();
+    for (const label of ['User ID', 'Repository', 'Agent', 'Model', 'Host']) {
+      expect(screen.queryByLabelText(label)).not.toBeInTheDocument();
+    }
     const nav = screen.getByRole('navigation', { name: 'Admin sections' });
     expect(within(nav).getByRole('link', { name: 'Runs' })).toHaveAttribute('aria-current', 'page');
     expect(within(nav).getByRole('link', { name: 'Servers' })).toHaveAttribute(
@@ -287,20 +300,15 @@ describe('admin runs list', () => {
 
   it('applies filters and paginates with the same window and filter scope', async () => {
     render(<AdminRunsPageComponent />);
-    await screen.findByRole('link', { name: 'Inspect parser' });
+    await screen.findByRole('link', { name: 'job-1' });
     vi.mocked(getAdminRuns)
       .mockResolvedValueOnce(page([run()], 'cursor-2'))
       .mockResolvedValueOnce(page([run({ id: 'job-2', title: 'Second run' })]));
-    fireEvent.change(screen.getByLabelText('User ID'), { target: { value: 'person-2' } });
-    fireEvent.change(screen.getByLabelText('Repository'), { target: { value: 'org/other' } });
     fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'failed' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Apply filters' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Load more runs' }));
-    await screen.findByRole('link', { name: 'Second run' });
+    await screen.findByRole('link', { name: 'job-2' });
     expect(getAdminRuns).toHaveBeenLastCalledWith(
       expect.objectContaining({
-        user_id: 'person-2',
-        repo: 'org/other',
         state: 'failed',
         cursor: 'cursor-2',
         since: page().since,
@@ -308,21 +316,105 @@ describe('admin runs list', () => {
       }),
       expect.any(AbortSignal),
     );
-    expect(screen.getByRole('link', { name: 'Inspect parser' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'job-1' })).toBeInTheDocument();
+    expect(screen.queryByText('Second run')).not.toBeInTheDocument();
+  });
+
+  it('applies Created and Status immediately and replaces previously paged rows', async () => {
+    vi.mocked(getAdminRuns)
+      .mockResolvedValueOnce(page([run()], 'cursor-2'))
+      .mockResolvedValueOnce(page([run({ id: 'job-2' })]))
+      .mockResolvedValueOnce(page([run({ id: 'job-30-days' })]))
+      .mockResolvedValueOnce(page([run({ id: 'job-failed', state: 'failed' })]));
+    render(<AdminRunsPageComponent />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Load more runs' }));
+    await screen.findByRole('link', { name: 'job-2' });
+
+    fireEvent.change(screen.getByLabelText('Created'), { target: { value: '30' } });
+    await screen.findByRole('link', { name: 'job-30-days' });
+    const timeFilters = vi.mocked(getAdminRuns).mock.lastCall![0];
+    expect(Date.parse(timeFilters.until!) - Date.parse(timeFilters.since!)).toBe(30 * 86_400_000);
+    expect(timeFilters.cursor).toBeUndefined();
+    expect(screen.queryByRole('link', { name: 'job-1' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'job-2' })).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'failed' } });
+    await screen.findByRole('link', { name: 'job-failed' });
+    const statusFilters = vi.mocked(getAdminRuns).mock.lastCall![0];
+    expect(statusFilters.state).toBe('failed');
+    expect(Date.parse(statusFilters.until!) - Date.parse(statusFilters.since!)).toBe(
+      30 * 86_400_000,
+    );
+    expect(statusFilters.cursor).toBeUndefined();
+    expect(screen.queryByRole('link', { name: 'job-30-days' })).not.toBeInTheDocument();
+    expect(getAdminRuns).toHaveBeenCalledTimes(4);
+  });
+
+  it('refreshes the time window while preserving Status and replacing previously paged rows', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(new Date('2026-09-10T08:00:00Z'));
+      vi.mocked(getAdminRuns)
+        .mockResolvedValueOnce(page())
+        .mockResolvedValueOnce(page([run({ state: 'failed' })], 'cursor-2'))
+        .mockResolvedValueOnce(page([run({ id: 'job-2', state: 'failed' })]))
+        .mockResolvedValueOnce(page([run({ id: 'refreshed-run', state: 'failed' })]));
+      render(<AdminRunsPageComponent />);
+      await screen.findByRole('link', { name: 'job-1' });
+      fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'failed' } });
+      fireEvent.click(await screen.findByRole('button', { name: 'Load more runs' }));
+      await screen.findByRole('link', { name: 'job-2' });
+
+      vi.setSystemTime(new Date('2026-09-10T09:00:00Z'));
+      fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+      await screen.findByRole('link', { name: 'refreshed-run' });
+      const filters = vi.mocked(getAdminRuns).mock.lastCall![0];
+      expect(filters.since).toBe('2026-09-03T09:00:00.000Z');
+      expect(filters.until).toBe('2026-09-10T09:00:00.000Z');
+      expect(filters.state).toBe('failed');
+      expect(filters.cursor).toBeUndefined();
+      expect(screen.getByLabelText('Status')).toHaveValue('failed');
+      expect(screen.queryByRole('link', { name: 'job-1' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('link', { name: 'job-2' })).not.toBeInTheDocument();
+      expect(getAdminRuns).toHaveBeenCalledTimes(4);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('ignores an old response when the filters change', async () => {
     const pending = deferred<AdminRunsPage>();
     vi.mocked(getAdminRuns)
       .mockReturnValueOnce(pending.promise)
-      .mockResolvedValueOnce(page([run({ title: 'Current match' })]));
+      .mockResolvedValueOnce(page([run({ id: 'current-match' })]));
     render(<AdminRunsPageComponent />);
-    fireEvent.change(screen.getByLabelText('User ID'), { target: { value: 'new-user' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Apply filters' }));
-    await screen.findByRole('link', { name: 'Current match' });
-    await act(async () => pending.resolve(page([run({ title: 'Stale match' })])));
-    expect(screen.queryByText('Stale match')).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('Created'), { target: { value: '30' } });
+    await screen.findByRole('link', { name: 'current-match' });
+    await act(async () => pending.resolve(page([run({ id: 'stale-match' })])));
+    expect(screen.queryByRole('link', { name: 'stale-match' })).not.toBeInTheDocument();
     expect(vi.mocked(getAdminRuns).mock.calls[0][1]?.aborted).toBe(true);
+  });
+
+  it('ignores a late pagination response after Status changes the filter scope', async () => {
+    const pending = deferred<AdminRunsPage>();
+    vi.mocked(getAdminRuns)
+      .mockResolvedValueOnce(page([run()], 'old-cursor'))
+      .mockReturnValueOnce(pending.promise)
+      .mockResolvedValueOnce(page([run({ id: 'current-match', state: 'failed' })]));
+    render(<AdminRunsPageComponent />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Load more runs' }));
+    fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'failed' } });
+    await screen.findByRole('link', { name: 'current-match' });
+    expect(vi.mocked(getAdminRuns).mock.calls[1][1]?.aborted).toBe(true);
+    expect(vi.mocked(getAdminRuns).mock.lastCall![0].cursor).toBeUndefined();
+
+    await act(async () =>
+      pending.resolve(page([run({ id: 'stale-match' })], 'another-old-cursor')),
+    );
+    expect(screen.queryByRole('link', { name: 'job-1' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'stale-match' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Load more runs' })).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'current-match' })).toBeInTheDocument();
   });
 
   it('clears retained cross-user rows when a later page rejects revoked access', async () => {
@@ -332,7 +424,7 @@ describe('admin runs list', () => {
     render(<AdminRunsPageComponent />);
     fireEvent.click(await screen.findByRole('button', { name: 'Load more runs' }));
     await screen.findByText('Admin access required');
-    expect(screen.queryByRole('link', { name: 'Inspect parser' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'job-1' })).not.toBeInTheDocument();
   });
 });
 
