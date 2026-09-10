@@ -2024,7 +2024,4 @@ class SessionUserResponse(BaseModel):  # type: ignore[no-any-unimported]
     """
 
     id: str
-    email: str | None = None
-    role: str
-    user_name: str | None = None
     agent_access: AgentAccess

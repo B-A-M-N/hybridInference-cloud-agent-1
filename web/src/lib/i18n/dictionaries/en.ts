@@ -96,6 +96,9 @@ export const en = {
   'sidebar.dateOtherYear': '{month}/{day}/{year}',
 
   // ── Settings ────────────────────────────────────────────────────────────
+  'settings.account': 'My account',
+  'settings.accountManaged': 'Your account is managed by the Gateway.',
+  'settings.manageAccount': 'Manage account',
   'settings.title': 'Settings',
   'settings.close': 'Close settings',
   'settings.done': 'Done',

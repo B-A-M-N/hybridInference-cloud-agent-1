@@ -98,6 +98,9 @@ export const zhCN: Record<TranslationKey, string> = {
   'sidebar.dateOtherYear': '{year}/{month}/{day}',
 
   // ── Settings ────────────────────────────────────────────────────────────
+  'settings.account': '我的账户',
+  'settings.accountManaged': '账号由主站管理。',
+  'settings.manageAccount': '管理账号',
   'settings.title': '设置',
   'settings.close': '关闭设置',
   'settings.done': '完成',

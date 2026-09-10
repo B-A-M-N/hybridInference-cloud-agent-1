@@ -135,8 +135,14 @@ def get_log_store(request: Request) -> Any | None:
 # ── Agent permissions and credential namespaces ────────────────────────
 
 
-async def resolve_agent_access(gateway: Any, user_id: str) -> AgentAccessDecision:
-    """Read current Agent permissions, with no session or role fallback."""
+async def resolve_agent_access(
+    gateway: Any, user_id: str, *, reject_unavailable_subject: bool = False
+) -> AgentAccessDecision:
+    """Read current Agent permissions, with no session or role fallback.
+
+    Login additionally rejects an unavailable subject. A policy denial for an
+    active account may still establish identity for the access-required page.
+    """
     try:
         decision = AgentAccessDecision.model_validate(await gateway.agent_access(user_id))
         if decision.user_id != user_id:
@@ -144,6 +150,8 @@ async def resolve_agent_access(gateway: Any, user_id: str) -> AgentAccessDecisio
         return decision
     except GatewayError as exc:
         if exc.status_code == 403 and exc.error_type == "subject_unavailable":
+            if reject_unavailable_subject:
+                raise HTTPException(status_code=403, detail="This account cannot sign in.") from exc
             return AgentAccessDecision(user_id=user_id, allowed=False, permissions=[])
         if exc.status_code in (401, 404) or exc.error_type == "gateway_not_configured":
             get_logger(__name__).warning(
@@ -239,7 +247,7 @@ async def get_current_user(
     request: Request,
     authorization: str | None = Header(None),
 ) -> dict[str, Any]:
-    """Verify session identity and read its non-authoritative profile claims.
+    """Verify the minimal session identity.
 
     Agent permissions are resolved separately at the Gateway on every
     protected request. A role in an old session never grants Agent access.
@@ -274,18 +282,7 @@ async def get_current_user(
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token payload.")
 
-    role = str(claims.get("role") or "free")
-    return {
-        "user_id": user_id,
-        "email": claims.get("email"),
-        # Carried in the session because the session is what ``/me`` can prove.
-        # Absent from the claims — every deployment today, since neither
-        # gateway contract reports a display name — reads as ``None`` here and
-        # at login alike.
-        "user_name": claims.get("user_name"),
-        "role": role,
-        "authenticated": True,
-    }
+    return {"user_id": user_id, "authenticated": True}
 
 
 async def verify_admin_access(

@@ -21,9 +21,6 @@ export interface AgentAccessApi {
 
 export interface SessionUserApi {
   id: string;
-  email: string | null;
-  role: string;
-  user_name?: string | null;
   agent_access?: AgentAccessApi;
 }
 

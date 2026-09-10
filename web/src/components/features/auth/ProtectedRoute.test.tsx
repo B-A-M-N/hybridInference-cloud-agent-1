@@ -83,7 +83,7 @@ describe('ProtectedRoute', () => {
     expect(assign).not.toHaveBeenCalled();
     expect(screen.queryByText('task list')).not.toBeInTheDocument();
 
-    vi.mocked(getSessionUser).mockResolvedValue({ id: 'u1', email: null, role: 'free' });
+    vi.mocked(getSessionUser).mockResolvedValue({ id: 'u1' });
     fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
     expect(await screen.findByText('task list')).toBeInTheDocument();
     expect(assign).not.toHaveBeenCalled();
@@ -130,8 +130,6 @@ describe('ProtectedRoute', () => {
   it('renders the app for a signed-in user and redirects nobody', async () => {
     vi.mocked(getSessionUser).mockResolvedValue({
       id: 'u1',
-      email: 'ada@example.com',
-      role: 'internal',
     });
 
     renderApp();
