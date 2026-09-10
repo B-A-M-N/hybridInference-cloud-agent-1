@@ -132,14 +132,14 @@ jobs:
           identity_pattern = "|".join(TARGETS)
           for unit in ("docker.service", "containerd.service"):
               rc, out, err = run(["sudo", "-n", "journalctl", "--utc", "--since", "2026-09-09 15:39:00", "--until", "2026-09-09 16:01:00", "-u", unit, "--grep", identity_pattern, "--no-pager", "-n", "150"])
-              print(json.dumps({"incident_container_journal":unit,"exit":rc,"records":len(out.splitlines())}))
+              print(json.dumps({"incident_container_journal":unit,"exit":rc,"records":len(out.splitlines()),"note":safe(err)}))
               for line in out.splitlines():
                   if any(cid in line for cid in TARGETS):
                       print(safe(line))
           # Docker history only for the exact two sandboxes and three historical workers.
           for cid in TARGETS:
               rc, out, err=run(["docker","events","--since",START,"--until",END,"--filter","container="+cid,"--format","{{.Time}} {{.Action}} {{.ID}}"])
-              print(json.dumps({"incident_container_events":cid,"exit":rc}))
+              print(json.dumps({"incident_container_events":cid,"exit":rc,"note":safe(err)}))
               for line in out.splitlines()[:100]:
                   if re.fullmatch(r"[0-9]+ [a-z_]+ [0-9a-f]+",line):
                       print(line)
