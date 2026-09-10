@@ -1,147 +1,23 @@
-name: Staging incident diagnostics
+name: Staging lease aggregate diagnostics
 on:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   inspect:
-    name: Read staging incident evidence (${{ matrix.role }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - role: control
-            label: deploy-cloud-agent-control-staging
-          - role: sandbox
-            label: deploy-cloud-agent-sandbox-staging
-    runs-on: [self-hosted, Linux, "${{ matrix.label }}"]
-    timeout-minutes: 10
+    name: Read anonymized aggregate lease statistics
+    runs-on: [self-hosted, Linux, deploy-cloud-agent-control-staging]
+    timeout-minutes: 5
     steps:
-      - name: Read bounded host logs and incident lease rows
+      - name: Read aggregate statistics without chat IDs or message details
         shell: bash
         run: |
           python3 - <<'PY'
-          """Bounded, read-only diagnostics for staging attempts 131--134."""
-          import json
-          import os
-          import re
-          import socket
           import subprocess
-          
-          START = "2026-09-09T15:39:00Z"
-          END = "2026-09-09T16:01:00Z"
-          PROJECTS = {"cloudagent", "freeinference-cloud-agent-sandbox-staging-kata"}
-          TARGETS = ["b9d22c444e1cbb733b8070154c99da41e5450333dbd4d883c776fe0f40280ad3", "69006638757dda34f1b8e38a0d60e6face31a12bc3c1b416ff1c679d7d4fbfd6", "d2341db2ac51", "011481ff3463", "7fb81949fe1d"]
-          
-          def run(argv, input=None):
-              try:
-                  p = subprocess.run(argv, input=input, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45)
-                  return p.returncode, p.stdout, p.stderr
-              except subprocess.TimeoutExpired:
-                  return 124, "", "command timed out"
-          
-          def safe(line):
-              if re.search(r"authorization|password|secret|credential|private.key|access.token|refresh.token|Bearer |BEGIN .*KEY", line, re.I):
-                  return "[credential-bearing line omitted]"
-              line = re.sub(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", "[JWT]", line)
-              line = re.sub(r"(https?://)[^/@\s]+:[^/@\s]+@", r"\1[redacted]@", line)
-              line = re.sub(r"(https?://[^\s?\"]+)\?[^\s\"]+", r"\1?[redacted]", line)
-              return line[:1600]
-          
-          def selected_logs(text, label):
-              lines = text.splitlines()
-              pattern = re.compile(r"ajob_5a236e7c1668931a|ajob_91a266bff57b8436|athr_e7d34fca824c60e8|athr_5a81070385540635|/attempts/(131|132|133|134)/|\b(heartbeat|lease|Traceback|ERROR|Exception|ReadTimeout|ConnectTimeout|PoolTimeout|deadlock|Killed process|out of memory|OOM|panic|Starting|Stopping|shutdown|restart)\b", re.I)
-              indices = set()
-              for i, line in enumerate(lines):
-                  if pattern.search(line):
-                      indices.update(range(max(0, i-2), min(len(lines), i+4)))
-              chosen = sorted(indices)
-              print(json.dumps({"log_source": label, "lines_available": len(lines), "selected": len(chosen)}))
-              for i in chosen[:650]:
-                  print(safe(lines[i]))
-          
-          print(json.dumps({"machine": socket.gethostname(), "window": [START, END]}))
-          code, ids, err = run(["docker", "ps", "-aq"])
-          if code:
-              print(json.dumps({"docker_inventory_exit": code, "error": safe(err)}))
-          selected = {}
-          for cid in list(dict.fromkeys(ids.split() + TARGETS)):
-              # Do not inspect environment variables, commands, mounts or credentials.
-              fmt = '{"id":{{json .Id}},"name":{{json .Name}},"created":{{json .Created}},"state":{{json .State.Status}},"running":{{json .State.Running}},"oom_killed":{{json .State.OOMKilled}},"exit_code":{{json .State.ExitCode}},"started":{{json .State.StartedAt}},"finished":{{json .State.FinishedAt}},"restart_count":{{json .RestartCount}},"project":{{json (index .Config.Labels "com.docker.compose.project")}},"service":{{json (index .Config.Labels "com.docker.compose.service")}},"log_type":{{json .HostConfig.LogConfig.Type}},"networks":{{json .NetworkSettings.Networks}}}'
-              rc, out, _ = run(["docker", "inspect", "--format", fmt, cid])
-              if rc:
-                  if cid in TARGETS:
-                      print(json.dumps({"historical_container": cid, "not_found": True}))
-                  continue
-              try:
-                  obj = json.loads(out)
-              except ValueError:
-                  continue
-              if obj.get("project") not in PROJECTS and cid not in TARGETS:
-                  continue
-              obj["networks"] = list((obj.get("networks") or {}).keys())
-              if obj["id"] in selected:
-                  continue
-              selected[obj["id"]] = obj
-              print(json.dumps({"container": obj}))
-              rc, out, err = run(["docker", "logs", "--timestamps", "--since", START, "--until", END, "--tail", "12000", obj["id"]])
-              selected_logs(out + err, obj["name"])
-          
-          DB_SCRIPT = '''import asyncio,json,os
-          import asyncpg
-          async def main():
-              dsn=os.environ["AGENT_DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://").replace("postgresql+psycopg://", "postgresql://")
-              conn=await asyncpg.connect(dsn, timeout=10, command_timeout=15)
-              try:
-                  async with conn.transaction(readonly=True):
-                      specs=[
-                          ("agent_attempts", "id BETWEEN 131 AND 134", "id job_id attempt_no status lease_owner lease_generation lease_expires_at started_at finished_at host_id base_sha runner_version runtime_version sandbox_runtime"),
-                          ("agent_thread_sandbox_memberships", "thread_id IN ('athr_e7d34fca824c60e8','athr_5a81070385540635')", "thread_id sandbox_id native_state context_status activation_generation process_generation resident_state active_attempt_id admitted_job_id admitted_at last_settled_job_id last_error created_at updated_at"),
-                          ("agent_sandboxes", "id IN ('asbx_c45ce7ff989730f9ac15bfef9b6c6a06','asbx_10da484e76b917d32481350fe66ecdcd')", "id host container_id state last_error created_at updated_at"),
-                      ]
-                      for table,where,fields in specs:
-                          expressions=",".join("to_jsonb(t)->'"+field+"' AS "+field for field in fields.split())
-                          rows=await conn.fetch("SELECT "+expressions+" FROM "+table+" t WHERE "+where)
-                          print(json.dumps({"table":table,"rows":[{k:json.loads(v) if isinstance(v,str) else v for k,v in dict(row).items()} for row in rows]},default=str))
-              finally:
-                  await conn.close()
-          try:
-              asyncio.run(main())
-          except Exception as e:
-              print(json.dumps({"db_error_type":type(e).__name__}))
-          '''
-          for cid, obj in selected.items():
-              if obj.get("project") == "cloudagent" and obj.get("service") == "control-plane" and obj["running"]:
-                  rc, out, err = run(["docker", "exec", "-i", cid, "python", "-"], input=DB_SCRIPT)
-                  print(json.dumps({"db_probe_exit": rc}))
-                  print(out)
-                  if err:
-                      print(safe(err))
-          
-          for unit in ("docker.service", "containerd.service"):
-              rc, out, err = run(["journalctl", "--utc", "--since", "2026-09-09 15:39:00", "--until", "2026-09-09 16:01:00", "-u", unit, "--no-pager", "-n", "2000"])
-              selected_logs(out, unit)
-              if rc or err:
-                  print(json.dumps({"journal_source": unit, "exit": rc, "note": safe(err)}))
-          rc, out, err = run(["journalctl", "--utc", "--since", "2026-09-09 15:39:00", "--until", "2026-09-09 16:01:00", "-k", "--no-pager", "-n", "2000"])
-          selected_logs(out, "kernel")
-          if rc or err:
-              print(json.dumps({"kernel_exit": rc, "note": safe(err)}))
-          
-          # Read only incident-container journal entries; never export unrelated host records.
-          identity_pattern = "|".join(TARGETS)
-          for unit in ("docker.service", "containerd.service"):
-              rc, out, err = run(["sudo", "-n", "journalctl", "--utc", "--since", "2026-09-09 15:39:00", "--until", "2026-09-09 16:01:00", "-u", unit, "--grep", identity_pattern, "--no-pager", "-n", "150"])
-              print(json.dumps({"incident_container_journal":unit,"exit":rc,"records":len(out.splitlines()),"note":safe(err)}))
-              for line in out.splitlines():
-                  if any(cid in line for cid in TARGETS):
-                      print(safe(line))
-          # Docker history only for the exact two sandboxes and three historical workers.
-          for cid in TARGETS:
-              rc, out, err=run(["docker","events","--since",START,"--until",END,"--filter","container="+cid,"--format","{{.Time}} {{.Action}} {{.Actor.ID}}"])
-              print(json.dumps({"incident_container_events":cid,"exit":rc,"note":safe(err)}))
-              for line in out.splitlines()[:100]:
-                  if re.fullmatch(r"[0-9]+ [a-z_]+ [0-9a-f]+",line):
-                      print(line)
+          probe="import asyncio,json,os\nimport asyncpg\nasync def main():\n    dsn=os.environ[\"AGENT_DATABASE_URL\"].replace(\"postgresql+asyncpg://\",\"postgresql://\").replace(\"postgresql+psycopg://\",\"postgresql://\")\n    c=await asyncpg.connect(dsn,timeout=10,command_timeout=30)\n    try:\n        async with c.transaction(readonly=True,isolation=\"repeatable_read\"):\n            common=\"\"\"WITH facts AS (\n            SELECT a.id,a.job_id,j.thread_id,a.host_id,a.lease_owner,a.status,a.started_at,\n              EXTRACT(EPOCH FROM a.finished_at-a.started_at) AS duration_s,\n              (a.lease_expires_at=a.started_at+interval '120 seconds') AS never_extended,\n              EXISTS(SELECT 1 FROM agent_job_events e WHERE e.attempt_id=a.id AND e.event_type='attempt_superseded' AND e.payload->>'reason'='lease_expired') AS lease_expired,\n              EXISTS(SELECT 1 FROM agent_job_events e WHERE e.attempt_id=a.id AND e.event_type IN ('message','tool_start','tool_result')) AS model_events,\n              EXISTS(SELECT 1 FROM agent_job_events e WHERE e.attempt_id=a.id AND e.event_type='checked_out') AS checkout_events,\n              to_jsonb(a)->>'sandbox_runtime' AS sandbox_runtime,\n              (j.state='failed') AS failed\n            FROM agent_attempts a JOIN agent_jobs j ON j.id=a.job_id\n            ) \"\"\"\n            queries={\n              \"overall\": \"SELECT count(*) AS attempts,count(DISTINCT job_id) AS jobs,count(DISTINCT thread_id) AS chats,count(*) FILTER(WHERE lease_expired) AS expired_attempts,count(DISTINCT thread_id) FILTER(WHERE lease_expired) AS affected_chats,min(started_at) AS first_attempt,max(started_at) AS latest_attempt FROM facts\",\n              \"by_day\": \"SELECT started_at::date AS day,count(*) AS attempts,count(*) FILTER(WHERE lease_expired) AS expired,count(*) FILTER(WHERE failed) AS failed FROM facts GROUP BY 1 ORDER BY 1\",\n              \"by_worker\": \"SELECT host_id,lease_owner,count(*) AS attempts,count(*) FILTER(WHERE lease_expired) AS expired,min(started_at) FILTER(WHERE lease_expired) AS first_expired_task,max(started_at) FILTER(WHERE lease_expired) AS last_expired_task FROM facts GROUP BY 1,2 ORDER BY expired DESC,attempts DESC\",\n              \"failure_stages\": \"SELECT started_at::date AS day,host_id,lease_owner,sandbox_runtime,CASE WHEN model_events THEN 'model_started' WHEN checkout_events THEN 'checkout_done' ELSE 'before_checkout' END AS stage,never_extended,count(*) AS expired_attempts,count(DISTINCT thread_id) AS chats,round(avg(duration_s),3) AS avg_duration_s FROM facts WHERE lease_expired GROUP BY 1,2,3,4,5,6 ORDER BY 1,2,3\",\n              \"duration_bands\": \"SELECT CASE WHEN duration_s<30 THEN '<30s' WHEN duration_s<120 THEN '30-120s' WHEN duration_s<300 THEN '120-300s' ELSE '>=300s_or_active' END AS band,count(*) AS attempts,count(*) FILTER(WHERE lease_expired) AS expired FROM facts GROUP BY 1 ORDER BY 1\"\n            }\n            for name,q in queries.items():\n                rows=await c.fetch(common+q)\n                print(json.dumps({\"aggregate\":name,\"rows\":[dict(r) for r in rows]},default=str))\n    finally:await c.close()\ntry:asyncio.run(main())\nexcept Exception as e:print(json.dumps({\"error_type\":type(e).__name__}))\n"
+          p=subprocess.run(["docker","ps","-q","--filter","label=com.docker.compose.project=cloudagent","--filter","label=com.docker.compose.service=control-plane"],capture_output=True,text=True,check=True)
+          ids=p.stdout.split()
+          if len(ids)!=1:raise RuntimeError("Expected one staging control-plane")
+          subprocess.run(["docker","exec","-i",ids[0],"python","-"],input=probe,text=True,check=True,timeout=120)
           
           PY
