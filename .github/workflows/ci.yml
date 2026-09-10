@@ -1,1035 +1,131 @@
-name: CI
-
-# One workflow, because the deployment hangs off it.
-#
-# This was four — Backend CI, Web CI, Secret Scan, Docker Build — each with its
-# own `paths:` filter. That arrangement cannot produce a trustworthy "this
-# commit is good" signal, which is exactly what a deploy needs to gate on. A
-# backend-only change does not run Web CI at all, and over the API a workflow
-# that was filtered out is indistinguishable from one that has not started yet:
-# both are simply absent. A deploy reading that has to treat "absent" as "fine",
-# and the first time it is wrong it ships unverified code to a live host.
-#
-# Inside one workflow the same condition is a *state*: a job whose paths did not
-# match is `skipped`, which is reported, not missing. `CI Gate` can then assert
-# that every job either succeeded or was skipped, and `deploy-staging.yml`
-# hangs off this workflow alone.
-#
-# The path filters keep their meaning — they moved from four `on:` blocks into
-# the `changes` job below, which is also the only place they now have to agree
-# with each other.
-
+name: Staging incident diagnostics
 on:
   workflow_dispatch:
-  push:
-    branches: [main, dev]
-  pull_request:
-    branches: [main, dev]
-
-# While this repository is private, CI uses the existing self-hosted pools.
-# Before making it public, #99 must route pull requests to GitHub-hosted
-# runners; tests, package install hooks and Docker builds execute PR code.
 permissions:
   contents: read
-
-concurrency:
-  group: ci-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  PYTHON_VERSION: "3.12"
-  UV_VERSION: "0.9.7"
-  NODE_VERSION: "22"
-  GITLEAKS_VERSION: "8.30.1"
-
 jobs:
-  changes:
-    name: Classify Changes
-    runs-on: [self-hosted, Linux, ci-general]
-    outputs:
-      backend: ${{ steps.classify.outputs.backend }}
-      web: ${{ steps.classify.outputs.web }}
-      docker: ${{ steps.classify.outputs.docker }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          # Full fetch: the diff below needs both endpoints, and shallow-clone
-          # packs with missing delta bases have been failing random checkouts
-          # on this pool.
-          fetch-depth: 0
-
-      - name: Classify changed paths
-        id: classify
-        env:
-          BEFORE: ${{ github.event.before }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          set -euo pipefail
-
-          # Fails open: anything this cannot resolve — a dispatch, a first push
-          # to a new branch, a base commit the runner does not have — runs
-          # everything. A misclassification that skips is a job that silently
-          # did not check; one that over-runs costs a minute.
-          files=""
-          resolved=false
-          case "${GITHUB_EVENT_NAME}" in
-            pull_request)
-              if [ -n "${PR_BASE_SHA:-}" ] && git cat-file -e "${PR_BASE_SHA}^{commit}" 2>/dev/null; then
-                files="$(git diff --name-only "${PR_BASE_SHA}" "${GITHUB_SHA}")"
-                resolved=true
-              fi
-              ;;
-            push)
-              if [ -n "${BEFORE:-}" ] \
-                 && [ "${BEFORE}" != "0000000000000000000000000000000000000000" ] \
-                 && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
-                files="$(git diff --name-only "${BEFORE}" "${GITHUB_SHA}")"
-                resolved=true
-              fi
-              ;;
-          esac
-
-          if [ "${resolved}" != "true" ]; then
-            echo "could not resolve a diff range (${GITHUB_EVENT_NAME}) — running everything"
-            {
-              echo "backend=true"
-              echo "web=true"
-              echo "docker=true"
-            } >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-
-          echo "--- changed files ---"
-          printf '%s\n' "${files}"
-          echo "---------------------"
-
-          matches() { printf '%s\n' "${files}" | grep -E "$1" >/dev/null; }
-
-          # Backend: everything that is not purely docs or the web app. This is
-          # the old `paths-ignore` inverted, so it stays true by default — a new
-          # top-level directory runs the backend checks rather than skipping
-          # them unnoticed.
-          if printf '%s\n' "${files}" \
-             | grep -vE '^(docs/|web/)' \
-             | grep -vE '(\.md|LICENSE|\.gitignore)$' \
-             | grep . >/dev/null; then
-            backend=true
-          else
-            backend=false
-          fi
-
-          # Web: the app itself.
-          if matches '^web/'; then web=true; else web=false; fi
-
-          # Docker: the deploy files and what they COPY. README.md is here
-          # because Dockerfile.agent-runner COPYs it alongside pyproject/uv.lock,
-          # so deleting or renaming it breaks the build and nothing else notices.
-          if matches '^(deploy/|cloud_agent_host/)' || matches '^(pyproject\.toml|uv\.lock|README\.md)$'; then
-            docker=true
-          else
-            docker=false
-          fi
-
-          # A change to CI itself runs all of it: the thing being changed is the
-          # checking, and a filtered CI edit is checked by nothing.
-          if matches '^\.github/workflows/'; then
-            backend=true; web=true; docker=true
-          fi
-
-          {
-            echo "backend=${backend}"
-            echo "web=${web}"
-            echo "docker=${docker}"
-          } | tee -a "${GITHUB_OUTPUT}"
-
-  # ---------------------------------------------------------------- backend
-  # One job, three checks — not a three-cell matrix. Each cell paid for its own
-  # checkout, uv install, Python install and `uv sync` in order to run a command
-  # that takes about a second: measured over one run, 14s of environment for 1s
-  # of linting. Keeping the checks together also avoids occupying several
-  # runners with identical setup for one commit.
-  #
-  # `fail-fast: false` is what the matrix bought, and it is kept below: every
-  # check runs even after one fails, and the job is red if any did. This also
-  # matches `make lint`, which has run all three as one gate all along.
-  lint:
-    name: Lint
-    needs: changes
-    if: needs.changes.outputs.backend == 'true'
-    runs-on: [self-hosted, Linux, ci-general]
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          # Full fetch: GitHub intermittently serves shallow-clone packs with
-          # missing delta bases ("pack has N unresolved deltas"), which fails
-          # random jobs at checkout on this pool. A full fetch is immune.
-          fetch-depth: 0
-
-      - name: Isolate uv cache dir
-        # Set via GITHUB_ENV because job-level env cannot use the runner
-        # context. The default ~/.cache/uv is shared by every runner process on
-        # the machine, and an entry disappearing mid-install fails the job with
-        # ENOENT while uv hardlinks into the venv. RUNNER_TEMP belongs to one
-        # runner process, which runs one job at a time — that is the whole
-        # isolation, so the path carries nothing else.
-        #
-        # In particular it must NOT carry GITHUB_RUN_ID. The cache service
-        # derives an entry's version from the paths being cached, so a
-        # per-run path misses on every restore and uploads a fresh copy every
-        # time, which is both no cache at all and a fast way through the 10 GB
-        # per-repository limit.
-        run: |
-          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache" >> "${GITHUB_ENV}"
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
-        with:
-          version: ${{ env.UV_VERSION }}
-          enable-cache: true
-          # Cache pruning adds work after the checks and is unnecessary for
-          # this job-local environment.
-          prune-cache: false
-
-      - name: Set up Python
-        run: uv python install ${{ env.PYTHON_VERSION }}
-
-      - name: Sync dependencies
-        run: uv sync
-
-      # `continue-on-error` on the checks and nowhere else. A setup step that
-      # fails still stops the job outright — there is nothing to lint without a
-      # venv, and three identical failures would only bury the cause. A *check*
-      # that fails records its outcome and lets the others run, which is the
-      # property the matrix had.
-      - name: Ruff Format
-        id: ruff_format
-        continue-on-error: true
-        run: uv run ruff format --check .
-
-      - name: Ruff Lint
-        id: ruff_lint
-        continue-on-error: true
-        run: uv run ruff check --no-fix .
-
-      - name: Pydocstyle
-        id: pydocstyle
-        continue-on-error: true
-        run: uv run pydocstyle cloud_agent cloud_agent_host
-
-      # `continue-on-error` keeps a failed check from failing the job, so
-      # without this the job would be green with a red step inside it. Same
-      # shape as `CI Gate` below, for the same reason.
-      - name: Every check passed
-        env:
-          RESULTS: >-
-            ruff-format=${{ steps.ruff_format.outcome }}
-            ruff-lint=${{ steps.ruff_lint.outcome }}
-            pydocstyle=${{ steps.pydocstyle.outcome }}
-        run: |
-          set -euo pipefail
-          failed=0
-          for entry in ${RESULTS}; do
-            name="${entry%%=*}"
-            result="${entry#*=}"
-            case "${result}" in
-              success) ;;
-              *) echo "::error title=Lint::${name} is ${result}"; failed=1 ;;
-            esac
-          done
-          [ "${failed}" -eq 0 ] || exit 1
-          echo "Lint: green"
-
-  test:
-    name: Tests
-    needs: changes
-    if: needs.changes.outputs.backend == 'true'
-    runs-on: [self-hosted, Linux, ci-general]
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Isolate uv and npm cache dirs
-        run: |
-          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache" >> "${GITHUB_ENV}"
-          echo "npm_config_cache=${RUNNER_TEMP}/npm-cache" >> "${GITHUB_ENV}"
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
-        with:
-          version: ${{ env.UV_VERSION }}
-          enable-cache: true
-          prune-cache: false
-
-      - name: Set up Python
-        run: uv python install ${{ env.PYTHON_VERSION }}
-
-      - name: Sync dependencies
-        run: uv sync
-
-      # -n 4 --dist loadfile, not a serial run: parallel workers isolate each
-      # test file into its own process, which is what surfaces environment
-      # leakage between files. A serial run silently passes on that class of bug.
-      - name: Pytest
-        run: uv run pytest -n 4 --dist loadfile -q -m "not external and not dbtest"
-
-      # A single OS user cannot reproduce a sibling CLI's 0700 process registry.
-      # Check the real normalizer across Linux UIDs before allowing deployment.
-      - name: Shared member permissions survive a sibling CLI restart
-        timeout-minutes: 5
-        env:
-          AGENT_PERMISSION_TEST_IMAGE: python:3.12-slim
-        run: |
-          docker pull "${AGENT_PERMISSION_TEST_IMAGE}"
-          uv run pytest -q -m external tests/external/test_shared_member_permissions.py
-
-      # Completion can precede the native CLI's history flush. Unit doubles
-      # cannot catch that race; exercise the shipped pin before CI can deploy.
-      # Inference is a loopback protocol fixture, with no API key or model cost.
-      - name: Set up Node for native CLI regression
-        uses: actions/setup-node@v6
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Install the sandbox's pinned Claude CLI
-        run: |
-          set -euo pipefail
-          version=$(sed -n 's/^ARG CLAUDE_CODE_VERSION=//p' deploy/sandbox/Dockerfile.agent-sandbox)
-          [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          npm install --no-audit --no-fund --prefix "${RUNNER_TEMP}/claude-context" \
-            "@anthropic-ai/claude-code@${version}"
-          echo "CLOUD_AGENT_TEST_CLAUDE_BINARY=${RUNNER_TEMP}/claude-context/node_modules/.bin/claude" >> "${GITHUB_ENV}"
-
-      - name: Native history survives close, restore and failed-turn retry
-        timeout-minutes: 10
-        run: uv run pytest -q -m external tests/external/test_claude_driver_context.py
-
-  # The other half of that command. `test` above deselects `dbtest`, and until
-  # this job existed nothing selected it — 158 tests that are written, green,
-  # and were never once executed by CI. The cost of that is on the record: the
-  # xfail in tests/integration/servers/test_agent_jobs_lifecycle.py documents a
-  # router/test mismatch that survived a whole migration, and says why in its
-  # own reason string — "It was never caught because the dbtest tier does not
-  # run in CI."
-  #
-  # These tests need a real Postgres because what they pin lives in SQL, not in
-  # Python: `FOR UPDATE SKIP LOCKED` is the entire guarantee that two workers
-  # cannot claim one job, and lease_generation fencing is the entire guarantee
-  # that a superseded attempt cannot publish a duplicate PR. A fake store can
-  # only restate what its author believed those statements do.
-  #
-  # A separate job rather than dropping the deselect from `test`: that job is
-  # the fast, dependency-free one that every backend change waits on, and it
-  # stays that way. The split also matches `make test` / `make test-db`, which
-  # is the contract AGENTS.md already documents.
-  test-db:
-    name: Tests (Postgres)
-    needs: changes
-    if: needs.changes.outputs.backend == 'true'
-    # This pool can start service containers; postgres:15 supports ARM64.
-    runs-on: [self-hosted, Linux, ci-general]
-
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          # The name the fixtures already default to. They were written against
-          # the gateway repo's CI, which provides exactly this; the tests moved
-          # here in the split and the database did not.
-          POSTGRES_DB: hybridinference_test_db
-        ports:
-          - 5432/tcp
-        # 1s, not the 10s this was copied from. Docker runs the first probe one
-        # interval after start, so a 10s interval means the job waits at least
-        # ten seconds no matter how fast Postgres is. Measured on this runner:
-        # 10.3s to healthy at `10s`, 2.5s at `1s` — the server is ready in
-        # about two. `pg_isready` is a connect-and-exit, so probing it every
-        # second costs nothing worth counting.
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 1s
-          --health-timeout 5s
-          --health-retries 15
-
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Isolate uv cache dir
-        run: |
-          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache" >> "${GITHUB_ENV}"
-
-      # Into GITHUB_ENV from a step, and not a job-level `env:` block, because
-      # the `job` context — which is where the mapped host port lives — is not
-      # available to `jobs.<id>.env`. A job-level block referencing it does not
-      # fail at the step; the whole workflow is rejected before anything runs.
-      #
-      # The port is looked up rather than fixed at 5432: `ports: - 5432/tcp`
-      # asks for an ephemeral host port and avoids coupling the test to runner
-      # image internals.
-      - name: Point the fixtures at the service container
-        run: |
-          {
-            echo "TEST_DB_HOST=localhost"
-            echo "TEST_DB_PORT=${{ job.services.postgres.ports['5432'] }}"
-            echo "TEST_DB_NAME=hybridinference_test_db"
-            echo "TEST_DB_USER=postgres"
-            echo "TEST_DB_PASSWORD=postgres"
-          } >> "${GITHUB_ENV}"
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
-        with:
-          version: ${{ env.UV_VERSION }}
-          enable-cache: true
-          prune-cache: false
-
-      - name: Set up Python
-        run: uv python install ${{ env.PYTHON_VERSION }}
-
-      - name: Sync dependencies
-        run: uv sync
-
-      # Before pytest, because every dbtest fixture answers an unreachable
-      # database with `pytest.skip`, not a failure. That is right for a laptop
-      # with no Postgres and exactly wrong here: it makes "green having run
-      # nothing" this job's natural failure mode, which is the same false
-      # signal the job exists to remove. So connectivity is asserted where it
-      # can still fail loudly.
-      - name: The database is actually reachable
-        run: |
-          uv run python - <<'PY'
-          import os, sys
-          import asyncpg, asyncio
-
-          async def main():
-              conn = await asyncpg.connect(
-                  host=os.environ["TEST_DB_HOST"],
-                  port=int(os.environ["TEST_DB_PORT"]),
-                  database=os.environ["TEST_DB_NAME"],
-                  user=os.environ["TEST_DB_USER"],
-                  password=os.environ["TEST_DB_PASSWORD"],
-              )
-              print(await conn.fetchval("SELECT version()"))
-              await conn.close()
-
-          asyncio.run(main())
-          PY
-
-      # Serial, and not `-n 4` like the job above. The fixtures derive a
-      # per-worker database name (`..._gw0`, `..._gw1`, …) so that xdist
-      # workers cannot truncate each other's tables — but the service
-      # container creates one database, so under `-n 4` all four workers would
-      # fail to connect and every test would skip. The tier runs in about 15
-      # seconds; there is nothing here worth sharding.
-      - name: Pytest (dbtest tier)
-        run: uv run pytest -q -m "dbtest" --junitxml="${RUNNER_TEMP}/dbtest.xml"
-
-      # The second half of the same guard. A fixture that skips on a database
-      # it cannot reach turns a broken service container into a passing job,
-      # and a `pytest -m` that silently matches nothing exits 0 too. Neither is
-      # distinguishable from success in the check list, so assert the shape of
-      # the run rather than trusting its exit code.
-      - name: The tier actually ran
-        run: |
-          uv run python - <<'PY'
-          import os, sys, xml.etree.ElementTree as ET
-
-          root = ET.parse(os.environ["RUNNER_TEMP"] + "/dbtest.xml").getroot()
-          suite = root if root.tag == "testsuite" else root.find("testsuite")
-          ran = int(suite.get("tests", 0))
-
-          # Per-testcase, not the suite's `skipped` attribute: junit counts an
-          # xfail as a skip, and this tier has a standing one. Only
-          # type="pytest.skip" is a test that declined to run, which is what a
-          # database-less run produces.
-          skipped = [
-              tc.get("name")
-              for tc in suite.iter("testcase")
-              for sk in tc.findall("skipped")
-              if sk.get("type") == "pytest.skip"
-          ]
-          print(f"dbtest: {ran} collected, {len(skipped)} skipped")
-
-          # A floor, not the exact count, so adding tests never fails this. It
-          # only has to be high enough that a database-less run cannot clear
-          # it — that run skips all of them.
-          if ran < 100:
-              sys.exit(f"only {ran} dbtests ran; the tier is not being selected")
-          if skipped:
-              sys.exit(
-                  f"{len(skipped)} dbtests skipped — the fixtures skip when Postgres "
-                  f"is unreachable, so this job proved nothing: {skipped[:5]}"
-              )
-          PY
-  # -------------------------------------------------------------------- web
-  # One job, five checks, for the reason spelled out over `lint` above — and
-  # more sharply here, because Node costs more to install than uv does. Measured
-  # over one run: 55s of setup across the five cells for 27s of actual checking,
-  # and four of the five spent longer installing than working (Prettier: 10s of
-  # setup, 1s of formatting check).
-  check:
-    name: Web
-    needs: changes
-    if: needs.changes.outputs.web == 'true'
-    runs-on: [self-hosted, Linux, ci-general]
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          # Full fetch: shallow-clone packs with missing delta bases have been
-          # failing random checkouts on this pool.
-          fetch-depth: 0
-
-      # web/ is an empty placeholder until task F1 lands the Next.js app. Until
-      # then this workflow is a deliberate no-op rather than a red X: gating on
-      # the manifest keeps the required-check list stable across that boundary.
-      - name: Detect web app
-        id: detect
-        run: |
-          if [ -f web/package.json ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "web/package.json not present yet — skipping (task F1)"
-          fi
-
-      - name: Isolate the npm cache dir
-        # Off the shared ~/.npm and onto this runner process's own temp, which
-        # runs one job at a time. Set before setup-node, which reads
-        # `npm config get cache` to decide where to restore into.
-        #
-        # Stable, with no run id in it: the cache service versions an entry by
-        # the paths it covers, so a per-run path would never restore and would
-        # upload a new copy of node_modules' cache on all five cells, every
-        # run. Same reasoning as UV_CACHE_DIR in backend-ci.
-        if: steps.detect.outputs.present == 'true'
-        run: |
-          echo "npm_config_cache=${RUNNER_TEMP}/npm-cache" >> "${GITHUB_ENV}"
-
-      - name: Set up Node
-        if: steps.detect.outputs.present == 'true'
-        uses: actions/setup-node@v6
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-
-      - name: Install dependencies
-        if: steps.detect.outputs.present == 'true'
-        working-directory: ./web
-        run: npm ci
-
-      # Ordered cheapest-first so a formatting slip is reported in seconds
-      # rather than after the build. They no longer run concurrently, so the
-      # order is now something a reader can spend.
-      - name: ESLint
-        id: eslint
-        if: steps.detect.outputs.present == 'true'
-        continue-on-error: true
-        working-directory: ./web
-        run: npm run lint
-
-      - name: Prettier
-        id: prettier
-        if: steps.detect.outputs.present == 'true'
-        continue-on-error: true
-        working-directory: ./web
-        run: npm run format:check
-
-      - name: TypeScript
-        id: typescript
-        if: steps.detect.outputs.present == 'true'
-        continue-on-error: true
-        working-directory: ./web
-        run: npm run type-check
-
-      - name: Tests
-        id: tests
-        if: steps.detect.outputs.present == 'true'
-        continue-on-error: true
-        working-directory: ./web
-        run: npm run test
-
-      - name: Build
-        id: build
-        if: steps.detect.outputs.present == 'true'
-        continue-on-error: true
-        working-directory: ./web
-        run: npm run build
-
-      # Skipped along with the checks when web/ is absent, so this stays the
-      # deliberate no-op the `Detect web app` step describes rather than
-      # reading five empty outcomes as five failures.
-      - name: Every check passed
-        if: steps.detect.outputs.present == 'true'
-        env:
-          RESULTS: >-
-            eslint=${{ steps.eslint.outcome }}
-            prettier=${{ steps.prettier.outcome }}
-            typescript=${{ steps.typescript.outcome }}
-            tests=${{ steps.tests.outcome }}
-            build=${{ steps.build.outcome }}
-        run: |
-          set -euo pipefail
-          failed=0
-          for entry in ${RESULTS}; do
-            name="${entry%%=*}"
-            result="${entry#*=}"
-            case "${result}" in
-              success) ;;
-              *) echo "::error title=Web::${name} is ${result}"; failed=1 ;;
-            esac
-          done
-          [ "${failed}" -eq 0 ] || exit 1
-          echo "Web: green"
-  # ------------------------------------------------------------------ secret
-  gitleaks:
-    name: Gitleaks
-    runs-on: [self-hosted, Linux, ci-general]
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      # Installing the release binary rather than using gitleaks-action, which
-      # requires a paid license for organization repositories.
-      #
-      # Into RUNNER_TEMP and onto GITHUB_PATH, not `sudo install` into
-      # /usr/local/bin: this runner's machine outlives the job and is shared.
-      # A system-wide write means the gateway's CI and this one overwrite each
-      # other's binary — today at the same version, silently at different ones
-      # the moment either bumps GITLEAKS_VERSION, and the scan that runs is
-      # then whichever job installed last. Unpacking outside the workspace also
-      # keeps the tarball out of the tree the next step scans.
-      - name: Install gitleaks
-        run: |
-          set -euo pipefail
-          case "$(uname -m)" in
-            x86_64) arch="x64" ;;
-            aarch64|arm64) arch="arm64" ;;
-            *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
-          esac
-          asset="gitleaks_${GITLEAKS_VERSION}_linux_${arch}.tar.gz"
-          base_url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
-          bindir="${RUNNER_TEMP}/bin"
-          mkdir -p "${bindir}"
-          cd "${RUNNER_TEMP}"
-          curl -fsSLO "${base_url}/${asset}"
-          curl -fsSLO "${base_url}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
-          grep "  ${asset}$" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" > gitleaks.sha256
-          sha256sum -c gitleaks.sha256
-          tar -xzf "${asset}" gitleaks
-          install -m 0755 gitleaks "${bindir}/gitleaks"
-          echo "${bindir}" >> "${GITHUB_PATH}"
-          "${bindir}/gitleaks" version
-
-      - name: Scan working tree
-        run: gitleaks detect --source . --no-git --redact --verbose --no-banner
-
-      # This repository is intended to be open-sourced with its history intact,
-      # so history is scanned too — a secret removed in a later commit is still
-      # published by the commit that introduced it.
-      - name: Scan history
-        run: gitleaks detect --source . --redact --verbose --no-banner
-  # ------------------------------------------------------------------ docker
-  build:
-    name: Build ${{ matrix.image.name }}
-    needs: changes
-    if: needs.changes.outputs.docker == 'true'
-    # **Each image builds on the architecture it is deployed to.** The control
-    # plane targets ARM64; the host images target x86_64. Each image uses the
-    # matching self-hosted image verification pool.
-    # A build resolving on ARM64 says nothing about a base image without an
-    # amd64 layer, or the reverse.
-    #
-    # `push: false` still: nothing here publishes. The point is that the build
-    # resolves *where it matters*.
-    runs-on: ${{ fromJSON(matrix.image.runner) }}
+  inspect:
+    name: Read staging incident evidence (${{ matrix.role }})
     strategy:
       fail-fast: false
       matrix:
-        image:
-          - name: runner
-            dockerfile: deploy/host/Dockerfile.agent-runner
-            runner: '["self-hosted","Linux","X64","image-verify-x64"]'
-          - name: sandbox
-            dockerfile: deploy/sandbox/Dockerfile.agent-sandbox
-            runner: '["self-hosted","Linux","X64","image-verify-x64"]'
-          - name: egress-proxy
-            dockerfile: deploy/host/Dockerfile.agent-egress-proxy
-            runner: '["self-hosted","Linux","X64","image-verify-x64"]'
-          - name: gateway-tunnel
-            dockerfile: deploy/host/Dockerfile.agent-gateway-tunnel
-            runner: '["self-hosted","Linux","X64","image-verify-x64"]'
-          - name: control-plane
-            dockerfile: deploy/control-plane/Dockerfile
-            runner: '["self-hosted","Linux","ARM64","image-verify-arm64"]'
+        include:
+          - role: control
+            label: deploy-cloud-agent-control-staging
+          - role: sandbox
+            label: deploy-cloud-agent-sandbox-staging
+    runs-on: [self-hosted, Linux, "${{ matrix.label }}"]
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - uses: docker/setup-buildx-action@v3
-
-      # Build only — never push. These images carry no credentials and this
-      # repository publishes none; the point is that the build resolves.
-      - name: Build ${{ matrix.image.name }}
-        id: build
-        # A transient buildkit/runner recycle surfaces as graceful_stop on this
-        # pool. Recreate the builder and retry once before failing the cell.
-        continue-on-error: true
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ${{ matrix.image.dockerfile }}
-          push: false
-          load: false
-          cache-from: type=gha,scope=${{ matrix.image.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
-
-      - name: Set up Docker Buildx (retry)
-        if: steps.build.outcome == 'failure'
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build ${{ matrix.image.name }} (retry)
-        if: steps.build.outcome == 'failure'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ${{ matrix.image.dockerfile }}
-          push: false
-          load: false
-          cache-from: type=gha,scope=${{ matrix.image.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
-
-  egress-proxy-starts:
-    name: The egress proxy stays up
-    needs: changes
-    if: needs.changes.outputs.docker == 'true'
-    # x86_64, because this job's whole point is that starting the thing proves
-    # what building it cannot — and the thing starts on the runner host. Squid
-    # opening its logs is exactly the kind of failure that could differ by base
-    # image layer, so proving it on the other architecture would prove the
-    # wrong one.
-    runs-on: [self-hosted, Linux, X64, image-verify-x64]
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      # **Building it proves nothing about whether it runs**, and this is the
-      # job that exists because of what that cost.
-      #
-      # Squid opens its logs *after* dropping to `cache_effective_user`, and in
-      # a container `/dev/stdout` is a root-owned `prw-------` pipe — so the
-      # open failed and squid treated it as fatal. The image built fine. The
-      # config passed `squid -k parse` fine. It exited on every start, 2814
-      # times on staging from 2026-08-03, and because the runner's isolation
-      # preflight correctly refuses to start without a reachable proxy, three
-      # runners and the workspace broker crash-looped behind it. No agent job
-      # ran for two days.
-      #
-      # Nothing textual would have caught it: the broken config parsed, and so
-      # did a first attempted fix (`cache_effective_user root`, which squid
-      # rejects outright). Only starting the thing does.
-      #
-      # Keep the tag, container and rendered config per-run so retries and
-      # concurrent workflow attempts remain independently diagnosable.
-      - name: Name this run's artifacts
+      - name: Read bounded host logs and incident lease rows
+        shell: bash
         run: |
-          suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          echo "IMAGE_TAG=egress-proxy:ci-${suffix}" >> "${GITHUB_ENV}"
-          echo "CONTAINER_NAME=egress-proxy-ci-${suffix}" >> "${GITHUB_ENV}"
-          echo "SQUID_CONF=${RUNNER_TEMP}/squid.conf" >> "${GITHUB_ENV}"
-
-      - name: Build the image
-        run: docker build -f deploy/host/Dockerfile.agent-egress-proxy -t "${IMAGE_TAG}" .
-
-      - name: Isolate uv cache dir
-        run: |
-          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache" >> "${GITHUB_ENV}"
-
-      # setup-uv rather than mutating the runner image's system Python; the
-      # action also gives this job the same pinned setup path as backend CI.
-      - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
-        with:
-          enable-cache: true
-          prune-cache: false
-
-      - name: Render a config the way the runner does
-        run: |
-          set -euo pipefail
-          uv run --with-editable . python -c "
-          from cloud_agent_host.egress_proxy import build_config_from_env
-          import os, pathlib
-          pathlib.Path(os.environ['SQUID_CONF']).write_text(
-              build_config_from_env({'AGENT_EGRESS_ALLOWLIST': 'registry.npmjs.org'})
-          )"
-
-      - name: It must still be running, and serving
-        run: |
-          set -euo pipefail
-          # Named, not just captured in `cid`: every branch below exits
-          # non-zero under `set -e` before any inline removal could run, so the
-          # container has to be reachable by the always() cleanup step instead.
-          cid=$(docker run -d --name "${CONTAINER_NAME}" -v "${SQUID_CONF}":/etc/squid/generated/squid.conf:ro "${IMAGE_TAG}")
-          sleep 10
-          state=$(docker inspect "$cid" --format '{{.State.Status}}')
-          docker logs "$cid" 2>&1 | tail -30
-          if [ "$state" != "running" ]; then
-            echo "::error::the egress proxy exited (state=$state) — the sandbox has no door, and every agent job will fail its isolation preflight"
-            exit 1
-          fi
-          # Up is not the same as listening: a squid that started and then
-          # failed to bind would still read as `running` for a moment.
-          docker logs "$cid" 2>&1 | grep -F "Accepting HTTP Socket connections" >/dev/null || {
-            echo "::error::the proxy is up but never accepted connections"
-            exit 1
-          }
-
-      # A hosted runner is discarded; this one is not. Without this the machine
-      # accumulates a squid container and image per run until the disk fills,
-      # and the symptom lands on whatever job happens to be running then.
-      #
-      # Container first: an image with a container still referencing it will
-      # not be removed, not even with `-f`, so cleaning up in the other order
-      # silently leaves both behind. Both failure branches above exit before
-      # any inline cleanup, which is exactly when this matters.
-      - name: Drop this run's container and image
-        if: always()
-        run: |
-          docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
-          docker image rm -f "${IMAGE_TAG}" >/dev/null 2>&1 || true
-
-  compose:
-    name: Compose resolves
-    needs: changes
-    if: needs.changes.outputs.docker == 'true'
-    # The one docker job with no architecture to match: `docker compose config`
-    # parses and interpolates, it does not build or start anything. Use the
-    # ARM64 pool so this does not queue behind the x64 image builds.
-    runs-on: [self-hosted, Linux, ARM64, image-verify-arm64]
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Isolate uv cache dir
-        run: |
-          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache" >> "${GITHUB_ENV}"
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
-        with:
-          enable-cache: true
-          prune-cache: false
-
-      # The images building proves the Dockerfiles; it says nothing about the
-      # file that wires them together. `config` is Compose's own parser: it
-      # resolves every interpolation, build context and service reference, so a
-      # variable that no longer exists or a dockerfile path that moved fails
-      # here rather than on a runner host at deploy time.
-      - name: Render the standalone stack
-        run: |
-          set -euo pipefail
-          # Values are placeholders — `config` never starts anything. They exist
-          # because the compose file requires them (`:?`), which is itself the
-          # behaviour being checked: a required variable that stopped being
-          # required would silently weaken the deployment.
-          cat > .env <<'ENVFILE'
-          # Broker authorization is distinct from enrollment-issued host
-          # credentials. The latter are persisted after one-time enrollment
-          # and therefore are not a Compose secret.
-          COMPOSE_PROJECT=freeinference-cloud-agent-sandbox-ci
-          AGENT_WORKSPACE_BROKER_TOKEN=ci-placeholder-broker-token
-          AGENT_SANDBOX_IMAGE=cloud-agent-sandbox:ci
-          AGENT_GATEWAY_URL=http://agent-gateway:8080
-          AGENT_TUNNEL_SSH_DESTINATION=ci@gateway.invalid
-          AGENT_TUNNEL_SSH_KEY=/dev/null
-          AGENT_TUNNEL_SSH_KNOWN_HOSTS=/dev/null
-          AGENT_MCP_TUNNEL_SSH_DESTINATION=ci@control-plane.invalid
-          AGENT_MCP_TUNNEL_SSH_KEY=/dev/null
-          AGENT_MCP_TUNNEL_SSH_KNOWN_HOSTS=/dev/null
-          # The third tunnel: the runner's own path to the control plane's main
-          # listener. Its own key, like the other two — one key opening both
-          # this and the MCP tunnel would make the 8000/8001 split cosmetic.
-          AGENT_CONTROL_PLANE_TUNNEL_SSH_DESTINATION=ci@control-plane.invalid
-          AGENT_CONTROL_PLANE_TUNNEL_SSH_KEY=/dev/null
-          AGENT_CONTROL_PLANE_TUNNEL_SSH_KNOWN_HOSTS=/dev/null
-          ENVFILE
-          docker compose \
-            -f deploy/host/docker-compose.sandbox.yml \
-            --env-file .env \
-            config > ${RUNNER_TEMP}/rendered.yml
-          echo "--- rendered services ---"
-          docker compose -f ${RUNNER_TEMP}/rendered.yml config --services
-
-      # The other machine. Same reasoning, different failure: a required
-      # secret that quietly became optional, or a variable renamed in code and
-      # not here, would otherwise be found by an operator at cutover.
-      - name: Render the control-plane stack
-        run: |
-          set -euo pipefail
-          cat > .env.control-plane <<'ENVFILE'
-          AGENT_DATABASE_URL=postgresql://cloudagent:ci@postgres:5432/cloudagent
-          GATEWAY_BASE_URL=https://gateway.invalid
-          GATEWAY_JWKS_URL=https://gateway.invalid/v1/identity/jwks
-          GATEWAY_GRANT_DISPATCH_TOKEN=ci-placeholder
-          AGENT_SESSION_SECRET=ci-placeholder-value-not-a-real-secret
-          AGENT_CONTROL_TOKEN_SECRET=ci-placeholder-value-not-a-real-secret
-          AGENT_SOURCE_CONTROL_ENCRYPTION_KEY=ci-placeholder-value-not-real
-          AGENT_DEPLOYMENT_SHA=ci-deployment-sha
-          AGENT_POSTGRES_PASSWORD=ci-placeholder
-          AGENT_WORKSPACE_BROKER_TOKEN=ci-placeholder-broker-token
-          # Sign-in is assembled server-side now, so the control plane needs
-          # the consent page, its own callback as the gateway must see it
-          # (byte-identical to an IDENTITY_ALLOWED_REDIRECTS entry there),
-          # and where to land the browser afterwards.
-          GATEWAY_AUTHORIZE_URL=https://gateway.invalid/authorize
-          AGENT_SESSION_REDIRECT_URI=https://agents.invalid/agents/api/v1/session/callback
-          AGENT_WEB_BASE_URL=https://agents.invalid/agents
-          # The web build arguments are required rather than defaulted to
-          # empty: empty is a real answer for a deployment that owns its
-          # hostname and silently wrong for one mounted under a prefix, and
-          # the difference does not show at start. Their presence here is
-          # part of what this step checks.
-          AGENT_WEB_BASE_PATH=/agents
-          AGENT_WEB_API_URL=/agents/api
-          AGENT_WEB_GATEWAY_URL=https://gateway.invalid
-          ENVFILE
-          docker compose \
-            -f deploy/control-plane/docker-compose.yml \
-            --env-file .env.control-plane \
-            config > ${RUNNER_TEMP}/control-plane.yml
-          docker compose -f ${RUNNER_TEMP}/control-plane.yml config --services
-
-      # The `:?` markers are the deployment's only defence against a service
-      # that starts with a signing key somebody left blank. This asserts they
-      # still bite, rather than that they are still spelled.
-      - name: A missing secret still refuses to render
-        run: |
-          set -euo pipefail
-          # Each fails for its own reason: a session secret left blank signs
-          # cookies with nothing; a missing broker token leaves the control
-          # plane unable to route files, terminals, Fork, snapshots or native
-          # session operations to an enrolled host.
-          check() {
-            local stack="$1" envfile="$2" required="$3"
-            grep -v "^${required}=" "$envfile" > .env.missing
-            if docker compose -f "$stack" --env-file .env.missing config >/dev/null 2>&1; then
-              echo "$stack rendered without $required" >&2
-              exit 1
-            fi
-            echo "a missing $required still refuses to render ($stack)"
-          }
-
-          CP=deploy/control-plane/docker-compose.yml
-          HOST=deploy/host/docker-compose.sandbox.yml
-          for required in AGENT_SESSION_SECRET AGENT_WORKSPACE_BROKER_TOKEN AGENT_DEPLOYMENT_SHA; do
-            check "$CP" .env.control-plane "$required"
-          done
-          for required in AGENT_WORKSPACE_BROKER_TOKEN; do
-            check "$HOST" .env "$required"
-          done
-
-      - name: The rendered stack keeps its security properties
-        run: |
-          set -euo pipefail
-          # `uv run --with pyyaml`, not a bare python3: incidental packages in
-          # the runner environment are not a dependency guarantee. The heredoc is
-          # quoted, so the path comes through the environment rather than shell
-          # interpolation.
-          uv run --no-project --with pyyaml python - <<'PY'
-          import os, sys, yaml
-          stack = yaml.safe_load(open(os.environ["RUNNER_TEMP"] + "/rendered.yml"))
-          failures = []
-
-          egress = stack["networks"].get("agent-egress", {})
-          if not egress.get("internal"):
-              failures.append("agent-egress is not internal — the sandbox would have a route out")
-
-          # Named, not counted. The sandbox's whole permission is "these two
-          # destinations and nothing else"; a check that only counted them
-          # would pass on a stack where one had been swapped for something
-          # broader.
-          on_egress = {
-              name
-              for name, svc in stack["services"].items()
-              if "agent-egress" in (svc.get("networks") or {})
-          }
-          if on_egress != {"gateway-tunnel", "mcp-tunnel"}:
-              failures.append(f"unexpected services on the closed network: {sorted(on_egress)}")
-
-          for name, svc in stack["services"].items():
-              for mount in svc.get("volumes") or []:
-                  target = mount.get("target") if isinstance(mount, dict) else str(mount)
-                  ro = mount.get("read_only") if isinstance(mount, dict) else ":ro" in str(mount)
-                  if "docker.sock" in str(target) and not ro:
-                      failures.append(f"{name} mounts the docker socket writable")
-
-          if failures:
-              print("\n".join(failures)); sys.exit(1)
-          print("rendered stack: egress internal, docker socket read-only")
+          python3 - <<'PY'
+          """Bounded, read-only diagnostics for staging attempts 131--134."""
+          import json
+          import os
+          import re
+          import socket
+          import subprocess
+          
+          START = "2026-09-09T15:39:00Z"
+          END = "2026-09-09T16:01:00Z"
+          PROJECTS = {"cloudagent", "freeinference-cloud-agent-sandbox-staging-kata"}
+          TARGETS = ["b9d22c444e1cbb733b8070154c99da41e5450333dbd4d883c776fe0f40280ad3", "69006638757dda34f1b8e38a0d60e6face31a12bc3c1b416ff1c679d7d4fbfd6", "d2341db2ac51", "011481ff3463", "7fb81949fe1d"]
+          
+          def run(argv, input=None):
+              try:
+                  p = subprocess.run(argv, input=input, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45)
+                  return p.returncode, p.stdout, p.stderr
+              except subprocess.TimeoutExpired:
+                  return 124, "", "command timed out"
+          
+          def safe(line):
+              if re.search(r"authorization|password|secret|credential|private.key|access.token|refresh.token|Bearer |BEGIN .*KEY", line, re.I):
+                  return "[credential-bearing line omitted]"
+              line = re.sub(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", "[JWT]", line)
+              line = re.sub(r"(https?://)[^/@\s]+:[^/@\s]+@", r"\1[redacted]@", line)
+              line = re.sub(r"(https?://[^\s?\"]+)\?[^\s\"]+", r"\1?[redacted]", line)
+              return line[:1600]
+          
+          def selected_logs(text, label):
+              lines = text.splitlines()
+              pattern = re.compile(r"ajob_5a236e7c1668931a|ajob_91a266bff57b8436|athr_e7d34fca824c60e8|athr_5a81070385540635|/attempts/(131|132|133|134)/|\b(heartbeat|lease|Traceback|ERROR|Exception|ReadTimeout|ConnectTimeout|PoolTimeout|deadlock|Killed process|out of memory|OOM|panic|Starting|Stopping|shutdown|restart)\b", re.I)
+              indices = set()
+              for i, line in enumerate(lines):
+                  if pattern.search(line):
+                      indices.update(range(max(0, i-2), min(len(lines), i+4)))
+              chosen = sorted(indices)
+              print(json.dumps({"log_source": label, "lines_available": len(lines), "selected": len(chosen)}))
+              for i in chosen[:650]:
+                  print(safe(lines[i]))
+          
+          print(json.dumps({"machine": socket.gethostname(), "window": [START, END]}))
+          code, ids, err = run(["docker", "ps", "-aq"])
+          if code:
+              print(json.dumps({"docker_inventory_exit": code, "error": safe(err)}))
+          selected = {}
+          for cid in list(dict.fromkeys(ids.split() + TARGETS)):
+              # Do not inspect environment variables, commands, mounts or credentials.
+              fmt = '{"id":{{json .Id}},"name":{{json .Name}},"created":{{json .Created}},"state":{{json .State.Status}},"running":{{json .State.Running}},"oom_killed":{{json .State.OOMKilled}},"exit_code":{{json .State.ExitCode}},"started":{{json .State.StartedAt}},"finished":{{json .State.FinishedAt}},"restart_count":{{json .RestartCount}},"project":{{json (index .Config.Labels "com.docker.compose.project")}},"service":{{json (index .Config.Labels "com.docker.compose.service")}},"log_type":{{json .HostConfig.LogConfig.Type}},"networks":{{json .NetworkSettings.Networks}}}'
+              rc, out, _ = run(["docker", "inspect", "--format", fmt, cid])
+              if rc:
+                  if cid in TARGETS:
+                      print(json.dumps({"historical_container": cid, "not_found": True}))
+                  continue
+              try:
+                  obj = json.loads(out)
+              except ValueError:
+                  continue
+              if obj.get("project") not in PROJECTS and cid not in TARGETS:
+                  continue
+              obj["networks"] = list((obj.get("networks") or {}).keys())
+              if obj["id"] in selected:
+                  continue
+              selected[obj["id"]] = obj
+              print(json.dumps({"container": obj}))
+              rc, out, err = run(["docker", "logs", "--timestamps", "--since", START, "--until", END, "--tail", "12000", obj["id"]])
+              selected_logs(out + err, obj["name"])
+          
+          DB_SCRIPT = '''import asyncio,json,os
+          import asyncpg
+          async def main():
+              dsn=os.environ["AGENT_DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://").replace("postgresql+psycopg://", "postgresql://")
+              conn=await asyncpg.connect(dsn, timeout=10, command_timeout=15)
+              try:
+                  async with conn.transaction(readonly=True):
+                      specs=[
+                          ("agent_attempts", "id BETWEEN 131 AND 134", "id job_id attempt_no status lease_owner lease_generation lease_expires_at started_at finished_at host_id base_sha runner_version runtime_version sandbox_runtime"),
+                          ("agent_thread_sandbox_memberships", "thread_id IN ('athr_e7d34fca824c60e8','athr_5a81070385540635')", "thread_id sandbox_id native_state context_status activation_generation process_generation resident_state active_attempt_id admitted_job_id admitted_at last_settled_job_id last_error created_at updated_at"),
+                          ("agent_sandboxes", "id IN ('asbx_c45ce7ff989730f9ac15bfef9b6c6a06','asbx_10da484e76b917d32481350fe66ecdcd')", "id host container_id state last_error created_at updated_at"),
+                      ]
+                      for table,where,fields in specs:
+                          expressions=",".join("to_jsonb(t)->'"+field+"' AS "+field for field in fields.split())
+                          rows=await conn.fetch("SELECT "+expressions+" FROM "+table+" t WHERE "+where)
+                          print(json.dumps({"table":table,"rows":[{k:json.loads(v) if isinstance(v,str) else v for k,v in dict(row).items()} for row in rows]},default=str))
+              finally:
+                  await conn.close()
+          try:
+              asyncio.run(main())
+          except Exception as e:
+              print(json.dumps({"db_error_type":type(e).__name__}))
+          '''
+          for cid, obj in selected.items():
+              if obj.get("project") == "cloudagent" and obj.get("service") == "control-plane" and obj["running"]:
+                  rc, out, err = run(["docker", "exec", "-i", cid, "python", "-"], input=DB_SCRIPT)
+                  print(json.dumps({"db_probe_exit": rc}))
+                  print(out)
+                  if err:
+                      print(safe(err))
+          
+          for unit in ("docker.service", "containerd.service"):
+              rc, out, err = run(["journalctl", "--utc", "--since", "2026-09-09 15:39:00", "--until", "2026-09-09 16:01:00", "-u", unit, "--no-pager", "-n", "2000"])
+              selected_logs(out, unit)
+              if rc or err:
+                  print(json.dumps({"journal_source": unit, "exit": rc, "note": safe(err)}))
+          rc, out, err = run(["journalctl", "--utc", "--since", "2026-09-09 15:39:00", "--until", "2026-09-09 16:01:00", "-k", "--no-pager", "-n", "2000"])
+          selected_logs(out, "kernel")
+          if rc or err:
+              print(json.dumps({"kernel_exit": rc, "note": safe(err)}))
+          
           PY
-
-  # -------------------------------------------------------------------- gate
-  ci-gate:
-    name: CI Gate
-    # The single job that says whether this commit is good. `deploy-staging.yml`
-    # keys on this workflow's conclusion, so this is what stands between a merge
-    # to dev and a rebuild of the staging stack.
-    if: always()
-    runs-on: [self-hosted, Linux, ci-general]
-    needs:
-      - changes
-      - lint
-      - test
-      - test-db
-      - check
-      - gitleaks
-      - build
-      - egress-proxy-starts
-      - compose
-    steps:
-      - name: Every job succeeded or was deliberately skipped
-        env:
-          RESULTS: >-
-            changes=${{ needs.changes.result }}
-            lint=${{ needs.lint.result }}
-            test=${{ needs.test.result }}
-            test-db=${{ needs.test-db.result }}
-            web=${{ needs.check.result }}
-            gitleaks=${{ needs.gitleaks.result }}
-            build=${{ needs.build.result }}
-            egress=${{ needs.egress-proxy-starts.result }}
-            compose=${{ needs.compose.result }}
-          CHANGES_RESULT: ${{ needs.changes.result }}
-        run: |
-          set -euo pipefail
-          echo "${RESULTS}" | tr ' ' '\n' | sed '/^$/d'
-
-          # `skipped` is ambiguous on its own: a job skipped by its `if` and a
-          # job skipped because something it needed failed report the same
-          # word. The classifier is the only thing every other job needs, so
-          # requiring it to have succeeded is what makes the rest of the
-          # skipped/success test meaningful.
-          if [ "${CHANGES_RESULT}" != "success" ]; then
-            echo "::error title=CI Gate::the change classifier did not succeed (${CHANGES_RESULT}); every downstream skip is unexplained"
-            exit 1
-          fi
-
-          failed=0
-          for entry in ${RESULTS}; do
-            name="${entry%%=*}"
-            result="${entry#*=}"
-            case "${result}" in
-              success|skipped) ;;
-              *) echo "::error title=CI Gate::${name} is ${result}"; failed=1 ;;
-            esac
-          done
-          [ "${failed}" -eq 0 ] || exit 1
-          echo "CI Gate: green"
