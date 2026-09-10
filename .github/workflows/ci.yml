@@ -138,7 +138,7 @@ jobs:
                       print(safe(line))
           # Docker history only for the exact two sandboxes and three historical workers.
           for cid in TARGETS:
-              rc, out, err=run(["docker","events","--since",START,"--until",END,"--filter","container="+cid,"--format","{{.Time}} {{.Action}} {{.ID}}"])
+              rc, out, err=run(["docker","events","--since",START,"--until",END,"--filter","container="+cid,"--format","{{.Time}} {{.Action}} {{.Actor.ID}}"])
               print(json.dumps({"incident_container_events":cid,"exit":rc,"note":safe(err)}))
               for line in out.splitlines()[:100]:
                   if re.fullmatch(r"[0-9]+ [a-z_]+ [0-9a-f]+",line):
