@@ -12,6 +12,7 @@ import {
   getAgentJobThread,
 } from '@/lib/api/agents';
 import { CONVERSATION_RESTORED_EVENT, type ConversationRestoredDetail } from './conversationEvents';
+import { onAgentSessionsChanged } from '@/lib/api/agentSessionEvents';
 import { PaneResizer } from './PaneResizer';
 import { useAgentProjects } from './useAgentJobs';
 import { announcePaneResize, useResizablePane } from './useResizablePane';
@@ -58,6 +59,8 @@ export function AgentsSidebar({ collapsed = false }: { collapsed?: boolean }) {
     userId?: string;
     row: SidebarConversation;
   } | null>(null);
+  const sessionGeneration = useRef(0);
+  const [sessionRefresh, setSessionRefresh] = useState(0);
   const [hiddenThreads, setHiddenThreads] = useState<Set<string>>(new Set());
   const [archiving, setArchiving] = useState<string | null>(null);
   const [pinning, setPinning] = useState<string | null>(null);
@@ -107,6 +110,23 @@ export function AgentsSidebar({ collapsed = false }: { collapsed?: boolean }) {
   useEffect(() => {
     setHiddenThreads(new Set());
   }, [userId]);
+  useEffect(
+    () =>
+      onAgentSessionsChanged((change) => {
+        sessionGeneration.current += 1;
+        setSessionRefresh(sessionGeneration.current);
+        for (const id of change.threadIds) knownRows.delete(id);
+        setHiddenThreads((current) => {
+          const next = new Set(current);
+          for (const id of change.threadIds) {
+            if (change.archived === false && !change.deleted) next.delete(id);
+            else next.add(id);
+          }
+          return next;
+        });
+      }),
+    [knownRows],
+  );
   useEffect(() => {
     const restored = (event: Event) => {
       const detail = (event as CustomEvent<ConversationRestoredDetail>).detail;
@@ -127,12 +147,13 @@ export function AgentsSidebar({ collapsed = false }: { collapsed?: boolean }) {
   }, [userId, reload, reloadProjects]);
   useEffect(() => {
     let cancelled = false;
+    const generation = sessionGeneration.current;
     setSelected(null);
     const id = /^\/([^/]+)$/.exec(pathname)?.[1];
     if (!id || ['archived', 'integrations', 'admin', 'login'].includes(id)) return;
     Promise.all([getAgentJob(id), getAgentJobThread(id)])
       .then(([job, thread]) => {
-        if (cancelled) return;
+        if (cancelled || generation !== sessionGeneration.current) return;
         const latest =
           thread?.jobs.reduce((a, b) => ((b.turn_no ?? 1) > (a.turn_no ?? 1) ? b : a), job) ?? job;
         const row = conversationRow({
@@ -155,7 +176,7 @@ export function AgentsSidebar({ collapsed = false }: { collapsed?: boolean }) {
     return () => {
       cancelled = true;
     };
-  }, [pathname, userId, updatePreferences, knownRows]);
+  }, [pathname, userId, updatePreferences, knownRows, sessionRefresh]);
   const mountPath = useRef(pathname);
   useEffect(() => {
     if (mountPath.current === pathname) return;

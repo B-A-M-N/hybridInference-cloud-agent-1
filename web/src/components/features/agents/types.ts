@@ -209,6 +209,7 @@ export interface AgentJob {
   finishedAt?: string | null;
   /** Conversation-level pin time. Every turn in the same thread shares it. */
   pinnedAt?: string | null;
+  archivedAt?: string | null;
   title: string;
   /** Complete current-turn prompt. Older fixtures may only have `title`. */
   prompt?: string;

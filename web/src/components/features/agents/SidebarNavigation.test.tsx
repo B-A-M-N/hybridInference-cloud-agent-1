@@ -2,7 +2,8 @@
 import '@testing-library/jest-dom/vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AgentConversationApi, AgentJobApi } from '@/lib/api/agents';
+import type { AgentConversationApi, AgentJobApi, AgentSessionListOptions } from '@/lib/api/agents';
+import { announceAgentSessionsChanged } from '@/lib/api/agentSessionEvents';
 const api = vi.hoisted(() => ({
   list: vi.fn(),
   projects: vi.fn(),
@@ -11,6 +12,8 @@ const api = vi.hoisted(() => ({
   archive: vi.fn(),
   restore: vi.fn(),
   archivedJobs: vi.fn(),
+  sessions: vi.fn(),
+  setArchived: vi.fn(),
   pin: vi.fn(),
   pathname: '/',
   params: '',
@@ -23,16 +26,19 @@ vi.mock('next/navigation', () => ({
 }));
 vi.mock('@/components/providers', async () => {
   const { translate } = await import('@/lib/i18n/translate');
+  const t = (key: Parameters<typeof translate>[1], vars?: Parameters<typeof translate>[2]) =>
+    translate('en', key, vars);
   return {
     useAuth: () => ({ state: { user: { id: api.user } } }),
-    useT: () => (key: Parameters<typeof translate>[1], vars?: Parameters<typeof translate>[2]) =>
-      translate('en', key, vars),
+    useT: () => t,
+    useLocale: () => ({ locale: 'en', t }),
   };
 });
 vi.mock('@/components/features/settings/SettingsLauncher', () => ({
   SettingsLauncher: () => null,
 }));
-vi.mock('@/lib/api/agents', () => ({
+vi.mock('@/lib/api/agents', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/api/agents')>()),
   listAgentConversations: api.list,
   listAgentProjects: api.projects,
   getAgentJob: api.get,
@@ -40,6 +46,8 @@ vi.mock('@/lib/api/agents', () => ({
   archiveAgentJob: api.archive,
   restoreAgentJob: api.restore,
   listAgentJobs: api.archivedJobs,
+  listAgentSessions: api.sessions,
+  setAgentSessionsArchived: api.setArchived,
   pinAgentJob: api.pin,
   unpinAgentJob: api.pin,
 }));
@@ -213,6 +221,48 @@ describe('sidebar navigation interactions', () => {
     );
     expect(screen.queryByText('Archived only')).not.toBeInTheDocument();
   });
+  it('does not inject a deleted selection when its initial detail response finishes late', async () => {
+    api.pathname = '/deleted';
+    const deleted = conversation('deleted');
+    let resolveOld!: (value: AgentJobApi) => void;
+    api.get.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveOld = resolve;
+        }),
+    );
+    api.thread.mockResolvedValue({
+      thread_id: deleted.job.thread_id,
+      title: 'Deleted conversation',
+      jobs: [deleted.job],
+      messages: [],
+    });
+    render(<AgentsSidebar />);
+    await screen.findByText('Task a');
+    act(() => announceAgentSessionsChanged({ threadIds: [deleted.job.thread_id!], deleted: true }));
+    await waitFor(() => expect(api.get).toHaveBeenCalledTimes(2));
+    await act(async () => resolveOld(deleted.job));
+    expect(screen.queryByText('Deleted conversation')).not.toBeInTheDocument();
+    expect(screen.queryByText('Current')).not.toBeInTheDocument();
+  });
+  it('removes a deleted selection from the remembered navigation rows', async () => {
+    api.pathname = '/deleted';
+    const deleted = conversation('deleted');
+    api.get.mockResolvedValue(deleted.job);
+    api.thread.mockResolvedValue({
+      thread_id: deleted.job.thread_id,
+      title: 'Deleted conversation',
+      jobs: [deleted.job],
+      messages: [],
+    });
+    render(<AgentsSidebar />);
+    await screen.findByText('Deleted conversation');
+    api.get.mockRejectedValue(new Error('Session no longer available'));
+    act(() => announceAgentSessionsChanged({ threadIds: [deleted.job.thread_id!], deleted: true }));
+    await waitFor(() => expect(screen.queryByText('Deleted conversation')).not.toBeInTheDocument());
+    expect(screen.queryByText('Current')).not.toBeInTheDocument();
+  });
+
   it('searches server history including archived results, escapes highlights, and restores grouping', async () => {
     const archived = { ...conversation('old'), archived: true, title: 'Old <img> task' };
     api.list.mockImplementation(
@@ -354,8 +404,37 @@ describe('sidebar navigation interactions', () => {
     api.archive.mockImplementation(async () => {
       archived = true;
     });
-    api.restore.mockImplementation(async () => {
-      archived = false;
+    api.setArchived.mockImplementation(async (ids: string[], value: boolean) => {
+      archived = value;
+      announceAgentSessionsChanged({ threadIds: ids, archived: value });
+      return {
+        sessions: ids.map((thread_id) => ({
+          thread_id,
+          archived: value,
+          archived_at: value ? '2026-09-01T00:00:00Z' : null,
+        })),
+      };
+    });
+    api.sessions.mockImplementation(async (options: AgentSessionListOptions) => {
+      const archivedSession = {
+        thread_id: old.job.thread_id,
+        title: old.title,
+        job: old.job,
+        can_delete: true,
+        archived_at: '2026-09-01T00:00:00Z',
+      };
+      const sessions = archived ? [archivedSession] : [];
+      return {
+        sessions,
+        total: options.includeSummary === false ? null : sessions.length,
+        projects:
+          options.includeSummary === false
+            ? null
+            : archived
+              ? [{ repo: old.job.repo, count: 1 }]
+              : [],
+        next_cursor: null,
+      };
     });
     api.archivedJobs.mockImplementation(async () => (archived ? [old.job] : []));
     api.list.mockImplementation(async ({ q, repo }: { q?: string; repo?: string }) => ({
@@ -383,12 +462,12 @@ describe('sidebar navigation interactions', () => {
         <ArchivedTasksView />
       </>,
     );
-    await screen.findByRole('button', { name: 'Restore' });
+    await screen.findByRole('button', { name: 'Unarchive Task old' });
     fireEvent.click(screen.getByRole('button', { name: 'Search tasks' }));
     fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Task old' } });
     await screen.findByText('No matching tasks. Try another title or repository.');
     const queriesBeforeRestore = api.projects.mock.calls.length;
-    fireEvent.click(screen.getByRole('button', { name: 'Restore' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Unarchive Task old' }));
     await screen.findByRole('link', { name: 'Task old · owner/repo' });
     expect(api.projects.mock.calls.length).toBeGreaterThan(queriesBeforeRestore);
     fireEvent.click(screen.getByRole('button', { name: 'Close search' }));
