@@ -1838,3 +1838,72 @@ def test_shared_claude_turn_fences_and_returns_exact_tool_marks():
         ("reap-except", 0, ((41, 400),)),
         ("normalize", 0),
     ]
+
+
+def test_the_census_has_its_own_clock_and_honours_its_own_interval():
+    """The census must not depend on the turn emitting events.
+
+    Driving censuses from the turn's event stream meant a turn that spent its
+    time waiting on a model produced almost none, while the summary still
+    advertised a one-second period. This pins the independent tick: one
+    census, then nothing until the interval has passed.
+    """
+    manager = _Manager()
+    manager.backend.runtime = KATA_RUNTIME
+    supervisor = SharedChatSessionSupervisor(
+        manager,
+        transport_factory=_TransportFactory(),
+        window_sample_interval_s=10.0,
+    )
+    lease = supervisor.acquire(
+        _spec(),
+        thread_id="athr_source",
+        owner="attempt:1",
+        activation_generation=1,
+        has_settled_context=True,
+        manifest=_members(),
+    )
+    supervisor.ensure_resident(
+        "athr_source",
+        lease.token,
+        _launch("athr_source", native_session_id="native-source", slot=0),
+    )
+    # The sampler thread is started with the supervisor; stop it so this test
+    # drives the tick itself and asserts the interval deterministically.
+    supervisor._stop.set()
+    if supervisor._sampler_thread is not None:
+        supervisor._sampler_thread.join(timeout=2)
+
+    supervisor.start_turn(
+        "athr_source",
+        lease.token,
+        prompt="work",
+        model="glm-5.1",
+        reasoning_effort=None,
+    )
+    registered = [event for event in manager.events if event[0] == "member-window"]
+    assert registered[-1] == ("member-window", "register")
+
+    assert supervisor.sample_open_windows() == 1
+    sampled = [event for event in manager.events if event[0] == "member-window"]
+    assert sampled[-1] == ("member-window", "sample")
+
+    # Within the interval nothing more is due, so the period is the census's
+    # own property rather than however often a caller happens to ask.
+    assert supervisor.sample_open_windows() == 0
+    assert [event for event in manager.events if event[0] == "member-window"] == sampled
+
+
+def test_a_member_without_an_open_window_is_never_censused():
+    """Nothing is measured for a member that is not running a turn."""
+    manager = _Manager()
+    manager.backend.runtime = KATA_RUNTIME
+    supervisor = SharedChatSessionSupervisor(
+        manager,
+        transport_factory=_TransportFactory(),
+        window_sample_interval_s=10.0,
+    )
+    supervisor._stop.set()
+
+    assert supervisor.sample_open_windows() == 0
+    assert [event for event in manager.events if event[0] == "member-window"] == []

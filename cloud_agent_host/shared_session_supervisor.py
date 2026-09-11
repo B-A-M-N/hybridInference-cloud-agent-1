@@ -38,6 +38,7 @@ from cloud_agent_host.guest_observer import (
     GuestObserverCursor,
 )
 from cloud_agent_host.member_resources import (
+    MEMBER_WINDOW_SAMPLE_INTERVAL_MS,
     RUNNING_CHECKPOINT_INTERVAL_S,
     CheckpointSchedule,
     MemberWindowHandle,
@@ -221,6 +222,8 @@ class _Member:
     window_sampler: MemberWindowSampler | None = None
     window_sequence: int = 0
     window_checkpoints: CheckpointSchedule | None = None
+    #: When this window's next census is due, on the supervisor's clock.
+    window_next_sample_mono: float = 0.0
     turn_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
@@ -257,6 +260,7 @@ class SharedChatSessionSupervisor:
         transport_factory: ResidentTransportFactory | None = None,
         native_forker: NativeForker | None = None,
         checkpoint_interval_s: float = RUNNING_CHECKPOINT_INTERVAL_S,
+        window_sample_interval_s: float = MEMBER_WINDOW_SAMPLE_INTERVAL_MS / 1000,
         window_checkpoint_hook: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         if idle_timeout_s <= 0 or sweep_interval_s <= 0:
@@ -266,6 +270,11 @@ class SharedChatSessionSupervisor:
         #: still running, so a crash keeps the work measured up to the last
         #: checkpoint. It must never raise into the turn.
         self._window_checkpoint_hook = window_checkpoint_hook
+        #: The census period. One second is what the summary reports and what
+        #: a reader compares across turns, so the sampler owns it.
+        self._sample_interval_s = window_sample_interval_s if window_sample_interval_s > 0 else 1.0
+        self._sample_tick_s = min(0.25, self._sample_interval_s / 4)
+        self._sampler_thread: threading.Thread | None = None
         self._manager = manager
         self._idle_timeout_s = idle_timeout_s
         self._sweep_interval_s = sweep_interval_s
@@ -297,6 +306,13 @@ class SharedChatSessionSupervisor:
                 name="shared-chat-sandbox-idle-sweep",
             )
             self._thread.start()
+            if self._sampler_thread is None or not self._sampler_thread.is_alive():
+                self._sampler_thread = threading.Thread(
+                    target=self._sample_loop,
+                    daemon=True,
+                    name="shared-member-window-sampler",
+                )
+                self._sampler_thread.start()
 
     def close(self) -> None:
         """Stop the supervisor process; leave Docker-owned state intact."""
@@ -658,7 +674,8 @@ class SharedChatSessionSupervisor:
                                 group.spec,
                                 argv,
                                 timeout_s=timeout_s,
-                            )
+                            ),
+                            interval_s=self._sample_interval_s,
                         )
                         window = window_sampler.open(
                             uid=MEMBER_UID_BASE + member.resident_slot_id,
@@ -936,23 +953,70 @@ class SharedChatSessionSupervisor:
             )
             return None
 
+    def sample_open_windows(self) -> int:
+        """Take one census for every member window that is due for one.
+
+        The census has its own clock on purpose. Driving it from the turn's
+        event stream meant it ran only when the agent happened to emit
+        something, so a turn that spent its time waiting on a model produced
+        almost no cycles, and the per-instance deltas and the PSS peak were
+        computed from a handful of readings while the summary still advertised
+        a one-second period.
+
+        Returns how many windows were sampled. A census that fails is not
+        retried here: the next tick is a second away and a late census no
+        longer describes the moment it was asked about.
+        """
+        sampled = 0
+        now = time.monotonic()
+        with self._lock:
+            members = [
+                member
+                for group in self._groups.values()
+                for member in group.members.values()
+                if member.window is not None
+                and member.window_sampler is not None
+                and member.window.baseline_taken
+            ]
+            due: list[tuple[Any, MemberWindowSampler, int]] = []
+            for member in members:
+                sampler = member.window_sampler
+                assert sampler is not None
+                if now < member.window_next_sample_mono:
+                    continue
+                member.window_next_sample_mono = now + sampler.interval_s
+                member.window_sequence += 1
+                due.append((member.window, sampler, member.window_sequence))
+        for window, sampler, sequence in due:
+            with contextlib.suppress(Exception):
+                sampler.sample(window, sequence)
+            sampled += 1
+        return sampled
+
+    def _sample_loop(self) -> None:
+        """Census every open window once a second until the supervisor stops."""
+        while not self._stop.wait(self._sample_tick_s):
+            with contextlib.suppress(Exception):
+                self.sample_open_windows()
+
     def checkpoint_running_window(
         self,
         thread_id: str,
         token: str,
     ) -> dict[str, Any] | None:
-        """Take one cumulative checkpoint for a member's running turn.
+        """Build one cumulative checkpoint for a member's running turn.
 
         Returns the snapshot to report, or None when no checkpoint is due or
         the member has no open window. The schedule owns the cadence: a caller
         may invoke this on any poll and only the fifteenth second produces a
-        report.
+        report. The censuses themselves are taken by
+        :meth:`sample_open_windows` on their own clock, so this only decides
+        when to upload.
 
-        A checkpoint describes the same counters as the final snapshot with
-        the window still open. The sample it takes is not read back here --
-        the window's own journal slice is frozen at close -- but taking it
-        keeps the censuses roughly one second apart, which is what the
-        per-instance deltas and the PSS peak are computed from.
+        The snapshot carries the counters this window has been credited with
+        so far. It is built from the member's running reducer rather than a
+        fresh one, so a checkpoint describes the same measurement the final
+        report will, with the window still open.
         """
         with self._lock:
             try:
@@ -968,8 +1032,6 @@ class SharedChatSessionSupervisor:
                 return None
             if not window.baseline_taken or not schedule.due():
                 return None
-            window_sampler.sample(window, sequence + 1)
-            member.window_sequence = sequence + 1
             schedule.mark_sent()
             boot_id = getattr(cursor, "guest_boot_id", "") or ""
             opened = getattr(cursor, "guest_mono_ns", 0) or 0
