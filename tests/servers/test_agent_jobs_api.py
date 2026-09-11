@@ -6080,8 +6080,9 @@ async def test_a_thread_event_read_refuses_a_foreign_job(
     assert response.status_code == 404
 
 
+@pytest.mark.parametrize("session_state", ["queued", "running", "idle", "failed"])
 async def test_session_listing_exposes_stable_titles_facets_and_archive_state(
-    client: AsyncClient, store: FakeAgentJobStore, monkeypatch
+    client: AsyncClient, store: FakeAgentJobStore, monkeypatch, session_state: str
 ):
     job_id = await _create_job(client)
     await store.set_thread_archived(job_id=job_id, user_id=_OWNER, archived=True)
@@ -6112,7 +6113,7 @@ async def test_session_listing_exposes_stable_titles_facets_and_archive_state(
             "archived": "true",
             "search": "  Stable  ",
             "repo": "owner/name",
-            "state": "queued",
+            "state": session_state,
             "limit": 20,
             "cursor": "previous-page",
         },
@@ -6129,11 +6130,22 @@ async def test_session_listing_exposes_stable_titles_facets_and_archive_state(
         archived=True,
         search="Stable",
         repo="owner/name",
-        state="queued",
+        state=session_state,
         limit=20,
         cursor="previous-page",
         include_summary=True,
     )
+
+
+async def test_job_response_preserves_turn_result_beside_conversation_activity(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    job_id = await _create_job(client)
+    store.jobs[job_id].update(state="cancelled", conversation_state="running")
+    response = await client.get(f"/v1/agent/jobs/{job_id}")
+    assert response.status_code == 200
+    assert response.json()["state"] == "cancelled"
+    assert response.json()["conversation_state"] == "running"
 
 
 async def test_session_list_can_omit_summary(

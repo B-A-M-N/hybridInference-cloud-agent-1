@@ -17,16 +17,16 @@ All three are nullable and no existing row is backfilled. A turn recorded
 before this revision was not measured this way, and a NULL says exactly that;
 writing a zero or an empty object would claim a measurement nobody took.
 
-Revision ID: 0030_attempt_turn_resources
-Revises: 0005_queued_follow_ups
+Revision ID: 0007_attempt_turn_resources
+Revises: 0006_host_capacity
 """
 
 from __future__ import annotations
 
 from alembic import op
 
-revision = "0030_attempt_turn_resources"
-down_revision = "0005_queued_follow_ups"
+revision = "0007_attempt_turn_resources"
+down_revision = "0006_host_capacity"
 branch_labels = None
 depends_on = None
 

@@ -130,14 +130,18 @@ reported figure is the larger **floor** and not an exact number.
 
 ## 3. Storage
 
-### 3.1 Migration `0030_attempt_turn_resources`
+### 3.1 Migration `0007_attempt_turn_resources`
 
-`down_revision = "0005_queued_follow_ups"`: the migration chain was rewritten
-into a single baseline (`0001`) plus four additive revisions, so the numbered
-chain the original design assumed does not exist on this line. **If this lands
-on a lineage that still carries the old `0006`-`0029` chain, this file must be
-renumbered and reparented to that head**; two Alembic heads, or a revision
-whose parent is absent, will fail the deployment rather than the tests.
+`down_revision = "0006_host_capacity"`: the migration chain was rewritten into
+a single baseline (`0001`) plus additive revisions, so the numbered chain the
+original design assumed does not exist on this line. This file has already
+been reparented once — it was written as `0030` against `0005`, and the host
+capacity work landed `0006` in between, which would have produced two heads.
+Anything else that lands on this chain must reparent this revision rather than
+assume its number is free; two Alembic heads, or a revision whose parent is
+absent, fail at deploy rather than in the tests.
+`tests/unit/test_schema_baseline.py` asserts exactly one head and no revision
+revised twice.
 
 Three nullable columns on `agent_attempt_resources`; old rows stay valid and
 are never backfilled. A partial index over the rows that actually carry a
