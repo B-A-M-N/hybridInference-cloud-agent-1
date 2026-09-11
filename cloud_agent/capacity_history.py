@@ -35,14 +35,13 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
-from cloud_agent.capacity_protocol import history_point_write_from_row
+from cloud_agent.capacity_protocol import CAPACITY_HISTORY_RETENTION_S, history_point_write_from_row
 from cloud_agent.logging_utils import get_logger
-from cloud_agent.storage.store import CAPACITY_HISTORY_RETENTION_S
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from cloud_agent.storage.store import AgentJobStore
+    from cloud_agent.ports import HostCapacityRepository
 
 logger = get_logger(__name__)
 
@@ -71,7 +70,7 @@ HISTORY_PRUNE_BATCH_SIZE = 2000
 
 
 async def collect_host_capacity_history(
-    store: AgentJobStore,
+    store: HostCapacityRepository,
     *,
     interval_seconds: float = HISTORY_INTERVAL_S,
     batch_size: int = HISTORY_BATCH_SIZE,
@@ -83,7 +82,7 @@ async def collect_host_capacity_history(
     """Record one capacity observation per host per minute, and prune old ones.
 
     Args:
-        store: The agent store.
+        store: The host-capacity capability.
         interval_seconds: Delay between rounds.
         batch_size: Hosts per page.
         batch_timeout_seconds: Ceiling on one database batch.
@@ -123,7 +122,7 @@ async def collect_host_capacity_history(
 
 
 async def _record_round(
-    store: AgentJobStore,
+    store: HostCapacityRepository,
     cursor: str | None,
     *,
     batch_size: int,
@@ -223,7 +222,7 @@ def _log_truncated() -> None:
 
 
 async def _write_point(
-    store: AgentJobStore, row: dict[str, Any], *, timeout_seconds: float
+    store: HostCapacityRepository, row: dict[str, Any], *, timeout_seconds: float
 ) -> None:
     """Persist one candidate row, isolating its failures from the round.
 
@@ -270,7 +269,7 @@ async def _write_point(
         )
 
 
-async def _prune(store: AgentJobStore, *, limit: int, timeout_seconds: float) -> None:
+async def _prune(store: HostCapacityRepository, *, limit: int, timeout_seconds: float) -> None:
     """Delete one bounded batch of expired history, or give up until next round.
 
     Retention failure is logged at warning level and never raised: a full disk

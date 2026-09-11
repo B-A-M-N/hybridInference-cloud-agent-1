@@ -14,11 +14,14 @@ import os
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
+
+if TYPE_CHECKING:
+    from cloud_agent.ports import SourceControlRepository
 
 GITLAB_ORIGIN = "https://gitlab.com"
 OAUTH_STATE_TTL = timedelta(minutes=10)
@@ -81,7 +84,7 @@ def _state_hash(state: str) -> str:
 
 
 async def issue_oauth_state(
-    store: Any,
+    store: SourceControlRepository,
     *,
     user_id: str,
     provider: str,
@@ -96,14 +99,16 @@ async def issue_oauth_state(
         state_hash=_state_hash(state),
         user_id=user_id,
         provider=provider,
-        code_verifier_ciphertext=cipher.encrypt(code_verifier) if code_verifier else None,
+        code_verifier_ciphertext=(
+            cipher.encrypt(code_verifier) if code_verifier and cipher is not None else None
+        ),
         expires_at=datetime.now(timezone.utc) + OAUTH_STATE_TTL,
     )
     return state
 
 
 async def consume_oauth_state(
-    store: Any,
+    store: SourceControlRepository,
     *,
     state: str,
     user_id: str,
@@ -199,7 +204,7 @@ class GitLabOAuthClient:
         self._timeout_s = timeout_s
         self._transport = transport
 
-    async def authorization_url(self, store: Any, *, user_id: str) -> str:
+    async def authorization_url(self, store: SourceControlRepository, *, user_id: str) -> str:
         """Create a PKCE authorization URL backed by one-time server state."""
         verifier = secrets.token_urlsafe(64)[:96]
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(
@@ -285,6 +290,8 @@ class GitLabOAuthClient:
         created_at = token.get("created_at")
         expires_in = token.get("expires_in")
         try:
+            if created_at is None or expires_in is None:
+                raise ValueError("the token response carries no usable expiry")
             issued = datetime.fromtimestamp(float(created_at), tz=timezone.utc)
             lifetime = max(1, int(expires_in))
         except (TypeError, ValueError, OSError):
@@ -357,7 +364,9 @@ class GitLabOAuthClient:
                 break
         return projects
 
-    async def access_token_for_connection(self, store: Any, connection: dict[str, Any]) -> str:
+    async def access_token_for_connection(
+        self, store: SourceControlRepository, connection: dict[str, Any]
+    ) -> str:
         """Decrypt a live token, rotating both tokens before expiry."""
         expires_at = connection["expires_at"]
         if expires_at.tzinfo is None:
@@ -376,7 +385,7 @@ class GitLabOAuthClient:
         return refreshed["access_token"]
 
     async def projects_for_connection(
-        self, store: Any, connection: dict[str, Any]
+        self, store: SourceControlRepository, connection: dict[str, Any]
     ) -> list[dict[str, Any]]:
         """List projects with the connection's live or refreshed token."""
         token = await self.access_token_for_connection(store, connection)

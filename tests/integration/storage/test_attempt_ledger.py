@@ -12,7 +12,8 @@ import pytest
 import pytest_asyncio
 
 from cloud_agent.ledger import summarize_conversation
-from cloud_agent.storage.store import AgentJobStore
+from cloud_agent.storage.assembly import Storage
+from cloud_agent.storage.repositories.ledger import PostgresLedgerRepository
 from cloud_agent.thread_stats import summarize_thread
 from tests.integration.storage.test_agent_job_store import (
     _claim,
@@ -27,7 +28,7 @@ pytestmark = [pytest.mark.dbtest, pytest.mark.asyncio]
 
 
 @pytest_asyncio.fixture
-async def store(monkeypatch):
+async def db(monkeypatch):
     """Migrate a dedicated test database and clean only its Agent tables."""
     name = os.getenv("TEST_DB_NAME", "cloud_agent_ledger_test_db")
     worker = os.getenv("PYTEST_XDIST_WORKER", "master")
@@ -57,10 +58,22 @@ async def store(monkeypatch):
 
     await clean()
     try:
-        yield AgentJobStore(pool)
+        yield pool
     finally:
         await clean()
         await pool.close()
+
+
+@pytest_asyncio.fixture
+async def store(db):
+    """Everything else this test needs, to set a claim up."""
+    return Storage(db)
+
+
+@pytest_asyncio.fixture
+async def ledger(db):
+    """The capability under test, on the repository that now owns it."""
+    return PostgresLedgerRepository(db)
 
 
 def _fence(job: dict, claim: dict, sandbox: dict) -> dict:
@@ -74,14 +87,14 @@ def _fence(job: dict, claim: dict, sandbox: dict) -> dict:
 
 
 async def _residency(
-    store: AgentJobStore,
+    store: Storage,
     job: dict,
     sandbox: dict,
     *,
     grant_id: str = "grant-actual-resident",
     binding_id: str | None = "gateway-binding-one",
 ) -> dict:
-    residency = await store.establish_residency(
+    residency = await store.residency.establish_residency(
         thread_id=job["thread_id"],
         host="shared-runner",
         runtime_id="claude-code",
@@ -90,7 +103,7 @@ async def _residency(
         sandbox_id=sandbox["sandbox_id"],
     )
     assert residency is not None
-    assert await store.link_residency_grant(
+    assert await store.grants.link_residency_grant(
         thread_id=job["thread_id"],
         generation=residency["generation"],
         grant_id=grant_id,
@@ -99,8 +112,8 @@ async def _residency(
     return residency
 
 
-async def _record(store: AgentJobStore, job: dict, claim: dict, sandbox: dict, residency: dict):
-    return await store.record_shared_thread_residency(
+async def _record(store: Storage, job: dict, claim: dict, sandbox: dict, residency: dict):
+    return await store.sandbox.record_shared_thread_residency(
         thread_id=job["thread_id"],
         attempt_id=claim["attempt_id"],
         lease_generation=claim["lease_generation"],
@@ -110,7 +123,8 @@ async def _record(store: AgentJobStore, job: dict, claim: dict, sandbox: dict, r
 
 
 async def _seed_attempt(
-    store: AgentJobStore,
+    db,
+    store: Storage,
     *,
     job: dict | None = None,
     attempt_no: int = 1,
@@ -121,7 +135,7 @@ async def _seed_attempt(
     """Seed historical attempts to exercise refresh scheduling independently."""
     job = await _create_job(store) if job is None else job
     started_at = started_at or datetime.now(timezone.utc) - timedelta(seconds=10)
-    async with store._pool.acquire() as conn:
+    async with db.acquire() as conn:
         attempt_id = await conn.fetchval(
             """
             INSERT INTO agent_attempts (
@@ -152,8 +166,8 @@ async def _seed_attempt(
     return job, attempt_id, ledger_id
 
 
-async def _force_due(store: AgentJobStore, ledger_id: int) -> None:
-    async with store._pool.acquire() as conn:
+async def _force_due(db, store: Storage, ledger_id: int) -> None:
+    async with db.acquire() as conn:
         await conn.execute(
             "UPDATE agent_attempt_ledger SET next_refresh_at = NOW() - INTERVAL '1 second' "
             "WHERE id = $1",
@@ -161,32 +175,34 @@ async def _force_due(store: AgentJobStore, ledger_id: int) -> None:
         )
 
 
-async def test_conversation_usage_is_owner_scoped_and_does_not_include_other_threads(store):
+async def test_conversation_usage_is_owner_scoped_and_does_not_include_other_threads(
+    db, store, ledger: PostgresLedgerRepository
+):
     """One read includes sibling turns, keeps unstarted ones, and excludes forks."""
     # Real turns of one thread: the schema ties a job's parent, messages and
     # owner to its thread, so a conversation is built the way the API builds
     # one rather than by re-pointing rows. Another owner's job cannot be
     # placed in this thread at all any more; owner scoping is still asserted
     # on the read below.
-    first, first_attempt, first_ledger = await _seed_attempt(store)
-    second = await store.create_follow_up(
+    first, first_attempt, first_ledger = await _seed_attempt(db, store)
+    second = await store.conversation_commands.create_follow_up(
         parent_job_id=first["id"], user_id="user-1", prompt="second turn"
     )
     assert second is not None and second.get("error") is None
-    _, second_attempt, second_ledger = await _seed_attempt(store, job=second)
-    queued = await store.create_follow_up(
+    _, second_attempt, second_ledger = await _seed_attempt(db, store, job=second)
+    queued = await store.conversation_commands.create_follow_up(
         parent_job_id=second["id"], user_id="user-1", prompt="unstarted turn"
     )
     assert queued is not None and queued.get("error") is None
-    other_thread, _, _ = await _seed_attempt(store)
-    async with store._pool.acquire() as conn:
+    other_thread, _, _ = await _seed_attempt(db, store)
+    async with db.acquire() as conn:
         await conn.execute(
             "UPDATE agent_attempt_ledger SET snapshot = $2::jsonb, queried_at = NOW() "
             "WHERE id = ANY($1::bigint[])",
             [first_ledger, second_ledger],
             json.dumps(report_payload(grant_id="grant-one")),
         )
-    rows = await store.ledger_rows_for_conversation(job_id=first["id"], user_id="user-1")
+    rows = await ledger.ledger_rows_for_conversation(job_id=first["id"], user_id="user-1")
     assert {row["job_id"] for row in rows} == {first["id"], second["id"], queued["id"]}
     assert {row["attempt_id"] for row in rows} == {first_attempt, second_attempt, None}
     summary = summarize_conversation(rows)
@@ -196,15 +212,20 @@ async def test_conversation_usage_is_owner_scoped_and_does_not_include_other_thr
     assert summary.incomplete is False
     assert other_thread["id"] not in {row["job_id"] for row in rows}
     assert (
-        await store.ledger_rows_for_conversation(job_id=first["id"], user_id="another-user") == []
+        await ledger.ledger_rows_for_conversation(job_id=first["id"], user_id="another-user") == []
     )
-    assert await store.ledger_rows_for_conversation(job_id="missing", user_id="user-1") == []
+    assert await ledger.ledger_rows_for_conversation(job_id="missing", user_id="user-1") == []
 
 
 async def _complete(
-    store: AgentJobStore, claim: dict, *, calls: int | None = 2, error: str | None = None
+    store: Storage,
+    claim: dict,
+    *,
+    calls: int | None = 2,
+    error: str | None = None,
+    ledger: PostgresLedgerRepository,
 ) -> bool:
-    return await store.complete_ledger_refresh(
+    return await ledger.complete_ledger_refresh(
         ledger_id=claim["id"],
         refresh_generation=claim["refresh_generation"],
         terminal=claim["terminal"],
@@ -213,10 +234,12 @@ async def _complete(
     )
 
 
-async def test_capture_actual_residency_grant_before_cli_and_preserve_rotations(store):
+async def test_capture_actual_residency_grant_before_cli_and_preserve_rotations(
+    db, store, ledger: PostgresLedgerRepository
+):
     """Grant cleanup and a new residency cannot rewrite an executed attempt."""
     job, claim, sandbox = await _reserve_shared_chat(store)
-    async with store._pool.acquire() as conn:
+    async with db.acquire() as conn:
         await conn.execute(
             "UPDATE agent_attempts SET grant_id = 'disposable-wrong-grant' WHERE id = $1",
             claim["attempt_id"],
@@ -224,7 +247,7 @@ async def test_capture_actual_residency_grant_before_cli_and_preserve_rotations(
     residency = await _residency(store, job, sandbox)
     assert await _record(store, job, claim, sandbox, residency)
     assert await _record(store, job, claim, sandbox, residency)
-    rows = await store.ledger_rows_for_job(job_id=job["id"])
+    rows = await ledger.ledger_rows_for_job(job_id=job["id"])
     assert len(rows) == 1
     original = rows[0]
     assert original["grant_id"] == "grant-actual-resident"
@@ -232,11 +255,11 @@ async def test_capture_actual_residency_grant_before_cli_and_preserve_rotations(
     assert original["window_since"] == original["started_at"]
     assert original["snapshot"] is None and original["refreshing"] is False
 
-    async with store._pool.acquire() as conn:
+    async with db.acquire() as conn:
         await conn.execute(
             "UPDATE agent_attempts SET grant_id = NULL WHERE id = $1", claim["attempt_id"]
         )
-    rotated = await store.establish_residency(
+    rotated = await store.residency.establish_residency(
         thread_id=job["thread_id"],
         host="shared-runner",
         runtime_id="claude-code",
@@ -246,14 +269,14 @@ async def test_capture_actual_residency_grant_before_cli_and_preserve_rotations(
     )
     assert rotated["previous_grant_id"] == original["grant_id"]
     assert rotated["grant_id"] is None and rotated["ledger_binding_id"] is None
-    assert await store.link_residency_grant(
+    assert await store.grants.link_residency_grant(
         thread_id=job["thread_id"],
         generation=rotated["generation"],
         grant_id="grant-rotated",
         binding_id="gateway-binding-two",
     )
     assert await _record(store, job, claim, sandbox, rotated)
-    rows = await store.ledger_rows_for_job(job_id=job["id"])
+    rows = await ledger.ledger_rows_for_job(job_id=job["id"])
     assert len(rows) == 2
     assert rows[0]["id"] == original["id"]
     assert rows[0]["grant_id"] == original["grant_id"]
@@ -264,17 +287,19 @@ async def test_capture_actual_residency_grant_before_cli_and_preserve_rotations(
     assert rows[1]["window_since"] == original["window_since"]
 
 
-async def test_hot_followup_captures_same_grant_for_its_own_attempt(store):
+async def test_hot_followup_captures_same_grant_for_its_own_attempt(
+    store, ledger: PostgresLedgerRepository
+):
     """A retained CLI gets a durable reference when its next prompt is admitted."""
     job, claim, sandbox = await _reserve_shared_chat(store)
     fence = _fence(job, claim, sandbox)
-    assert await store.mark_thread_sandbox_running(
+    assert await store.sandbox.mark_thread_sandbox_running(
         **fence, container_id="ledger-container", context_status="new"
     )
     residency = await _residency(store, job, sandbox)
     assert await _record(store, job, claim, sandbox, residency)
-    assert await store.admit_thread_sandbox_turn(**fence, job_id=job["id"])
-    assert await store.settle_thread_sandbox(
+    assert await store.sandbox.admit_thread_sandbox_turn(**fence, job_id=job["id"])
+    assert await store.sandbox.settle_thread_sandbox(
         **fence,
         job_id=job["id"],
         context_status="live",
@@ -282,14 +307,14 @@ async def test_hot_followup_captures_same_grant_for_its_own_attempt(store):
         idle_timeout_seconds=1800,
         base_sha=job["base_sha"],
     )
-    assert await store.transition(
+    assert await store.attempt_commands.transition(
         job_id=job["id"],
         attempt_id=claim["attempt_id"],
         lease_generation=claim["lease_generation"],
         from_states=("running",),
         to_state="succeeded",
     )
-    followup = await store.create_follow_up(
+    followup = await store.conversation_commands.create_follow_up(
         parent_job_id=job["id"], user_id=job["user_id"], prompt="continue the retained turn"
     )
     following_claim = await _claim(
@@ -300,7 +325,7 @@ async def test_hot_followup_captures_same_grant_for_its_own_attempt(store):
         host_credential_hash="test-credential-hash",
     )
     assert following_claim["id"] == followup["id"]
-    following_sandbox = await store.reserve_thread_sandbox(
+    following_sandbox = await store.sandbox.reserve_thread_sandbox(
         thread_id=job["thread_id"],
         attempt_id=following_claim["attempt_id"],
         lease_generation=following_claim["lease_generation"],
@@ -313,44 +338,48 @@ async def test_hot_followup_captures_same_grant_for_its_own_attempt(store):
         execution_profile=sandbox["execution_profile"],
     )
     next_fence = _fence(followup, following_claim, following_sandbox)
-    assert await store.mark_thread_sandbox_running(
+    assert await store.sandbox.mark_thread_sandbox_running(
         **next_fence, container_id="ledger-container", context_status="live"
     )
-    assert (await store.ledger_rows_for_job(job_id=followup["id"]))[0]["id"] is None
-    assert await store.admit_thread_sandbox_turn(**next_fence, job_id=followup["id"])
-    assert await store.admit_thread_sandbox_turn(**next_fence, job_id=followup["id"])
-    rows = await store.ledger_rows_for_job(job_id=followup["id"])
+    assert (await ledger.ledger_rows_for_job(job_id=followup["id"]))[0]["id"] is None
+    assert await store.sandbox.admit_thread_sandbox_turn(**next_fence, job_id=followup["id"])
+    assert await store.sandbox.admit_thread_sandbox_turn(**next_fence, job_id=followup["id"])
+    rows = await ledger.ledger_rows_for_job(job_id=followup["id"])
     assert len(rows) == 1 and rows[0]["id"] is not None
     assert rows[0]["grant_id"] == "grant-actual-resident"
-    first = (await store.ledger_rows_for_job(job_id=job["id"]))[0]
+    first = (await ledger.ledger_rows_for_job(job_id=job["id"]))[0]
     assert first["id"] != rows[0]["id"]
     assert first["attempt_id"] == claim["attempt_id"]
     assert first["window_until"] <= rows[0]["window_since"]
 
 
 @pytest.mark.parametrize("missing", ["binding", "grant"])
-async def test_missing_historical_attribution_remains_untracked(store, missing):
+async def test_missing_historical_attribution_remains_untracked(
+    db, store, missing, ledger: PostgresLedgerRepository
+):
     """No grant or no binding must never become a false zero."""
     job, claim, sandbox = await _reserve_shared_chat(store)
     residency = await _residency(
         store, job, sandbox, binding_id=None if missing == "binding" else "gateway-binding-one"
     )
     if missing == "grant":
-        async with store._pool.acquire() as conn:
+        async with db.acquire() as conn:
             await conn.execute(
                 "UPDATE agent_thread_sandbox_memberships SET residency_grant_id = NULL "
                 "WHERE thread_id = $1",
                 job["thread_id"],
             )
     assert await _record(store, job, claim, sandbox, residency)
-    assert await store.admit_thread_sandbox_turn(**_fence(job, claim, sandbox), job_id=job["id"])
-    rows = await store.ledger_rows_for_job(job_id=job["id"])
+    assert await store.sandbox.admit_thread_sandbox_turn(
+        **_fence(job, claim, sandbox), job_id=job["id"]
+    )
+    rows = await ledger.ledger_rows_for_job(job_id=job["id"])
     assert len(rows) == 1
     assert rows[0]["attempt_id"] == claim["attempt_id"]
     assert rows[0]["id"] is None and rows[0]["snapshot"] is None
     assert rows[0]["refreshing"] is False
-    assert await store.queue_job_ledger_refresh(job_id=job["id"]) == 0
-    assert await store.claim_due_ledger_refresh() is None
+    assert await ledger.queue_job_ledger_refresh(job_id=job["id"]) == 0
+    assert await ledger.claim_due_ledger_refresh() is None
 
 
 async def test_a_stale_residency_generation_is_refused_at_record(store):
@@ -363,11 +392,11 @@ async def test_a_stale_residency_generation_is_refused_at_record(store):
 
 
 @pytest.mark.parametrize("write", ["startup", "admission"])
-async def test_attribution_insert_failure_rolls_back_the_cli_admission(store, write):
+async def test_attribution_insert_failure_rolls_back_the_cli_admission(db, store, write):
     """A failed snapshot-reference write cannot acknowledge untracked execution."""
     job, claim, sandbox = await _reserve_shared_chat(store)
     residency = await _residency(store, job, sandbox)
-    async with store._pool.acquire() as conn:
+    async with db.acquire() as conn:
         before_generation = await conn.fetchval(
             "SELECT residency_generation FROM agent_thread_sandbox_memberships WHERE thread_id = $1",
             job["thread_id"],
@@ -388,10 +417,10 @@ async def test_attribution_insert_failure_rolls_back_the_cli_admission(store, wr
             if write == "startup":
                 await _record(store, job, claim, sandbox, residency)
             else:
-                await store.admit_thread_sandbox_turn(
+                await store.sandbox.admit_thread_sandbox_turn(
                     **_fence(job, claim, sandbox), job_id=job["id"]
                 )
-        async with store._pool.acquire() as conn:
+        async with db.acquire() as conn:
             member = await conn.fetchrow(
                 "SELECT residency_generation, admitted_job_id "
                 "FROM agent_thread_sandbox_memberships WHERE thread_id = $1",
@@ -401,19 +430,21 @@ async def test_attribution_insert_failure_rolls_back_the_cli_admission(store, wr
         if write == "startup":
             assert member["residency_generation"] == before_generation
     finally:
-        async with store._pool.acquire() as conn:
+        async with db.acquire() as conn:
             await conn.execute(
                 "ALTER TABLE agent_attempt_ledger DROP CONSTRAINT test_ledger_failure"
             )
 
 
 @pytest.mark.parametrize("expired", [False, True])
-async def test_stale_attempt_cannot_capture_a_grant(store, expired):
+async def test_stale_attempt_cannot_capture_a_grant(
+    db, store, expired, ledger: PostgresLedgerRepository
+):
     """The execution fence, including expiry, protects both capture paths."""
     job, claim, sandbox = await _reserve_shared_chat(store)
     residency = await _residency(store, job, sandbox)
     if expired:
-        async with store._pool.acquire() as conn:
+        async with db.acquire() as conn:
             await conn.execute(
                 "UPDATE agent_attempts SET lease_expires_at = NOW() - INTERVAL '1 second' "
                 "WHERE id = $1",
@@ -422,20 +453,23 @@ async def test_stale_attempt_cannot_capture_a_grant(store, expired):
     else:
         claim["lease_generation"] += 1
     assert not await _record(store, job, claim, sandbox, residency)
-    assert not await store.admit_thread_sandbox_turn(
+    assert not await store.sandbox.admit_thread_sandbox_turn(
         **_fence(job, claim, sandbox), job_id=job["id"]
     )
-    assert (await store.ledger_rows_for_job(job_id=job["id"]))[0]["id"] is None
+    assert (await ledger.ledger_rows_for_job(job_id=job["id"]))[0]["id"] is None
 
 
 @pytest.mark.parametrize("write", ["startup", "admission"])
 async def test_capture_serializes_with_finish_without_inverting_attempt_membership_locks(
-    store, write
+    db,
+    store,
+    write,
+    ledger: PostgresLedgerRepository,
 ):
     """A finish owning the attempt can still close membership while capture waits."""
     job, claim, sandbox = await _reserve_shared_chat(store)
     residency = await _residency(store, job, sandbox)
-    async with store._pool.acquire() as conn:
+    async with db.acquire() as conn:
         if write == "admission":
             await conn.execute(
                 "UPDATE agent_thread_sandbox_memberships SET residency_generation = $2 "
@@ -451,7 +485,7 @@ async def test_capture_serializes_with_finish_without_inverting_attempt_membersh
             capture = asyncio.create_task(
                 _record(store, job, claim, sandbox, residency)
                 if write == "startup"
-                else store.admit_thread_sandbox_turn(
+                else store.sandbox.admit_thread_sandbox_turn(
                     **_fence(job, claim, sandbox), job_id=job["id"]
                 )
             )
@@ -486,16 +520,19 @@ async def test_capture_serializes_with_finish_without_inverting_attempt_membersh
                 await asyncio.gather(capture, return_exceptions=True)
                 raise
         assert await asyncio.wait_for(capture, timeout=1) is False
-    assert (await store.ledger_rows_for_job(job_id=job["id"]))[0]["id"] is None
+    assert (await ledger.ledger_rows_for_job(job_id=job["id"]))[0]["id"] is None
 
 
-async def test_all_retry_attempts_visible_and_windows_do_not_overlap(store):
+async def test_all_retry_attempts_visible_and_windows_do_not_overlap(
+    db, store, ledger: PostgresLedgerRepository
+):
     """A delayed finish is clamped without extending a turn through idle gaps."""
     start = datetime.now(timezone.utc) - timedelta(minutes=5)
     job, first_id, _ = await _seed_attempt(
-        store, started_at=start, finished_at=start + timedelta(seconds=120)
+        db, store, started_at=start, finished_at=start + timedelta(seconds=120)
     )
     _, second_id, _ = await _seed_attempt(
+        db,
         store,
         job=job,
         attempt_no=2,
@@ -503,6 +540,7 @@ async def test_all_retry_attempts_visible_and_windows_do_not_overlap(store):
         finished_at=start + timedelta(seconds=90),
     )
     _, third_id, _ = await _seed_attempt(
+        db,
         store,
         job=job,
         attempt_no=3,
@@ -510,190 +548,204 @@ async def test_all_retry_attempts_visible_and_windows_do_not_overlap(store):
         grant_id=None,
     )
     # A different thread starting inside the window is not a boundary.
-    await _seed_attempt(store, started_at=start + timedelta(seconds=20), grant_id=None)
-    rows = await store.ledger_rows_for_job(job_id=job["id"])
+    await _seed_attempt(db, store, started_at=start + timedelta(seconds=20), grant_id=None)
+    rows = await ledger.ledger_rows_for_job(job_id=job["id"])
     assert [row["attempt_id"] for row in rows] == [first_id, second_id, third_id]
     assert rows[0]["window_until"] == start + timedelta(seconds=60)
     assert rows[1]["window_until"] == start + timedelta(seconds=90)
     assert rows[2]["id"] is None and rows[2]["refreshing"] is False
-    claimed = await store.claim_due_ledger_refresh()
+    claimed = await ledger.claim_due_ledger_refresh()
     assert claimed["attempt_id"] == second_id  # Earlier completion has earlier due priority.
     assert claimed["window_until"] == rows[1]["window_until"]
-    claimed = await store.claim_due_ledger_refresh()
+    claimed = await ledger.claim_due_ledger_refresh()
     assert claimed["attempt_id"] == first_id
     assert claimed["window_until"] == rows[0]["window_until"]
 
 
-async def test_refresh_claims_are_exclusive_and_expired_writes_are_fenced(store):
+async def test_refresh_claims_are_exclusive_and_expired_writes_are_fenced(
+    db, store, ledger: PostgresLedgerRepository
+):
     """Two workers cannot fetch one row, and an old response cannot replace a new one."""
-    job, _, ledger_id = await _seed_attempt(store)
-    assert await store.claim_due_ledger_refresh() is None
-    assert await store.queue_job_ledger_refresh(job_id=job["id"]) == 1
-    assert await store.queue_job_ledger_refresh(job_id=job["id"]) == 0
+    job, _, ledger_id = await _seed_attempt(db, store)
+    assert await ledger.claim_due_ledger_refresh() is None
+    assert await ledger.queue_job_ledger_refresh(job_id=job["id"]) == 1
+    assert await ledger.queue_job_ledger_refresh(job_id=job["id"]) == 0
     claims = await asyncio.gather(
-        store.claim_due_ledger_refresh(), store.claim_due_ledger_refresh()
+        ledger.claim_due_ledger_refresh(), ledger.claim_due_ledger_refresh()
     )
     claimed = [claim for claim in claims if claim is not None]
     assert len(claimed) == 1
     first = claimed[0]
     assert first["id"] == ledger_id and first["terminal"] is False
-    assert (await store.ledger_rows_for_job(job_id=job["id"]))[0]["refreshing"] is True
-    assert await store.queue_job_ledger_refresh(job_id=job["id"]) == 0
-    async with store._pool.acquire() as conn:
+    assert (await ledger.ledger_rows_for_job(job_id=job["id"]))[0]["refreshing"] is True
+    assert await ledger.queue_job_ledger_refresh(job_id=job["id"]) == 0
+    async with db.acquire() as conn:
         await conn.execute(
             "UPDATE agent_attempt_ledger "
             "SET refresh_lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
             ledger_id,
         )
-    assert not await _complete(store, first, calls=999)
-    replacement = await store.claim_due_ledger_refresh()
+    assert not await _complete(store, first, ledger=ledger, calls=999)
+    replacement = await ledger.claim_due_ledger_refresh()
     assert replacement["refresh_generation"] == first["refresh_generation"] + 1
-    assert await _complete(store, replacement, calls=3)
-    assert not await _complete(store, first, calls=999)
-    row = (await store.ledger_rows_for_job(job_id=job["id"]))[0]
+    assert await _complete(store, replacement, ledger=ledger, calls=3)
+    assert not await _complete(store, first, ledger=ledger, calls=999)
+    row = (await ledger.ledger_rows_for_job(job_id=job["id"]))[0]
     assert row["snapshot"]["totals"]["calls"] == 3
     assert row["refreshing"] is False
 
 
-async def test_failure_preserves_cached_snapshot_and_throttles_manual_retry(store):
+async def test_failure_preserves_cached_snapshot_and_throttles_manual_retry(
+    db, store, ledger: PostgresLedgerRepository
+):
     """Snapshot freshness and last-attempt time are intentionally different."""
-    job, _, ledger_id = await _seed_attempt(store)
-    await store.queue_job_ledger_refresh(job_id=job["id"])
-    assert await _complete(store, await store.claim_due_ledger_refresh(), calls=7)
-    cached = (await store.ledger_rows_for_job(job_id=job["id"]))[0]
-    await _force_due(store, ledger_id)
+    job, _, ledger_id = await _seed_attempt(db, store)
+    await ledger.queue_job_ledger_refresh(job_id=job["id"])
+    assert await _complete(store, await ledger.claim_due_ledger_refresh(), ledger=ledger, calls=7)
+    cached = (await ledger.ledger_rows_for_job(job_id=job["id"]))[0]
+    await _force_due(db, store, ledger_id)
     assert await _complete(
-        store, await store.claim_due_ledger_refresh(), error="gateway_unavailable"
+        store, await ledger.claim_due_ledger_refresh(), ledger=ledger, error="gateway_unavailable"
     )
-    failed = (await store.ledger_rows_for_job(job_id=job["id"]))[0]
+    failed = (await ledger.ledger_rows_for_job(job_id=job["id"]))[0]
     assert failed["snapshot"] == cached["snapshot"]
     assert failed["queried_at"] == cached["queried_at"]
     assert failed["last_error_code"] == "gateway_unavailable"
-    assert await store.queue_job_ledger_refresh(job_id=job["id"]) == 1
-    retry = (await store.ledger_rows_for_job(job_id=job["id"]))[0]
+    assert await ledger.queue_job_ledger_refresh(job_id=job["id"]) == 1
+    retry = (await ledger.ledger_rows_for_job(job_id=job["id"]))[0]
     assert retry["next_refresh_at"] >= retry["last_refresh_attempt_at"] + timedelta(seconds=5)
-    assert await store.queue_job_ledger_refresh(job_id=job["id"]) == 0
-    assert await store.claim_due_ledger_refresh() is None
-    await _force_due(store, ledger_id)
-    assert await _complete(store, await store.claim_due_ledger_refresh(), calls=8)
-    recovered = (await store.ledger_rows_for_job(job_id=job["id"]))[0]
+    assert await ledger.queue_job_ledger_refresh(job_id=job["id"]) == 0
+    assert await ledger.claim_due_ledger_refresh() is None
+    await _force_due(db, store, ledger_id)
+    assert await _complete(store, await ledger.claim_due_ledger_refresh(), ledger=ledger, calls=8)
+    recovered = (await ledger.ledger_rows_for_job(job_id=job["id"]))[0]
     assert recovered["last_error_code"] is None
     assert recovered["snapshot"]["totals"]["calls"] == 8
     assert recovered["queried_at"] > cached["queried_at"]
 
 
-async def test_terminal_refresh_retries_are_bounded_and_failures_consume_attempts(store):
+async def test_terminal_refresh_retries_are_bounded_and_failures_consume_attempts(
+    db, store, ledger: PostgresLedgerRepository
+):
     """Terminal jobs refresh immediately, after 30 s, and at least 5 min after finish."""
     end = datetime.now(timezone.utc)
     job, attempt_id, ledger_id = await _seed_attempt(
-        store, started_at=end - timedelta(minutes=10), finished_at=end
+        db, store, started_at=end - timedelta(minutes=10), finished_at=end
     )
-    first = await store.claim_due_ledger_refresh()
+    first = await ledger.claim_due_ledger_refresh()
     assert first["terminal"] is True and first["window_until"] == end
-    assert await _complete(store, first, error="gateway_unavailable")
-    row = (await store.ledger_rows_for_job(job_id=job["id"]))[0]
+    assert await _complete(store, first, ledger=ledger, error="gateway_unavailable")
+    row = (await ledger.ledger_rows_for_job(job_id=job["id"]))[0]
     assert row["terminal_refresh_count"] == 1
     assert row["next_refresh_at"] == end + timedelta(seconds=30)
-    assert await store.claim_due_ledger_refresh() is None
+    assert await ledger.claim_due_ledger_refresh() is None
 
     # Advance the fixture's terminal age rather than sleeping; forcing only
     # next_refresh_at must no longer consume a reconciliation ahead of time.
-    async with store._pool.acquire() as conn:
+    async with db.acquire() as conn:
         end = await conn.fetchval(
             "UPDATE agent_attempts SET finished_at = NOW() - INTERVAL '31 seconds' "
             "WHERE id = $1 RETURNING finished_at",
             attempt_id,
         )
-    await _force_due(store, ledger_id)
-    assert await _complete(store, await store.claim_due_ledger_refresh(), calls=2)
-    row = (await store.ledger_rows_for_job(job_id=job["id"]))[0]
+    await _force_due(db, store, ledger_id)
+    assert await _complete(store, await ledger.claim_due_ledger_refresh(), ledger=ledger, calls=2)
+    row = (await ledger.ledger_rows_for_job(job_id=job["id"]))[0]
     assert row["terminal_refresh_count"] == 2
     assert row["next_refresh_at"] >= end + timedelta(seconds=300)
-    assert await store.claim_due_ledger_refresh() is None
+    assert await ledger.claim_due_ledger_refresh() is None
 
-    async with store._pool.acquire() as conn:
+    async with db.acquire() as conn:
         await conn.execute(
             "UPDATE agent_attempts SET finished_at = NOW() - INTERVAL '301 seconds' WHERE id = $1",
             attempt_id,
         )
-    await _force_due(store, ledger_id)
+    await _force_due(db, store, ledger_id)
     assert await _complete(
-        store, await store.claim_due_ledger_refresh(), error="gateway_unavailable"
+        store, await ledger.claim_due_ledger_refresh(), ledger=ledger, error="gateway_unavailable"
     )
-    row = (await store.ledger_rows_for_job(job_id=job["id"]))[0]
+    row = (await ledger.ledger_rows_for_job(job_id=job["id"]))[0]
     assert row["terminal_refresh_count"] == 3
     assert row["next_refresh_at"] is None
     assert row["snapshot"]["totals"]["calls"] == 2
-    assert await store.claim_due_ledger_refresh() is None
+    assert await ledger.claim_due_ledger_refresh() is None
     # Bounded automatic retries do not disable an owner's explicit later retry.
-    assert await store.queue_job_ledger_refresh(job_id=job["id"]) == 1
-    await _force_due(store, ledger_id)
-    assert await _complete(store, await store.claim_due_ledger_refresh(), calls=5)
-    assert (await store.ledger_rows_for_job(job_id=job["id"]))[0]["next_refresh_at"] is None
+    assert await ledger.queue_job_ledger_refresh(job_id=job["id"]) == 1
+    await _force_due(db, store, ledger_id)
+    assert await _complete(store, await ledger.claim_due_ledger_refresh(), ledger=ledger, calls=5)
+    assert (await ledger.ledger_rows_for_job(job_id=job["id"]))[0]["next_refresh_at"] is None
 
 
-async def test_early_manual_reads_preserve_both_terminal_reconciliations(store):
+async def test_early_manual_reads_preserve_both_terminal_reconciliations(
+    db, store, ledger: PostgresLedgerRepository
+):
     """Refresh clicks can replace cached data without spending the later stages."""
     end = datetime.now(timezone.utc)
     job, attempt_id, ledger_id = await _seed_attempt(
-        store, started_at=end - timedelta(minutes=10), finished_at=end
+        db, store, started_at=end - timedelta(minutes=10), finished_at=end
     )
-    assert await _complete(store, await store.claim_due_ledger_refresh(), calls=1)
+    assert await _complete(store, await ledger.claim_due_ledger_refresh(), ledger=ledger, calls=1)
 
     for stage, delay in ((1, 30), (2, 300)):
         if stage == 2:
             # The +30-second reconciliation is now due; its failure still
             # consumes this stage and schedules the five-minute read.
-            async with store._pool.acquire() as conn:
+            async with db.acquire() as conn:
                 end = await conn.fetchval(
                     "UPDATE agent_attempts SET finished_at = NOW() - INTERVAL '31 seconds' "
                     "WHERE id = $1 RETURNING finished_at",
                     attempt_id,
                 )
-            await _force_due(store, ledger_id)
+            await _force_due(db, store, ledger_id)
             assert await _complete(
-                store, await store.claim_due_ledger_refresh(), error="usage_unavailable"
+                store,
+                await ledger.claim_due_ledger_refresh(),
+                ledger=ledger,
+                error="usage_unavailable",
             )
         for click in range(3):
             # Bypass only the click throttle. The reconciliation's actual
             # time boundary remains in the future for every manual read.
-            async with store._pool.acquire() as conn:
+            async with db.acquire() as conn:
                 await conn.execute(
                     "UPDATE agent_attempt_ledger "
                     "SET last_refresh_attempt_at = NOW() - INTERVAL '6 seconds' WHERE id = $1",
                     ledger_id,
                 )
-            assert await store.queue_job_ledger_refresh(job_id=job["id"]) == 1
-            claim = await store.claim_due_ledger_refresh()
+            assert await ledger.queue_job_ledger_refresh(job_id=job["id"]) == 1
+            claim = await ledger.claim_due_ledger_refresh()
             assert claim is not None
             assert await _complete(
                 store,
                 claim,
+                ledger=ledger,
                 calls=click + 2,
                 error="usage_unavailable" if click == 1 else None,
             )
-            row = (await store.ledger_rows_for_job(job_id=job["id"]))[0]
+            row = (await ledger.ledger_rows_for_job(job_id=job["id"]))[0]
             assert row["terminal_refresh_count"] == stage
             assert row["next_refresh_at"] == end + timedelta(seconds=delay)
             assert row["last_refresh_attempt_at"] < row["next_refresh_at"]
-            assert await store.claim_due_ledger_refresh() is None
+            assert await ledger.claim_due_ledger_refresh() is None
 
 
 @pytest.mark.parametrize("failure", [False, True])
-async def test_slow_early_read_cannot_consume_the_five_minute_reconciliation(store, failure):
+async def test_slow_early_read_cannot_consume_the_five_minute_reconciliation(
+    db, store, failure, ledger: PostgresLedgerRepository
+):
     """A query started at +299 seconds stays early even if it finishes after +300."""
     end = datetime.now(timezone.utc) - timedelta(seconds=301)
     job, _, ledger_id = await _seed_attempt(
-        store, started_at=end - timedelta(minutes=10), finished_at=end
+        db, store, started_at=end - timedelta(minutes=10), finished_at=end
     )
-    async with store._pool.acquire() as conn:
+    async with db.acquire() as conn:
         await conn.execute(
             "UPDATE agent_attempt_ledger SET terminal_refresh_count = 2 WHERE id = $1",
             ledger_id,
         )
-    await _force_due(store, ledger_id)
-    claim = await store.claim_due_ledger_refresh()
-    async with store._pool.acquire() as conn:
+    await _force_due(db, store, ledger_id)
+    claim = await ledger.claim_due_ledger_refresh()
+    async with db.acquire() as conn:
         # Model the persisted start of an HTTP query whose response is only
         # now arriving. Its lease/generation remain live and unchanged.
         await conn.execute(
@@ -701,49 +753,53 @@ async def test_slow_early_read_cannot_consume_the_five_minute_reconciliation(sto
             ledger_id,
             end + timedelta(seconds=299),
         )
-    assert await _complete(store, claim, calls=3, error="usage_unavailable" if failure else None)
-    row = (await store.ledger_rows_for_job(job_id=job["id"]))[0]
+    assert await _complete(
+        store, claim, ledger=ledger, calls=3, error="usage_unavailable" if failure else None
+    )
+    row = (await ledger.ledger_rows_for_job(job_id=job["id"]))[0]
     assert row["terminal_refresh_count"] == 2
     assert row["next_refresh_at"] >= end + timedelta(seconds=300)
-    final = await store.claim_due_ledger_refresh()
+    final = await ledger.claim_due_ledger_refresh()
     assert final is not None and final["refresh_generation"] > claim["refresh_generation"]
-    assert await _complete(store, final, error="usage_unavailable")
-    row = (await store.ledger_rows_for_job(job_id=job["id"]))[0]
+    assert await _complete(store, final, ledger=ledger, error="usage_unavailable")
+    row = (await ledger.ledger_rows_for_job(job_id=job["id"]))[0]
     assert row["terminal_refresh_count"] == 3 and row["next_refresh_at"] is None
-    assert await store.claim_due_ledger_refresh() is None
+    assert await ledger.claim_due_ledger_refresh() is None
 
 
-async def test_running_query_finishing_after_attempt_still_gets_closed_window_refresh(store):
+async def test_running_query_finishing_after_attempt_still_gets_closed_window_refresh(
+    db, store, ledger: PostgresLedgerRepository
+):
     """An in-flight running snapshot cannot satisfy the first terminal refresh."""
-    job, attempt_id, _ = await _seed_attempt(store)
-    await store.queue_job_ledger_refresh(job_id=job["id"])
-    running = await store.claim_due_ledger_refresh()
-    async with store._pool.acquire() as conn:
+    job, attempt_id, _ = await _seed_attempt(db, store)
+    await ledger.queue_job_ledger_refresh(job_id=job["id"])
+    running = await ledger.claim_due_ledger_refresh()
+    async with db.acquire() as conn:
         end = await conn.fetchval(
             "UPDATE agent_attempts SET status = 'finished', finished_at = NOW() "
             "WHERE id = $1 RETURNING finished_at",
             attempt_id,
         )
-    assert await _complete(store, running, calls=1)
-    row = (await store.ledger_rows_for_job(job_id=job["id"]))[0]
+    assert await _complete(store, running, ledger=ledger, calls=1)
+    row = (await ledger.ledger_rows_for_job(job_id=job["id"]))[0]
     assert row["terminal_refresh_count"] == 0 and row["refreshing"] is True
-    terminal = await store.claim_due_ledger_refresh()
+    terminal = await ledger.claim_due_ledger_refresh()
     assert terminal["terminal"] is True
     assert terminal["window_until"] == end > running["window_until"]
 
 
-async def test_job_runtime_usage_includes_retries_but_excludes_other_turns(store):
+async def test_job_runtime_usage_includes_retries_but_excludes_other_turns(db, store):
     """Comparison data retains usage identities and output detection without transcript text."""
-    job, first, _ = await _seed_attempt(store, grant_id=None)
-    _, retry, _ = await _seed_attempt(store, job=job, attempt_no=2, grant_id=None)
+    job, first, _ = await _seed_attempt(db, store, grant_id=None)
+    _, retry, _ = await _seed_attempt(db, store, job=job, attempt_no=2, grant_id=None)
     # A real second turn of the same thread: the schema ties a job's messages
     # and parent to its thread, so a job cannot simply be re-pointed.
-    sibling = await store.create_follow_up(
+    sibling = await store.conversation_commands.create_follow_up(
         parent_job_id=job["id"], user_id=job["user_id"], prompt="a sibling turn"
     )
     assert sibling is not None and sibling.get("error") is None
-    _, sibling_attempt, _ = await _seed_attempt(store, job=sibling, grant_id=None)
-    async with store._pool.acquire() as conn:
+    _, sibling_attempt, _ = await _seed_attempt(db, store, job=sibling, grant_id=None)
+    async with db.acquire() as conn:
         for event_job, attempt_id, tokens, text in [
             (job["id"], first, 10, " \n\t"),
             (job["id"], retry, 20, "non-empty output"),
@@ -767,7 +823,7 @@ async def test_job_runtime_usage_includes_retries_but_excludes_other_turns(store
                     }
                 ),
             )
-    inputs = await store.job_usage_inputs(job_id=job["id"])
+    inputs = await store.execution_queries.job_usage_inputs(job_id=job["id"])
     assert inputs["job_ids"] == [job["id"]]
     assert len(inputs["attempts"]) == 2
     assert [event["attempt_id"] for event in inputs["events"]] == [first, retry]
@@ -781,11 +837,13 @@ async def test_job_runtime_usage_includes_retries_but_excludes_other_turns(store
     assert summary.output_tokens is None
 
 
-async def test_deleting_attempt_cascades_its_snapshot_but_not_other_attempts(store):
+async def test_deleting_attempt_cascades_its_snapshot_but_not_other_attempts(
+    db, store, ledger: PostgresLedgerRepository
+):
     """New references follow the existing Agent database retention boundary."""
-    job, first, _ = await _seed_attempt(store)
-    _, second, _ = await _seed_attempt(store, job=job, attempt_no=2)
-    async with store._pool.acquire() as conn:
+    job, first, _ = await _seed_attempt(db, store)
+    _, second, _ = await _seed_attempt(db, store, job=job, attempt_no=2)
+    async with db.acquire() as conn:
         await conn.execute("DELETE FROM agent_attempts WHERE id = $1", first)
-    rows = await store.ledger_rows_for_job(job_id=job["id"])
+    rows = await ledger.ledger_rows_for_job(job_id=job["id"])
     assert len(rows) == 1 and rows[0]["attempt_id"] == second

@@ -46,12 +46,15 @@ from __future__ import annotations
 
 import hmac
 import os
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import jwt
 from fastapi import Depends, Header, HTTPException, Request
 
 from cloud_agent import identity
+
+#: Whatever a surface narrowed the store to; this only removes the ``None``.
+_StoreT = TypeVar("_StoreT")
 from cloud_agent.agent_access import AgentAccessDecision
 from cloud_agent.api.errors import AgentConfigurationError
 from cloud_agent.gateway import GatewayError
@@ -60,15 +63,20 @@ from cloud_agent.logging_utils import get_logger
 if TYPE_CHECKING:
     from cloud_agent.gateway import GatewayClient
     from cloud_agent.grants import GrantClient
-    from cloud_agent.storage.store import AgentJobStore
+    from cloud_agent.storage.assembly import Storage
 
 
 # ── Wiring this service owns ───────────────────────────────────────────
 
 
-def get_agent_job_store(request: Request) -> AgentJobStore | None:
-    """Dependency to obtain the agent job store (if configured)."""
-    return getattr(request.app.state, "store", None)
+def get_storage(request: Request) -> Storage | None:
+    """Dependency to obtain the assembled storage layer (if configured).
+
+    One provider for all sixteen capabilities, and not sixteen providers: a
+    handler takes this and annotates the Protocol naming the capabilities it
+    uses, so the narrowing is stated where the calls are, next to them.
+    """
+    return getattr(request.app.state, "storage", None)
 
 
 def get_gateway_client(request: Request) -> GatewayClient:
@@ -211,7 +219,7 @@ def looks_like_agent_token(api_key: str | None) -> bool:
     reaches, so that an expired session stays a session failure instead of
     being retried as something else.
     """
-    return bool(api_key) and api_key.startswith(AGENT_TOKEN_PREFIX)
+    return bool(api_key and api_key.startswith(AGENT_TOKEN_PREFIX))
 
 
 def bearer_token(authorization: str | None) -> str | None:
@@ -405,3 +413,22 @@ async def log_admin_action(
             exc_info=True,
             extra={"event": "agent_admin_audit_write_failed", "action": action},
         )
+
+
+def require_store(store: _StoreT | None) -> _StoreT:
+    """Return the store or fail with a clear 503 when the DB is absent.
+
+    Shared by the surfaces that answer with this shape. A router that answers
+    with a different refusal keeps its own, so no response body changes.
+    """
+    if store is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "type": "unavailable",
+                    "message": "Agent jobs require a configured database.",
+                }
+            },
+        )
+    return store

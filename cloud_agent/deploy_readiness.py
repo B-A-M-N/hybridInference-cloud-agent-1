@@ -29,7 +29,6 @@ import asyncpg
 
 from cloud_agent.broker_routing import ENV_BROKER_TOKEN, probe_broker
 from cloud_agent.host_pool import HOST_ONLINE
-from cloud_agent.storage.store import AgentJobStore
 from cloud_agent_host.shared_protocol import (
     NATIVE_FORK_AT_ANCHOR_CAPABILITY,
     SHARED_SANDBOX_CAPABILITY,
@@ -38,6 +37,8 @@ from cloud_agent_host.shared_protocol import (
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
+
+    from cloud_agent.ports import HostPoolRepository
 
     BrokerProbe = Callable[..., Awaitable[str | None]]
 
@@ -96,7 +97,7 @@ def _host_rejection(
 
 
 async def shared_live_readiness(
-    store: AgentJobStore,
+    store: HostPoolRepository,
     *,
     not_before: datetime,
     broker_token: str,
@@ -178,11 +179,11 @@ async def shared_live_readiness(
     probe_rows = list(placement_rows)
     probed_hosts = {str(row.get("host")) for row in probe_rows}
     for owner in sorted(retained_hosts):
-        row = rows_by_host.get(owner)
-        if row is None or row.get("status") != HOST_ONLINE or owner in probed_hosts:
+        owner_row = rows_by_host.get(owner)
+        if owner_row is None or owner_row.get("status") != HOST_ONLINE or owner in probed_hosts:
             continue
         reason = _host_rejection(
-            row,
+            owner_row,
             not_before=not_before,
             expected_deployment_sha=expected_deployment_sha,
             require_target_deployment=False,
@@ -192,7 +193,7 @@ async def shared_live_readiness(
         if reason is not None:
             rejected.append(f"retained owner {owner}: {reason}")
             continue
-        probe_rows.append(row)
+        probe_rows.append(owner_row)
         probed_hosts.add(owner)
     if rejected:
         return SharedLiveReadiness(
@@ -322,8 +323,13 @@ async def wait_for_shared_live(
     # an aware UTC timestamp avoids local-time ambiguity in the comparison.
     not_before = datetime.now(UTC)
     deadline = time.monotonic() + timeout_seconds
+    from cloud_agent.storage.assembly import Storage
+
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=1)
-    store = AgentJobStore(pool)
+    # The one assembly, so this entry point names no implementation of its
+    # own: it needs the host pool and takes it from the same place the
+    # service does.
+    store = Storage(pool).host_pool
     last_detail = ""
     try:
         while True:

@@ -29,7 +29,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
@@ -63,6 +63,15 @@ MAX_CAPACITY_BYTES = 8 * 1024
 #: last reading should keep being drawn in green.
 FRESH_AFTER_SECONDS = 90.0
 
+#: How old a stored observation may be and still be written into history. Three
+#: heartbeat intervals: a host that has stopped reporting must stop adding
+#: points rather than have its last reading copied forward minute after minute.
+CAPACITY_HISTORY_MAX_AGE_S = 90.0
+
+#: History retention. The page serves at most 24 hours, so anything older is
+#: deleted rather than merely hidden.
+CAPACITY_HISTORY_RETENTION_S = 24 * 60 * 60.0
+
 #: One historical point per observation minute, and the windows the API serves.
 HISTORY_RESOLUTION_SECONDS = 60
 HISTORY_RANGES: dict[str, int] = {"1h": 3600, "6h": 21600, "24h": 86400}
@@ -85,15 +94,27 @@ _MAX_JSON_INT = 2**53 - 1
 _NO_CONTROL_CHARACTERS = r"^[^\x00-\x1f\x7f]*$"
 
 CpuMissingReason = Literal[
+    "warming_up",
+    "counter_reset",
+    "source_unavailable",
+    "invalid_sample",
+]
+MemoryMissingReason = Literal["source_unavailable", "invalid_sample"]
+
+# A Literal has to spell its members, so the runner's constants and this type
+# are two statements of one fact. Tied together here rather than left to drift:
+# a reason the runner can report and this type rejects would fail validation on
+# a heartbeat the runner considers valid.
+assert set(get_args(CpuMissingReason)) == {
     CPU_MISSING_WARMING_UP,
     CPU_MISSING_COUNTER_RESET,
     CPU_MISSING_SOURCE_UNAVAILABLE,
     CPU_MISSING_INVALID_SAMPLE,
-]
-MemoryMissingReason = Literal[
+}
+assert set(get_args(MemoryMissingReason)) == {
     MEMORY_MISSING_SOURCE_UNAVAILABLE,
     MEMORY_MISSING_INVALID_SAMPLE,
-]
+}
 InventoryStatus = Literal["available", "partial", "unavailable"]
 Freshness = Literal["fresh", "stale", "unavailable"]
 
@@ -330,7 +351,7 @@ def parse_capacity_block(raw: object) -> HostCapacityReport | None:
     try:
         return HostCapacityReport.model_validate(raw)
     except ValidationError as exc:
-        first = exc.errors()[0] if exc.errors() else {}
+        first: Mapping[str, Any] = exc.errors()[0] if exc.errors() else {}
         _log_dropped(
             "invalid",
             detail=f"{'.'.join(str(part) for part in first.get('loc', ()))}:{first.get('type')}",
@@ -485,7 +506,7 @@ class AgentHostCapacityHistoryResponse(BaseModel):
     )
     resolution_seconds: int = HISTORY_RESOLUTION_SECONDS
     semantics: Literal["sampled_observation"] = Field(
-        "sampled_observation",
+        default="sampled_observation",
         description=(
             "Each point is one observation per minute, not a continuous "
             "average and not a peak. A CPU point averages the interval before "
