@@ -250,6 +250,12 @@ class MemberWindowReducer:
     #: real state -- a turn can finish its work and go quiet -- and it is the
     #: one case where a total of zero is a measurement rather than an absence.
     _saw_empty_window: bool = False
+    #: False when the window's final census did not arrive: the collection was
+    #: cut off, or the journal slice ended early. Everything measured up to
+    #: that point is real, but the tail is missing, so no metric may be
+    #: reported as complete. Shortening the window instead would present a
+    #: truncated turn as a shorter finished one.
+    _readings_complete: bool = True
 
     # -- ingestion ---------------------------------------------------------
 
@@ -532,6 +538,12 @@ class MemberWindowReducer:
         self.unclosed_instances = sum(
             1 for state_ in self._threads.values() if not state_.closed and not state_.regressed
         )
+        if not self._readings_complete:
+            self._cpu_partial = True
+            self._io_partial = True
+            self._cpu_reasons.add("window_prefix_retained")
+            self._io_reasons.add("window_prefix_retained")
+            self._memory_reasons.add("window_prefix_retained")
         cpu_status = self._metric_status(
             self._cpu_measured or self._saw_empty_window,
             self._cpu_partial,
@@ -593,8 +605,14 @@ class MemberWindowReducer:
         """
         observed = max(0, self._observed_through_ms)
         duration = max(0, duration_ms)
-        if state == _STATE_FINAL and observed < duration:
-            duration = observed
+        if state == _STATE_FINAL and self.opened_guest_mono_ns >= 0 and observed < duration:
+            # The closing census is missing. The window really ran for
+            # ``duration_ms``; the data reached ``observed``. Keeping the true
+            # end and the true cut-off lets a reader see the gap, which is the
+            # whole reason both fields exist, and no metric may then claim to
+            # be complete. Without an opening tick there is nothing to compare
+            # against, so the window keeps its own length.
+            self._readings_complete = False
         snapshot = self.snapshot(state=state)
         snapshot["window"] = {
             "duration_ms": duration,

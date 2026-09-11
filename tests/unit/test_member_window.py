@@ -411,14 +411,38 @@ class TestWindowShape:
         assert result["window"]["duration_ms"] == 130_000
         assert result["state"] == "collecting"
 
-    def test_a_final_summary_never_claims_past_what_it_saw(self) -> None:
+    def test_a_missing_tail_is_reported_as_a_gap_not_a_shorter_window(self) -> None:
+        """A truncated turn must not be dressed up as a shorter finished one.
+
+        The window really ran for 130 seconds; the data reached 12. Clamping
+        the duration to 12 would have hidden the missing tail behind a
+        complete-looking short turn, which is why the true end and the true
+        cut-off are both kept and no metric may then read as complete.
+        """
         window = opened()
-        window.observe_sample(cycle(0, reading(7), mono_ns=0))
-        window.observe_sample(cycle(1, reading(7), mono_ns=12_000_000_000))
+        window.observe_sample(cycle(0, reading(7, cpu_ns=1_000_000), mono_ns=0))
+        window.observe_sample(cycle(1, reading(7, cpu_ns=2_000_000), mono_ns=12_000_000_000))
 
         result = summary(window, state="final", duration_ms=130_000)
 
+        assert result["window"]["duration_ms"] == 130_000
+        assert result["window"]["observed_through_ms"] == 12_000
+        assert result["cpu"]["status"] == STATUS_PARTIAL
+        assert "window_prefix_retained" in result["cpu"]["reason_codes"]
+        assert result["memory"]["status"] == STATUS_PARTIAL
+        assert "window_prefix_retained" in result["memory"]["reason_codes"]
+
+    def test_a_window_that_ended_where_it_was_measured_stays_complete(self) -> None:
+        """The ordinary case: the closing census arrived, so nothing is missing."""
+        window = opened()
+        window.observe_sample(cycle(0, reading(7, cpu_ns=1_000_000), mono_ns=0))
+        window.observe_sample(cycle(1, reading(7, cpu_ns=2_000_000), mono_ns=12_000_000_000))
+
+        result = summary(window, state="final", duration_ms=12_000)
+
         assert result["window"]["duration_ms"] == 12_000
+        assert result["window"]["observed_through_ms"] == 12_000
+        assert result["cpu"]["status"] == STATUS_AVAILABLE
 
     def test_the_scope_and_source_are_stamped(self) -> None:
         result = summary(reducer())
