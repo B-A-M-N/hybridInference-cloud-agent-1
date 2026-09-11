@@ -104,6 +104,164 @@ export interface AttemptResourcesApi {
   process_events_lost?: number;
   processes_truncated?: boolean;
   processes?: ProcessObservationApi[];
+  /** The whole-turn member execution window, or null when none was collected. */
+  turn_summary?: TurnResourceSummaryApi | null;
+}
+
+/**
+ * One metric's completeness, stated per metric rather than as a whole-turn
+ * percentage. `available` means complete within its declared method and scope:
+ * it never claims zero sampling error or that the number is the platform's
+ * whole cost. `partial` is a measured lower bound for an additive quantity.
+ * `unavailable` carries no number at all.
+ */
+export type ResourceMetricStatus = 'available' | 'partial' | 'unavailable';
+
+/**
+ * Every way a `member_execution_window` measurement can be incomplete.
+ *
+ * A bounded enum mirrored from the control plane, not free text: the admin UI
+ * maps each code to one fixed sentence, so no UID, lease token, kernel field
+ * name or exception string can reach a page through this field. Unknown codes
+ * fall back to one generic sentence rather than being rendered.
+ */
+export type TurnResourceReasonCode =
+  | 'missing_thread_baseline'
+  | 'counter_regressed'
+  | 'thread_identity_conflict'
+  | 'observer_restarted'
+  | 'ring_loss'
+  | 'filesystem_attribution_unverified'
+  | 'pss_unreadable'
+  | 'address_space_share_unverified'
+  | 'sampling_over_budget'
+  | 'window_prefix_retained'
+  | 'observer_unavailable'
+  | 'not_a_kata_guest'
+  | 'source_mismatch';
+
+/** Reported before the sandbox has closed the window, and final once it has. */
+export type TurnResourceState = 'collecting' | 'final';
+
+/** Where a measurement actually reached, on the guest's monotonic clock. */
+export interface TurnResourceWindowApi {
+  /** Guest-monotonic open-to-close span. */
+  duration_ms: number;
+  /** How far data reached; below `duration_ms` this is a prefix, never filled in. */
+  observed_through_ms: number;
+  open_scan_ms: number;
+  close_scan_ms: number;
+}
+
+/**
+ * One member's own scheduler time inside the execution window.
+ *
+ * A thread that ran on two cores for ten seconds contributes about twenty
+ * seconds, so `usec` may legitimately exceed the wall-clock duration. It is
+ * never a utilisation percentage.
+ */
+export interface TurnCpuResourcesApi {
+  status: ResourceMetricStatus;
+  method: 'live_and_exit_task_counters';
+  usec: number | null;
+  reason_codes: TurnResourceReasonCode[];
+}
+
+/**
+ * The sampled peak of the member's proportional resident memory.
+ *
+ * PSS shares mapped resident pages between users instead of billing each of
+ * them in full, but it is not machine memory: it excludes the VM kernel,
+ * unmapped page cache, host services and special page classes, and RSS is
+ * never substituted for it. Sampling cannot see between ticks, so even a
+ * complete plan stays labelled as sampled.
+ */
+export interface TurnMemoryResourcesApi {
+  status: ResourceMetricStatus;
+  method: 'sampled_member_pss';
+  peak_bytes: number | null;
+  sample_interval_ms: number;
+  /** Cycles in which every one of the member's address spaces read cleanly. */
+  valid_samples: number;
+  /** Cycles the schedule intended for the window's duration. */
+  expected_samples: number;
+  max_gap_ms: number;
+  reason_codes: TurnResourceReasonCode[];
+}
+
+/**
+ * Storage I/O the kernel charged to the member's own tasks.
+ *
+ * This is task I/O accounting, not what the host disk physically did, so the
+ * method is named beside the number wherever it is shown.
+ */
+export interface TurnStorageIoResourcesApi {
+  status: ResourceMetricStatus;
+  method: 'task_io_accounting';
+  read_bytes: number | null;
+  write_bytes: number | null;
+  reason_codes: TurnResourceReasonCode[];
+}
+
+/**
+ * One attempt's whole-turn member execution window.
+ *
+ * `state` is derived, not stored: a `collecting` snapshot for an attempt that
+ * has already ended reads as `interrupted`, with `observed_through_ms` kept so
+ * the UI can say how far it actually got instead of rounding it up to the end
+ * of the task.
+ */
+export interface TurnResourceSummaryApi extends TurnResourceWindowApi {
+  measurement_id: string;
+  state: TurnResourceState | 'interrupted';
+  /** The capability string that produced the summary; never added across sources. */
+  source: string;
+  received_at: string | null;
+  cpu: TurnCpuResourcesApi;
+  memory: TurnMemoryResourcesApi;
+  storage_io: TurnStorageIoResourcesApi;
+  /**
+   * How many attempts the run's numbers cover, out of how many it has, taken
+   * from the run's compact projection. A run-level fact rather than an
+   * attempt-level one, so an attempt response leaves both unset; when they are
+   * present and differ, the summary must say that it is not the run's total.
+   */
+  attempts_measured?: number;
+  attempts_total?: number;
+}
+
+/** One metric's status alone, for the Runs list's compact summary. */
+export interface ResourceMetricBriefApi {
+  status: ResourceMetricStatus;
+  reason_codes: TurnResourceReasonCode[];
+}
+
+/**
+ * The compact per-run resource projection the Runs list shows.
+ *
+ * Flattened scalars only, so listing a page of runs stays one bounded query
+ * over exactly that page. The detail view carries the full
+ * `TurnResourceSummaryApi`; this exists so the list does not have to.
+ *
+ * `source_mismatch` is the one reason code that can appear on a brief the
+ * reducer did not take from a single stored summary: it means the run's
+ * attempts were measured by different capabilities or schema versions, which
+ * are never mixed into one total.
+ */
+export interface RunResourceSummaryApi {
+  cpu_usec: number | null;
+  memory_peak_bytes: number | null;
+  state: TurnResourceState | 'interrupted';
+  observed_through_ms: number | null;
+  cpu: ResourceMetricBriefApi;
+  memory: ResourceMetricBriefApi;
+  storage_io: ResourceMetricBriefApi;
+  /**
+   * How many attempts the numbers cover, out of how many the run has. A total
+   * over three of five executions is not the run's total.
+   */
+  attempts_measured: number;
+  attempts_total: number;
 }
 
 export interface AgentAttemptSummaryApi {
@@ -116,6 +274,11 @@ export interface AgentAttemptSummaryApi {
 
 export interface AgentAttemptTelemetryApi extends AgentAttemptSummaryApi {
   resources: AttemptResourcesApi | null;
+  /**
+   * The whole-turn member execution window for this attempt, or null when none
+   * was collected. Null is "not measured here", never a zero.
+   */
+  turn_summary?: TurnResourceSummaryApi | null;
 }
 
 export type AgentLedgerStatus = 'pending' | 'available' | 'partial' | 'unavailable' | 'stale';

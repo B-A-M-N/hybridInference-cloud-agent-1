@@ -63,6 +63,7 @@ class FakeAgentJobStore:
         self.archived_threads: dict[str, datetime] = {}
         self.pinned_threads: dict[str, datetime] = {}
         self.turn_telemetry: dict[str, dict[str, Any]] = {}
+        self.turn_summaries: dict[int, dict[str, Any]] = {}
         self.attempt_telemetry: dict[str, list[dict[str, Any]]] = {}
         self.attempt_jobs: dict[int, str] = {}
         self.live_fence: tuple[int, int] | None = None
@@ -627,6 +628,51 @@ class FakeAgentJobStore:
             "attempt_id": attempt_id,
         }
         return True
+
+    async def record_attempt_turn_summary(
+        self,
+        *,
+        attempt_id: int,
+        lease_generation: int,
+        measurement_id: str,
+        report_seq: int,
+        state: str,
+        summary: dict[str, Any],
+    ) -> str:
+        """Apply the store's ordering rules to one cumulative snapshot.
+
+        Deliberately a real reimplementation of the ordering rather than a
+        dict assignment: the HTTP mapping for ``duplicate`` and ``conflict``
+        is only meaningful if the fake can produce them the way the SQL does.
+        The database clock, the row lock and the JSONB round trip are what the
+        ``dbtest`` suite covers; this covers the contract above the store.
+        """
+        if not self._fenced(attempt_id, lease_generation):
+            return "lease_lost"
+        stored = self.turn_summaries.get(attempt_id)
+        if stored is None:
+            self.turn_summaries[attempt_id] = {
+                "seq": report_seq,
+                "summary": summary,
+                "measurement_id": measurement_id,
+                "state": state,
+            }
+            return "stored"
+        if report_seq < stored["seq"]:
+            return "conflict"
+        if report_seq == stored["seq"]:
+            return "duplicate" if stored["summary"] == summary else "conflict"
+        if stored["state"] == "final" and state == "collecting":
+            return "conflict"
+        if stored["measurement_id"] != measurement_id:
+            return "conflict"
+        self.turn_summaries[attempt_id] = {
+            "seq": report_seq,
+            "summary": summary,
+            "measurement_id": measurement_id,
+            "state": state,
+        }
+        return "stored"
 
     async def admit_thread_sandbox_turn(self, **kwargs: Any) -> bool:
         """Record the at-most-once admission RPC under the worker fence."""
@@ -5386,6 +5432,187 @@ async def test_a_superseded_attempt_cannot_relabel_what_the_live_one_used(
 
     job = (await client.get(f"/v1/agent/jobs/{job_id}")).json()
     assert job["resources"] is None
+
+
+def _turn_resources_body(
+    *,
+    report_seq: int = 1,
+    state: str = "final",
+    measurement_id: str = "00000000-0000-4000-8000-000000000001",
+    cpu_usec: int = 80_000_000,
+    observed_through_ms: int = 130_000,
+) -> dict[str, Any]:
+    """One canonical ``member_execution_window`` body, as the guest posts it."""
+    return {
+        "schema_version": 1,
+        "measurement_id": measurement_id,
+        "report_seq": report_seq,
+        "state": state,
+        "scope": "member_execution_window",
+        "source": "kata-guest-member-window-v1",
+        "window": {
+            "duration_ms": 130_000,
+            "observed_through_ms": observed_through_ms,
+            "open_scan_ms": 12,
+            "close_scan_ms": 15,
+        },
+        "cpu": {
+            "status": "available",
+            "method": "live_and_exit_task_counters",
+            "usec": cpu_usec,
+            "reason_codes": [],
+        },
+        "memory": {
+            "status": "available",
+            "method": "sampled_member_pss",
+            "peak_bytes": 1_288_490_189,
+            "sample_interval_ms": 1000,
+            "valid_samples": 131,
+            "expected_samples": 131,
+            "max_gap_ms": 1000,
+            "reason_codes": [],
+        },
+        "storage_io": {
+            "status": "unavailable",
+            "method": "task_io_accounting",
+            "read_bytes": None,
+            "write_bytes": None,
+            "reason_codes": ["filesystem_attribution_unverified"],
+        },
+    }
+
+
+async def test_a_turn_resource_snapshot_is_acknowledged_and_its_retry_too(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """An acknowledged checkpoint whose response was lost must be safe to resend."""
+    job_id = await _create_job(client)
+    claim = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+    auth = {"Authorization": f"Bearer {claim['worker_token']}"}
+    endpoint = f"/v1/agent/worker/jobs/{job_id}/turn-resources"
+    body = _turn_resources_body(report_seq=2)
+
+    first = await client.post(endpoint, json=body, headers=auth)
+    retry = await client.post(endpoint, json=body, headers=auth)
+
+    assert first.status_code == 200
+    assert first.json()["ok"] is True
+    assert retry.status_code == 200
+    assert retry.json()["ok"] is True
+    assert store.turn_summaries[claim["attempt_id"]]["seq"] == 2
+
+
+async def test_a_stale_or_disagreeing_snapshot_is_refused_with_409(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """``conflict`` is not ``lease_lost``: the worker keeps going, the post does not."""
+    job_id = await _create_job(client)
+    claim = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+    auth = {"Authorization": f"Bearer {claim['worker_token']}"}
+    endpoint = f"/v1/agent/worker/jobs/{job_id}/turn-resources"
+    assert (
+        await client.post(endpoint, json=_turn_resources_body(report_seq=5), headers=auth)
+    ).status_code == 200
+
+    stale = await client.post(endpoint, json=_turn_resources_body(report_seq=4), headers=auth)
+    disagreeing = await client.post(
+        endpoint, json=_turn_resources_body(report_seq=5, cpu_usec=1), headers=auth
+    )
+
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["error"]["type"] == "turn_summary_conflict"
+    assert disagreeing.status_code == 409
+    assert disagreeing.json()["detail"]["error"]["type"] == "turn_summary_conflict"
+    assert store.turn_summaries[claim["attempt_id"]]["seq"] == 5
+
+
+async def test_a_final_snapshot_cannot_be_reopened_by_a_collecting_one(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """A newer sequence does not outrank the end of collection."""
+    job_id = await _create_job(client)
+    claim = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+    auth = {"Authorization": f"Bearer {claim['worker_token']}"}
+    endpoint = f"/v1/agent/worker/jobs/{job_id}/turn-resources"
+    await client.post(endpoint, json=_turn_resources_body(report_seq=9), headers=auth)
+
+    reopened = await client.post(
+        endpoint,
+        json=_turn_resources_body(report_seq=10, state="collecting", observed_through_ms=4_000),
+        headers=auth,
+    )
+
+    assert reopened.status_code == 409
+    assert store.turn_summaries[claim["attempt_id"]]["state"] == "final"
+
+
+async def test_a_superseded_attempt_cannot_file_a_turn_resource_snapshot(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """The fence is the same one every other worker write uses."""
+    job_id = await _create_job(client)
+    claim = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+    auth = {"Authorization": f"Bearer {claim['worker_token']}"}
+    store.live_fence = (101, 2)
+
+    refused = await client.post(
+        f"/v1/agent/worker/jobs/{job_id}/turn-resources",
+        json=_turn_resources_body(),
+        headers=auth,
+    )
+
+    assert refused.status_code == 409
+    assert refused.json()["detail"]["error"]["type"] == "lease_lost"
+    assert store.turn_summaries == {}
+
+
+async def test_an_oversized_turn_resource_snapshot_is_refused_before_parsing(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """The 16 KiB cap is on the bytes that crossed the wire, not on the model.
+
+    The body carries a valid snapshot plus one long unknown field, so a server
+    that validated first and bounded second would answer 422 or 200 here. The
+    only correct answer is 413: the contract bounds the payload itself.
+    """
+    job_id = await _create_job(client)
+    claim = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+    auth = {"Authorization": f"Bearer {claim['worker_token']}"}
+    body = _turn_resources_body()
+    body["padding"] = "x" * (16 * 1024)
+
+    refused = await client.post(
+        f"/v1/agent/worker/jobs/{job_id}/turn-resources", json=body, headers=auth
+    )
+
+    assert refused.status_code == 413
+    assert refused.json()["detail"]["error"]["type"] == "payload_too_large"
+    assert store.turn_summaries == {}
+
+
+async def test_a_turn_resource_response_never_echoes_body_identity(
+    client: AsyncClient, store: FakeAgentJobStore
+):
+    """Identity comes from the signed claims, so the body cannot name anything.
+
+    A body that tries to select another attempt must be stored against the
+    caller's own fenced attempt and answered with no identity at all.
+    """
+    job_id = await _create_job(client)
+    claim = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+    auth = {"Authorization": f"Bearer {claim['worker_token']}"}
+    body = _turn_resources_body()
+    body.update({"attempt_id": 999, "lease_generation": 7, "job_id": "ajob_someone_else"})
+
+    response = await client.post(
+        f"/v1/agent/worker/jobs/{job_id}/turn-resources", json=body, headers=auth
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert set(store.turn_summaries) == {claim["attempt_id"]}
+    assert "job_id" not in response.text
+    assert "attempt_id" not in response.text
 
 
 async def test_an_unmeasured_turn_reports_nothing_rather_than_zero(

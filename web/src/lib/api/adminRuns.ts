@@ -1,7 +1,29 @@
 import { config } from '@/config/env';
 
-import type { AgentAttemptTelemetryApi, AgentJobApiState, AgentJobUsageApi } from './agents';
+import type {
+  AgentAttemptTelemetryApi,
+  AgentJobApiState,
+  AgentJobUsageApi,
+  RunResourceSummaryApi,
+} from './agents';
 import { fetchWithAuth, jsonOrThrow } from './client';
+
+// The admin Runs surface reads the same resource shapes the owner-facing
+// telemetry endpoint returns, so they are defined once beside
+// `AttemptResourcesApi` and re-exported here for the admin page and its
+// presentation module.
+export type {
+  ResourceMetricBriefApi,
+  ResourceMetricStatus,
+  RunResourceSummaryApi,
+  TurnCpuResourcesApi,
+  TurnMemoryResourcesApi,
+  TurnResourceReasonCode,
+  TurnResourceState,
+  TurnResourceSummaryApi,
+  TurnResourceWindowApi,
+  TurnStorageIoResourcesApi,
+} from './agents';
 
 const RUNS = '/admin/agent/runs';
 
@@ -24,6 +46,12 @@ export interface AdminRun {
   /** Display names; older control planes only return runner IDs in hosts. */
   physical_hosts?: string[];
   tool_calls: number;
+  /**
+   * Compact whole-turn member execution window, or null when no attempt of
+   * this run has one. Optional because older control planes do not send it;
+   * null and absent both mean "not collected", never zero.
+   */
+  resource_summary?: RunResourceSummaryApi | null;
 }
 
 export interface AdminRunFilters {

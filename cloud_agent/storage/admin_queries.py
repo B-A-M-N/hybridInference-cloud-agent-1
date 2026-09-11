@@ -25,6 +25,7 @@ from cloud_agent.schemas import AttemptResources, ProcessObservation, ToolCallRe
 from cloud_agent.storage.store import _load_json
 from cloud_agent.thread_stats import _TOKEN_KEY_GROUPS
 from cloud_agent_host.event_payloads import MAX_EVENT_PAYLOAD_BYTES, bound_event_payload
+from cloud_agent_host.turn_resources import summarize_run_resources
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -53,8 +54,24 @@ _RUN_COLUMNS = """
           WHERE a.job_id = j.id AND a.host_id IS NOT NULL
           ORDER BY 1) AS physical_hosts,
     (SELECT COUNT(*) FROM agent_job_events e
-     WHERE e.job_id = j.id AND e.event_type = 'tool_use') AS tool_calls
+     WHERE e.job_id = j.id AND e.event_type = 'tool_use') AS tool_calls,
+    (SELECT jsonb_agg(jsonb_build_object(
+                'summary', r.turn_summary,
+                'received_at', r.turn_summary_received_at,
+                'terminal', a.status <> 'running')
+            ORDER BY a.id)
+     FROM agent_attempts a
+     JOIN agent_attempt_resources r ON r.attempt_id = a.id
+     WHERE a.job_id = j.id AND r.turn_summary IS NOT NULL) AS resource_summary_attempts
 """
+
+# The derived, non-scalar keys of ``AttemptResources``. ``turn_summary`` is a
+# real JSONB column but not a scalar one: emitting it from the generated list
+# would hand the model a JSON document where it expects the reducer's derived
+# projection (state rewritten to ``interrupted``, per-metric envelope). The
+# child collections are fetched separately anyway, because one row per call or
+# process does not belong in a single flat SELECT.
+_RESOURCE_DERIVED_FIELDS = frozenset({"tool_calls", "processes", "turn_summary"})
 
 _EVENT_COLUMNS = """
     e.id, e.attempt_id, a.attempt_no, e.seq,
@@ -87,11 +104,22 @@ _EVENT_COLUMNS = """
 # usage key cannot reach the application on a default metadata request.
 _USAGE_KEYS_SQL = ", ".join(f"'{key}'" for group in _TOKEN_KEY_GROUPS for key in group)
 _RESOURCE_FIELDS = tuple(
-    key for key in AttemptResources.model_fields if key not in {"tool_calls", "processes"}
+    key for key in AttemptResources.model_fields if key not in _RESOURCE_DERIVED_FIELDS
 )
 _RESOURCE_COLUMNS = ", ".join(
-    f"LEFT(r.{key}, 128) AS {key}" if key in {"sampler_version", "process_observer"} else f"r.{key}"
-    for key in _RESOURCE_FIELDS
+    [
+        *(
+            f"LEFT(r.{key}, 128) AS {key}"
+            if key in {"sampler_version", "process_observer"}
+            else f"r.{key}"
+            for key in _RESOURCE_FIELDS
+        ),
+        # Explicit, not generated: the stored snapshot is projected as JSONB
+        # and handed to the shared reducer, which is the only thing allowed to
+        # decide what a reader sees. Selecting it as a plain column would leak
+        # the stored ``collecting`` state into a terminal attempt's response.
+        "r.turn_summary AS turn_summary",
+    ]
 )
 _CALL_COLUMNS = ", ".join(
     f"LEFT({key}, 256) AS {key}" if key in {"tool_use_id", "tool_name", "timing_source"} else key
@@ -103,6 +131,30 @@ _PROCESS_COLUMNS = ", ".join(
 )
 _MAX_CALLS = 512
 _MAX_PROCESSES = 2048
+
+
+def _fold_run_resource_summary(row: dict[str, Any]) -> dict[str, Any]:
+    """Turn one run row's per-attempt snapshots into its compact summary.
+
+    The list query returns the raw snapshots of the current page's attempts;
+    the fold itself belongs to the shared reducer, so the list and the detail
+    view cannot disagree about what a run's CPU or memory peak is. A run with
+    no measured attempt keeps ``None`` — "not measured here" is not zero.
+    """
+    attempts = _load_json(row.pop("resource_summary_attempts", None)) or []
+    summaries = [
+        item.get("summary") if isinstance(item, dict) else None
+        for item in attempts
+        if isinstance(item, dict)
+    ]
+    terminal = [bool(item.get("terminal")) if isinstance(item, dict) else True for item in attempts]
+    received = [item.get("received_at") if isinstance(item, dict) else None for item in attempts]
+    row["resource_summary"] = summarize_run_resources(
+        summaries,
+        terminal_by_attempt=terminal or None,
+        received_at_by_attempt=received or None,
+    )
+    return row
 
 
 class AdminRunQueries:
@@ -161,7 +213,9 @@ class AdminRunQueries:
                 cursor.job_id if cursor else None,
                 limit + 1,
             )
-        page = [AdminRun.model_validate(dict(row)) for row in rows[:limit]]
+        page = [
+            AdminRun.model_validate(_fold_run_resource_summary(dict(row))) for row in rows[:limit]
+        ]
         next_cursor = None
         if len(rows) > limit:
             last = page[-1]
@@ -185,7 +239,9 @@ class AdminRunQueries:
                 WHERE j.id = $1""",
                 job_id,
             )
-        return dict(row) if row is not None else None
+        if row is None:
+            return None
+        return _fold_run_resource_summary(dict(row))
 
     async def attempts(self, job_id: str) -> list[dict[str, Any]]:
         """Read execution identities without lease credentials or failure text."""
@@ -304,12 +360,19 @@ class AdminRunQueries:
         return AdminActivityPage(events=page, next_cursor=next_cursor)
 
     async def resources(self, job_id: str, attempt_id: int) -> dict[str, Any] | None:
-        """Read one attempt's resource rows with their original source and gaps."""
+        """Read one attempt's resource rows with their original source and gaps.
+
+        ``turn_summary`` is returned as the stored snapshot, not as the
+        response projection: the caller runs it through the shared reducer,
+        which is also what the Runs list uses. Selecting the projection here
+        would be a second implementation of the same rules.
+        """
         async with self._read() as conn:
             row = await conn.fetchrow(
                 f"""
                 SELECT a.id AS attempt_id, a.attempt_no, a.started_at, a.finished_at,
-                       a.continuity_mode, a.context_status, {_RESOURCE_COLUMNS}
+                       a.continuity_mode, a.context_status,
+                       a.status <> 'running' AS attempt_terminal, {_RESOURCE_COLUMNS}
                 FROM agent_attempts a
                 LEFT JOIN agent_attempt_resources r ON r.attempt_id = a.id
                 WHERE a.job_id = $1 AND a.id = $2
@@ -320,6 +383,7 @@ class AdminRunQueries:
             if row is None:
                 return None
             telemetry = dict(row)
+            telemetry["turn_summary"] = _load_json(telemetry.get("turn_summary"))
             calls = await conn.fetch(
                 f"SELECT {_CALL_COLUMNS} FROM agent_tool_call_resources "
                 "WHERE attempt_id = $1 ORDER BY call_seq LIMIT $2",

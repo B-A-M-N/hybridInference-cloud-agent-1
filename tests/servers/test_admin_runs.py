@@ -13,11 +13,17 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from cloud_agent import identity
-from cloud_agent.admin_observability import AdminActivityPage, AdminRunList, cursor_scope
+from cloud_agent.admin_observability import (
+    AdminActivityPage,
+    AdminRun,
+    AdminRunList,
+    cursor_scope,
+)
 from cloud_agent.api import admin_runs, usage
 from cloud_agent.api.deps import get_agent_job_store, get_gateway_client
 from cloud_agent.api.routes import require_agent_owner
 from cloud_agent.app import create_app, create_mcp_app
+from cloud_agent.schemas import ResourceMetricBrief, RunResourceSummary
 from cloud_agent_host.event_payloads import MAX_EVENT_PAYLOAD_BYTES
 from tests.servers.test_owner_revalidation import _AccessGateway
 from tests.unit.test_ledger_snapshots import END, START, ledger_row
@@ -33,12 +39,9 @@ PATHS = [
 ]
 
 
-@pytest.fixture
-def setup(monkeypatch):
-    monkeypatch.setenv("ADMIN_TOKEN", "admin-observations-test")
-    monkeypatch.setenv(identity.ENV_SESSION_SECRET, "admin-observations-session-test-long-secret")
-    monkeypatch.setenv(identity.ENV_ISSUER, "https://gateway.example")
-    run = {
+def _admin_run_row() -> dict:
+    """One run row in the shape ``AdminRunQueries.list_runs`` returns."""
+    return {
         "id": "ajob_other",
         "thread_id": "athr_other",
         "title": "A task title",
@@ -58,6 +61,14 @@ def setup(monkeypatch):
         "detail": "private exception output",
         "metadata": {"token": "private credential"},
     }
+
+
+@pytest.fixture
+def setup(monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", "admin-observations-test")
+    monkeypatch.setenv(identity.ENV_SESSION_SECRET, "admin-observations-session-test-long-secret")
+    monkeypatch.setenv(identity.ENV_ISSUER, "https://gateway.example")
+    run = _admin_run_row()
     event = {
         "id": 20,
         "attempt_id": 10,
@@ -204,6 +215,131 @@ async def test_resource_read_keeps_message_timing_and_unavailable_whole_turn(set
     queries.resources.assert_awaited_once_with("ajob_other", 10)
     queries.event_content.assert_not_awaited()
     store.get_job.assert_not_awaited()
+
+
+def _turn_summary_snapshot(*, state: str, observed_through_ms: int) -> dict[str, object]:
+    """One stored snapshot in the canonical shape the route reduces."""
+    return {
+        "schema_version": 1,
+        "measurement_id": "00000000-0000-4000-8000-000000000001",
+        "report_seq": 9,
+        "state": state,
+        "scope": "member_execution_window",
+        "source": "kata-guest-member-window-v1",
+        "window": {
+            "duration_ms": 130_000,
+            "observed_through_ms": observed_through_ms,
+            "open_scan_ms": 12,
+            "close_scan_ms": 15,
+        },
+        "cpu": {
+            "status": "available",
+            "method": "live_and_exit_task_counters",
+            "usec": 80_000_000,
+            "reason_codes": [],
+        },
+        "memory": {
+            "status": "available",
+            "method": "sampled_member_pss",
+            "peak_bytes": 1_288_490_189,
+            "sample_interval_ms": 1000,
+            "valid_samples": 131,
+            "expected_samples": 131,
+            "max_gap_ms": 1000,
+            "reason_codes": [],
+        },
+        "storage_io": {
+            "status": "unavailable",
+            "method": "task_io_accounting",
+            "read_bytes": None,
+            "write_bytes": None,
+            "reason_codes": ["filesystem_attribution_unverified"],
+        },
+    }
+
+
+async def test_a_terminal_attempt_reports_its_prefix_as_interrupted_not_final(setup):
+    """The derived state is the reason the reducer exists on this path."""
+    app, queries, _, _ = setup
+    queries.resources.return_value.update(
+        {
+            "attempt_terminal": True,
+            "turn_summary_received_at": END,
+            "turn_summary": _turn_summary_snapshot(state="collecting", observed_through_ms=12_000),
+        }
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(PREFIX + "/ajob_other/attempts/10/resources", headers=ADMIN)
+
+    assert response.status_code == 200
+    turn = response.json()["resources"]["turn_summary"]
+    assert turn["state"] == "interrupted"
+    assert turn["window"]["observed_through_ms"] == 12_000
+    assert turn["window"]["duration_ms"] == 130_000
+    assert turn["cpu"]["usec"] == 80_000_000
+
+
+async def test_the_stored_snapshot_is_not_rewritten_by_a_read(setup):
+    """Reads never mutate: the stored state stays what the guest reported."""
+    app, queries, _, _ = setup
+    stored = _turn_summary_snapshot(state="collecting", observed_through_ms=12_000)
+    queries.resources.return_value.update({"attempt_terminal": True, "turn_summary": stored})
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.get(PREFIX + "/ajob_other/attempts/10/resources", headers=ADMIN)
+
+    assert stored["state"] == "collecting"
+
+
+async def test_an_unreadable_snapshot_does_not_break_the_detail_view(setup):
+    """A damaged row must not fail an admin page; it reports no summary."""
+    app, queries, _, _ = setup
+    queries.resources.return_value["turn_summary"] = {"schema_version": 99}
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(PREFIX + "/ajob_other/attempts/10/resources", headers=ADMIN)
+
+    assert response.status_code == 200
+    assert response.json()["resources"]["turn_summary"] is None
+
+
+async def test_the_runs_list_carries_the_compact_resource_summary(setup):
+    """The list projection is the model's, already folded by the shared reducer."""
+    app, queries, _, _ = setup
+    summary = RunResourceSummary(
+        cpu_usec=80_000_000,
+        memory_peak_bytes=1_288_490_189,
+        state="final",
+        observed_through_ms=130_000,
+        cpu=ResourceMetricBrief(status="available"),
+        memory=ResourceMetricBrief(status="available"),
+        storage_io=ResourceMetricBrief(
+            status="unavailable",
+            reason_codes=["filesystem_attribution_unverified"],
+        ),
+        attempts_measured=2,
+        attempts_total=3,
+    )
+    queries.list_runs.return_value = AdminRunList(
+        runs=[
+            AdminRun.model_validate({**_admin_run_row(), "resource_summary": summary}),
+        ],
+        since=START,
+        until=END,
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(PREFIX, headers=ADMIN)
+
+    assert response.status_code == 200
+    listed = response.json()["runs"][0]["resource_summary"]
+    assert listed["cpu_usec"] == 80_000_000
+    assert listed["memory_peak_bytes"] == 1_288_490_189
+    assert listed["storage_io"]["status"] == "unavailable"
+    assert listed["cpu"]["status"] == "available"
+    assert listed["attempts_measured"] == 2
+    assert listed["attempts_total"] == 3
 
 
 @pytest.mark.parametrize("browser", [False, True])

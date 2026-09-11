@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response
-from pydantic import AwareDatetime  # noqa: TC002 — FastAPI resolves this at runtime.
+from pydantic import AwareDatetime, ValidationError
 
 from cloud_agent.admin_observability import (
     ActivityCursor,
@@ -26,9 +26,10 @@ from cloud_agent.api.deps import get_agent_job_store, get_client_ip, verify_admi
 from cloud_agent.api.routes import _attempt_duration_ms, _attempt_resources, _require_store
 from cloud_agent.ledger import summarize_job_usage
 from cloud_agent.logging_utils import get_logger
-from cloud_agent.schemas import AgentAttemptTelemetry
+from cloud_agent.schemas import AgentAttemptTelemetry, AttemptResources, TurnResourceSummary
 from cloud_agent.storage.admin_queries import AdminRunQueries
 from cloud_agent.storage.store import TERMINAL_STATES
+from cloud_agent_host.turn_resources import summarize_turn_resources
 
 if TYPE_CHECKING:
     from cloud_agent.storage.store import AgentJobStore
@@ -55,6 +56,38 @@ async def _run(queries: AdminRunQueries, job_id: str) -> dict[str, Any]:
     if row is None:
         raise HTTPException(status_code=404, detail="Run not found.")
     return row
+
+
+def _resources_with_turn_summary(telemetry: dict[str, Any]) -> AttemptResources | None:
+    """Shape one attempt's resources, adding the derived whole-turn window.
+
+    The stored snapshot and the attempt's terminal state go through the shared
+    reducer, so this view and the Runs list derive ``interrupted`` the same way.
+    The reducer is total: a malformed or absent snapshot yields no
+    ``turn_summary`` and never fails the page, which is what keeps one damaged
+    row from taking down the detail view.
+
+    The same policy covers the model itself. The reducer checks the structure
+    it must understand, not every literal method string a modified row could
+    carry, so a snapshot that still cannot become a response is reported as
+    absent rather than as a 500 on the admin page.
+    """
+    resources = _attempt_resources(telemetry)
+    if resources is None:
+        return None
+    summary = summarize_turn_resources(
+        telemetry.get("turn_summary"),
+        attempt_terminal=bool(telemetry.get("attempt_terminal")),
+        received_at=telemetry.get("turn_summary_received_at"),
+    )
+    if summary is None:
+        return resources
+    try:
+        turn_summary = TurnResourceSummary.model_validate(summary)
+    except ValidationError:
+        logger.warning("agent_admin_turn_summary_unreadable")
+        return resources
+    return resources.model_copy(update={"turn_summary": turn_summary})
 
 
 @router.get("", response_model=AdminRunList)
@@ -143,7 +176,7 @@ async def get_admin_resources(
         continuity_mode=telemetry.get("continuity_mode"),
         context_status=telemetry.get("context_status"),
         duration_ms=_attempt_duration_ms(telemetry),
-        resources=_attempt_resources(telemetry),
+        resources=_resources_with_turn_summary(telemetry),
     )
 
 

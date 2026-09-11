@@ -38,7 +38,7 @@ import hashlib
 import json
 import secrets
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 import asyncpg
 
@@ -517,6 +517,12 @@ _QUALIFIED_HOST_COLUMNS = (
     ", ".join(f"h.{column}" for column in _HOST_COLUMN_NAMES)
     + ", (h.credential_hash IS NOT NULL) AS enrolled"
 )
+
+#: Every outcome of :meth:`AgentJobStore.record_attempt_turn_summary`. ``stored``
+#: and ``duplicate`` are success — a retried post is the same snapshot said
+#: twice. ``conflict`` is a protocol violation that retrying cannot fix, and
+#: ``lease_lost`` is the fence every worker write shares: stop immediately.
+TurnSummaryWrite = Literal["stored", "duplicate", "conflict", "lease_lost"]
 
 
 class AgentJobStore:
@@ -4672,6 +4678,183 @@ class AgentJobStore:
                 )
             return True
 
+    async def record_attempt_turn_summary(
+        self,
+        *,
+        attempt_id: int,
+        lease_generation: int,
+        measurement_id: str,
+        report_seq: int,
+        state: str,
+        summary: dict[str, Any],
+    ) -> TurnSummaryWrite:
+        """Store one cumulative ``member_execution_window`` snapshot per attempt.
+
+        Fenced like every other worker write: a superseded attempt must not be
+        able to relabel what the live one consumed. The fence predicate is
+        evaluated against the locked attempt row and the database clock, so a
+        lease that expired a microsecond ago cannot write even if the reaper
+        has not noticed it yet.
+
+        Unlike :meth:`record_attempt_resources`, this body is a cumulative
+        snapshot rather than a closed window. The runner posts checkpoints
+        while the turn runs and a final one when it ends, and a delivery can be
+        duplicated, reordered, or replayed after a retry. ``report_seq`` is
+        therefore the ordering key and ``turn_summary_seq`` is what it was
+        accepted at: a lower or equal-and-different sequence must never win,
+        because that would let a stale checkpoint roll a measured window
+        backwards. Equal sequences with a byte-identical payload are the same
+        snapshot arriving twice, which is what a retry of an acknowledged post
+        looks like.
+
+        The first accepted snapshot fixes the attempt's ``measurement_id``.
+        A later report naming a different measurement is not an update to the
+        same window — it is a different window claiming the same attempt, and
+        accepting it would silently splice two measurements together.
+
+        This never touches the legacy aggregate columns or the tool-call and
+        process child rows. Those describe what the container sampler and the
+        process observer saw, which is independent evidence; this snapshot
+        describes the member's own window. Neither replaces the other, so a
+        turn may have either, both, or neither.
+
+        When this runs first it inserts a legacy-compatible base row — the
+        same "no container totals were attributed to this member" statement
+        ``shared-member-v1`` already makes, never a fabricated measurement.
+
+        Args:
+            attempt_id: The attempt the snapshot describes.
+            lease_generation: The caller's fencing generation for that attempt.
+            measurement_id: The window identity fixed at the first accepted report.
+            report_seq: Strictly monotonic per ``measurement_id``.
+            state: ``collecting`` or ``final`` as the guest reported it.
+            summary: The canonical snake_case snapshot to store.
+
+        Returns:
+            ``stored`` when this call accepted the snapshot, ``duplicate`` when
+            the identical snapshot was already stored, ``conflict`` when the
+            ordering rules refuse it, and ``lease_lost`` when the attempt is
+            not running under this lease. Only ``stored`` and ``duplicate`` are
+            success for the caller; the other two are not retryable.
+        """
+        async with self._pool.acquire() as conn, conn.transaction():
+            # Lock the attempt before reading its resource row. The lock is
+            # what makes the read-decide-write below atomic: two concurrent
+            # checkpoints of the same attempt serialize here, so the second
+            # one sees what the first wrote instead of racing it.
+            fenced = await conn.fetchrow(
+                """
+                SELECT id, job_id FROM agent_attempts
+                WHERE id = $1 AND lease_generation = $2
+                  AND status = 'running' AND lease_expires_at > NOW()
+                FOR UPDATE
+                """,
+                attempt_id,
+                lease_generation,
+            )
+            if fenced is None:
+                return "lease_lost"
+            inserted = await conn.fetchval(
+                """
+                INSERT INTO agent_attempt_resources (
+                    attempt_id, job_id, sample_count, coverage, sampler_version,
+                    turn_summary, turn_summary_seq, turn_summary_received_at
+                )
+                VALUES ($1, $2, 0, 0, 'shared-member-v1', $3::jsonb, $4, NOW())
+                ON CONFLICT (attempt_id) DO NOTHING
+                RETURNING attempt_id
+                """,
+                attempt_id,
+                fenced["job_id"],
+                json.dumps(summary),
+                report_seq,
+            )
+            if inserted is not None:
+                return "stored"
+            stored = await conn.fetchrow(
+                """
+                SELECT turn_summary, turn_summary_seq
+                FROM agent_attempt_resources
+                WHERE attempt_id = $1
+                """,
+                attempt_id,
+            )
+            if stored is None:
+                # The row must exist after the INSERT above found a conflict.
+                # Reaching here means it was deleted between the two
+                # statements, and the safe answer is that nothing was written.
+                return "conflict"
+            stored_summary = _load_json(stored["turn_summary"])
+            stored_object = stored_summary if isinstance(stored_summary, dict) else {}
+            decision = self._turn_summary_decision(
+                stored_seq=stored["turn_summary_seq"],
+                stored_summary=stored_summary,
+                stored_measurement=stored_object.get("measurement_id"),
+                stored_state=stored_object.get("state"),
+                measurement_id=measurement_id,
+                report_seq=report_seq,
+                state=state,
+                summary=summary,
+            )
+            if decision != "accept":
+                return decision
+            updated = await conn.fetchval(
+                """
+                UPDATE agent_attempt_resources
+                SET turn_summary = $2::jsonb,
+                    turn_summary_seq = $3,
+                    turn_summary_received_at = NOW()
+                WHERE attempt_id = $1
+                RETURNING attempt_id
+                """,
+                attempt_id,
+                json.dumps(summary),
+                report_seq,
+            )
+            if updated is None:
+                return "conflict"
+            return "stored"
+
+    @staticmethod
+    def _turn_summary_decision(
+        *,
+        stored_seq: int | None,
+        stored_summary: Any,
+        stored_measurement: Any,
+        stored_state: Any,
+        measurement_id: str,
+        report_seq: int,
+        state: str,
+        summary: dict[str, Any],
+    ) -> TurnSummaryWrite:
+        """Whether an incoming snapshot may replace the stored one, and how.
+
+        Separated from the statement so the ordering rules read as rules
+        rather than as one long SQL condition, and so each refusal is a named
+        decision: the caller gets ``conflict`` for every one of them, because
+        none of them is a transient failure worth retrying.
+        """
+        if stored_seq is None:
+            # The row exists for the legacy accounting only. The first
+            # snapshot may take it over, and nothing can conflict with a
+            # sequence that was never recorded.
+            return "accept"
+        if report_seq < stored_seq:
+            return "conflict"
+        if report_seq == stored_seq:
+            # Same sequence means the same snapshot. A different payload at
+            # the same sequence is two states claiming one position, and
+            # last-write-wins would let whichever arrived second decide.
+            # An identical payload is the retry this whole path exists for.
+            return "duplicate" if stored_summary == summary else "conflict"
+        # From here the incoming snapshot is newer, which still does not make
+        # it authoritative: these two rules outrank recency.
+        if stored_state == "final" and state == "collecting":
+            return "conflict"
+        if stored_measurement is not None and stored_measurement != measurement_id:
+            return "conflict"
+        return "accept"
+
     async def job_attempts_telemetry(self, *, job_id: str) -> list[dict[str, Any]]:
         """Read lightweight attempt summaries without tool or process rows."""
         async with self._pool.acquire() as conn:
@@ -4721,7 +4904,9 @@ class AgentJobStore:
                            AS process_observation_complete,
                        COALESCE(r.process_events_lost, 0) AS process_events_lost,
                        COALESCE(r.processes_truncated, FALSE) AS processes_truncated,
-                       COALESCE(r.tool_calls_truncated, FALSE) AS tool_calls_truncated
+                       COALESCE(r.tool_calls_truncated, FALSE) AS tool_calls_truncated,
+                       COALESCE(a.finished_at IS NOT NULL, FALSE) AS attempt_terminal,
+                       r.turn_summary, r.turn_summary_received_at
                 FROM agent_attempts a
                 LEFT JOIN agent_attempt_resources r ON r.attempt_id = a.id
                 WHERE a.job_id = $1
@@ -4735,6 +4920,11 @@ class AgentJobStore:
             if row is None:
                 return None
             telemetry = dict(row)
+            # A JSONB column arrives as text through this pool. Decode it here
+            # so every reader gets the snapshot as the object the guest posted,
+            # and a row that is not an object reads as absent rather than as a
+            # string no reducer can use.
+            telemetry["turn_summary"] = _load_json(telemetry.get("turn_summary"))
             calls = await conn.fetch(
                 """
                 SELECT call_seq, tool_use_id, tool_name,

@@ -3828,6 +3828,328 @@ async def test_an_unmeasured_window_is_stored_as_such_not_as_zero(store: AgentJo
     assert telemetry["tool_time_ms"] is None
 
 
+MEASUREMENT_ID = "00000000-0000-4000-8000-000000000001"
+
+
+def _turn_snapshot(
+    *,
+    state: str = "final",
+    measurement_id: str = MEASUREMENT_ID,
+    cpu_usec: int = 80_000_000,
+    peak_bytes: int = 1_288_490_189,
+    duration_ms: int = 130_000,
+    observed_through_ms: int = 130_000,
+) -> dict[str, object]:
+    """One cumulative snapshot in the canonical snake_case stored shape."""
+    return {
+        "schema_version": 1,
+        "measurement_id": measurement_id,
+        "report_seq": 1,
+        "state": state,
+        "scope": "member_execution_window",
+        "source": "kata-guest-member-window-v1",
+        "window": {
+            "duration_ms": duration_ms,
+            "observed_through_ms": observed_through_ms,
+            "open_scan_ms": 12,
+            "close_scan_ms": 15,
+        },
+        "cpu": {
+            "status": "available",
+            "method": "live_and_exit_task_counters",
+            "usec": cpu_usec,
+            "reason_codes": [],
+        },
+        "memory": {
+            "status": "available",
+            "method": "sampled_member_pss",
+            "peak_bytes": peak_bytes,
+            "sample_interval_ms": 1000,
+            "valid_samples": 131,
+            "expected_samples": 131,
+            "max_gap_ms": 1000,
+            "reason_codes": [],
+        },
+        "storage_io": {
+            "status": "unavailable",
+            "method": "task_io_accounting",
+            "read_bytes": None,
+            "write_bytes": None,
+            "reason_codes": ["filesystem_attribution_unverified"],
+        },
+    }
+
+
+async def _record_turn_summary(
+    store: AgentJobStore,
+    claim: dict,
+    *,
+    report_seq: int,
+    summary: dict[str, object],
+    state: str | None = None,
+    measurement_id: str | None = None,
+    lease_generation: int | None = None,
+) -> str:
+    """Post one checkpoint through the arguments the route passes."""
+    return await store.record_attempt_turn_summary(
+        attempt_id=claim["attempt_id"],
+        lease_generation=(
+            claim["lease_generation"] if lease_generation is None else lease_generation
+        ),
+        measurement_id=(
+            str(summary["measurement_id"]) if measurement_id is None else measurement_id
+        ),
+        report_seq=report_seq,
+        state=str(summary["state"]) if state is None else state,
+        summary={**summary, "report_seq": report_seq},
+    )
+
+
+async def test_a_turn_summary_is_stored_and_its_retry_is_not_a_second_write(
+    store: AgentJobStore,
+):
+    """A cumulative snapshot resent unchanged is the same snapshot, not a delta.
+
+    This is the property a fake keyed by attempt cannot check: ``duplicate``
+    has to come from the stored sequence and the stored payload matching, and
+    the row must still hold the first value afterwards.
+    """
+    job = await _create_job(store)
+    claim = await _claim(store, worker_id="w1", lease_ttl_seconds=60)
+    assert claim is not None
+    snapshot = _turn_snapshot()
+
+    assert await _record_turn_summary(store, claim, report_seq=1, summary=snapshot) == "stored"
+    assert await _record_turn_summary(store, claim, report_seq=1, summary=snapshot) == "duplicate"
+
+    telemetry = await store.job_turn_telemetry(job_id=job["id"])
+    assert telemetry is not None
+    assert telemetry["turn_summary"]["cpu"]["usec"] == 80_000_000
+    assert telemetry["turn_summary"]["state"] == "final"
+    assert telemetry["turn_summary_received_at"] is not None
+
+
+async def test_an_older_checkpoint_cannot_roll_a_stored_window_backwards(
+    store: AgentJobStore,
+):
+    """Out-of-order delivery must not replace a newer cumulative snapshot."""
+    job = await _create_job(store)
+    claim = await _claim(store, worker_id="w1", lease_ttl_seconds=60)
+    assert claim is not None
+
+    assert (
+        await _record_turn_summary(
+            store, claim, report_seq=7, summary=_turn_snapshot(cpu_usec=50_000_000)
+        )
+        == "stored"
+    )
+    assert (
+        await _record_turn_summary(
+            store, claim, report_seq=3, summary=_turn_snapshot(cpu_usec=1_000)
+        )
+        == "conflict"
+    )
+
+    telemetry = await store.job_turn_telemetry(job_id=job["id"])
+    assert telemetry is not None
+    assert telemetry["turn_summary"]["cpu"]["usec"] == 50_000_000
+
+
+async def test_two_payloads_at_one_sequence_are_a_protocol_conflict(
+    store: AgentJobStore,
+):
+    """Last-write-wins would let whichever delivery arrived second decide."""
+    job = await _create_job(store)
+    claim = await _claim(store, worker_id="w1", lease_ttl_seconds=60)
+    assert claim is not None
+
+    assert (
+        await _record_turn_summary(store, claim, report_seq=4, summary=_turn_snapshot()) == "stored"
+    )
+    different = _turn_snapshot(cpu_usec=1)
+    assert await _record_turn_summary(store, claim, report_seq=4, summary=different) == "conflict"
+
+    telemetry = await store.job_turn_telemetry(job_id=job["id"])
+    assert telemetry is not None
+    assert telemetry["turn_summary"]["cpu"]["usec"] == 80_000_000
+
+
+async def test_a_final_snapshot_cannot_be_overwritten_by_a_collecting_one(
+    store: AgentJobStore,
+):
+    """A newer sequence does not outrank ``final``. Nothing un-finishes a turn."""
+    job = await _create_job(store)
+    claim = await _claim(store, worker_id="w1", lease_ttl_seconds=60)
+    assert claim is not None
+
+    assert (
+        await _record_turn_summary(
+            store, claim, report_seq=9, summary=_turn_snapshot(state="final")
+        )
+        == "stored"
+    )
+    assert (
+        await _record_turn_summary(
+            store,
+            claim,
+            report_seq=10,
+            summary=_turn_snapshot(state="collecting", observed_through_ms=4_000),
+        )
+        == "conflict"
+    )
+
+    telemetry = await store.job_turn_telemetry(job_id=job["id"])
+    assert telemetry is not None
+    assert telemetry["turn_summary"]["state"] == "final"
+    assert telemetry["turn_summary"]["window"]["observed_through_ms"] == 130_000
+
+
+async def test_a_second_measurement_cannot_take_over_a_fixed_window(
+    store: AgentJobStore,
+):
+    """The first accepted report fixes the attempt's ``measurement_id``."""
+    job = await _create_job(store)
+    claim = await _claim(store, worker_id="w1", lease_ttl_seconds=60)
+    assert claim is not None
+
+    assert (
+        await _record_turn_summary(store, claim, report_seq=1, summary=_turn_snapshot()) == "stored"
+    )
+    other = "00000000-0000-4000-8000-000000000002"
+    assert (
+        await _record_turn_summary(
+            store,
+            claim,
+            report_seq=2,
+            summary=_turn_snapshot(measurement_id=other, cpu_usec=7),
+        )
+        == "conflict"
+    )
+
+    telemetry = await store.job_turn_telemetry(job_id=job["id"])
+    assert telemetry is not None
+    assert telemetry["turn_summary"]["measurement_id"] == MEASUREMENT_ID
+
+
+async def test_a_superseded_or_expired_lease_cannot_write_a_turn_summary(
+    store: AgentJobStore,
+):
+    """Fenced like every other worker write, against the database clock."""
+    job = await _create_job(store)
+    claim = await _claim(store, worker_id="w1", lease_ttl_seconds=60)
+    assert claim is not None
+
+    assert (
+        await _record_turn_summary(
+            store,
+            claim,
+            report_seq=1,
+            summary=_turn_snapshot(),
+            lease_generation=claim["lease_generation"] + 1,
+        )
+        == "lease_lost"
+    )
+    await _expire_attempt(store, claim["attempt_id"])
+    assert (
+        await _record_turn_summary(store, claim, report_seq=1, summary=_turn_snapshot())
+        == "lease_lost"
+    )
+
+    telemetry = await store.job_turn_telemetry(job_id=job["id"])
+    assert telemetry is not None
+    assert telemetry["turn_summary"] is None
+
+
+async def test_the_legacy_writer_does_not_clobber_the_turn_summary(
+    store: AgentJobStore,
+):
+    """Two independent reports about one attempt, in both write orders."""
+    job = await _create_job(store)
+    claim = await _claim(store, worker_id="w1", lease_ttl_seconds=60)
+    assert claim is not None
+
+    assert (
+        await _record_turn_summary(store, claim, report_seq=1, summary=_turn_snapshot()) == "stored"
+    )
+    assert await store.record_attempt_resources(
+        attempt_id=claim["attempt_id"],
+        lease_generation=claim["lease_generation"],
+        rollup={"cpu_usec": 1_000, "sample_count": 5, "coverage": 1.0, "sampler_version": "1"},
+    )
+
+    telemetry = await store.job_turn_telemetry(job_id=job["id"])
+    assert telemetry is not None
+    assert telemetry["cpu_usec"] == 1_000, "the legacy rollup must have landed"
+    assert telemetry["turn_summary"]["cpu"]["usec"] == 80_000_000, (
+        "the legacy writer erased the turn summary"
+    )
+
+
+async def test_the_turn_writer_keeps_the_legacy_row_and_its_child_rows(
+    store: AgentJobStore,
+):
+    """The other direction: a snapshot must not erase independent evidence."""
+    job = await _create_job(store)
+    claim = await _claim(store, worker_id="w1", lease_ttl_seconds=60)
+    assert claim is not None
+
+    assert await store.record_attempt_resources(
+        attempt_id=claim["attempt_id"],
+        lease_generation=claim["lease_generation"],
+        rollup={
+            "cpu_usec": 9_000,
+            "mem_peak_bytes": 4_096,
+            "sample_count": 12,
+            "coverage": 1.0,
+            "sampler_version": "2",
+            "tool_calls": [_tool_call(1, "Read")],
+            "processes": [_retry_process("reader")],
+        },
+    )
+    assert (
+        await _record_turn_summary(store, claim, report_seq=1, summary=_turn_snapshot()) == "stored"
+    )
+
+    telemetry = await store.job_turn_telemetry(job_id=job["id"])
+    assert telemetry is not None
+    assert telemetry["cpu_usec"] == 9_000
+    assert telemetry["mem_peak_bytes"] == 4_096
+    assert telemetry["sampler_version"] == "2"
+    assert [call["tool_name"] for call in telemetry["tool_calls"]] == ["Read"]
+    assert [process["comm"] for process in telemetry["processes"]] == ["reader"]
+    assert telemetry["turn_summary"]["measurement_id"] == MEASUREMENT_ID
+
+
+async def test_a_turn_summary_alone_creates_a_legacy_compatible_base_row(
+    store: AgentJobStore,
+):
+    """The base is the honest "no container totals were attributed", not a zero.
+
+    ``sampler_version`` is NOT NULL with no default, so the row the snapshot
+    writer inserts has to name the shared-member convention itself. A reader
+    must see coverage 0 and NULL counters rather than a fabricated measurement.
+    """
+    job = await _create_job(store)
+    claim = await _claim(store, worker_id="w1", lease_ttl_seconds=60)
+    assert claim is not None
+
+    assert (
+        await _record_turn_summary(store, claim, report_seq=1, summary=_turn_snapshot()) == "stored"
+    )
+
+    telemetry = await store.job_turn_telemetry(job_id=job["id"])
+    assert telemetry is not None
+    assert telemetry["sampler_version"] == "shared-member-v1"
+    assert telemetry["sample_count"] == 0
+    assert telemetry["coverage"] == 0.0
+    assert telemetry["cpu_usec"] is None
+    assert telemetry["mem_peak_bytes"] is None
+    assert telemetry["net_rx_bytes"] is None
+    assert telemetry["tool_calls"] == []
+    assert telemetry["processes"] == []
+    assert telemetry["turn_summary"]["cpu"]["usec"] == 80_000_000
+
+
 def _tool_call(seq: int, name: str, **overrides: object) -> dict[str, object]:
     """One per-call row in the shape the runner's attribution produces."""
     return {
