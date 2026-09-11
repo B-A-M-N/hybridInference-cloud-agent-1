@@ -1524,55 +1524,6 @@ def create_app(
                     return resources
                 resources = build_turn_resources(value, tool_windows)
                 return resources
-                telemetry = (
-                    value
-                    if isinstance(value, SharedTurnTelemetry)
-                    else SharedTurnTelemetry(
-                        observation=(
-                            value
-                            if isinstance(value, GuestObservation)
-                            else GuestObservation.unavailable(
-                                "shared turn returned no process telemetry"
-                            )
-                        )
-                    )
-                )
-                tool_windows.apply_marks(list(telemetry.tool_marks))
-                windows = tool_windows.windows()
-                resources = shared_member_resource_rollup()
-                tool_calls = attribute(
-                    [],
-                    windows,
-                    windows_complete=not tool_windows.truncated,
-                )
-                processes, process_counts = attribute_processes(
-                    telemetry.observation,
-                    windows,
-                    windows_complete=not tool_windows.truncated,
-                )
-                resources.update(
-                    {
-                        "tool_calls": add_process_resources(
-                            add_process_counts(tool_calls, process_counts),
-                            processes,
-                            observation_complete=telemetry.observation.complete,
-                        ),
-                        "tool_calls_truncated": tool_windows.truncated,
-                        "tool_time_ms": (None if tool_windows.truncated else tool_time_ms(windows)),
-                        "process_observer": telemetry.observation.source,
-                        "process_observation_complete": telemetry.observation.complete,
-                        "process_events_lost": telemetry.observation.lost_events,
-                        "processes_truncated": telemetry.observation.truncated,
-                        "processes": processes,
-                    }
-                )
-                # The whole-turn member execution window travels beside the
-                # legacy rollup rather than inside it: it is a different
-                # measurement with its own endpoint, and folding it into this
-                # dict would make the shared-member guard's terms ambiguous.
-                if telemetry.turn_resources is not None:
-                    resources["turn_resources"] = telemetry.turn_resources
-                return resources
 
             try:
                 for event in turn.lines():

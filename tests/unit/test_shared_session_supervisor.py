@@ -1964,3 +1964,105 @@ def test_a_checkpoint_is_produced_without_any_turn_event():
     assert pending is not None and pending["state"] == "collecting"
     # Taking it is what makes forwarding happen once rather than repeatedly.
     assert supervisor.take_reported_checkpoint("athr_source") is None
+
+
+def test_checkpoints_are_produced_without_a_hook_because_production_has_none():
+    """The delivery gate must not depend on an observer nobody installs.
+
+    The broker builds its supervisor without a checkpoint hook. An earlier
+    version returned early when the hook was absent, so no checkpoint was ever
+    produced in production while a test that passed its own hook stayed green --
+    the same shape of gap as a fixture that does not match the producer.
+    """
+    manager = _Manager()
+    manager.backend.runtime = KATA_RUNTIME
+    supervisor = SharedChatSessionSupervisor(
+        manager,
+        transport_factory=_TransportFactory(),
+        window_sample_interval_s=10.0,
+        checkpoint_interval_s=0.0,
+    )
+    assert supervisor._window_checkpoint_hook is None
+
+    lease = supervisor.acquire(
+        _spec(),
+        thread_id="athr_source",
+        owner="attempt:1",
+        activation_generation=1,
+        has_settled_context=True,
+        manifest=_members(),
+    )
+    supervisor.ensure_resident(
+        "athr_source",
+        lease.token,
+        _launch("athr_source", native_session_id="native-source", slot=0),
+    )
+    supervisor._stop.set()
+    if supervisor._sampler_thread is not None:
+        supervisor._sampler_thread.join(timeout=2)
+
+    supervisor.start_turn(
+        "athr_source",
+        lease.token,
+        prompt="work",
+        model="glm-5.1",
+        reasoning_effort=None,
+    )
+    supervisor.sample_open_windows()
+
+    pending = supervisor.take_reported_checkpoint("athr_source")
+    assert pending is not None
+    assert pending["state"] == "collecting"
+
+
+def test_the_final_report_sequence_stays_above_every_checkpoint():
+    """A checkpoint produced while the turn closes must not block the final.
+
+    The sampler keeps ticking while the closing observation runs, which takes a
+    guest exec. A final report that derived its sequence from the census counter
+    could come out below a checkpoint made in that window, and the store
+    rejects a lower sequence -- leaving a completed turn stored as collecting.
+    """
+    manager = _Manager()
+    manager.backend.runtime = KATA_RUNTIME
+    supervisor = SharedChatSessionSupervisor(
+        manager,
+        transport_factory=_TransportFactory(),
+        window_sample_interval_s=10.0,
+        checkpoint_interval_s=0.0,
+    )
+    lease = supervisor.acquire(
+        _spec(),
+        thread_id="athr_source",
+        owner="attempt:1",
+        activation_generation=1,
+        has_settled_context=True,
+        manifest=_members(),
+    )
+    supervisor.ensure_resident(
+        "athr_source",
+        lease.token,
+        _launch("athr_source", native_session_id="native-source", slot=0),
+    )
+    supervisor._stop.set()
+    if supervisor._sampler_thread is not None:
+        supervisor._sampler_thread.join(timeout=2)
+
+    turn = supervisor.start_turn(
+        "athr_source",
+        lease.token,
+        prompt="work",
+        model="glm-5.1",
+        reasoning_effort=None,
+    )
+    sequences: list[int] = []
+    for _ in range(3):
+        supervisor.sample_open_windows()
+        checkpoint = supervisor.take_reported_checkpoint("athr_source")
+        if checkpoint is not None:
+            sequences.append(checkpoint["report_seq"])
+    telemetry = supervisor.complete_turn("athr_source", lease.token, turn)
+
+    assert sequences, "checkpoints should have been produced"
+    assert telemetry.turn_resources is not None
+    assert telemetry.turn_resources["report_seq"] > max(sequences)

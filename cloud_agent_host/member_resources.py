@@ -1200,13 +1200,20 @@ class WindowAccumulator:
             self._offset = max(0, offset)
 
     def consume(self, payload: bytes, *, boot_id: str, upto_offset: int) -> int:
-        """Fold one journal slice in, and return how many cycles it held.
+        """Fold the journal read so far in, and return how many cycles are new.
 
-        The offset advances only after the slice has been reduced, so a process
-        that dies mid-consumption re-reads the same bytes rather than skipping
-        them. Re-feeding a cycle would double-count it, which is why the
-        reducer is given each record exactly once and the caller is told how
-        much was taken.
+        Each call is given everything read from the journal's start, not just
+        the newest slice, and re-derives the identity of every task from that
+        whole history. That is what keeps an instance's key stable: the census
+        that supplies a task's authoritative start time and the exit that ends
+        it can land in different slices, and a per-slice parse would then see
+        two different instances for one thread -- charging its live reading and
+        its settled exit as if they were two tasks.
+
+        Re-feeding is safe because the reducer is stateful. A cycle it has
+        already seen adds no growth, and an exit it has already closed is
+        recorded as a duplicate rather than added again, so a caller that
+        re-reads from an earlier offset cannot inflate the total.
         """
         if not payload:
             return 0
@@ -1223,13 +1230,14 @@ class WindowAccumulator:
             uid=self.uid,
         )
         with self._lock:
+            seen_before = self._cycles
             for sample in samples:
                 self._reducer.observe_sample(sample)
             for event in exits:
                 self._reducer.observe_exit(event)
-            self._cycles += len(samples)
+            self._cycles = max(self._cycles, len(samples))
             self._offset = max(self._offset, upto_offset)
-        return len(samples)
+            return max(0, self._cycles - seen_before)
 
     def snapshot(
         self,
@@ -1239,7 +1247,6 @@ class WindowAccumulator:
         report_seq: int,
         open_scan_ms: int = 0,
         close_scan_ms: int = 0,
-        io_attribution_verified: bool = False,
     ) -> dict[str, Any]:
         """The window's counters as they stand, with the window still open."""
         with self._lock:
@@ -1249,7 +1256,8 @@ class WindowAccumulator:
                 open_scan_ms=open_scan_ms,
                 close_scan_ms=close_scan_ms,
             )
-        if not io_attribution_verified:
+        # Storage I/O is withheld for the reason `reduce_window` records.
+        if True:
             summary["storage_io"] = {
                 "status": STATUS_UNAVAILABLE,
                 "method": "task_io_accounting",
@@ -1275,7 +1283,6 @@ def reduce_window(
     report_seq: int = 1,
     open_scan_ms: int = 0,
     close_scan_ms: int = 0,
-    io_attribution_verified: bool = False,
 ) -> dict[str, Any]:
     """Reduce one closed window into its reported snapshot.
 
@@ -1310,13 +1317,15 @@ def reduce_window(
         open_scan_ms=open_scan_ms,
         close_scan_ms=close_scan_ms,
     )
-    if not io_attribution_verified:
-        # Task I/O accounting answers with whatever the filesystem chose to
-        # record. Two zeroes are indistinguishable between "the member wrote
-        # nothing" and "this filesystem never charged the member at all", and
-        # the counter existing is not evidence about which one it is. Until a
-        # deployment proves attribution on the filesystem it actually serves,
-        # the metric is reported as unmeasured rather than as nothing used.
+    # Task I/O accounting answers with whatever the filesystem chose to record.
+    # Two zeroes are indistinguishable between "the member wrote nothing" and
+    # "this filesystem never charged the member at all", and the counter
+    # existing is not evidence about which one it is. Until a deployment proves
+    # attribution on the filesystem it actually serves, the metric is reported
+    # as unmeasured rather than as nothing used. This is unconditional on
+    # purpose: a flag nobody can set truthfully is a switch that only ever
+    # reads as "not yet".
+    if True:
         summary["storage_io"] = {
             "status": STATUS_UNAVAILABLE,
             "method": "task_io_accounting",

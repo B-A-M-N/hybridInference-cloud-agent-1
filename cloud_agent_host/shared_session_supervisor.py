@@ -222,6 +222,13 @@ class _Member:
     window: MemberWindowHandle | None = None
     window_sampler: MemberWindowSampler | None = None
     window_sequence: int = 0
+    #: The last ``report_seq`` this window handed out. It is separate from the
+    #: census counter because both keep moving: the sampler ticks while a
+    #: closing census is in flight, so a final report that derived its sequence
+    #: from the census counter could come out below a checkpoint that was
+    #: produced in between -- and the store rejects a lower sequence, which
+    #: would leave a normally completed turn stored as still collecting.
+    window_report_seq: int = 0
     window_checkpoints: CheckpointSchedule | None = None
     #: When this window's next census is due, on the supervisor's clock.
     window_next_sample_mono: float = 0.0
@@ -231,6 +238,11 @@ class _Member:
     #: The newest checkpoint the sampler produced and the turn has not
     #: forwarded yet.
     window_pending_checkpoint: dict[str, Any] | None = None
+    #: How far the window's journal has been read, and everything read so far.
+    #: Identity is derived from the whole history, so the bytes are kept rather
+    #: than only the newest slice.
+    window_journal_offset: int = 0
+    window_journal_bytes: bytes = b""
     turn_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
@@ -827,16 +839,19 @@ class SharedChatSessionSupervisor:
                         str(exc),
                         source=GUEST_OBSERVER_SOURCE,
                     )
+        if window is None:
+            final_sequence = window_sequence + 1
+        else:
+            with self._lock:
+                _, live_member = self._leased_member(thread_id, token)
+                live_member.window_report_seq += 1
+                final_sequence = live_member.window_report_seq
         turn_resources = self._freeze_window(
             window=window,
             window_sampler=window_sampler,
             observation=observation,
-            sequence=window_sequence + 2,
+            sequence=final_sequence,
         )
-        if turn_resources is not None:
-            with self._lock:
-                _, live_member = self._leased_member(thread_id, token)
-                live_member.window_sequence = window_sequence + 2
         telemetry = SharedTurnTelemetry(
             observation=observation,
             tool_marks=(
@@ -1056,9 +1071,14 @@ class SharedChatSessionSupervisor:
             return group.members[thread_id].lease_token or ""
 
     def _report_due_checkpoints(self) -> None:
-        """Offer every window whose upload interval has elapsed."""
-        if self._window_checkpoint_hook is None:
-            return
+        """Produce a checkpoint for every window whose interval has elapsed.
+
+        The checkpoint is parked on the member for whoever forwards it, and the
+        optional hook is an extra observer rather than the delivery mechanism.
+        Gating this on a hook meant that a supervisor built without one -- which
+        is how the broker builds it -- produced no checkpoints at all, so a
+        crashed turn kept nothing.
+        """
         with self._lock:
             due = [
                 (member.thread_id, member.lease_token)
@@ -1074,18 +1094,21 @@ class SharedChatSessionSupervisor:
                 snapshot = self.checkpoint_running_window(thread_id, token)
                 if snapshot is None:
                     continue
-                self._window_checkpoint_hook(thread_id, snapshot)
-                with self._lock:
-                    group = self._members.get(thread_id)
-                    if group is not None and thread_id in group.members:
-                        group.members[thread_id].window_pending_checkpoint = snapshot
+                if self._window_checkpoint_hook is not None:
+                    with contextlib.suppress(Exception):
+                        self._window_checkpoint_hook(thread_id, snapshot)
 
     def _consume_window_journal(
         self,
         accumulator: WindowAccumulator,
         cursor: GuestObserverCursor,
     ) -> int:
-        """Fold the journal's new bytes for one window into its accumulator.
+        """Fold this window's journal, read so far, into its accumulator.
+
+        The slice read is the new tail only -- reading the whole journal once a
+        second for the length of a turn would be wasteful -- but it is handed
+        on top of what was read before, because identity has to be derived from
+        the whole history rather than from whichever slice a record landed in.
 
         Read errors are swallowed by the caller: a census the host could not
         read back is a gap in the checkpoint, and the next tick tries again
@@ -1094,13 +1117,33 @@ class SharedChatSessionSupervisor:
         read = getattr(self._manager, "member_window_journal_delta", None)
         if read is None:
             return 0
-        scoped = replace(cursor, offset=accumulator.offset)
-        payload, new_offset = read(self._group_spec_for(accumulator), scoped)
-        return accumulator.consume(
-            payload,
-            boot_id=cursor.guest_boot_id,
-            upto_offset=new_offset,
-        )
+        for member in self._members_with_accumulator(accumulator):
+            scoped = replace(cursor, offset=member.window_journal_offset)
+            payload, new_offset = read(self._group_spec_for(accumulator), scoped)
+            # A journal read can catch the observer mid-write, and the tail of
+            # such a read is half a record. Advancing past it would lose that
+            # cycle for good and leave nothing in the accounting to say so, so
+            # the offset stops at the last complete line and the partial tail
+            # is read again once the writer has finished it.
+            complete = payload.rfind(b"\n") + 1
+            member.window_journal_offset = new_offset - (len(payload) - complete)
+            member.window_journal_bytes = member.window_journal_bytes + payload[:complete]
+            return accumulator.consume(
+                member.window_journal_bytes,
+                boot_id=cursor.guest_boot_id,
+                upto_offset=member.window_journal_offset,
+            )
+        return 0
+
+    def _members_with_accumulator(self, accumulator: WindowAccumulator) -> list[Any]:
+        """The members owning one accumulator, so its journal state can follow it."""
+        with self._lock:
+            return [
+                member
+                for group in self._groups.values()
+                for member in group.members.values()
+                if member.window_accumulator is accumulator
+            ]
 
     def _group_spec_for(self, accumulator: WindowAccumulator) -> Any:
         """The sandbox spec owning one window's accumulator."""
@@ -1145,12 +1188,13 @@ class SharedChatSessionSupervisor:
             window_sampler = member.window_sampler
             schedule = member.window_checkpoints
             cursor = member.observer_cursor
-            sequence = member.window_sequence
             if window is None or window_sampler is None or schedule is None:
                 return None
             if not window.baseline_taken or not schedule.due():
                 return None
             schedule.mark_sent()
+            member.window_report_seq += 1
+            report_seq = member.window_report_seq
             boot_id = getattr(cursor, "guest_boot_id", "") or ""
             opened = getattr(cursor, "guest_mono_ns", 0) or 0
             accumulator = member.window_accumulator
@@ -1164,7 +1208,7 @@ class SharedChatSessionSupervisor:
                 snapshot = accumulator.snapshot(
                     state="collecting",
                     duration_ms=duration_ms,
-                    report_seq=sequence + 1,
+                    report_seq=report_seq,
                     open_scan_ms=window.open_scan_ms,
                 )
             else:
@@ -1176,9 +1220,13 @@ class SharedChatSessionSupervisor:
                     opened_guest_mono_ns=opened,
                     state="collecting",
                     duration_ms=duration_ms,
-                    report_seq=sequence + 1,
+                    report_seq=report_seq,
                     open_scan_ms=window.open_scan_ms,
                 )
+            with self._lock:
+                group = self._members.get(thread_id)
+                if group is not None and thread_id in group.members:
+                    group.members[thread_id].window_pending_checkpoint = snapshot
         except Exception:
             logger.warning(
                 "member window checkpoint failed for %s",

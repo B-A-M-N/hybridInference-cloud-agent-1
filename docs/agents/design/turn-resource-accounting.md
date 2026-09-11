@@ -372,9 +372,16 @@ implementation ships the probe rather than assuming the answer:
   with its reviewed capability set.
 - `smaps_rollup` puts `Pss:` inside the first 16 KiB, which the bounded read
   depends on.
-- the sandbox's workspace filesystem attributes task I/O to the member. If it
-  does not, `storage_io` stays `unavailable` with
-  `filesystem_attribution_unverified` rather than reporting two zeroes.
+- the sandbox's workspace filesystem attributes task I/O to the member.
+
+Until that last one is proven on the filesystem a deployment actually serves,
+`storage_io` is reported `unavailable` with
+`filesystem_attribution_unverified`, and the guest record does not carry
+per-task read/write bytes at all: two zeroes cannot be told apart between "the
+member wrote nothing" and "this filesystem never charged the member", so
+shipping figures the platform refuses to act on would be payload without a
+reader. The member totals still carry the cycle's I/O counters, so the metric
+can be enabled without changing the record's shape.
 
 ## 6. What is not in this change
 

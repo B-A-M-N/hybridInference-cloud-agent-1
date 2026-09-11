@@ -1289,11 +1289,17 @@ static int journal_window_sample(struct observer *observer,
     for (size_t index = 0; index < task_count; ++index) {
         const struct window_task *task = &tasks[index];
 
+        /* Per-task I/O is deliberately not carried. The platform reports
+         * storage I/O as unmeasured until a deployment proves this filesystem
+         * charges a member's writes back to the member, so shipping the bytes
+         * would be payload nothing may act on -- and a figure that looks
+         * measurable but is contractually refused is worse than absent. The
+         * member totals below still carry the cycle's counters, so I/O can be
+         * turned on without changing this record's shape. */
         length = snprintf(line + used,
                           sizeof(line) - used,
                           "%s{\"tid\":%u,\"tgid\":%u,\"uid\":%u,"
                           "\"starttime\":%" PRIu64 ",\"cpu_ns\":%" PRIu64
-                          ",\"read_bytes\":%" PRIu64 ",\"write_bytes\":%" PRIu64
                           ",\"counters\":%u}",
                           index == 0 ? "" : ",",
                           task->tid,
@@ -1301,8 +1307,6 @@ static int journal_window_sample(struct observer *observer,
                           task->uid,
                           task->starttime_ticks,
                           task->cpu_ns,
-                          task->read_bytes,
-                          task->write_bytes,
                           (unsigned int)task->counters);
         if (length <= 0 || (size_t)length >= sizeof(line) - used)
             return -1;
