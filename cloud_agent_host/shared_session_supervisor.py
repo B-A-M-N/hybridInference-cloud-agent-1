@@ -228,6 +228,9 @@ class _Member:
     #: This window's cumulative measurement, kept across journal reads so a
     #: checkpoint describes the same counters the final report will.
     window_accumulator: WindowAccumulator | None = None
+    #: The newest checkpoint the sampler produced and the turn has not
+    #: forwarded yet.
+    window_pending_checkpoint: dict[str, Any] | None = None
     turn_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
@@ -1021,7 +1024,61 @@ class SharedChatSessionSupervisor:
                 with contextlib.suppress(Exception):
                     self._consume_window_journal(accumulator, cursor)
             sampled += 1
+        # Reporting runs on the same clock as the census rather than on the
+        # turn's event stream. A turn that spends a minute inside one silent
+        # tool call emits nothing for that minute, and an upload that waits for
+        # an event would leave nothing behind if the host died in it.
+        self._report_due_checkpoints()
         return sampled
+
+    def take_reported_checkpoint(self, thread_id: str) -> dict[str, Any] | None:
+        """The newest checkpoint not yet handed to a caller, or None.
+
+        The sampler thread produces checkpoints on its own clock; this is how
+        the turn's event stream collects them. Taking is destructive so a
+        checkpoint is forwarded once, but the window keeps producing new ones
+        whether or not anything ever asks.
+        """
+        with self._lock:
+            try:
+                _, member = self._leased_member(thread_id, self._lease_token_for(thread_id))
+            except Exception:
+                return None
+            pending = member.window_pending_checkpoint
+            member.window_pending_checkpoint = None
+            return pending
+
+    def _lease_token_for(self, thread_id: str) -> str:
+        with self._lock:
+            group = self._members.get(thread_id)
+            if group is None:
+                raise SessionLeaseLost("member is not in a shared sandbox")
+            return group.members[thread_id].lease_token or ""
+
+    def _report_due_checkpoints(self) -> None:
+        """Offer every window whose upload interval has elapsed."""
+        if self._window_checkpoint_hook is None:
+            return
+        with self._lock:
+            due = [
+                (member.thread_id, member.lease_token)
+                for group in self._groups.values()
+                for member in group.members.values()
+                if member.window is not None
+                and member.window_checkpoints is not None
+                and member.lease_token is not None
+                and member.window_checkpoints.due()
+            ]
+        for thread_id, token in due:
+            with contextlib.suppress(Exception):
+                snapshot = self.checkpoint_running_window(thread_id, token)
+                if snapshot is None:
+                    continue
+                self._window_checkpoint_hook(thread_id, snapshot)
+                with self._lock:
+                    group = self._members.get(thread_id)
+                    if group is not None and thread_id in group.members:
+                        group.members[thread_id].window_pending_checkpoint = snapshot
 
     def _consume_window_journal(
         self,
@@ -1133,9 +1190,6 @@ class SharedChatSessionSupervisor:
                 exc_info=True,
             )
             return None
-        if self._window_checkpoint_hook is not None:
-            with contextlib.suppress(Exception):
-                self._window_checkpoint_hook(window.measurement_id, snapshot)
         return snapshot
 
     def interrupt(self, thread_id: str, token: str) -> None:

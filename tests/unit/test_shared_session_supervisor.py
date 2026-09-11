@@ -1907,3 +1907,60 @@ def test_a_member_without_an_open_window_is_never_censused():
 
     assert supervisor.sample_open_windows() == 0
     assert [event for event in manager.events if event[0] == "member-window"] == []
+
+
+def test_a_checkpoint_is_produced_without_any_turn_event():
+    """Uploads must not wait for the agent to say something.
+
+    The sampler thread owns both the census and the upload cadence, so a turn
+    that spends its time inside one silent tool call still leaves a report
+    behind. This drives the tick directly and asserts a checkpoint appears with
+    no event stream involved.
+    """
+    reported: list[tuple[str, dict]] = []
+    manager = _Manager()
+    manager.backend.runtime = KATA_RUNTIME
+    supervisor = SharedChatSessionSupervisor(
+        manager,
+        transport_factory=_TransportFactory(),
+        window_sample_interval_s=10.0,
+        checkpoint_interval_s=0.0,
+        window_checkpoint_hook=lambda thread_id, snapshot: reported.append((thread_id, snapshot)),
+    )
+    lease = supervisor.acquire(
+        _spec(),
+        thread_id="athr_source",
+        owner="attempt:1",
+        activation_generation=1,
+        has_settled_context=True,
+        manifest=_members(),
+    )
+    supervisor.ensure_resident(
+        "athr_source",
+        lease.token,
+        _launch("athr_source", native_session_id="native-source", slot=0),
+    )
+    supervisor._stop.set()
+    if supervisor._sampler_thread is not None:
+        supervisor._sampler_thread.join(timeout=2)
+
+    supervisor.start_turn(
+        "athr_source",
+        lease.token,
+        prompt="work",
+        model="glm-5.1",
+        reasoning_effort=None,
+    )
+    assert reported == []
+
+    supervisor.sample_open_windows()
+
+    # A checkpoint was produced and is waiting for the turn stream to forward,
+    # without a single turn event having been read.
+    assert len(reported) == 1
+    assert reported[0][0] == "athr_source"
+    assert reported[0][1]["state"] == "collecting"
+    pending = supervisor.take_reported_checkpoint("athr_source")
+    assert pending is not None and pending["state"] == "collecting"
+    # Taking it is what makes forwarding happen once rather than repeatedly.
+    assert supervisor.take_reported_checkpoint("athr_source") is None

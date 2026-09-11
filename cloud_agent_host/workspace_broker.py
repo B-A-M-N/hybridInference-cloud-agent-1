@@ -1432,22 +1432,23 @@ def create_app(
         except (DriverError, SandboxError, ValueError) as exc:
             raise supervisor_error(exc) from exc
 
-        def checkpoint_running_turn(
+        def take_reported_checkpoint(
             supervisor: Any,
             member_thread_id: str,
-            token: str,
         ) -> dict[str, Any] | None:
-            """Take one running checkpoint, or None when none is due.
+            """Collect a checkpoint the sampler thread has already produced.
 
-            A checkpoint is best effort: it exists so a crash keeps the work
-            measured up to the last report, and a failure to take one must not
+            The sampler runs on its own clock, so a turn that emits nothing for
+            a minute still gets its uploads; this only forwards what is waiting.
+            Best effort by construction: a checkpoint exists so a crash keeps
+            the work already measured, and a failure to forward one must not
             reach the turn's own event stream as an error.
             """
-            take = getattr(supervisor, "checkpoint_running_window", None)
+            take = getattr(supervisor, "take_reported_checkpoint", None)
             if take is None:
                 return None
             try:
-                return take(member_thread_id, token)
+                return take(member_thread_id)
             except Exception:
                 return None
 
@@ -1530,10 +1531,10 @@ def create_app(
                         + "\n"
                     )
                     # A long turn crosses the checkpoint interval several
-                    # times. The schedule inside the supervisor decides when
-                    # that produces a report, so polling here costs one
-                    # comparison per event and the cadence has a single owner.
-                    checkpoint = checkpoint_running_turn(owner, thread_id, body.token)
+                    # times. The sampler thread produces those checkpoints on
+                    # its own clock; this only forwards one that is waiting,
+                    # which costs a dictionary read per event.
+                    checkpoint = take_reported_checkpoint(owner, thread_id)
                     if checkpoint is not None:
                         yield (
                             json.dumps(
