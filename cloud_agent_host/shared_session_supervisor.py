@@ -43,6 +43,7 @@ from cloud_agent_host.member_resources import (
     CheckpointSchedule,
     MemberWindowHandle,
     MemberWindowSampler,
+    WindowAccumulator,
     reduce_window,
 )
 from cloud_agent_host.resident_transport import (
@@ -224,6 +225,9 @@ class _Member:
     window_checkpoints: CheckpointSchedule | None = None
     #: When this window's next census is due, on the supervisor's clock.
     window_next_sample_mono: float = 0.0
+    #: This window's cumulative measurement, kept across journal reads so a
+    #: checkpoint describes the same counters the final report will.
+    window_accumulator: WindowAccumulator | None = None
     turn_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
@@ -356,6 +360,7 @@ class SharedChatSessionSupervisor:
                     member.window = None
                     member.window_sampler = None
                     member.window_checkpoints = None
+                    member.window_accumulator = None
                     if member.resident_state == "live":
                         member.resident_state = "restarting"
         for transport in transports:
@@ -732,6 +737,16 @@ class SharedChatSessionSupervisor:
                 member.window = window
                 member.window_sampler = window_sampler
                 member.window_sequence = 0
+                member.window_accumulator = (
+                    WindowAccumulator(
+                        uid=window.uid,
+                        measurement_id=window.measurement_id,
+                        opened_guest_mono_ns=(getattr(observer_cursor, "guest_mono_ns", 0) or 0),
+                    )
+                    if window is not None
+                    else None
+                )
+                member.window_next_sample_mono = 0.0
                 member.window_checkpoints = (
                     CheckpointSchedule(interval_s=self._checkpoint_interval_s)
                     if window is not None
@@ -868,6 +883,7 @@ class SharedChatSessionSupervisor:
             member.window = None
             member.window_sampler = None
             member.window_checkpoints = None
+            member.window_accumulator = None
             transport = member.transport
             if boundary_error is not None:
                 member.transport = None
@@ -986,12 +1002,57 @@ class SharedChatSessionSupervisor:
                     continue
                 member.window_next_sample_mono = now + sampler.interval_s
                 member.window_sequence += 1
-                due.append((member.window, sampler, member.window_sequence))
-        for window, sampler, sequence in due:
+                due.append(
+                    (
+                        member.window,
+                        sampler,
+                        member.window_sequence,
+                        member.observer_cursor,
+                        member.window_accumulator,
+                    )
+                )
+        for window, sampler, sequence, cursor, accumulator in due:
             with contextlib.suppress(Exception):
                 sampler.sample(window, sequence)
+            # Fold in whatever the census just wrote, so the running state and
+            # any checkpoint built from it describe real cycles rather than an
+            # empty reducer.
+            if accumulator is not None and cursor is not None:
+                with contextlib.suppress(Exception):
+                    self._consume_window_journal(accumulator, cursor)
             sampled += 1
         return sampled
+
+    def _consume_window_journal(
+        self,
+        accumulator: WindowAccumulator,
+        cursor: GuestObserverCursor,
+    ) -> int:
+        """Fold the journal's new bytes for one window into its accumulator.
+
+        Read errors are swallowed by the caller: a census the host could not
+        read back is a gap in the checkpoint, and the next tick tries again
+        from the same offset rather than skipping the bytes it never saw.
+        """
+        read = getattr(self._manager, "member_window_journal_delta", None)
+        if read is None:
+            return 0
+        scoped = replace(cursor, offset=accumulator.offset)
+        payload, new_offset = read(self._group_spec_for(accumulator), scoped)
+        return accumulator.consume(
+            payload,
+            boot_id=cursor.guest_boot_id,
+            upto_offset=new_offset,
+        )
+
+    def _group_spec_for(self, accumulator: WindowAccumulator) -> Any:
+        """The sandbox spec owning one window's accumulator."""
+        with self._lock:
+            for group in self._groups.values():
+                for member in group.members.values():
+                    if member.window_accumulator is accumulator:
+                        return group.spec
+        raise SandboxError("member window accumulator has no sandbox")
 
     def _sample_loop(self) -> None:
         """Census every open window once a second until the supervisor stops."""
@@ -1035,24 +1096,32 @@ class SharedChatSessionSupervisor:
             schedule.mark_sent()
             boot_id = getattr(cursor, "guest_boot_id", "") or ""
             opened = getattr(cursor, "guest_mono_ns", 0) or 0
+            accumulator = member.window_accumulator
         try:
-            # No censuses are handed over yet. Reducing an empty sample list
-            # yields a snapshot whose window is real but whose every metric is
-            # unavailable, which is honest about what has been *reduced* even
-            # though the guest has by now written cycles the host has not read
-            # back. Feeding them in means consuming the journal incrementally
-            # and keeping one reducer per window, which is not built yet.
-            snapshot = reduce_window(
-                uid=window.uid,
-                measurement_id=window.measurement_id,
-                boot_id=boot_id,
-                samples=(),
-                opened_guest_mono_ns=opened,
-                state="collecting",
-                duration_ms=max(0, int((time.monotonic() - window.opened_host_mono) * 1000)),
-                report_seq=sequence + 1,
-                open_scan_ms=window.open_scan_ms,
-            )
+            duration_ms = max(0, int((time.monotonic() - window.opened_host_mono) * 1000))
+            if accumulator is not None:
+                # The same counters the final report will carry, with the
+                # window still open: a crash keeps everything measured so far.
+                with contextlib.suppress(Exception):
+                    self._consume_window_journal(accumulator, cursor)
+                snapshot = accumulator.snapshot(
+                    state="collecting",
+                    duration_ms=duration_ms,
+                    report_seq=sequence + 1,
+                    open_scan_ms=window.open_scan_ms,
+                )
+            else:
+                snapshot = reduce_window(
+                    uid=window.uid,
+                    measurement_id=window.measurement_id,
+                    boot_id=boot_id,
+                    samples=(),
+                    opened_guest_mono_ns=opened,
+                    state="collecting",
+                    duration_ms=duration_ms,
+                    report_seq=sequence + 1,
+                    open_scan_ms=window.open_scan_ms,
+                )
         except Exception:
             logger.warning(
                 "member window checkpoint failed for %s",

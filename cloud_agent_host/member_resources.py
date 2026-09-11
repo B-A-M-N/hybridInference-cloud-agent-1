@@ -43,6 +43,7 @@ unavailable rather than as nothing.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
@@ -1151,6 +1152,113 @@ class MemberWindowSampler:
         )
         elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
         return acknowledged, elapsed_ms
+
+
+class WindowAccumulator:
+    """One window's cumulative measurement, kept across journal reads.
+
+    A checkpoint exists so a crash keeps the work already done, which means it
+    has to describe the same counters the final report will -- not a fresh
+    reducer that has seen nothing. This holds one reducer for the window's
+    whole life and consumes the journal in order, so a cycle is credited once
+    however many times a checkpoint happens.
+
+    The offset is the contract that makes replay safe: only bytes past it are
+    parsed, and it only moves once they have been folded in. Consumption is
+    serialized because the census ticks on its own thread while a checkpoint
+    may be requested from the turn's.
+    """
+
+    def __init__(self, *, uid: int, measurement_id: str, opened_guest_mono_ns: int) -> None:
+        self._lock = threading.Lock()
+        self._reducer = MemberWindowReducer(
+            uid=uid,
+            measurement_id=measurement_id,
+            opened_guest_mono_ns=opened_guest_mono_ns,
+        )
+        self._offset = 0
+        self._cycles = 0
+        self.measurement_id = measurement_id
+        self.uid = uid
+        self.opened_guest_mono_ns = opened_guest_mono_ns
+
+    @property
+    def offset(self) -> int:
+        """How far into the journal this window has consumed."""
+        with self._lock:
+            return self._offset
+
+    @property
+    def cycles(self) -> int:
+        """How many census cycles have been folded in."""
+        with self._lock:
+            return self._cycles
+
+    def at(self, offset: int) -> None:
+        """Start consuming from a known fence, for a window opened elsewhere."""
+        with self._lock:
+            self._offset = max(0, offset)
+
+    def consume(self, payload: bytes, *, boot_id: str, upto_offset: int) -> int:
+        """Fold one journal slice in, and return how many cycles it held.
+
+        The offset advances only after the slice has been reduced, so a process
+        that dies mid-consumption re-reads the same bytes rather than skipping
+        them. Re-feeding a cycle would double-count it, which is why the
+        reducer is given each record exactly once and the caller is told how
+        much was taken.
+        """
+        if not payload:
+            return 0
+        samples = parse_window_samples(
+            payload,
+            measurement_id=self.measurement_id,
+            boot_id=boot_id,
+            opened_guest_mono_ns=self.opened_guest_mono_ns,
+        )
+        exits = exit_events_from_journal(
+            payload,
+            boot_id=boot_id,
+            measurement_id=self.measurement_id,
+            uid=self.uid,
+        )
+        with self._lock:
+            for sample in samples:
+                self._reducer.observe_sample(sample)
+            for event in exits:
+                self._reducer.observe_exit(event)
+            self._cycles += len(samples)
+            self._offset = max(self._offset, upto_offset)
+        return len(samples)
+
+    def snapshot(
+        self,
+        *,
+        state: str,
+        duration_ms: int,
+        report_seq: int,
+        open_scan_ms: int = 0,
+        close_scan_ms: int = 0,
+        io_attribution_verified: bool = False,
+    ) -> dict[str, Any]:
+        """The window's counters as they stand, with the window still open."""
+        with self._lock:
+            summary = self._reducer.summary(
+                state=state,
+                duration_ms=duration_ms,
+                open_scan_ms=open_scan_ms,
+                close_scan_ms=close_scan_ms,
+            )
+        if not io_attribution_verified:
+            summary["storage_io"] = {
+                "status": STATUS_UNAVAILABLE,
+                "method": "task_io_accounting",
+                "read_bytes": None,
+                "write_bytes": None,
+                "reason_codes": ["filesystem_attribution_unverified"],
+            }
+        summary["report_seq"] = max(1, report_seq)
+        return summary
 
 
 def reduce_window(

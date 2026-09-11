@@ -41,6 +41,7 @@ from urllib.parse import urlparse
 from cloud_agent_host.egress import EgressTier
 from cloud_agent_host.guest_observer import (
     GUEST_OBSERVER_BINARY,
+    GUEST_OBSERVER_EVENTS,
     GUEST_OBSERVER_ROOT,
     GUEST_OBSERVER_ROTATE_BYTES,
     GuestObservation,
@@ -2833,6 +2834,64 @@ class ChatSandboxManager:
             return self._guest_observer_controller(spec).snapshot(after_poll_seq=after_poll_seq)
         except GuestObserverRuntimeError as exc:
             raise SandboxError(str(exc)) from exc
+
+    def member_window_journal_delta(
+        self,
+        spec: ChatSandboxSpec,
+        cursor: GuestObserverCursor,
+        *,
+        timeout_s: float = 10.0,
+    ) -> tuple[bytes, int]:
+        """Read the journal bytes this window has not consumed yet.
+
+        Returns the payload and the offset it ended at, so a caller can keep
+        one reducer per window and fold each cycle in exactly once. The read is
+        fenced exactly like the observation read is: the device, inode and size
+        must all still describe the same journal, because a restarted observer
+        would otherwise hand back bytes from a different file under the same
+        path and silently restart the counters.
+        """
+        if not cursor.available or not cursor.journal_ino:
+            return b"", cursor.offset
+        reader = (
+            "import os, sys\n"
+            "filename, offset, expected_dev, expected_ino = sys.argv[1], int(sys.argv[2]), "
+            "int(sys.argv[3]), int(sys.argv[4])\n"
+            "with open(filename, 'rb', buffering=0) as handle:\n"
+            "    journal = os.fstat(handle.fileno())\n"
+            "    if (int(journal.st_dev) != expected_dev "
+            "            or int(journal.st_ino) != expected_ino):\n"
+            "        raise RuntimeError('observer journal changed before read')\n"
+            "    if int(journal.st_size) < offset:\n"
+            "        raise RuntimeError('observer journal is behind the read fence')\n"
+            "    handle.seek(offset)\n"
+            "    sys.stdout.buffer.write(handle.read(max(0, int(journal.st_size) - offset)))\n"
+        )
+        result = self.exec_capture(
+            spec,
+            [
+                "python3",
+                "-c",
+                reader,
+                GUEST_OBSERVER_EVENTS,
+                str(cursor.offset),
+                str(cursor.journal_dev),
+                str(cursor.journal_ino),
+            ],
+            workdir="/",
+            timeout_s=timeout_s,
+            user_uid=0,
+            user_gid=0,
+        )
+        if getattr(result, "returncode", 1) != 0:
+            detail = getattr(result, "stderr", b"")
+            if isinstance(detail, bytes):
+                detail = detail.decode("utf-8", "replace")
+            raise SandboxError(f"member window journal read failed: {str(detail)[-300:]}")
+        payload = getattr(result, "stdout", b"")
+        if not isinstance(payload, bytes):
+            payload = str(payload).encode("utf-8", "replace")
+        return payload, cursor.offset + len(payload)
 
     def member_window_request(
         self,

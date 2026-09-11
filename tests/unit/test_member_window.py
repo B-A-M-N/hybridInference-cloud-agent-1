@@ -11,8 +11,14 @@ than a missing one: a dashboard cannot tell that a total was double counted.
 from __future__ import annotations
 
 import json
+import pathlib
+import sys
 
 import pytest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+from guest_serializer import run_serializer
 
 from cloud_agent_host.member_resources import (
     EXIT_COUNTER_CPU,
@@ -30,6 +36,7 @@ from cloud_agent_host.member_resources import (
     MemberWindowReducer,
     ThreadExit,
     ThreadReading,
+    WindowAccumulator,
     WindowSample,
     exit_events_from_processes,
     instance_key,
@@ -617,68 +624,69 @@ class TestExitEventProjection:
 
 
 class TestTheGuestWireFormat:
-    """The census record the C serializer actually writes must parse.
+    """The census record parses, using the guest's own serializer.
 
-    The host parser was tested against a hand-written fixture that matched the
-    parser instead of matching the guest. That is how a missing closing brace
-    survived: every host test passed while the real journal was unparseable.
-    This fixture is the serializer's output shape, byte for byte, and the
-    closure of the outer object is the part that was wrong.
+    Earlier versions of this test fed the parser a hand-written fixture, which
+    matched the parser instead of the producer: a census record missing its
+    outer closing brace kept every host test green while the real journal was
+    unreadable. The bytes below are produced by compiling
+    ``journal_window_sample`` out of ``guest-observer.c`` and running it, so a
+    shape change is measured rather than assumed.
     """
 
-    def c_record(self, sample_seq: int = 1, *, task: bool = True) -> str:
-        """One line exactly as ``journal_window_sample`` builds it."""
-        detail = (
-            '{"tid":7,"tgid":7,"uid":11001,"starttime":100,"cpu_ns":5000,'
-            '"read_bytes":100,"write_bytes":20,"counters":3}'
-            if task
-            else ""
-        )
-        return (
-            '{"version":2,"seq":11,"kind":"window_sample","mono_ns":1000000,'
-            f'"measurement_id":"{MEASUREMENT}","uid":11001,"window":'
-            f'{{"sample_seq":{sample_seq},"counters":79,"tasks":1,"address_spaces":1,'
-            '"pss_bytes":4096,"pss_failed":0,"cpu_ns":5000,"read_bytes":100,'
-            f'"write_bytes":20,"task_detail":[{detail}]}}}}'
-        )
+    @pytest.fixture(scope="class")
+    @classmethod
+    def guest_journal(cls, tmp_path_factory: pytest.TempPathFactory) -> bytes:
+        return run_serializer(tmp_path_factory.mktemp("guest-serializer"))
 
-    def test_the_serializer_line_is_valid_json(self) -> None:
-        """The record closes both objects it opened."""
-        parsed = json.loads(self.c_record())
+    def test_every_record_the_guest_writes_is_valid_json(self, guest_journal: bytes) -> None:
+        lines = [line for line in guest_journal.splitlines() if line.strip()]
 
-        assert parsed["kind"] == "window_sample"
-        assert parsed["window"]["task_detail"][0]["tid"] == 7
+        assert len(lines) >= 2
+        for line in lines:
+            decoded = json.loads(line)
+            assert decoded["kind"] == "window_sample"
+            assert isinstance(decoded["window"], dict)
 
-    def test_the_host_reads_back_what_the_guest_wrote(self) -> None:
+    def test_the_host_reads_back_what_the_guest_wrote(self, guest_journal: bytes) -> None:
         samples = parse_window_samples(
-            self.c_record().encode() + b"\n",
-            measurement_id=MEASUREMENT,
+            guest_journal,
+            measurement_id="measurement-1",
             boot_id=BOOT,
         )
 
-        assert len(samples) == 1
-        assert samples[0].address_spaces == 1
-        assert samples[0].pss_bytes == 4096
-        assert len(samples[0].tasks) == 1
-        assert samples[0].tasks[0].tid == 7
-
-    def test_all_three_census_phases_parse(self) -> None:
-        """Opening, periodic and closing cycles share one shape."""
-        payload = b"\n".join(self.c_record(seq).encode() for seq in (0, 1, 2)) + b"\n"
-
-        samples = parse_window_samples(payload, measurement_id=MEASUREMENT, boot_id=BOOT)
-
-        assert [sample.sample_seq for sample in samples] == [0, 1, 2]
-
-    def test_an_empty_member_cycle_parses(self) -> None:
-        samples = parse_window_samples(
-            self.c_record(task=False).encode() + b"\n",
-            measurement_id=MEASUREMENT,
-            boot_id=BOOT,
-        )
-
-        assert len(samples) == 1
+        # The opening cycle is an empty member and the periodic one carries two
+        # tasks; both are real states and both must survive the round trip.
+        assert len(samples) == 2
+        assert [sample.sample_seq for sample in samples] == [0, 1]
         assert samples[0].tasks == ()
+        assert len(samples[1].tasks) == 2
+        assert {task.tid for task in samples[1].tasks} == {7, 8}
+        assert samples[1].address_spaces == 2
+        assert samples[1].pss_bytes == 8192
+
+    def test_a_cycle_the_parser_cannot_use_is_visible_rather_than_silent(
+        self, guest_journal: bytes
+    ) -> None:
+        """Truncating the guest's own bytes must lose the cycle, not fake one."""
+        truncated = guest_journal[: len(guest_journal) // 2]
+
+        samples = parse_window_samples(
+            truncated,
+            measurement_id="measurement-1",
+            boot_id=BOOT,
+        )
+
+        assert len(samples) <= 1
+
+    def test_records_for_another_measurement_are_ignored(self, guest_journal: bytes) -> None:
+        samples = parse_window_samples(
+            guest_journal,
+            measurement_id="some-other-measurement",
+            boot_id=BOOT,
+        )
+
+        assert samples == []
 
 
 class TestProductionChainRegressions:
@@ -883,3 +891,140 @@ class TestTaskNumberReuse:
         # Merging the two lives reported only the second life's 200 ms.
         assert len(events) == 2
         assert sum(event.cpu_ns or 0 for event in events) == 300_000_000
+
+
+class TestTheRunningAccumulator:
+    """A crash must keep what was already measured, exactly once.
+
+    The acceptance here is not "a checkpoint exists" but that the checkpoint
+    carries the cycles already consumed, that feeding the same bytes twice
+    cannot inflate it, and that a cycle the host could not read stays missing
+    rather than becoming a zero.
+    """
+
+    MEAS = "accumulator-measurement"
+    OPENED = 1_000_000_000_000
+
+    def record(self, seq: int, *, cpu_ns: int, offset_seconds: int) -> str:
+        import json as _json
+
+        ticks = (self.OPENED - 60_000_000_000) // 10_000_000
+        return _json.dumps(
+            {
+                "version": 2,
+                "seq": seq,
+                "kind": "window_sample",
+                "mono_ns": self.OPENED + offset_seconds * 1_000_000_000,
+                "measurement_id": self.MEAS,
+                "uid": 11001,
+                "window": {
+                    "sample_seq": seq,
+                    "counters": WINDOW_CPU
+                    | WINDOW_STORAGE_IO
+                    | WINDOW_READING_COMPLETE
+                    | WINDOW_PSS
+                    | WINDOW_PSS_COMPLETE
+                    | WINDOW_ADDRESS_SPACES_DEDUPED,
+                    "address_spaces": 1,
+                    "pss_bytes": 4096,
+                    "pss_failed": 0,
+                    "task_detail": [
+                        {
+                            "tid": 7,
+                            "tgid": 7,
+                            "uid": 11001,
+                            "starttime": ticks,
+                            "cpu_ns": cpu_ns,
+                            "read_bytes": 0,
+                            "write_bytes": 0,
+                            "counters": WINDOW_CPU,
+                        }
+                    ],
+                },
+            }
+        )
+
+    def accumulator(self) -> WindowAccumulator:
+        return WindowAccumulator(
+            uid=11001,
+            measurement_id=self.MEAS,
+            opened_guest_mono_ns=self.OPENED,
+        )
+
+    def test_a_checkpoint_carries_the_cycles_already_consumed(self) -> None:
+        """What the guest measured survives into the running report."""
+        window = self.accumulator()
+        first = self.record(0, cpu_ns=1_000_000_000, offset_seconds=1) + "\n"
+        window.consume(first.encode(), boot_id=BOOT, upto_offset=len(first))
+
+        snapshot = window.snapshot(state="collecting", duration_ms=30_000, report_seq=1)
+
+        # The task predates the window, so its first reading is this window's
+        # baseline and the amount charged so far is zero -- a real zero, since
+        # a cycle was read, rather than the unavailable of an empty reducer.
+        assert snapshot["cpu"]["usec"] == 0
+        assert snapshot["cpu"]["status"] == STATUS_AVAILABLE
+        assert snapshot["memory"]["peak_bytes"] == 4096
+
+    def test_growth_across_reads_is_charged_once(self) -> None:
+        window = self.accumulator()
+        first = self.record(0, cpu_ns=1_000_000_000, offset_seconds=1) + "\n"
+        second = self.record(1, cpu_ns=1_500_000_000, offset_seconds=2) + "\n"
+        window.consume(first.encode(), boot_id=BOOT, upto_offset=len(first))
+        window.consume(second.encode(), boot_id=BOOT, upto_offset=len(first) + len(second))
+
+        snapshot = window.snapshot(state="collecting", duration_ms=30_000, report_seq=1)
+
+        # 1.0 s is the baseline and 0.5 s is the growth the second cycle saw.
+        assert snapshot["cpu"]["usec"] == 500_000
+
+    def test_replaying_the_same_bytes_cannot_inflate_the_total(self) -> None:
+        """A re-read after a failed consumption must not double count."""
+        window = self.accumulator()
+        first = self.record(0, cpu_ns=1_000_000_000, offset_seconds=1) + "\n"
+        window.consume(first.encode(), boot_id=BOOT, upto_offset=len(first))
+        before = window.snapshot(state="collecting", duration_ms=30_000, report_seq=1)
+
+        # The caller re-reads from an offset it had already consumed, which is
+        # what happens when a consumer dies between reading and advancing.
+        window.consume(first.encode(), boot_id=BOOT, upto_offset=len(first))
+        after = window.snapshot(state="collecting", duration_ms=30_000, report_seq=2)
+
+        # The reducer is stateful: one cycle observed twice contributes once,
+        # because a sample sequence already seen adds no growth.
+        assert after["cpu"]["usec"] == before["cpu"]["usec"]
+
+    def test_a_window_that_measured_nothing_reports_nothing_rather_than_zero(self) -> None:
+        """No cycle read yet is unmeasured, not a member that used nothing."""
+        window = self.accumulator()
+
+        snapshot = window.snapshot(state="collecting", duration_ms=30_000, report_seq=1)
+
+        assert snapshot["cpu"]["usec"] is None
+        assert snapshot["cpu"]["status"] == STATUS_UNAVAILABLE
+        assert snapshot["window"]["duration_ms"] == 30_000
+
+    def test_the_offset_only_moves_past_what_was_folded_in(self) -> None:
+        """The caller can resume from the last consumed byte."""
+        window = self.accumulator()
+        first = self.record(0, cpu_ns=1_000_000_000, offset_seconds=1) + "\n"
+
+        assert window.offset == 0
+        window.consume(first.encode(), boot_id=BOOT, upto_offset=len(first))
+
+        assert window.offset == len(first)
+        assert window.cycles == 1
+
+    def test_the_checkpoint_is_what_the_final_report_will_carry(self) -> None:
+        """Both read the same state, so a crash loses only the unreached tail."""
+        window = self.accumulator()
+        first = self.record(0, cpu_ns=1_000_000_000, offset_seconds=1) + "\n"
+        second = self.record(1, cpu_ns=2_000_000_000, offset_seconds=2) + "\n"
+        window.consume(first.encode(), boot_id=BOOT, upto_offset=len(first))
+        running = window.snapshot(state="collecting", duration_ms=30_000, report_seq=1)
+        window.consume(second.encode(), boot_id=BOOT, upto_offset=len(first) + len(second))
+        final = window.snapshot(state="final", duration_ms=30_000, report_seq=2)
+
+        assert running["cpu"]["usec"] == 0
+        assert final["cpu"]["usec"] == 1_000_000
+        assert final["measurement_id"] == running["measurement_id"]
