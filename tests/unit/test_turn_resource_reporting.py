@@ -12,7 +12,6 @@ being filled with zeros that a reader could not tell from a measured zero.
 from __future__ import annotations
 
 import json
-import pathlib
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -451,21 +450,30 @@ def test_the_broker_and_the_runner_agree_about_where_the_summary_lives(monkeypat
     hand-built fixture kept the test green. This asserts the producer's actual
     key path and the consumer's read of it in one place.
     """
-    broker_source = (
-        pathlib.Path(__file__).resolve().parents[2] / "cloud_agent_host" / "workspace_broker.py"
-    ).read_text()
-    runner_source = (
-        pathlib.Path(__file__).resolve().parents[2] / "cloud_agent_host" / "runner.py"
-    ).read_text()
-
-    assert 'resources["turn_resources"] = telemetry.turn_resources' in broker_source
-    assert 'result_frame.get("resources")' in runner_source
-    assert 'result_frame.get("turn_resources")' not in runner_source
+    from cloud_agent_host.guest_observer import GuestObservation
+    from cloud_agent_host.shared_session_supervisor import SharedTurnTelemetry
+    from cloud_agent_host.tool_windows import ToolWindowTracker
+    from cloud_agent_host.workspace_broker import build_turn_resources
 
     payload = _snapshot()
+    telemetry = SharedTurnTelemetry(
+        observation=GuestObservation(
+            source="kata-guest-ebpf-v1",
+            complete=True,
+            lost_events=0,
+            truncated=False,
+        ),
+        turn_resources=payload,
+    )
+
+    # The real producer, not a frame written by hand: a source-text assertion
+    # passed while the summary was still emitted from the wrong place.
+    produced = build_turn_resources(telemetry, ToolWindowTracker())
+
+    assert produced["turn_resources"] == payload
     run = _run_terminal_turn(
         monkeypatch,
-        {"kind": "result", "status": "completed", "resources": {"turn_resources": payload}},
+        {"kind": "result", "status": "completed", "resources": produced},
     )
 
     run.control.report_turn_resources.assert_called_once_with(payload)
