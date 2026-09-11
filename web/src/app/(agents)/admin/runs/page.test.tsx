@@ -6,7 +6,11 @@ import { useSyncExternalStore } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AgentAccessApi } from '@/lib/api/session';
-import type { AgentAttemptTelemetryApi, AgentJobUsageApi } from '@/lib/api/agents';
+import type {
+  AgentAttemptTelemetryApi,
+  AgentJobUsageApi,
+  AttemptResourcesApi,
+} from '@/lib/api/agents';
 import type {
   AdminActivityEvent,
   AdminRun,
@@ -221,15 +225,21 @@ function event(overrides: Partial<AdminActivityEvent> = {}): AdminActivityEvent 
   };
 }
 
-function resources(): AgentAttemptTelemetryApi {
+/**
+ * The real response shape: the turn summary is one of the attempt's resources,
+ * not a sibling of them. Overrides replace entries inside `resources`, so a
+ * case cannot accidentally exercise a shape the server never sends.
+ */
+function resources(override: Partial<AttemptResourcesApi> = {}): AgentAttemptTelemetryApi {
   return {
     attempt_id: 10,
     attempt_no: 1,
     continuity_mode: 'hot',
     context_status: 'live',
     duration_ms: 120000,
-    turn_summary: turnSummary(),
     resources: {
+      turn_summary: turnSummary(),
+      ...override,
       // Deliberately stale numeric values with coverage zero: these must not
       // become whole-sandbox readings merely because the fields are populated.
       cpu_usec: 999000000,
@@ -1116,8 +1126,9 @@ describe('admin run observation', () => {
 
   it('keeps an interrupted collection out of the finalised form and names its cut-off', async () => {
     vi.mocked(getAdminAttemptResources).mockResolvedValue({
-      ...resources(),
-      turn_summary: turnSummary({ state: 'interrupted', observed_through_ms: 130_000 }),
+      ...resources({
+        turn_summary: turnSummary({ state: 'interrupted', observed_through_ms: 130_000 }),
+      }),
     });
     render(<AdminRunPage />);
     await screen.findByText('Turn resource summary');
@@ -1133,24 +1144,25 @@ describe('admin run observation', () => {
 
   it('keeps the lower bound off a partial memory peak and on a partial CPU one', async () => {
     vi.mocked(getAdminAttemptResources).mockResolvedValue({
-      ...resources(),
-      turn_summary: turnSummary({
-        cpu: {
-          status: 'partial',
-          method: 'live_and_exit_task_counters',
-          usec: 80_000_000,
-          reason_codes: ['ring_loss'],
-        },
-        memory: {
-          status: 'partial',
-          method: 'sampled_member_pss',
-          peak_bytes: 1_288_490_189,
-          sample_interval_ms: 1000,
-          valid_samples: 9,
-          expected_samples: 20,
-          max_gap_ms: 4000,
-          reason_codes: ['pss_unreadable'],
-        },
+      ...resources({
+        turn_summary: turnSummary({
+          cpu: {
+            status: 'partial',
+            method: 'live_and_exit_task_counters',
+            usec: 80_000_000,
+            reason_codes: ['ring_loss'],
+          },
+          memory: {
+            status: 'partial',
+            method: 'sampled_member_pss',
+            peak_bytes: 1_288_490_189,
+            sample_interval_ms: 1000,
+            valid_samples: 9,
+            expected_samples: 20,
+            max_gap_ms: 4000,
+            reason_codes: ['pss_unreadable'],
+          },
+        }),
       }),
     });
     render(<AdminRunPage />);
@@ -1163,8 +1175,7 @@ describe('admin run observation', () => {
 
   it('says a missing window was not collected rather than showing a zero', async () => {
     vi.mocked(getAdminAttemptResources).mockResolvedValue({
-      ...resources(),
-      turn_summary: null,
+      ...resources({ turn_summary: null }),
     });
     render(<AdminRunPage />);
     await screen.findByText('Turn resource summary');

@@ -67,8 +67,8 @@ _RUN_COLUMNS = """
                 'terminal', a.status <> 'running')
             ORDER BY a.id)
      FROM agent_attempts a
-     JOIN agent_attempt_resources r ON r.attempt_id = a.id
-     WHERE a.job_id = j.id AND r.turn_summary IS NOT NULL) AS resource_summary_attempts
+     LEFT JOIN agent_attempt_resources r ON r.attempt_id = a.id
+     WHERE a.job_id = j.id) AS resource_summary_attempts
 """
 
 # The derived, non-scalar keys of ``AttemptResources``. ``turn_summary`` is a

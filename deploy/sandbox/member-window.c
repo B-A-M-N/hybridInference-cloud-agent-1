@@ -58,6 +58,20 @@ static int connect_window_socket(void)
         close(fd);
         return -1;
     }
+    /* The observer answers every request, and an unbound datagram socket has
+     * no address to answer to: it arrives with msg_namelen == 0, which the
+     * observer refuses outright. Binding an empty abstract address lets the
+     * kernel assign one on the trusted side of the sandbox, so the reply has
+     * somewhere to go without naming a path the agent could collide with. */
+    {
+        struct sockaddr_un local = {.sun_family = AF_UNIX};
+
+        if (bind(fd, (const struct sockaddr *)&local, sizeof(local.sun_family)) < 0) {
+            perror("bind member window socket");
+            close(fd);
+            return -1;
+        }
+    }
     if (connect(fd, (const struct sockaddr *)&address,
                 offsetof(struct sockaddr_un, sun_path) + sizeof(FI_WINDOW_SOCKET)) < 0) {
         perror("connect member window socket");

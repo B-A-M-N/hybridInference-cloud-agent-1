@@ -2796,6 +2796,12 @@ class ChatSandboxManager:
             )
             return
         missing = [name for name in ("cpu", "storage_io", "pss") if not capability.get(name)]
+        if capability.get("storage_io") and not capability.get("io_attributed"):
+            # The counters exist but this filesystem never proved it charges a
+            # write back to the task that made it. A zero from that filesystem
+            # cannot be told apart from an accounting gap, so the metric is
+            # reported as unavailable rather than as a measured nothing.
+            missing.append("storage_io (attribution unproven)")
         if missing:
             logger.warning(
                 "Kata guest cannot measure part of a member window: %s",

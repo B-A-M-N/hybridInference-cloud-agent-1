@@ -1921,8 +1921,14 @@ def _run_shared_live_attempt(
             # without the key is a turn nobody measured, and is left absent
             # rather than filled with zeros.
             with contextlib.suppress(Exception):
+                # The broker ships the legacy rollup and the turn summary
+                # inside one ``resources`` object; reading the frame's top
+                # level found nothing and silently reported no turn at all.
                 turn_resources = (
-                    result_frame.get("turn_resources") if isinstance(result_frame, dict) else None
+                    (result_frame.get("resources") or {}).get("turn_resources")
+                    if isinstance(result_frame, dict)
+                    and isinstance(result_frame.get("resources"), dict)
+                    else None
                 )
                 reportable = _reportable_turn_resources(turn_resources)
                 if reportable is not None:

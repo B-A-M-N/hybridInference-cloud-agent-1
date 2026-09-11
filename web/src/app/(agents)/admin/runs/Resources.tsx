@@ -112,7 +112,7 @@ function TurnResourceSummary({
   telemetry: AgentAttemptTelemetryApi;
   attemptCoverage: RunResourceSummaryApi | null;
 }) {
-  const summary = telemetry.turn_summary ?? null;
+  const summary = telemetry.resources?.turn_summary ?? null;
   if (!summary) {
     return (
       <div className={`${CARD} mt-4 p-5 text-sm text-gray-500 dark:text-gray-400`}>

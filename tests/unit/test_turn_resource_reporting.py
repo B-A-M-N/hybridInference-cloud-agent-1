@@ -12,6 +12,7 @@ being filled with zeros that a reader could not tell from a measured zero.
 from __future__ import annotations
 
 import json
+import pathlib
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -338,7 +339,9 @@ def test_the_terminal_frame_snapshot_is_posted_before_the_lease_is_finished(monk
     payload = _snapshot()
     run = _run_terminal_turn(
         monkeypatch,
-        {"kind": "result", "status": "completed", "resources": {}, "turn_resources": payload},
+        # The broker nests the summary inside `resources`; a top-level key is
+        # a shape it never produces, and reading that was the bug.
+        {"kind": "result", "status": "completed", "resources": {"turn_resources": payload}},
     )
 
     assert run.result == 0
@@ -372,7 +375,7 @@ def test_a_structurally_invalid_frame_snapshot_is_not_posted(monkeypatch):
     broken = {key: value for key, value in _snapshot().items() if key != "measurement_id"}
     run = _run_terminal_turn(
         monkeypatch,
-        {"kind": "result", "status": "completed", "resources": {}, "turn_resources": broken},
+        {"kind": "result", "status": "completed", "resources": {"turn_resources": broken}},
     )
 
     assert run.result == 0
@@ -438,3 +441,31 @@ def test_a_running_checkpoint_is_posted_as_collecting_during_the_stream(monkeypa
     assert bodies[0]["state"] == "collecting"
     assert bodies[0]["report_seq"] == 11
     assert bodies[0]["window"]["observed_through_ms"] == 0
+
+
+def test_the_broker_and_the_runner_agree_about_where_the_summary_lives(monkeypatch):
+    """The frame contract between the two host modules, pinned by both sides.
+
+    The broker nests the summary under ``resources``; the runner used to read
+    the frame's top level, so every real turn reported nothing while a
+    hand-built fixture kept the test green. This asserts the producer's actual
+    key path and the consumer's read of it in one place.
+    """
+    broker_source = (
+        pathlib.Path(__file__).resolve().parents[2] / "cloud_agent_host" / "workspace_broker.py"
+    ).read_text()
+    runner_source = (
+        pathlib.Path(__file__).resolve().parents[2] / "cloud_agent_host" / "runner.py"
+    ).read_text()
+
+    assert 'resources["turn_resources"] = telemetry.turn_resources' in broker_source
+    assert 'result_frame.get("resources")' in runner_source
+    assert 'result_frame.get("turn_resources")' not in runner_source
+
+    payload = _snapshot()
+    run = _run_terminal_turn(
+        monkeypatch,
+        {"kind": "result", "status": "completed", "resources": {"turn_resources": payload}},
+    )
+
+    run.control.report_turn_resources.assert_called_once_with(payload)

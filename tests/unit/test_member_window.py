@@ -590,3 +590,68 @@ class TestExitEventProjection:
     def test_a_row_without_a_start_time_is_not_keyed_by_pid(self) -> None:
         """Without the kernel's start time there is no stable identity."""
         assert exit_events_from_processes([self.Row(started_guest_mono_ns=0)], boot_id=BOOT) == []
+
+
+class TestTheGuestWireFormat:
+    """The census record the C serializer actually writes must parse.
+
+    The host parser was tested against a hand-written fixture that matched the
+    parser instead of matching the guest. That is how a missing closing brace
+    survived: every host test passed while the real journal was unparseable.
+    This fixture is the serializer's output shape, byte for byte, and the
+    closure of the outer object is the part that was wrong.
+    """
+
+    def c_record(self, sample_seq: int = 1, *, task: bool = True) -> str:
+        """One line exactly as ``journal_window_sample`` builds it."""
+        detail = (
+            '{"tid":7,"tgid":7,"uid":11001,"starttime":100,"cpu_ns":5000,'
+            '"read_bytes":100,"write_bytes":20,"counters":3}'
+            if task
+            else ""
+        )
+        return (
+            '{"version":2,"seq":11,"kind":"window_sample","mono_ns":1000000,'
+            f'"measurement_id":"{MEASUREMENT}","uid":11001,"window":'
+            f'{{"sample_seq":{sample_seq},"counters":79,"tasks":1,"address_spaces":1,'
+            '"pss_bytes":4096,"pss_failed":0,"cpu_ns":5000,"read_bytes":100,'
+            f'"write_bytes":20,"task_detail":[{detail}]}}}}'
+        )
+
+    def test_the_serializer_line_is_valid_json(self) -> None:
+        """The record closes both objects it opened."""
+        parsed = json.loads(self.c_record())
+
+        assert parsed["kind"] == "window_sample"
+        assert parsed["window"]["task_detail"][0]["tid"] == 7
+
+    def test_the_host_reads_back_what_the_guest_wrote(self) -> None:
+        samples = parse_window_samples(
+            self.c_record().encode() + b"\n",
+            measurement_id=MEASUREMENT,
+            boot_id=BOOT,
+        )
+
+        assert len(samples) == 1
+        assert samples[0].address_spaces == 1
+        assert samples[0].pss_bytes == 4096
+        assert len(samples[0].tasks) == 1
+        assert samples[0].tasks[0].tid == 7
+
+    def test_all_three_census_phases_parse(self) -> None:
+        """Opening, periodic and closing cycles share one shape."""
+        payload = b"\n".join(self.c_record(seq).encode() for seq in (0, 1, 2)) + b"\n"
+
+        samples = parse_window_samples(payload, measurement_id=MEASUREMENT, boot_id=BOOT)
+
+        assert [sample.sample_seq for sample in samples] == [0, 1, 2]
+
+    def test_an_empty_member_cycle_parses(self) -> None:
+        samples = parse_window_samples(
+            self.c_record(task=False).encode() + b"\n",
+            measurement_id=MEASUREMENT,
+            boot_id=BOOT,
+        )
+
+        assert len(samples) == 1
+        assert samples[0].tasks == ()

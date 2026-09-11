@@ -183,6 +183,13 @@ class GuestObservation:
     #: turn already read this journal slice: a window that read it a second
     #: time would pay twice for the same bytes and could see a different slice.
     window_samples: tuple[Any, ...] = ()
+    #: The raw journal this slice was parsed from. ``processes`` below is
+    #: folded per thread group, which is the right shape for per-call
+    #: attribution and the wrong one for a per-thread resource window: a
+    #: group-summed figure cannot be reconciled against per-thread live
+    #: readings without charging one thread's work to another. The window
+    #: reducer reads the thread-level records from here instead.
+    journal_payload: bytes = b""
 
     @classmethod
     def unavailable(
@@ -866,6 +873,13 @@ def parse_events(
     for raw_line in payload.splitlines():
         if not raw_line:
             continue
+        # The journal carries two record families now: process lifecycle and
+        # the member window's live censuses. A census is not a process event,
+        # so it is skipped rather than judged malformed, and its own line bound
+        # is the census serializer's, not this one's: one member's per-task
+        # detail can legitimately exceed the process line cap.
+        if _is_window_record(raw_line):
+            continue
         if len(raw_line) > 4096:
             malformed = True
             continue
@@ -884,6 +898,8 @@ def parse_events(
             if uid != cursor.uid:
                 continue
             kind = event.get("kind")
+            if kind == "window_sample":
+                continue
             if kind not in {"fork", "exec", "exit", "done", "tool_pre", "tool_post"}:
                 raise GuestObserverProtocolError("guest process event kind is unknown")
             mono_ns = _integer(event, "mono_ns", positive=True)
@@ -1033,6 +1049,16 @@ def parse_events(
     )
 
 
+def _is_window_record(raw_line: bytes) -> bool:
+    """Whether a journal line is a member window census rather than an event.
+
+    The two families share one journal. This test is deliberately on the raw
+    bytes so a census line is never handed to the process parser, and so a
+    census larger than the process line cap is not mistaken for corruption.
+    """
+    return b'"kind":"window_sample"' in raw_line
+
+
 def finish_observation(
     *,
     cursor: GuestObserverCursor,
@@ -1076,6 +1102,7 @@ def finish_observation(
         clock_error_ns=cursor.clock_error_ns,
         detail=(detail[:300] if detail else None),
         window_samples=window_samples,
+        journal_payload=payload,
     )
 
 

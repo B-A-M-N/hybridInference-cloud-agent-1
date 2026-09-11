@@ -915,7 +915,7 @@ class SharedChatSessionSupervisor:
                 measurement_id=window.measurement_id,
                 boot_id=getattr(cursor, "guest_boot_id", "") or "",
                 samples=observation.window_samples,
-                processes=observation.processes,
+                journal_payload=observation.journal_payload,
                 opened_guest_mono_ns=getattr(cursor, "guest_mono_ns", 0) or 0,
                 lost_events=observation.lost_events,
                 state="final",

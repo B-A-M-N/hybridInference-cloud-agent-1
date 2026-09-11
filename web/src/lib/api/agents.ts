@@ -273,12 +273,12 @@ export interface AgentAttemptSummaryApi {
 }
 
 export interface AgentAttemptTelemetryApi extends AgentAttemptSummaryApi {
-  resources: AttemptResourcesApi | null;
   /**
-   * The whole-turn member execution window for this attempt, or null when none
-   * was collected. Null is "not measured here", never a zero.
+   * The attempt's measurements. The turn summary lives inside this object at
+   * ``resources.turn_summary``, because that is where the server puts it: the
+   * summary is one of the attempt's resources, not a sibling of them.
    */
-  turn_summary?: TurnResourceSummaryApi | null;
+  resources: AttemptResourcesApi | null;
 }
 
 export type AgentLedgerStatus = 'pending' | 'available' | 'partial' | 'unavailable' | 'stale';

@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -114,6 +114,12 @@ class ThreadReading:
     cpu_ns: int | None = None
     read_bytes: int | None = None
     write_bytes: int | None = None
+    #: True when the kernel's own start time for this instance falls inside the
+    #: window. Such a task began after the window opened, so everything it has
+    #: accumulated is this window's work; an instance that predates the window
+    #: is baselined instead, because its earlier consumption belongs to
+    #: whatever ran before.
+    born_in_window: bool = False
 
 
 @dataclass(frozen=True)
@@ -289,9 +295,18 @@ class MemberWindowReducer:
             state.last_guest_mono_ns = max(state.last_guest_mono_ns, sample.guest_mono_ns)
             if not sample.readings_are_complete or state.closed:
                 continue
-            self._advance(state, "cpu_ns", reading.cpu_ns, sample.guest_mono_ns)
-            self._advance(state, "read_bytes", reading.read_bytes, sample.guest_mono_ns)
-            self._advance(state, "write_bytes", reading.write_bytes, sample.guest_mono_ns)
+            for field_name, value in (
+                ("cpu_ns", reading.cpu_ns),
+                ("read_bytes", reading.read_bytes),
+                ("write_bytes", reading.write_bytes),
+            ):
+                self._advance(
+                    state,
+                    field_name,
+                    value,
+                    sample.guest_mono_ns,
+                    reading_born_in_window=reading.born_in_window,
+                )
         if not sample.readings_are_complete:
             self._cpu_partial = True
             self._io_partial = True
@@ -374,6 +389,8 @@ class MemberWindowReducer:
         field_name: str,
         value: int | None,
         guest_mono_ns: int,
+        *,
+        reading_born_in_window: bool = False,
     ) -> None:
         """Add one instance's growth for one counter since its last reading."""
         if value is None:
@@ -381,14 +398,18 @@ class MemberWindowReducer:
             return
         previous = getattr(state, field_name)
         if previous is None:
-            # This is the instance's opening reading, taken inside the window,
-            # so the range starts here. Its earlier work belongs to whatever
-            # ran before this window opened.
+            # This is the instance's first reading. A task that started before
+            # the window opens a range here: its earlier work belongs to
+            # whatever ran before. A task born inside the window owes
+            # everything it has already accumulated, because none of it
+            # predates the window.
             setattr(state, field_name, value)
             if field_name == "cpu_ns":
                 self._cpu_measured = True
             else:
                 self._io_measured = True
+            if reading_born_in_window:
+                self._add(field_name, value)
             return
         if value < previous:
             self._regressed(state, field_name)
@@ -616,7 +637,12 @@ def instance_key(*, boot_id: str, starttime_ticks: int, tid: int) -> str:
     return f"{boot_id}:{starttime_ticks}:{tid}"
 
 
-def parse_window_sample(line: Mapping[str, Any], *, boot_id: str) -> WindowSample | None:
+def parse_window_sample(
+    line: Mapping[str, Any],
+    *,
+    boot_id: str,
+    opened_guest_mono_ns: int = -1,
+) -> WindowSample | None:
     """Read one ``window_sample`` journal record, or None if it is not one.
 
     A record this parser cannot read is skipped rather than guessed at: the
@@ -637,7 +663,11 @@ def parse_window_sample(line: Mapping[str, Any], *, boot_id: str) -> WindowSampl
     detail = window.get("task_detail")
     if isinstance(detail, list):
         for entry in detail:
-            reading = _parse_thread_reading(entry, boot_id=boot_id)
+            reading = _parse_thread_reading(
+                entry,
+                boot_id=boot_id,
+                window_opened_ns=opened_guest_mono_ns,
+            )
             if reading is not None:
                 readings.append(reading)
     return WindowSample(
@@ -651,8 +681,21 @@ def parse_window_sample(line: Mapping[str, Any], *, boot_id: str) -> WindowSampl
     )
 
 
-def _parse_thread_reading(entry: Any, *, boot_id: str) -> ThreadReading | None:
-    """One per-task entry, or None when it lacks a usable identity."""
+def _parse_thread_reading(
+    entry: Any,
+    *,
+    boot_id: str,
+    window_opened_ns: int = -1,
+) -> ThreadReading | None:
+    """One per-task entry, or None when it lacks a usable identity.
+
+    The start time is in clock ticks since the guest boot. Comparing it with
+    the window's own opening tick is what separates "this task was already
+    running" from "this task started while we were measuring": the first is a
+    baseline, the second is work the window owes in full. When the opening tick
+    is unknown the instance is treated as pre-existing, which under-counts
+    rather than inventing work the window may not have caused.
+    """
     if not isinstance(entry, dict):
         return None
     tid = _int_or_none(entry.get("tid"))
@@ -661,6 +704,10 @@ def _parse_thread_reading(entry: Any, *, boot_id: str) -> ThreadReading | None:
     starttime = _int_or_none(entry.get("starttime"))
     if tid is None or tgid is None or uid is None or starttime is None:
         return None
+    born_in_window = False
+    if window_opened_ns >= 0:
+        started_ns = starttime * NS_PER_TICK
+        born_in_window = started_ns >= window_opened_ns
     return ThreadReading(
         instance=instance_key(boot_id=boot_id, starttime_ticks=starttime, tid=tid),
         tid=tid,
@@ -669,6 +716,7 @@ def _parse_thread_reading(entry: Any, *, boot_id: str) -> ThreadReading | None:
         cpu_ns=_int_or_none(entry.get("cpu_ns")),
         read_bytes=_int_or_none(entry.get("read_bytes")),
         write_bytes=_int_or_none(entry.get("write_bytes")),
+        born_in_window=born_in_window,
     )
 
 
@@ -700,6 +748,123 @@ def parse_window_samples(
             samples.append(sample)
     samples.sort(key=lambda item: item.sample_seq)
     return samples
+
+
+#: The guest observer's exit-time counter bits, mirrored for the raw records.
+_EXIT_COUNTER_CPU = 1 << 0
+_EXIT_COUNTER_IO = 1 << 2
+
+
+def exit_events_from_journal(
+    payload: bytes,
+    *,
+    boot_id: str,
+    measurement_id: str,
+    uid: int,
+) -> list[ThreadExit]:
+    """Build per-thread exit events from the guest's own journal.
+
+    The parsed ``processes`` rows cannot be used for this. They are folded per
+    thread group, so their CPU and I/O are the group's totals: charging them to
+    the group leader's thread instance would add a worker thread's consumption
+    a second time on top of the live reading that already covered it, and a
+    short-lived thread of a still-resident group would never appear at all.
+
+    The raw records are per task. Their identity is the kernel's monotonic
+    timestamp of the ``fork`` that created the task, converted to the same tick
+    unit the census uses for ``/proc/<tid>/stat``, so a live reading and a
+    settled exit describe one instance rather than two. Records for other
+    members sharing the guest are ignored, and the window's own measurement is
+    the only scope that contributes.
+    """
+    births: dict[tuple[int, int], int] = {}
+    by_instance: dict[str, int] = {}
+    events: list[ThreadExit] = []
+    for raw in payload.splitlines():
+        if not raw.strip():
+            continue
+        try:
+            decoded = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(decoded, dict):
+            continue
+        kind = decoded.get("kind")
+        if kind == "window_sample":
+            # A census carries the kernel's own start time for every live
+            # task, which is the authoritative birth tick when it is present.
+            if decoded.get("measurement_id") != measurement_id:
+                continue
+            window = decoded.get("window")
+            detail = window.get("task_detail") if isinstance(window, dict) else None
+            if isinstance(detail, list):
+                for entry in detail:
+                    if not isinstance(entry, dict):
+                        continue
+                    tid = _int_or_none(entry.get("tid"))
+                    tgid = _int_or_none(entry.get("tgid"))
+                    starttime = _int_or_none(entry.get("starttime"))
+                    if tid is not None and tgid is not None and starttime is not None:
+                        births[(tid, tgid)] = starttime
+            continue
+        if kind == "fork":
+            tid = _int_or_none(decoded.get("pid"))
+            tgid = _int_or_none(decoded.get("tgid"))
+            mono_ns = _int_or_none(decoded.get("mono_ns"))
+            if tid is not None and tgid is not None and mono_ns is not None:
+                births.setdefault((tid, tgid), mono_ns // NS_PER_TICK)
+            continue
+        if kind not in ("exit", "done"):
+            continue
+        if _int_or_none(decoded.get("uid")) != uid:
+            continue
+        tid = _int_or_none(decoded.get("pid"))
+        tgid = _int_or_none(decoded.get("tgid"))
+        mono_ns = _int_or_none(decoded.get("mono_ns"))
+        if tid is None or tgid is None or mono_ns is None:
+            continue
+        counters = _int_or_none(decoded.get("counters")) or 0
+        cpu_ns = _int_or_none(decoded.get("cpu_ns"))
+        read_bytes = _int_or_none(decoded.get("read_bytes"))
+        write_bytes = _int_or_none(decoded.get("write_bytes"))
+        # An exit and a done record describe the same task from two directions:
+        # the kernel's settled counters and the scheduler's final runtime. A
+        # task produces both, so they are merged into one event rather than
+        # emitted twice.
+        key = (tid, tgid)
+        # The exit record carries the settled counters; the done record carries
+        # the scheduler's final runtime. Both belong to one instance, so they
+        # are merged into one event instead of being counted twice.
+        instance = instance_key(
+            boot_id=boot_id,
+            starttime_ticks=births.get(key, mono_ns // NS_PER_TICK),
+            tid=tid,
+        )
+        index = by_instance.get(instance)
+        merged = events[index] if index is not None else None
+        if merged is not None:
+            events[index] = replace(
+                merged,
+                guest_mono_ns=max(merged.guest_mono_ns, mono_ns),
+                cpu_ns=cpu_ns if cpu_ns is not None else merged.cpu_ns,
+                read_bytes=read_bytes if read_bytes is not None else merged.read_bytes,
+                write_bytes=write_bytes if write_bytes is not None else merged.write_bytes,
+                counter_bits=merged.counter_bits
+                | (counters & (_EXIT_COUNTER_CPU | _EXIT_COUNTER_IO)),
+            )
+            continue
+        by_instance[instance] = len(events)
+        events.append(
+            ThreadExit(
+                instance=instance,
+                guest_mono_ns=mono_ns,
+                cpu_ns=cpu_ns if counters & _EXIT_COUNTER_CPU else None,
+                read_bytes=read_bytes if counters & _EXIT_COUNTER_IO else None,
+                write_bytes=write_bytes if counters & _EXIT_COUNTER_IO else None,
+                counter_bits=counters & (_EXIT_COUNTER_CPU | _EXIT_COUNTER_IO),
+            )
+        )
+    return events
 
 
 def exit_events_from_processes(
@@ -913,7 +1078,7 @@ def reduce_window(
     measurement_id: str,
     boot_id: str,
     samples: Iterable[WindowSample],
-    processes: Iterable[Any],
+    journal_payload: bytes = b"",
     opened_guest_mono_ns: int = -1,
     lost_events: int = 0,
     state: str = _STATE_FINAL,
@@ -942,7 +1107,12 @@ def reduce_window(
     reducer.note_ring_loss(lost_events)
     for sample in samples:
         reducer.observe_sample(sample)
-    for event in exit_events_from_processes(processes, boot_id=boot_id):
+    for event in exit_events_from_journal(
+        journal_payload,
+        boot_id=boot_id,
+        measurement_id=measurement_id,
+        uid=uid,
+    ):
         reducer.observe_exit(event)
     summary = reducer.summary(
         state=state,
