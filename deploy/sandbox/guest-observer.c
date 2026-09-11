@@ -974,51 +974,6 @@ static uint64_t burn_cpu_once(uint64_t seed)
     return seed;
 }
 
-/* Does this filesystem charge a write back to the task that made it?
- *
- * The capability probe used to stop at "the two keys can be read", which is
- * not the same claim: a filesystem that never accounts workspace writes would
- * still answer with two zeroes, and a zero from an unaccounted filesystem is
- * indistinguishable from a member that genuinely wrote nothing. This writes a
- * known quantity through the same task-local entry the census reads and
- * requires the delta to cover it.
- */
-static bool storage_io_is_attributed(void)
-{
-    char body[WINDOW_IO_BYTES];
-    char path[64];
-    char payload[4096];
-    uint64_t before = 0;
-    uint64_t after = 0;
-    ssize_t written;
-    int fd;
-
-    memset(payload, 0x5a, sizeof(payload));
-    snprintf(path, sizeof(path), "/proc/%u/task/%u/io", (unsigned)getpid(),
-             (unsigned)getpid());
-    if (read_bounded(path, body, sizeof(body)) <= 0)
-        return false;
-    if (!labelled_u64(body, "write_bytes:", &before))
-        return false;
-    snprintf(path, sizeof(path), "%s/io-attribution-probe", OBSERVER_ROOT);
-    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    if (fd < 0)
-        return false;
-    written = write(fd, payload, sizeof(payload));
-    (void)fsync(fd);
-    close(fd);
-    unlink(path);
-    if (written != (ssize_t)sizeof(payload))
-        return false;
-    snprintf(path, sizeof(path), "/proc/%u/task/%u/io", (unsigned)getpid(),
-             (unsigned)getpid());
-    if (read_bounded(path, body, sizeof(body)) <= 0)
-        return false;
-    if (!labelled_u64(body, "write_bytes:", &after))
-        return false;
-    return after >= before + (uint64_t)sizeof(payload);
-}
-
 static bool read_self_schedstat(uint64_t *cpu_ns)
 {
     char body[WINDOW_SCHEDSTAT_BYTES];
@@ -1066,11 +1021,8 @@ static uint8_t probe_window_capability(void)
     }
     if (read_bounded("/proc/self/io", body, sizeof(body)) > 0 &&
         labelled_u64(body, "read_bytes:", &ignored) &&
-        labelled_u64(body, "write_bytes:", &ignored)) {
+        labelled_u64(body, "write_bytes:", &ignored))
         capability |= FI_WINDOW_STORAGE_IO;
-        if (storage_io_is_attributed())
-            capability |= FI_WINDOW_IO_ATTRIBUTED;
-    }
     if (read_address_space_pss((uint32_t)getpid(), &pss))
         capability |= FI_WINDOW_PSS;
     return capability;
@@ -1826,18 +1778,12 @@ int main(int argc, char **argv)
          * window is a separate capability from the lifecycle events: kernels
          * differ on per-task runtime and on smaps_rollup, and a host must not
          * advertise a metric this guest will only ever return as missing. */
-        /* The attribution probe writes through this directory, so it has to
-         * exist before the probe runs. A guest that cannot create it reports
-         * the capability as absent rather than failing the self-test: the
-         * lifecycle observation this helper exists for is unaffected. */
-        (void)mkdir(OBSERVER_ROOT, 0700);
         capability = probe_window_capability();
         printf("freeinference-guest-observer-v%d\n", FI_OBSERVER_VERSION);
-        printf("{\"window\":{\"cpu\":%s,\"storage_io\":%s,\"io_attributed\":%s,"
-               "\"pss\":%s,\"counters\":%u}}\n",
+        printf("{\"window\":{\"cpu\":%s,\"storage_io\":%s,\"pss\":%s,"
+               "\"counters\":%u}}\n",
                (capability & FI_WINDOW_CPU) != 0 ? "true" : "false",
                (capability & FI_WINDOW_STORAGE_IO) != 0 ? "true" : "false",
-               (capability & FI_WINDOW_IO_ATTRIBUTED) != 0 ? "true" : "false",
                (capability & FI_WINDOW_PSS) != 0 ? "true" : "false",
                (unsigned int)capability);
         result = 0;

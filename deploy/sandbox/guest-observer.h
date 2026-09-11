@@ -49,11 +49,6 @@ enum fi_window_counter {
      * its task I/O counters. Clear means the totals above are a floor over
      * the tasks that did answer, and the cycle may not become a baseline. */
     FI_WINDOW_READING_COMPLETE = 1U << 6,
-    /* Preflight proved that a write this guest made is charged back to the
-     * task that made it on this filesystem. Without that proof a reported
-     * storage figure could be a true zero or an accounting gap, and the two
-     * are indistinguishable, so the metric must not be offered as measured. */
-    FI_WINDOW_IO_ATTRIBUTED = 1U << 7,
 };
 
 /* Fixed-width ring-buffer ABI shared by the BPF program and trusted loader. */

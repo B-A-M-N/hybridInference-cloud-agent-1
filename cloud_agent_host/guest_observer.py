@@ -1087,6 +1087,12 @@ def finish_observation(
             payload,
             measurement_id=cursor.measurement_id,
             boot_id=cursor.guest_boot_id,
+            # The window opens on this same fence, immediately after it is
+            # taken, so the cursor's guest clock is the origin the census
+            # compares a task's start time against. Without it every task
+            # looks pre-existing and a child born in the window loses the
+            # work it did before its first reading.
+            opened_guest_mono_ns=cursor.guest_mono_ns,
         )
         if cursor.measurement_id
         else ()

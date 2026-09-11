@@ -1036,12 +1036,17 @@ class SharedChatSessionSupervisor:
             boot_id = getattr(cursor, "guest_boot_id", "") or ""
             opened = getattr(cursor, "guest_mono_ns", 0) or 0
         try:
+            # No censuses are handed over yet. Reducing an empty sample list
+            # yields a snapshot whose window is real but whose every metric is
+            # unavailable, which is honest about what has been *reduced* even
+            # though the guest has by now written cycles the host has not read
+            # back. Feeding them in means consuming the journal incrementally
+            # and keeping one reducer per window, which is not built yet.
             snapshot = reduce_window(
                 uid=window.uid,
                 measurement_id=window.measurement_id,
                 boot_id=boot_id,
                 samples=(),
-                processes=(),
                 opened_guest_mono_ns=opened,
                 state="collecting",
                 duration_ms=max(0, int((time.monotonic() - window.opened_host_mono) * 1000)),

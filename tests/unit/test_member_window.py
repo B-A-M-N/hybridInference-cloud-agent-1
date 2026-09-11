@@ -679,3 +679,207 @@ class TestTheGuestWireFormat:
 
         assert len(samples) == 1
         assert samples[0].tasks == ()
+
+
+class TestProductionChainRegressions:
+    """The cases the reviewer reproduced through the real entry points.
+
+    Each of these failed while the unit tests around it passed, because those
+    tests exercised a helper the production path never called or a shape the
+    production path never used. They go through the same functions the
+    supervisor does.
+    """
+
+    OPENED_NS = 1_000_000_000_000
+
+    def window_record(self, *, tid: int, starttime_ticks: int, cpu_ns: int, seq: int = 1):
+        import json as _json
+
+        return _json.dumps(
+            {
+                "version": 2,
+                "seq": seq,
+                "kind": "window_sample",
+                "mono_ns": self.OPENED_NS + seq * 1_000_000_000,
+                "measurement_id": MEASUREMENT,
+                "uid": 11001,
+                "window": {
+                    "sample_seq": seq,
+                    "counters": WINDOW_CPU | WINDOW_STORAGE_IO | WINDOW_READING_COMPLETE,
+                    "address_spaces": 1,
+                    "pss_bytes": 0,
+                    "pss_failed": 0,
+                    "task_detail": [
+                        {
+                            "tid": tid,
+                            "tgid": tid,
+                            "uid": 11001,
+                            "starttime": starttime_ticks,
+                            "cpu_ns": cpu_ns,
+                            "read_bytes": 0,
+                            "write_bytes": 0,
+                            "counters": WINDOW_CPU,
+                        }
+                    ],
+                },
+            }
+        )
+
+    def reduce(self, payload: bytes, *, opened_ns: int | None = None):
+        from cloud_agent_host.member_resources import reduce_window
+
+        origin = self.OPENED_NS if opened_ns is None else opened_ns
+        samples = parse_window_samples(
+            payload,
+            measurement_id=MEASUREMENT,
+            boot_id=BOOT,
+            opened_guest_mono_ns=origin,
+        )
+        return reduce_window(
+            uid=11001,
+            measurement_id=MEASUREMENT,
+            boot_id=BOOT,
+            samples=samples,
+            opened_guest_mono_ns=origin,
+            state="final",
+            duration_ms=0,
+        )
+
+    def test_a_child_born_inside_the_window_is_not_baselined_away(self) -> None:
+        """The window owes everything a task born during it has consumed."""
+        ticks = (self.OPENED_NS + 2_000_000_000) // 10_000_000
+        first = self.window_record(tid=50, starttime_ticks=ticks, cpu_ns=900_000_000, seq=1)
+        second = self.window_record(tid=50, starttime_ticks=ticks, cpu_ns=1_000_000_000, seq=2)
+
+        result = self.reduce((first + "\n" + second + "\n").encode())
+
+        # 900 ms was already spent when the window first saw it, and it grew by
+        # another 100 ms. Baselining the first reading discarded the 900 ms.
+        assert result["cpu"]["usec"] == 1_000_000
+        assert result["cpu"]["status"] == STATUS_AVAILABLE
+
+    def test_a_resident_task_is_still_baselined(self) -> None:
+        """A task that predates the window is charged only its growth."""
+        ticks = (self.OPENED_NS - 60_000_000_000) // 10_000_000
+        first = self.window_record(tid=7, starttime_ticks=ticks, cpu_ns=90_000_000_000, seq=1)
+        second = self.window_record(tid=7, starttime_ticks=ticks, cpu_ns=90_500_000_000, seq=2)
+
+        result = self.reduce((first + "\n" + second + "\n").encode())
+
+        assert result["cpu"]["usec"] == 500_000
+
+    def test_the_prefix_report_is_accepted_by_the_api_schema(self) -> None:
+        """A shortened window must not produce a report the API refuses.
+
+        Keeping the true window end while claiming ``final`` violated the
+        request schema, so the snapshot was rejected and the runner swallowed
+        the rejection: the turn went unreported entirely.
+        """
+        from cloud_agent.schemas import WorkerTurnResourcesRequest
+
+        ticks = (self.OPENED_NS - 60_000_000_000) // 10_000_000
+        payload = (
+            self.window_record(tid=7, starttime_ticks=ticks, cpu_ns=1_000_000, seq=1) + "\n"
+        ).encode()
+        samples = parse_window_samples(
+            payload,
+            measurement_id=MEASUREMENT,
+            boot_id=BOOT,
+            opened_guest_mono_ns=self.OPENED_NS,
+        )
+        from cloud_agent_host.member_resources import reduce_window
+
+        snapshot = reduce_window(
+            uid=11001,
+            measurement_id=MEASUREMENT,
+            boot_id=BOOT,
+            samples=samples,
+            opened_guest_mono_ns=self.OPENED_NS,
+            state="final",
+            duration_ms=60_000,
+        )
+        snapshot["report_seq"] = 1
+
+        assert snapshot["state"] == "collecting"
+        assert snapshot["window"]["duration_ms"] == 60_000
+        assert snapshot["window"]["observed_through_ms"] < 60_000
+        WorkerTurnResourcesRequest.model_validate(snapshot)
+
+    def test_an_unproven_filesystem_reports_no_io_rather_than_a_zero(self) -> None:
+        """Two zeroes from an unverified filesystem are not a measured nothing."""
+        ticks = (self.OPENED_NS - 60_000_000_000) // 10_000_000
+        payload = (
+            self.window_record(tid=7, starttime_ticks=ticks, cpu_ns=1_000_000) + "\n"
+        ).encode()
+
+        result = self.reduce(payload)
+
+        assert result["storage_io"]["status"] == STATUS_UNAVAILABLE
+        assert result["storage_io"]["read_bytes"] is None
+        assert "filesystem_attribution_unverified" in result["storage_io"]["reason_codes"]
+
+
+class TestTaskNumberReuse:
+    """Two lives on one task number are two tasks, not one."""
+
+    def test_a_reused_tid_produces_two_exits_with_their_own_totals(self) -> None:
+        import json as _json
+
+        from cloud_agent_host.member_resources import exit_events_from_journal
+
+        lines = [
+            {"kind": "fork", "pid": 50, "tgid": 50, "mono_ns": 10_000_000, "uid": 11001},
+            {
+                "kind": "exit",
+                "pid": 50,
+                "tgid": 50,
+                "mono_ns": 20_000_000,
+                "uid": 11001,
+                "counters": 5,
+                "cpu_ns": 100_000_000,
+                "read_bytes": 10,
+                "write_bytes": 0,
+            },
+            {
+                "kind": "done",
+                "pid": 50,
+                "tgid": 50,
+                "mono_ns": 20_000_000,
+                "uid": 11001,
+                "counters": 1,
+                "cpu_ns": 100_000_000,
+            },
+            {"kind": "fork", "pid": 50, "tgid": 50, "mono_ns": 50_000_000, "uid": 11001},
+            {
+                "kind": "exit",
+                "pid": 50,
+                "tgid": 50,
+                "mono_ns": 60_000_000,
+                "uid": 11001,
+                "counters": 5,
+                "cpu_ns": 200_000_000,
+                "read_bytes": 20,
+                "write_bytes": 0,
+            },
+            {
+                "kind": "done",
+                "pid": 50,
+                "tgid": 50,
+                "mono_ns": 60_000_000,
+                "uid": 11001,
+                "counters": 1,
+                "cpu_ns": 200_000_000,
+            },
+        ]
+        payload = ("\n".join(_json.dumps(line) for line in lines) + "\n").encode()
+
+        events = exit_events_from_journal(
+            payload,
+            boot_id=BOOT,
+            measurement_id=MEASUREMENT,
+            uid=11001,
+        )
+
+        # Merging the two lives reported only the second life's 200 ms.
+        assert len(events) == 2
+        assert sum(event.cpu_ns or 0 for event in events) == 300_000_000

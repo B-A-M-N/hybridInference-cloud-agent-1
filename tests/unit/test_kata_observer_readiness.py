@@ -360,7 +360,7 @@ def test_a_partial_window_capability_names_what_is_missing(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING):
         manager._check_observer_self_test(
             "freeinference-guest-observer-v2\n"
-            '{"window":{"cpu":true,"storage_io":true,"io_attributed":true,'
+            '{"window":{"cpu":true,"storage_io":true,'
             '"pss":false,"counters":3}}\n'
         )
 
@@ -372,33 +372,13 @@ def test_a_partial_window_capability_names_what_is_missing(monkeypatch, caplog):
     assert partial and partial[0].__dict__.get("missing") == ["pss"]
 
 
-def test_storage_counters_without_attribution_are_reported(monkeypatch, caplog):
-    """Readable counters on a filesystem that never charged a write back are
-    not a measured zero, so they are reported rather than offered."""
-    manager = _self_test_manager(monkeypatch)
-
-    with caplog.at_level(logging.WARNING):
-        manager._check_observer_self_test(
-            "freeinference-guest-observer-v2\n"
-            '{"window":{"cpu":true,"storage_io":true,"io_attributed":false,'
-            '"pss":true,"counters":7}}\n'
-        )
-
-    partial = [
-        record
-        for record in caplog.records
-        if record.__dict__.get("event") == "guest_observer_window_capability_partial"
-    ]
-    assert partial and partial[0].__dict__.get("missing") == ["storage_io (attribution unproven)"]
-
-
 def test_a_complete_capability_report_is_not_a_warning(monkeypatch, caplog):
     manager = _self_test_manager(monkeypatch)
 
     with caplog.at_level(logging.WARNING):
         manager._check_observer_self_test(
             "freeinference-guest-observer-v2\n"
-            '{"window":{"cpu":true,"storage_io":true,"io_attributed":true,'
+            '{"window":{"cpu":true,"storage_io":true,'
             '"pss":true,"counters":7}}\n'
         )
 

@@ -612,7 +612,16 @@ class MemberWindowReducer:
             # whole reason both fields exist, and no metric may then claim to
             # be complete. Without an opening tick there is nothing to compare
             # against, so the window keeps its own length.
+            #
+            # The state has to change with it. A ``final`` report describing a
+            # window prefix is refused by the request schema, so leaving it
+            # final would have produced a snapshot the API rejects outright --
+            # and the runner swallows that, so the whole turn would have gone
+            # unreported. ``collecting`` is the honest state for a window whose
+            # collection stopped early: it is read back as ``interrupted`` once
+            # the attempt is terminal, which is precisely what happened.
             self._readings_complete = False
+            state = _STATE_COLLECTING
         snapshot = self.snapshot(state=state)
         snapshot["window"] = {
             "duration_ms": duration,
@@ -743,6 +752,7 @@ def parse_window_samples(
     *,
     measurement_id: str,
     boot_id: str,
+    opened_guest_mono_ns: int = -1,
 ) -> list[WindowSample]:
     """Read one measurement's cycles out of a journal slice, in order.
 
@@ -761,7 +771,11 @@ def parse_window_samples(
             continue
         if not isinstance(decoded, dict) or decoded.get("measurement_id") != measurement_id:
             continue
-        sample = parse_window_sample(decoded, boot_id=boot_id)
+        sample = parse_window_sample(
+            decoded,
+            boot_id=boot_id,
+            opened_guest_mono_ns=opened_guest_mono_ns,
+        )
         if sample is not None:
             samples.append(sample)
     samples.sort(key=lambda item: item.sample_seq)
@@ -788,16 +802,39 @@ def exit_events_from_journal(
     a second time on top of the live reading that already covered it, and a
     short-lived thread of a still-resident group would never appear at all.
 
-    The raw records are per task. Their identity is the kernel's monotonic
-    timestamp of the ``fork`` that created the task, converted to the same tick
-    unit the census uses for ``/proc/<tid>/stat``, so a live reading and a
-    settled exit describe one instance rather than two. Records for other
-    members sharing the guest are ignored, and the window's own measurement is
-    the only scope that contributes.
+    Records for other members sharing the guest are ignored, and only this
+    window's own measurement contributes births from a census.
+
+    Identity is per *lifecycle*, not per task number. The kernel reuses a TID
+    the moment its owner is reaped, so the same number can name two unrelated
+    tasks inside one window. Each task number therefore tracks the life it
+    currently owns and whether that life has ended: a settled exit ends it, and
+    anything arriving afterwards under the same number starts a new instance
+    rather than reopening the finished one. Merging the two would report the
+    shorter of the two totals as if it were both.
     """
     births: dict[tuple[int, int], int] = {}
-    by_instance: dict[str, int] = {}
+    #: The instance each task number currently names, the event it is being
+    #: accumulated into, and whether its life has ended.
+    current: dict[tuple[int, int], str] = {}
+    event_index: dict[str, int] = {}
+    ended: dict[tuple[int, int], bool] = {}
     events: list[ThreadExit] = []
+    seen_exit: set[str] = set()
+
+    def key_for(tid: int, tgid: int, fallback_ticks: int) -> str:
+        return instance_key(boot_id=boot_id, starttime_ticks=fallback_ticks, tid=tid)
+
+    def start_life(tid: int, tgid: int, starttime_ticks: int) -> str:
+        """Begin a new lifecycle for one task number."""
+        identifier = key_for(tid, tgid, starttime_ticks)
+        births[(tid, tgid)] = starttime_ticks
+        current[(tid, tgid)] = identifier
+        ended[(tid, tgid)] = False
+        event_index.pop(identifier, None)
+        seen_exit.discard(identifier)
+        return identifier
+
     for raw in payload.splitlines():
         if not raw.strip():
             continue
@@ -808,59 +845,91 @@ def exit_events_from_journal(
         if not isinstance(decoded, dict):
             continue
         kind = decoded.get("kind")
+        mono_ns = _int_or_none(decoded.get("mono_ns"))
         if kind == "window_sample":
-            # A census carries the kernel's own start time for every live
-            # task, which is the authoritative birth tick when it is present.
             if decoded.get("measurement_id") != measurement_id:
                 continue
             window = decoded.get("window")
             detail = window.get("task_detail") if isinstance(window, dict) else None
-            if isinstance(detail, list):
-                for entry in detail:
-                    if not isinstance(entry, dict):
-                        continue
-                    tid = _int_or_none(entry.get("tid"))
-                    tgid = _int_or_none(entry.get("tgid"))
-                    starttime = _int_or_none(entry.get("starttime"))
-                    if tid is not None and tgid is not None and starttime is not None:
-                        births[(tid, tgid)] = starttime
+            if not isinstance(detail, list):
+                continue
+            for entry in detail:
+                if not isinstance(entry, dict):
+                    continue
+                tid = _int_or_none(entry.get("tid"))
+                tgid = _int_or_none(entry.get("tgid"))
+                starttime = _int_or_none(entry.get("starttime"))
+                if tid is None or tgid is None or starttime is None:
+                    continue
+                task = (tid, tgid)
+                known = births.get(task)
+                if known is None:
+                    start_life(tid, tgid, starttime)
+                    continue
+                if known == starttime:
+                    continue
+                # The kernel's own start time disagrees with what this task
+                # number was carrying. If the old life already ended the number
+                # has been reused, and if it has not then this is the
+                # authoritative stamp for the life in progress.
+                if ended.get(task):
+                    start_life(tid, tgid, starttime)
+                else:
+                    previous = current.get(task)
+                    if previous is not None:
+                        event_index.pop(previous, None)
+                    start_life(tid, tgid, starttime)
             continue
+        tid = _int_or_none(decoded.get("pid"))
+        tgid = _int_or_none(decoded.get("tgid"))
+        if tid is None or tgid is None or mono_ns is None:
+            continue
+        task = (tid, tgid)
         if kind == "fork":
-            tid = _int_or_none(decoded.get("pid"))
-            tgid = _int_or_none(decoded.get("tgid"))
-            mono_ns = _int_or_none(decoded.get("mono_ns"))
-            if tid is not None and tgid is not None and mono_ns is not None:
-                births.setdefault((tid, tgid), mono_ns // NS_PER_TICK)
+            # A fork on a number whose previous life already ended is a new
+            # task, and a fork on a live number is the same one being
+            # announced; either way the birth is the kernel's own timestamp
+            # until a census supplies the authoritative start time.
+            if ended.get(task, True) or task not in births:
+                start_life(tid, tgid, mono_ns // NS_PER_TICK)
             continue
         if kind not in ("exit", "done"):
             continue
         if _int_or_none(decoded.get("uid")) != uid:
             continue
-        tid = _int_or_none(decoded.get("pid"))
-        tgid = _int_or_none(decoded.get("tgid"))
-        mono_ns = _int_or_none(decoded.get("mono_ns"))
-        if tid is None or tgid is None or mono_ns is None:
-            continue
+        closed_life = seen_exit.intersection({current.get(task, "")})
+        if ended.get(task) and kind == "done" and closed_life:
+            # The life ended at sched_process_exit; this is the scheduler's
+            # final runtime for the same life and belongs to that instance.
+            instance = current[task]
+        else:
+            if ended.get(task) or task not in current:
+                # No live life for this number: it began and ended between two
+                # censuses, which is exactly the case exit records exist for.
+                start_life(tid, tgid, mono_ns // NS_PER_TICK)
+            instance = current[task]
         counters = _int_or_none(decoded.get("counters")) or 0
         cpu_ns = _int_or_none(decoded.get("cpu_ns"))
         read_bytes = _int_or_none(decoded.get("read_bytes"))
         write_bytes = _int_or_none(decoded.get("write_bytes"))
-        # An exit and a done record describe the same task from two directions:
-        # the kernel's settled counters and the scheduler's final runtime. A
-        # task produces both, so they are merged into one event rather than
-        # emitted twice.
-        key = (tid, tgid)
-        # The exit record carries the settled counters; the done record carries
-        # the scheduler's final runtime. Both belong to one instance, so they
-        # are merged into one event instead of being counted twice.
-        instance = instance_key(
-            boot_id=boot_id,
-            starttime_ticks=births.get(key, mono_ns // NS_PER_TICK),
-            tid=tid,
-        )
-        index = by_instance.get(instance)
-        merged = events[index] if index is not None else None
-        if merged is not None:
+        index = event_index.get(instance)
+        if index is None:
+            event_index[instance] = len(events)
+            events.append(
+                ThreadExit(
+                    instance=instance,
+                    guest_mono_ns=mono_ns,
+                    cpu_ns=cpu_ns if counters & _EXIT_COUNTER_CPU else None,
+                    read_bytes=read_bytes if counters & _EXIT_COUNTER_IO else None,
+                    write_bytes=write_bytes if counters & _EXIT_COUNTER_IO else None,
+                    counter_bits=counters & (_EXIT_COUNTER_CPU | _EXIT_COUNTER_IO),
+                )
+            )
+        else:
+            # The exit record carries the settled counters and the done record
+            # the scheduler's final runtime; both belong to one instance, so
+            # they merge instead of being counted twice.
+            merged = events[index]
             events[index] = replace(
                 merged,
                 guest_mono_ns=max(merged.guest_mono_ns, mono_ns),
@@ -870,18 +939,12 @@ def exit_events_from_journal(
                 counter_bits=merged.counter_bits
                 | (counters & (_EXIT_COUNTER_CPU | _EXIT_COUNTER_IO)),
             )
-            continue
-        by_instance[instance] = len(events)
-        events.append(
-            ThreadExit(
-                instance=instance,
-                guest_mono_ns=mono_ns,
-                cpu_ns=cpu_ns if counters & _EXIT_COUNTER_CPU else None,
-                read_bytes=read_bytes if counters & _EXIT_COUNTER_IO else None,
-                write_bytes=write_bytes if counters & _EXIT_COUNTER_IO else None,
-                counter_bits=counters & (_EXIT_COUNTER_CPU | _EXIT_COUNTER_IO),
-            )
-        )
+        if kind == "exit":
+            # sched_process_exit is the end of the life. The done record only
+            # supplies the final CPU reading for it, so the life stays open
+            # until then.
+            ended[task] = True
+            seen_exit.add(instance)
     return events
 
 
@@ -1104,6 +1167,7 @@ def reduce_window(
     report_seq: int = 1,
     open_scan_ms: int = 0,
     close_scan_ms: int = 0,
+    io_attribution_verified: bool = False,
 ) -> dict[str, Any]:
     """Reduce one closed window into its reported snapshot.
 
@@ -1138,5 +1202,19 @@ def reduce_window(
         open_scan_ms=open_scan_ms,
         close_scan_ms=close_scan_ms,
     )
+    if not io_attribution_verified:
+        # Task I/O accounting answers with whatever the filesystem chose to
+        # record. Two zeroes are indistinguishable between "the member wrote
+        # nothing" and "this filesystem never charged the member at all", and
+        # the counter existing is not evidence about which one it is. Until a
+        # deployment proves attribution on the filesystem it actually serves,
+        # the metric is reported as unmeasured rather than as nothing used.
+        summary["storage_io"] = {
+            "status": STATUS_UNAVAILABLE,
+            "method": "task_io_accounting",
+            "read_bytes": None,
+            "write_bytes": None,
+            "reason_codes": ["filesystem_attribution_unverified"],
+        }
     summary["report_seq"] = max(1, report_seq)
     return summary
