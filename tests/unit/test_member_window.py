@@ -949,6 +949,7 @@ class TestTheRunningAccumulator:
             uid=11001,
             measurement_id=self.MEAS,
             opened_guest_mono_ns=self.OPENED,
+            boot_id=BOOT,
         )
 
     def test_a_checkpoint_carries_the_cycles_already_consumed(self) -> None:
@@ -1028,3 +1029,130 @@ class TestTheRunningAccumulator:
         assert running["cpu"]["usec"] == 0
         assert final["cpu"]["usec"] == 1_000_000
         assert final["measurement_id"] == running["measurement_id"]
+
+
+class TestSlicesAndLateRecords:
+    """Identity spans slices, and a record that arrives late is still counted.
+
+    Both cases below were introduced by the fix for the other: keeping identity
+    across a read boundary is what made a late record merge into an instance
+    that had already been reported, and the merge then had to report again.
+    """
+
+    MEAS = "slice-measurement"
+    OPENED = 1_000_000_000_000
+
+    def accumulator(self) -> WindowAccumulator:
+        return WindowAccumulator(
+            uid=11001,
+            measurement_id=self.MEAS,
+            opened_guest_mono_ns=self.OPENED,
+            boot_id=BOOT,
+        )
+
+    def census(self, seq: int, cpu_ns: int) -> bytes:
+        import json as _json
+
+        ticks = (self.OPENED - 60_000_000_000) // 10_000_000
+        record = _json.dumps(
+            {
+                "version": 2,
+                "seq": seq,
+                "kind": "window_sample",
+                "mono_ns": self.OPENED + seq * 1_000_000_000,
+                "measurement_id": self.MEAS,
+                "uid": 11001,
+                "window": {
+                    "sample_seq": seq,
+                    "counters": WINDOW_CPU | WINDOW_STORAGE_IO | WINDOW_READING_COMPLETE,
+                    "address_spaces": 1,
+                    "pss_bytes": 4096,
+                    "pss_failed": 0,
+                    "task_detail": [
+                        {
+                            "tid": 9,
+                            "tgid": 9,
+                            "uid": 11001,
+                            "starttime": ticks,
+                            "cpu_ns": cpu_ns,
+                            "counters": WINDOW_CPU,
+                        }
+                    ],
+                },
+            }
+        )
+        return (record + "\n").encode()
+
+    def test_a_census_and_its_exit_in_different_slices_are_one_instance(self) -> None:
+        """The window must not charge a live reading and its exit separately."""
+        import json as _json
+
+        window = self.accumulator()
+        census = self.census(0, 1_000_000_000)
+        window.consume(census, boot_id=BOOT, upto_offset=len(census))
+        settled = (
+            _json.dumps(
+                {
+                    "kind": "exit",
+                    "pid": 9,
+                    "tgid": 9,
+                    "uid": 11001,
+                    "mono_ns": self.OPENED + 2_000_000_000,
+                    "counters": 1,
+                    "cpu_ns": 1_000_000_000,
+                }
+            )
+            + "\n"
+        ).encode()
+        window.consume(settled, boot_id=BOOT, upto_offset=len(census) + len(settled))
+
+        snapshot = window.snapshot(state="collecting", duration_ms=30_000, report_seq=1)
+
+        # The census was this task's baseline and the settled exit restates the
+        # same total: nothing was consumed inside the window.
+        assert snapshot["cpu"]["usec"] == 0
+
+    def test_a_done_record_after_its_exit_is_still_counted(self) -> None:
+        """The exit reads zero CPU; the scheduler's runtime arrives later."""
+        import json as _json
+
+        window = self.accumulator()
+        escape = (
+            _json.dumps(
+                {
+                    "kind": "exit",
+                    "pid": 9,
+                    "tgid": 9,
+                    "uid": 11001,
+                    "mono_ns": self.OPENED + 1_000_000_000,
+                    "counters": 5,
+                    "cpu_ns": 0,
+                    "read_bytes": 4,
+                    "write_bytes": 0,
+                }
+            )
+            + "\n"
+        ).encode()
+        window.consume(escape, boot_id=BOOT, upto_offset=len(escape))
+
+        done = (
+            _json.dumps(
+                {
+                    "kind": "done",
+                    "pid": 9,
+                    "tgid": 9,
+                    "uid": 11001,
+                    "mono_ns": self.OPENED + 1_000_000_000,
+                    "counters": 1,
+                    "cpu_ns": 700_000_000,
+                }
+            )
+            + "\n"
+        ).encode()
+        window.consume(done, boot_id=BOOT, upto_offset=len(escape) + len(done))
+
+        snapshot = window.snapshot(state="collecting", duration_ms=30_000, report_seq=1)
+
+        # Emitting the instance at its exit and never reporting the restatement
+        # lost this thread's CPU entirely.
+        assert snapshot["cpu"]["usec"] == 700_000

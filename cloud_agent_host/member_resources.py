@@ -335,7 +335,13 @@ class MemberWindowReducer:
             state = _ThreadState()
             self._threads[exit_event.instance] = state
         if state.closed:
-            self.duplicate_exits += 1
+            # A closed instance can still be restated: the kernel's exit record
+            # carries the settled I/O and reads zero CPU, and the scheduler's
+            # final runtime arrives with the done record for the same task. That
+            # is growth rather than a duplicate, so only a restatement that adds
+            # nothing counts as one.
+            if not self._restate(state, exit_event):
+                self.duplicate_exits += 1
             return
         self._observed_through_ms = max(
             self._observed_through_ms, self._relative_ms(exit_event.guest_mono_ns)
@@ -424,6 +430,37 @@ class MemberWindowReducer:
         setattr(state, field_name, value)
         self._add(field_name, value - previous)
         state.last_guest_mono_ns = max(state.last_guest_mono_ns, guest_mono_ns)
+
+    def _restate(self, state: _ThreadState, exit_event: ThreadExit) -> bool:
+        """Apply growth reported after an instance was already closed.
+
+        Returns whether anything changed. Only increases are taken: a value that
+        moved backwards is refused exactly as it is for a live reading, because
+        reconciling it would mean inventing time.
+        """
+        changed = False
+        for field_name, value in (
+            ("cpu_ns", exit_event.cpu_ns),
+            ("read_bytes", exit_event.read_bytes),
+            ("write_bytes", exit_event.write_bytes),
+        ):
+            if value is None:
+                continue
+            previous = getattr(state, field_name)
+            if previous is not None and value < previous:
+                self._regressed(state, field_name)
+                continue
+            if previous is None or value > previous:
+                delta = value if previous is None else value - previous
+                setattr(state, field_name, value)
+                self._add(field_name, delta)
+                changed = True
+        if exit_event.guest_mono_ns > state.last_guest_mono_ns:
+            state.last_guest_mono_ns = exit_event.guest_mono_ns
+            self._observed_through_ms = max(
+                self._observed_through_ms, self._relative_ms(exit_event.guest_mono_ns)
+            )
+        return changed
 
     def _close(
         self,
@@ -788,72 +825,121 @@ _EXIT_COUNTER_CPU = 1 << 0
 _EXIT_COUNTER_IO = 1 << 2
 
 
-def exit_events_from_journal(
-    payload: bytes,
-    *,
-    boot_id: str,
-    measurement_id: str,
-    uid: int,
-) -> list[ThreadExit]:
-    """Build per-thread exit events from the guest's own journal.
+class ExitTracker:
+    """Per-thread exits for one window, fed the journal one slice at a time.
 
-    The parsed ``processes`` rows cannot be used for this. They are folded per
-    thread group, so their CPU and I/O are the group's totals: charging them to
-    the group leader's thread instance would add a worker thread's consumption
-    a second time on top of the live reading that already covered it, and a
-    short-lived thread of a still-resident group would never appear at all.
+    The identity state lives here rather than in a single call because a
+    census and the exit it pairs with can fall either side of a read boundary.
+    A per-slice parse would then name one thread twice -- its authoritative
+    start time arrives with the census in one slice, the exit lands in the
+    next -- and the window would charge its live reading and its settled exit
+    as two tasks.
 
-    Records for other members sharing the guest are ignored, and only this
-    window's own measurement contributes births from a census.
+    An earlier version solved that by re-parsing everything read so far on
+    every tick, which is correct but costs O(cycles^2): at 20 tasks a cycle the
+    per-tick parse grew from 1.5 ms to 22 ms across 400 ticks. Keeping the
+    state here gives the same identity continuity while parsing each byte once.
 
     Identity is per *lifecycle*, not per task number. The kernel reuses a TID
-    the moment its owner is reaped, so the same number can name two unrelated
-    tasks inside one window. Each task number therefore tracks the life it
-    currently owns and whether that life has ended: a settled exit ends it, and
-    anything arriving afterwards under the same number starts a new instance
-    rather than reopening the finished one. Merging the two would report the
-    shorter of the two totals as if it were both.
+    the moment its owner is reaped, so one number can name two unrelated tasks
+    inside one window; each number tracks the life it currently owns and
+    whether that life has ended.
     """
-    births: dict[tuple[int, int], int] = {}
-    #: The instance each task number currently names, the event it is being
-    #: accumulated into, and whether its life has ended.
-    current: dict[tuple[int, int], str] = {}
-    event_index: dict[str, int] = {}
-    ended: dict[tuple[int, int], bool] = {}
-    events: list[ThreadExit] = []
-    seen_exit: set[str] = set()
 
-    def key_for(tid: int, tgid: int, fallback_ticks: int) -> str:
-        return instance_key(boot_id=boot_id, starttime_ticks=fallback_ticks, tid=tid)
+    def __init__(self, *, boot_id: str, measurement_id: str, uid: int) -> None:
+        self._boot_id = boot_id
+        self._measurement_id = measurement_id
+        self._uid = uid
+        self._births: dict[tuple[int, int], int] = {}
+        self._current: dict[tuple[int, int], str] = {}
+        self._event_index: dict[str, int] = {}
+        self._ended: dict[tuple[int, int], bool] = {}
+        self._seen_exit: set[str] = set()
+        #: Instances whose ``done`` record has arrived. The exit record carries
+        #: the settled I/O but reads zero CPU -- the scheduler's runtime is only
+        #: final once the task leaves the CPU for the last time -- so emitting
+        #: an instance before its done record would report a thread's CPU as
+        #: nothing. A done record can be lost, so an instance is also released
+        #: on the slice after its exit rather than waited on forever.
+        self._settled: set[str] = set()
+        self._events: list[ThreadExit] = []
+        self._emitted: set[str] = set()
+        self._slices = 0
+        #: The slice each instance was first seen in, so one that never gets a
+        #: done record is still released rather than waited on.
+        self._pending_since: dict[str, int] = {}
+        #: What was last handed over per instance, so a restated exit -- the
+        #: exit record reads zero CPU and the done record carries the
+        #: scheduler's final runtime -- is reported again rather than dropped.
+        self._last_emitted: dict[str, ThreadExit] = {}
 
-    def start_life(tid: int, tgid: int, starttime_ticks: int) -> str:
+    def _key_for(self, tid: int, starttime_ticks: int) -> str:
+        return instance_key(boot_id=self._boot_id, starttime_ticks=starttime_ticks, tid=tid)
+
+    def _start_life(self, tid: int, tgid: int, starttime_ticks: int) -> str:
         """Begin a new lifecycle for one task number."""
-        identifier = key_for(tid, tgid, starttime_ticks)
-        births[(tid, tgid)] = starttime_ticks
-        current[(tid, tgid)] = identifier
-        ended[(tid, tgid)] = False
-        event_index.pop(identifier, None)
-        seen_exit.discard(identifier)
+        identifier = self._key_for(tid, starttime_ticks)
+        self._births[(tid, tgid)] = starttime_ticks
+        self._current[(tid, tgid)] = identifier
+        self._ended[(tid, tgid)] = False
+        self._event_index.pop(identifier, None)
+        self._seen_exit.discard(identifier)
         return identifier
 
-    for raw in payload.splitlines():
-        if not raw.strip():
-            continue
-        try:
-            decoded = json.loads(raw)
-        except (ValueError, UnicodeDecodeError):
-            continue
-        if not isinstance(decoded, dict):
-            continue
+    def consume(self, payload: bytes) -> list[ThreadExit]:
+        """Fold one slice in and return the exits it finished or completed.
+
+        Only records this call had not already reported are returned, so a
+        caller that re-reads a slice cannot be handed the same exit twice.
+        """
+        for raw in payload.splitlines():
+            if not raw.strip():
+                continue
+            try:
+                decoded = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(decoded, dict):
+                continue
+            self._observe(decoded)
+        self._slices += 1
+        return self._drain()
+
+    def _drain(self) -> list[ThreadExit]:
+        """Hand over every instance whose counters are as settled as they get.
+
+        An instance is ready when its ``done`` record has arrived, because that
+        is where the scheduler's final runtime is read. One whose done record
+        has not arrived by the end of the following slice is handed over anyway:
+        a lost record would otherwise hold that thread's CPU back forever, and a
+        floor reported late is better than a total that never appears.
+        """
+        fresh: list[ThreadExit] = []
+        for identifier, index in self._event_index.items():
+            event = self._events[index]
+            if event == self._last_emitted.get(identifier):
+                continue
+            if identifier not in self._emitted:
+                ready = identifier in self._settled or self._slices > self._pending_since.get(
+                    identifier, self._slices
+                )
+                if not ready:
+                    continue
+            self._emitted.add(identifier)
+            self._last_emitted[identifier] = event
+            fresh.append(event)
+        return fresh
+
+    def _observe(self, decoded: dict[str, Any]) -> None:
         kind = decoded.get("kind")
         mono_ns = _int_or_none(decoded.get("mono_ns"))
         if kind == "window_sample":
-            if decoded.get("measurement_id") != measurement_id:
-                continue
+            if decoded.get("measurement_id") != self._measurement_id:
+                return
             window = decoded.get("window")
             detail = window.get("task_detail") if isinstance(window, dict) else None
             if not isinstance(detail, list):
-                continue
+                return
             for entry in detail:
                 if not isinstance(entry, dict):
                     continue
@@ -863,62 +949,58 @@ def exit_events_from_journal(
                 if tid is None or tgid is None or starttime is None:
                     continue
                 task = (tid, tgid)
-                known = births.get(task)
+                known = self._births.get(task)
                 if known is None:
-                    start_life(tid, tgid, starttime)
+                    self._start_life(tid, tgid, starttime)
                     continue
                 if known == starttime:
                     continue
-                # The kernel's own start time disagrees with what this task
-                # number was carrying. If the old life already ended the number
-                # has been reused, and if it has not then this is the
-                # authoritative stamp for the life in progress.
-                if ended.get(task):
-                    start_life(tid, tgid, starttime)
-                else:
-                    previous = current.get(task)
+                # The kernel's own start time disagrees with what this number
+                # was carrying: the old life is over either way, so a reused
+                # number becomes a second instance and this becomes the
+                # authoritative stamp for a life still in progress.
+                if not self._ended.get(task):
+                    previous = self._current.get(task)
                     if previous is not None:
-                        event_index.pop(previous, None)
-                    start_life(tid, tgid, starttime)
-            continue
+                        self._event_index.pop(previous, None)
+                        self._emitted.discard(previous)
+                self._start_life(tid, tgid, starttime)
+            return
         tid = _int_or_none(decoded.get("pid"))
         tgid = _int_or_none(decoded.get("tgid"))
         if tid is None or tgid is None or mono_ns is None:
-            continue
+            return
         task = (tid, tgid)
         if kind == "fork":
-            # A fork on a number whose previous life already ended is a new
-            # task, and a fork on a live number is the same one being
-            # announced; either way the birth is the kernel's own timestamp
-            # until a census supplies the authoritative start time.
-            if ended.get(task, True) or task not in births:
-                start_life(tid, tgid, mono_ns // NS_PER_TICK)
-            continue
+            if self._ended.get(task, True) or task not in self._births:
+                self._start_life(tid, tgid, mono_ns // NS_PER_TICK)
+            return
         if kind not in ("exit", "done"):
-            continue
-        if _int_or_none(decoded.get("uid")) != uid:
-            continue
-        closed_life = seen_exit.intersection({current.get(task, "")})
-        if ended.get(task) and kind == "done" and closed_life:
+            return
+        if _int_or_none(decoded.get("uid")) != self._uid:
+            return
+        closed_life = self._seen_exit.intersection({self._current.get(task, "")})
+        if self._ended.get(task) and kind == "done" and closed_life:
             # The life ended at sched_process_exit; this is the scheduler's
-            # final runtime for the same life and belongs to that instance.
-            instance = current[task]
+            # final runtime for it and belongs to that instance.
+            identifier = self._current[task]
         else:
-            if ended.get(task) or task not in current:
-                # No live life for this number: it began and ended between two
-                # censuses, which is exactly the case exit records exist for.
-                start_life(tid, tgid, mono_ns // NS_PER_TICK)
-            instance = current[task]
+            if self._ended.get(task) or task not in self._current:
+                self._start_life(tid, tgid, mono_ns // NS_PER_TICK)
+            identifier = self._current[task]
         counters = _int_or_none(decoded.get("counters")) or 0
         cpu_ns = _int_or_none(decoded.get("cpu_ns"))
         read_bytes = _int_or_none(decoded.get("read_bytes"))
         write_bytes = _int_or_none(decoded.get("write_bytes"))
-        index = event_index.get(instance)
+        if kind == "done":
+            self._settled.add(identifier)
+        index = self._event_index.get(identifier)
         if index is None:
-            event_index[instance] = len(events)
-            events.append(
+            self._event_index[identifier] = len(self._events)
+            self._pending_since[identifier] = self._slices
+            self._events.append(
                 ThreadExit(
-                    instance=instance,
+                    instance=identifier,
                     guest_mono_ns=mono_ns,
                     cpu_ns=cpu_ns if counters & _EXIT_COUNTER_CPU else None,
                     read_bytes=read_bytes if counters & _EXIT_COUNTER_IO else None,
@@ -927,11 +1009,8 @@ def exit_events_from_journal(
                 )
             )
         else:
-            # The exit record carries the settled counters and the done record
-            # the scheduler's final runtime; both belong to one instance, so
-            # they merge instead of being counted twice.
-            merged = events[index]
-            events[index] = replace(
+            merged = self._events[index]
+            self._events[index] = replace(
                 merged,
                 guest_mono_ns=max(merged.guest_mono_ns, mono_ns),
                 cpu_ns=cpu_ns if cpu_ns is not None else merged.cpu_ns,
@@ -941,12 +1020,26 @@ def exit_events_from_journal(
                 | (counters & (_EXIT_COUNTER_CPU | _EXIT_COUNTER_IO)),
             )
         if kind == "exit":
-            # sched_process_exit is the end of the life. The done record only
-            # supplies the final CPU reading for it, so the life stays open
-            # until then.
-            ended[task] = True
-            seen_exit.add(instance)
-    return events
+            self._ended[task] = True
+            self._seen_exit.add(identifier)
+
+
+def exit_events_from_journal(
+    payload: bytes,
+    *,
+    boot_id: str,
+    measurement_id: str,
+    uid: int,
+) -> list[ThreadExit]:
+    """Per-thread exits from one journal slice, with no state carried over.
+
+    A convenience for callers that hold the whole journal at once, such as the
+    closing reduction. A caller consuming the journal incrementally uses
+    :class:`ExitTracker` instead, which is the same logic with identity kept
+    between slices.
+    """
+    tracker = ExitTracker(boot_id=boot_id, measurement_id=measurement_id, uid=uid)
+    return tracker.consume(payload)
 
 
 def exit_events_from_processes(
@@ -1169,12 +1262,27 @@ class WindowAccumulator:
     may be requested from the turn's.
     """
 
-    def __init__(self, *, uid: int, measurement_id: str, opened_guest_mono_ns: int) -> None:
+    def __init__(
+        self,
+        *,
+        uid: int,
+        measurement_id: str,
+        opened_guest_mono_ns: int,
+        boot_id: str,
+    ) -> None:
         self._lock = threading.Lock()
         self._reducer = MemberWindowReducer(
             uid=uid,
             measurement_id=measurement_id,
             opened_guest_mono_ns=opened_guest_mono_ns,
+        )
+        #: Identity state lives here, not in a per-call parse. A census and the
+        #: exit it pairs with can fall either side of a read boundary, and a
+        #: slice-local parse would name one thread twice.
+        self._exits = ExitTracker(
+            boot_id=boot_id,
+            measurement_id=measurement_id,
+            uid=uid,
         )
         self._offset = 0
         self._cycles = 0
@@ -1200,20 +1308,22 @@ class WindowAccumulator:
             self._offset = max(0, offset)
 
     def consume(self, payload: bytes, *, boot_id: str, upto_offset: int) -> int:
-        """Fold the journal read so far in, and return how many cycles are new.
+        """Fold one new slice in, and return how many cycles it held.
 
-        Each call is given everything read from the journal's start, not just
-        the newest slice, and re-derives the identity of every task from that
-        whole history. That is what keeps an instance's key stable: the census
-        that supplies a task's authoritative start time and the exit that ends
-        it can land in different slices, and a per-slice parse would then see
-        two different instances for one thread -- charging its live reading and
-        its settled exit as if they were two tasks.
+        ``boot_id`` is documentation of the caller's fence rather than the
+        tracker's input: identity is stamped with the boot the window opened
+        on, which cannot change without a new window. Passing a different one
+        here would key the same thread under two names, so the constructor is
+        where it is fixed.
 
-        Re-feeding is safe because the reducer is stateful. A cycle it has
-        already seen adds no growth, and an exit it has already closed is
-        recorded as a duplicate rather than added again, so a caller that
-        re-reads from an earlier offset cannot inflate the total.
+        The slice is everything read since the last call, so each byte is
+        parsed once. Identity still spans the whole window because the tracker
+        carries it between calls; deriving it from one slice alone would name a
+        thread twice whenever a census and its exit fell either side of a read
+        boundary.
+
+        The offset advances only once the slice has been folded in, so a caller
+        that re-reads after a failure cannot lose a cycle.
         """
         if not payload:
             return 0
@@ -1223,21 +1333,15 @@ class WindowAccumulator:
             boot_id=boot_id,
             opened_guest_mono_ns=self.opened_guest_mono_ns,
         )
-        exits = exit_events_from_journal(
-            payload,
-            boot_id=boot_id,
-            measurement_id=self.measurement_id,
-            uid=self.uid,
-        )
+        exits = self._exits.consume(payload)
         with self._lock:
-            seen_before = self._cycles
             for sample in samples:
                 self._reducer.observe_sample(sample)
             for event in exits:
                 self._reducer.observe_exit(event)
-            self._cycles = max(self._cycles, len(samples))
+            self._cycles += len(samples)
             self._offset = max(self._offset, upto_offset)
-            return max(0, self._cycles - seen_before)
+            return len(samples)
 
     def snapshot(
         self,

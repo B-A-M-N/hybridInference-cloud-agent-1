@@ -238,11 +238,10 @@ class _Member:
     #: The newest checkpoint the sampler produced and the turn has not
     #: forwarded yet.
     window_pending_checkpoint: dict[str, Any] | None = None
-    #: How far the window's journal has been read, and everything read so far.
-    #: Identity is derived from the whole history, so the bytes are kept rather
-    #: than only the newest slice.
+    #: How far the window's journal has been read. Only the offset is kept:
+    #: the accumulator carries identity between slices, so retaining every byte
+    #: read would grow without bound and re-parse it all on each tick.
     window_journal_offset: int = 0
-    window_journal_bytes: bytes = b""
     turn_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
@@ -757,6 +756,7 @@ class SharedChatSessionSupervisor:
                         uid=window.uid,
                         measurement_id=window.measurement_id,
                         opened_guest_mono_ns=(getattr(observer_cursor, "guest_mono_ns", 0) or 0),
+                        boot_id=self._window_boot_id(group.spec, observer_cursor),
                     )
                     if window is not None
                     else None
@@ -929,6 +929,25 @@ class SharedChatSessionSupervisor:
                 telemetry,
             ) from boundary_error
         return telemetry
+
+    def _window_boot_id(self, spec: Any, cursor: Any) -> str:
+        """The boot every instance key in one window is stamped with.
+
+        The cursor carries it when the observer could report one. Falling back
+        to asking the manager keeps a window whose cursor predates that field --
+        or a guest that could not answer -- from keying every thread under an
+        empty boot, which would let two boots' task numbers collide.
+        """
+        from_cursor = getattr(cursor, "guest_boot_id", "") or ""
+        if from_cursor:
+            return from_cursor
+        read = getattr(self._manager, "guest_boot_id", None)
+        if read is None:
+            return ""
+        try:
+            return read(spec) or ""
+        except Exception:
+            return ""
 
     def _freeze_window(
         self,
@@ -1117,33 +1136,37 @@ class SharedChatSessionSupervisor:
         read = getattr(self._manager, "member_window_journal_delta", None)
         if read is None:
             return 0
-        for member in self._members_with_accumulator(accumulator):
-            scoped = replace(cursor, offset=member.window_journal_offset)
-            payload, new_offset = read(self._group_spec_for(accumulator), scoped)
-            # A journal read can catch the observer mid-write, and the tail of
-            # such a read is half a record. Advancing past it would lose that
-            # cycle for good and leave nothing in the accounting to say so, so
-            # the offset stops at the last complete line and the partial tail
-            # is read again once the writer has finished it.
-            complete = payload.rfind(b"\n") + 1
-            member.window_journal_offset = new_offset - (len(payload) - complete)
-            member.window_journal_bytes = member.window_journal_bytes + payload[:complete]
-            return accumulator.consume(
-                member.window_journal_bytes,
-                boot_id=cursor.guest_boot_id,
-                upto_offset=member.window_journal_offset,
-            )
-        return 0
+        member = self._member_with_accumulator(accumulator)
+        if member is None:
+            return 0
+        scoped = replace(cursor, offset=member.window_journal_offset)
+        payload, new_offset = read(self._group_spec_for(accumulator), scoped)
+        # A journal read can catch the observer mid-write, and the tail of such
+        # a read is half a record. Advancing past it would lose that cycle for
+        # good and leave nothing in the accounting to say so, so the offset
+        # stops at the last complete line and the partial tail is read again
+        # once the writer has finished it.
+        complete = payload.rfind(b"\n") + 1
+        member.window_journal_offset = new_offset - (len(payload) - complete)
+        return accumulator.consume(
+            payload[:complete],
+            boot_id=cursor.guest_boot_id,
+            upto_offset=member.window_journal_offset,
+        )
 
-    def _members_with_accumulator(self, accumulator: WindowAccumulator) -> list[Any]:
-        """The members owning one accumulator, so its journal state can follow it."""
+    def _member_with_accumulator(self, accumulator: WindowAccumulator) -> Any | None:
+        """The member owning one accumulator, or None once its window closed.
+
+        One accumulator belongs to exactly one member at a time, so this takes
+        the single owner rather than iterating: a loop that returned on its
+        first pass would silently skip a second owner if that ever changed.
+        """
         with self._lock:
-            return [
-                member
-                for group in self._groups.values()
-                for member in group.members.values()
-                if member.window_accumulator is accumulator
-            ]
+            for group in self._groups.values():
+                for member in group.members.values():
+                    if member.window_accumulator is accumulator:
+                        return member
+        return None
 
     def _group_spec_for(self, accumulator: WindowAccumulator) -> Any:
         """The sandbox spec owning one window's accumulator."""

@@ -2893,6 +2893,20 @@ class ChatSandboxManager:
             payload = str(payload).encode("utf-8", "replace")
         return payload, cursor.offset + len(payload)
 
+    def guest_boot_id(self, spec: ChatSandboxSpec) -> str:
+        """This guest's boot identifier, or an empty string when unreadable.
+
+        A task's identity is only unique within one boot, so every instance key
+        carries it. The observer controller caches the read, so asking once per
+        window costs one guest exec rather than one per census.
+        """
+        if self.backend.runtime != KATA_RUNTIME:
+            return ""
+        try:
+            return self._guest_observer_controller(spec).guest_boot_id()
+        except Exception:
+            return ""
+
     def member_window_request(
         self,
         spec: ChatSandboxSpec,
