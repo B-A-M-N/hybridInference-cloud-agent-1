@@ -179,6 +179,31 @@ static int write_all(int fd, const char *data, size_t length)
     return 0;
 }
 
+/* Format into a fixed buffer, rejecting rather than silently shortening.
+ *
+ * Every path and record this helper builds is bounded on purpose, so a
+ * conversion that does not fit is a bug in the bound and not a value to be
+ * abbreviated: a truncated path names a different file and a truncated record
+ * cannot be parsed back. Returning the length keeps the call sites explicit,
+ * and -Wformat-truncation stays quiet because the failure is handled here
+ * rather than left to chance.
+ */
+static int format_into(char *output, size_t capacity, const char *format, ...)
+{
+    va_list args;
+    int written;
+
+    va_start(args, format);
+    written = vsnprintf(output, capacity, format, args);
+    va_end(args);
+    if (written < 0 || (size_t)written >= capacity) {
+        if (capacity > 0)
+            output[0] = '\0';
+        return -1;
+    }
+    return written;
+}
+
 static size_t json_escape(char *output, size_t capacity, const char *input, size_t input_limit)
 {
     static const char hex[] = "0123456789abcdef";
@@ -1112,7 +1137,11 @@ static int run_census(struct observer *observer,
             continue;
         if (!parse_u64(entry->d_name, &pid) || pid > UINT32_MAX)
             continue;
-        snprintf(path, sizeof(path), "/proc/%s/status", entry->d_name);
+        /* The path is built from the number that was just parsed, not from
+         * the directory entry text, so a name of any length is irrelevant
+         * here. A PID is at most ten digits and the longest suffix is
+         * "/status", which the buffer has room for by construction. */
+        snprintf(path, sizeof(path), "/proc/%u/status", (uint32_t)pid);
         if (read_bounded(path, body, sizeof(body)) <= 0)
             continue;
         if (!labelled_u64(body, "Tgid:", &tgid) || !labelled_u64(body, "Uid:", &owner))
@@ -1591,7 +1620,8 @@ static int publish_status(const struct observer *observer)
         observer->journal_ino);
     if (length <= 0 || (size_t)length >= sizeof(status))
         return -1;
-    snprintf(temporary, sizeof(temporary), "%s.tmp.%ld", STATUS_PATH, (long)getpid());
+    if (format_into(temporary, sizeof(temporary), "%s.tmp.%ld", STATUS_PATH, (long)getpid()) < 0)
+        return -1;
     fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0)
         return -1;
