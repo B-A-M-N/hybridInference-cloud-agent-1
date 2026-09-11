@@ -466,11 +466,14 @@ jobs:
               )
           PY
   # -------------------------------------------------------------------- web
-  # One job, five checks, for the reason spelled out over `lint` above — and
+  # One job, six checks, for the reason spelled out over `lint` above — and
   # more sharply here, because Node costs more to install than uv does. Measured
   # over one run: 55s of setup across the five cells for 27s of actual checking,
   # and four of the five spent longer installing than working (Prettier: 10s of
-  # setup, 1s of formatting check).
+  # setup, 1s of formatting check). The last two install nothing and reuse the
+  # checkout, but they do build: the guard builds the one that must fail, and
+  # the acceptance builds both web variants. That replaces a plain
+  # `npm run build` step rather than adding to it.
   check:
     name: Web
     needs: changes
@@ -553,16 +556,33 @@ jobs:
         working-directory: ./web
         run: npm run test
 
-      - name: Build
-        id: build
+      # A Client Component importing the server config reader must fail the
+      # build, and that is enforced by the bundler rather than by the module,
+      # so only a real build proves it. The build is expected to fail; the
+      # script exits non-zero when it does not.
+      - name: Server-only guard
+        id: server-only
         if: steps.detect.outputs.present == 'true'
         continue-on-error: true
         working-directory: ./web
-        run: npm run build
+        run: node scripts/check-server-only-guard.mjs
+
+      # Builds both web variants — root and `/agents` — and boots each under
+      # two runtime environments. A unit test cannot see this: the failure
+      # being guarded against is configuration resolved at `next build` and
+      # frozen into the bundle, and only the built server can show whether
+      # that happened. See the script's header for the full list of
+      # assertions, including the sign-in and asset prefixes per variant.
+      - name: Runtime site config
+        id: runtime-config
+        if: steps.detect.outputs.present == 'true'
+        continue-on-error: true
+        working-directory: ./web
+        run: node scripts/check-runtime-site-config.mjs
 
       # Skipped along with the checks when web/ is absent, so this stays the
       # deliberate no-op the `Detect web app` step describes rather than
-      # reading five empty outcomes as five failures.
+      # reading six empty outcomes as six failures.
       - name: Every check passed
         if: steps.detect.outputs.present == 'true'
         env:
@@ -571,7 +591,8 @@ jobs:
             prettier=${{ steps.prettier.outcome }}
             typescript=${{ steps.typescript.outcome }}
             tests=${{ steps.tests.outcome }}
-            build=${{ steps.build.outcome }}
+            server-only=${{ steps.server-only.outcome }}
+            runtime-config=${{ steps.runtime-config.outcome }}
         run: |
           set -euo pipefail
           failed=0
