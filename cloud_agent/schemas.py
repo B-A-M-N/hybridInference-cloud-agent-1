@@ -308,6 +308,7 @@ class AgentJobResponse(BaseModel):
     base_sha: str | None = None
     output_branch: str | None = None
     state: str
+    conversation_state: Literal["queued", "running", "idle", "failed"] | None = None
     cancel_requested: bool = False
     current_attempt_id: int | None = None
     published_pr_url: str | None = None
@@ -390,7 +391,9 @@ class AgentJobListResponse(BaseModel):
     jobs: list[AgentJobResponse]
 
 
-AgentSessionState = Literal["running", "queued", "needs_review", "done", "failed", "cancelled"]
+AgentSessionState = Literal[
+    "running", "queued", "idle", "needs_review", "done", "failed", "cancelled"
+]
 AgentSessionDeleteBlockReason = Literal[
     "not_archived", "session_active", "fork_in_progress", "publication_pending"
 ]
