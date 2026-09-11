@@ -1432,6 +1432,25 @@ def create_app(
         except (DriverError, SandboxError, ValueError) as exc:
             raise supervisor_error(exc) from exc
 
+        def checkpoint_running_turn(
+            supervisor: Any,
+            member_thread_id: str,
+            token: str,
+        ) -> dict[str, Any] | None:
+            """Take one running checkpoint, or None when none is due.
+
+            A checkpoint is best effort: it exists so a crash keeps the work
+            measured up to the last report, and a failure to take one must not
+            reach the turn's own event stream as an error.
+            """
+            take = getattr(supervisor, "checkpoint_running_window", None)
+            if take is None:
+                return None
+            try:
+                return take(member_thread_id, token)
+            except Exception:
+                return None
+
         def frames():
             turn_boundary_closed = False
             tool_windows = ToolWindowTracker()
@@ -1483,6 +1502,12 @@ def create_app(
                         "processes": processes,
                     }
                 )
+                # The whole-turn member execution window travels beside the
+                # legacy rollup rather than inside it: it is a different
+                # measurement with its own endpoint, and folding it into this
+                # dict would make the shared-member guard's terms ambiguous.
+                if telemetry.turn_resources is not None:
+                    resources["turn_resources"] = telemetry.turn_resources
                 return resources
 
             try:
@@ -1504,6 +1529,22 @@ def create_app(
                         )
                         + "\n"
                     )
+                    # A long turn crosses the checkpoint interval several
+                    # times. The schedule inside the supervisor decides when
+                    # that produces a report, so polling here costs one
+                    # comparison per event and the cadence has a single owner.
+                    checkpoint = checkpoint_running_turn(owner, thread_id, body.token)
+                    if checkpoint is not None:
+                        yield (
+                            json.dumps(
+                                {
+                                    "kind": "resource_checkpoint",
+                                    "turn_resources": checkpoint,
+                                },
+                                separators=(",", ":"),
+                            )
+                            + "\n"
+                        )
                 result = turn.wait()
                 # The activation boundary is part of success, not cleanup
                 # after success. It reaps escaped background processes and

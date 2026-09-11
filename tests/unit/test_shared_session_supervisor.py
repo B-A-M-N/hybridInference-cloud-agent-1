@@ -131,10 +131,23 @@ class _Manager:
         self.events.append(("normalize", kwargs["slot_id"]))
 
     def begin_guest_observation(
-        self, spec: ChatSandboxSpec, *, user_uid: int
+        self,
+        spec: ChatSandboxSpec,
+        *,
+        user_uid: int,
+        measurement_id: str | None = None,
     ) -> GuestObserverCursor:
         self.events.append(("observe-begin", user_uid))
-        return GuestObserverCursor(uid=user_uid, available=True)
+        return GuestObserverCursor(
+            uid=user_uid,
+            available=True,
+            measurement_id=measurement_id,
+        )
+
+    def member_window_request(self, spec: ChatSandboxSpec, argv: list[str], *, timeout_s: float):
+        """Accept the fixed window verbs without a real guest helper."""
+        self.events.append(("member-window", argv[1]))
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
 
     def finish_guest_observation(
         self, spec: ChatSandboxSpec, cursor: GuestObserverCursor | None
@@ -1591,10 +1604,17 @@ def test_kata_turn_observation_is_uid_scoped_and_closes_before_platform_cleanup(
         (10.0, "pre", "toolu_1"),
         (10.1, "post", "toolu_1"),
     )
-    assert manager.events[-5:] == [
+    # The window is fenced by the observation that reads it back: the opening
+    # census lands after the fence is taken, the closing census lands before
+    # the fence is read, and the platform's own cleanup follows both so it is
+    # never billed to the member.
+    assert manager.events[-8:] == [
         ("census", 0),
         ("observe-begin", 11001),
+        ("member-window", "register"),
+        ("member-window", "sample"),
         ("observe-finish", 11001),
+        ("member-window", "close"),
         ("reap-except", 0, ((41, 400),)),
         ("normalize", 0),
     ]
@@ -1664,13 +1684,18 @@ def test_lost_shared_residency_preserves_observation_until_turn_closes():
     supervisor.residency_lost("athr_source", generation=1)
 
     assert turn.interrupted is True
-    assert manager.events[-1] == ("observe-begin", 11001)
+    # Losing residency interrupts the member but must not close the window
+    # early: the turn is still the turn, and its closing census belongs to
+    # ``complete_turn`` like every other activation's.
+    assert ("member-window", "close") not in manager.events
 
     telemetry = supervisor.complete_turn("athr_source", lease.token, turn)
 
     assert telemetry.complete is True
-    assert manager.events[-3:] == [
+    assert manager.events[-5:] == [
+        ("member-window", "sample"),
         ("observe-finish", 11001),
+        ("member-window", "close"),
         ("reap-except", 0, ((41, 400),)),
         ("normalize", 0),
     ]

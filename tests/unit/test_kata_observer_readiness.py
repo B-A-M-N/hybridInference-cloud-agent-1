@@ -1,6 +1,7 @@
 """Regressions reproduced on Kata 3.32, beyond a mocked kernel-name check."""
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -181,7 +182,10 @@ def test_readiness_requires_events_and_member_isolation_and_cleans_up(monkeypatc
         privileged_calls.append(argv)
         return SimpleNamespace(
             returncode=int(failure == "observer"),
-            stdout="freeinference-guest-observer-v1\n",
+            stdout=(
+                "freeinference-guest-observer-v2\n"
+                '{"window":{"cpu":true,"storage_io":true,"pss":true,"counters":7}}\n'
+            ),
             stderr="no lifecycle events",
         )
 
@@ -315,3 +319,69 @@ def test_hosts_refresh_replaces_setup_aliases_and_is_idempotent(monkeypatch, tmp
     manager._sync_kata_service_hosts(spec, current)
     assert "10.2.0.2" not in hosts.read_text()
     assert "10.3.0.2 agent-gateway" in hosts.read_text()
+
+
+def _self_test_manager(monkeypatch):
+    """A manager whose privileged exec answers the observer self-test."""
+    manager = _manager()
+    monkeypatch.setattr(
+        manager,
+        "_kata_privileged_exec",
+        lambda spec, argv, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    return manager
+
+
+def test_the_self_test_must_name_the_helper(monkeypatch):
+    """An answer that is not the reviewed helper is a failed preflight."""
+    manager = _self_test_manager(monkeypatch)
+
+    with pytest.raises(SandboxError):
+        manager._check_observer_self_test("some other program\n")
+
+
+def test_a_guest_without_a_window_capability_is_accepted_but_reported(monkeypatch, caplog):
+    """Lifecycle events still work; the missing capability is not silent."""
+    manager = _self_test_manager(monkeypatch)
+
+    with caplog.at_level(logging.WARNING):
+        manager._check_observer_self_test("freeinference-guest-observer-v2\n")
+
+    assert any(
+        record.__dict__.get("event") == "guest_observer_window_capability_absent"
+        for record in caplog.records
+    )
+
+
+def test_a_partial_window_capability_names_what_is_missing(monkeypatch, caplog):
+    """A kernel that cannot read PSS must say so where an operator looks."""
+    manager = _self_test_manager(monkeypatch)
+
+    with caplog.at_level(logging.WARNING):
+        manager._check_observer_self_test(
+            "freeinference-guest-observer-v2\n"
+            '{"window":{"cpu":true,"storage_io":true,"pss":false,"counters":3}}\n'
+        )
+
+    partial = [
+        record
+        for record in caplog.records
+        if record.__dict__.get("event") == "guest_observer_window_capability_partial"
+    ]
+    assert partial and partial[0].__dict__.get("missing") == ["pss"]
+
+
+def test_a_complete_capability_report_is_not_a_warning(monkeypatch, caplog):
+    manager = _self_test_manager(monkeypatch)
+
+    with caplog.at_level(logging.WARNING):
+        manager._check_observer_self_test(
+            "freeinference-guest-observer-v2\n"
+            '{"window":{"cpu":true,"storage_io":true,"pss":true,"counters":7}}\n'
+        )
+
+    assert not [
+        record
+        for record in caplog.records
+        if str(record.__dict__.get("event", "")).startswith("guest_observer_window")
+    ]

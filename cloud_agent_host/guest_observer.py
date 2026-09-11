@@ -35,6 +35,9 @@ GUEST_OBSERVER_ROOT = "/run/freeinference-observer"
 GUEST_OBSERVER_EVENTS = f"{GUEST_OBSERVER_ROOT}/events.jsonl"
 GUEST_OBSERVER_STATUS = f"{GUEST_OBSERVER_ROOT}/status.json"
 GUEST_OBSERVER_BINARY = "/usr/local/libexec/freeinference-guest-observer"
+#: The kernel's own boot identifier. A task's start time and TID repeat across
+#: boots, so this is what makes an instance key unique.
+GUEST_BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 
 # One member turn may read at most this much of the group-wide journal.  The
 # observer itself has a larger lifetime cap; this one bounds one broker result.
@@ -105,6 +108,13 @@ class GuestObserverCursor:
     clock_error_ns: int = 0
     available: bool = False
     detail: str | None = None
+    #: The guest boot this fence belongs to. A thread's identity is only
+    #: unique within one boot, so a marker that survives a guest restart must
+    #: not be able to make an old instance look like a new one.
+    guest_boot_id: str = ""
+    #: Set when this cursor also fences one member execution window. The
+    #: observation then also carries that window's live census cycles.
+    measurement_id: str | None = None
 
     @classmethod
     def unavailable(cls, uid: int, detail: str) -> GuestObserverCursor:
@@ -168,6 +178,11 @@ class GuestObservation:
     origin_guest_mono_ns: int = 0
     clock_error_ns: int = 0
     detail: str | None = None
+    #: Live census cycles for the member windows this slice covers, already
+    #: filtered to the member's own UID. They ride the observation because the
+    #: turn already read this journal slice: a window that read it a second
+    #: time would pay twice for the same bytes and could see a different slice.
+    window_samples: tuple[Any, ...] = ()
 
     @classmethod
     def unavailable(
@@ -206,6 +221,10 @@ class GuestObserverController:
         self._capture = capture
         self._privileged = privileged
         self._lock = lock or threading.Lock()
+        #: Cached after the first successful read: the boot cannot change while
+        #: this controller is talking to the same observer, and a restart
+        #: produces a new controller anyway.
+        self._boot_id: str | None = None
 
     @staticmethod
     def _stderr(result: Any) -> str:
@@ -396,11 +415,34 @@ class GuestObserverController:
                 return False
             return True
 
+    def guest_boot_id(self) -> str:
+        """This guest's boot identifier, or an empty string if unreadable.
+
+        A task's identity is only unique within one boot: after a guest
+        restart the same start time and TID can recur. The reader carries the
+        boot with every instance key for that reason, and an unreadable
+        identifier is reported as empty rather than invented.
+        """
+        with self._lock:
+            if self._boot_id is not None:
+                return self._boot_id
+        boot_id = ""
+        try:
+            result = self._capture(["cat", GUEST_BOOT_ID_PATH], 5.0)
+            if getattr(result, "returncode", 1) == 0:
+                boot_id = self._stdout(result).decode("utf-8", "replace").strip()[:64]
+        except Exception:
+            boot_id = ""
+        with self._lock:
+            self._boot_id = boot_id
+        return boot_id
+
     def begin(
         self,
         *,
         user_uid: int,
         restart_if_missing: bool = True,
+        measurement_id: str | None = None,
     ) -> GuestObserverCursor:
         """Fence the journal immediately before one prompt is admitted.
 
@@ -408,6 +450,12 @@ class GuestObserverController:
         passes ``restart_if_missing=False`` so a transient snapshot failure for
         this new turn cannot restart the singleton and invalidate every older
         cursor.  Once those owners close, the next idle begin may recover it.
+
+        ``measurement_id`` additionally makes this fence the start of a member
+        execution window, so the observation also carries that window's live
+        census cycles. The fence must be taken before the window's opening
+        census, which is why the identifier travels with it here rather than
+        being attached afterwards.
         """
         try:
             if restart_if_missing:
@@ -437,6 +485,8 @@ class GuestObserverController:
             mono_offset_ns=host_midpoint - snapshot.guest_mono_ns,
             clock_error_ns=max(0, (host_after - host_before) // 2),
             available=True,
+            guest_boot_id=self.guest_boot_id(),
+            measurement_id=measurement_id,
         )
 
     def finish(self, cursor: GuestObserverCursor | None) -> GuestObservation:
@@ -1001,6 +1051,20 @@ def finish_observation(
     )
     processes, tool_marks, malformed = parse_events(payload, cursor=cursor)
     was_truncated = truncated or journal_dropped > 0 or malformed
+    # Imported here rather than at module scope: the reducer pulls in the
+    # window's own vocabulary, and this module is imported by paths that only
+    # ever read process events.
+    from cloud_agent_host.member_resources import parse_window_samples
+
+    window_samples = tuple(
+        parse_window_samples(
+            payload,
+            measurement_id=cursor.measurement_id,
+            boot_id=cursor.guest_boot_id,
+        )
+        if cursor.measurement_id
+        else ()
+    )
     return GuestObservation(
         source=GUEST_OBSERVER_SOURCE,
         complete=lost == 0 and not was_truncated,
@@ -1011,6 +1075,7 @@ def finish_observation(
         origin_guest_mono_ns=cursor.guest_mono_ns,
         clock_error_ns=cursor.clock_error_ns,
         detail=(detail[:300] if detail else None),
+        window_samples=window_samples,
     )
 
 

@@ -357,13 +357,14 @@ def test_retained_guest_journal_rotates_only_without_active_turns(monkeypatch):
             self.start()
             return True
 
-        def begin(self, *, user_uid, restart_if_missing=True):
+        def begin(self, *, user_uid, restart_if_missing=True, measurement_id=None):
             self.restart_choices.append(restart_if_missing)
             return GuestObserverCursor(
                 uid=user_uid,
                 observer_pid=self.pid,
                 offset=self.size,
                 available=True,
+                measurement_id=measurement_id,
             )
 
         def finish(self, _cursor):
