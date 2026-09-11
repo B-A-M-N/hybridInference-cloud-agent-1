@@ -165,8 +165,10 @@ Compatibility rules, in both directions:
   existing statement "no container totals were attributed to this member", not
   a fabricated measurement.
 
-`turn_summary` is stored with canonical snake_case keys. The wire camelCase is
-a transport detail converted at the API boundary in one place.
+`turn_summary` is stored with canonical snake_case keys, and the worker's post
+body uses the same spelling, so no renaming layer sits between the collector
+and the stored row. Case conversion happens once, on the frontend boundary,
+when the admin API's JSON is adapted for display.
 
 ### 3.2 Write rules
 

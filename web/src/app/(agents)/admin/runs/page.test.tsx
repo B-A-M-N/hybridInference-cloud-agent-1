@@ -1124,9 +1124,10 @@ describe('admin run observation', () => {
     expect(
       screen.getAllByText(/Collection interrupted: data reached 2m 10s/).length,
     ).toBeGreaterThan(1);
-    // The gateway ledger says "Not finalized" elsewhere on this page; the
-    // turn panel must not add a claim of its own that collection finished.
-    expect(screen.getByText('Not finalized')).toBeInTheDocument();
+    // The turn panel must not add a claim of its own that collection
+    // finished. The gateway ledger's "not finalized" sentence lives in the
+    // owner-facing RunDetails tree, which this admin page does not render, so
+    // there is nothing here to cross-check against.
     expect(screen.queryByText(/Collection finished with the turn/)).not.toBeInTheDocument();
   });
 
