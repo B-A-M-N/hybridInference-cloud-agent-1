@@ -342,6 +342,23 @@ static int monotonic_ms(uint64_t *value)
     return 0;
 }
 
+/* The guest's monotonic clock in nanoseconds.
+ *
+ * The records this helper writes share one time base, and it is this one:
+ * the kernel stamps its lifecycle events from the same clock, so a census and
+ * an exit can be ordered against each other and against the window's own
+ * boundaries. Reading the BPF helper's clock here would work too, but this is
+ * the loader's userspace clock and needs no kernel-side declaration. */
+static int monotonic_ns(uint64_t *value)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+        return -1;
+    *value = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+    return 0;
+}
+
 static int exercise_lifecycle_events(int ring_map_fd, struct ring_buffer **ring_out)
 {
     struct self_test_state state = {0};
@@ -1202,9 +1219,15 @@ static int journal_window_sample(struct observer *observer,
                                  size_t task_count)
 {
     char line[MAX_WINDOW_LINE_BYTES];
+    uint64_t mono_ns = 0;
     size_t used;
     int length;
 
+    /* A record with no timestamp cannot be ordered against the window's
+     * boundaries, so the cycle is refused rather than stamped with a zero
+     * that would read as "at the beginning of the boot". */
+    if (monotonic_ns(&mono_ns) < 0)
+        return -1;
     observer->event_seq += 1;
     length = snprintf(
         line,
@@ -1218,7 +1241,7 @@ static int journal_window_sample(struct observer *observer,
         ",\"write_bytes\":%" PRIu64 ",\"task_detail\":[",
         FI_OBSERVER_VERSION,
         observer->event_seq,
-        (uint64_t)bpf_ktime_get_ns(),
+        mono_ns,
         measurement_id,
         uid,
         sample_seq,
