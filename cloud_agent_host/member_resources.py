@@ -820,11 +820,6 @@ def parse_window_samples(
     return samples
 
 
-#: The guest observer's exit-time counter bits, mirrored for the raw records.
-_EXIT_COUNTER_CPU = 1 << 0
-_EXIT_COUNTER_IO = 1 << 2
-
-
 class ExitTracker:
     """Per-thread exits for one window, fed the journal one slice at a time.
 
@@ -1002,10 +997,10 @@ class ExitTracker:
                 ThreadExit(
                     instance=identifier,
                     guest_mono_ns=mono_ns,
-                    cpu_ns=cpu_ns if counters & _EXIT_COUNTER_CPU else None,
-                    read_bytes=read_bytes if counters & _EXIT_COUNTER_IO else None,
-                    write_bytes=write_bytes if counters & _EXIT_COUNTER_IO else None,
-                    counter_bits=counters & (_EXIT_COUNTER_CPU | _EXIT_COUNTER_IO),
+                    cpu_ns=cpu_ns if counters & EXIT_COUNTER_CPU else None,
+                    read_bytes=read_bytes if counters & EXIT_COUNTER_IO else None,
+                    write_bytes=write_bytes if counters & EXIT_COUNTER_IO else None,
+                    counter_bits=counters & (EXIT_COUNTER_CPU | EXIT_COUNTER_IO),
                 )
             )
         else:
@@ -1017,7 +1012,7 @@ class ExitTracker:
                 read_bytes=read_bytes if read_bytes is not None else merged.read_bytes,
                 write_bytes=write_bytes if write_bytes is not None else merged.write_bytes,
                 counter_bits=merged.counter_bits
-                | (counters & (_EXIT_COUNTER_CPU | _EXIT_COUNTER_IO)),
+                | (counters & (EXIT_COUNTER_CPU | EXIT_COUNTER_IO)),
             )
         if kind == "exit":
             self._ended[task] = True
