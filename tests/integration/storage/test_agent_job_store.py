@@ -4100,7 +4100,7 @@ async def test_a_turn_summary_is_stored_and_its_retry_is_not_a_second_write(
     assert await _record_turn_summary(store, claim, report_seq=1, summary=snapshot) == "stored"
     assert await _record_turn_summary(store, claim, report_seq=1, summary=snapshot) == "duplicate"
 
-    telemetry = await store.job_turn_telemetry(job_id=job["id"])
+    telemetry = await store.execution_queries.job_turn_telemetry(job_id=job["id"])
     assert telemetry is not None
     assert telemetry["turn_summary"]["cpu"]["usec"] == 80_000_000
     assert telemetry["turn_summary"]["state"] == "final"
@@ -4128,7 +4128,7 @@ async def test_an_older_checkpoint_cannot_roll_a_stored_window_backwards(
         == "conflict"
     )
 
-    telemetry = await store.job_turn_telemetry(job_id=job["id"])
+    telemetry = await store.execution_queries.job_turn_telemetry(job_id=job["id"])
     assert telemetry is not None
     assert telemetry["turn_summary"]["cpu"]["usec"] == 50_000_000
 
@@ -4147,7 +4147,7 @@ async def test_two_payloads_at_one_sequence_are_a_protocol_conflict(
     different = _turn_snapshot(cpu_usec=1)
     assert await _record_turn_summary(store, claim, report_seq=4, summary=different) == "conflict"
 
-    telemetry = await store.job_turn_telemetry(job_id=job["id"])
+    telemetry = await store.execution_queries.job_turn_telemetry(job_id=job["id"])
     assert telemetry is not None
     assert telemetry["turn_summary"]["cpu"]["usec"] == 80_000_000
 
@@ -4176,7 +4176,7 @@ async def test_a_final_snapshot_cannot_be_overwritten_by_a_collecting_one(
         == "conflict"
     )
 
-    telemetry = await store.job_turn_telemetry(job_id=job["id"])
+    telemetry = await store.execution_queries.job_turn_telemetry(job_id=job["id"])
     assert telemetry is not None
     assert telemetry["turn_summary"]["state"] == "final"
     assert telemetry["turn_summary"]["window"]["observed_through_ms"] == 130_000
@@ -4204,7 +4204,7 @@ async def test_a_second_measurement_cannot_take_over_a_fixed_window(
         == "conflict"
     )
 
-    telemetry = await store.job_turn_telemetry(job_id=job["id"])
+    telemetry = await store.execution_queries.job_turn_telemetry(job_id=job["id"])
     assert telemetry is not None
     assert telemetry["turn_summary"]["measurement_id"] == MEASUREMENT_ID
 
@@ -4233,7 +4233,7 @@ async def test_a_superseded_or_expired_lease_cannot_write_a_turn_summary(
         == "lease_lost"
     )
 
-    telemetry = await store.job_turn_telemetry(job_id=job["id"])
+    telemetry = await store.execution_queries.job_turn_telemetry(job_id=job["id"])
     assert telemetry is not None
     assert telemetry["turn_summary"] is None
 
@@ -4249,13 +4249,13 @@ async def test_the_legacy_writer_does_not_clobber_the_turn_summary(
     assert (
         await _record_turn_summary(store, claim, report_seq=1, summary=_turn_snapshot()) == "stored"
     )
-    assert await store.record_attempt_resources(
+    assert await store.attempt_commands.record_attempt_resources(
         attempt_id=claim["attempt_id"],
         lease_generation=claim["lease_generation"],
         rollup={"cpu_usec": 1_000, "sample_count": 5, "coverage": 1.0, "sampler_version": "1"},
     )
 
-    telemetry = await store.job_turn_telemetry(job_id=job["id"])
+    telemetry = await store.execution_queries.job_turn_telemetry(job_id=job["id"])
     assert telemetry is not None
     assert telemetry["cpu_usec"] == 1_000, "the legacy rollup must have landed"
     assert telemetry["turn_summary"]["cpu"]["usec"] == 80_000_000, (
@@ -4271,7 +4271,7 @@ async def test_the_turn_writer_keeps_the_legacy_row_and_its_child_rows(
     claim = await _claim(store, worker_id="w1", lease_ttl_seconds=60)
     assert claim is not None
 
-    assert await store.record_attempt_resources(
+    assert await store.attempt_commands.record_attempt_resources(
         attempt_id=claim["attempt_id"],
         lease_generation=claim["lease_generation"],
         rollup={
@@ -4288,7 +4288,7 @@ async def test_the_turn_writer_keeps_the_legacy_row_and_its_child_rows(
         await _record_turn_summary(store, claim, report_seq=1, summary=_turn_snapshot()) == "stored"
     )
 
-    telemetry = await store.job_turn_telemetry(job_id=job["id"])
+    telemetry = await store.execution_queries.job_turn_telemetry(job_id=job["id"])
     assert telemetry is not None
     assert telemetry["cpu_usec"] == 9_000
     assert telemetry["mem_peak_bytes"] == 4_096
@@ -4315,7 +4315,7 @@ async def test_a_turn_summary_alone_creates_a_legacy_compatible_base_row(
         await _record_turn_summary(store, claim, report_seq=1, summary=_turn_snapshot()) == "stored"
     )
 
-    telemetry = await store.job_turn_telemetry(job_id=job["id"])
+    telemetry = await store.execution_queries.job_turn_telemetry(job_id=job["id"])
     assert telemetry is not None
     assert telemetry["sampler_version"] == "shared-member-v1"
     assert telemetry["sample_count"] == 0
