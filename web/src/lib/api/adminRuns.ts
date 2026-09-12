@@ -155,34 +155,6 @@ export interface AdminLlmRequestPage {
   next_cursor: string | null;
 }
 
-export interface AdminActivityEvent {
-  id: number;
-  attempt_id: number;
-  attempt_no: number;
-  seq: number;
-  event_type: string;
-  created_at: string;
-  tool_use_id: string | null;
-  tool_name: string | null;
-  is_error: boolean | null;
-  has_content: boolean;
-}
-
-export interface AdminActivityPage {
-  events: AdminActivityEvent[];
-  next_cursor: string | null;
-}
-
-export interface AdminEventContent {
-  id: number;
-  attempt_id: number;
-  seq: number;
-  event_type: string;
-  created_at: string;
-  payload: Record<string, unknown>;
-  truncated: boolean;
-}
-
 function query(values: Record<string, string | number | undefined>): string {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(values)) {
@@ -210,14 +182,6 @@ export function getAdminRun(jobId: string, signal?: AbortSignal): Promise<AdminR
   return read(runPath(jobId), signal);
 }
 
-export function getAdminRunActivity(
-  jobId: string,
-  filters: { cursor?: string; attempt_id?: number; limit?: number } = {},
-  signal?: AbortSignal,
-): Promise<AdminActivityPage> {
-  return read(`${runPath(jobId)}/activity${query(filters)}`, signal);
-}
-
 export function getAdminAttemptResources(
   jobId: string,
   attemptId: number,
@@ -242,19 +206,4 @@ export function getAdminLlmRequests(
   signal?: AbortSignal,
 ): Promise<AdminLlmRequestPage> {
   return read(`${runPath(jobId)}/llm-requests${query(filters)}`, signal);
-}
-
-/** Explicit content access. The server records the actor and event before returning it. */
-export async function revealAdminEventContent(
-  jobId: string,
-  eventId: number,
-  signal?: AbortSignal,
-): Promise<AdminEventContent> {
-  return jsonOrThrow<AdminEventContent>(
-    await fetchWithAuth(config.apiBase, `${runPath(jobId)}/events/${eventId}/content`, {
-      method: 'POST',
-      signal,
-      cache: 'no-store',
-    }),
-  );
 }

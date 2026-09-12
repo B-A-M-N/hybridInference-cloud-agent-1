@@ -75,9 +75,9 @@ administrator page.
 |---|---|
 | `GET /admin/agent/runs` | Filtered task metadata with a continuation cursor |
 | `GET /admin/agent/runs/{job_id}` | Task metadata, attribution identities and existing usage summaries |
-| `GET /admin/agent/runs/{job_id}/activity` | Bounded, metadata-only runtime events |
+| `GET /admin/agent/runs/{job_id}/activity` | Bounded, metadata-only runtime events (API only; see the amendment below) |
 | `GET /admin/agent/runs/{job_id}/attempts/{attempt_id}/resources` | Existing measurements for an attempt belonging to this task |
-| `POST /admin/agent/runs/{job_id}/events/{event_id}/content` | Explicit, audited read of one event's recorded content |
+| `POST /admin/agent/runs/{job_id}/events/{event_id}/content` | Explicit, audited read of one event's recorded content (API only; see the amendment below) |
 
 Default responses and queries use an explicit metadata allowlist. Removing a
 few known content keys from an arbitrary payload is not a privacy boundary.
@@ -96,6 +96,21 @@ and explicit truncation for old oversized records. Responses are not cached.
 This release reads observations and snapshots; visiting a page does not trigger
 a Gateway ledger refresh or mutate task execution. The explicit content audit
 is the only write introduced by this feature.
+
+### Amendment 2026-09-12: the activity panel has no UI
+
+The run detail page no longer renders a runtime activity list, and the web
+client no longer calls either route above. Both routes, their cross-user SQL,
+the metadata allowlist and the content audit are unchanged and still served.
+
+The panel was removed, not the capability. Per-tool-call records with their
+timing source live in the resources panel and per-request model records live in
+the LLM requests panel, which is where the activity list's readable content had
+moved; what the list added beyond them was a page of near-identical `lifecycle`
+rows whose distinguishing `phase` is not in the metadata allowlist, so telling
+two of them apart cost a content-read audit record. Deleting the audited route
+along with the panel would not have removed the ability to read a payload, only
+the record of someone doing it, so the route stays.
 
 ## Implementation boundaries
 
