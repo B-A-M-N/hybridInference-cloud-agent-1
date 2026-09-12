@@ -8,7 +8,7 @@ they were, and only the class holding them changed.
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import asyncpg
 
@@ -43,6 +43,12 @@ from cloud_agent.storage._sql.sandbox import THREAD_SANDBOX_SOURCE
 
 if TYPE_CHECKING:
     from cloud_agent.ports.attempt_commands import TurnSummaryWrite
+
+#: What the ordering rules decide, before the caller writes anything.
+#: ``accept`` is this function's own answer and never leaves the repository:
+#: the write either succeeds (``stored``) or the row moved under it
+#: (``conflict``), and the caller only ever sees the port's four outcomes.
+TurnSummaryDecision = Literal["accept", "duplicate", "conflict"]
 
 
 class PostgresAttemptCommands:
@@ -1092,7 +1098,7 @@ class PostgresAttemptCommands:
         report_seq: int,
         state: str,
         summary: dict[str, Any],
-    ) -> TurnSummaryWrite:
+    ) -> TurnSummaryDecision:
         """Whether an incoming snapshot may replace the stored one, and how.
 
         Separated from the statement so the ordering rules read as rules

@@ -10,7 +10,7 @@ import binascii
 # model, so hiding this one behind TYPE_CHECKING leaves `AgentRunnerHost`
 # silently unbuilt and raises at the first request instead of at import.
 from datetime import datetime  # noqa: TC003
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -269,11 +269,11 @@ TurnResourceReasonCode = Literal[
 #: The only scope this schema describes. A member execution window bills what
 #: one member did inside a shared sandbox; it is not the platform cost of a
 #: task, and it must never be presented as one.
-TURN_RESOURCE_SCOPE = "member_execution_window"
+TURN_RESOURCE_SCOPE: Final[Literal["member_execution_window"]] = "member_execution_window"
 
 #: The capability string that produced a summary. Summaries from different
 #: sources are never added together.
-TURN_RESOURCE_SOURCE = "kata-guest-member-window-v1"
+TURN_RESOURCE_SOURCE: Final[Literal["kata-guest-member-window-v1"]] = "kata-guest-member-window-v1"
 
 #: Reported before the sandbox has closed the window, and final once it has.
 TurnResourceState = Literal["collecting", "final"]

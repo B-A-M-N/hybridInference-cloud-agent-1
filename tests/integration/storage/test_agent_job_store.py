@@ -4069,7 +4069,7 @@ async def _record_turn_summary(
     lease_generation: int | None = None,
 ) -> str:
     """Post one checkpoint through the arguments the route passes."""
-    return await store.record_attempt_turn_summary(
+    return await store.attempt_commands.record_attempt_turn_summary(
         attempt_id=claim["attempt_id"],
         lease_generation=(
             claim["lease_generation"] if lease_generation is None else lease_generation
