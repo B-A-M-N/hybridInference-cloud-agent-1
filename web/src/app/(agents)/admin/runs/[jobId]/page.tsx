@@ -10,7 +10,6 @@ import { getAdminRun, type AdminRunDetail } from '@/lib/api/adminRuns';
 import { getErrorMessage } from '@/lib/utils/errors';
 
 import { AdminNavigation } from '../../AdminNavigation';
-import { Activity } from '../Activity';
 import { LLMRequests } from '../LLMRequests';
 import { Resources } from '../Resources';
 import { SessionStatistics } from '../SessionStatistics';
@@ -193,7 +192,7 @@ function RunDetails({ jobId }: { jobId: string }) {
                         </label>
                         <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
                           {viewingHistory
-                            ? 'Viewing a previous attempt. Activity, resources and LLM requests below show this attempt.'
+                            ? 'Viewing a previous attempt. Resources and LLM requests below show this attempt.'
                             : 'Viewing the latest attempt. Choose a previous attempt to inspect its records.'}
                         </p>
                       </div>
@@ -206,12 +205,6 @@ function RunDetails({ jobId }: { jobId: string }) {
                 No execution has started.
               </p>
             )}
-            <Activity
-              key={`activity:${attemptId}:${revision}`}
-              jobId={jobId}
-              attemptId={attemptId ?? undefined}
-              onAccessDenied={onAccessDenied}
-            />
             {attemptId !== null && (
               <Resources
                 key={`resources:${attemptId}:${revision}`}
