@@ -27,7 +27,7 @@ from typing import Any
 import pytest
 
 from cloud_agent import host_pool
-from cloud_agent_host import enrollment
+from cloud_agent_host import enrollment, runner
 
 
 class _Response:
@@ -323,6 +323,139 @@ def test_each_heartbeat_recomputes_dynamic_host_capabilities(monkeypatch) -> Non
         "shared-sandbox-v1",
         "shared-sandbox-deployment:target",
     ]
+
+
+def test_the_readiness_marker_is_compared_with_the_value_at_startup(tmp_path) -> None:
+    """Only a *change* is a reason to beat outside the schedule.
+
+    The deployment writes `pending:<sha>` before it replaces the runners and
+    the bare `<sha>` once every host check has passed. Treating a readable but
+    unchanged marker as news would beat on every poll; treating an unreadable
+    one as news would beat forever on a host whose mount is missing.
+    """
+    marker = tmp_path / "shared-live-ready"
+    marker.write_text("pending:target\n")
+    identity = enrollment.HostIdentity(host="h1", credential="c")
+    beat = enrollment.HostHeartbeat(
+        base_url="http://cp", identity=identity, readiness_marker=str(marker)
+    )
+
+    assert not beat._readiness_marker_moved(), "an unchanged marker woke the beat"
+
+    marker.write_text("target\n")
+    assert beat._readiness_marker_moved()
+    assert not beat._readiness_marker_moved(), "the same value woke the beat twice"
+
+    missing = enrollment.HostHeartbeat(
+        base_url="http://cp", identity=identity, readiness_marker=str(tmp_path / "absent")
+    )
+    assert not missing._readiness_marker_moved(), "an unreadable marker woke the beat"
+
+
+def test_a_torn_read_of_the_marker_is_not_a_change(tmp_path) -> None:
+    """The deployment truncates this file in place, so a poll can see nothing.
+
+    Keeping the inode is deliberate — every replica has it bind-mounted — so
+    the empty window is inherent to the write. Beating on it would be a
+    heartbeat per poll for the duration of the write, and it would reset the
+    baseline to empty, making the value that landed look like a second change.
+    """
+    marker = tmp_path / "shared-live-ready"
+    marker.write_text("pending:target\n")
+    identity = enrollment.HostIdentity(host="h1", credential="c")
+    beat = enrollment.HostHeartbeat(
+        base_url="http://cp", identity=identity, readiness_marker=str(marker)
+    )
+
+    marker.write_text("")
+    assert not beat._readiness_marker_moved(), "a torn read woke the beat"
+
+    marker.write_text("target\n")
+    assert beat._readiness_marker_moved(), "the value that landed was swallowed by the torn read"
+
+
+def test_a_published_readiness_marker_pulls_the_next_beat_forward(tmp_path, monkeypatch) -> None:
+    """The rollout fence must not wait out an interval for a fact already true.
+
+    `sandbox_host.sh` publishes readiness by rewriting the file every runner
+    mounts, and the control plane admits no rollout until a heartbeat carries
+    that exact SHA back. With a plain `wait(interval)` the beat carrying it
+    arrived up to one full interval after the host was ready: measured on
+    staging, 15.2s of a 46s host deployment, and the whole remaining wait of
+    the control job's 37.1s fence.
+    """
+    monkeypatch.setattr(enrollment, "READINESS_MARKER_POLL_S", 0.01)
+    marker = tmp_path / "shared-live-ready"
+    marker.write_text("pending:target\n")
+    identity = enrollment.HostIdentity(host="h1", credential="c")
+    # A short interval on purpose: a regression waits it out, and the point is
+    # that it fails in seconds rather than in half a minute. The comparison
+    # below is against the interval, not a number chosen for this one.
+    identity.interval_s = 5.0
+    beat = enrollment.HostHeartbeat(
+        base_url="http://cp", identity=identity, readiness_marker=str(marker)
+    )
+    sent: list[float] = []
+    started = time.monotonic()
+
+    def record(url, body, bearer=""):
+        sent.append(time.monotonic() - started)
+        if len(sent) == 1:
+            # The deployment passing its own checks, 200ms into the interval.
+            threading.Timer(0.2, lambda: marker.write_text("target\n")).start()
+        else:
+            beat._stop.set()
+        return {"status": "online", "heartbeat_interval_seconds": 5}
+
+    monkeypatch.setattr(enrollment, "_post", record)
+    beat._run()
+
+    assert len(sent) == 2, "the marker change did not produce a heartbeat"
+    assert sent[1] < identity.interval_s / 2, (
+        f"waited {sent[1]:.1f}s of a {identity.interval_s}s interval for a marker "
+        "published 0.2s in; that is the schedule, not the change"
+    )
+
+
+def test_the_runner_watches_the_marker_the_deployment_publishes(monkeypatch) -> None:
+    """Both halves of the fence have to be wired to each other.
+
+    `sandbox_host.sh` publishing the marker is only one half; the runner has to
+    notice. A runner that mounts the marker and reads it on the beat alone
+    leaves the rollout fence waiting for the next scheduled heartbeat, which is
+    silent and is what the interval-sized wait above costs.
+
+    The other half is that the capabilities are recomputed. `HostHeartbeat`
+    accepts a static list as well as a callable, and the marker reaches the
+    control plane *through* that list: given a static one, waking early would
+    only send an answer computed once at startup, and the fence would wait out
+    the interval anyway — the optimization silently becoming nothing.
+    """
+    monkeypatch.setenv("AGENT_SHARED_LIVE_READY_FILE", "/run/cloud-agent/shared-live-ready")
+
+    assert runner._shared_live_ready_file() == "/run/cloud-agent/shared-live-ready"
+
+    source = pathlib.Path(runner.__file__).read_text()
+    pool = source[source.index("pool = HostHeartbeat(") : source.index("pool.start()")]
+    assert "readiness_marker=_shared_live_ready_file()" in pool, (
+        "the runner builds its host heartbeat without the marker it was given"
+    )
+    assert "capabilities=lambda:" in pool, (
+        "the host heartbeat was given a static capability list, so a marker-driven beat "
+        "would report the capabilities this runner started with"
+    )
+
+
+def test_without_a_marker_the_heartbeat_cadence_is_unchanged(monkeypatch) -> None:
+    """A deployment that mounts no marker keeps the interval it always had."""
+    identity = enrollment.HostIdentity(host="h1", credential="c")
+    identity.interval_s = 0.3
+    beat = enrollment.HostHeartbeat(base_url="http://cp", identity=identity)
+
+    started = time.monotonic()
+    beat._wait_for_next_beat()
+
+    assert time.monotonic() - started >= 0.25, "a host with no marker beat off-schedule"
 
 
 def test_a_rejected_credential_stops_claims_for_good(monkeypatch) -> None:

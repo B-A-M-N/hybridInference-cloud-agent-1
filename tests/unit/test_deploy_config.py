@@ -1528,3 +1528,79 @@ def test_the_tunnel_forwards_one_fixed_destination():
     assert "-L " in script
     for proxy_flag in ("-D ", "DynamicForward", "ProxyCommand"):
         assert proxy_flag not in script, proxy_flag
+
+
+def test_the_egress_proxy_does_not_inherit_the_docker_stop_timeout(compose: dict) -> None:
+    """Squid winds down on SIGTERM, and this container is replaced every deploy.
+
+    Left unset it takes the Docker default of ten seconds: measured on two
+    consecutive staging rollouts at 10.30s and 10.31s, against 0.1-0.3s for
+    every other container in this stack — and it sits upstream of the runners
+    in the dependency order, so the whole rollout waited on it.
+    """
+    declared = str(compose["services"]["agent-egress-proxy"]["stop_grace_period"])
+    default = re.search(r":-(\d+)s\}", declared)
+
+    assert default, (
+        "the egress proxy declares no bounded stop_grace_period, so a Squid that "
+        f"does not exit on SIGTERM costs the ten-second Docker default: {declared!r}"
+    )
+    assert int(default.group(1)) <= 5, (
+        f"a stateless egress proxy does not need {default.group(1)} to drain; "
+        "the runners it serves are already stopped by then"
+    )
+
+
+def test_deployment_builds_disable_provenance_attestations() -> None:
+    """A regenerated attestation makes an unchanged rebuild a new image.
+
+    Buildx attaches provenance by default and rewrites it on every build, so an
+    image's manifest index moves while the image itself does not. A daemon with
+    the containerd image store identifies an image by that index, and Compose
+    then treats every image it just rebuilt as changed: it replaces all eight
+    containers of the sandbox stack on every deploy — 10.3s of that the egress
+    proxy sitting out Docker's stop timeout — and the digest a retained group
+    pinned stops resolving. Measured on the real runner image with every layer
+    CACHED: two builds with the default give two ids, two with the flag give one.
+
+    Asserted on the command lines because the flag changes nothing until it is
+    missing on a host with that store, and because the compose file's
+    `build.provenance` is the obvious place someone will move it to — a place
+    `docker compose config` accepts and `docker compose build` ignores.
+    """
+    host = (REPO_ROOT / "deploy/host/sandbox_host.sh").read_text()
+    control = _CONTROL_PLANE_DEPLOY.read_text()
+
+    # `in`, not `startswith`: the host passes its image and replica count as a
+    # command prefix, so the line can legitimately read
+    # `AGENT_SANDBOX_IMAGE=… compose build …`. It happens to be a continuation
+    # line today, which is the only reason `startswith` finds it — joining those
+    # two lines, an ordinary tidy-up, would retire this assertion in silence.
+    # Comments are skipped because three of them name these commands while
+    # explaining the flag.
+    compose_builds = [
+        line.strip()
+        for line in (host + control).splitlines()
+        if "compose build" in line and not line.strip().startswith("#")
+    ]
+    assert compose_builds, "no compose build command found — has it moved?"
+    for line in compose_builds:
+        assert "--provenance=false" in line, f"compose build without the flag: {line!r}"
+
+    sandbox_builds = [
+        line.strip()
+        for line in host.splitlines()
+        if "docker build" in line and not line.strip().startswith("#")
+    ]
+    assert sandbox_builds, "no sandbox image build found — has it moved?"
+    for line in sandbox_builds:
+        assert "--provenance=false" in line, f"sandbox image build without the flag: {line!r}"
+
+    for compose in (_COMPOSE, _CONTROL_PLANE_COMPOSE):
+        # The *key*, not the word: a comment recording why `build.provenance`
+        # cannot be used here is exactly what the next reader needs, and a
+        # substring check would fail the file for carrying it.
+        assert not re.search(r"^\s*provenance\s*:", compose.read_text(), re.MULTILINE), (
+            f"{compose.name} sets build.provenance, which compose accepts and then ignores; "
+            "the flag has to be on the build command"
+        )

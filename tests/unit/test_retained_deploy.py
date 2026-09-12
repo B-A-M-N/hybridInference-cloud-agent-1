@@ -31,6 +31,7 @@ def _host(
     daemon_root: str = "/var/lib/docker",
     capability: str = "shared-sandbox-v1,native-fork-at-anchor-v1",
     credential_rejected: bool = False,
+    attest_exit: int = 0,
 ) -> dict[str, str]:
     app_dir = tmp_path / "app"
     app_dir.mkdir()
@@ -65,7 +66,7 @@ def _host(
         "  'info') exit 0 ;;\n"
         f"  *' ps -q runner') printf '%s\\n' '{runner_ids}' ;;\n"
         f"  *' logs --since 2m runner') echo '{rejection_log}' ;;\n"
-        f"  exec*'_shared_live_host_capabilities'*) echo '{capability}' ;;\n"
+        f"  exec*'_shared_live_host_capabilities'*) echo '{capability}'; exit {attest_exit} ;;\n"
         f"  exec*'retained_docker_data_root'*) echo '{daemon_root}' ;;\n"
         "  exec*'AGENT_CONTROL_PLANE_URL'*) echo '200' ;;\n"
         "  run*) printf '200' ;;\n"
@@ -419,6 +420,22 @@ def test_shared_live_check_runs_the_real_sandbox_preflight_before_attesting() ->
     assert check.index("backend.preflight()") < check.index("backend.version_stamp()")
 
 
+def test_the_replica_attestations_start_before_any_is_waited_on() -> None:
+    """The preflights must overlap rather than queue.
+
+    Each one makes a real request through the tunnels from inside its own
+    container and none reads another's answer, so running them in series bought
+    nothing and cost the sum of three waits: 16.6s of a 46s host deployment.
+    """
+    script = SANDBOX_HOST.read_text()
+    check = script[script.index("check_shared_live_stack() {") : script.index("# ── Isolation")]
+    launched = check.index("docker exec")
+    waited = check.index('wait "${attest_pids')
+
+    assert launched < waited, "the replica attestations were serialized again"
+    assert "&" in check[launched:waited], "the attestation does not run in the background"
+
+
 def test_retained_mode_requires_an_enrolled_host_identity(tmp_path: Path) -> None:
     result = _run(_host(tmp_path, credential=False), "preflight")
 
@@ -474,6 +491,97 @@ def test_host_up_waits_for_parallel_control_bootstrap_but_manual_check_is_immedi
     assert 'readiness_wait="${readiness_wait:-900}"' in up
     assert '( cmd_check "$readiness_wait" )' in up
     assert "check) cmd_check 0" in dispatch
+
+
+def test_every_failing_replica_is_reported_not_just_the_first(tmp_path: Path) -> None:
+    """Run together, all three answers exist at once; report all of them.
+
+    "All three failed" is a configuration problem and "one failed" is that
+    machine, and the serial loop could only ever surface the first — which is
+    the pattern the reader needs to tell them apart.
+    """
+    result = _run(_host(tmp_path, capability=""), "check")
+
+    assert result.returncode != 0
+    for index in (1, 2, 3):
+        assert f"runner-{index} did not attest shared-sandbox-v1" in result.stderr
+
+
+def test_a_runner_whose_preflight_cannot_run_reports_the_exit_code(tmp_path: Path) -> None:
+    """125/126/127 mean the container or the exec is gone, not that a check failed.
+
+    The status has to be captured with `|| rc=$?`. Read from `$?` after the
+    command it is never written at all: the script is `set -Eeuo pipefail`, so a
+    failing `docker exec` ends the subshell where it stands — on the only path
+    that reads the file. That left every failure with an absent status, which
+    the reader below happens to treat as a failure; the next reader may not.
+    """
+    result = _run(_host(tmp_path, attest_exit=125), "check")
+
+    assert result.returncode != 0
+    assert "could not complete sandbox preflight" in result.stderr
+    assert "docker exec status: 125" in result.stderr, (
+        "the exit code is what tells a vanished container from a preflight that raised"
+    )
+
+
+def test_the_attestation_cleanup_belongs_to_the_shell_that_created_it() -> None:
+    """`cmd_up` runs these checks in a subshell, and a subshell resets traps.
+
+    A handler the script installs at the top level therefore never runs for the
+    `exit` that a failed check performs inside it — and `ATTEST_DIR` is set in
+    the subshell, so the parent's copy is still empty. The directory then leaks
+    on exactly the path that fails.
+    """
+    script = SANDBOX_HOST.read_text()
+    function = script.index("check_shared_live_stack() {")
+    check = script[function : script.index("# ── Isolation")]
+    registered = "trap cleanup_attest_dir EXIT"
+
+    # Exactly one, and inside the function. Asserting only that it is absent
+    # *before* the function passes for a registration after it, which is the
+    # same top-level trap and the same leak.
+    assert script.count(registered) == 1, (
+        f"the cleanup is registered {script.count(registered)} times; it belongs once, "
+        "in the shell that creates the directory"
+    )
+    assert registered in check, (
+        "the cleanup is registered outside check_shared_live_stack, where the subshell in "
+        "cmd_up resets it and a failed `up` leaks its directory"
+    )
+
+
+def test_a_failed_attestation_prints_the_end_of_the_traceback() -> None:
+    """The exception and its message are the *last* lines of a traceback.
+
+    Each replica's stderr goes to its own file now instead of streaming to the
+    terminal, so what gets printed is a choice — and the head of a Python
+    traceback is frames, which is the half that explains nothing.
+    """
+    script = SANDBOX_HOST.read_text()
+    check = script[script.index("check_shared_live_stack() {") : script.index("# ── Isolation")]
+
+    assert "tail -n 40" in check
+    assert "sed -n '1,20p'" not in check
+
+
+def test_host_up_probes_the_tunnels_instead_of_pausing_first() -> None:
+    """`up` must reach the probe, not sleep on the way to it.
+
+    `compose up -d` has already created and started every container, and the
+    probe retries until the readiness deadline, so a fixed pause before it buys
+    nothing and is paid in full by every deployment: 5.1s measured from `up -d`
+    returning to the retained-storage line, with the first probe succeeding
+    immediately after it.
+    """
+    script = SANDBOX_HOST.read_text()
+    up = script[script.index("cmd_up() {") : script.index("cmd_check() {")]
+    # Statements, not the word: the comment above the probe explains the pause
+    # that was removed, and a substring search over the function would fail on
+    # the strength of the sentence describing it.
+    pauses = [line for line in up.splitlines() if line.strip().startswith("sleep")]
+
+    assert not pauses, f"the host start pauses before probing; the probe already retries: {pauses}"
 
 
 def test_shared_live_check_fails_when_runner_does_not_advertise(tmp_path: Path) -> None:
