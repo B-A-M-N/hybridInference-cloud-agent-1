@@ -4,6 +4,8 @@
 - 状态：交互方向已确认，并已按本文实现；实现与本文档在同一个 PR。
 - 代码基线：`dev`，`b7a24c6`。实现前重新检查最新 `dev` 的相关变更。
 - 目标仓库：`HarvardMadSys/hybridInference-cloud-agent`，本地目录名也可能为 `freeinference-cloud-agent`。
+- 修订 2026-09-11：Tool 的 Payload / Result 不再内嵌已存事件记录（见 §6.2、§6.3）。原始记录由 Run 的 Raw 页签与 Session log 统一提供，step 不再各带一份。
+- 修订 2026-09-11（二）：Tool 详情不再单独提供复制实参的按钮与 `Error flag` 行（见 §6.2、§6.3）。复制由 Payload / Result 块自带的 `Copy` 提供，失败状态由 Status 与退出码表达。
 
 ## 1. 已确认的产品决定
 
@@ -212,13 +214,13 @@ Timing ›
 - 对象/数组格式化并高亮；字符串按原文展示，不强制解析成 JSON。
 - 空字符串、空对象、`false`、`0` 均是合法值，不用 `||` 误判成未记录。
 - `detail` / `text` 只有在特定 runtime 的契约确认它就是实参时才可作为实参；否则标为预览或降级信息。
-- 缺失显示 `Payload was not recorded.`。提供复制实参与查看已存调用事件的展开区，后者不增加 Tool 的 Raw 页签。
+- 缺失显示 `Payload was not recorded.`。复制实参由 Payload 块自带的 `Copy` 提供，不另设按钮，不增加 Tool 的 Raw 页签，也不在 Payload 内重复调用事件本身。
 
 ### 6.3 Result
 
 - 通过第 8 节的配对规则找到结果。支持 `content`、`output`、`aggregated_output`、`text` 等已验证的 runtime 结果字段。
-- 显示可读输出；同时保留退出码、错误标志以及“Stored result event”折叠区，允许检查原始结果记录。
-- `is_error = true` 或有效非零退出码表示失败，不能只根据父 run 成功而显示 Completed。
+- 显示可读输出与退出码，不内嵌原始结果记录；重复结果时只保留歧义提示，不列出记录本身。
+- `is_error = true` 或有效非零退出码表示失败，不能只根据父 run 成功而显示 Completed。失败由 Status 与退出码表达，不再单独列出 `Error flag` 行；没有退出码时，失败只体现在 Status 上。
 - 已收到空结果时显示 `Tool completed with no output.`；没有结果记录是另一个状态。
 - 尚在等待结果时显示 `Waiting for result…`；已结束的 attempt 缺结果时显示 `Result was not recorded.`。
 - 对运行中状态的判断必须基于匹配 attempt 的状态；不是基于当前页面最新的 job 是否还在运行。
@@ -241,7 +243,7 @@ Timing ›
 证据优先级：
 
 1. 对应 job + attempt + call 的 tool telemetry，且 `timing_source` 表明精确执行边界：显示 `Tool execution hooks`。
-2. 正确配对的调用/结果事件时间：显示 `Session timestamps`。在本页说明其区间是 call-record → result-record，可能包含排队、runtime/转发延迟；不是纯工具 CPU 时间。
+2. 正确配对的调用/结果事件时间：显示 `Session timestamps`。该区间是 call-record → result-record，可能包含排队、runtime/转发延迟；页签不为此另加说明。
 3. 没有可用证据：`Not recorded`。
 
 若精确 duration 来自执行钩子而只有事件接收时间，不能把事件接收时间标为精确 Started；分别标识 `Recorded at` 与 duration 的来源。不同证据的开始和结束时间不能混搭求差。
@@ -350,12 +352,14 @@ interface TrajectoryStep {
 
 ### 8.6 Harness 报告事件
 
-runtime 在启动时对自己的配置所做的陈述，作为可选证据字段 `harness` 挂在对应的 `lifecycle` 事件 payload 上。带该报告的 step 在 **Summary / Raw** 之外增加两个页签：
+runtime 在启动时对自己的配置所做的陈述，作为可选证据字段 `harness` 挂在对应的 `lifecycle` 事件 payload 上。该 step **就是这份报告**，因此只提供读取它的两个页签：
 
 | 选中对象 | 详情页签，按顺序 |
 | --- | --- |
-| 带 `harness` 报告的 lifecycle 事件 | **Summary / System Prompt / Tools / Raw** |
+| 带 `harness` 报告的 lifecycle 事件 | **System Prompt / Tools** |
 | 其余事件 | **Summary / Raw**，不出现空页签 |
+
+对带报告的事件不再提供 Summary 与 Raw：这是与 DS Harness 入口对齐的结果（DSH 的 "Initial System Prompt" 同样只有这两个页签）。代价是这条事件的原始记录不再从该行进入 —— 若需要，应另加入口而不是把页签加回来。选中该类 step 时的默认页签是其第一个页签，不是固定名称，否则页签条与面板会对"当前打开哪个"说法不一致。
 
 数据边界：
 
@@ -504,7 +508,7 @@ npm run build
 
 纯投影规则在 `trajectory.test.ts` 或新增数据测试中验证，页签/选择/历史范围在 `TrajectoryView.test.tsx` 和相关组件测试中验证。
 
-保留 `toSessionLog` 的原始事件完整性测试。新增 UI 使用 step 数量时，不能继续把它叫 event count；可显示 `N steps · M events`。工具结果被纳入对应 Tool 后，证明它仍能在 Result、Stored event 和日志中读取。
+保留 `toSessionLog` 的原始事件完整性测试。新增 UI 使用 step 数量时，不能继续把它叫 event count；可显示 `N steps · M events`。工具结果被纳入对应 Tool 后，证明它仍能在 Result、Run 的 Raw 页签和 Session log 中读取。
 
 浏览器人工验收浅色/深色、宽屏/窄屏、一个 Assistant、一个成功工具、一个失败或缺结果工具、一个历史 Turn。模拟数据检查与实际部署检查分别记录，不能将原型截图当成真实 API 验证。
 

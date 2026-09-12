@@ -24,11 +24,9 @@ from cloud_agent.admin_observability import (
     encode_cursor,
 )
 from cloud_agent.schemas import AttemptResources, ProcessObservation, ToolCallResources
-from cloud_agent.storage.store import (
-    LEDGER_WINDOW_UNTIL_SQL,
-    NEXT_ATTEMPT_START_SQL,
-    _load_json,
-)
+from cloud_agent.storage._sql.attempts import NEXT_ATTEMPT_START_SQL
+from cloud_agent.storage._sql.ledger import LEDGER_WINDOW_UNTIL_SQL
+from cloud_agent.storage._sql.rows import load_json
 from cloud_agent.thread_stats import _TOKEN_KEY_GROUPS
 from cloud_agent_host.event_payloads import MAX_EVENT_PAYLOAD_BYTES, bound_event_payload
 from cloud_agent_host.turn_resources import summarize_run_resources
@@ -159,7 +157,7 @@ def _fold_run_resource_summary(row: dict[str, Any]) -> dict[str, Any]:
     view cannot disagree about what a run's CPU or memory peak is. A run with
     no measured attempt keeps ``None`` — "not measured here" is not zero.
     """
-    attempts = _load_json(row.pop("resource_summary_attempts", None)) or []
+    attempts = load_json(row.pop("resource_summary_attempts", None)) or []
     summaries = [
         item.get("summary") if isinstance(item, dict) else None
         for item in attempts
@@ -394,7 +392,7 @@ class AdminRunQueries:
         return {
             "job_ids": [job_id],
             "attempts": [dict(row) for row in attempts],
-            "events": [{**dict(row), "payload": _load_json(row["payload"])} for row in rows],
+            "events": [{**dict(row), "payload": load_json(row["payload"])} for row in rows],
         }
 
     async def activity(
@@ -477,7 +475,7 @@ class AdminRunQueries:
             if row is None:
                 return None
             telemetry = dict(row)
-            telemetry["turn_summary"] = _load_json(telemetry.get("turn_summary"))
+            telemetry["turn_summary"] = load_json(telemetry.get("turn_summary"))
             calls = await conn.fetch(
                 f"SELECT {_CALL_COLUMNS} FROM agent_tool_call_resources "
                 "WHERE attempt_id = $1 ORDER BY call_seq LIMIT $2",
@@ -533,6 +531,6 @@ class AdminRunQueries:
         if row is None:
             return None
         result = dict(row)
-        result["payload"] = bound_event_payload(_load_json(row["payload"]) or {})
+        result["payload"] = bound_event_payload(load_json(row["payload"]) or {})
         result["truncated"] = result["payload"].get("truncated") is True
         return result

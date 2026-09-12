@@ -13,12 +13,10 @@ import {
   DetailRows,
   DetailSection,
   EmptyNote,
-  StoredRecord,
   TabPanel,
   TextBlock,
   TruncationNote,
   ValueBlock,
-  copyText,
   recordedAt,
 } from './StepDetailParts';
 import { formatDuration } from './TurnFooter';
@@ -133,6 +131,17 @@ export function ToolStepDetails({
       </DetailRow>
     </DetailRows>
   );
+  // Only the readings that need a caveat get a sentence. Exact hook timing has
+  // no exposed boundaries, and a call whose records disagree claims no
+  // measurement at all. An interval bracketed by two stored records is named by
+  // the Timing source row, so it is not explained again here.
+  const timingNote = exactTiming
+    ? 'The duration comes from the sandbox hooks that bracket the call. The exact start and finish boundaries are not exposed here.'
+    : step.ambiguity
+      ? 'The records for this call disagree, so no measurement is attributed to it: not the sandbox timing and not the interval between the stored records.'
+      : step.timing.source === 'session_timestamps'
+        ? null
+        : 'No evidence for this call\u2019s execution window was recorded.';
 
   if (tab === 'payload') {
     return (
@@ -151,26 +160,6 @@ export function ToolStepDetails({
           <EmptyNote>Payload was not recorded.</EmptyNote>
         )}
         {step.truncated && callEvent ? <TruncationNote payload={callEvent.payload ?? {}} /> : null}
-        {callEvent ? (
-          <DetailSection title="Stored call event">
-            <StoredRecord
-              title={`#${callEvent.id} · ${callEvent.event_type} · seq ${callEvent.seq} · attempt ${callEvent.attempt_id}`}
-              event={callEvent}
-            />
-          </DetailSection>
-        ) : null}
-        <button
-          type="button"
-          onClick={() =>
-            void copyText(
-              JSON.stringify(step.payloadValue ?? step.payloadPreview ?? null, null, 2) ?? '',
-              'Arguments',
-            )
-          }
-          className="rounded border border-gray-200 px-2 py-0.5 text-[11px] text-gray-500 hover:border-gray-300 hover:text-gray-900 dark:border-white/10 dark:text-gray-400 dark:hover:border-white/20 dark:hover:text-gray-100"
-        >
-          Copy arguments
-        </button>
       </TabPanel>
     );
   }
@@ -182,33 +171,22 @@ export function ToolStepDetails({
           <>
             <TruncationNote payload={resultEvents[0]?.payload ?? {}} />
             <ResultState step={step} />
-            <DetailRows>
-              <DetailRow label="Error flag" tone={step.result.isError ? 'error' : 'default'}>
-                {step.result.isError ? 'true' : 'false'}
-              </DetailRow>
-              {step.result.exitCode !== null ? (
+            {step.result.exitCode !== null ? (
+              <DetailRows>
                 <DetailRow
                   label="Exit code"
                   tone={step.result.exitCode === 0 ? 'default' : 'error'}
                 >
                   {step.result.exitCode}
                 </DetailRow>
-              ) : null}
-            </DetailRows>
+              </DetailRows>
+            ) : null}
             {step.ambiguity === 'duplicate_result' ? (
               <p role="note" className="text-[11px] text-amber-700 dark:text-amber-300">
-                More than one result was stored for this call. All of them are kept below, so the
-                pairing is not verified and neither a status nor a duration is claimed.
+                More than one result was stored for this call, so the pairing is not verified and
+                neither a status nor a duration is claimed.
               </p>
             ) : null}
-            {resultEvents.map((event) => (
-              <DetailSection key={event.id} title="Stored result event">
-                <StoredRecord
-                  title={`#${event.id} · ${event.event_type} · seq ${event.seq} · attempt ${event.attempt_id}`}
-                  event={event}
-                />
-              </DetailSection>
-            ))}
           </>
         ) : (
           <>
@@ -247,15 +225,9 @@ export function ToolStepDetails({
     return (
       <TabPanel idPrefix={idPrefix} tab="timing">
         {timingRows}
-        <p className="text-[11px] text-gray-400 dark:text-gray-500">
-          {exactTiming
-            ? 'The duration comes from the sandbox hooks that bracket the call. The exact start and finish boundaries are not exposed here.'
-            : step.ambiguity
-              ? 'The records for this call disagree, so no measurement is attributed to it: not the sandbox timing and not the interval between the stored records.'
-              : step.timing.source === 'session_timestamps'
-                ? 'This interval runs from the stored call record to the stored result record. It includes queueing and runtime or forwarding delay, so it is not pure tool execution time.'
-                : 'No evidence for this call\u2019s execution window was recorded.'}
-        </p>
+        {timingNote ? (
+          <p className="text-[11px] text-gray-400 dark:text-gray-500">{timingNote}</p>
+        ) : null}
       </TabPanel>
     );
   }

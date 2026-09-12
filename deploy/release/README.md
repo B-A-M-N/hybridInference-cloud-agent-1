@@ -51,8 +51,39 @@ Two invariants worth naming because they cannot be enforced in the same place:
 
 ## Producing one
 
-The publication job (P2b) builds each artifact with
-`--build-arg SOURCE_COMMIT=<sha>`, then writes one input file:
+`.github/workflows/publish.yml` produces a release for every CI run that
+concludes green on a push to `dev`, and for a `workflow_dispatch` naming a dev
+commit whose own CI is green. In order:
+
+1. **Vet the commit.** It has to be on `dev`, its own CI has to have concluded
+   success on a push, and no release may exist for it yet. A release that
+   exists is left exactly as it is: a manifest that could be overwritten is
+   one whose sha256 nobody can pin.
+2. **Build, push and start each artifact** — one cell per artifact, on the
+   architecture it is deployed to, from the same matrix CI verifies
+   (`test_publish_workflow.py` fails if the two differ). Each cell pushes by
+   digest with `--build-arg SOURCE_COMMIT=<sha>`, pulls that digest back, and
+   runs `smoke.py` on the pulled image: the check is applied to the bytes the
+   registry holds, and the pull is the first proof they can be pulled at all.
+   It then records the digest and the image's own labels in one small file.
+3. **Assemble the manifest.** `publish_inputs.py assemble` turns the seven
+   records into the generator's input (below), `build_recipe.py` packages the
+   recipe, and `release_manifest.py` writes the document — only if every
+   check passes.
+4. **Publish a release** tagged `agent-<sha>`, created as a draft, with
+   `recipe.tar.gz` and `release.json` attached, and made visible only once
+   both assets are on it. The release notes and the run summary carry the
+   sha256 of `release.json`, which is the value a distribution's lock pins.
+
+Nothing on this path deploys, and nothing on it is reachable from a pull
+request: there is no `pull_request` trigger, and `workflow_run` executes the
+copy of the file on the default branch. That is also the one operational
+caveat: `workflow_run` fires only for a workflow file that is on the default
+branch, so until `publish.yml` has been synced to `main`, dev pushes do not
+publish on their own and a dispatch on `dev` is how a release is produced.
+
+The generator's input, written by `publish_inputs.py assemble` from the cell
+records:
 
 ```json
 {
@@ -110,6 +141,47 @@ Each run also asserts the image's own identity labels —
 `unknown`, so a build argument that fails to arrive produces an image every
 resolver refuses; this is the last place that can be seen before it is pushed.
 
+## Control-plane integration acceptance
+
+A release is published only if it deploys. Between pushing the images and
+creating the release, the publication workflow installs the candidate the way a
+distribution will: `deploy/release/acceptance.py` extracts the recipe into a
+directory with no source, writes a deployment `.env`, and runs the real
+`deploy/control-plane/deploy.sh` in artifact mode against a real Docker daemon,
+pulling this run's own digests from the registry. Then it asks each running
+container what it is and compares that with the manifest.
+
+| It proves | It does not prove |
+|---|---|
+| The recipe installs with no checkout, no Dockerfile, no build | Anything about the execution host, Kata, or a real job |
+| The images pull by digest and the containers carry those digests | That a second architecture would work; this starts the arm64 half |
+| Alembic migrates a real database from the control image | That the gateway contract works; there is no gateway |
+| The identity namespace check runs, and both listeners answer `/healthz` | That sign-in works end to end |
+| The web service runs the variant the manifest named, by its own labels | That the console renders for a user |
+| A deployment naming its own image is refused before anything is pulled | That a *registry* would refuse it; that is the resolver's job, in P4 |
+
+**The host readiness fence is expected to refuse, and that is the point.**
+`deploy_readiness` waits for a heartbeat from an execution host running this
+exact commit, and CI has no such host. Standing one up would make the check
+prove something about the fixture, and weakening the fence for CI would remove
+the only thing between a new control plane and a pool that has not been replaced
+with it. So the deploy is expected to reach the fence and stop, which is itself
+asserted: reaching it means every stage before it passed, in order. The stages
+are listed in `acceptance.py` as `STAGES`, and the module says what each one
+stands for.
+
+One service is left over by that stop. `web` starts after the fence, so the
+acceptance brings it up itself, from the same generated Compose file and under
+the same `--no-build --pull never` restrictions the deploy uses. That is an
+explicit step of the acceptance rather than something the deploy did.
+
+The comparison is in `accept_artifacts.py`, as pure functions with no daemon, so
+what "is what is running what the release named" means can be read and tested on
+its own. Two things it deliberately gets right: a registry digest is taken from
+`RepoDigests` rather than the image ID, which is a different object; and a role
+is checked against the image's own label rather than the registry path, because
+which package an image lives in is storage layout.
+
 ## Registry layout is not part of this contract
 
 Artifacts are addressed by digest, so which package or tag an image lives in is
@@ -117,12 +189,16 @@ storage layout rather than interface. The role is carried by the image's own
 `io.hybridinference.artifact.role` label, not by the repository path, so the
 layout can change without the manifest becoming a lie.
 
-The plan, decided when the first push happens:
+Decided, and written into `publish.yml`:
 
 | Package | Contents | Why |
 |---|---|---|
 | `ghcr.io/harvardmadsys/cloud-agent` | control, web (both variants), runner, tunnel, egress — one tag per role and commit | Access control in GHCR is per package, and none of these needs to differ. |
 | `ghcr.io/harvardmadsys/cloud-agent-sandbox` | sandbox | It bundles third-party Agent CLIs whose redistribution is a separate question, so it needs a visibility switch of its own. |
+
+Each digest also gets one tag for people, `<cell>-<sha>` — `control-<sha>`,
+`web-agents-<sha>`, `sandbox-<sha>` and so on — written only after the image
+has started. Nothing selects on it.
 
 Moving between layouts later is possible but not free: a faithful copy of a
 multi-architecture index keeps its digests, while re-creating an index — a
@@ -154,13 +230,70 @@ committed as written. Recorded here rather than edited into it:
   Moving them to a neutral namespace is a dual-read migration of its own (D8),
   not something a release should force.
 
+## Deploying a recipe
+
+The recipe contains deployment helpers, configuration examples, and Compose
+templates with no `build:` entries. Image variables in those templates are bound
+to the manifest's digests before any Compose startup command. The same recipe
+supports both Web variants; select `AGENT_WEB_VARIANT=root` or `agents` in the
+deployment configuration. If omitted, the existing `AGENT_WEB_BASE_PATH` selects
+the variant, with an empty/unset path selecting `root`.
+
+Extract the archive into a release directory. Install its
+`deploy/release/requirements.txt` into a Python 3.12+ virtual environment and
+point `AGENT_DEPLOY_PYTHON` at that interpreter. The host needs Docker Compose
+and its existing Kata provisioning; the deployment does not install a runtime.
+
+Keep `DEPLOY_ROOT` stable across releases. Its `.env`, `.deployed-sha`, and
+`.shared-live-ready` belong to the deployment, while the extracted recipe can
+live in a different directory. Keep the existing Compose project name, host
+enrollment root, and Docker data root when migrating an existing installation.
+Generated Compose files live under the stable deployment root so relative
+mounts continue to point at the same data. The edge proxy's configuration is
+read from the selected recipe.
+
+For the control plane:
+
+```bash
+AGENT_DEPLOY_MODE=artifacts \
+AGENT_RELEASE_MANIFEST=/opt/cloud-agent/release/release.json \
+AGENT_DEPLOY_PYTHON=/opt/cloud-agent/deployer/bin/python \
+DEPLOY_ROOT=/srv/cloud-agent-control \
+bash /opt/cloud-agent/release/recipe/deploy/control-plane/deploy.sh
+```
+
+For the execution host, use the same release and interpreter with that host's
+own persistent root:
+
+```bash
+AGENT_DEPLOY_MODE=artifacts \
+AGENT_RELEASE_MANIFEST=/opt/cloud-agent/release/release.json \
+AGENT_DEPLOY_PYTHON=/opt/cloud-agent/deployer/bin/python \
+DEPLOY_ROOT=/srv/cloud-agent-host \
+bash /opt/cloud-agent/release/recipe/deploy/host/deploy.sh
+```
+
+The manifest supplies the commit and all owned image references. Any conflicting
+effective Compose configuration is refused before pulling or replacing services.
+Remove old image/commit overrides when switching to artifact mode. The default
+`source` mode continues to support the existing checkout-based workflows.
+
+Image pulls and the host's Kata probe precede runner drain. Migrations, the
+identity namespace check, exact-commit readiness, reverse broker probes, and
+deferred host readiness publication retain their existing ordering. A failed
+readiness gate does not activate the replacement control-plane stack.
+
+The script tests execute an extracted recipe with Docker actions recorded and
+failure-injected. They also exercise the real Compose environment parser when
+available. These tests do not establish that a particular Linux host, registry
+release, or live Kata runtime is ready; that remains the environment cutover
+acceptance.
+
 ## What is still owed
 
-* **P2b**: the publication workflow — build and start each artifact, push by
-  digest on a green `dev`, publish the manifest as a release asset; plus the two
-  web variants in the CI build matrix, which is where the image is first
-  verified on its own architecture rather than only as a bundle.
-* **P3**: artifact-mode deployment — recipes without `build:`, `pull` plus
-  `up --no-build`, and the same host-side protocol checks.
+* **The execution host's half of the acceptance**: the control-plane stack is
+  installed and checked on every release, above. The host stack is not, because
+  it needs Kata and a machine that can run it, so it belongs to the staging
+  handoff along with the failure and rollback drills.
 * **P4**: the resolver — the registry-side half of these checks, and
   `agent.lock` pinning this document's hash.

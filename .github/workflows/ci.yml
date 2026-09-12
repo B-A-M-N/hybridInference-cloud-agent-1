@@ -220,6 +220,15 @@ jobs:
         continue-on-error: true
         run: uv run pydocstyle cloud_agent cloud_agent_host
 
+      # Blocking, and the store is inside it on purpose: a checker that cannot
+      # see the class it validates callers against proves nothing about the
+      # wiring, which is the point of cloud_agent/ports. Scope and strictness
+      # live in [tool.mypy]; this only runs it.
+      - name: Mypy
+        id: mypy
+        continue-on-error: true
+        run: uv run mypy
+
       # `continue-on-error` keeps a failed check from failing the job, so
       # without this the job would be green with a red step inside it. Same
       # shape as `CI Gate` below, for the same reason.
@@ -229,6 +238,7 @@ jobs:
             ruff-format=${{ steps.ruff_format.outcome }}
             ruff-lint=${{ steps.ruff_lint.outcome }}
             pydocstyle=${{ steps.pydocstyle.outcome }}
+            mypy=${{ steps.mypy.outcome }}
         run: |
           set -euo pipefail
           failed=0
@@ -725,28 +735,30 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docker == 'true'
     runs-on: ${{ fromJSON(matrix.artifact.runner) }}
-    # `docker/setup-buildx-action` makes its builder *the current builder* and
-    # its post step deletes that builder when the job ends. Both halves go
-    # through `$HOME/.docker/buildx/current`, which everything running as this
-    # user on this machine shares: the other cells of this job, the staging
-    # deploy on the same host, an operator's shell. The pointer records no
-    # owner, so a cell that finishes while somebody else is mid-build deletes
-    # the builder out from under them. The 2026-09-11 staging deploy died that
-    # way four seconds into its build — `target migrate: failed to receive
-    # status`, `Unavailable`, `graceful_stop`, EOF — and the retry below had
-    # been reading the same collision as a transient buildkit recycle.
+    # The builder lives in a config directory belonging to the *runner*, not to
+    # this job, because its layer cache is the only thing between a cell and
+    # re-downloading hundreds of megabytes. With a builder per job the cache
+    # dies with it: the sandbox cell spent 120s of its 162s pulling a single
+    # 522MB layer back out of `type=gha` at 4.4MB/s. Measured on spark2 with
+    # one builder used twice — 10.3s cold, 0.54s warm.
     #
-    # `BUILDX_CONFIG` gives this cell a config directory nobody else reads, so
-    # its builder and the pointer to it stay private. It has to be job-level,
-    # because the action's setup and its post-step cleanup both resolve the
-    # variable from here; the path has to be per-cell, because cells of this
-    # matrix share a machine, and it has to be outside the workspace, because
-    # the checkout here is the build context. Leaving the directory behind is
-    # deliberate too: the post step still has to reach it to remove its
-    # builder, and post steps run after every step below. One small pointer
-    # file per cell is what stays.
-    env:
-      BUILDX_CONFIG: /tmp/cloud-agent-buildx/${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.artifact.name }}
+    # Per runner is safe because a runner executes one job at a time, so
+    # nothing races for the pointer, and `RUNNER_NAME` keeps two runners on one
+    # host apart. The directory sits under `_work`, which the runner does not
+    # clean between jobs, unlike `RUNNER_TEMP`.
+    #
+    # None of this goes near `$HOME/.docker/buildx`. That pointer records no
+    # owner, and on 2026-09-11 a cell finishing while the staging deploy was
+    # mid-build deleted the builder out from under it — `target migrate:
+    # failed to receive status`, `graceful_stop`.
+    #
+    # `cache-from: type=gha` is deliberately absent from the builds below, as an
+    # experiment. With a builder per runner, every x64 runner already holds a
+    # complete cache for every artifact: on rtx6000b-ca-3 the sandbox build
+    # finishes in 5.5s with every layer CACHED. CI nonetheless downloads 835MB
+    # of layers that are present locally, and the only difference between CI's
+    # invocation and that manual build is this flag. If the download disappears,
+    # it was the cause; if not, this is reverted and the search continues.
     strategy:
       fail-fast: false
       matrix:
@@ -819,8 +831,65 @@ jobs:
           suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.artifact.name }}"
           echo "IMAGE_TAG=${{ matrix.artifact.name }}:ci-${suffix}" >> "${GITHUB_ENV}"
           echo "SUFFIX=${suffix}" >> "${GITHUB_ENV}"
+          # Credentials of this job's own. The runners on this machine share
+          # one $HOME, and docker/login-action's post step logs *out* at the
+          # end of its job — from the shared ~/.docker/config.json. That is
+          # where the runner user's persistent Docker Hub login lives, the one
+          # the service containers and the `docker pull` in Tests rely on, so
+          # every image cell that finished was logging the whole machine out
+          # again. (In the publication workflow the same logout stripped the
+          # credentials of the cells still running beside it.) A config
+          # directory per job makes the logout a no-op for everyone else.
+          # Buildx state is unaffected; it lives in BUILDX_CONFIG.
+          mkdir -p "${RUNNER_TEMP}/docker-config"
+          echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-config" >> "${GITHUB_ENV}"
 
-      - uses: docker/setup-buildx-action@v3
+      # Authenticated pulls. Rate limits are per *account* once logged in and
+      # per *IP* when not — and this machine's egress address is shared with the
+      # other repository's CI, so the anonymous allowance is spent by two
+      # projects. It ran out twice today and took every image cell with it.
+      # Authenticated it is 200 pulls an hour, attributed to the account:
+      # verified on spark2, `docker-ratelimit-source: realtmxi`,
+      # `x-ratelimit-limit: 200;w=3600`.
+      #
+      # Before the builder step, not before the build: creating a builder pulls
+      # `moby/buildkit` from Docker Hub too, and that was the first thing the
+      # 429 blocked.
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Reused across jobs, and self-healing: a builder whose buildkitd will not
+      # start is removed and recreated rather than failing every later cell.
+      # `--bootstrap` is what proves it started, so it doubles as the check.
+      #
+      # The *name* carries the runner too, and that is not decoration. A config
+      # directory keeps the builder definitions apart, but buildx names the
+      # buildkitd container after the builder alone: two runners whose builder
+      # is both called `ci-persistent` share one
+      # `buildx_buildkit_ci-persistent0`, and one runner's self-heal deletes the
+      # container the other is building through. Verified on spark2 — with a
+      # shared name, removing A's builder takes the container with it; with
+      # `ci-<runner>` each keeps its own, and B's buildkitd start time does not
+      # move while A rebuilds.
+      - name: Reuse this runner's builder, or make one
+        run: |
+          set -euo pipefail
+          buildx_config="$(dirname "${RUNNER_WORKSPACE}")/buildx/${RUNNER_NAME}"
+          mkdir -p "${buildx_config}"
+          export BUILDX_CONFIG="${buildx_config}"
+          echo "BUILDX_CONFIG=${buildx_config}" >> "${GITHUB_ENV}"
+          builder="ci-${RUNNER_NAME}"
+          if ! docker buildx inspect "${builder}" --bootstrap >/dev/null 2>&1; then
+            docker buildx rm "${builder}" >/dev/null 2>&1 || true
+            docker buildx create --name "${builder}" --driver docker-container --use >/dev/null
+            docker buildx inspect "${builder}" --bootstrap >/dev/null
+          fi
+          docker buildx use "${builder}" >/dev/null
+          echo "BUILDER=${builder}" >> "${GITHUB_ENV}"
+          echo "builder ${builder} ready in ${buildx_config}"
 
       # `push: false` still: nothing here publishes, and these images carry no
       # credentials. `load: true` is what puts the image on this runner's
@@ -834,12 +903,13 @@ jobs:
         id: build
         # The graceful_stop this retry was written for is not a transient
         # recycle: it is another job on this machine deleting the builder this
-        # cell is building through, which the job-level BUILDX_CONFIG above now
-        # prevents. Kept as a backstop, because a builder can still die for
-        # reasons of its own and building once more is cheaper than a red cell.
+        # cell is building through. That is fixed. The retry stays as a
+        # backstop, because a build can still fail for reasons of its own and
+        # running it once more is cheaper than a red cell.
         continue-on-error: true
         uses: docker/build-push-action@v6
         with:
+          builder: ${{ env.BUILDER }}
           context: .
           file: ${{ matrix.artifact.dockerfile }}
           push: false
@@ -852,17 +922,15 @@ jobs:
           build-args: |
             SOURCE_COMMIT=${{ github.sha }}
             ${{ matrix.artifact.build_args }}
-          cache-from: type=gha,scope=${{ matrix.artifact.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.artifact.name }}
 
-      - name: Set up Docker Buildx (retry)
-        if: steps.build.outcome == 'failure'
-        uses: docker/setup-buildx-action@v3
-
+      # No builder work here: one that would not start was already replaced
+      # before the first attempt. What can still fail is the build itself.
       - name: Build ${{ matrix.artifact.name }} (retry)
         if: steps.build.outcome == 'failure'
         uses: docker/build-push-action@v6
         with:
+          builder: ${{ env.BUILDER }}
           context: .
           file: ${{ matrix.artifact.dockerfile }}
           push: false
@@ -875,7 +943,6 @@ jobs:
           build-args: |
             SOURCE_COMMIT=${{ github.sha }}
             ${{ matrix.artifact.build_args }}
-          cache-from: type=gha,scope=${{ matrix.artifact.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.artifact.name }}
 
       - name: Isolate uv cache dir
