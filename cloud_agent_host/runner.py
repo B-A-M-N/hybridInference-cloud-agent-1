@@ -416,6 +416,28 @@ class ControlPlane:
         except Exception:
             pass
 
+    def report_turn_resources(self, payload: dict[str, Any]) -> None:
+        """Report one cumulative whole-turn member execution snapshot.
+
+        The same method serves a running ``collecting`` checkpoint and the
+        closing ``final`` snapshot: the body carries its own state and
+        ``report_seq``, and the endpoint treats a resend at the same sequence
+        as the same report. Swallowed like every other observability write --
+        a turn that ran must not fail because the platform could not record
+        its telemetry -- with the loss of the lease still fatal.
+
+        There is deliberately no retry here. The payload is a cumulative
+        snapshot with a monotonic ``report_seq``, so a checkpoint lost to a
+        transport error is superseded by the next one: retrying would upload
+        a stale picture while the current one is already being assembled.
+        """
+        try:
+            self._post(f"/v1/agent/worker/jobs/{self.job_id}/turn-resources", payload)
+        except LeaseLost:
+            raise
+        except Exception:
+            pass
+
     def reserve_chat_sandbox(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Reserve immutable thread/container identity under this attempt fence."""
         return self._post(
@@ -1306,6 +1328,53 @@ def _shared_group_manifest(reservation: dict[str, Any], *, thread_id: str) -> li
     return projected
 
 
+#: The top-level keys a turn summary must carry before this host will post it.
+#: The control plane owns the authoritative schema; this is only the check
+#: that says "a report, not a fragment", so a producer bug cannot post a body
+#: that the endpoint would reject as malformed. A rejected report is worse
+#: than an absent one: it reads as a platform error instead of a measurement
+#: that was never taken.
+_TURN_RESOURCES_KEYS = (
+    "measurement_id",
+    "report_seq",
+    "state",
+    "window",
+    "cpu",
+    "memory",
+    "storage_io",
+)
+
+
+def _report_checkpoint_quietly(control: Any, payload: dict[str, Any]) -> None:
+    """Report one running checkpoint, never letting it disturb the stream.
+
+    A checkpoint exists so a crashed turn keeps the work it already did. That
+    makes it strictly optional at the time it is taken: if the report cannot
+    be delivered, the next checkpoint and the final snapshot carry the same
+    cumulative state, so a failure here must not surface as a turn error.
+    """
+    with contextlib.suppress(Exception):
+        control.report_turn_resources(payload)
+
+
+def _reportable_turn_resources(payload: Any) -> dict[str, Any] | None:
+    """Return the snapshot to post, or None when there is nothing honest to send.
+
+    ``None`` is a real answer, not a failure: a turn whose broker returned no
+    summary was not measured, and a synthesized empty snapshot would store
+    "this turn used nothing" -- a claim nobody made. The attempt's legacy
+    resource row already says "no member totals were attributed", so silence
+    here leaves the two consistent.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema_version") != 1:
+        return None
+    if any(key not in payload for key in _TURN_RESOURCES_KEYS):
+        return None
+    return payload
+
+
 def _stream_shared_agent_turn(
     *,
     supervisor: SessionSupervisorClient,
@@ -1391,6 +1460,15 @@ def _stream_shared_agent_turn(
                         control.append_event(NormalizedEvent("error", {"host": blocked}))
                 if event_type and event_type != LINE:
                     control.append_event(NormalizedEvent(event_type, payload))
+                continue
+            if kind == "resource_checkpoint":
+                # A running checkpoint, not a terminal frame. It is reported
+                # as `collecting` so a crash keeps the work measured up to
+                # here; the closing snapshot carries the same counters and the
+                # higher sequence, which is what supersedes this one.
+                checkpoint = _reportable_turn_resources(frame.get("turn_resources"))
+                if checkpoint is not None:
+                    _report_checkpoint_quietly(control, checkpoint)
                 continue
             if kind == "result":
                 result_frame = frame
@@ -1836,6 +1914,25 @@ def _run_shared_live_attempt(
                 fallback = shared_member_resource_rollup()
                 observed = result_frame.get("resources") if isinstance(result_frame, dict) else None
                 control.report_resources(observed if isinstance(observed, dict) else fallback)
+            # The whole-turn member window travels with the same terminal
+            # frame. It is posted here, before the terminal transition below,
+            # because the report is fenced on this attempt's live lease -- the
+            # same reason the legacy rollup above is posted here. A frame
+            # without the key is a turn nobody measured, and is left absent
+            # rather than filled with zeros.
+            with contextlib.suppress(Exception):
+                # The broker ships the legacy rollup and the turn summary
+                # inside one ``resources`` object; reading the frame's top
+                # level found nothing and silently reported no turn at all.
+                turn_resources = (
+                    (result_frame.get("resources") or {}).get("turn_resources")
+                    if isinstance(result_frame, dict)
+                    and isinstance(result_frame.get("resources"), dict)
+                    else None
+                )
+                reportable = _reportable_turn_resources(turn_resources)
+                if reportable is not None:
+                    control.report_turn_resources(reportable)
         if exit_code == 130:
             failure_detail = "cancelled by owner after shared-session admission"
             abandon_before_finish(lost=True, detail=failure_detail)

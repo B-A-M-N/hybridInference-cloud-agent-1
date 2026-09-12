@@ -6,12 +6,19 @@ import { useSyncExternalStore } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AgentAccessApi } from '@/lib/api/session';
-import type { AgentAttemptTelemetryApi, AgentJobUsageApi } from '@/lib/api/agents';
+import type {
+  AgentAttemptTelemetryApi,
+  AgentJobUsageApi,
+  AttemptResourcesApi,
+} from '@/lib/api/agents';
 import type {
   AdminActivityEvent,
   AdminRun,
   AdminRunDetail,
   AdminRunsPage,
+  ResourceMetricBriefApi,
+  RunResourceSummaryApi,
+  TurnResourceSummaryApi,
 } from '@/lib/api/adminRuns';
 import { APIError } from '@/lib/utils/errors';
 
@@ -69,6 +76,12 @@ import {
 } from '@/lib/api/adminRuns';
 import AdminRunsPageComponent from './page';
 import AdminRunPage from './[jobId]/page';
+import {
+  collectingSentence,
+  formatCpuSeconds,
+  formatMemoryBytes,
+  UNKNOWN_REASON_SENTENCE,
+} from './presentTurnResources';
 import { RunState } from './shared';
 
 function run(overrides: Partial<AdminRun> = {}): AdminRun {
@@ -212,7 +225,12 @@ function event(overrides: Partial<AdminActivityEvent> = {}): AdminActivityEvent 
   };
 }
 
-function resources(): AgentAttemptTelemetryApi {
+/**
+ * The real response shape: the turn summary is one of the attempt's resources,
+ * not a sibling of them. Overrides replace entries inside `resources`, so a
+ * case cannot accidentally exercise a shape the server never sends.
+ */
+function resources(override: Partial<AttemptResourcesApi> = {}): AgentAttemptTelemetryApi {
   return {
     attempt_id: 10,
     attempt_no: 1,
@@ -220,6 +238,8 @@ function resources(): AgentAttemptTelemetryApi {
     context_status: 'live',
     duration_ms: 120000,
     resources: {
+      turn_summary: turnSummary(),
+      ...override,
       // Deliberately stale numeric values with coverage zero: these must not
       // become whole-sandbox readings merely because the fields are populated.
       cpu_usec: 999000000,
@@ -276,12 +296,78 @@ function resources(): AgentAttemptTelemetryApi {
   };
 }
 
+/** The compact per-run resource projection the Runs list reads. */
+function runSummary(overrides: Partial<RunResourceSummaryApi> = {}): RunResourceSummaryApi {
+  return {
+    cpu_usec: 80_000_000,
+    memory_peak_bytes: 1_288_490_189,
+    state: 'final',
+    observed_through_ms: 130_000,
+    cpu: { status: 'available', reason_codes: [] },
+    memory: { status: 'available', reason_codes: [] },
+    storage_io: { status: 'unavailable', reason_codes: ['filesystem_attribution_unverified'] },
+    attempts_measured: 1,
+    attempts_total: 1,
+    ...overrides,
+  };
+}
+
+/** One attempt's whole-turn member execution window. */
+function turnSummary(overrides: Partial<TurnResourceSummaryApi> = {}): TurnResourceSummaryApi {
+  return {
+    measurement_id: '00000000-0000-4000-8000-000000000001',
+    state: 'final',
+    source: 'kata-guest-member-window-v1',
+    received_at: '2026-09-10T08:02:00Z',
+    duration_ms: 130_000,
+    observed_through_ms: 130_000,
+    open_scan_ms: 12,
+    close_scan_ms: 15,
+    cpu: {
+      status: 'available',
+      method: 'live_and_exit_task_counters',
+      usec: 80_000_000,
+      reason_codes: [],
+    },
+    memory: {
+      status: 'available',
+      method: 'sampled_member_pss',
+      peak_bytes: 1_288_490_189,
+      sample_interval_ms: 1000,
+      valid_samples: 131,
+      expected_samples: 131,
+      max_gap_ms: 1000,
+      reason_codes: [],
+    },
+    storage_io: {
+      status: 'unavailable',
+      method: 'task_io_accounting',
+      read_bytes: null,
+      write_bytes: null,
+      reason_codes: ['filesystem_attribution_unverified'],
+    },
+    ...overrides,
+  };
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((done) => {
     resolve = done;
   });
   return { promise, resolve };
+}
+
+/**
+ * The list row whose accessible name starts with the run's link text.
+ *
+ * Queried this way because a resource cell must be asserted inside the row it
+ * belongs to: "80 CPU-s appears somewhere" would also pass for a stale cell.
+ */
+function row(runId: string): HTMLElement {
+  return screen.getByRole('row', {
+    name: (name: string) => name.startsWith(runId),
+  });
 }
 
 beforeEach(() => {
@@ -673,6 +759,120 @@ describe('admin runs list', () => {
   });
 });
 
+describe('admin runs resource cells', () => {
+  // The list asserts a cell's text belongs to the run on screen, never that
+  // some text appeared: a cell left over from the previous selection is the
+  // failure this column can actually have.
+  it('says a run with no whole-turn summary has none, rather than showing a zero', async () => {
+    vi.mocked(getAdminRuns).mockResolvedValue(page([run()]));
+    render(<AdminRunsPageComponent />);
+    await screen.findByRole('link', { name: 'job-1' });
+    expect(within(row('job-1')).getAllByText('Not collected')).toHaveLength(3);
+    expect(within(row('job-1')).queryByText('0 B')).not.toBeInTheDocument();
+    expect(within(row('job-1')).queryByText('0 CPU-s')).not.toBeInTheDocument();
+  });
+
+  it('shows CPU and the sampled memory peak for a measured run', async () => {
+    vi.mocked(getAdminRuns).mockResolvedValue(page([run({ resource_summary: runSummary() })]));
+    render(<AdminRunsPageComponent />);
+    await screen.findByRole('link', { name: 'job-1' });
+    expect(within(row('job-1')).getByText(`${formatCpuSeconds(80_000_000)}`)).toBeInTheDocument();
+    expect(
+      within(row('job-1')).getByText(`${formatMemoryBytes(1_288_490_189)} \u00b7 sampled`),
+    ).toBeInTheDocument();
+    // An unsupported I/O metric does not make the row read as a zero.
+    expect(screen.queryByText(/^0 B$/)).not.toBeInTheDocument();
+  });
+
+  it('never leaves the previous run\u2019s resource cell beside a new selection', async () => {
+    vi.mocked(getAdminRuns)
+      .mockResolvedValueOnce(page([run({ resource_summary: runSummary() })]))
+      .mockResolvedValueOnce(page([run({ resource_summary: null })]));
+    render(<AdminRunsPageComponent />);
+    await screen.findByRole('link', { name: 'job-1' });
+    expect(within(row('job-1')).getByText('80 CPU-s')).toBeInTheDocument();
+
+    // A filter change replaces the page; the old numbers must go with it.
+    fireEvent.change(screen.getByLabelText('Created'), { target: { value: '30' } });
+    await waitFor(() => expect(getAdminRuns).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(within(row('job-1')).queryByText('80 CPU-s')).not.toBeInTheDocument(),
+    );
+    expect(within(row('job-1')).getAllByText('Not collected')).toHaveLength(3);
+  });
+
+  it('renders a partial CPU measurement as a lower bound and a partial peak as observed', async () => {
+    vi.mocked(getAdminRuns).mockResolvedValue(
+      page([
+        run({
+          resource_summary: runSummary({
+            state: 'interrupted',
+            observed_through_ms: 130_000,
+            cpu: { status: 'partial', reason_codes: ['ring_loss'] },
+            memory: { status: 'partial', reason_codes: ['pss_unreadable'] },
+            attempts_measured: 3,
+            attempts_total: 5,
+          }),
+        }),
+      ]),
+    );
+    render(<AdminRunsPageComponent />);
+    await screen.findByRole('link', { name: 'job-1' });
+    const cpu = within(row('job-1')).getByText(/\u2265 80 CPU-s/);
+    expect(cpu).toBeInTheDocument();
+    expect(cpu.textContent).toContain('collection was interrupted');
+    const memory = within(row('job-1')).getByText(/1.2 GiB/);
+    expect(memory.textContent).toContain('observed');
+    expect(memory.textContent).not.toContain('\u2265');
+    // A total over three of five executions is not the run's total.
+    const state = within(row('job-1')).getByText('Interrupted');
+    expect(state.getAttribute('title')).toContain('3 of 5 executions measured');
+  });
+
+  it('states when collection is still running rather than showing a final total', async () => {
+    vi.mocked(getAdminRuns).mockResolvedValue(
+      page([
+        run({
+          resource_summary: runSummary({
+            state: 'collecting',
+            observed_through_ms: 90_000,
+            memory: { status: 'partial', reason_codes: ['sampling_over_budget'] },
+          }),
+        }),
+      ]),
+    );
+    render(<AdminRunsPageComponent />);
+    await screen.findByRole('link', { name: 'job-1' });
+    const state = within(row('job-1')).getByText('Collecting');
+    // The string handed to title is checked separately: jsdom renders the
+    // attribute, and the sentence must name how far the window actually got.
+    expect(state.getAttribute('title')).toBe(collectingSentence(90_000));
+    expect(state.getAttribute('title')).toContain('not the turn\u2019s total');
+  });
+
+  it('gives an unknown reason code the generic sentence, never the code', async () => {
+    vi.mocked(getAdminRuns).mockResolvedValue(
+      page([
+        run({
+          resource_summary: runSummary({
+            cpu: {
+              status: 'partial',
+              reason_codes: [
+                'uid=1001 lease_token=deadbeef',
+              ] as unknown as ResourceMetricBriefApi['reason_codes'],
+            },
+          }),
+        }),
+      ]),
+    );
+    render(<AdminRunsPageComponent />);
+    await screen.findByRole('link', { name: 'job-1' });
+    const cpu = within(row('job-1')).getByText(/\u2265 80 CPU-s/);
+    expect(cpu.getAttribute('title')).toBe(UNKNOWN_REASON_SENTENCE);
+    expect(screen.queryByText(/deadbeef|uid=1001/)).not.toBeInTheDocument();
+  });
+});
+
 describe('admin run observation', () => {
   it('shows the server and timing without an execution selector for a single attempt', async () => {
     render(<AdminRunPage />);
@@ -888,6 +1088,100 @@ describe('admin run observation', () => {
     expect(screen.queryByText('16m 39s')).not.toBeInTheDocument();
     expect(screen.getByText(/2 events lost/)).toBeInTheDocument();
     expect(screen.getByText(/largest single process peak/)).toBeInTheDocument();
+  });
+
+  it('shows the whole-turn window at the contract\u2019s scope and length', async () => {
+    render(<AdminRunPage />);
+    expect(await screen.findByText('Turn resource summary')).toBeInTheDocument();
+    expect(screen.getByText('80 CPU-s')).toBeInTheDocument();
+    expect(screen.getByText('1.2 GiB \u00b7 sampled')).toBeInTheDocument();
+    // The panel must never imply the number is the platform's whole cost.
+    expect(
+      screen.getByText('Sandbox member execution, including the agent and its tools'),
+    ).toBeInTheDocument();
+    expect(screen.getByText('sampled every 1s')).toBeInTheDocument();
+    expect(
+      screen.getByText(/CPU complete\. memory sampling complete\. I\/O unavailable\./),
+    ).toBeInTheDocument();
+    // Said wherever the metric appears, never only in one place.
+    expect(
+      screen.getAllByText(/do not prove which filesystem this I\/O reached/).length,
+    ).toBeGreaterThan(1);
+  });
+
+  it('says the scope and the run-level coverage when the numbers are not the run\u2019s total', async () => {
+    vi.mocked(getAdminRun).mockResolvedValue(
+      detail({
+        run: run({
+          resource_summary: runSummary({ attempts_measured: 3, attempts_total: 5 }),
+        }),
+      }),
+    );
+    render(<AdminRunPage />);
+    await screen.findByText('Turn resource summary');
+    expect(
+      screen.getByText('3 of 5 executions measured; this is not the run\u2019s total.'),
+    ).toBeInTheDocument();
+  });
+
+  it('keeps an interrupted collection out of the finalised form and names its cut-off', async () => {
+    vi.mocked(getAdminAttemptResources).mockResolvedValue({
+      ...resources({
+        turn_summary: turnSummary({ state: 'interrupted', observed_through_ms: 130_000 }),
+      }),
+    });
+    render(<AdminRunPage />);
+    await screen.findByText('Turn resource summary');
+    expect(
+      screen.getAllByText(/Collection interrupted: data reached 2m 10s/).length,
+    ).toBeGreaterThan(1);
+    // The turn panel must not add a claim of its own that collection
+    // finished. The gateway ledger's "not finalized" sentence lives in the
+    // owner-facing RunDetails tree, which this admin page does not render, so
+    // there is nothing here to cross-check against.
+    expect(screen.queryByText(/Collection finished with the turn/)).not.toBeInTheDocument();
+  });
+
+  it('keeps the lower bound off a partial memory peak and on a partial CPU one', async () => {
+    vi.mocked(getAdminAttemptResources).mockResolvedValue({
+      ...resources({
+        turn_summary: turnSummary({
+          cpu: {
+            status: 'partial',
+            method: 'live_and_exit_task_counters',
+            usec: 80_000_000,
+            reason_codes: ['ring_loss'],
+          },
+          memory: {
+            status: 'partial',
+            method: 'sampled_member_pss',
+            peak_bytes: 1_288_490_189,
+            sample_interval_ms: 1000,
+            valid_samples: 9,
+            expected_samples: 20,
+            max_gap_ms: 4000,
+            reason_codes: ['pss_unreadable'],
+          },
+        }),
+      }),
+    });
+    render(<AdminRunPage />);
+    await screen.findByText('Turn resource summary');
+    expect(screen.getByText('\u2265 80 CPU-s')).toBeInTheDocument();
+    expect(screen.getByText('1.2 GiB \u00b7 sampled \u00b7 observed')).toBeInTheDocument();
+    expect(screen.queryByText(/\u2265 1\.2 GiB/)).not.toBeInTheDocument();
+    expect(screen.getAllByText(/This value is a lower bound/).length).toBeGreaterThan(1);
+  });
+
+  it('says a missing window was not collected rather than showing a zero', async () => {
+    vi.mocked(getAdminAttemptResources).mockResolvedValue({
+      ...resources({ turn_summary: null }),
+    });
+    render(<AdminRunPage />);
+    await screen.findByText('Turn resource summary');
+    expect(screen.getByText(/Not collected for this execution/)).toBeInTheDocument();
+    expect(screen.getByText(/This is not a measured zero/)).toBeInTheDocument();
+    expect(screen.queryByText('0 CPU-s')).not.toBeInTheDocument();
   });
 
   it('reveals one event only after an explicit click, renders content as text, and discards it when hidden', async () => {

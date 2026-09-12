@@ -131,10 +131,23 @@ class _Manager:
         self.events.append(("normalize", kwargs["slot_id"]))
 
     def begin_guest_observation(
-        self, spec: ChatSandboxSpec, *, user_uid: int
+        self,
+        spec: ChatSandboxSpec,
+        *,
+        user_uid: int,
+        measurement_id: str | None = None,
     ) -> GuestObserverCursor:
         self.events.append(("observe-begin", user_uid))
-        return GuestObserverCursor(uid=user_uid, available=True)
+        return GuestObserverCursor(
+            uid=user_uid,
+            available=True,
+            measurement_id=measurement_id,
+        )
+
+    def member_window_request(self, spec: ChatSandboxSpec, argv: list[str], *, timeout_s: float):
+        """Accept the fixed window verbs without a real guest helper."""
+        self.events.append(("member-window", argv[1]))
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
 
     def finish_guest_observation(
         self, spec: ChatSandboxSpec, cursor: GuestObserverCursor | None
@@ -1591,10 +1604,17 @@ def test_kata_turn_observation_is_uid_scoped_and_closes_before_platform_cleanup(
         (10.0, "pre", "toolu_1"),
         (10.1, "post", "toolu_1"),
     )
-    assert manager.events[-5:] == [
+    # The window is fenced by the observation that reads it back: the opening
+    # census lands after the fence is taken, the closing census lands before
+    # the fence is read, and the platform's own cleanup follows both so it is
+    # never billed to the member.
+    assert manager.events[-8:] == [
         ("census", 0),
         ("observe-begin", 11001),
+        ("member-window", "register"),
+        ("member-window", "sample"),
         ("observe-finish", 11001),
+        ("member-window", "close"),
         ("reap-except", 0, ((41, 400),)),
         ("normalize", 0),
     ]
@@ -1664,13 +1684,18 @@ def test_lost_shared_residency_preserves_observation_until_turn_closes():
     supervisor.residency_lost("athr_source", generation=1)
 
     assert turn.interrupted is True
-    assert manager.events[-1] == ("observe-begin", 11001)
+    # Losing residency interrupts the member but must not close the window
+    # early: the turn is still the turn, and its closing census belongs to
+    # ``complete_turn`` like every other activation's.
+    assert ("member-window", "close") not in manager.events
 
     telemetry = supervisor.complete_turn("athr_source", lease.token, turn)
 
     assert telemetry.complete is True
-    assert manager.events[-3:] == [
+    assert manager.events[-5:] == [
+        ("member-window", "sample"),
         ("observe-finish", 11001),
+        ("member-window", "close"),
         ("reap-except", 0, ((41, 400),)),
         ("normalize", 0),
     ]
@@ -1813,3 +1838,231 @@ def test_shared_claude_turn_fences_and_returns_exact_tool_marks():
         ("reap-except", 0, ((41, 400),)),
         ("normalize", 0),
     ]
+
+
+def test_the_census_has_its_own_clock_and_honours_its_own_interval():
+    """The census must not depend on the turn emitting events.
+
+    Driving censuses from the turn's event stream meant a turn that spent its
+    time waiting on a model produced almost none, while the summary still
+    advertised a one-second period. This pins the independent tick: one
+    census, then nothing until the interval has passed.
+    """
+    manager = _Manager()
+    manager.backend.runtime = KATA_RUNTIME
+    supervisor = SharedChatSessionSupervisor(
+        manager,
+        transport_factory=_TransportFactory(),
+        window_sample_interval_s=10.0,
+    )
+    lease = supervisor.acquire(
+        _spec(),
+        thread_id="athr_source",
+        owner="attempt:1",
+        activation_generation=1,
+        has_settled_context=True,
+        manifest=_members(),
+    )
+    supervisor.ensure_resident(
+        "athr_source",
+        lease.token,
+        _launch("athr_source", native_session_id="native-source", slot=0),
+    )
+    # The sampler thread is started with the supervisor; stop it so this test
+    # drives the tick itself and asserts the interval deterministically.
+    supervisor._stop.set()
+    if supervisor._sampler_thread is not None:
+        supervisor._sampler_thread.join(timeout=2)
+
+    supervisor.start_turn(
+        "athr_source",
+        lease.token,
+        prompt="work",
+        model="glm-5.1",
+        reasoning_effort=None,
+    )
+    registered = [event for event in manager.events if event[0] == "member-window"]
+    assert registered[-1] == ("member-window", "register")
+
+    assert supervisor.sample_open_windows() == 1
+    sampled = [event for event in manager.events if event[0] == "member-window"]
+    assert sampled[-1] == ("member-window", "sample")
+
+    # Within the interval nothing more is due, so the period is the census's
+    # own property rather than however often a caller happens to ask.
+    assert supervisor.sample_open_windows() == 0
+    assert [event for event in manager.events if event[0] == "member-window"] == sampled
+
+
+def test_a_member_without_an_open_window_is_never_censused():
+    """Nothing is measured for a member that is not running a turn."""
+    manager = _Manager()
+    manager.backend.runtime = KATA_RUNTIME
+    supervisor = SharedChatSessionSupervisor(
+        manager,
+        transport_factory=_TransportFactory(),
+        window_sample_interval_s=10.0,
+    )
+    supervisor._stop.set()
+
+    assert supervisor.sample_open_windows() == 0
+    assert [event for event in manager.events if event[0] == "member-window"] == []
+
+
+def test_a_checkpoint_is_produced_without_any_turn_event():
+    """Uploads must not wait for the agent to say something.
+
+    The sampler thread owns both the census and the upload cadence, so a turn
+    that spends its time inside one silent tool call still leaves a report
+    behind. This drives the tick directly and asserts a checkpoint appears with
+    no event stream involved.
+    """
+    reported: list[tuple[str, dict]] = []
+    manager = _Manager()
+    manager.backend.runtime = KATA_RUNTIME
+    supervisor = SharedChatSessionSupervisor(
+        manager,
+        transport_factory=_TransportFactory(),
+        window_sample_interval_s=10.0,
+        checkpoint_interval_s=0.0,
+        window_checkpoint_hook=lambda thread_id, snapshot: reported.append((thread_id, snapshot)),
+    )
+    lease = supervisor.acquire(
+        _spec(),
+        thread_id="athr_source",
+        owner="attempt:1",
+        activation_generation=1,
+        has_settled_context=True,
+        manifest=_members(),
+    )
+    supervisor.ensure_resident(
+        "athr_source",
+        lease.token,
+        _launch("athr_source", native_session_id="native-source", slot=0),
+    )
+    supervisor._stop.set()
+    if supervisor._sampler_thread is not None:
+        supervisor._sampler_thread.join(timeout=2)
+
+    supervisor.start_turn(
+        "athr_source",
+        lease.token,
+        prompt="work",
+        model="glm-5.1",
+        reasoning_effort=None,
+    )
+    assert reported == []
+
+    supervisor.sample_open_windows()
+
+    # A checkpoint was produced and is waiting for the turn stream to forward,
+    # without a single turn event having been read.
+    assert len(reported) == 1
+    assert reported[0][0] == "athr_source"
+    assert reported[0][1]["state"] == "collecting"
+    pending = supervisor.take_reported_checkpoint("athr_source")
+    assert pending is not None and pending["state"] == "collecting"
+    # Taking it is what makes forwarding happen once rather than repeatedly.
+    assert supervisor.take_reported_checkpoint("athr_source") is None
+
+
+def test_checkpoints_are_produced_without_a_hook_because_production_has_none():
+    """The delivery gate must not depend on an observer nobody installs.
+
+    The broker builds its supervisor without a checkpoint hook. An earlier
+    version returned early when the hook was absent, so no checkpoint was ever
+    produced in production while a test that passed its own hook stayed green --
+    the same shape of gap as a fixture that does not match the producer.
+    """
+    manager = _Manager()
+    manager.backend.runtime = KATA_RUNTIME
+    supervisor = SharedChatSessionSupervisor(
+        manager,
+        transport_factory=_TransportFactory(),
+        window_sample_interval_s=10.0,
+        checkpoint_interval_s=0.0,
+    )
+    assert supervisor._window_checkpoint_hook is None
+
+    lease = supervisor.acquire(
+        _spec(),
+        thread_id="athr_source",
+        owner="attempt:1",
+        activation_generation=1,
+        has_settled_context=True,
+        manifest=_members(),
+    )
+    supervisor.ensure_resident(
+        "athr_source",
+        lease.token,
+        _launch("athr_source", native_session_id="native-source", slot=0),
+    )
+    supervisor._stop.set()
+    if supervisor._sampler_thread is not None:
+        supervisor._sampler_thread.join(timeout=2)
+
+    supervisor.start_turn(
+        "athr_source",
+        lease.token,
+        prompt="work",
+        model="glm-5.1",
+        reasoning_effort=None,
+    )
+    supervisor.sample_open_windows()
+
+    pending = supervisor.take_reported_checkpoint("athr_source")
+    assert pending is not None
+    assert pending["state"] == "collecting"
+
+
+def test_the_final_report_sequence_stays_above_every_checkpoint():
+    """A checkpoint produced while the turn closes must not block the final.
+
+    The sampler keeps ticking while the closing observation runs, which takes a
+    guest exec. A final report that derived its sequence from the census counter
+    could come out below a checkpoint made in that window, and the store
+    rejects a lower sequence -- leaving a completed turn stored as collecting.
+    """
+    manager = _Manager()
+    manager.backend.runtime = KATA_RUNTIME
+    supervisor = SharedChatSessionSupervisor(
+        manager,
+        transport_factory=_TransportFactory(),
+        window_sample_interval_s=10.0,
+        checkpoint_interval_s=0.0,
+    )
+    lease = supervisor.acquire(
+        _spec(),
+        thread_id="athr_source",
+        owner="attempt:1",
+        activation_generation=1,
+        has_settled_context=True,
+        manifest=_members(),
+    )
+    supervisor.ensure_resident(
+        "athr_source",
+        lease.token,
+        _launch("athr_source", native_session_id="native-source", slot=0),
+    )
+    supervisor._stop.set()
+    if supervisor._sampler_thread is not None:
+        supervisor._sampler_thread.join(timeout=2)
+
+    turn = supervisor.start_turn(
+        "athr_source",
+        lease.token,
+        prompt="work",
+        model="glm-5.1",
+        reasoning_effort=None,
+    )
+    sequences: list[int] = []
+    for _ in range(3):
+        supervisor.sample_open_windows()
+        checkpoint = supervisor.take_reported_checkpoint("athr_source")
+        if checkpoint is not None:
+            sequences.append(checkpoint["report_seq"])
+    telemetry = supervisor.complete_turn("athr_source", lease.token, turn)
+
+    assert sequences, "checkpoints should have been produced"
+    assert telemetry.turn_resources is not None
+    assert telemetry.turn_resources["report_seq"] > max(sequences)

@@ -17,6 +17,9 @@ from cloud_agent.grant_usage import (
     GatewayCursor,  # noqa: TC001 — Pydantic resolves this at runtime.
 )
 from cloud_agent.ledger import JobUsageResponse  # noqa: TC001 — Pydantic resolves this at runtime.
+from cloud_agent.schemas import (
+    RunResourceSummary,  # noqa: TC001 — Pydantic resolves this at runtime.
+)
 from cloud_agent.session_statistics import (
     SessionStatistics,  # noqa: TC001 — Pydantic resolves this at runtime.
 )
@@ -45,6 +48,13 @@ class AdminRun(BaseModel):
         description="Distinct physical host labels, falling back to runner IDs when unreported.",
     )
     tool_calls: int = 0
+    resource_summary: RunResourceSummary | None = Field(
+        default=None,
+        description=(
+            "Compact whole-turn member execution window for this run, or null when no "
+            "attempt has one. Cheap scalars only, so a page of runs stays one query."
+        ),
+    )
 
 
 class AdminRunList(BaseModel):

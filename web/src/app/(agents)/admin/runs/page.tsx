@@ -13,6 +13,11 @@ import { getErrorMessage } from '@/lib/utils/errors';
 import { AdminNavigation } from '../AdminNavigation';
 import { presetKey } from '../usage/present';
 import {
+  runResourceCells,
+  type ResourceCompleteness,
+  type TurnResourceCells,
+} from './presentTurnResources';
+import {
   accessDenied,
   AdminRequired,
   BUTTON,
@@ -26,16 +31,25 @@ import {
 const STATES: AgentJobApiState[] = ['queued', 'running', 'succeeded', 'failed', 'cancelled'];
 
 // The column set is fixed: this list is metadata only, so every cell maps to a
-// field the runs endpoint already returns.
+// field the runs endpoint already returns. Resources are three columns rather
+// than one because "measured a little" and "measured nothing" must not read
+// alike; process I/O is deliberately absent, since it belongs to the detail
+// view and would widen the list past what a reader scans here.
 const COLUMNS = [
-  { label: 'Run', width: '27%' },
+  { label: 'Run', width: '25%' },
   { label: 'User', width: '11%' },
   { label: 'Status', width: '10%' },
-  { label: 'Agent / model', width: '16%' },
-  { label: 'Host', width: '12%' },
-  { label: 'Tool calls', width: '9%' },
+  { label: 'Agent / model', width: '15%' },
+  { label: 'Host', width: '11%' },
+  { label: 'Tool calls', width: '8%' },
+  { label: 'CPU', width: '8%' },
+  { label: 'Peak memory', width: '8%' },
+  { label: 'Resources', width: '9%' },
   { label: 'Created', width: '15%' },
 ] as const;
+
+//: The numeric columns, which are right-aligned like the tool-call count.
+const NUMERIC_COLUMNS = new Set(['Tool calls', 'CPU', 'Peak memory']);
 
 const SKELETON_ROWS = 6;
 
@@ -355,7 +369,7 @@ function RunsTable({ runs }: { runs: AdminRunsPage['runs'] }) {
   return (
     <div className={`${CARD} mt-3 overflow-hidden`}>
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[1180px] table-fixed text-left text-sm">
+        <table className="w-full min-w-[1420px] table-fixed text-left text-sm">
           <colgroup>
             {COLUMNS.map(({ label, width }) => (
               <col key={label} style={{ width }} />
@@ -363,11 +377,11 @@ function RunsTable({ runs }: { runs: AdminRunsPage['runs'] }) {
           </colgroup>
           <thead className="border-b border-gray-100 bg-gray-50/70 text-[11px] uppercase tracking-wide text-gray-500 dark:border-white/5 dark:bg-white/[0.02] dark:text-gray-400">
             <tr>
-              {COLUMNS.map(({ label }, index) => (
+              {COLUMNS.map(({ label }) => (
                 <th
                   key={label}
                   className={`whitespace-nowrap px-4 py-3 font-medium ${
-                    index === 5 ? 'text-right' : ''
+                    NUMERIC_COLUMNS.has(label) ? 'text-right' : ''
                   }`}
                 >
                   {label}
@@ -376,77 +390,140 @@ function RunsTable({ runs }: { runs: AdminRunsPage['runs'] }) {
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-100 dark:divide-white/5">
-            {runs.map((run) => (
-              <tr
-                key={run.id}
-                className="h-16 align-middle transition-colors hover:bg-gray-50/70 dark:hover:bg-white/[0.03]"
-              >
-                <th scope="row" className="px-4 py-3 font-normal">
-                  <div className="flex min-w-0 items-baseline gap-2 leading-5">
-                    <Link
-                      href={`/admin/runs/${encodeURIComponent(run.id)}`}
-                      className="min-w-0 truncate rounded-sm font-mono text-xs font-medium text-crimson hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-crimson focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:text-crimson-light dark:focus-visible:ring-crimson-light dark:focus-visible:ring-offset-gray-900"
-                    >
-                      {run.id}
-                    </Link>
+            {runs.map((run) => {
+              // Derived from this row's own summary, never from a previous
+              // row's: a cell cannot survive a filter or page change.
+              const cells = runResourceCells(run.resource_summary);
+              return (
+                <tr
+                  key={run.id}
+                  className="h-16 align-middle transition-colors hover:bg-gray-50/70 dark:hover:bg-white/[0.03]"
+                >
+                  <th scope="row" className="px-4 py-3 font-normal">
+                    <div className="flex min-w-0 items-baseline gap-2 leading-5">
+                      <Link
+                        href={`/admin/runs/${encodeURIComponent(run.id)}`}
+                        className="min-w-0 truncate rounded-sm font-mono text-xs font-medium text-crimson hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-crimson focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:text-crimson-light dark:focus-visible:ring-crimson-light dark:focus-visible:ring-offset-gray-900"
+                      >
+                        {run.id}
+                      </Link>
+                      <span
+                        className="max-w-20 shrink-0 truncate text-xs text-gray-500 dark:text-gray-400"
+                        title={`Turn ${run.turn_no}`}
+                      >
+                        Turn {run.turn_no}
+                      </span>
+                    </div>
                     <span
-                      className="max-w-20 shrink-0 truncate text-xs text-gray-500 dark:text-gray-400"
-                      title={`Turn ${run.turn_no}`}
+                      className="mt-1 block truncate text-xs leading-4 text-gray-500 dark:text-gray-400"
+                      title={run.repo}
                     >
-                      Turn {run.turn_no}
+                      {run.repo}
                     </span>
-                  </div>
-                  <span
-                    className="mt-1 block truncate text-xs leading-4 text-gray-500 dark:text-gray-400"
-                    title={run.repo}
-                  >
-                    {run.repo}
-                  </span>
-                </th>
-                <td className="px-4 py-3">
-                  <span
-                    className="block truncate font-mono text-xs text-gray-600 dark:text-gray-300"
-                    title={run.user_id}
-                  >
-                    {run.user_id}
-                  </span>
-                </td>
-                <td className="overflow-hidden whitespace-nowrap px-4 py-3">
-                  <RunState state={run.state} />
-                </td>
-                <td className="px-4 py-3">
-                  <span
-                    className="block truncate leading-5 text-gray-800 dark:text-gray-200"
-                    title={run.runtime}
-                  >
-                    {run.runtime}
-                  </span>
-                  <span
-                    className="mt-1 block truncate text-xs leading-4 text-gray-500 dark:text-gray-400"
-                    title={run.model}
-                  >
-                    {run.model}
-                  </span>
-                </td>
-                <td className="px-4 py-3">
-                  <RunHosts hosts={run.physical_hosts ?? run.hosts} />
-                </td>
-                <td className="px-4 py-3 text-right tabular-nums text-gray-800 dark:text-gray-200">
-                  <span className="block truncate" title={run.tool_calls.toLocaleString()}>
-                    {run.tool_calls.toLocaleString()}
-                  </span>
-                </td>
-                <td className="px-4 py-3 text-xs text-gray-500 dark:text-gray-400">
-                  <span className="block truncate" title={dateTime(run.created_at)}>
-                    {dateTime(run.created_at)}
-                  </span>
-                </td>
-              </tr>
-            ))}
+                  </th>
+                  <td className="px-4 py-3">
+                    <span
+                      className="block truncate font-mono text-xs text-gray-600 dark:text-gray-300"
+                      title={run.user_id}
+                    >
+                      {run.user_id}
+                    </span>
+                  </td>
+                  <td className="overflow-hidden whitespace-nowrap px-4 py-3">
+                    <RunState state={run.state} />
+                  </td>
+                  <td className="px-4 py-3">
+                    <span
+                      className="block truncate leading-5 text-gray-800 dark:text-gray-200"
+                      title={run.runtime}
+                    >
+                      {run.runtime}
+                    </span>
+                    <span
+                      className="mt-1 block truncate text-xs leading-4 text-gray-500 dark:text-gray-400"
+                      title={run.model}
+                    >
+                      {run.model}
+                    </span>
+                  </td>
+                  <td className="px-4 py-3">
+                    <RunHosts hosts={run.physical_hosts ?? run.hosts} />
+                  </td>
+                  <td className="px-4 py-3 text-right tabular-nums text-gray-800 dark:text-gray-200">
+                    <span className="block truncate" title={run.tool_calls.toLocaleString()}>
+                      {run.tool_calls.toLocaleString()}
+                    </span>
+                  </td>
+                  {[cells.cpu, cells.memory].map((cell, index) => (
+                    <td
+                      key={COLUMNS[index + 6].label}
+                      className="px-4 py-3 text-right tabular-nums text-gray-800 dark:text-gray-200"
+                    >
+                      <span className="block truncate" title={cell.title ?? cell.text}>
+                        {cell.text}
+                      </span>
+                    </td>
+                  ))}
+                  <td className="overflow-hidden whitespace-nowrap px-4 py-3">
+                    <RunResourceState cells={cells} />
+                  </td>
+                  <td className="px-4 py-3 text-xs text-gray-500 dark:text-gray-400">
+                    <span className="block truncate" title={dateTime(run.created_at)}>
+                      {dateTime(run.created_at)}
+                    </span>
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
     </div>
+  );
+}
+
+//: One tinted pill per resource completeness, in the same shape the run-state
+//: column uses. "Not collected" is a neutral pill rather than a dash: a dash
+//: reads as a zero, and no measurement is not a measured zero.
+const RESOURCE_STATE_STYLES: Record<ResourceCompleteness, { badge: string; dot: string }> = {
+  complete: {
+    badge:
+      'bg-emerald-50 text-emerald-700 ring-emerald-600/20 dark:bg-emerald-500/10 dark:text-emerald-400 dark:ring-emerald-500/25',
+    dot: 'bg-emerald-500',
+  },
+  partial: {
+    badge:
+      'bg-amber-50 text-amber-700 ring-amber-600/20 dark:bg-amber-500/10 dark:text-amber-400 dark:ring-amber-500/25',
+    dot: 'bg-amber-500',
+  },
+  collecting: {
+    badge:
+      'bg-blue-50 text-blue-700 ring-blue-600/20 dark:bg-blue-500/10 dark:text-blue-400 dark:ring-blue-500/25',
+    dot: 'bg-blue-500',
+  },
+  interrupted: {
+    badge:
+      'bg-orange-50 text-orange-700 ring-orange-600/20 dark:bg-orange-500/10 dark:text-orange-400 dark:ring-orange-500/25',
+    dot: 'bg-orange-500',
+  },
+  unavailable: {
+    badge:
+      'bg-gray-100 text-gray-600 ring-gray-500/20 dark:bg-white/5 dark:text-gray-400 dark:ring-white/15',
+    dot: 'bg-gray-500 dark:bg-gray-400',
+  },
+};
+
+function RunResourceState({ cells }: { cells: TurnResourceCells }) {
+  const style = RESOURCE_STATE_STYLES[cells.completeness];
+  const title = cells.state.title ?? cells.state.text;
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${style.badge}`}
+      title={title}
+    >
+      <span aria-hidden className={`h-1.5 w-1.5 shrink-0 rounded-full ${style.dot}`} />
+      {cells.state.text}
+    </span>
   );
 }
 

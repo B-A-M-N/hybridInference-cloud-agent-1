@@ -232,7 +232,9 @@ class PostgresExecutionQueries:
                            AS process_observation_complete,
                        COALESCE(r.process_events_lost, 0) AS process_events_lost,
                        COALESCE(r.processes_truncated, FALSE) AS processes_truncated,
-                       COALESCE(r.tool_calls_truncated, FALSE) AS tool_calls_truncated
+                       COALESCE(r.tool_calls_truncated, FALSE) AS tool_calls_truncated,
+                       r.turn_summary, r.turn_summary_received_at,
+                       (a.status <> 'running') AS attempt_terminal
                 FROM agent_attempts a
                 LEFT JOIN agent_attempt_resources r ON r.attempt_id = a.id
                 WHERE a.job_id = $1
@@ -246,6 +248,10 @@ class PostgresExecutionQueries:
             if row is None:
                 return None
             telemetry = dict(row)
+            # The stored snapshot is JSONB, which this pool may hand back as
+            # text; the reader needs the object, and its absence stays None
+            # rather than becoming an empty one.
+            telemetry["turn_summary"] = load_json(telemetry.get("turn_summary"))
             calls = await conn.fetch(
                 """
                 SELECT call_seq, tool_use_id, tool_name,

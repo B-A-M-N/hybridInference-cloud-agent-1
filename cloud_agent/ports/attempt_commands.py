@@ -9,7 +9,14 @@ operations it needs rather than on the whole persistence surface.
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
+
+#: Every outcome of :meth:`AttemptCommands.record_attempt_turn_summary`.
+#: ``stored`` and ``duplicate`` are success -- a retried post is the same
+#: snapshot said twice. ``conflict`` is a protocol violation that retrying
+#: cannot fix, and ``lease_lost`` is the fence every worker write shares: stop
+#: immediately.
+TurnSummaryWrite = Literal["stored", "duplicate", "conflict", "lease_lost"]
 
 
 class AttemptCommands(Protocol):
@@ -177,6 +184,66 @@ class AttemptCommands(Protocol):
     ) -> bool:
         """Stamp the diagnostic rung and optional product context semantic."""
         ...
+
+    async def record_attempt_turn_summary(
+        self,
+        *,
+        attempt_id: int,
+        lease_generation: int,
+        measurement_id: str,
+        report_seq: int,
+        state: str,
+        summary: dict[str, Any],
+    ) -> TurnSummaryWrite:
+        """Store one cumulative ``member_execution_window`` snapshot per attempt.
+
+        Fenced like every other worker write: a superseded attempt must not be
+        able to relabel what the live one consumed. The fence predicate is
+        evaluated against the locked attempt row and the database clock, so a
+        lease that expired a microsecond ago cannot write even if the reaper
+        has not noticed it yet.
+
+        Unlike :meth:`record_attempt_resources`, this body is a cumulative
+        snapshot rather than a closed window. The runner posts checkpoints
+        while the turn runs and a final one when it ends, and a delivery can be
+        duplicated, reordered, or replayed after a retry. ``report_seq`` is
+        therefore the ordering key and ``turn_summary_seq`` is what it was
+        accepted at: a lower or equal-and-different sequence must never win,
+        because that would let a stale checkpoint roll a measured window
+        backwards. Equal sequences with a byte-identical payload are the same
+        snapshot arriving twice, which is what a retry of an acknowledged post
+        looks like.
+
+        The first accepted snapshot fixes the attempt's ``measurement_id``.
+        A later report naming a different measurement is not an update to the
+        same window — it is a different window claiming the same attempt, and
+        accepting it would silently splice two measurements together.
+
+        This never touches the legacy aggregate columns or the tool-call and
+        process child rows. Those describe what the container sampler and the
+        process observer saw, which is independent evidence; this snapshot
+        describes the member's own window. Neither replaces the other, so a
+        turn may have either, both, or neither.
+
+        When this runs first it inserts a legacy-compatible base row — the
+        same "no container totals were attributed to this member" statement
+        ``shared-member-v1`` already makes, never a fabricated measurement.
+
+        Args:
+            attempt_id: The attempt the snapshot describes.
+            lease_generation: The caller's fencing generation for that attempt.
+            measurement_id: The window identity fixed at the first accepted report.
+            report_seq: Strictly monotonic per ``measurement_id``.
+            state: ``collecting`` or ``final`` as the guest reported it.
+            summary: The canonical snake_case snapshot to store.
+
+        Returns:
+            ``stored`` when this call accepted the snapshot, ``duplicate`` when
+            the identical snapshot was already stored, ``conflict`` when the
+            ordering rules refuse it, and ``lease_lost`` when the attempt is
+            not running under this lease. Only ``stored`` and ``duplicate`` are
+            success for the caller; the other two are not retryable.
+        """
 
     async def record_attempt_resources(
         self, *, attempt_id: int, lease_generation: int, rollup: dict[str, Any]

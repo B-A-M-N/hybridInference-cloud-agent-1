@@ -153,6 +153,7 @@ from cloud_agent.schemas import (
     WorkerSandboxSettleRequest,
     WorkerTerminalSuspendRequest,
     WorkerThreadSandbox,
+    WorkerTurnResourcesRequest,
 )
 from cloud_agent.source_control import (
     OAuthStateError,
@@ -287,6 +288,13 @@ _TERMINAL_ID_PATTERN = r"^term_[A-Za-z0-9_-]{1,80}$"
 # for less. Without this the runner would be handed push rights it must not
 # have, on a host that runs untrusted repository code.
 _CLONE_SCOPE = {"contents": "read"}
+
+#: One whole-turn resource snapshot, as UTF-8 bytes, exactly as the collection
+#: contract bounds it. The guest helper posts a fixed small shape, so this is
+#: not a tuning knob: it is the point past which the body is no longer the
+#: report it claims to be. Enforced on the raw body before parsing so an
+#: oversized post cannot allocate a model first.
+MAX_TURN_RESOURCES_BODY_BYTES = 16 * 1024
 
 
 async def authenticate_agent_owner(
@@ -3363,6 +3371,30 @@ def _lease_lost() -> HTTPException:
     )
 
 
+def _turn_summary_conflict() -> HTTPException:
+    """The 409 for a snapshot the store's ordering rules refused.
+
+    Deliberately not ``_lease_lost``: the lease is fine and the worker must
+    not stop, but this particular report can never be accepted — a stale
+    ``report_seq``, two payloads claiming one sequence, a ``collecting``
+    snapshot trying to overwrite a stored ``final`` one, or a second
+    measurement claiming an attempt whose window is already fixed. Retrying
+    the same body will produce the same answer, so the message says so.
+    """
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": {
+                "type": "turn_summary_conflict",
+                "message": (
+                    "This turn resource snapshot conflicts with the one already stored "
+                    "for this attempt; do not retry it."
+                ),
+            }
+        },
+    )
+
+
 def _match_job(claims: dict[str, Any], job_id: str) -> None:
     """Reject a token minted for a different job."""
     if claims["job_id"] != job_id:
@@ -4172,6 +4204,64 @@ async def worker_report_resources(
     )
     if not recorded:
         raise _lease_lost()
+    return WorkerAckResponse(ok=True)
+
+
+@router.post("/worker/jobs/{job_id}/turn-resources", response_model=WorkerAckResponse)
+async def worker_report_turn_resources(
+    request: Request,
+    job_id: str,
+    body: WorkerTurnResourcesRequest,
+    authorization: str | None = Header(None),
+    store: _RoutesStorage | None = Depends(get_storage),
+) -> WorkerAckResponse:
+    """Record one cumulative whole-turn member execution window.
+
+    A separate report from the legacy resource rollup, with its own semantics:
+    it is cumulative rather than a closed window, so the same snapshot can
+    arrive more than once while ``report_seq`` stays the only thing that
+    orders it. ``stored`` and ``duplicate`` are both success — an acknowledged
+    checkpoint whose response was lost must be safe to resend unchanged.
+
+    The body is bounded before it is parsed. The contract caps one summary at
+    16 KiB of UTF-8, and a rejected oversize report has to be cheap to reject;
+    letting the model build first would let an unbounded body allocate before
+    the bound is ever checked. Measuring the raw body is also the only check
+    that counts what actually crossed the wire rather than what survived
+    parsing.
+
+    Identity comes from the signed claims only. The body cannot name an
+    attempt, a lease, or a job, so a snapshot can never be filed against
+    anything but the caller's own fenced attempt.
+    """
+    job_store = _require_store(store)
+    claims = _worker_claims(authorization)
+    _match_job(claims, job_id)
+    if len(await request.body()) > MAX_TURN_RESOURCES_BODY_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "error": {
+                    "type": "payload_too_large",
+                    "message": (
+                        "A turn resource snapshot is limited to "
+                        f"{MAX_TURN_RESOURCES_BODY_BYTES} bytes."
+                    ),
+                }
+            },
+        )
+    result = await job_store.attempt_commands.record_attempt_turn_summary(
+        attempt_id=claims["attempt_id"],
+        lease_generation=claims["lease_generation"],
+        measurement_id=body.measurement_id,
+        report_seq=body.report_seq,
+        state=body.state,
+        summary=body.model_dump(),
+    )
+    if result == "lease_lost":
+        raise _lease_lost()
+    if result == "conflict":
+        raise _turn_summary_conflict()
     return WorkerAckResponse(ok=True)
 
 

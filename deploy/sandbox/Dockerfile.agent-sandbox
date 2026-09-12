@@ -45,6 +45,7 @@ WORKDIR /src
 COPY deploy/sandbox/guest-observer.h \
      deploy/sandbox/guest-observer.bpf.c \
      deploy/sandbox/guest-observer.c \
+     deploy/sandbox/member-window.c \
      deploy/sandbox/tool-mark.h \
      deploy/sandbox/tool-mark.c ./
 RUN clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
@@ -52,6 +53,8 @@ RUN clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
         -c guest-observer.bpf.c -o freeinference-guest-observer.bpf.o \
     && gcc -O2 -Wall -Wextra -Werror guest-observer.c \
         -o freeinference-guest-observer -lbpf -lelf -lz \
+    && gcc -O2 -Wall -Wextra -Werror member-window.c \
+        -o freeinference-member-window \
     && gcc -O2 -Wall -Wextra -Werror tool-mark.c \
         -o freeinference-tool-mark
 
@@ -194,7 +197,8 @@ RUN python3 -m venv /opt/claude-agent-sdk \
 LABEL org.freeinference.runtime.claude-code.version="${CLAUDE_CODE_VERSION}" \
       org.freeinference.helper.claude-agent-sdk.version="0.2.148" \
       org.freeinference.helper.http-agent-live-bridge.version="2" \
-      org.freeinference.helper.guest-observer.version="1" \
+      org.freeinference.helper.guest-observer.version="2" \
+      org.freeinference.helper.member-window.version="1" \
       org.freeinference.helper.tool-mark.version="1" \
       org.freeinference.runtime.codex.version="${CODEX_VERSION}" \
       org.freeinference.runtime.pi.version="${PI_VERSION}" \
@@ -240,11 +244,14 @@ COPY --from=guest-observer-build /src/freeinference-guest-observer.bpf.o \
      /usr/local/libexec/freeinference-guest-observer.bpf.o
 COPY --from=guest-observer-build /src/freeinference-tool-mark \
      /usr/local/libexec/freeinference-tool-mark
+COPY --from=guest-observer-build /src/freeinference-member-window \
+     /usr/local/libexec/freeinference-member-window
 RUN chmod 0755 /usr/local/bin/pi-freeinference /usr/local/bin/opencode-freeinference \
         /usr/local/bin/kilo-freeinference /usr/local/bin/http-agent-live-bridge \
         /usr/local/bin/claude-session-fork \
         /usr/local/libexec/freeinference-guest-observer \
         /usr/local/libexec/freeinference-tool-mark \
+        /usr/local/libexec/freeinference-member-window \
     && chmod 0555 /usr/local/bin/member-process-reaper \
     && chmod 0644 /usr/local/libexec/freeinference-guest-observer.bpf.o
 

@@ -297,6 +297,67 @@ class SharedBaseImportRequest(SharedSandboxIdentityRequest):
     bundle_b64: str = Field(..., min_length=1)
 
 
+def build_turn_resources(
+    value: Any,
+    tool_windows: ToolWindowTracker,
+) -> dict[str, Any]:
+    """The resource object one finished shared turn reports.
+
+    Named and module-level so the frame a turn actually emits can be built by a
+    test. The contract between this producer and the runner that reads it lived
+    in two closures either side of an HTTP hop, and a hand-written frame in the
+    runner's test hid a nesting change that made every real turn report
+    nothing.
+    """
+    telemetry = (
+        value
+        if isinstance(value, SharedTurnTelemetry)
+        else SharedTurnTelemetry(
+            observation=(
+                value
+                if isinstance(value, GuestObservation)
+                else GuestObservation.unavailable("shared turn returned no process telemetry")
+            )
+        )
+    )
+    tool_windows.apply_marks(list(telemetry.tool_marks))
+    windows = tool_windows.windows()
+    resources: dict[str, Any] = shared_member_resource_rollup()
+    tool_calls = attribute(
+        [],
+        windows,
+        windows_complete=not tool_windows.truncated,
+    )
+    processes, process_counts = attribute_processes(
+        telemetry.observation,
+        windows,
+        windows_complete=not tool_windows.truncated,
+    )
+    resources.update(
+        {
+            "tool_calls": add_process_resources(
+                add_process_counts(tool_calls, process_counts),
+                processes,
+                observation_complete=telemetry.observation.complete,
+            ),
+            "tool_calls_truncated": tool_windows.truncated,
+            "tool_time_ms": (None if tool_windows.truncated else tool_time_ms(windows)),
+            "process_observer": telemetry.observation.source,
+            "process_observation_complete": telemetry.observation.complete,
+            "process_events_lost": telemetry.observation.lost_events,
+            "processes_truncated": telemetry.observation.truncated,
+            "processes": processes,
+        }
+    )
+    # The whole-turn member execution window travels beside the legacy rollup
+    # rather than inside it: it is a different measurement with its own
+    # endpoint, and folding it into this dict would make the shared-member
+    # guard's terms ambiguous.
+    if telemetry.turn_resources is not None:
+        resources["turn_resources"] = telemetry.turn_resources
+    return resources
+
+
 @dataclass(frozen=True)
 class _TerminalEvent:
     """One resumable event in a terminal's bounded output ring."""
@@ -1432,6 +1493,26 @@ def create_app(
         except (DriverError, SandboxError, ValueError) as exc:
             raise supervisor_error(exc) from exc
 
+        def take_reported_checkpoint(
+            supervisor: Any,
+            member_thread_id: str,
+        ) -> dict[str, Any] | None:
+            """Collect a checkpoint the sampler thread has already produced.
+
+            The sampler runs on its own clock, so a turn that emits nothing for
+            a minute still gets its uploads; this only forwards what is waiting.
+            Best effort by construction: a checkpoint exists so a crash keeps
+            the work already measured, and a failure to forward one must not
+            reach the turn's own event stream as an error.
+            """
+            take = getattr(supervisor, "take_reported_checkpoint", None)
+            if take is None:
+                return None
+            try:
+                return take(member_thread_id)
+            except Exception:
+                return None
+
         def frames():
             turn_boundary_closed = False
             tool_windows = ToolWindowTracker()
@@ -1441,48 +1522,7 @@ def create_app(
                 nonlocal resources
                 if resources is not None:
                     return resources
-                telemetry = (
-                    value
-                    if isinstance(value, SharedTurnTelemetry)
-                    else SharedTurnTelemetry(
-                        observation=(
-                            value
-                            if isinstance(value, GuestObservation)
-                            else GuestObservation.unavailable(
-                                "shared turn returned no process telemetry"
-                            )
-                        )
-                    )
-                )
-                tool_windows.apply_marks(list(telemetry.tool_marks))
-                windows = tool_windows.windows()
-                resources = shared_member_resource_rollup()
-                tool_calls = attribute(
-                    [],
-                    windows,
-                    windows_complete=not tool_windows.truncated,
-                )
-                processes, process_counts = attribute_processes(
-                    telemetry.observation,
-                    windows,
-                    windows_complete=not tool_windows.truncated,
-                )
-                resources.update(
-                    {
-                        "tool_calls": add_process_resources(
-                            add_process_counts(tool_calls, process_counts),
-                            processes,
-                            observation_complete=telemetry.observation.complete,
-                        ),
-                        "tool_calls_truncated": tool_windows.truncated,
-                        "tool_time_ms": (None if tool_windows.truncated else tool_time_ms(windows)),
-                        "process_observer": telemetry.observation.source,
-                        "process_observation_complete": telemetry.observation.complete,
-                        "process_events_lost": telemetry.observation.lost_events,
-                        "processes_truncated": telemetry.observation.truncated,
-                        "processes": processes,
-                    }
-                )
+                resources = build_turn_resources(value, tool_windows)
                 return resources
 
             try:
@@ -1504,6 +1544,22 @@ def create_app(
                         )
                         + "\n"
                     )
+                    # A long turn crosses the checkpoint interval several
+                    # times. The sampler thread produces those checkpoints on
+                    # its own clock; this only forwards one that is waiting,
+                    # which costs a dictionary read per event.
+                    checkpoint = take_reported_checkpoint(owner, thread_id)
+                    if checkpoint is not None:
+                        yield (
+                            json.dumps(
+                                {
+                                    "kind": "resource_checkpoint",
+                                    "turn_resources": checkpoint,
+                                },
+                                separators=(",", ":"),
+                            )
+                            + "\n"
+                        )
                 result = turn.wait()
                 # The activation boundary is part of success, not cleanup
                 # after success. It reaps escaped background processes and

@@ -10,7 +10,7 @@ import binascii
 # model, so hiding this one behind TYPE_CHECKING leaves `AgentRunnerHost`
 # silently unbuilt and raises at the first request instead of at import.
 from datetime import datetime  # noqa: TC003
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -232,6 +232,202 @@ class ProcessObservation(BaseModel):
     io_wchar_bytes: int | None = None
 
 
+#: One metric's completeness, stated per metric rather than as a whole-turn
+#: percentage. ``available`` means complete *within its declared method and
+#: scope*: it never claims zero sampling error, zero boundary error, or that
+#: the number covers the platform's whole cost. ``partial`` is a measured lower
+#: bound for an additive quantity. ``unavailable`` carries no number at all.
+ResourceMetricStatus = Literal["available", "partial", "unavailable"]
+
+#: Every way a ``member_execution_window`` measurement can be incomplete. A
+#: bounded enum, not free text: the admin UI maps each code to one fixed
+#: sentence, so no UID, lease token, kernel field name or exception string can
+#: reach a page through this field.
+TurnResourceReasonCode = Literal[
+    "missing_thread_baseline",
+    "counter_regressed",
+    "thread_identity_conflict",
+    "observer_restarted",
+    "ring_loss",
+    "filesystem_attribution_unverified",
+    "pss_unreadable",
+    "address_space_share_unverified",
+    "sampling_over_budget",
+    "window_prefix_retained",
+    "observer_unavailable",
+    "not_a_kata_guest",
+    #: A run whose attempts were measured by different capabilities. Their
+    #: numbers do not share a method, so they are never added into one total.
+    "source_mismatch",
+    #: The live census and the settled exits disagree by more than the
+    #: reconciliation tolerance. Both measure the same work, so a difference
+    #: that large means one of them is wrong; the larger is reported as a
+    #: floor rather than as an exact number.
+    "estimates_diverged",
+]
+
+#: The only scope this schema describes. A member execution window bills what
+#: one member did inside a shared sandbox; it is not the platform cost of a
+#: task, and it must never be presented as one.
+TURN_RESOURCE_SCOPE: Final[Literal["member_execution_window"]] = "member_execution_window"
+
+#: The capability string that produced a summary. Summaries from different
+#: sources are never added together.
+TURN_RESOURCE_SOURCE: Final[Literal["kata-guest-member-window-v1"]] = "kata-guest-member-window-v1"
+
+#: Reported before the sandbox has closed the window, and final once it has.
+TurnResourceState = Literal["collecting", "final"]
+
+
+class TurnCpuResources(BaseModel):
+    """One member's own scheduler time inside the execution window.
+
+    The sum over every tracked work thread of its ``se.sum_exec_runtime``
+    delta. A thread that ran on two cores for ten seconds contributes about
+    twenty seconds, so this may legitimately exceed wall-clock duration.
+    Never derived from a utilisation percentage, and never summed from tool
+    rows in place of the whole turn.
+    """
+
+    status: ResourceMetricStatus
+    method: Literal["live_and_exit_task_counters"]
+    usec: int | None = Field(None, ge=0)
+    reason_codes: list[TurnResourceReasonCode] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def status_matches_the_number(self) -> TurnCpuResources:
+        """Refuse a status that its own evidence contradicts."""
+        if self.status == "unavailable" and self.usec is not None:
+            raise ValueError("an unavailable CPU measurement cannot carry a value")
+        if self.status == "available" and self.usec is None:
+            raise ValueError("an available CPU measurement needs a value")
+        return self
+
+
+class TurnMemoryResources(BaseModel):
+    """The sampled peak of the member's proportional resident memory.
+
+    ``peak_bytes`` is the maximum over census cycles of the sum of PSS across
+    the member's distinct address spaces. PSS shares mapped resident pages
+    between users instead of billing each of them in full, but it is not
+    machine memory: it excludes the VM kernel, unmapped page cache, host
+    services and special page classes, and RSS is never substituted for it.
+    Sampling cannot see between ticks, so even a complete plan stays labelled
+    ``sampled``.
+    """
+
+    status: ResourceMetricStatus
+    method: Literal["sampled_member_pss"]
+    peak_bytes: int | None = Field(None, ge=0)
+    sample_interval_ms: int = Field(..., gt=0)
+    #: Cycles in which every one of the member's address spaces read cleanly.
+    #: A cycle with one failed read is not a complete cycle and cannot set the
+    #: peak.
+    valid_samples: int = Field(0, ge=0)
+    #: Cycles the schedule intended for ``window.duration_ms``.
+    expected_samples: int = Field(0, ge=0)
+    max_gap_ms: int = Field(0, ge=0)
+    reason_codes: list[TurnResourceReasonCode] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def status_matches_the_number(self) -> TurnMemoryResources:
+        """Refuse a peak with no complete cycle, and a cycle count that inverts."""
+        if self.status == "unavailable" and self.peak_bytes is not None:
+            raise ValueError("an unavailable memory measurement cannot carry a peak")
+        if self.status == "available" and self.peak_bytes is None:
+            raise ValueError("an available memory measurement needs a peak")
+        if self.valid_samples > self.expected_samples:
+            raise ValueError("valid PSS cycles cannot exceed the planned cycles")
+        return self
+
+
+class TurnStorageIoResources(BaseModel):
+    """Storage I/O the kernel charged to the member's own tasks.
+
+    This is task I/O accounting, not what the host disk physically did: page
+    cache, writeback, the filesystem and Kata virtiofs can all move where a
+    byte is attributed. ``rchar``/``wchar`` are deliberately absent — they
+    count pipes, sockets and terminals too, so they cannot stand in for
+    storage I/O.
+    """
+
+    status: ResourceMetricStatus
+    method: Literal["task_io_accounting"]
+    read_bytes: int | None = Field(None, ge=0)
+    write_bytes: int | None = Field(None, ge=0)
+    reason_codes: list[TurnResourceReasonCode] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def status_matches_the_numbers(self) -> TurnStorageIoResources:
+        """Refuse a status its own counters contradict."""
+        measured = self.read_bytes is not None or self.write_bytes is not None
+        if self.status == "unavailable" and measured:
+            raise ValueError("an unavailable storage measurement cannot carry counters")
+        if self.status != "unavailable" and not measured:
+            raise ValueError("a measured storage window needs at least one counter")
+        return self
+
+
+class TurnResourceWindow(BaseModel):
+    """Where the measurement actually reached, on the guest's monotonic clock."""
+
+    duration_ms: int = Field(..., ge=0)
+    #: How far data reached before the window was frozen. Below ``duration_ms``
+    #: this is a prefix, and the missing tail is never filled in.
+    observed_through_ms: int = Field(..., ge=0)
+    #: What the open and close boundary scans themselves cost. They are the
+    #: measurement's own overhead, so they are reported rather than hidden.
+    open_scan_ms: int = Field(0, ge=0)
+    close_scan_ms: int = Field(0, ge=0)
+
+    @model_validator(mode="after")
+    def observed_cannot_exceed_the_window(self) -> TurnResourceWindow:
+        """A prefix is shorter than or equal to the window it is part of."""
+        if self.observed_through_ms > self.duration_ms:
+            raise ValueError("an observation cannot reach past the window's end")
+        return self
+
+
+class WorkerTurnResourcesRequest(BaseModel):
+    """One cumulative ``member_execution_window`` snapshot for one attempt.
+
+    This is an independent report, not a variant of
+    :class:`WorkerResourcesRequest`. It never writes, replaces or deletes that
+    report's tool-call and process rows, and it is deliberately not bound by
+    the guard that keeps ``shared-member-v1`` free of container totals: the
+    numbers here are attributed per member UID, which that guard exists
+    because the *container* sampler cannot do.
+
+    The body is a snapshot, not a batch of deltas. ``report_seq`` is monotonic
+    per ``measurement_id``, so a retry re-sends the same cumulative state and a
+    reordered or duplicated delivery cannot accumulate.
+    """
+
+    schema_version: Literal[1] = 1
+    measurement_id: str = Field(..., min_length=8, max_length=64)
+    report_seq: int = Field(..., ge=1)
+    state: TurnResourceState
+    scope: Literal["member_execution_window"] = TURN_RESOURCE_SCOPE
+    source: Literal["kata-guest-member-window-v1"] = TURN_RESOURCE_SOURCE
+    window: TurnResourceWindow
+    cpu: TurnCpuResources
+    memory: TurnMemoryResources
+    storage_io: TurnStorageIoResources
+
+    @model_validator(mode="after")
+    def a_final_report_states_a_complete_window(self) -> WorkerTurnResourcesRequest:
+        """Keep ``final`` meaning what it says.
+
+        A final report whose observation stopped short of its own window would
+        render as a finished turn with a silently short tail. Such a report
+        stays ``collecting`` (plus a ``window_prefix_retained`` reason code) so
+        the stored shape keeps telling the truth even after the attempt ends.
+        """
+        if self.state == "final" and self.window.observed_through_ms < self.window.duration_ms:
+            raise ValueError("a final turn resource report cannot describe a window prefix")
+        return self
+
+
 class AttemptResources(BaseModel):
     """Attempt telemetry across historical samples and current guest observations.
 
@@ -239,6 +435,12 @@ class AttemptResources(BaseModel):
     member turns intentionally report ``coverage = 0`` with null aggregate
     counters, then carry per-tool timing and optional UID-filtered Kata process
     rows. A reader must render that as "turn totals unavailable", not zero use.
+
+    ``turn_summary`` is separate from all of the above. It is the whole-turn
+    member execution window: this member's own CPU and PSS peak, reported by
+    the guest helper through its own endpoint. It is populated independently,
+    so a turn may have a complete ``turn_summary`` with no tool rows, or tool
+    rows with no ``turn_summary`` at all.
     """
 
     cpu_usec: int | None = None
@@ -268,6 +470,59 @@ class AttemptResources(BaseModel):
     process_events_lost: int = 0
     processes_truncated: bool = False
     processes: list[ProcessObservation] = Field(default_factory=list)
+    #: The whole-turn member execution window, or ``None`` for a turn recorded
+    #: before it was collected. ``None`` is "not measured here", never zero.
+    turn_summary: TurnResourceSummary | None = None
+
+
+class TurnResourceSummary(BaseModel):
+    """One attempt's whole-turn member execution window, as stored and read.
+
+    Derived from the stored snapshot rather than recomputed: the list view, the
+    detail view and any later aggregation share one reducer. ``state`` is
+    derived too — a stored ``collecting`` snapshot for an attempt that is
+    already terminal reads as ``interrupted``, with ``observed_through_ms``
+    kept so the UI can say how far it actually got instead of rounding it up
+    to the end of the task.
+    """
+
+    measurement_id: str
+    state: Literal["collecting", "final", "interrupted"]
+    source: str
+    received_at: datetime | None = None
+    window: TurnResourceWindow
+    cpu: TurnCpuResources
+    memory: TurnMemoryResources
+    storage_io: TurnStorageIoResources
+
+
+class ResourceMetricBrief(BaseModel):
+    """One metric's status alone, for the Runs list's compact summary."""
+
+    status: ResourceMetricStatus
+    reason_codes: list[TurnResourceReasonCode] = Field(default_factory=list)
+
+
+class RunResourceSummary(BaseModel):
+    """The compact per-turn resource projection the Runs list shows.
+
+    Flattened scalars only, so listing a page of runs stays one bounded query
+    over exactly that page and never reads event or process tables. The detail
+    view carries the full :class:`TurnResourceSummary`; this exists so the list
+    does not have to.
+    """
+
+    cpu_usec: int | None = None
+    memory_peak_bytes: int | None = None
+    state: Literal["collecting", "final", "interrupted"]
+    observed_through_ms: int | None = None
+    cpu: ResourceMetricBrief
+    memory: ResourceMetricBrief
+    storage_io: ResourceMetricBrief
+    #: How many attempts the numbers cover, and whether any of them is missing
+    #: a summary. A total over four of five executions is not the run's total.
+    attempts_measured: int = 0
+    attempts_total: int = 0
 
 
 class AgentAttemptSummary(BaseModel):

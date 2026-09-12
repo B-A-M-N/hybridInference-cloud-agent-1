@@ -21,6 +21,7 @@ import fcntl
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
@@ -40,6 +41,7 @@ from urllib.parse import urlparse
 from cloud_agent_host.egress import EgressTier
 from cloud_agent_host.guest_observer import (
     GUEST_OBSERVER_BINARY,
+    GUEST_OBSERVER_EVENTS,
     GUEST_OBSERVER_ROOT,
     GUEST_OBSERVER_ROTATE_BYTES,
     GuestObservation,
@@ -93,6 +95,11 @@ CHAT_WORKDIR = "/workspace"
 CHAT_STATE_DIR = "/agent-state"
 ACTIVATION_TMPFS = "/run/agent-activation"
 MEMBER_TMPFS_ROOT = "/run/agent-members"
+#: This module is a library boundary: it reports what it observed and
+#: leaves the decision to the caller, so a warning here is the only
+#: record an operator gets of a partially capable guest.
+logger = logging.getLogger(__name__)
+
 MEMBER_UID_BASE = 11001
 MEMBER_UID_LIMIT = 128
 MEMBER_REAPER_TARGET = "/usr/local/bin/member-process-reaper"
@@ -2723,11 +2730,9 @@ class ChatSandboxManager:
             observer = self._kata_privileged_exec(
                 spec, [GUEST_OBSERVER_BINARY, "--self-test"], timeout_s=30
             )
-            if (
-                observer.returncode != 0
-                or observer.stdout.strip() != "freeinference-guest-observer-v1"
-            ):
+            if observer.returncode != 0:
                 raise SandboxError("Kata guest observer self-test failed: " + observer.stderr[:500])
+            self._check_observer_self_test(observer.stdout)
             marker = self.exec_capture(
                 spec,
                 ["/usr/local/libexec/freeinference-tool-mark", "--self-test"],
@@ -2763,6 +2768,45 @@ class ChatSandboxManager:
                 [self.backend.docker_binary, "rm", "--force", spec.container_name], timeout=30
             )
 
+    def _check_observer_self_test(self, stdout: str) -> None:
+        """Accept the helper's identity line and report its window matrix.
+
+        The helper answers with ``freeinference-guest-observer-v<N>`` and, from
+        version 2, a second line naming the live counters this guest can
+        actually read. A capability this kernel lacks is reported here, where
+        an operator reads preflight output, rather than being discovered as a
+        permanently partial window later. It is deliberately not fatal: a
+        guest without a live census still observes process lifecycles, and
+        the platform offers what it can prove rather than refusing the host.
+        """
+        lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+        if not lines or not lines[0].startswith("freeinference-guest-observer-v"):
+            raise SandboxError("Kata guest observer self-test failed: unrecognised helper identity")
+        if len(lines) < 2:
+            logger.warning(
+                "Kata guest observer reports no member window capability",
+                extra={"event": "guest_observer_window_capability_absent"},
+            )
+            return
+        try:
+            capability = json.loads(lines[1]).get("window") or {}
+        except (ValueError, AttributeError):
+            logger.warning(
+                "Kata guest observer capability report is unreadable",
+                extra={"event": "guest_observer_window_capability_unreadable"},
+            )
+            return
+        missing = [name for name in ("cpu", "storage_io", "pss") if not capability.get(name)]
+        if missing:
+            logger.warning(
+                "Kata guest cannot measure part of a member window: %s",
+                ", ".join(missing),
+                extra={
+                    "event": "guest_observer_window_capability_partial",
+                    "missing": missing,
+                },
+            )
+
     def _observer_privileged_exec(
         self,
         spec: ChatSandboxSpec,
@@ -2790,6 +2834,104 @@ class ChatSandboxManager:
             return self._guest_observer_controller(spec).snapshot(after_poll_seq=after_poll_seq)
         except GuestObserverRuntimeError as exc:
             raise SandboxError(str(exc)) from exc
+
+    def member_window_journal_delta(
+        self,
+        spec: ChatSandboxSpec,
+        cursor: GuestObserverCursor,
+        *,
+        timeout_s: float = 10.0,
+    ) -> tuple[bytes, int]:
+        """Read the journal bytes this window has not consumed yet.
+
+        Returns the payload and the offset it ended at, so a caller can keep
+        one reducer per window and fold each cycle in exactly once. The read is
+        fenced exactly like the observation read is: the device, inode and size
+        must all still describe the same journal, because a restarted observer
+        would otherwise hand back bytes from a different file under the same
+        path and silently restart the counters.
+        """
+        if not cursor.available or not cursor.journal_ino:
+            return b"", cursor.offset
+        reader = (
+            "import os, sys\n"
+            "filename, offset, expected_dev, expected_ino = sys.argv[1], int(sys.argv[2]), "
+            "int(sys.argv[3]), int(sys.argv[4])\n"
+            "with open(filename, 'rb', buffering=0) as handle:\n"
+            "    journal = os.fstat(handle.fileno())\n"
+            "    if (int(journal.st_dev) != expected_dev "
+            "            or int(journal.st_ino) != expected_ino):\n"
+            "        raise RuntimeError('observer journal changed before read')\n"
+            "    if int(journal.st_size) < offset:\n"
+            "        raise RuntimeError('observer journal is behind the read fence')\n"
+            "    handle.seek(offset)\n"
+            "    sys.stdout.buffer.write(handle.read(max(0, int(journal.st_size) - offset)))\n"
+        )
+        result = self.exec_capture(
+            spec,
+            [
+                "python3",
+                "-c",
+                reader,
+                GUEST_OBSERVER_EVENTS,
+                str(cursor.offset),
+                str(cursor.journal_dev),
+                str(cursor.journal_ino),
+            ],
+            workdir="/",
+            timeout_s=timeout_s,
+            user_uid=0,
+            user_gid=0,
+        )
+        if getattr(result, "returncode", 1) != 0:
+            detail = getattr(result, "stderr", b"")
+            if isinstance(detail, bytes):
+                detail = detail.decode("utf-8", "replace")
+            raise SandboxError(f"member window journal read failed: {str(detail)[-300:]}")
+        payload = getattr(result, "stdout", b"")
+        if not isinstance(payload, bytes):
+            payload = str(payload).encode("utf-8", "replace")
+        return payload, cursor.offset + len(payload)
+
+    def guest_boot_id(self, spec: ChatSandboxSpec) -> str:
+        """This guest's boot identifier, or an empty string when unreadable.
+
+        A task's identity is only unique within one boot, so every instance key
+        carries it. The observer controller caches the read, so asking once per
+        window costs one guest exec rather than one per census.
+        """
+        if self.backend.runtime != KATA_RUNTIME:
+            return ""
+        try:
+            return self._guest_observer_controller(spec).guest_boot_id()
+        except Exception:
+            return ""
+
+    def member_window_request(
+        self,
+        spec: ChatSandboxSpec,
+        argv: list[str],
+        *,
+        timeout_s: float,
+    ) -> subprocess.CompletedProcess[bytes]:
+        """Ask the guest observer for one member execution window operation.
+
+        The window helper is a second reviewed binary beside the tool marker,
+        and the observer accepts a window request only from it. Nothing here
+        composes a command from job input: ``argv`` comes from the fixed
+        ``sample``/``register``/``close`` verbs inside
+        :class:`~cloud_agent_host.member_resources.MemberWindowSampler`, and
+        the container is the same label-verified sandbox the turn is already
+        running in.
+        """
+        return self.exec_capture(
+            spec,
+            argv,
+            workdir="/",
+            timeout_s=timeout_s,
+            user_uid=0,
+            user_gid=0,
+        )
 
     def _guest_observer_controller(self, spec: ChatSandboxSpec) -> GuestObserverController:
         """Bind the shared observer contract to this label-verified container."""
@@ -2839,8 +2981,15 @@ class ChatSandboxManager:
         spec: ChatSandboxSpec,
         *,
         user_uid: int,
+        measurement_id: str | None = None,
     ) -> GuestObserverCursor:
-        """Fence the journal immediately before one member prompt is admitted."""
+        """Fence the journal immediately before one member prompt is admitted.
+
+        ``measurement_id`` additionally marks this fence as the start of a
+        member execution window, so the observation also carries that window's
+        live census cycles. The fence has to be taken before the window's
+        opening census, which is why the identifier travels with it here.
+        """
         if self.backend.runtime != KATA_RUNTIME:
             return GuestObserverCursor.unavailable(user_uid, "sandbox is not a Kata guest")
         controller = self._guest_observer_controller(spec)
@@ -2856,6 +3005,7 @@ class ChatSandboxManager:
                 # cursor is explicitly unavailable; cleanup of existing owners
                 # makes a later idle begin eligible to restart it.
                 restart_if_missing=not active,
+                measurement_id=measurement_id,
             )
             if cursor.available:
                 # A restart invalidates every old-pid cursor already; do not
