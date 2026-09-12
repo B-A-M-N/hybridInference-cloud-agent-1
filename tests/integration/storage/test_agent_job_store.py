@@ -4209,9 +4209,7 @@ async def test_a_second_measurement_cannot_take_over_a_fixed_window(
     assert telemetry["turn_summary"]["measurement_id"] == MEASUREMENT_ID
 
 
-async def test_a_superseded_or_expired_lease_cannot_write_a_turn_summary(
-    store: Storage,
-):
+async def test_a_superseded_or_expired_lease_cannot_write_a_turn_summary(pool, store: Storage):
     """Fenced like every other worker write, against the database clock."""
     job = await _create_job(store)
     claim = await _claim(store, worker_id="w1", lease_ttl_seconds=60)
@@ -4227,7 +4225,7 @@ async def test_a_superseded_or_expired_lease_cannot_write_a_turn_summary(
         )
         == "lease_lost"
     )
-    await _expire_attempt(store, claim["attempt_id"])
+    await _expire_attempt(pool, store, claim["attempt_id"])
     assert (
         await _record_turn_summary(store, claim, report_seq=1, summary=_turn_snapshot())
         == "lease_lost"
