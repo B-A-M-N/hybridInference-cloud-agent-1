@@ -15,6 +15,7 @@ import Link from 'next/link';
 import toast from 'react-hot-toast';
 
 import { Markdown } from '@/components/ui/Markdown';
+import { basePath } from '@/config/env';
 import { useT } from '@/components/providers';
 import {
   cancelAgentJob,
@@ -1359,10 +1360,11 @@ export function JobDetail({
         // carried no level and now shows one differs, so it is sent.
         ...(effort && effort !== job.reasoningEffort ? { reasoning_effort: effort } : {}),
       });
-      // This is the next turn of the same transcript, not a new page for the
-      // reader. Next scrolls on navigation by default, which jumps the task
-      // region back to the top and makes every follow-up look like a reload.
-      router.push(`/${child.id}`, { scroll: false });
+      // A router.push remounts the dynamic [jobId] segment even with
+      // scroll:false and a stable JobDetail key. Native history updates Next's
+      // usePathname without replacing the page, preserving the conversation
+      // while useAgentJob loads the next turn. Reload and Back keep real URLs.
+      window.history.pushState(null, '', `${basePath}/${encodeURIComponent(child.id)}`);
       // The reader asked for this turn, so following its output is what they
       // asked for — the one place besides "back to bottom" that resumes it.
       scroll.followLatest();

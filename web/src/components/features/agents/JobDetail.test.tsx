@@ -476,6 +476,67 @@ describe('JobDetail', () => {
     expect(screen.getByText(/with all of its detail/)).toBeInTheDocument();
   });
 
+  it('keeps follow-up startup quiet while retaining the running controls and real activity', () => {
+    const startup = [
+      'started',
+      'workspace_preparing',
+      'workspace_reused',
+      'workspace_ready',
+      'init',
+    ].map((text) => ({ kind: 'lifecycle' as const, text, attemptNo: 1 }));
+    const job = makeJob({ turnNo: 2, events: startup });
+    const view = render(<JobDetail job={job} />);
+    const activity = screen.getByLabelText('Agent activity');
+    expect(activity).toBeEmptyDOMElement();
+    expect(screen.queryByText('Continuing conversation…')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeEnabled();
+
+    view.rerender(
+      <JobDetail
+        job={{
+          ...job,
+          events: [
+            ...startup,
+            { kind: 'thinking', text: '', attemptNo: 1 },
+            { kind: 'lifecycle', text: 'Approaching model usage limit', attemptNo: 1 },
+          ],
+        }}
+      />,
+    );
+    expect(screen.queryByText('Continuing conversation…')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Agent reasoning')).toBeInTheDocument();
+    expect(screen.getByText('Approaching model usage limit')).toBeInTheDocument();
+    expect(activity).not.toHaveTextContent(/workspace|Run started|Agent ready/i);
+  });
+
+  it('keeps startup detail out of completed follow-ups and preserves their output', () => {
+    render(
+      <JobDetail
+        job={makeJob({
+          turnNo: 3,
+          historyTurns: [
+            {
+              jobId: 'ajob_2',
+              turnNo: 2,
+              forkable: true,
+              messages: [],
+              events: [
+                { kind: 'lifecycle', text: 'workspace_preparing', attemptNo: 1 },
+                { kind: 'lifecycle', text: 'workspace_reused', attemptNo: 1 },
+                { kind: 'message', text: 'Follow-up answer', attemptNo: 1 },
+                { kind: 'lifecycle', text: 'result', attemptNo: 1 },
+              ],
+            },
+          ],
+        })}
+      />,
+    );
+    const history = within(screen.getByLabelText('Turn 2 agent activity'));
+    expect(history.queryByText(/workspace/i)).not.toBeInTheDocument();
+    expect(history.getByText('Follow-up answer')).toBeInTheDocument();
+    expect(history.getByText('Agent finished')).toBeInTheDocument();
+  });
+
   it('shows reasoning as a status without rendering raw thinking text', () => {
     render(
       <JobDetail
@@ -570,7 +631,8 @@ describe('JobDetail', () => {
         prompt: 'Now add a regression test',
       }),
     );
-    expect(navigation.push).toHaveBeenCalledWith('/ajob_child', { scroll: false });
+    expect(window.location.pathname).toBe('/ajob_child');
+    expect(navigation.push).not.toHaveBeenCalled();
   });
 
   it('sends the follow-up on Enter and keeps Shift+Enter a newline', async () => {
@@ -597,7 +659,8 @@ describe('JobDetail', () => {
         prompt: 'Now add a regression test',
       }),
     );
-    expect(navigation.push).toHaveBeenCalledWith('/ajob_child', { scroll: false });
+    expect(window.location.pathname).toBe('/ajob_child');
+    expect(navigation.push).not.toHaveBeenCalled();
   });
 
   it('swallows Enter on an empty follow-up rather than growing a blank line', async () => {
