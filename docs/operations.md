@@ -375,12 +375,18 @@ and the middle one is the one people skip.
 *Order the schema first.* `0008_generic_mcp_connections` drops
 `UNIQUE(user_id, server)`, renames `server` to `template`, adds the connection's
 transport, location, endpoint / launch spec and auth profile, moves the legacy
-`agent_threads.mcp_servers` list onto explicit bindings, and drops that column.
-Deploy it, and drain the old instances, **before** anything writes the new
-shape: an old instance still resolves tools by provider name and ignores the
-status and revision columns, so a connection it cannot see the state of is a
-connection it authorizes anyway. A deployment that cannot drain should keep the
-old API unreachable rather than rely on the new rows being ignored.
+`agent_threads.mcp_servers` list onto explicit bindings. It retains an empty,
+write-constrained `mcp_servers` column and a generated, always-NULL `server`
+column so the previous API can still list conversations, build the composer
+configuration and accept ordinary queued submissions during the host rollout.
+Neither column can authorize MCP access. Existing selections survive in the
+new bindings; their execution requires the updated API and relay. New
+connections are never offered to the old provider-name authorizer.
+
+`0011_mcp_rolling_compat` adds the same inert columns to databases that already
+applied the original, destructive `0008`. Apply migrations through head before
+replacing the API. This is a forward repair: it preserves connections,
+credentials and permissions, and does not require a database downgrade.
 
 *Migrate, do not guess.* The revision maps a legacy name only where the thread's
 owner has exactly one connection for that provider, and writes everything else
@@ -1261,7 +1267,8 @@ the revisions stacked on this one; the window covers them as well.)
   unfinished ancestor, it refuses the downgrade until those queued follow-ups
   are drained or cancelled because the older scheduler cannot preserve their
   execution order.
-- `0008_generic_mcp_connections` drops `agent_threads.mcp_servers` and turns
+- `0008_generic_mcp_connections` empties and write-constrains the legacy
+  `agent_threads.mcp_servers` column and turns
   `agent_mcp_connections` into a self-describing connection: transport,
   execution location, endpoint or launch spec and auth profile, with the
   provider name kept as an optional `template`. The legacy name list is mapped
@@ -1273,7 +1280,9 @@ the revisions stacked on this one; the window covers them as well.)
   follows it with the lease that fences a credential refresh between workers.
   `0010_mcp_policy_revisions` adds the permission revision allocator, so saving
   or reattaching a connection cannot reuse an old approval's policy version.
-  Apply it before starting the updated control plane and MCP relay.
+  `0011_mcp_rolling_compat` restores inert compatibility columns on databases
+  upgraded by the original `0008`, which dropped/renamed them. Apply through
+  head before starting the updated control plane and MCP relay.
 
 The runner holds no database connection — its heartbeats are HTTP calls to the
 control plane — so stopping the control plane, the MCP relay and the web tier

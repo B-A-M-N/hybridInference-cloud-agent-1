@@ -237,6 +237,26 @@ Never run `git clean` in this tree.
 
 ## Rolling back
 
+### Recovering an interrupted MCP rollout
+
+The September 15 staging rollout applied the MCP schema, then timed out waiting
+for the host eleven seconds before that host completed successfully. The old
+API remained running, but its conversation/configuration queries referenced
+columns removed by the original `0008`; `/healthz` still returned 200 because
+it is a liveness check. Staging's control-plane wait now uses the normal 900s
+budget, including cold image builds, while the host's local check keeps its
+120s budget starting after its build.
+
+Recover forward with a release containing `0011_mcp_rolling_compat`. It repairs
+the old API's read/write shape before the readiness wait, while preserving the
+new connection and permission data. Complete both deployment halves and verify
+their `.deployed-sha` values agree, then check conversation listing, ordinary
+submission and the new MCP connection API. A green liveness endpoint alone does
+not prove recovery. The compatibility columns deliberately expose no legacy
+MCP authority; finishing the updated API/relay deployment is required for MCP.
+
+### Code rollback
+
 Dispatch **Deploy Staging** with `sha` set to a compatible commit to go back to.
 The workflow always runs the current deployment orchestrator against a separate
 checkout of that target, so choosing an old SHA cannot also remove the exact-SHA
