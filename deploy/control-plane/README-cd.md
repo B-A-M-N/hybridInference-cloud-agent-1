@@ -263,6 +263,34 @@ restore/deploy the host half first rather than bypassing the compatibility fence
 There is no implicit break-glass that can install a control protocol no runner
 has proved it speaks.
 
+### A failed host rollout rolls itself back
+
+The host half does not wait for a human to notice. `sandbox_host.sh up`
+invalidates this host's shared-live marker and drains the runners that were
+serving *before* it runs the checks that decide whether the replacement is fit,
+so a check that fails leaves the host advertising nothing — and a runner
+advertising nothing does not poll at all. On 2026-09-13 one lost guest-observer
+probe left staging in that state for 29.6 hours ([#259]).
+
+`deploy/host/deploy.sh` therefore ends a failed rollout by deploying the commit
+`.deployed-sha` records — the last one that passed every host check — through the
+same path as any other rollback, using that generation's own script, compose
+file and build recipe. The job still fails: a restore is a repair, not a
+success, and it must not read as one.
+
+It restores only when the host is genuinely dark. A rollout that died before
+invalidating the marker left the previous generation running and untouched, and
+interrupting a working host to replace it with itself is worse than the failed
+deploy it would be reacting to. It refuses — leaving the host exactly as it
+found it, and saying which of these it was — when `.deployed-sha` names nothing,
+names the target, names a commit this host cannot produce or cannot cross the
+protocol fence to reach, or when the orchestrator is itself running from inside
+`DEPLOY_ROOT`, where a reset would rewrite the file bash is still reading. The
+deploy root always has to be a compatible target: recovering forward is still the
+answer when it is not.
+
+[#259]: https://github.com/HarvardMadSys/hybridInference-cloud-agent/issues/259
+
 ## What the script refuses to do
 
 - Deploy to a directory that is not a git checkout.
@@ -275,6 +303,9 @@ has proved it speaks.
 - Enable shared-live scheduling before a post-check host heartbeat and a
   control-plane-to-broker health request both succeed. `SHARED_READY_TIMEOUT`
   controls this deployment-only wait and defaults to 900 seconds.
+- Restore anything other than the generation `.deployed-sha` records: not a
+  commit the deploy root cannot produce, not a target the protocol fence
+  refuses, and not a host that never stopped serving.
 
 ## The names
 
