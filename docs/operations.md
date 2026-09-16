@@ -14,6 +14,9 @@ What is on `dev` today, what is verified, and the exact steps left before a
 job can run for real. This page is about operating it; design rationale lives
 in the project's issue history.
 
+For the pre-drain Kata check, old-release migration regression, peer-failure
+handling and queue alerts, see [deployment reliability](deployment-reliability.md).
+
 ## What a job does
 
 ```text

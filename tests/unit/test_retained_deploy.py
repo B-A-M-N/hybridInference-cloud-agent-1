@@ -35,6 +35,7 @@ def _host(
     attest_exit: int = 0,
     broker_running: bool = True,
     broker_serving: bool = True,
+    candidate_exit: int = 0,
 ) -> dict[str, str]:
     app_dir = tmp_path / "app"
     app_dir.mkdir()
@@ -72,6 +73,8 @@ def _host(
         'case "$*" in\n'
         f"  'info --format {{{{.DockerRootDir}}}}') echo '{daemon_root}' ;;\n"
         "  'info') exit 0 ;;\n"
+        '  *\' config --format json\') echo \'{"name":"test-retained","services":{"runner":{"image":"test-candidate-runner"}}}\' ;;\n'
+        f"  run*'cloud_agent_host.candidate_check') exit {candidate_exit} ;;\n"
         f"  *' ps -q runner') printf '%s\\n' '{runner_ids}' ;;\n"
         f"  *' ps -q workspace-broker') printf '%s\\n' '{broker_id}' ;;\n"
         f"  *' logs --since 2m runner') echo '{rejection_log}' ;;\n"
