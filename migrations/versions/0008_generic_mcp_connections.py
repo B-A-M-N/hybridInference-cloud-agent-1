@@ -24,9 +24,10 @@ Four new tables carry what a connection cannot: the discovery result, a
 conversation's use of it, one call held for a decision, and the user-run
 connectors that serve private and stdio servers.
 
-``agent_threads.mcp_servers`` is migrated and dropped. It held provider names,
-and a name is not a binding: left in place it would be a second authorization
-path that no version fence covers, which is exactly what the design forbids.
+``agent_threads.mcp_servers`` is migrated, then emptied and constrained to stay
+empty. The old API still projects this column while the new host is deploying.
+An inert column keeps ordinary conversation reads/writes working without leaving
+a second authorization path that no version fence covers.
 Each legacy entry is mapped to the user's connection for that provider when
 there is exactly one, and quarantined in ``agent_mcp_legacy_bindings`` when
 there is not. A mapped binding is created with ``selection_pending`` set, so a
@@ -82,6 +83,12 @@ def _widen_connections() -> None:
     # existing rows keep their provenance and the upgrade is data-preserving.
     op.execute("ALTER TABLE agent_mcp_connections RENAME COLUMN server TO template")
     op.execute("ALTER TABLE agent_mcp_connections ALTER COLUMN template DROP NOT NULL")
+    # The old composer and Integrations API still SELECT/ORDER BY server.
+    # Never expose a new connection through their provider-name authorizer.
+    op.execute(
+        "ALTER TABLE agent_mcp_connections ADD COLUMN server TEXT "
+        "GENERATED ALWAYS AS (NULL::text) STORED"
+    )
     # An unauthenticated or connector-local server has no platform-held secret.
     op.execute("ALTER TABLE agent_mcp_connections ALTER COLUMN access_token_ciphertext DROP NOT NULL")
     op.execute("ALTER TABLE agent_mcp_connections ADD COLUMN label TEXT")
@@ -423,14 +430,23 @@ def _migrate_thread_server_names() -> None:
         ON CONFLICT (thread_id, server) DO NOTHING
         """
     )
-    # The name list is dropped rather than kept as a compatibility read: a
-    # second path that authorizes by name is a path no version fence covers.
-    op.execute("ALTER TABLE agent_threads DROP COLUMN mcp_servers")
+    # Keep old job projections and empty selections executable until the API
+    # is replaced. Bindings above preserve the selection; this column cannot
+    # authorize anything, including when an old process tries to write it.
+    op.execute("UPDATE agent_threads SET mcp_servers = '{}'::text[]")
+    op.execute("ALTER TABLE agent_threads ALTER COLUMN mcp_servers SET DEFAULT '{}'::text[]")
+    op.execute(
+        "ALTER TABLE agent_threads ADD CONSTRAINT ck_agent_threads_legacy_mcp_empty "
+        "CHECK (mcp_servers IS NULL OR cardinality(mcp_servers) = 0)"
+    )
 
 
 def downgrade() -> None:
     """Put the provider-shaped schema back, keeping what can be mapped."""
-    op.execute("ALTER TABLE agent_threads ADD COLUMN mcp_servers TEXT[]")
+    op.execute("ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS mcp_servers TEXT[]")
+    op.execute(
+        "ALTER TABLE agent_threads DROP CONSTRAINT IF EXISTS ck_agent_threads_legacy_mcp_empty"
+    )
     op.execute(
         """
         UPDATE agent_threads t
@@ -510,6 +526,7 @@ def downgrade() -> None:
     )
     op.execute("DELETE FROM agent_mcp_connections WHERE template IS NULL")
     op.execute("UPDATE agent_mcp_connections SET template = 'github' WHERE template IS NULL")
+    op.execute("ALTER TABLE agent_mcp_connections DROP COLUMN IF EXISTS server")
     op.execute("ALTER TABLE agent_mcp_connections RENAME COLUMN template TO server")
     op.execute("ALTER TABLE agent_mcp_connections ALTER COLUMN server SET NOT NULL")
     op.execute("DELETE FROM agent_mcp_connections WHERE access_token_ciphertext IS NULL")

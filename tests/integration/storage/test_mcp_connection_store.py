@@ -1735,10 +1735,15 @@ async def test_the_0007_migration_maps_legacy_server_names_onto_bindings() -> No
                 "SELECT connection_id, alias FROM agent_mcp_thread_bindings "
                 "WHERE thread_id = 'athr_other'"
             )
-            still_there = await conn.fetchval(
-                "SELECT count(*) FROM information_schema.columns "
-                "WHERE table_name = 'agent_threads' AND column_name = 'mcp_servers'"
+            legacy_selection = await conn.fetchval(
+                "SELECT mcp_servers FROM agent_threads WHERE id = 'athr_legacy'"
             )
+            # Compatibility is a read shape, never another authorization path.
+            with pytest.raises(asyncpg.CheckViolationError):
+                await conn.execute(
+                    "UPDATE agent_threads SET mcp_servers = ARRAY['github'] "
+                    "WHERE id = 'athr_legacy'"
+                )
 
         assert [(row["alias"], row["enabled"], row["selection_pending"]) for row in mapped] == [
             ("github", True, True)
@@ -1752,17 +1757,14 @@ async def test_the_0007_migration_maps_legacy_server_names_onto_bindings() -> No
         assert [(row["connection_id"], row["alias"]) for row in other_mapped] == [
             (other_github, "github")
         ]
-        assert still_there == 0
+        assert legacy_selection == []
     finally:
         # Always leave the shared per-worker database at head and empty. An
         # interrupted downgrade can leave the predecessor's unique constraint
         # missing, and the upgrade drops it by name before anything else.
         async with pool.acquire() as conn:
-            at_previous_revision = await conn.fetchval(
-                "SELECT count(*) FROM information_schema.columns "
-                "WHERE table_name = 'agent_mcp_connections' AND column_name = 'server'"
-            )
-            if at_previous_revision:
+            revision = await conn.fetchval("SELECT version_num FROM alembic_version")
+            if revision == _PREVIOUS_REVISION:
                 present = await conn.fetchval(
                     "SELECT count(*) FROM pg_constraint WHERE conname = "
                     "'uq_agent_mcp_connections_server'"
