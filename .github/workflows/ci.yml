@@ -494,8 +494,9 @@ jobs:
           set -euo pipefail
           base="${PR_BASE_SHA:-${BEFORE_SHA:-HEAD^}}"
           # Published tags follow a successful deployment. This also covers a
-          # dev commit whose preceding commit never reached staging.
-          previous="$(git describe --first-parent --match 'agent-*' --abbrev=0 "$base")"
+          # dev commit whose preceding commit never reached staging. GitHub
+          # releases create lightweight tags, so include them with --tags.
+          previous="$(git describe --tags --first-parent --match 'agent-*' --abbrev=0 "$base")"
           uv run python scripts/check_rolling_upgrade.py --base "$previous"
 
       # The second half of the same guard. A fixture that skips on a database
