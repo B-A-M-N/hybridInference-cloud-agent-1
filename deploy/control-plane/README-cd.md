@@ -1,5 +1,8 @@
 # Continuous deployment
 
+The [deployment reliability runbook](../../docs/deployment-reliability.md)
+describes pre-deployment checks, failure handling and alert configuration.
+
 Two branches, two environments, and they federate with the matching gateway:
 
 | Branch | Environment | Deploys | Gateway it talks to |
