@@ -49,7 +49,6 @@ import { TerminalWorkspace } from './TerminalWorkspace';
 import { ThreadStatsBar } from './ThreadStatsBar';
 import { ThreadActions } from './ThreadActions';
 import { McpSessionPanel } from './mcp/McpSessionPanel';
-import { McpApprovalNotice } from './mcp/McpApprovalNotice';
 import type { AgentJob } from './types';
 import type { AgentJobApi, AgentJobEventApi, AgentThreadEventApi } from '@/lib/api/agents';
 import { AttemptTurnFooter } from './AttemptTurnFooter';
@@ -84,7 +83,7 @@ import {
   HistoryTurn,
 } from './ChatMessages';
 
-type WorkspaceTab = 'git' | 'terminal' | 'files' | 'tools' | 'side-chat';
+type WorkspaceTab = 'git' | 'terminal' | 'files' | 'side-chat';
 
 export const WORKSPACE_WIDTH_STORAGE_KEY = 'agents.workspace.width';
 const WORKSPACE_DEFAULT_WIDTH = 560;
@@ -114,10 +113,6 @@ const WORKSPACE_TABS: Array<{ key: WorkspaceTab; label: string }> = [
   { key: 'git', label: 'Git' },
   { key: 'terminal', label: 'Terminal' },
   { key: 'files', label: 'Files' },
-  // MCP selection and approvals are per conversation, so they belong beside
-  // the workspace rather than on the account-wide Integrations page: a held
-  // call is decided against this session's rules, not the user's.
-  { key: 'tools', label: 'Tools' },
   { key: 'side-chat', label: 'Side Chat' },
 ];
 
@@ -1441,13 +1436,11 @@ export function JobDetail({
                 ref={scroll.composerRef}
                 className="sticky bottom-0 z-10 -mx-2 mt-10 bg-gradient-to-t from-gray-50 via-gray-50/95 px-2 pb-2 pt-8 dark:from-gray-950 dark:via-gray-950/95"
               >
-                <McpApprovalNotice
+                <McpSessionPanel
                   jobId={job.id}
+                  threadId={job.threadId ?? job.id}
                   active={isActive}
-                  onReview={() => {
-                    setWorkspaceOpen(true);
-                    setWorkspaceTab('tools');
-                  }}
+                  approvalsOnly
                 />
                 {isArchived ? (
                   <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-gray-200 bg-white p-4 dark:border-white/10 dark:bg-gray-900">
@@ -1709,19 +1702,6 @@ export function JobDetail({
             className="min-h-0 flex-1 overflow-y-auto p-5"
           >
             <WorkspaceFiles job={job} active={workspaceOpen && workspaceTab === 'files'} />
-          </div>
-          <div
-            id="workspace-panel-tools"
-            role="tabpanel"
-            aria-labelledby="workspace-tab-tools"
-            hidden={workspaceTab !== 'tools'}
-            className="min-h-0 flex-1 overflow-y-auto p-5"
-          >
-            <McpSessionPanel
-              jobId={job.id}
-              threadId={job.threadId ?? job.id}
-              active={workspaceOpen && workspaceTab === 'tools'}
-            />
           </div>
           <div
             id="workspace-panel-side-chat"
