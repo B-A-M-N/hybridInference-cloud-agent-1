@@ -1483,6 +1483,7 @@ with no leader and no sharding.
 | `AGENT_PHYSICAL_HOST` | host name | Physical server this environment runs on, reported at enrolment as the `physical_host` label and used to group the admin inventory. `sandbox_host.sh` defaults it to `hostname -s`; set it explicitly when invoking Compose directly. Never a container hostname or a runtime suffix |
 | `AGENT_HOST_SLOTS` | `3` | Turns at once until an admin sets a number on the Servers page; at least two, at most 128. `AGENT_RUNNER_REPLICAS` is no longer read |
 | `AGENT_RETAINED_DOCKER_DATA_ROOT` | `/var/lib/docker` | Expected daemon `DockerRootDir`; provision this root on durable storage. It is verified by the host and broker and is never mounted into a chat container |
+| `AGENT_HOST_STORAGE_PROBE` | `overlay_root` | Which probe measures the filesystem holding the sandbox writable layers, shown as the Servers page's Storage column. `off` stops measuring storage on that host and is the rollback; an unrecognized name reports `unsupported` rather than measuring something else. A reading is published only for a topology the host deployment has attested; see *How full is the sandbox storage?* |
 | `AGENT_SANDBOX_UID` / `_GID` | `10001` | Only for a custom sandbox image; must match its user |
 | `AGENT_REPO_ALLOWLIST` | — | Comma-separated `owner/name`, or `owner/*`, for the single-tenant dogfood. Users who connect the App themselves do not need it; unset simply means the only entitlement is a user's own connection |
 | `AGENT_GITHUB_APP_CLIENT_ID` / `_CLIENT_SECRET` | — | The App's OAuth half. Only the user-facing connect flow needs it; minting installation tokens uses the private key alone |
@@ -1508,6 +1509,114 @@ tokens. GitLab is intentionally narrower in this release: it verifies the
 authenticated GitLab user and shows their accessible projects for discovery.
 GitLab projects do not appear in the Agent task composer, and the control plane does
 not claim to read their source or publish GitLab merge requests yet.
+
+### How full is the sandbox storage?
+
+The Servers table has a **Storage** column beside CPU and Memory: how much of
+the filesystem holding the retained sandbox writable layers is in use, in `df`
+terms. It answers a question the sandbox count cannot — `25 stopped` says
+containers are retained, not how much disk they hold — and it observes one
+filesystem, not one chat: a repository, its dependencies, uncommitted changes
+and the native CLI session all live in a container's writable layer, and
+stopping a container does not release it.
+
+The reading itself is cheap and local. A runner is an ordinary container under
+the same Docker daemon and storage driver as the sandboxes, so OverlayFS's
+`statfs` semantics make `os.statvfs("/")` inside it describe the upper layer's
+filesystem — the disk the writable layers are on. No host mount, no Docker
+query, no child process. The figures are `df`'s: `used` is `total - free`,
+`available` is what an unprivileged writer may still use, and the percentage is
+taken over `used + available`. The blocks the filesystem reserves for root that
+are still free are in neither figure — which is why the two do not add up to
+the total, and why `total - available` is not used space.
+
+**Why a deployment has to attest it first.** Docker's `overlay2.size` (and a
+container's `--storage-opt size=` on XFS with pquota) is implemented with project quotas,
+and a quota is what `statfs` returns for a directory inside the project. A
+container reading its own quota, and a host running `df <upperdir>`, would then
+report the *quota* — 10 GiB, say — with the same device number, so comparing
+those two proves nothing. `sandbox_host.sh` therefore compares the container's
+numbers against `df` of the **mount root** of the filesystem containing the
+upper directory, which no container project covers, and writes the verdict to
+`.storage-probe/verdict.json` beside `.shared-live-ready`:
+
+* the mount root's size must equal the container's own `total_bytes` exactly —
+  `size` does not move under writes, so this is the topology test;
+* `df <upperdir>` and `df <mount_root>` must agree on size, and `daemon.json`
+  / the `dockerd` command line must not mention `overlay2.size`; either
+  disagreement is recorded as `unsupported` (project quota);
+* `used` and `available` are compared within `max(1 GiB, 1% of size)` and only
+  as a diagnosis, because builds and cleanup interleave and nothing pauses the
+  world for monitoring.
+
+A non-root deployment user may be unable to traverse Docker/containerd's
+root-owned snapshot directories. When direct mount lookup fails, the deployment
+uses the running replica's immutable image ID for a temporary metadata helper.
+Docker resolves two non-recursive, read-only directory binds: the candidate
+mount root and that replica's upper directory. The helper checks the actual
+binds' device, filesystem root and type against the host mount-table plan before
+reading counters. A guessed path or mismatched mount never becomes verified.
+
+The helper has no network, capabilities, host PID namespace, Docker socket or
+credentials. Its root filesystem is read-only; it only reads its own mount
+metadata and calls `fstatvfs` on the two bound directories. It shares the
+attestation's remaining deadline, has its own maximum five-second alarm, and is
+removed on exit. Failed starts are cleaned up within the remaining budget. This
+is a deployment-only mount exception; collectors and job containers do not get
+these host views. No sudo rule or host directory permission change is needed.
+
+Each runner reads that file every sampling round and publishes a number only for
+its own upper directory, with a matching size. Anything else — no file, no
+entry, an entry that says `unsupported`, a resized filesystem — is reported as
+`unverified` / `unsupported` and the page says so instead of drawing a number.
+A rebuilt container gets a new upper directory, so an old attestation stops
+applying on its own; there is no time-based expiry.
+
+Compose binds only the dedicated `.storage-probe/` directory read-only at
+`/run/cloud-agent/storage-probe`. Each sample opens `verdict.json` by name, so
+deleting it reports `unverified` on the next sample; `sandbox_host.sh check`
+recreates it and sampling resumes without restarting replicas. Keep the bound
+directory itself in place. The file inside it is written beside itself and
+renamed over, never truncated first, so a replica sampling during a refresh
+reads either the old document or the new one and never an empty one. Upgrade from the old `.storage-probe-verdict` file
+bind with a normal `up`, which recreates runners with the new mount; `check`
+alone cannot change an existing container's mount configuration. The legacy
+file is ignored and is not used as a fallback.
+
+**Storage verification never blocks a deployment.** A metric that cannot be
+established is not a reason to keep a working host out of the pool: every
+failure above is a warning and a verdict entry, and `up` continues. The two
+operational consequences:
+
+```bash
+# Re-run the checks without redeploying — this also refreshes the verdict.
+deploy/host/sandbox_host.sh check
+
+# Turn the metric off entirely (the rollback). The `.env` is the deploy
+# checkout root's, beside `.deployed-sha`, which is where every reader looks.
+echo 'AGENT_HOST_STORAGE_PROBE=off' >> .env
+deploy/host/sandbox_host.sh up
+```
+
+The `up` is not optional. A container's environment is fixed when it is
+created, so replicas started before the edit keep measuring until they are
+replaced; `up` replaces them. A `check` in between is still worth running — it
+rewrites the verdict with no entries, which stops those replicas publishing a
+figure on their next sample even though they are still measuring. The variable
+takes `overlay_root` or `off` and nothing else: any other spelling is refused
+at configuration time rather than leaving the script and the runner to disagree
+about what it meant.
+
+**What the number is not.** It is block space, so `available` does not promise
+that any particular container can still write — inodes, quotas and a read-only
+remount still fail. It includes every other writer on that filesystem, so it is
+not the sum of Docker objects and it does not predict how many more sandboxes
+fit. On the default host deployment the rollout also stops reporting if the
+mount root itself is inside a size-limited project quota, which `df` cannot
+distinguish; the configuration check is best effort. Rootless, remote-Docker,
+btrfs/ZFS and devicemapper hosts are unverified: the probe reports
+`unsupported` rather than guessing. On Docker Desktop the host shell cannot see
+the VM's mounts, so local development shows `unverified`.
 
 ### Which machine runs the jobs
 
