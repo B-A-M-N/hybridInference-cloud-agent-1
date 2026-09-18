@@ -127,8 +127,7 @@ const DEPLOYMENTS = [
 
 // What a deployment that configured nothing renders.
 //
-// The literal is a copy of `NEUTRAL_SITE_CONFIG` in
-// `apps/frontend/src/config/site.ts`:
+// The literal is a copy of `NEUTRAL_SITE_CONFIG` in `apps/frontend/src/config/site.ts`:
 // this script cannot import TypeScript, and the unit test there is what pins
 // that object. Written down twice on purpose — if the default changes, this
 // check fails on the next run rather than agreeing with itself.

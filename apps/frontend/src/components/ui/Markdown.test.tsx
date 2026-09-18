@@ -43,7 +43,9 @@ describe('Markdown', () => {
     // case that used to fall through to the inline chip and render one chip
     // per line of an ASCII diagram.
     const { container } = render(
-      <Markdown text={'see `README.md`\n\n```\nbrowser ──▶ apps/frontend/\n   ▼\napps/backend/\n```'} />,
+      <Markdown
+        text={'see `README.md`\n\n```\nbrowser ──▶ apps/frontend/\n   ▼\napps/backend/\n```'}
+      />,
     );
     const inline = screen.getByText('README.md');
     const block = container.querySelector('pre > code');

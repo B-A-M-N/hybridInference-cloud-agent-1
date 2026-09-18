@@ -26,7 +26,9 @@ def install_mcp_helpers(manager: ChatSandboxManager, spec: ChatSandboxSpec, runt
     source_root = Path("/usr/local/libexec/mcp-runtime")
     if not source_root.is_dir():
         # Source checkouts run the same tests as the packaged host.
-        source_root = Path(__file__).resolve().parents[1] / "deploy/sandbox"
+        # `parents[3]`: this file, `cloud_agent_host/`, `backend/`, `apps/` —
+        # the package sits two levels deeper than it did at the root.
+        source_root = Path(__file__).resolve().parents[3] / "deploy/sandbox"
     current = manager._require(spec)
     for name in _HELPERS.get(runtime, ()):
         source = source_root / name

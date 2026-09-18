@@ -13,8 +13,7 @@
 // honest test is a real build. It is cheap — a build that fails on this error
 // stops during compilation.
 //
-// Run from `apps/frontend/`, or from anywhere with
-// `node apps/frontend/scripts/...`.
+// Run from `apps/frontend/`, or from anywhere with `node apps/frontend/scripts/...`.
 
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
