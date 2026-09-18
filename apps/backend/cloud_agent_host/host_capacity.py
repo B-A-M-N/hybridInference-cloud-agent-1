@@ -77,7 +77,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 
-from cloud_agent_contracts.host_capacity import (
+from cloud_agent_host.logging_utils import get_logger
+from cloud_agent_shared.host_capacity import (
     CPU_MISSING_COUNTER_RESET,
     CPU_MISSING_INVALID_SAMPLE,
     CPU_MISSING_SOURCE_UNAVAILABLE,
@@ -98,7 +99,6 @@ from cloud_agent_contracts.host_capacity import (
     storage_bytes_in_range,
     storage_usage,  # noqa: F401 — re-exported: the identity the host namespace kept.
 )
-from cloud_agent_host.logging_utils import get_logger
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence

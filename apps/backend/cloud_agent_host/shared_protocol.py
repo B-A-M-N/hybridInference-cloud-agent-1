@@ -1,6 +1,6 @@
-"""Re-export of :mod:`cloud_agent_contracts.shared_protocol`.
+"""Re-export of :mod:`cloud_agent_shared.shared_protocol`.
 
-The constants and helpers moved to the ``cloud_agent_contracts`` package, which
+The constants and helpers moved to the ``cloud_agent_shared`` package, which
 the runner image ships on its own. This module stays so existing host-side
 importers keep working: ``from cloud_agent_host.shared_protocol import ...``
 resolves to the very same objects, not copies.
@@ -20,13 +20,13 @@ and no test imports it. That is exactly the set a scan of
 ``tests/integration/storage/test_agent_grant_store.py`` and
 ``tests/integration/storage/test_agent_job_store.py``. The control plane is
 not in that set: it already imports
-``cloud_agent_contracts.shared_protocol`` directly, which is the path every
+``cloud_agent_shared.shared_protocol`` directly, which is the path every
 one of these callers is meant to end up on. The boundary test's
 contracts-isolation test is what keeps the new path honest while the old one
 still has callers.
 """
 
-from cloud_agent_contracts.shared_protocol import (
+from cloud_agent_shared.shared_protocol import (
     ENV_DEPLOYMENT_SHA,
     HOST_CONCURRENCY_CAPABILITY,
     HOST_CONCURRENCY_MAX_SLOTS,

@@ -30,7 +30,7 @@ from cloud_agent.api import routes
 from cloud_agent.app import create_app
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CONTRACT_FILE = REPO_ROOT / "contracts" / "agent-control-plane.openapi.json"
+CONTRACT_FILE = REPO_ROOT / "gateway_contracts" / "agent-control-plane.openapi.json"
 
 #: The prefix every surface router carries, and this test's scope.
 AGENT_PREFIX = "/v1/agent"

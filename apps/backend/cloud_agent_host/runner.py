@@ -45,7 +45,6 @@ if TYPE_CHECKING:
 
 import httpx
 
-from cloud_agent_git.source_archive import build_upload_archive
 from cloud_agent_host.chat_sandbox import (
     CHAT_UPLOADS_DIR,
     CHAT_WORKDIR,
@@ -113,6 +112,7 @@ from cloud_agent_host.shared_protocol import (
     shared_deployment_capability,
 )
 from cloud_agent_host.source_archive import build_base_bundle, build_source_archive
+from cloud_agent_shared.git.source_archive import build_upload_archive
 
 DEFAULT_LEASE_TTL_S = 120.0
 HEARTBEAT_INTERVAL_S = 30.0

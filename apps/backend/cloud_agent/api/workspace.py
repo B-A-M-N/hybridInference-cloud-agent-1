@@ -47,7 +47,7 @@ from cloud_agent.workspace_errors import (
     _workspace_broker_http_error,
     _workspace_not_materialized,
 )
-from cloud_agent_contracts.workspace_browser import WorkspacePathError, normalize_workspace_path
+from cloud_agent_shared.workspace_browser import WorkspacePathError, normalize_workspace_path
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator

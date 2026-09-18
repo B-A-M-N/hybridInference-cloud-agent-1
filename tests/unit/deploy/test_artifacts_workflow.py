@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-
 from deploy.release import release_manifest as rm, smoke
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -193,14 +192,14 @@ def test_the_build_passes_the_commit_every_image_must_name() -> None:
 
 
 def test_a_change_to_the_console_runs_the_image_jobs() -> None:
-    """web/ is half of the console image, and used to skip every docker job.
+    """apps/frontend/ is half of the console image, and used to skip every docker job.
 
-    Dockerfile.web copies `web/`, so a pull request that only touched the app
+    Dockerfile.web copies `apps/frontend/`, so a pull request that only touched the app
     changed what that image contains and ran none of the jobs that build it —
     which is how the image went unverified in the first place.
     """
     classify = str(step("Classify changed paths", job="changes")["run"])
-    assert "cloud_agent_host/|web/" in classify
+    assert "cloud_agent_host/|apps/frontend/" in classify
 
 
 def test_a_failed_run_leaves_nothing_behind() -> None:

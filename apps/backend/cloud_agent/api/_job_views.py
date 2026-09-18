@@ -28,11 +28,11 @@ from cloud_agent.schemas import (
     ProcessObservation,
     ToolCallResources,
 )
-from cloud_agent_contracts.egress import (
+from cloud_agent_shared.egress import (
     EgressPolicyError,
     build_policy_from_env as build_egress_policy,
 )
-from cloud_agent_git.patch_gate import branch_name_for
+from cloud_agent_shared.git.patch_gate import branch_name_for
 
 if TYPE_CHECKING:
     from typing import Any

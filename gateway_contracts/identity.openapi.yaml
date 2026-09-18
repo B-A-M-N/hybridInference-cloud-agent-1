@@ -350,4 +350,4 @@ x-pinned-by:
   consumer:
     - tests/unit/test_identity.py
     - tests/servers/test_session_api.py
-    - web/src/lib/auth/signin.test.ts
+    - apps/frontend/src/lib/auth/signin.test.ts

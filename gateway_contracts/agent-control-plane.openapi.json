@@ -8553,7 +8553,7 @@
         "type": "object"
       },
       "SessionUserResponse": {
-        "description": "Who the session says the caller is.\n\n``id`` rather than ``user_id``: this is the shape ``web/src/lib/api/\nsession.ts`` was written against, and it is the contract for all three\nsession routes.",
+        "description": "Who the session says the caller is.\n\n``id`` rather than ``user_id``: this is the shape ``apps/frontend/src/lib/api/\nsession.ts`` was written against, and it is the contract for all three\nsession routes.",
         "properties": {
           "agent_access": {
             "$ref": "#/components/schemas/AgentAccess"

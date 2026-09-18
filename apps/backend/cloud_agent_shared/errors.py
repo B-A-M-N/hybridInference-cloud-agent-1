@@ -1,7 +1,7 @@
 """Error types both sides of the deployment have to agree on.
 
 ``SandboxError`` is the one error that crosses the boundary: the host's sandbox
-raises it, and the shared source-archive builders in ``cloud_agent_git`` raise
+raises it, and the shared source-archive builders in ``cloud_agent_shared.git`` raise
 the same class when a prepared checkout cannot be archived. It is an ordinary
 ``Exception`` subclass with no behaviour of its own, so it carries no execution
 dependency and belongs with the rest of the shared vocabulary rather than in

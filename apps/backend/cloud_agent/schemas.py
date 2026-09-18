@@ -28,8 +28,8 @@ from cloud_agent.skills.models import (
     SelectedSkill,
     SkillLimits,
 )
-from cloud_agent_contracts.event_payloads import bound_event_payload
-from cloud_agent_contracts.shared_protocol import (
+from cloud_agent_shared.event_payloads import bound_event_payload
+from cloud_agent_shared.shared_protocol import (
     HOST_CONCURRENCY_MAX_SLOTS,
     HOST_CONCURRENCY_MIN_SLOTS,
     SHARED_MEMBER_ACCOUNTING_VERSION,
@@ -2516,7 +2516,7 @@ class HostHeartbeatResponse(BaseModel):
 class SessionUserResponse(BaseModel):
     """Who the session says the caller is.
 
-    ``id`` rather than ``user_id``: this is the shape ``web/src/lib/api/
+    ``id`` rather than ``user_id``: this is the shape ``apps/frontend/src/lib/api/
     session.ts`` was written against, and it is the contract for all three
     session routes.
     """

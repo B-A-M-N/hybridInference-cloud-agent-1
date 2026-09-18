@@ -28,7 +28,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from cloud_agent_contracts.errors import SandboxError
 from cloud_agent_host.egress import (
     PHASES,
     EgressPolicy,
@@ -38,6 +37,7 @@ from cloud_agent_host.egress import (
 )
 from cloud_agent_host.egress_proxy import CANARY_HOST
 from cloud_agent_host.logging_utils import get_logger
+from cloud_agent_shared.errors import SandboxError
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

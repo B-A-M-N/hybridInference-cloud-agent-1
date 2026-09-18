@@ -1,7 +1,7 @@
 """Version fence shared by the control plane and shared-sandbox runners.
 
 The runner image deliberately ships only :mod:`cloud_agent_host` and
-:mod:`cloud_agent_contracts`.  Protocol constants used while polling must
+:mod:`cloud_agent_shared`.  Protocol constants used while polling must
 therefore live on this side of the package boundary; the control plane already
 ships both packages for shared patch validation and imports the same values so
 the two claim gates cannot drift.

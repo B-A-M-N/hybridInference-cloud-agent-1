@@ -18,7 +18,7 @@ import tarfile
 import tempfile
 from typing import TYPE_CHECKING
 
-from cloud_agent_contracts.errors import SandboxError
+from cloud_agent_shared.errors import SandboxError
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
