@@ -29,10 +29,10 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from fastapi import HTTPException
 
-from cloud_agent.api._workspace_access import _workspace_broker_http_error
 from cloud_agent.application.residency import RESIDENCY_TTL_S, _mint_residency_grant
 from cloud_agent.broker_routing import broker_for_job
 from cloud_agent.workspace_broker_client import WorkspaceBrokerError
+from cloud_agent.workspace_errors import _workspace_broker_http_error
 
 if TYPE_CHECKING:
     from cloud_agent.ports import (

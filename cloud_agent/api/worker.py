@@ -22,7 +22,6 @@ from typing import TYPE_CHECKING, Any, Protocol
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
 
 from cloud_agent.api._workspace_access import (
-    _workspace_broker_http_error,
     _workspace_id,
     _workspace_not_ready,
 )
@@ -83,6 +82,7 @@ from cloud_agent.tokens import (
     parse_worker_token,
 )
 from cloud_agent.workspace_broker_client import WorkspaceBrokerError
+from cloud_agent.workspace_errors import _workspace_broker_http_error
 from cloud_agent_host.runtimes import runtimes_supporting_mcp
 
 if TYPE_CHECKING:
