@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import receiptContract from '../../../../../tests/fixtures/side_chat_job_receipt.json';
+import receiptContract from '../../../../../../tests/fixtures/side_chat_job_receipt.json';
 import { installSideChatLocks } from './sideChatTestSupport';
 import '@testing-library/jest-dom/vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';

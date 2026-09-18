@@ -52,7 +52,7 @@
 //      render and after the last, so "one image, many deployments" is checked
 //      rather than inferred from the shape of the loop.
 //
-// Run from `web/`.
+// Run from `apps/frontend/`.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -127,7 +127,8 @@ const DEPLOYMENTS = [
 
 // What a deployment that configured nothing renders.
 //
-// The literal is a copy of `NEUTRAL_SITE_CONFIG` in `web/src/config/site.ts`:
+// The literal is a copy of `NEUTRAL_SITE_CONFIG` in
+// `apps/frontend/src/config/site.ts`:
 // this script cannot import TypeScript, and the unit test there is what pins
 // that object. Written down twice on purpose — if the default changes, this
 // check fails on the next run rather than agreeing with itself.

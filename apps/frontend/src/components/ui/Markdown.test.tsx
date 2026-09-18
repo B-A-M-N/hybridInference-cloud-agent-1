@@ -43,14 +43,14 @@ describe('Markdown', () => {
     // case that used to fall through to the inline chip and render one chip
     // per line of an ASCII diagram.
     const { container } = render(
-      <Markdown text={'see `README.md`\n\n```\nbrowser ──▶ web/\n   ▼\ncloud_agent/\n```'} />,
+      <Markdown text={'see `README.md`\n\n```\nbrowser ──▶ apps/frontend/\n   ▼\napps/backend/\n```'} />,
     );
     const inline = screen.getByText('README.md');
     const block = container.querySelector('pre > code');
     expect(block).not.toBeNull();
     expect(inline.className).toContain('bg-gray-950/[0.06]');
     expect(block!.className).not.toContain('bg-gray-950/[0.06]');
-    expect(block!.textContent).toBe('browser ──▶ web/\n   ▼\ncloud_agent/');
+    expect(block!.textContent).toBe('browser ──▶ apps/frontend/\n   ▼\napps/backend/');
   });
 
   it('colours the keywords of a fence that names its language', () => {
