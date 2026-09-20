@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import json
 import os
 import pathlib
 import queue
@@ -41,7 +42,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable, Mapping
 
 import httpx
 
@@ -112,6 +113,18 @@ from cloud_agent_host.shared_protocol import (
     shared_deployment_capability,
 )
 from cloud_agent_host.source_archive import build_base_bundle, build_source_archive
+from cloud_agent_profiling import operation_profiling
+from cloud_agent_profiling.measurement_delivery import (
+    DELIVERY_ATTEMPTS_MAX,
+    DELIVERY_BYTES_MAX,
+    DELIVERY_DRAIN_S,
+    DELIVERY_HANDOFF_DRAIN_S,
+    DELIVERY_QUEUE_MAX,
+    DELIVERY_TIMEOUT_S,
+    attempts_exhausted,
+    classify_exception,
+    classify_response,
+)
 from cloud_agent_shared.git.source_archive import build_upload_archive
 
 DEFAULT_LEASE_TTL_S = 120.0
@@ -133,6 +146,11 @@ _POLL_INTERVAL_S = 0.5
 # report. The broker client itself has the same 180 second request ceiling.
 _SHARED_TURN_INTERRUPT_DRAIN_S = 180.0
 _GIT_TIMEOUT_S = 300.0
+
+#: The root profiling operation covering one attempt's startup chain, from the
+#: claim request to the moment the prompt is handed to the resident CLI. It is
+#: the name an experiment lists in its run descriptor's `operations`.
+STARTUP_OPERATION = "attempt.startup"
 
 logger = get_logger(__name__)
 
@@ -387,6 +405,25 @@ class ControlPlane:
             raise LeaseLost(response.text[:200])
         response.raise_for_status()
         return response.json() if response.content else {}
+
+    def record_measurement(self, job_id: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Post one measurement and return its status and body.
+
+        Returns the answer rather than raising on a non-2xx, because delivery
+        decides what a status means: a 409 here is a *measurement* conflict,
+        not a lost lease, and the shared ``_post`` would raise ``LeaseLost``
+        for it and end a turn that had already succeeded.
+        """
+        response = self._client.post(
+            f"{self._base}/v1/agent/worker/jobs/{job_id}/measurements",
+            json=body,
+            timeout=DELIVERY_TIMEOUT_S,
+        )
+        try:
+            parsed = response.json() if response.content else {}
+        except ValueError:
+            parsed = {}
+        return response.status_code, parsed if isinstance(parsed, dict) else {}
 
     def append_event(self, event: NormalizedEvent) -> None:
         """Report one normalized event, retrying once now that replay is safe.
@@ -1550,8 +1587,17 @@ def _stream_shared_agent_turn(
     heart: Heartbeater,
     lease_token: str,
     timeout_s: float,
+    measurement: operation_profiling.Measurement | None = None,
+    on_frozen: Callable[[operation_profiling.Measurement], None] | None = None,
 ) -> tuple[int, str, list[str], dict[str, Any] | None]:
-    """Relay exactly one broker-framed member turn under its attempt fence."""
+    """Relay exactly one broker-framed member turn under its attempt fence.
+
+    Handing the prompt to the supervisor closes the startup measurement:
+    everything after that point is model execution, which the design keeps in a
+    separate post-dispatch fragment. The caller marks the ``prompt_dispatch``
+    boundary immediately before this call, so the handoff is one stage in the
+    startup timeline rather than a stage of its own after it.
+    """
     stream = supervisor.start_shared_turn(
         job.thread_id,
         token=lease_token,
@@ -1559,6 +1605,14 @@ def _stream_shared_agent_turn(
         model=job.model,
         reasoning_effort=job.reasoning_effort,
     )
+    operation_profiling.finish(measurement, outcome="dispatched")
+    # Queued here, not when the turn ends. The prompt has been handed over and
+    # the startup is complete and frozen, so the sample exists now -- while the
+    # model may run for another hour. Waiting would both delay an operator's
+    # view of it and, on a long enough turn, deliver it after the experiment's
+    # grace period, which the endpoint correctly refuses.
+    if measurement is not None and on_frozen is not None:
+        on_frozen(measurement)
     frames: queue.Queue[dict[str, Any] | None] = queue.Queue()
 
     def pump() -> None:
@@ -1681,6 +1735,41 @@ def _stream_shared_agent_turn(
         stream.close()
 
 
+def _classify_startup_path(container_action: str, resident_action: str) -> str:
+    """Name the startup path from the actions the supervisor actually took.
+
+    The four paths differ by what was done, not by how long it took, and the
+    container's state afterwards cannot tell them apart: a stop followed by a
+    start and a container that never stopped both end up running. So this reads
+    the supervisor's report rather than inferring from the timeline, and says
+    ``unknown`` when the actions do not identify a path instead of guessing.
+    """
+    if container_action == "create":
+        return "new_group"
+    if container_action == "start":
+        return "resume_stopped"
+    # Anything else -- including a resident action the broker did not report --
+    # does not identify a path, and guessing one would poison the comparison
+    # the four paths exist for.
+    if container_action == "reuse":
+        if resident_action == "reuse":
+            return "reuse_live"
+        if resident_action in {"new", "resume"}:
+            return "resume_running"
+    return "unknown"
+
+
+def _stage(measurement: operation_profiling.Measurement | None, name: str) -> str:
+    """Record a stage boundary and return the name.
+
+    The runner already tracks its phase in ``stage`` for failure reporting, so
+    the timeline costs one call per transition and needs no restructuring.
+    Consecutive marks become the record's per-stage durations.
+    """
+    operation_profiling.mark(measurement, name)
+    return name
+
+
 def _run_shared_live_attempt(
     *,
     runtime: AgentRuntime,
@@ -1692,8 +1781,15 @@ def _run_shared_live_attempt(
     gateway_base_url: str,
     agent_timeout_s: float,
     finish_attempt: Any,
+    measurement: operation_profiling.Measurement | None = None,
 ) -> int:
-    """Deliver one chat turn to its supervisor-owned resident CLI member."""
+    """Deliver one chat turn to its supervisor-owned resident CLI member.
+
+    ``measurement`` is the opt-in startup timing for this attempt. It is
+    ``None`` unless an experiment selected it, and every call on it is a no-op
+    in that case, so the delivery path is unchanged when profiling is off.
+    """
+    operation_profiling.mark(measurement, "validate")
     if not isinstance(backend, ContainerBackend):
         finish_attempt("failed", "shared live chats require the container or kata backend")
         return 2
@@ -1756,6 +1852,7 @@ def _run_shared_live_attempt(
             finish_attempt("failed", "shared chat container identity does not match its labels")
             return 2
 
+    operation_profiling.mark(measurement, "reserve")
     try:
         reservation = control.reserve_chat_sandbox(
             {
@@ -1804,7 +1901,7 @@ def _run_shared_live_attempt(
     terminals_suspended = False
     context_invalid = False
     failure_detail: str | None = None
-    stage = "supervisor_acquire"
+    stage = _stage(measurement, "supervisor_acquire")
     context_status = "restored" if has_context else "new"
     idle_timeout_s = _chat_idle_timeout_s()
 
@@ -1845,6 +1942,9 @@ def _run_shared_live_attempt(
     try:
         supervisor = _session_supervisor_from_env()
         try:
+            acquire_call = operation_profiling.expect_fragment(
+                measurement, "broker", "supervisor_acquire"
+            )
             lease = supervisor.acquire_shared(
                 spec,
                 thread_id=job.thread_id,
@@ -1853,11 +1953,23 @@ def _run_shared_live_attempt(
                 has_settled_context=has_context,
                 members=manifest,
                 expected_container_id=reservation.get("container_id"),
+                profiling=operation_profiling.measurement_context(measurement, acquire_call),
             )
         except SessionSupervisorError as exc:
             context_invalid = has_context and exc.status_code == 410
             raise
         lease_token = str(lease["token"])
+        container_action = str(lease.get("container_action") or "unknown")
+        # One answer for one call. Sub-stages the broker measured are durations,
+        # not offsets, so they hang off the stage they happened in rather than
+        # being placed on this process's timeline.
+        operation_profiling.record_fragment(
+            measurement,
+            producer="broker",
+            call_id=acquire_call,
+            stage="supervisor_acquire",
+            response=lease,
+        )
         if int(lease["activation_generation"]) != activation_generation:
             raise SandboxError("shared supervisor returned the wrong activation generation")
         if reservation.get("container_id") not in {None, lease.get("container_id")}:
@@ -1865,7 +1977,7 @@ def _run_shared_live_attempt(
         context_status = str(lease.get("context_status") or context_status)
         if context_status not in {"new", "live", "restored"}:
             raise SandboxError(f"shared supervisor returned invalid context {context_status!r}")
-        stage = "sandbox_running"
+        stage = _stage(measurement, "sandbox_running")
         running = control.mark_chat_sandbox_running(
             sandbox_generation=spec.generation,
             activation_generation=activation_generation,
@@ -1889,18 +2001,19 @@ def _run_shared_live_attempt(
                 },
             )
         )
-        stage = "terminal_suspend"
+        stage = _stage(measurement, "terminal_suspend")
         control.suspend_terminals("workspace_preparing")
         terminals_suspended = True
 
+        imported_base: str | None = None
         if not has_context:
-            stage = "workspace_reset"
+            stage = _stage(measurement, "workspace_reset")
             manager.reset_unsettled_state(spec)
-            stage = "checkout"
+            stage = _stage(measurement, "checkout")
             base_sha = _prepare_retained_checkout(job=job, manager=manager, spec=spec)
             reused_workspace = False
             if job.setup_script:
-                stage = "setup"
+                stage = _stage(measurement, "setup")
                 setup = run_setup(
                     script=job.setup_script,
                     workdir=CHAT_WORKDIR,
@@ -1917,10 +2030,10 @@ def _run_shared_live_attempt(
                     abandon_before_finish(lost=False, detail=failure_detail)
                     finish_attempt("failed", failure_detail, base_sha=base_sha)
                     return 1
-            stage = "workspace_permissions"
+            stage = _stage(measurement, "workspace_permissions")
             manager.prepare_shared_workspace(spec)
         else:
-            stage = "native_workspace_resume"
+            stage = _stage(measurement, "native_workspace_resume")
             if not native_session_id:
                 context_invalid = True
                 raise SandboxError("shared chat has no native Agent CLI session locator")
@@ -1977,7 +2090,7 @@ def _run_shared_live_attempt(
             )
         )
 
-        stage = "runtime_preflight"
+        stage = _stage(measurement, "runtime_preflight")
         version_problem = runtime_version_unavailable(job, retained)
         if version_problem is not None:
             failure_detail = version_problem
@@ -1990,12 +2103,17 @@ def _run_shared_live_attempt(
             finish_attempt("failed", failure_detail, base_sha=base_sha)
             return 2
 
-        stage = "agent_network"
+        stage = _stage(measurement, "agent_network")
+        # This manager runs in the runner's own process, so its sub-stages are
+        # timed directly onto the measurement. On the warm path the Kata guest
+        # restart never happens, and a timeline without those stages is the
+        # answer rather than a gap.
+        network_observer = operation_profiling.stage_observer(measurement)
         if has_context:
-            manager.require_network_phase(spec, "agent")
+            manager.require_network_phase(spec, "agent", observer=network_observer)
         else:
-            manager.transition_to_agent_network(spec)
-        stage = "terminal_resume"
+            manager.transition_to_agent_network(spec, observer=network_observer)
+        stage = _stage(measurement, "terminal_resume")
         control.resume_terminals()
         terminals_suspended = False
 
@@ -2019,14 +2137,18 @@ def _run_shared_live_attempt(
             slot_id=slot_id,
             residency_generation=int(running.get("residency_generation") or 0),
         )
-        stage = "resident_start"
+        stage = _stage(measurement, "resident_start")
         resident_descriptor: dict[str, Any] | None = None
         if lease.get("resident_state") == "live":
             try:
+                resident_call = operation_profiling.expect_fragment(
+                    measurement, "broker", "resident_start"
+                )
                 resident_descriptor = supervisor.ensure_shared_resident(
                     job.thread_id,
                     token=lease_token,
                     launch=launch,
+                    profiling=operation_profiling.measurement_context(measurement, resident_call),
                 )
             except SessionSupervisorError:
                 # A process-fixed model/MCP setting changed, the process died,
@@ -2050,10 +2172,14 @@ def _run_shared_live_attempt(
                 credential=credential,
                 residency_generation=int(residency["generation"]),
             )
+            resident_call = operation_profiling.expect_fragment(
+                measurement, "broker", "resident_start"
+            )
             resident_descriptor = supervisor.ensure_shared_resident(
                 job.thread_id,
                 token=lease_token,
                 launch=launch,
+                profiling=operation_profiling.measurement_context(measurement, resident_call),
             )
         context_status = str(resident_descriptor.get("context_status") or context_status)
         if context_status not in {"new", "live", "restored"}:
@@ -2061,6 +2187,27 @@ def _run_shared_live_attempt(
                 f"shared supervisor returned invalid resident context {context_status!r}"
             )
         process_generation = int(resident_descriptor["process_generation"])
+        resident_action = str(resident_descriptor.get("resident_action") or "unknown")
+        operation_profiling.record_fragment(
+            measurement,
+            producer="broker",
+            call_id=resident_call,
+            stage="resident_start",
+            response=resident_descriptor,
+        )
+        if measurement is not None:
+            operation_profiling.set_attributes(
+                measurement,
+                context_status=context_status,
+                container_action=container_action,
+                resident_action=resident_action,
+                startup_path=_classify_startup_path(container_action, resident_action),
+                process_generation=process_generation,
+                container_id=str(lease["container_id"]),
+                workspace_action=(
+                    "prepare" if not has_context else ("base_import" if imported_base else "reuse")
+                ),
+            )
         control.record_chat_process(
             sandbox_generation=spec.generation,
             activation_generation=activation_generation,
@@ -2073,7 +2220,7 @@ def _run_shared_live_attempt(
         else:
             control.report_context_status("new")
 
-        stage = "prompt_admission"
+        stage = _stage(measurement, "prompt_admission")
         _retry_lifecycle_receipt(
             "prompt_admission_retry",
             job.job_id,
@@ -2086,6 +2233,27 @@ def _run_shared_live_attempt(
         result_frame: dict[str, Any] | None = None
         try:
             stage = "turn_stream"
+            # The prompt handoff is the last startup stage. `stage` stays a
+            # plain string because a failure inside the turn is an execution
+            # failure, not a startup stage.
+            operation_profiling.mark(measurement, "prompt_dispatch")
+
+            def _frozen_measurement(frozen: operation_profiling.Measurement) -> None:
+                """Send a startup sample the moment it is complete.
+
+                Its own callback rather than a call here, because the freeze
+                happens inside the streaming helper: the startup ends when the
+                prompt is handed to the supervisor, not when the model is done.
+                """
+                _enqueue_delivery(
+                    frozen,
+                    job=job,
+                    # The client already holds the address it was built with,
+                    # so this path needs no extra plumbing to reach it.
+                    base_url=control._base,
+                    drain_s=DELIVERY_HANDOFF_DRAIN_S,
+                )
+
             exit_code, tail, tool_errors, result_frame = _stream_shared_agent_turn(
                 supervisor=supervisor,
                 job=job,
@@ -2093,6 +2261,8 @@ def _run_shared_live_attempt(
                 heart=heart,
                 lease_token=lease_token,
                 timeout_s=agent_timeout_s,
+                measurement=measurement,
+                on_frozen=_frozen_measurement,
             )
         finally:
             # Container totals include concurrent siblings and cannot be
@@ -2160,7 +2330,7 @@ def _run_shared_live_attempt(
                 )
             )
 
-        stage = "settlement"
+        stage = _stage(measurement, "settlement")
         local_settle = _retry_lifecycle_receipt(
             "supervisor_settlement_retry",
             job.job_id,
@@ -2221,6 +2391,7 @@ def _run_shared_live_attempt(
         return 0
     except LeaseLost:
         failure_detail = "attempt lease lost during shared live execution"
+        operation_profiling.finish(measurement, outcome="lease_lost", failure_stage=stage)
         return 3
     except (DriverError, SandboxError, SessionSupervisorError, WorktreeError) as exc:
         failure_detail = str(exc)
@@ -2235,6 +2406,14 @@ def _run_shared_live_attempt(
         report_failure()
         return 2
     finally:
+        # Any path that stopped before the prompt handoff still reports one
+        # record naming the stage it stopped at, instead of a silently missing
+        # sample. After a successful dispatch this is a no-op.
+        operation_profiling.finish(
+            measurement,
+            outcome="failed" if failure_detail else "incomplete",
+            failure_stage=stage,
+        )
         if not settled and not abandoned:
             abandon_before_finish(lost=turn_admitted or context_invalid, detail=failure_detail)
         if supervisor is not None:
@@ -2270,16 +2449,47 @@ def run_once(
         backend = build_backend_from_env()
         backend.preflight()
 
-    job = claim(
-        base_url=base_url,
-        host_credential=host_credential,
+    # Opt-in timing for the startup chain. `None` unless an experiment selects
+    # this operation, and every helper below is a no-op on `None`.
+    measurement = operation_profiling.start_operation(
+        operation=STARTUP_OPERATION,
+        host=host,
         worker_id=worker_id,
-        lease_ttl=lease_ttl,
-        attestation=_claim_attestation(backend),
     )
+    try:
+        with operation_profiling.span(measurement, "claim"):
+            attestation = _claim_attestation(backend)
+            job = claim(
+                base_url=base_url,
+                host_credential=host_credential,
+                worker_id=worker_id,
+                lease_ttl=lease_ttl,
+                attestation=attestation,
+            )
+    except BaseException:
+        # A claim that never returned allocated no attempt, so there is nothing
+        # to report and the run must not spend a slot on a failed poll.
+        operation_profiling.discard(measurement)
+        raise
     if job is None:
+        # Nothing was claimed, so there is no startup to measure.
+        operation_profiling.discard(measurement)
         print("no queued agent job; nothing to do")
         return 0
+    # Target filters on job/thread/sandbox can only be applied now. A
+    # measurement that falls out of scope emits nothing.
+    if measurement is not None and not operation_profiling.bind(
+        measurement,
+        attempt_id=job.attempt_id,
+        job_id=job.job_id,
+        thread_id=job.thread_id,
+        sandbox_id=str((job.thread_sandbox or {}).get("sandbox_id") or "") or None,
+        runtime_id=job.runtime,
+        runtime_version=job.runtime_version,
+        execution_profile=job.execution_profile,
+    ):
+        operation_profiling.discard(measurement)
+        measurement = None
 
     return run_turn(
         job,
@@ -2290,6 +2500,7 @@ def run_once(
         agent_timeout_s=agent_timeout_s,
         backend=backend,
         host=host,
+        measurement=measurement,
     )
 
 
@@ -2303,6 +2514,221 @@ def run_turn(
     agent_timeout_s: float = DEFAULT_AGENT_TIMEOUT_S,
     backend: SandboxBackend | None = None,
     host: str | None = None,
+    measurement: operation_profiling.Measurement | None = None,
+) -> int:
+    """Deliver one already-claimed turn, then report what it measured.
+
+    The delivery is outside the turn on purpose: the record was frozen while
+    the startup ran, and sending it -- with its retries and its timeouts --
+    must not land inside the thing being measured or delay the turn's own
+    answer.
+    """
+    try:
+        return _run_turn(
+            job,
+            base_url=base_url,
+            gateway_url=gateway_url,
+            worker_id=worker_id,
+            lease_ttl=lease_ttl,
+            agent_timeout_s=agent_timeout_s,
+            backend=backend,
+            host=host,
+            measurement=measurement,
+        )
+    finally:
+        # A bounded sweep, not the delivery itself for the common case: the
+        # record was queued when it was frozen, and this only catches one the
+        # turn ended before. Waited for briefly, because a control plane that
+        # is slow or unreachable must not hold this process open -- the turn is
+        # over and its answer given, and whatever the thread has not finished
+        # by the drain bound is simply not delivered.
+        _enqueue_delivery(measurement, job=job, base_url=base_url, drain_s=DELIVERY_DRAIN_S)
+
+
+def _delivery_payload_size(measurement: operation_profiling.Measurement) -> int:
+    """Return the encoded record and manifest bytes held by one delivery."""
+    outcome = measurement.frozen_outcome or "incomplete"
+    record = operation_profiling.frozen_record(measurement, outcome)
+    manifest = operation_profiling.manifest_for_measurement(measurement)
+    if record is None or manifest is None:
+        return 0
+    try:
+        return len(
+            json.dumps(
+                {"record": record, "run": manifest},
+                separators=(",", ":"),
+                default=str,
+            ).encode()
+        )
+    except (TypeError, ValueError):
+        return 0
+
+
+def _enqueue_delivery(
+    measurement: operation_profiling.Measurement | None,
+    *,
+    job: ClaimedJob,
+    base_url: str,
+    drain_s: float,
+) -> None:
+    """Start a frozen measurement's send, or wait for the one already running.
+
+    A record is frozen once, so only the first caller starts a thread. *Every*
+    caller then waits its own bound -- including the one that started it. The
+    first version returned as soon as the thread was running, which meant a
+    turn that failed before dispatch (so the exit's sweep was the first
+    enqueue) got no wait at all, and the process could exit with the send still
+    in flight. That is exactly the case the sweep exists for.
+    """
+    if measurement is None:
+        return
+    global _DELIVERY_DROPPED_COUNT, _DELIVERY_DRAIN_TIMEOUTS, _DELIVERY_PENDING_BYTES
+    measurement_id = measurement.measurement_id
+    payload_size = _delivery_payload_size(measurement)
+    start = False
+    dropped = False
+    with _DELIVERY_STATE_LOCK:
+        if measurement_id in _DELIVERED_MEASUREMENT_IDS:
+            return
+        thread = _IN_FLIGHT_DELIVERIES.get(measurement_id)
+        if thread is None and measurement_id not in _STARTING_DELIVERIES:
+            if (
+                len(_IN_FLIGHT_DELIVERIES) + len(_STARTING_DELIVERIES) >= DELIVERY_QUEUE_MAX
+                or _DELIVERY_PENDING_BYTES + payload_size > DELIVERY_BYTES_MAX
+            ):
+                _DELIVERED_MEASUREMENT_IDS.add(measurement_id)
+                _DELIVERY_DROPPED_COUNT += 1
+                dropped = True
+            else:
+                _STARTING_DELIVERIES.add(measurement_id)
+                _DELIVERY_SIZES[measurement_id] = payload_size
+                _DELIVERY_PENDING_BYTES += payload_size
+                start = True
+    if dropped:
+        logger.warning(
+            "agent_measurement_delivery_queue_full",
+            extra={
+                "event": "agent_measurement_delivery_queue_full",
+                "measurement_id": measurement_id,
+                "dropped": _DELIVERY_DROPPED_COUNT,
+            },
+        )
+        return
+    if start:
+        thread = _deliver_in_background(job=job, base_url=base_url, measurement=measurement)
+        with _DELIVERY_STATE_LOCK:
+            _STARTING_DELIVERIES.discard(measurement_id)
+            # Recorded only once it is actually running. A thread that could
+            # not start leaves nothing behind, so the next caller retries.
+            if thread is not None and measurement_id not in _DELIVERED_MEASUREMENT_IDS:
+                _IN_FLIGHT_DELIVERIES[measurement_id] = thread
+            elif thread is None:
+                _DELIVERY_PENDING_BYTES = max(
+                    0,
+                    _DELIVERY_PENDING_BYTES - _DELIVERY_SIZES.pop(measurement_id, 0),
+                )
+    # Joined whether it was just started or was already on its way: the bound
+    # belongs to the caller that is waiting, not to whoever happened to be
+    # first.
+    if thread is not None and drain_s > 0:
+        thread.join(timeout=drain_s)
+        if thread.is_alive():
+            with _DELIVERY_STATE_LOCK:
+                _DELIVERY_DRAIN_TIMEOUTS += 1
+                timed_out = _DELIVERY_DRAIN_TIMEOUTS
+            logger.warning(
+                "agent_measurement_delivery_outlived_drain",
+                extra={
+                    "event": "agent_measurement_delivery_outlived_drain",
+                    "measurement_id": measurement_id,
+                    "drain_s": drain_s,
+                    "count": timed_out,
+                },
+            )
+
+
+def _deliver_in_background(
+    *,
+    job: ClaimedJob,
+    base_url: str,
+    measurement: operation_profiling.Measurement,
+) -> threading.Thread | None:
+    """Start a send for this measurement, or ``None`` if no thread would run."""
+
+    def _send() -> None:
+        global _DELIVERY_PENDING_BYTES
+        control: ControlPlane | None = None
+        try:
+            control = ControlPlane(base_url, job.worker_token)
+            outcome = measurement.frozen_outcome or "incomplete"
+            record = operation_profiling.frozen_record(measurement, outcome)
+            manifest = operation_profiling.manifest_for_measurement(measurement)
+            if record is None or manifest is None:
+                logger.warning(
+                    "agent_measurement_delivery_missing_record",
+                    extra={
+                        "event": "agent_measurement_delivery_missing_record",
+                        "job_id": job.job_id,
+                        "measurement_id": measurement.measurement_id,
+                    },
+                )
+                return
+            counts = deliver_measurement_record(
+                control=control,
+                job_id=job.job_id,
+                record=record,
+                manifest=manifest,
+            )
+            if counts["dropped"] or counts["retried"]:
+                logger.info(
+                    "agent_measurement_delivery_summary",
+                    extra={
+                        "event": "agent_measurement_delivery_summary",
+                        "job_id": job.job_id,
+                        "measurement_id": measurement.measurement_id,
+                        **counts,
+                    },
+                )
+        except Exception:
+            logger.warning(
+                "agent_measurement_delivery_failed",
+                exc_info=True,
+                extra={"event": "agent_measurement_delivery_failed"},
+            )
+        finally:
+            if control is not None:
+                control.close()
+            with _DELIVERY_STATE_LOCK:
+                _DELIVERED_MEASUREMENT_IDS.add(measurement.measurement_id)
+                _IN_FLIGHT_DELIVERIES.pop(measurement.measurement_id, None)
+                _DELIVERY_PENDING_BYTES = max(
+                    0,
+                    _DELIVERY_PENDING_BYTES - _DELIVERY_SIZES.pop(measurement.measurement_id, 0),
+                )
+
+    thread = threading.Thread(target=_send, name="agent-measurement-delivery", daemon=True)
+    try:
+        thread.start()
+    except RuntimeError as exc:  # pragma: no cover - thread limit reached
+        logger.warning(
+            "agent_measurement_delivery_unstarted",
+            extra={"event": "agent_measurement_delivery_unstarted", "error": str(exc)},
+        )
+        return None
+    return thread
+
+
+def _run_turn(
+    job: ClaimedJob,
+    *,
+    base_url: str,
+    gateway_url: str = "",
+    worker_id: str,
+    lease_ttl: float = DEFAULT_LEASE_TTL_S,
+    agent_timeout_s: float = DEFAULT_AGENT_TIMEOUT_S,
+    backend: SandboxBackend | None = None,
+    host: str | None = None,
+    measurement: operation_profiling.Measurement | None = None,
 ) -> int:
     """Deliver one already-claimed turn, and report its outcome.
 
@@ -2341,6 +2767,7 @@ def run_turn(
     try:
         runtime = get_runtime(job.runtime)
     except KeyError as exc:
+        operation_profiling.finish(measurement, outcome="failed", failure_stage="runtime_lookup")
         finish_attempt("failed", str(exc))
         control.close()
         return 2
@@ -2357,6 +2784,7 @@ def run_turn(
             gateway_base_url=gateway_url,
             agent_timeout_s=agent_timeout_s,
             finish_attempt=finish_attempt,
+            measurement=measurement,
         )
     except LeaseLost as exc:
         _log_control_failure("attempt_dispatch_fenced", job.job_id, exc)
@@ -2373,6 +2801,9 @@ def run_turn(
             _log_control_failure("finish", job.job_id, finish_exc)
         return 2
     finally:
+        # A claimed attempt whose validation rejected it before the shared
+        # handler started still closes its measurement, marked incomplete.
+        operation_profiling.finish(measurement, outcome="incomplete", failure_stage="preflight")
         heart.stop()
         control.close()
 
@@ -2496,6 +2927,15 @@ def _start_host_capacity_collector(backend: SandboxBackend) -> HostCapacityColle
     return collector
 
 
+def _child_turn_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Strip parent bookkeeping while preserving the profiling handoff."""
+    return {
+        key: value
+        for key, value in payload.items()
+        if not key.startswith("_") or key == "_profiling"
+    }
+
+
 def _spawn_turn(
     payload: dict[str, Any],
     *,
@@ -2560,11 +3000,10 @@ def _spawn_turn(
     os.close(write_fd)
     try:
         assert process.stdin is not None
-        # Underscore-prefixed keys are this host's own bookkeeping; what the
-        # child parses is the control plane's answer and nothing else.
-        process.stdin.write(
-            encode_turn({key: value for key, value in payload.items() if not key.startswith("_")})
-        )
+        # Most underscore-prefixed keys are parent bookkeeping. Profiling is
+        # the one intentional child handoff: stripping it makes the deployed
+        # multi-process path silently measure nothing.
+        process.stdin.write(encode_turn(_child_turn_payload(payload)))
         process.stdin.close()
     except OSError as exc:
         os.close(read_fd)
@@ -2668,6 +3107,12 @@ def _serve_turn(
     # it did when a replica ran one job at a time.
     _drain_on_sigterm()
     write_handover(handover_fd, f"{HANDOVER_ACCEPTED} {job.job_id}")
+    # Everything worth measuring happens *below* the answer, so the selection
+    # the host made has to be reattached here and not before it: timing a turn
+    # this process then declines would report a startup that never ran. The
+    # slot belongs to the host, so an unusable selection simply means this
+    # child does not measure -- it never means the turn is refused.
+    measurement = operation_profiling.attach_selection(payload.get("_profiling"))
     return run_turn(
         job,
         base_url=base_url,
@@ -2677,6 +3122,7 @@ def _serve_turn(
         agent_timeout_s=agent_timeout_s,
         backend=backend,
         host=host,
+        measurement=measurement,
     )
 
 
@@ -2905,15 +3351,26 @@ def run_forever(
             # exactly when it is worth asking.
             claims += 1
             turn_worker_id = f"{worker_id}-{claims}"
+            # Selected before the request, exactly as the single-process path
+            # does: the wait for a claim is part of the startup a user feels.
+            # The slot is claimed here and not in the child, so one attempt
+            # costs one sample however the turn is actually executed.
+            measurement = operation_profiling.start_operation(
+                operation=STARTUP_OPERATION,
+                host=host,
+                worker_id=turn_worker_id,
+            )
             try:
-                payload = claim_payload(
-                    base_url=base_url,
-                    host_credential=pool.credential,
-                    worker_id=turn_worker_id,
-                    lease_ttl=lease_ttl,
-                    attestation=_claim_attestation(backend),
-                )
+                with operation_profiling.span(measurement, "claim"):
+                    payload = claim_payload(
+                        base_url=base_url,
+                        host_credential=pool.credential,
+                        worker_id=turn_worker_id,
+                        lease_ttl=lease_ttl,
+                        attestation=_claim_attestation(backend),
+                    )
             except ClaimUnreachable as exc:
+                operation_profiling.discard(measurement)
                 print(
                     f"agent runner: control plane unreachable, retrying: {exc}",
                     file=sys.stderr,
@@ -2922,6 +3379,7 @@ def run_forever(
                 time.sleep(idle_wait)
                 continue
             except Exception as exc:
+                operation_profiling.discard(measurement)
                 print(
                     f"agent runner: claim failed unexpectedly: {exc}", file=sys.stderr, flush=True
                 )
@@ -2929,10 +3387,19 @@ def run_forever(
                 continue
 
             if payload is None:
+                # Nothing was claimed, so there is no startup to measure and
+                # the poll must not spend a slot.
+                operation_profiling.discard(measurement)
                 time.sleep(idle_wait)
                 continue
 
-            _hand_over_turn(payload, turns=turns, base_url=base_url, worker_id=turn_worker_id)
+            _hand_over_turn(
+                payload,
+                turns=turns,
+                base_url=base_url,
+                worker_id=turn_worker_id,
+                measurement=_bound_measurement(measurement, payload),
+            )
     except KeyboardInterrupt:
         immediate = True
     turns.shutdown(immediate=immediate)
@@ -2940,8 +3407,219 @@ def run_forever(
     return 0
 
 
+#: The fields of a record a run manifest is built from. The manifest is
+#: derived from the record rather than re-read from the environment so the two
+def deliver_measurement_record(
+    *,
+    control: ControlPlane,
+    job_id: str,
+    record: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+) -> dict[str, int]:
+    """Deliver one frozen record with bounded retries and explicit accounting."""
+    counts = {"delivered": 0, "duplicate": 0, "dropped": 0, "retried": 0}
+    measurement_id = str(record.get("measurement_id") or "")
+    body: dict[str, Any] = {"record": dict(record), "run": dict(manifest)}
+    for attempt in range(1, DELIVERY_ATTEMPTS_MAX + 1):
+        try:
+            status, answer = control.record_measurement(job_id, body)
+        except Exception as exc:
+            outcome = classify_exception(exc)
+        else:
+            outcome = classify_response(status, answer)
+        if outcome.delivered:
+            counts["duplicate" if outcome.result == "duplicate" else "delivered"] += 1
+            break
+        if not outcome.retryable:
+            counts["dropped"] += 1
+            logger.warning(
+                "agent_measurement_refused",
+                extra={
+                    "event": "agent_measurement_refused",
+                    "job_id": job_id,
+                    "measurement_id": measurement_id,
+                    "reason": outcome.reason,
+                },
+            )
+            break
+        counts["retried"] += 1
+        if attempts_exhausted(attempt):
+            counts["dropped"] += 1
+            logger.warning(
+                "agent_measurement_undeliverable",
+                extra={
+                    "event": "agent_measurement_undeliverable",
+                    "job_id": job_id,
+                    "measurement_id": measurement_id,
+                    "reason": outcome.reason,
+                },
+            )
+            break
+        time.sleep(min(2.0, 0.25 * attempt))
+    return counts
+
+
+def deliver_measurements(
+    *,
+    control: ControlPlane,
+    job_id: str,
+    measurement_ids: Iterable[str] | None = None,
+) -> dict[str, int]:
+    """Drain selected records from the optional JSONL baseline sink.
+
+    The live runtime delivers its frozen record directly and does not require
+    this file. This reader remains for explicit sink drains and recovery tests;
+    delivery, retry, and timeout still happen after the measurement boundary.
+
+    Delivery is best effort by design. A refused or undeliverable record is
+    counted and the turn ends normally -- the measurement is diagnostic, and
+    losing one must never fail the work it described. What it must not do is
+    *silently* lose one, which is what the counts are for.
+
+    Returns:
+        ``{"delivered", "duplicate", "dropped", "retried"}`` for this call.
+    """
+    sink = (os.environ.get(operation_profiling.ENV_PROFILING_SINK) or "").strip()
+    counts = {"delivered": 0, "duplicate": 0, "dropped": 0, "retried": 0}
+    if not sink:
+        return counts
+    wanted = set(measurement_ids or ())
+    # Drained *before* the sink is looked for. The exporter writes on its own
+    # thread, so a record can be frozen and queued in this process while the
+    # file does not exist yet -- and treating that as "nothing to send" lost
+    # the record for good, because the turn's exit only joins a send that has
+    # already finished. An empty scan must not be read as a completed send.
+    operation_profiling.flush_sink()
+    if not os.path.exists(sink):
+        return counts
+    try:
+        with open(sink, encoding="utf-8") as handle:
+            lines = [line for line in handle if line.strip()]
+    except OSError as exc:
+        logger.warning(
+            "agent_measurement_sink_unreadable",
+            extra={"event": "agent_measurement_sink_unreadable", "error": str(exc)},
+        )
+        return counts
+
+    delivered: set[str] = set()
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            # A truncated line is a record the exporter could not finish
+            # writing. It is dropped from the sink and counted, not retried:
+            # re-reading bytes that will never parse cannot help.
+            counts["dropped"] += 1
+            continue
+        measurement_id = str(record.get("measurement_id") or "")
+        if wanted and measurement_id not in wanted:
+            continue
+        if measurement_id in _DELIVERED_MEASUREMENT_IDS:
+            continue
+        manifest = operation_profiling.manifest_for_run(operation_profiling.active_run())
+        if manifest is None:
+            counts["dropped"] += 1
+            delivered.add(measurement_id)
+            continue
+        outcome_counts = deliver_measurement_record(
+            control=control,
+            job_id=job_id,
+            record=record,
+            manifest=manifest,
+        )
+        for key, value in outcome_counts.items():
+            counts[key] += value
+        delivered.add(measurement_id)
+
+    # Remembered in this process rather than erased from the file. The sink can
+    # be shared -- several runners on one host pointed at one state directory --
+    # and a read-modify-write of it would silently drop whatever another
+    # process appended between this call's read and its write.
+    with _DELIVERY_STATE_LOCK:
+        _DELIVERED_MEASUREMENT_IDS.update(delivered)
+    return counts
+
+
+#: Measurements this process has already decided the fate of. Held in memory
+#: because the sink is append-only and may be shared: rewriting it would race
+#: another process's append, and losing a record that was never delivered is
+#: exactly the failure the delivery counts exist to make visible.
+_DELIVERED_MEASUREMENT_IDS: set[str] = set()
+
+
+#: Measurements this process has already queued for delivery. A record is
+#: frozen once and its fate is decided once, so a second enqueue would be the
+#: same sample sent twice -- and one of the two would be reported as a
+#: duplicate that never happened.
+#: The delivery in flight for each measurement, so a later caller can wait
+#: for the send already happening. A second enqueue cannot start one -- the
+#: record is frozen once -- but "already queued" must not mean "do not wait",
+#: or the handoff's short bound would silently become the only attempt.
+_IN_FLIGHT_DELIVERIES: dict[str, threading.Thread] = {}
+_STARTING_DELIVERIES: set[str] = set()
+_DELIVERY_SIZES: dict[str, int] = {}
+_DELIVERY_STATE_LOCK = threading.Lock()
+_DELIVERY_DROPPED_COUNT = 0
+_DELIVERY_DRAIN_TIMEOUTS = 0
+_DELIVERY_PENDING_BYTES = 0
+
+
+def reset_delivery_state() -> None:
+    """Forget what this process delivered and queued. Tests call this."""
+    global _DELIVERY_DROPPED_COUNT, _DELIVERY_DRAIN_TIMEOUTS, _DELIVERY_PENDING_BYTES
+    with _DELIVERY_STATE_LOCK:
+        _DELIVERED_MEASUREMENT_IDS.clear()
+        _IN_FLIGHT_DELIVERIES.clear()
+        _STARTING_DELIVERIES.clear()
+        _DELIVERY_SIZES.clear()
+        _DELIVERY_DROPPED_COUNT = 0
+        _DELIVERY_DRAIN_TIMEOUTS = 0
+        _DELIVERY_PENDING_BYTES = 0
+
+
+def _bound_measurement(
+    measurement: operation_profiling.Measurement | None, payload: dict[str, Any]
+) -> operation_profiling.Measurement | None:
+    """Apply the target filter to a selection, now that the turn is known.
+
+    Job, thread, sandbox and runtime only exist once a claim has answered, so
+    the authoritative scope check happens here. A measurement that falls out of
+    scope returns ``None`` and emits nothing -- and its slot goes back, because
+    a target that never matched must not spend the experiment.
+    """
+    if measurement is None:
+        return None
+    try:
+        job = ClaimedJob.from_response(payload)
+    except (KeyError, TypeError, ValueError):
+        # A payload this process cannot read is the child's problem to decline;
+        # it is not a reason to report a measurement against facts nobody
+        # established.
+        operation_profiling.discard(measurement)
+        return None
+    if not operation_profiling.bind(
+        measurement,
+        attempt_id=job.attempt_id,
+        job_id=job.job_id,
+        thread_id=job.thread_id,
+        sandbox_id=str((job.thread_sandbox or {}).get("sandbox_id") or "") or None,
+        runtime_id=job.runtime,
+        runtime_version=job.runtime_version,
+        execution_profile=job.execution_profile,
+    ):
+        operation_profiling.discard(measurement)
+        return None
+    return measurement
+
+
 def _hand_over_turn(
-    payload: dict[str, Any], *, turns: TurnPool, base_url: str, worker_id: str
+    payload: dict[str, Any],
+    *,
+    turns: TurnPool,
+    base_url: str,
+    worker_id: str,
+    measurement: operation_profiling.Measurement | None = None,
 ) -> None:
     """Give one claimed turn to a child, and requeue it only if it never began.
 
@@ -2952,11 +3630,43 @@ def _hand_over_turn(
     back from here would be this host overruling that judgement with a guess.
     """
     job_id = str(payload.get("job_id") or "")
+    try:
+        delivery_job = ClaimedJob.from_response(payload)
+    except (KeyError, TypeError, ValueError):
+        delivery_job = None
     # Carried beside the turn rather than in it: the child logs under the same
     # name the claim recorded as this turn's lease owner. Stripped before
     # delivery, so the payload the child parses is the control plane's answer
     # and nothing this host added to it.
-    payload = {**payload, "_worker_id": worker_id}
+    # The selection rides beside the turn for the same reason the worker id
+    # does: the child runs the part worth measuring, and the parent holds the
+    # budget slot. It is discarded once the child is gone, because the child's
+    # record is the measurement -- this process only opened it.
+    context = operation_profiling.handoff_context(measurement)
+    if measurement is not None and context is None:
+        measurement.expired = measurement.expired or measurement.past_deadline()
+        operation_profiling.finish(
+            measurement,
+            outcome="incomplete",
+            failure_stage=(
+                "expired_before_handoff"
+                if measurement.expired
+                else "selection_unavailable_before_handoff"
+            ),
+        )
+        if delivery_job is not None:
+            _enqueue_delivery(
+                measurement,
+                job=delivery_job,
+                base_url=base_url,
+                drain_s=DELIVERY_HANDOFF_DRAIN_S,
+            )
+        measurement = None
+    payload = {
+        **payload,
+        "_worker_id": worker_id,
+        **({"_profiling": context} if context else {}),
+    }
     try:
         result = turns.launch(payload)
     except Exception as exc:
@@ -2971,8 +3681,30 @@ def _hand_over_turn(
         )
         result = LaunchResult(LAUNCH_UNCERTAIN, None, f"{type(exc).__name__}: {exc}")
     if result.outcome == LAUNCH_STARTED:
+        # The child owns the record now, and with it the budget slot: the
+        # selection was handed over, so refunding it here would let one
+        # experiment spend its whole allowance on launches that were measured.
+        # Marking it finished without emitting is what releases the parent's
+        # hold on the record while keeping the slot spent.
+        if measurement is not None:
+            measurement.finished = True
+            measurement.reserved = False
         return
     if result.outcome == LAUNCH_UNCERTAIN:
+        # Nothing observed the turn's fate, and the child may or may not have
+        # started. The selection is emitted as it stands -- incomplete, naming
+        # the boundary it reached -- rather than dropped, because "we do not
+        # know how far it got" is itself the observation.
+        operation_profiling.finish(
+            measurement, outcome="incomplete", failure_stage="handover_uncertain"
+        )
+        if delivery_job is not None:
+            _enqueue_delivery(
+                measurement,
+                job=delivery_job,
+                base_url=base_url,
+                drain_s=DELIVERY_HANDOFF_DRAIN_S,
+            )
         logger.warning(
             "agent_turn_handover_uncertain",
             extra={
@@ -2984,6 +3716,14 @@ def _hand_over_turn(
         return
     # Provably never started: back to the queue, with no attempt spent and no
     # wait for a lease that nothing is holding.
+    operation_profiling.finish(measurement, outcome="incomplete", failure_stage="not_started")
+    if delivery_job is not None:
+        _enqueue_delivery(
+            measurement,
+            job=delivery_job,
+            base_url=base_url,
+            drain_s=DELIVERY_HANDOFF_DRAIN_S,
+        )
     worker_token = str(payload.get("worker_token") or "")
     released = bool(worker_token) and release_turn(
         base_url=base_url,

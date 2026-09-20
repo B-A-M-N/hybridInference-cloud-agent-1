@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from cloud_agent.storage._sql.rows import load_json
+from cloud_agent.storage._sql.sandbox import THREAD_SANDBOX_SOURCE
 
 if TYPE_CHECKING:
     from typing import Any
@@ -197,6 +198,42 @@ class PostgresExecutionQueries:
                 job_id,
             )
             return [dict(row) for row in rows]
+
+    async def get_attempt(self, *, job_id: str, attempt_id: int) -> dict[str, Any] | None:
+        """Return one attempt of one job, by its exact id.
+
+        Bounded to the job on purpose: an attempt id is unique on its own, but
+        a caller that authenticated as this job has no business reading any
+        other job's attempt, and putting the constraint in the query means the
+        check cannot be forgotten by a caller.
+
+        The generation is included because a credential names one, and a
+        record that names it must be reporting on the attempt it belongs to.
+
+        ``thread_sandbox`` is decoded here rather than left as the JSONB text
+        asyncpg hands back for a ``to_jsonb`` projection. Callers read it as a
+        mapping -- the ingest needs the sandbox and host that served *this*
+        attempt -- and text fails at ``.get()`` with an ``AttributeError`` that
+        only a real database produces.
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""
+                SELECT a.id AS attempt_id, a.job_id, a.attempt_no, a.lease_generation,
+                       a.host_id, a.status, a.started_at, a.finished_at,
+                       to_jsonb(s) AS thread_sandbox
+                FROM agent_attempts a
+                LEFT JOIN {THREAD_SANDBOX_SOURCE} ON s.thread_id = a.thread_id
+                WHERE a.id = $1 AND a.job_id = $2
+                """,
+                attempt_id,
+                job_id,
+            )
+        if row is None:
+            return None
+        attempt = dict(row)
+        attempt["thread_sandbox"] = load_json(attempt.get("thread_sandbox"))
+        return attempt
 
     async def job_turn_telemetry(
         self, *, job_id: str, attempt_id: int | None = None

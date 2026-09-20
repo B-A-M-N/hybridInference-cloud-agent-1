@@ -1,6 +1,6 @@
 """The runner-facing worker surface: claim, report, settle, finish.
 
-Seventeen endpoints a host agent calls with a per-attempt capability token
+Eighteen endpoints a host agent calls with a per-attempt capability token
 rather than as an owner. The token carries the ``(job_id, attempt_id,
 lease_generation)`` fence, so a worker whose lease was reaped is refused by the
 store even though its token still parses; those refusals surface as 409, the
@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import os
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
@@ -44,6 +45,8 @@ from cloud_agent.host_pool import hash_secret
 from cloud_agent.logging_utils import get_logger
 from cloud_agent.mcp.models import ConnectionStatus
 from cloud_agent.mcp.registry import resolve_for_thread
+from cloud_agent.measurement_ingest import Owner
+from cloud_agent.measurement_persistence import persist_measurement
 from cloud_agent.schemas import (
     HostResidencyEstablishResponse,
     WorkerAckResponse,
@@ -57,6 +60,8 @@ from cloud_agent.schemas import (
     WorkerFinishRequest,
     WorkerHeartbeatRequest,
     WorkerHeartbeatResponse,
+    WorkerMeasurementRequest,
+    WorkerMeasurementResponse,
     WorkerReleaseRequest,
     WorkerResourcesRequest,
     WorkerSandboxAbandonRequest,
@@ -91,9 +96,11 @@ if TYPE_CHECKING:
         AttemptCommands,
         ConversationCommands,
         ConversationQueries,
+        ExecutionQueries,
         GrantRepository,
         HostPoolRepository,
         McpConnectionRepository,
+        OperationMeasurements,
         ResidencyRepository,
         SandboxRepository,
         SourceControlRepository as SourceControlPort,
@@ -120,9 +127,11 @@ class _WorkerStorage(Protocol):
     attempt_commands: AttemptCommands
     conversation_commands: ConversationCommands
     conversation_queries: ConversationQueries
+    execution_queries: ExecutionQueries
     grants: GrantRepository
     host_pool: HostPoolRepository
     mcp: McpConnectionRepository
+    operation_measurements: OperationMeasurements
     residency: ResidencyRepository
     sandbox: SandboxRepository
     source_control: SourceControlPort
@@ -798,6 +807,104 @@ async def worker_append_event(
     if event_id is None:
         raise _lease_lost()
     return WorkerEventResponse(event_id=event_id)
+
+
+@router.post(
+    "/worker/jobs/{job_id}/measurements",
+    response_model=WorkerMeasurementResponse,
+)
+async def worker_record_measurement(
+    job_id: str,
+    body: WorkerMeasurementRequest,
+    authorization: str | None = Header(None),
+    store: _WorkerStorage | None = Depends(get_storage),
+) -> WorkerMeasurementResponse:
+    """Store one finished measurement without requiring a still-live lease."""
+    job_store = _require_store(store)
+    claims = _worker_claims(authorization)
+    _match_job(claims, job_id)
+    if (
+        str(body.record.get("producer") or "") != "runner"
+        or str(body.record.get("operation") or "") != "attempt.startup"
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": {
+                    "type": "measurement_rejected",
+                    "message": (
+                        "the worker endpoint accepts only runner-rooted attempt.startup records"
+                    ),
+                }
+            },
+        )
+    attempt_id = claims.get("attempt_id")
+    generation = claims.get("lease_generation")
+    if attempt_id is None or generation is None:
+        raise _lease_lost()
+    attempt = await job_store.execution_queries.get_attempt(
+        job_id=job_id, attempt_id=int(attempt_id)
+    )
+    if attempt is None or int(attempt["lease_generation"]) != int(generation):
+        raise _lease_lost()
+    job = await job_store.conversation_queries.get_job(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": {"type": "not_found", "message": "No such job."}},
+        )
+    attempt_sandbox = attempt.get("thread_sandbox")
+    attempt_sandbox = attempt_sandbox if isinstance(attempt_sandbox, dict) else {}
+    current_sandbox = job.get("thread_sandbox")
+    current_sandbox = current_sandbox if isinstance(current_sandbox, dict) else {}
+    owner = Owner(
+        owner_id=str(job.get("user_id") or "") or None,
+        job_id=job_id,
+        thread_id=str(attempt.get("thread_id") or job.get("thread_id") or "") or None,
+        sandbox_id=str(attempt_sandbox.get("sandbox_id") or current_sandbox.get("sandbox_id") or "")
+        or None,
+        host_id=str(attempt.get("host_id") or "") or None,
+        attempt_id=int(attempt_id),
+        lease_generation=int(generation),
+    )
+    if body.run is None:
+        # Payload-declared producer names are not trusted.  In-process control
+        # plane records never call this endpoint, so every HTTP producer must
+        # state the manifest against which its record is checked.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": {
+                    "type": "measurement_rejected",
+                    "message": "a producer must state its experiment manifest with its record",
+                }
+            },
+        )
+    result, reason = await persist_measurement(
+        capability=job_store.operation_measurements,
+        record=body.record,
+        owner=owner,
+        run=body.run,
+        now=datetime.now(UTC),
+    )
+    if result in {"conflict", "run_conflict"}:
+        return WorkerMeasurementResponse(
+            result=result,
+            measurement_id=str(body.record.get("measurement_id") or ""),
+            reason=(
+                "this measurement id already names different contents"
+                if result == "conflict"
+                else "this run id already names a different experiment"
+            ),
+        )
+    if result == "rejected":
+        raise HTTPException(
+            status_code=422,
+            detail={"error": {"type": "measurement_rejected", "message": reason}},
+        )
+    return WorkerMeasurementResponse(
+        result=result, measurement_id=str(body.record.get("measurement_id") or "")
+    )
 
 
 @router.get("/worker/jobs/{job_id}/attachments", response_model=WorkerAttachmentListResponse)

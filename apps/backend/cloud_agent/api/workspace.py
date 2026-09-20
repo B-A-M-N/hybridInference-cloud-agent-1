@@ -15,9 +15,17 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Protocol
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
+from cloud_agent import measurement_writer
+from cloud_agent.api._operation_measurements import (
+    FILE_READ_STAGE,
+    measured_call,
+    measured_response,
+    profiling_answer_headers,
+    record_measurement,
+)
 from cloud_agent.api._owner_auth import _owned_job, require_agent_owner
 from cloud_agent.api._workspace_access import (
     _TERMINAL_ID_PATTERN,
@@ -29,6 +37,19 @@ from cloud_agent.api.deps import get_agent_app_credentials, get_storage, require
 from cloud_agent.api.threads import _SSE_HEADERS
 from cloud_agent.entitlement import RepoNotAllowed, require_entitled_repo
 from cloud_agent.logging_utils import get_logger
+from cloud_agent.operation_measurement import (
+    FILE_CANDIDATES,
+    FILES_LIST,
+    ROUTE_FILES,
+    ROUTE_TERMINALS,
+    TERMINAL_CREATE,
+    TERMINAL_LIST,
+    TERMINAL_OPEN,
+    TERMINAL_STREAM,
+    continuation,
+    operation as measured_operation,
+    root_scope,
+)
 from cloud_agent.schemas import (
     AgentGitWorkspaceResponse,
     AgentTerminalRequest,
@@ -55,6 +76,7 @@ if TYPE_CHECKING:
     from cloud_agent.ports import (
         ConversationQueries,
         HostPoolRepository,
+        OperationMeasurements,
         SandboxRepository,
         SourceControlRepository as SourceControlPort,
     )
@@ -69,10 +91,11 @@ logger = get_logger("cloud_agent.api.routes")
 
 
 class _WorkspaceStorage(Protocol):
-    """The four capabilities the workspace surface reaches for."""
+    """The five capabilities the workspace surface reaches for."""
 
     conversation_queries: ConversationQueries
     host_pool: HostPoolRepository
+    operation_measurements: OperationMeasurements
     sandbox: SandboxRepository
     source_control: SourceControlPort
 
@@ -202,11 +225,12 @@ async def _terminal_owner_workspace(
 @router.get("/jobs/{job_id}/files", response_model=AgentWorkspaceResponse)
 async def get_agent_job_workspace_file(
     job_id: str,
+    request: Request,
     path: str = Query("", max_length=4096),
     user: dict[str, Any] = Depends(require_agent_owner),
     store: _WorkspaceStorage | None = Depends(get_storage),
     app_credentials: Any | None = Depends(get_agent_app_credentials),
-) -> AgentWorkspaceResponse:
+) -> Response:
     """Browse the chat's retained workspace through its owning host broker."""
     job_store = _require_store(store)
     job = await _owned_job(job_store.conversation_queries, job_id, user)
@@ -222,6 +246,8 @@ async def get_agent_job_workspace_file(
         job=job, user=user, store=job_store, app_credentials=app_credentials
     )
 
+    candidates = frozenset(FILE_CANDIDATES if safe_path else (FILES_LIST,))
+    scope = root_scope(FILES_LIST, job, service=ROUTE_FILES, candidates=candidates)
     broker = await _workspace_broker_for_job(job_store, job)
     if broker is None:
         raise HTTPException(
@@ -233,10 +259,84 @@ async def get_agent_job_workspace_file(
                 }
             },
         )
-    try:
-        return AgentWorkspaceResponse(**(await broker.files(_workspace_id(job), safe_path)))
-    except WorkspaceBrokerError as exc:
-        raise _workspace_broker_http_error(exc) from exc
+    recorded = False
+    with measured_operation(FILES_LIST, scope, continuing=continuation(request.headers)) as measure:
+        try:
+            if measure is not None:
+                measure.mark(FILE_READ_STAGE)
+                if len(candidates) > 1:
+                    # Until the answer arrives a non-root path may be either a
+                    # directory expansion or a file preview.
+                    measure.name_request("files.read")
+            frame = measure.begin_call(FILE_READ_STAGE) if measure is not None else None
+            try:
+                body = await measured_call(
+                    measure,
+                    FILE_READ_STAGE,
+                    call=lambda profiling: broker.files(
+                        _workspace_id(job), safe_path, profiling=profiling
+                    ),
+                    record=False,
+                    call_id=frame,
+                )
+            except WorkspaceBrokerError as exc:
+                if _workspace_not_materialized(exc):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": {
+                                "type": "workspace_unavailable",
+                                "message": "This chat has no retained workspace.",
+                            }
+                        },
+                    ) from exc
+                raise _workspace_broker_http_error(exc) from exc
+            if measure is not None:
+                kind = str(body.get("kind") or "")
+                kind_operation = measure.result_operation(body, default=FILES_LIST)
+                broker_operation = str(body.get("profiling_operation") or "").strip()
+                result_operation = (
+                    ""
+                    if broker_operation and broker_operation != kind_operation
+                    else kind_operation
+                )
+                if not measure.confirm(result_operation):
+                    measure.discard()
+                    recorded = True
+                    return measured_response(AgentWorkspaceResponse, None, body)
+                measure.record_answer(FILE_READ_STAGE, frame, body)
+                measure.measurement.facts["kind"] = kind
+                if kind == "directory":
+                    measure.measurement.facts["entry_count"] = len(body.get("entries") or [])
+                else:
+                    measure.measurement.facts["content_truncated"] = bool(body.get("truncated"))
+                    measure.measurement.facts["binary"] = bool(body.get("binary"))
+                measure.outcome = "completed"
+            response = measured_response(AgentWorkspaceResponse, measure, body)
+            record_measurement(
+                store=job_store,
+                job=job,
+                measure=measure,
+            )
+            recorded = True
+            return response
+        finally:
+            if not recorded:
+                if measure is not None and safe_path and measure.request_kind == "files.read":
+                    # The failed read never produced the kind that decides
+                    # list versus open. Filing it under the provisional first
+                    # candidate corrupts that operation's failure rate.
+                    measure.discard()
+                    local_writer = measurement_writer.writer()
+                    local_writer.counts.rejected += 1
+                    local_writer.counts.note("ambiguous_file_kind")
+                else:
+                    record_measurement(
+                        store=job_store,
+                        job=job,
+                        measure=measure,
+                        failure="failed",
+                    )
 
 
 @router.put("/jobs/{job_id}/files", response_model=AgentWorkspaceResponse)
@@ -334,11 +434,12 @@ async def run_agent_job_terminal_command(
 )
 async def create_agent_job_terminal(
     job_id: str,
+    request: Request,
     body: AgentTerminalSessionCreateRequest,
     user: dict[str, Any] = Depends(require_agent_owner),
     store: _WorkspaceStorage | None = Depends(get_storage),
     app_credentials: Any | None = Depends(get_agent_app_credentials),
-) -> AgentTerminalSessionResponse:
+) -> Response:
     """Open an interactive PTY in the agent's workspace."""
     job, broker = await _terminal_owner_workspace(
         job_id=job_id,
@@ -347,18 +448,44 @@ async def create_agent_job_terminal(
         app_credentials=app_credentials,
         require_ready=True,
     )
-    try:
-        return AgentTerminalSessionResponse(
-            **(
-                await broker.create_terminal(
-                    _workspace_id(job),
-                    rows=body.rows,
-                    cols=body.cols,
+    scope = root_scope(TERMINAL_OPEN, job, service=ROUTE_TERMINALS)
+    with measured_operation(
+        TERMINAL_OPEN, scope, continuing=continuation(request.headers)
+    ) as measure:
+        try:
+            if measure is not None:
+                measure.name_request(TERMINAL_CREATE)
+                measure.mark(TERMINAL_CREATE)
+            try:
+                payload = await measured_call(
+                    measure,
+                    TERMINAL_CREATE,
+                    call=lambda profiling: broker.create_terminal(
+                        _workspace_id(job),
+                        rows=body.rows,
+                        cols=body.cols,
+                        profiling=profiling,
+                    ),
                 )
+            except WorkspaceBrokerError as exc:
+                raise _terminal_broker_http_error(exc) from exc
+            if measure is not None:
+                measure.outcome = "completed"
+            response = measured_response(AgentTerminalSessionResponse, measure, payload)
+            record_measurement(
+                store=_require_store(store),
+                job=job,
+                measure=measure,
             )
-        )
-    except WorkspaceBrokerError as exc:
-        raise _terminal_broker_http_error(exc) from exc
+            return response
+        except BaseException:
+            record_measurement(
+                store=_require_store(store),
+                job=job,
+                measure=measure,
+                failure="failed",
+            )
+            raise
 
 
 @router.get(
@@ -367,10 +494,11 @@ async def create_agent_job_terminal(
 )
 async def list_agent_job_terminals(
     job_id: str,
+    request: Request,
     user: dict[str, Any] = Depends(require_agent_owner),
     store: _WorkspaceStorage | None = Depends(get_storage),
     app_credentials: Any | None = Depends(get_agent_app_credentials),
-) -> AgentTerminalSessionListResponse:
+) -> Response:
     """List interactive terminals, including exited sessions kept for replay."""
     job, broker = await _terminal_owner_workspace(
         job_id=job_id,
@@ -379,10 +507,42 @@ async def list_agent_job_terminals(
         app_credentials=app_credentials,
         require_ready=True,
     )
-    try:
-        return AgentTerminalSessionListResponse(**(await broker.list_terminals(_workspace_id(job))))
-    except WorkspaceBrokerError as exc:
-        raise _terminal_broker_http_error(exc) from exc
+    scope = root_scope(TERMINAL_OPEN, job, service=ROUTE_TERMINALS)
+    with measured_operation(
+        TERMINAL_OPEN, scope, continuing=continuation(request.headers)
+    ) as measure:
+        try:
+            if measure is not None:
+                measure.name_request(TERMINAL_LIST)
+                measure.mark(TERMINAL_LIST)
+            try:
+                payload = await measured_call(
+                    measure,
+                    TERMINAL_LIST,
+                    call=lambda profiling: broker.list_terminals(
+                        _workspace_id(job), profiling=profiling
+                    ),
+                )
+            except WorkspaceBrokerError as exc:
+                raise _terminal_broker_http_error(exc) from exc
+            if measure is not None:
+                measure.outcome = "completed"
+                measure.measurement.facts["terminal_count"] = len(payload.get("terminals") or [])
+            response = measured_response(AgentTerminalSessionListResponse, measure, payload)
+            record_measurement(
+                store=_require_store(store),
+                job=job,
+                measure=measure,
+            )
+            return response
+        except BaseException:
+            record_measurement(
+                store=_require_store(store),
+                job=job,
+                measure=measure,
+                failure="failed",
+            )
+            raise
 
 
 @router.get("/jobs/{job_id}/terminals/{terminal_id}/stream")
@@ -402,25 +562,68 @@ async def stream_agent_job_terminal(
         store=store,
         app_credentials=app_credentials,
     )
-    try:
-        upstream = await broker.stream_terminal(_workspace_id(job), terminal_id, after=after)
-    except WorkspaceBrokerError as exc:
-        raise _terminal_broker_http_error(exc) from exc
-
-    async def relay() -> AsyncIterator[Any]:
+    scope = root_scope(TERMINAL_OPEN, job, service=ROUTE_TERMINALS)
+    with measured_operation(
+        TERMINAL_OPEN, scope, continuing=continuation(request.headers)
+    ) as measure:
         try:
-            async for chunk in upstream:
-                if await request.is_disconnected():
-                    break
-                yield chunk
-        finally:
-            await upstream.aclose()
+            if measure is not None:
+                measure.name_request(TERMINAL_STREAM)
+                measure.mark(TERMINAL_STREAM)
+            stream_call = measure.begin_call(TERMINAL_STREAM) if measure is not None else None
+            try:
+                upstream = await measured_call(
+                    measure,
+                    TERMINAL_STREAM,
+                    call=lambda profiling: broker.stream_terminal(
+                        _workspace_id(job), terminal_id, after=after, profiling=profiling
+                    ),
+                    record=False,
+                    call_id=stream_call,
+                )
+            except WorkspaceBrokerError as exc:
+                raise _terminal_broker_http_error(exc) from exc
+            if measure is not None:
+                measure.record_answer_from_headers(
+                    TERMINAL_STREAM, stream_call, upstream.profiling_answer
+                )
+                measure.outcome = "completed"
 
-    return StreamingResponse(
-        relay(),
-        media_type="text/event-stream",
-        headers=_SSE_HEADERS,
-    )
+            async def relay() -> AsyncIterator[Any]:
+                try:
+                    async for chunk in upstream:
+                        if await request.is_disconnected():
+                            break
+                        yield chunk
+                finally:
+                    await upstream.aclose()
+
+            response = StreamingResponse(
+                relay(),
+                media_type="text/event-stream",
+                headers=(
+                    _SSE_HEADERS
+                    if measure is None
+                    else {**_SSE_HEADERS, **profiling_answer_headers(measure)}
+                ),
+            )
+            # This operation is the attach handshake, not the lifetime of the
+            # terminal byte stream.  Persist now so an hour-long SSE does not
+            # turn one short attach into a late, rejected delivery.
+            record_measurement(
+                store=_require_store(store),
+                job=job,
+                measure=measure,
+            )
+            return response
+        except BaseException:
+            record_measurement(
+                store=_require_store(store),
+                job=job,
+                measure=measure,
+                failure="failed",
+            )
+            raise
 
 
 @router.post(

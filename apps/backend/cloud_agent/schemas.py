@@ -970,6 +970,44 @@ class AgentWorkspaceEntry(BaseModel):
     omitted_reason: str | None = None
 
 
+class AgentOperationProfilingFragment(BaseModel):
+    """Which selected measurement produced this response, and how complete it is.
+
+    Present only while an experiment has selected this operation. A client that
+    does not know the field sees no change, and a client that does can carry
+    ``interaction_id`` into the next request of the same interaction and report
+    its own endpoint separately -- the browser's clock is never compared with
+    the server's, the two are correlated through that id.
+
+    Two completeness questions are kept apart on purpose. The ``fragment_*``
+    pair describes the downstream call this reply came from; ``collection_complete``
+    describes this whole local record. A reader must not have to infer either
+    from the other, and a fragment can be answered and still be a floor.
+    """
+
+    #: One logical interaction. Every request of it shares this id.
+    interaction_id: str = Field(..., min_length=1, max_length=64)
+    #: This request's own record id. Never reused across requests.
+    measurement_id: str = Field(..., min_length=1, max_length=64)
+    #: The downstream call this reply answers, when one answered.
+    call_id: str | None = Field(None, min_length=1, max_length=64)
+    #: The operation the request was filed under, once its result was known.
+    operation: str = Field("", max_length=128)
+    #: Which local request this was, so a distribution does not mix a listing
+    #: with a file preview or a terminal attach.
+    request_kind: str = Field("", max_length=128)
+    #: Whether the broker finished collecting for that call. Distinct from
+    #: having timed something: a stage that legitimately did no timed work --
+    #: a reuse, an empty directory -- answers without stages and is complete.
+    fragment_recorded: bool = False
+    #: Whether that collection was cut short by a deadline. An empty stage list
+    #: means "collected and nothing to time" only when this is false.
+    fragment_truncated: bool = False
+    #: Whether this local record closed every boundary, owed no unanswered
+    #: fragment and lost no span. A failed operation can still be complete.
+    collection_complete: bool = False
+
+
 class AgentWorkspaceResponse(BaseModel):
     """A directory listing or bounded text-file preview from a job workspace."""
 
@@ -984,6 +1022,7 @@ class AgentWorkspaceResponse(BaseModel):
     omitted_reason: str | None = None
     writable: bool = False
     source: Literal["workspace"] = "workspace"
+    profiling: AgentOperationProfilingFragment | None = None
 
 
 class AgentWorkspaceWriteRequest(BaseModel):
@@ -1055,12 +1094,21 @@ class AgentTerminalSessionResponse(BaseModel):
     rows: int = Field(..., ge=2, le=200)
     cols: int = Field(..., ge=20, le=500)
     last_seq: int = Field(..., ge=0)
+    # Deliberately no profiling field here. This model is the terminal *item*
+    # inside a list as well as the reply to a create, and it is reused by
+    # routes that are not instrumented (input, resize, delete). A field on it
+    # would put ``profiling: null`` on every nested item and on those replies,
+    # changing the contract for requests that were never measured. The measured
+    # routes add their block to the serialized body instead.
 
 
 class AgentTerminalSessionListResponse(BaseModel):
     """Interactive terminal sessions retained by one live workspace."""
 
     terminals: list[AgentTerminalSessionResponse] = Field(default_factory=list)
+    #: Present only on a measured list request; the instrumented handler adds
+    #: it after serializing, so an unmeasured reply has no key at all.
+    profiling: AgentOperationProfilingFragment | None = None
 
 
 class AgentGitChange(BaseModel):
@@ -1741,6 +1789,36 @@ class WorkerAckResponse(BaseModel):
 
     ok: bool
     state: str | None = None
+
+
+class WorkerMeasurementRequest(BaseModel):
+    """One finished measurement, as the producer froze it.
+
+    Deliberately opaque below the envelope: the record is validated against the
+    collector's own bounds and its facts whitelist by the route, because those
+    constants live with the producer that produced it and a schema that
+    restated them would be a second copy free to drift.
+    """
+
+    #: The frozen record, exactly as the producer emitted it.
+    record: dict[str, Any]
+    #: The experiment manifest, sent with the first record a producer delivers
+    #: so the catalogue can be created. Omitted afterwards.
+    run: dict[str, Any] | None = None
+
+
+class WorkerMeasurementResponse(BaseModel):
+    """What the control plane did with one measurement.
+
+    ``result`` is an outcome rather than a bare acknowledgement because the
+    producer has to distinguish three things it would otherwise guess at:
+    stored, already stored (a retry that must not count twice), and refused
+    (which is terminal and must not be retried).
+    """
+
+    result: Literal["stored", "duplicate", "conflict", "run_conflict", "rejected"]
+    measurement_id: str | None = None
+    reason: str | None = None
 
 
 class McpConnectionSummary(BaseModel):

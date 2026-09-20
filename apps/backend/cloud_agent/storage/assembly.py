@@ -35,6 +35,7 @@ from cloud_agent.storage.repositories import (
     PostgresLedgerRepository,
     PostgresMcpCatalogRepository,
     PostgresMcpConnectionRepository,
+    PostgresOperationMeasurementRepository,
     PostgresResidencyRepository,
     PostgresSandboxRepository,
     PostgresSessionForkRepository,
@@ -60,6 +61,7 @@ if TYPE_CHECKING:
         LedgerRepository,
         McpCatalogRepository,
         McpConnectionRepository,
+        OperationMeasurements,
         ResidencyRepository,
         SandboxRepository,
         SessionForkRepository,
@@ -93,6 +95,9 @@ class Storage:
         self.host_pool: HostPoolRepository = PostgresHostPoolRepository(pool)
         self.ledger: LedgerRepository = PostgresLedgerRepository(pool)
         self.mcp: McpConnectionRepository = PostgresMcpConnectionRepository(pool)
+        self.operation_measurements: OperationMeasurements = PostgresOperationMeasurementRepository(
+            pool
+        )
         self.mcp_catalog: McpCatalogRepository = PostgresMcpCatalogRepository(pool)
         self.residency: ResidencyRepository = PostgresResidencyRepository(pool)
         self.sandbox: SandboxRepository = PostgresSandboxRepository(pool)

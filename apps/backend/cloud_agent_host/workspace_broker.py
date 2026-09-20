@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -83,6 +83,8 @@ from cloud_agent_host.workspace_browser import (
     WorkspacePathError,
     normalize_workspace_path,
 )
+from cloud_agent_profiling.operation_call import BrokerCall, closed, open_call
+from cloud_agent_profiling.operation_profiling import PROFILING_CONTEXT_HEADER
 
 logger = get_logger(__name__)
 
@@ -228,6 +230,14 @@ class SharedSandboxAcquireRequest(SharedSandboxIdentityRequest):
     owner: str = Field(..., min_length=1, max_length=256)
     activation_generation: int = Field(..., ge=1)
     has_settled_context: bool = False
+    #: The measurement selection the caller is profiling this path under.
+    #: Deliberately unvalidated: a broker sees one call at a time and cannot
+    #: know which attempt it belongs to, so the caller states the selection and
+    #: `operation_profiling.start_stage_recording` decides whether to honour
+    #: it. Typing or bounding this field would let a malformed *measurement*
+    #: setting reject a sandbox request with 422 before the supervisor ever saw
+    #: it, and measurement configuration must never fail the business call.
+    profiling: Any = None
 
 
 class SharedResidentLaunchConfig(BaseModel):
@@ -253,6 +263,9 @@ class SharedResidentLaunchRequest(SharedLeaseRequest):
     """Lease fence plus resident launch configuration."""
 
     launch: SharedResidentLaunchConfig
+    #: See ``SharedSandboxAcquireRequest.profiling``. Deliberately unvalidated
+    #: here too, so a malformed selection cannot reject a resident request.
+    profiling: Any = None
 
 
 class SharedTurnRequest(SharedLeaseRequest):
@@ -1329,15 +1342,29 @@ def create_app(
 
     def retained_operation(
         workspace_id: str,
-        operation: Callable[[RetainedChatBackend], dict[str, Any]],
+        operation: Callable[[RetainedChatBackend, BrokerCall], dict[str, Any]],
+        *,
+        call: BrokerCall | None = None,
     ) -> dict[str, Any]:
+        """Open a workspace, run one operation, and answer its measurement call.
+
+        ``call`` is this request's measurement fragment, if the inherited
+        selection named one. It gates nothing: the workspace is admitted, its
+        network phase is verified, and the operation runs exactly as before.
+        Only the timings are conditional, and the answer is merged into the
+        body so a caller can tell a producer that collected nothing from one
+        that never reported at all.
+        """
+        active = call if call is not None else closed()
         owner = retained_owner(workspace_id)
         token: str | None = None
         try:
-            token, _ = owner.operation_opened(workspace_id)
+            with active.stage("admission"):
+                token, _ = owner.operation_opened(workspace_id)
             retained = owner.backend(workspace_id)
-            retained.manager.require_network_phase(retained.spec, "agent")
-            return operation(retained)
+            with active.stage("network_phase"):
+                retained.manager.require_network_phase(retained.spec, "agent")
+            return active.answer(operation(retained, active))
         except RetainedWorkspaceError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
         except (SandboxError, ValueError) as exc:
@@ -1427,6 +1454,7 @@ def create_app(
                 has_settled_context=body.has_settled_context,
                 manifest=shared_manifest(body.members),
                 expected_container_id=body.expected_container_id,
+                profiling=body.profiling,
             )
         except (SandboxError, ValueError) as exc:
             raise supervisor_error(exc) from exc
@@ -1470,6 +1498,7 @@ def create_app(
                 thread_id,
                 body.token,
                 resident_launch(thread_id, body.launch),
+                profiling=body.profiling,
             )
         except (DriverError, SandboxError, ValueError) as exc:
             raise supervisor_error(exc) from exc
@@ -1889,19 +1918,35 @@ def create_app(
     @app.get("/workspaces/{workspace_id}/files")
     def files(
         workspace_id: str,
+        request: Request,
         path: str = Query("", max_length=4096),
         _: None = Depends(authenticate),
     ) -> dict[str, Any]:
         relative = _relative_path(path)
-        return retained_operation(
-            workspace_id,
-            lambda retained: read_retained_file(
+        # A path alone cannot say what this request is: the empty path is the
+        # root listing, but a non-empty one may be a file preview or a
+        # directory expansion, and only the read can tell them apart. So the
+        # call is opened for the candidates the caller offered and filed by the
+        # kind its own result reports.
+        candidates = ("files.list", "files.open") if path else ("files.list",)
+        call = open_call(request.headers.get(PROFILING_CONTEXT_HEADER), operations=candidates)
+
+        def _read(retained: Any, active: BrokerCall) -> dict[str, Any]:
+            body = read_retained_file(
                 retained,
                 relative,
                 max_preview_bytes=MAX_FILE_PREVIEW_BYTES,
                 max_directory_entries=MAX_DIRECTORY_ENTRIES,
-            ),
-        )
+                observer=active.recorder,
+            )
+            kind = str(body.get("kind") or "")
+            if kind == "directory":
+                active.set_operation("files.list")
+            elif kind in {"file", "symlink"}:
+                active.set_operation("files.open")
+            return body
+
+        return retained_operation(workspace_id, _read, call=call)
 
     @app.put("/workspaces/{workspace_id}/files")
     def write_file(
@@ -1913,7 +1958,7 @@ def create_app(
         relative = _relative_path(path)
         return retained_operation(
             workspace_id,
-            lambda retained: write_retained_file(
+            lambda retained, _call: write_retained_file(
                 retained,
                 relative,
                 body.content,
@@ -1932,22 +1977,28 @@ def create_app(
         return await asyncio.to_thread(
             retained_operation,
             workspace_id,
-            lambda retained: _run_terminal(retained, "/workspace", body),
+            lambda retained, _call: _run_terminal(retained, "/workspace", body),
         )
 
     @app.post("/workspaces/{workspace_id}/terminals")
     async def create_terminal(
         workspace_id: str,
+        request: Request,
         body: TerminalCreateRequest,
         _: None = Depends(authenticate),
     ) -> dict[str, Any]:
+        call = open_call(
+            request.headers.get(PROFILING_CONTEXT_HEADER), operations=("terminal.open",)
+        )
         owner = retained_owner(workspace_id)
         terminal_token: str | None = None
         try:
-            token, descriptor = await asyncio.to_thread(owner.terminal_opened, workspace_id)
+            with call.stage("admission"):
+                token, descriptor = await asyncio.to_thread(owner.terminal_opened, workspace_id)
             terminal_token = token
             retained = owner.backend(workspace_id)
-            retained.manager.require_network_phase(retained.spec, "agent")
+            with call.stage("network_phase"):
+                retained.manager.require_network_phase(retained.spec, "agent")
 
             def on_terminal_closed(last_activity: float) -> None:
                 owner.terminal_closed(
@@ -1956,16 +2007,18 @@ def create_app(
                     last_activity_monotonic=last_activity,
                 )
 
-            return await asyncio.to_thread(
-                terminals.create,
-                descriptor.origin_thread_id,
-                "/workspace",
-                rows=body.rows,
-                cols=body.cols,
-                backend=retained,
-                idle_ttl_s=owner.idle_timeout_s,
-                on_closed=on_terminal_closed,
-            )
+            with call.stage("pty_spawn"):
+                body_out = await asyncio.to_thread(
+                    terminals.create,
+                    descriptor.origin_thread_id,
+                    "/workspace",
+                    rows=body.rows,
+                    cols=body.cols,
+                    backend=retained,
+                    idle_ttl_s=owner.idle_timeout_s,
+                    on_closed=on_terminal_closed,
+                )
+            return call.answer(body_out)
         except (HTTPException, SandboxError, ValueError) as exc:
             if terminal_token is not None:
                 with contextlib.suppress(SandboxError):
@@ -2018,21 +2071,32 @@ def create_app(
     @app.get("/workspaces/{workspace_id}/terminals")
     async def list_terminals(
         workspace_id: str,
+        request: Request,
         _: None = Depends(authenticate),
     ) -> dict[str, Any]:
+        call = open_call(
+            request.headers.get(PROFILING_CONTEXT_HEADER), operations=("terminal.open",)
+        )
         scope = terminal_scope(workspace_id)
-        return {"terminals": await asyncio.to_thread(terminals.list, scope)}
+        with call.stage("list"):
+            body = {"terminals": await asyncio.to_thread(terminals.list, scope)}
+        return call.answer(body)
 
     @app.get("/workspaces/{workspace_id}/terminals/{terminal_id}/stream")
     async def stream_terminal(
         workspace_id: str,
         terminal_id: str,
+        request: Request,
         after: int = Query(0, ge=0),
         _: None = Depends(authenticate),
     ) -> StreamingResponse:
+        call = open_call(
+            request.headers.get(PROFILING_CONTEXT_HEADER), operations=("terminal.open",)
+        )
         scope = terminal_scope(workspace_id)
-        session = terminals.get(scope, terminal_id)
-        session.open_stream()
+        with call.stage("stream_attach"):
+            session = terminals.get(scope, terminal_id)
+            session.open_stream()
 
         async def event_stream() -> AsyncIterator[str]:
             cursor = after
@@ -2058,7 +2122,9 @@ def create_app(
         return StreamingResponse(
             event_stream(),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            # A stream's body is the terminal's own bytes, so this call's
+            # measurement answer travels in headers rather than in the body.
+            headers=call.headers(extra={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}),
         )
 
     @app.post("/workspaces/{workspace_id}/terminals/{terminal_id}/input")
@@ -2114,7 +2180,7 @@ def create_app(
         return await asyncio.to_thread(
             retained_operation,
             workspace_id,
-            lambda retained: _run_git(retained, "/workspace", base_sha),
+            lambda retained, _call: _run_git(retained, "/workspace", base_sha),
         )
 
     return app

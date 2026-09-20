@@ -25,6 +25,8 @@ apps/
 │   ├── cloud_agent/           control plane (FastAPI): API, auth adapter,
 │   │                          scheduler, publishing, storage
 │   ├── cloud_agent_host/      host agent: runner, sandbox, runtimes, workspace broker
+│   ├── cloud_agent_profiling/ neutral opt-in measurement vocabulary the control
+│   │                          plane and host both import without either owning it
 │   └── cloud_agent_shared/    vocabulary both images ship: capability strings,
 │       │                      protocol versions, pins, egress policy, shared errors
 │       └── git/               the patch gate and the source-archive builders

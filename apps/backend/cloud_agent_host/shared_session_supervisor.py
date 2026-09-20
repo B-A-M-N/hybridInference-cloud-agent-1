@@ -31,6 +31,7 @@ from cloud_agent_host.chat_sandbox import (
     ChatSandboxSpec,
     RetainedChatBackend,
     RetainedChatLost,
+    SandboxActionFacts,
 )
 from cloud_agent_host.drivers import DialectRuntime
 from cloud_agent_host.guest_observer import (
@@ -59,6 +60,12 @@ from cloud_agent_host.session_lifecycle import (
     DEFAULT_SWEEP_INTERVAL_S,
     SessionBusy,
     SessionLeaseLost,
+)
+from cloud_agent_profiling.operation_profiling import (
+    StageRecorder,
+    context_call_id,
+    start_stage_recording,
+    substage,
 )
 
 if TYPE_CHECKING:
@@ -115,6 +122,27 @@ class SharedSessionLease:
     context_status: ContextStatus
     resident_state: ResidentState
     resident_slot_id: int
+    #: What this activation actually did to the container: ``created``,
+    #: ``adopted``, ``started``, ``reused`` or ``unknown``. The runner cannot
+    #: derive it from the container's state afterwards, and the four startup
+    #: paths differ precisely by this action.
+    container_action: str = "unknown"
+    #: Sub-stage durations measured in this process, if it is part of an
+    #: experiment. Durations only: another process's monotonic offsets would
+    #: not be comparable with the caller's.
+    stages: list[dict[str, Any]] = field(default_factory=list)
+    #: Which caller call this answers, echoed back so a retry is a second
+    #: fragment rather than a replacement for the first.
+    profiling_call_id: str | None = None
+    #: Whether this process finished collecting for that call. Distinct from
+    #: `stages` being empty: a reuse that legitimately did no timed work still
+    #: collected, and reporting it as missing made every reuse incomplete.
+    profiling_recorded: bool = False
+    #: Whether that collection was cut short by this process's own deadline.
+    #: An empty `stages` means "collected and nothing to time" only when this
+    #: is false -- otherwise it means the stages were skipped and never
+    #: measured, which must not pass for a complete fragment.
+    profiling_truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -143,6 +171,17 @@ class SharedSessionDescriptor:
     native_session_id: str | None
     idle_deadline_monotonic: float | None
     context_status: ContextStatus
+    #: What the resident call did to the member's CLI process: ``reuse`` kept
+    #: the live process, ``resume`` reopened the native session, ``new``
+    #: started a process with no session to resume.
+    resident_action: str = "unknown"
+    #: Sub-stage durations measured in this process, if it is part of an
+    #: experiment. See :class:`SharedSessionLease`.
+    stages: list[dict[str, Any]] = field(default_factory=list)
+    #: See :class:`SharedSessionLease`.
+    profiling_call_id: str | None = None
+    profiling_recorded: bool = False
+    profiling_truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -454,6 +493,8 @@ class SharedChatSessionSupervisor:
         members: builtins.list[SharedMemberManifest],
         *,
         expected_container_id: str | None = None,
+        facts: SandboxActionFacts | None = None,
+        observer: StageRecorder | None = None,
     ) -> builtins.list[SharedSessionDescriptor]:
         """Install the control plane's authoritative member aliases."""
         if not members:
@@ -478,7 +519,7 @@ class SharedChatSessionSupervisor:
                 inspection = (
                     self._manager.require_existing(spec, container_id=expected_container_id)
                     if expected_container_id
-                    else self._manager.create(spec)
+                    else self._manager.create(spec, facts=facts, observer=observer)
                 )
                 group = _Group(spec=spec, inspection=inspection)
                 self._groups[spec.sandbox_id] = group
@@ -579,9 +620,23 @@ class SharedChatSessionSupervisor:
         has_settled_context: bool,
         manifest: builtins.list[SharedMemberManifest],
         expected_container_id: str | None = None,
+        profiling: dict[str, Any] | None = None,
     ) -> SharedSessionLease:
         """Start one group if needed and lease only the addressed member."""
-        self.register_manifest(spec, manifest, expected_container_id=expected_container_id)
+        # Container actions are always reported: they are a couple of string
+        # assignments, and the runner needs them whenever it is profiling.
+        # Durations are collected only for a selection this process can honour:
+        # its own switch, its own run, and the caller's inherited deadline.
+        facts = SandboxActionFacts()
+        recorder = start_stage_recording(profiling)
+        call_id = context_call_id(profiling)
+        self.register_manifest(
+            spec,
+            manifest,
+            expected_container_id=expected_container_id,
+            facts=facts,
+            observer=recorder,
+        )
         with self._lock:
             group, member = self._member(thread_id)
             transition_deadline = time.monotonic() + 30.0
@@ -593,7 +648,9 @@ class SharedChatSessionSupervisor:
                 self._condition.wait(timeout=min(remaining, 0.5))
             if member.lease_token is not None:
                 if member.lease_owner == owner:
-                    return self._lease(group, member)
+                    return self._lease(
+                        group, member, facts=facts, recorder=recorder, call_id=call_id
+                    )
                 raise SessionBusy(f"chat {thread_id!r} already has an active turn")
             if member.current_turn is not None:
                 raise SessionBusy(f"chat {thread_id!r} already has a running turn")
@@ -614,6 +671,8 @@ class SharedChatSessionSupervisor:
             group.inspection = self._manager.start(
                 group.spec,
                 network_phase="agent" if has_settled_context else "setup",
+                facts=facts,
+                observer=recorder,
             )
             member.activation_generation = activation_generation
             member.settlement_receipt = None
@@ -628,24 +687,37 @@ class SharedChatSessionSupervisor:
             group.idle_deadline = None
 
         with self._lock:
-            return self._lease(group, member)
+            return self._lease(group, member, facts=facts, recorder=recorder, call_id=call_id)
 
     def ensure_resident(
         self,
         thread_id: str,
         token: str,
         launch: ResidentLaunch,
+        profiling: dict[str, Any] | None = None,
     ) -> SharedSessionDescriptor:
         """Open or reuse the member transport after workspace preparation."""
+        # Only durations are gated: the member's action is reported either way,
+        # because the runner needs it to classify the startup path.
+        recorder = start_stage_recording(profiling)
+        call_id = context_call_id(profiling)
         with self._lock:
             group, member = self._leased_member(thread_id, token)
             self._require_mutation_admission(group)
         # CLI initialization may block. The member lock, not the group lock,
         # leaves siblings able to initialize and execute simultaneously.
         with member.turn_lock:
-            self._ensure_transport(group, member, launch)
+            resident_action = self._ensure_transport(group, member, launch, observer=recorder)
         with self._lock:
-            return self._descriptor(group, member)
+            return self._descriptor(
+                group,
+                member,
+                resident_action=resident_action,
+                stages=recorder.stages if recorder is not None else [],
+                call_id=call_id,
+                recorded=recorder is not None,
+                truncated=recorder is not None and recorder.stopped_early(),
+            )
 
     def start_turn(
         self,
@@ -2070,7 +2142,10 @@ class SharedChatSessionSupervisor:
         group: _Group,
         member: _Member,
         launch: ResidentLaunch,
-    ) -> None:
+        *,
+        observer: StageRecorder | None = None,
+    ) -> str:
+        """Open or reuse this member's transport, reporting which one it was."""
         with self._lock:
             current_group, current_member = self._member(member.thread_id)
             if current_group is not group or current_member is not member:
@@ -2100,7 +2175,7 @@ class SharedChatSessionSupervisor:
                 if launch.residency_generation:
                     member.residency_generation = launch.residency_generation
                 member.resident_state = "live"
-                return
+                return "reuse"
             if current is not None and current.alive and not launch.credential:
                 # A probe from a new turn intentionally omits credentials so a
                 # HOT hit never rotates the residency grant. Preserve the
@@ -2112,7 +2187,8 @@ class SharedChatSessionSupervisor:
         if current is not None:
             with contextlib.suppress(Exception):
                 current.close()
-        transport = self._transport_factory.open(group.spec, launch)
+        with substage(observer, "cli_spawn"):
+            transport = self._transport_factory.open(group.spec, launch)
         observed = transport.native_session_id
         if launch.native_session_id and observed and observed != launch.native_session_id:
             with contextlib.suppress(Exception):
@@ -2151,6 +2227,10 @@ class SharedChatSessionSupervisor:
             with contextlib.suppress(Exception):
                 transport.close()
             raise SessionLeaseLost("shared sandbox lifecycle changed during process launch")
+        # A freshly opened process is a native resume when there was a session
+        # to resume, and a new CLI otherwise. It is never a reuse: the HOT
+        # process returned above.
+        return "resume" if launch.native_session_id else "new"
 
     def _ensure_running(self, group: _Group) -> None:
         current = self._manager.inspect(group.spec.container_name)
@@ -2222,7 +2302,15 @@ class SharedChatSessionSupervisor:
         return group, member
 
     @staticmethod
-    def _lease(group: _Group, member: _Member) -> SharedSessionLease:
+    def _lease(
+        group: _Group,
+        member: _Member,
+        *,
+        facts: SandboxActionFacts | None = None,
+        recorder: StageRecorder | None = None,
+        call_id: str | None = None,
+    ) -> SharedSessionLease:
+        """Build the caller's receipt, including what this call did to the container."""
         assert member.lease_token is not None
         return SharedSessionLease(
             thread_id=member.thread_id,
@@ -2236,13 +2324,27 @@ class SharedChatSessionSupervisor:
             context_status=member.context_status,
             resident_state=member.resident_state,
             resident_slot_id=member.resident_slot_id,
+            container_action=facts.container_action if facts is not None else "unknown",
+            stages=list(recorder.stages) if recorder is not None else [],
+            profiling_call_id=call_id,
+            profiling_recorded=recorder is not None,
+            profiling_truncated=recorder is not None and recorder.stopped_early(),
         )
 
     def _descriptors(self, group: _Group) -> builtins.list[SharedSessionDescriptor]:
         return [self._descriptor(group, member) for member in group.members.values()]
 
     @staticmethod
-    def _descriptor(group: _Group, member: _Member) -> SharedSessionDescriptor:
+    def _descriptor(
+        group: _Group,
+        member: _Member,
+        *,
+        resident_action: str = "unknown",
+        stages: builtins.list[dict[str, Any]] | None = None,
+        call_id: str | None = None,
+        recorded: bool = False,
+        truncated: bool = False,
+    ) -> SharedSessionDescriptor:
         return SharedSessionDescriptor(
             thread_id=member.thread_id,
             origin_thread_id=group.spec.thread_id,
@@ -2270,6 +2372,11 @@ class SharedChatSessionSupervisor:
             native_session_id=member.native_session_id,
             idle_deadline_monotonic=group.idle_deadline,
             context_status=member.context_status,
+            resident_action=resident_action,
+            stages=list(stages) if stages else [],
+            profiling_call_id=call_id,
+            profiling_recorded=recorded,
+            profiling_truncated=truncated,
         )
 
     @staticmethod

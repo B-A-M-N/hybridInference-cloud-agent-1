@@ -3477,6 +3477,69 @@
         "title": "AgentJobResponse",
         "type": "object"
       },
+      "AgentOperationProfilingFragment": {
+        "description": "Which selected measurement produced this response, and how complete it is.\n\nPresent only while an experiment has selected this operation. A client that\ndoes not know the field sees no change, and a client that does can carry\n``interaction_id`` into the next request of the same interaction and report\nits own endpoint separately -- the browser's clock is never compared with\nthe server's, the two are correlated through that id.\n\nTwo completeness questions are kept apart on purpose. The ``fragment_*``\npair describes the downstream call this reply came from; ``collection_complete``\ndescribes this whole local record. A reader must not have to infer either\nfrom the other, and a fragment can be answered and still be a floor.",
+        "properties": {
+          "call_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Call Id"
+          },
+          "collection_complete": {
+            "default": false,
+            "title": "Collection Complete",
+            "type": "boolean"
+          },
+          "fragment_recorded": {
+            "default": false,
+            "title": "Fragment Recorded",
+            "type": "boolean"
+          },
+          "fragment_truncated": {
+            "default": false,
+            "title": "Fragment Truncated",
+            "type": "boolean"
+          },
+          "interaction_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Interaction Id",
+            "type": "string"
+          },
+          "measurement_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Measurement Id",
+            "type": "string"
+          },
+          "operation": {
+            "default": "",
+            "maxLength": 128,
+            "title": "Operation",
+            "type": "string"
+          },
+          "request_kind": {
+            "default": "",
+            "maxLength": 128,
+            "title": "Request Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "interaction_id",
+          "measurement_id"
+        ],
+        "title": "AgentOperationProfilingFragment",
+        "type": "object"
+      },
       "AgentProject": {
         "description": "One repo the caller has run tasks in, summarized for the task tree.",
         "properties": {
@@ -4082,6 +4145,16 @@
       "AgentTerminalSessionListResponse": {
         "description": "Interactive terminal sessions retained by one live workspace.",
         "properties": {
+          "profiling": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentOperationProfilingFragment"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "terminals": {
             "items": {
               "$ref": "#/components/schemas/AgentTerminalSessionResponse"
@@ -4717,6 +4790,16 @@
           "path": {
             "title": "Path",
             "type": "string"
+          },
+          "profiling": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentOperationProfilingFragment"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "size": {
             "anyOf": [
@@ -10505,6 +10588,76 @@
         "title": "WorkerHeartbeatResponse",
         "type": "object"
       },
+      "WorkerMeasurementRequest": {
+        "description": "One finished measurement, as the producer froze it.\n\nDeliberately opaque below the envelope: the record is validated against the\ncollector's own bounds and its facts whitelist by the route, because those\nconstants live with the producer that produced it and a schema that\nrestated them would be a second copy free to drift.",
+        "properties": {
+          "record": {
+            "additionalProperties": true,
+            "title": "Record",
+            "type": "object"
+          },
+          "run": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run"
+          }
+        },
+        "required": [
+          "record"
+        ],
+        "title": "WorkerMeasurementRequest",
+        "type": "object"
+      },
+      "WorkerMeasurementResponse": {
+        "description": "What the control plane did with one measurement.\n\n``result`` is an outcome rather than a bare acknowledgement because the\nproducer has to distinguish three things it would otherwise guess at:\nstored, already stored (a retry that must not count twice), and refused\n(which is terminal and must not be retried).",
+        "properties": {
+          "measurement_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Measurement Id"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "result": {
+            "enum": [
+              "stored",
+              "duplicate",
+              "conflict",
+              "run_conflict",
+              "rejected"
+            ],
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "WorkerMeasurementResponse",
+        "type": "object"
+      },
       "WorkerProcessObservation": {
         "description": "One bounded guest-kernel process identity reported by the broker.",
         "properties": {
@@ -12323,6 +12476,526 @@
           }
         },
         "summary": "Get Admin Conversation"
+      }
+    },
+    "/admin/agent/measurement-writer": {
+      "get": {
+        "description": "Return this replica's bounded diagnostic-writer state and loss counts.",
+        "operationId": "measurement_writer_status_admin_agent_measurement_writer_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Measurement Writer Status Admin Agent Measurement Writer Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Measurement Writer Status"
+      }
+    },
+    "/admin/agent/measurements": {
+      "get": {
+        "description": "Return one page of measurement summaries, newest first.\n\nSummaries only: the frozen record is the largest thing this surface holds\nand a list needs none of it, so a page of them would be a page of payload.\nThe cursor is the ``measurement_id`` of the last row, resolved to its own\narrival here -- a caller cannot forge an arrival time, and the pair\n``(received_at, measurement_id)`` is what makes the page stable while new\nsamples land.\n\n``attempt_id`` and ``interaction_id`` are not two spellings of one filter.\nAn attempt selects the startup record of exactly one execution; an\ninteraction selects the list, create and stream-attach requests of one\nterminal open, which have no attempt at all. A caller that wants the whole\nof one terminal open asks by interaction, and gets three rows that are\nthree measurements rather than one.",
+        "operationId": "list_measurements_admin_agent_measurements_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "run_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Run Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "operation",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Operation"
+            }
+          },
+          {
+            "in": "query",
+            "name": "request_kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Request Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "coverage_scope",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Coverage Scope"
+            }
+          },
+          {
+            "in": "query",
+            "name": "outcome",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Outcome"
+            }
+          },
+          {
+            "in": "query",
+            "name": "collection_complete",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Collection Complete"
+            }
+          },
+          {
+            "in": "query",
+            "name": "job_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Job Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "thread_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Thread Id"
+            }
+          },
+          {
+            "description": "One execution's startup samples; startup records carry one.",
+            "in": "query",
+            "name": "attempt_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "One execution's startup samples; startup records carry one.",
+              "title": "Attempt Id"
+            }
+          },
+          {
+            "description": "Every request of one logical interaction, such as a terminal open.",
+            "in": "query",
+            "name": "interaction_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Every request of one logical interaction, such as a terminal open.",
+              "title": "Interaction Id"
+            }
+          },
+          {
+            "description": "Opaque cursor: the measurement_id to continue after.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Opaque cursor: the measurement_id to continue after.",
+              "title": "After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Measurements Admin Agent Measurements Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Measurements"
+      }
+    },
+    "/admin/agent/measurements/{measurement_id}": {
+      "get": {
+        "description": "Return one measurement with the record it was frozen from.",
+        "operationId": "get_measurement_admin_agent_measurements__measurement_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "measurement_id",
+            "required": true,
+            "schema": {
+              "title": "Measurement Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Measurement Admin Agent Measurements  Measurement Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Measurement"
+      }
+    },
+    "/admin/agent/profiling-runs": {
+      "get": {
+        "description": "Return the experiment catalogue, most recent first.\n\nA run appears here only once a producer has delivered a measurement for it:\nthe row is created by that delivery, so an experiment that collected\nnothing has nothing to list. The page says how many runs it returned rather\nthan implying it returned all of them.",
+        "operationId": "list_profiling_runs_admin_agent_profiling_runs_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Since"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Profiling Runs Admin Agent Profiling Runs Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Profiling Runs"
+      }
+    },
+    "/admin/agent/profiling-runs/{run_id}/summary": {
+      "get": {
+        "description": "Return counts and percentiles over a whole experiment.\n\nComputed in SQL, not over one page: a percentile of the rows a reader\nhappened to load is a percentile of the page. The groups carry the\ndimensions that decide comparability, and the counts report what was\nexcluded from the distribution alongside what was included.",
+        "operationId": "summarize_profiling_run_admin_agent_profiling_runs__run_id__summary_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "group_by",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Group By"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Summarize Profiling Run Admin Agent Profiling Runs  Run Id  Summary Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Summarize Profiling Run"
       }
     },
     "/admin/agent/runner-hosts": {
@@ -19929,6 +20602,72 @@
           }
         },
         "summary": "Worker Heartbeat"
+      }
+    },
+    "/v1/agent/worker/jobs/{job_id}/measurements": {
+      "post": {
+        "description": "Store one finished measurement without requiring a still-live lease.",
+        "operationId": "worker_record_measurement_v1_agent_worker_jobs__job_id__measurements_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkerMeasurementRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerMeasurementResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Worker Record Measurement"
       }
     },
     "/v1/agent/worker/jobs/{job_id}/release": {

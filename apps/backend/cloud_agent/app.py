@@ -29,6 +29,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.responses import PlainTextResponse
 
 from cloud_agent.logging_utils import configure_process_logging, get_logger
 
@@ -37,10 +38,17 @@ logger = get_logger(__name__)
 
 #: The admin observation reads. Their bodies are time-varying and describe
 #: other users' runs, so no intermediary may store one.
-ADMIN_READ_PREFIX = "/admin/agent/runs"
+ADMIN_READ_PREFIXES = (
+    "/admin/agent/runs",
+    "/admin/agent/measurements",
+    "/admin/agent/measurement-writer",
+    "/admin/agent/profiling-runs",
+)
 
 
-def install_admin_no_store(app: FastAPI, *, prefix: str = ADMIN_READ_PREFIX) -> None:
+def install_admin_no_store(
+    app: FastAPI, *, prefixes: tuple[str, ...] = ADMIN_READ_PREFIXES
+) -> None:
     """Keep admin read responses, refusals included, out of every cache.
 
     A route dependency can set a header on a response the route returns, but
@@ -49,7 +57,7 @@ def install_admin_no_store(app: FastAPI, *, prefix: str = ADMIN_READ_PREFIX) -> 
     them, and are registered here rather than as middleware: middleware would
     also sit in front of the event streams, which are long-lived by design.
     """
-    prefix = prefix.rstrip("/")
+    normalized = tuple(prefix.rstrip("/") for prefix in prefixes)
 
     async def with_no_store(request: Request, exc: Exception) -> Response:
         response: Response
@@ -57,12 +65,32 @@ def install_admin_no_store(app: FastAPI, *, prefix: str = ADMIN_READ_PREFIX) -> 
             response = await request_validation_exception_handler(request, exc)
         else:
             response = await http_exception_handler(request, exc)  # type: ignore[arg-type]
-        if request.url.path == prefix or request.url.path.startswith(f"{prefix}/"):
+        if any(
+            request.url.path == prefix or request.url.path.startswith(f"{prefix}/")
+            for prefix in normalized
+        ):
             response.headers["Cache-Control"] = "no-store"
         return response
 
+    async def unexpected_with_no_store(request: Request, exc: Exception) -> Response:
+        protected = any(
+            request.url.path == prefix or request.url.path.startswith(f"{prefix}/")
+            for prefix in normalized
+        )
+        logger.error(
+            "unhandled_request_error",
+            exc_info=exc,
+            extra={"event": "unhandled_request_error", "path": request.url.path},
+        )
+        return PlainTextResponse(
+            "Internal Server Error",
+            status_code=500,
+            headers={"Cache-Control": "no-store"} if protected else None,
+        )
+
     app.add_exception_handler(StarletteHTTPException, with_no_store)
     app.add_exception_handler(RequestValidationError, with_no_store)
+    app.add_exception_handler(Exception, unexpected_with_no_store)
 
 
 from cloud_agent.bootstrap.lifespan import lifespan
@@ -76,6 +104,7 @@ def create_app() -> FastAPI:
         admin_conversations,
         admin_hosts,
         admin_llm_requests,
+        admin_measurements,
         admin_runs,
         admin_usage,
         hosts,
@@ -111,6 +140,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_conversations.router)
     app.include_router(admin_runs.router)
     app.include_router(admin_usage.router)
+    app.include_router(admin_measurements.router)
     # Per-request LLM detail reads a second service and stays in its own module
     # for the same reason it is a separate page load: the default run detail
     # must not acquire a gateway I/O path.
