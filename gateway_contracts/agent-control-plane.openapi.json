@@ -12843,6 +12843,55 @@
         "summary": "Get Measurement"
       }
     },
+    "/admin/agent/profiling-control": {
+      "get": {
+        "description": "Return the control mode, the current experiment and what has confirmed it.\n\n``mode`` is the deployment's answer to \"who may control this\", and it is\nwhat stops the page from offering a switch that would do nothing. The three\nanswers are deliberately different:\n\n* ``disabled`` -- no control at all, and no collection either.\n* ``environment`` -- a static descriptor decides; Admin reports that the\n  deployment is configuration-managed and offers no switch, because there is\n  nothing for this API to turn off.\n* ``admin`` -- the persisted configuration decides, and everything below\n  applies.\n\nA deployment whose mode is not ``admin`` still gets an answer rather than a\n404: \"you cannot control this here, and here is why\" is the useful reply.",
+        "operationId": "get_profiling_control_admin_agent_profiling_control_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Profiling Control Admin Agent Profiling Control Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Profiling Control"
+      }
+    },
     "/admin/agent/profiling-runs": {
       "get": {
         "description": "Return the experiment catalogue, most recent first.\n\nA run appears here only once a producer has delivered a measurement for it:\nthe row is created by that delivery, so an experiment that collected\nnothing has nothing to list. The page says how many runs it returned rather\nthan implying it returned all of them.",
@@ -12919,6 +12968,135 @@
           }
         },
         "summary": "List Profiling Runs"
+      },
+      "post": {
+        "description": "Create and start one measurement experiment.\n\nThe body is read as a plain mapping rather than a generated model so that a\nrefusal can name the offending field in the same envelope every other\nrefusal uses. Unknown keys are refused rather than ignored: a caller that\nmisspelled ``operations`` would otherwise start an experiment measuring\nnothing.",
+        "operationId": "start_profiling_run_admin_agent_profiling_runs_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Payload",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Start Profiling Run Admin Agent Profiling Runs Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Profiling Run"
+      }
+    },
+    "/admin/agent/profiling-runs/{run_id}/stop": {
+      "post": {
+        "description": "Stop the named experiment.\n\nStopping does not interrupt anything a user is doing: it stops *collecting*.\nA file read that is already running finishes, a terminal stays attached, and\nevery sample already frozen is delivered. What ends is the addition of new\nsamples, at the latest when the bounded authorization the producers hold\nlapses.",
+        "operationId": "stop_profiling_run_admin_agent_profiling_runs__run_id__stop_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Payload",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Stop Profiling Run Admin Agent Profiling Runs  Run Id  Stop Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stop Profiling Run"
       }
     },
     "/admin/agent/profiling-runs/{run_id}/summary": {
@@ -14917,6 +15095,76 @@
         "summary": "Register Host",
         "tags": [
           "agent-hosts"
+        ]
+      }
+    },
+    "/v1/agent/hosts/profiling-policy": {
+      "post": {
+        "description": "Return the profiling policy this host must apply.\n\nA dedicated read so a Start or a Stop reaches a host that is between beats.\nIt takes the same credential the beat does, so the host needs no second\nsecret, and the sandbox -- which never holds the credential -- can reach\nnothing here.\n\nThe host is resolved by the credential and never named by the request, which\nis what makes it impossible to ask about another machine: an answer is\ncomputed for whoever authenticated.",
+        "operationId": "read_host_profiling_policy_v1_agent_hosts_profiling_policy_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Read Host Profiling Policy V1 Agent Hosts Profiling Policy Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Host Profiling Policy",
+        "tags": [
+          "host-profiling"
         ]
       }
     },

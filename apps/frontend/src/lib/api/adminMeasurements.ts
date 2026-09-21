@@ -5,7 +5,9 @@
 // record says, and what the experiment as a whole distributes like. The fifth
 // question -- why an experiment has no samples -- is deliberately left
 // unanswered here, and the empty page carries the server's own wording for it
-// rather than a client guess.
+// rather than a client guess. The runtime-control routes at the end of the file
+// are the only writes on this surface: they answer whether anything is being
+// collected at all, which is a different question from what was collected.
 //
 // `no-store` is not a default that can be dropped: the control plane computes
 // ages and completeness from a clock, so a cached page would describe a moment
@@ -18,6 +20,7 @@ import { fetchWithAuth, jsonOrThrow } from './client';
 const RUNS = '/admin/agent/profiling-runs';
 const MEASUREMENTS = '/admin/agent/measurements';
 const WRITER = '/admin/agent/measurement-writer';
+const CONTROL = '/admin/agent/profiling-control';
 
 /**
  * The dimensions the summary groups by.
@@ -376,4 +379,225 @@ export async function getMeasurementWriterStatus(
   return jsonOrThrow<MeasurementWriterStatus>(
     await fetchWithAuth(config.apiBase, WRITER, { signal, cache: 'no-store' }),
   );
+}
+
+// ---------------------------------------------------------------------------
+// Runtime control of collection
+// ---------------------------------------------------------------------------
+//
+// The reads above describe what was collected. These describe whether anything
+// is being collected at all, and are the only writes on this surface.
+//
+// A write carries the revision the admin was looking at, so a command built
+// from a stale page is refused rather than applied to a run nobody chose, and a
+// client-generated request id, so a retry after a lost response is the same
+// command instead of a second run. Both travel in the body; neither is
+// recoverable from the response of the request that failed.
+
+/**
+ * What the deployment's *configuration* says it is doing.
+ *
+ * Four values, and they are not the same fact: `off` is a state somebody chose,
+ * `on` is an experiment in force, and the other two are statements about
+ * whether this deployment can be commanded from the Admin API at all.
+ * `unavailable` covers both "profiling is disabled" and "there is no control
+ * row", and `unmanaged` means the deployment's own configuration decides.
+ * Neither of those is off, and a page that rendered one as off would offer a
+ * switch that does nothing.
+ */
+export type ProfilingControlStatus = 'off' | 'on' | 'unavailable' | 'unmanaged';
+
+/**
+ * Which of the three questions an operator is asking.
+ *
+ * The grouping is this client's, not the wire's: the server serves root
+ * operation names and each group is the set of names one checkbox stands for.
+ * The names behind a group are read from the server rather than hard-coded
+ * here, because what a deployment can select is exactly what it must be asked
+ * for.
+ */
+export type MeasurementOperationGroup = 'sandbox_startup' | 'terminal_open' | 'file_access';
+
+export interface ProfilingControlRun {
+  run_id: string;
+  /** The root operation names this run selects. */
+  operations: string[];
+  target: { host?: string };
+  expires_at: string;
+  started_at: string | null;
+  stopped_at: string | null;
+  stop_reason: string | null;
+  lifecycle: string | null;
+  source: string | null;
+  created_by: string | null;
+  control_revision: number | null;
+  /**
+   * What the authority's clock had left when it answered. A countdown between
+   * polls is measured from this, never from `expires_at`, which is a wall-clock
+   * instant two clocks would have to agree on.
+   */
+  seconds_remaining: number;
+}
+
+/**
+ * One deployment's control state, as the server reads it at one instant.
+ *
+ * Everything here describes the configuration: what the deployment is
+ * currently set to collect, until when, and what that configuration has stored.
+ * It says nothing about which processes have applied it -- sync lags by design,
+ * and `sync_note` states the lag instead of pretending to have measured it.
+ */
+export interface ProfilingControlSnapshot {
+  /** Which deployment this control row belongs to; never chosen by a client. */
+  deployment: string;
+  /**
+   * Who may control this deployment.
+   *
+   * `admin` is the only mode in which a command from this page means anything:
+   * a deployment configured by its environment answers `unmanaged`, and one
+   * with profiling disabled answers `unavailable`. Both still answer, rather
+   * than 404, so the card can say why it offers no switch.
+   */
+  mode: 'disabled' | 'environment' | 'admin';
+  /** The control revision a write must echo back as `expected_revision`. */
+  revision: number;
+  /** False when this deployment has no Admin control state to command. */
+  configured: boolean;
+  /** ISO-8601 UTC, by the server's clock. */
+  server_time: string;
+  status: ProfilingControlStatus;
+  /**
+   * The experiment **in force**, or null when the deployment is not collecting.
+   *
+   * A stopped experiment is reported in `last_stopped_run` rather than here, so
+   * a reader can never mistake a tombstone for a live command.
+   */
+  run: ProfilingControlRun | null;
+  /**
+   * Whether `run` is an experiment that is actually collecting.
+   *
+   * Stated by the server instead of inferred from `run !== null` because the
+   * two are separate questions, and the one wrong answer would keep a page
+   * offering a Stop for an experiment that already ended.
+   */
+  run_active: boolean;
+  /**
+   * The experiment the most recent Stop ended, for the status text.
+   *
+   * Context only: never a run to stop, and cleared by the next Start.
+   */
+  last_stopped_run: ProfilingControlRun | null;
+  /** Real stored rows for the active run; 0 when there is no active run. */
+  stored_samples: number;
+  budget_scope: 'producer_instance';
+  /** The server's own statement of what the bound does and does not cover. */
+  budget_note: string;
+  /**
+   * How long a change takes to reach every process, in the server's words.
+   *
+   * Rendered as written: a card that implied instant agreement would be
+   * describing a consensus it never measured.
+   */
+  sync_note: string;
+  operations: {
+    /** The root operation names each group selects, as this deployment offers them. */
+    selectable: {
+      sandbox_startup: string[];
+      terminal_open: string[];
+      file_access: string[];
+    };
+    all: string[];
+  };
+  bounds: {
+    min_duration_seconds: number;
+    max_duration_seconds: number;
+    default_max_operations: number;
+    hard_max_operations: number;
+  };
+}
+
+export interface StartMeasurementRequest {
+  /**
+   * Client-generated and stable across retries of the same command, so a
+   * response lost in transit does not create a second run.
+   */
+  request_id: string;
+  /** The revision the admin was looking at, not necessarily the current one. */
+  expected_revision: number;
+  operations: string[];
+  /** `null` means every host. */
+  target: { host: string | null };
+  duration_seconds: number;
+}
+
+export interface StartMeasurementResponse {
+  /** The control state the command produced; the page renders this, not a guess. */
+  control: ProfilingControlSnapshot;
+  run_id: string;
+  revision: number;
+}
+
+export interface StopMeasurementResponse {
+  control: ProfilingControlSnapshot;
+  run_id: string;
+  revision: number;
+}
+
+export async function getProfilingControl(signal?: AbortSignal): Promise<ProfilingControlSnapshot> {
+  return jsonOrThrow<ProfilingControlSnapshot>(
+    await fetchWithAuth(config.apiBase, CONTROL, { signal, cache: 'no-store' }),
+  );
+}
+
+export async function startProfilingRun(
+  body: StartMeasurementRequest,
+  signal?: AbortSignal,
+): Promise<StartMeasurementResponse> {
+  return jsonOrThrow<StartMeasurementResponse>(
+    await fetchWithAuth(config.apiBase, RUNS, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal,
+      cache: 'no-store',
+    }),
+  );
+}
+
+export async function stopProfilingRun(
+  runId: string,
+  body: { request_id: string },
+  signal?: AbortSignal,
+): Promise<StopMeasurementResponse> {
+  return jsonOrThrow<StopMeasurementResponse>(
+    await fetchWithAuth(config.apiBase, `${RUNS}/${encodeURIComponent(runId)}/stop`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal,
+      cache: 'no-store',
+    }),
+  );
+}
+
+/**
+ * The root operation names the checked groups stand for.
+ *
+ * The mapping is read from the snapshot, so a deployment that offers nothing
+ * for a group is asked for nothing; the caller's order is kept and a name two
+ * groups share is sent once. An empty result is a real answer -- there is
+ * nothing this deployment can collect for that selection -- and a caller that
+ * posts it would be refused, which is why the page refuses first.
+ */
+export function measurementOperationsFor(
+  groups: MeasurementOperationGroup[],
+  snapshot: ProfilingControlSnapshot,
+): string[] {
+  const operations: string[] = [];
+  for (const group of groups) {
+    for (const operation of snapshot.operations.selectable[group] ?? []) {
+      if (!operations.includes(operation)) operations.push(operation);
+    }
+  }
+  return operations;
 }

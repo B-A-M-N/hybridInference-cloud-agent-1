@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -162,6 +163,32 @@ def _enable(monkeypatch, **overrides: Any) -> dict[str, Any]:
     operation_profiling.reset_cache()
     reset_selections()
     return run
+
+
+def _enable_admin(monkeypatch, **overrides: Any) -> tuple[dict[str, Any], Any]:
+    """Put this process under Admin control with one experiment in force.
+
+    Returns the descriptor and the published snapshot, so a test can publish a
+    Stop the way the control plane's sync loop does.
+    """
+    run: dict[str, Any] = {
+        "run_id": "cp-run-1",
+        "operations": ["files.list", "files.open", "terminal.open"],
+        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
+        "max_operations": 10,
+    }
+    run.update(overrides)
+    monkeypatch.setenv(operation_profiling.ENV_PROFILING_MODE, operation_profiling.MODE_ADMIN)
+    operation_profiling.reset_cache()
+    reset_selections()
+    published = operation_profiling.policy_store().publish(
+        operation_profiling.ControlState(
+            mode=operation_profiling.MODE_ADMIN,
+            config_version=1,
+            run=operation_profiling.parse_run(json.dumps(run)),
+        )
+    )
+    return run, published
 
 
 def _answer(headers: Any) -> dict[str, Any] | None:
@@ -1285,8 +1312,19 @@ async def test_a_streamed_truncation_reaches_the_client_headers(
 async def test_a_request_that_outlived_its_run_reports_incomplete(
     client: AsyncClient, store: FakeStorage, monkeypatch, records
 ):
-    """The response cannot claim completeness while the record is expiring."""
-    run = _enable(monkeypatch)
+    """The response cannot claim completeness while the record is expiring.
+
+    The boundary the request crosses here is the **experiment's own deadline**,
+    which is the only thing that truncates work already selected. Swapping the
+    deployment's configuration mid-request used to look like the same thing and
+    is not: a selection is bound to the experiment that made it, so a later
+    configuration -- a Disable, or the next experiment -- leaves it alone and
+    this request would now be complete on purpose.
+    """
+    run = _enable(
+        monkeypatch,
+        expires_at=(datetime.now(timezone.utc) + timedelta(seconds=0.4)).isoformat(),
+    )
     broker = _RecordingClient()
     _use_broker(monkeypatch, broker)
     job_id = await _ready_job(client, store)
@@ -1295,22 +1333,69 @@ async def test_a_request_that_outlived_its_run_reports_incomplete(
     # response body is built, or the response claims a sample the record denies.
     original = broker.files
 
-    async def _expire_then_read(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        run["expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
-        monkeypatch.setenv(operation_profiling.ENV_PROFILING_RUN, json.dumps(run))
-        operation_profiling.reset_cache()
+    async def _outlive_the_run(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        time.sleep(0.7)
         return await original(*args, **kwargs)
 
-    monkeypatch.setattr(broker, "files", _expire_then_read)
+    monkeypatch.setattr(broker, "files", _outlive_the_run)
 
     response = await client.get(f"/v1/agent/jobs/{job_id}/files")
 
     assert response.status_code == 200
+    assert run["expires_at"]
     emitted = records()
     # Whatever was collected is reported as partial, identically in both places.
-    if emitted and "profiling" in response.json():
-        assert response.json()["profiling"]["collection_complete"] is False
-        assert emitted[0]["collection_complete"] is False
+    assert "profiling" in response.json(), "the request was selected before it lapsed"
+    assert response.json()["profiling"]["collection_complete"] is False
+    assert emitted[0]["collection_complete"] is False
+
+
+async def test_a_disable_does_not_truncate_an_in_flight_request(
+    client: AsyncClient, store: FakeStorage, monkeypatch, records
+):
+    """Disabling collection stops selecting; it does not cut a request short.
+
+    Only Admin control changes configuration at runtime, so that is the mode
+    this happens in: the broker's own copy of the configuration is replaced
+    mid-request, which is exactly what a Disable does. The request keeps its own
+    experiment and its own deadline and finishes complete -- and the broker,
+    which has just been told to stop selecting, still answers the fragment this
+    request had already started.
+    """
+    _enable_admin(monkeypatch)
+    broker = _RecordingClient()
+    _use_broker(monkeypatch, broker)
+    job_id = await _ready_job(client, store)
+
+    original = broker.files
+
+    async def _disable_then_read(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        # The whole deployment stops selecting, including the broker's copy.
+        operation_profiling.policy_store().publish(
+            operation_profiling.ControlState(
+                mode=operation_profiling.MODE_ADMIN,
+                config_version=2,
+                run=None,
+                stop_reason="stopped",
+            )
+        )
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(broker, "files", _disable_then_read)
+
+    response = await client.get(f"/v1/agent/jobs/{job_id}/files")
+
+    assert response.status_code == 200
+    block = response.json()["profiling"]
+    assert block is not None, "the selection was made before the change"
+    assert block["fragment_recorded"] is True, "the fragment still belonged to it"
+    assert block["collection_complete"] is True
+    assert records()[0]["collection_complete"] is True
+    # And a request arriving after the Disable is not selected at all.
+    operation_profiling.reset_cache()
+    broker.files = original
+    after = await client.get(f"/v1/agent/jobs/{job_id}/files")
+    assert "profiling" not in after.json()
 
 
 # ---------------------------------------------------------------------------
