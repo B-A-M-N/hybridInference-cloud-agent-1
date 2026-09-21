@@ -297,6 +297,100 @@ describe('toDisplayJob', () => {
     expect(toDisplayJob(JOB).branch).toBe('agent/ajob_1');
   });
 
+  it("carries the conversation goal and this round's report", () => {
+    const job = toDisplayJob({
+      ...JOB,
+      turn_source: 'goal',
+      goal_round: 3,
+      goal_round_kind: 'repair',
+      goal_report_parse: 'valid',
+      goal_report_outcome: 'needs_input',
+      goal_report_detail: 'which environment should this deploy to?',
+      goal: {
+        goal_id: 'goal_1',
+        objective: 'make `pytest` pass',
+        state: 'paused',
+        revision: 4,
+        max_rounds: 10,
+        rounds_used: 3,
+        pause_reason: 'needs_input',
+        pause_detail: 'the agent stopped and asked for input',
+        completion_basis: null,
+        completed_by_job_id: null,
+        created_at: null,
+        updated_at: null,
+      },
+    });
+    expect(job.goal).toEqual({
+      objective: 'make `pytest` pass',
+      state: 'paused',
+      revision: 4,
+      roundsUsed: 3,
+      maxRounds: 10,
+      pauseReason: 'needs_input',
+      pauseDetail: 'the agent stopped and asked for input',
+    });
+    expect(job.goalTurn).toEqual({
+      source: 'goal',
+      round: 3,
+      kind: 'repair',
+      reportParse: 'valid',
+      reportOutcome: 'needs_input',
+      reportDetail: 'which environment should this deploy to?',
+    });
+  });
+
+  it('carries a completion as the model report it is', () => {
+    const job = toDisplayJob({
+      ...JOB,
+      turn_source: 'goal',
+      goal_round: 4,
+      goal_round_kind: 'work',
+      goal_report_parse: 'valid',
+      goal_report_outcome: 'complete',
+      goal: {
+        goal_id: 'goal_1',
+        objective: 'make `pytest` pass',
+        state: 'complete',
+        revision: 4,
+        max_rounds: 10,
+        rounds_used: 4,
+        pause_reason: null,
+        pause_detail: null,
+        completion_basis: 'model_reported',
+        completed_by_job_id: 'ajob_1',
+        created_at: null,
+        updated_at: null,
+      },
+    });
+    expect(job.goal?.completionBasis).toBe('model_reported');
+    expect(job.goalTurn?.reportOutcome).toBe('complete');
+  });
+
+  it('says nothing about a goal on a conversation that has none', () => {
+    // A deployment older than this feature, and every conversation nobody set
+    // a goal on: the transcript must not grow an empty band for either, and a
+    // turn must not carry a goal relationship it does not have. Written out
+    // inline, this object was on every job in the product.
+    const job = toDisplayJob(JOB);
+    expect(job.goal).toBeUndefined();
+    expect(job.goalTurn).toBeUndefined();
+  });
+
+  it("reads no completion report out of a person's own turn", () => {
+    // The platform parses the final message of the rounds it queued itself.
+    // A report-shaped row on a turn the owner sent is not a report the platform
+    // made, and the transcript must not present one as the goal's last word.
+    const job = toDisplayJob({
+      ...JOB,
+      turn_source: 'human',
+      goal_report_parse: 'valid',
+      goal_report_outcome: 'complete',
+      goal_report_detail: 'all green',
+    });
+    expect(job.goalTurn).toBeUndefined();
+  });
+
   it('maps the conversation pin time', () => {
     expect(toDisplayJob({ ...JOB, pinned_at: '2026-07-29T12:00:00Z' }).pinnedAt).toBe(
       '2026-07-29T12:00:00Z',

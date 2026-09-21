@@ -189,7 +189,13 @@ async def lifespan(app: FastAPI, *, background: bool = True) -> AsyncIterator[No
     if background:
         app.state.mcp_catalog = McpCatalog(storage.mcp_catalog, http)
         app.state.mcp_catalog_task = asyncio.create_task(app.state.mcp_catalog.run())
-        reaper = asyncio.create_task(reap_expired_attempts(storage, grants=app.state.grants))
+        reaper = asyncio.create_task(
+            reap_expired_attempts(
+                storage,
+                grants=app.state.grants,
+                app_credentials=app.state.app_credentials,
+            )
+        )
         snapshot_coordinator = asyncio.create_task(coordinate_shared_snapshots(storage))
         ledger_collector = asyncio.create_task(
             collect_usage_snapshots(storage.ledger, app.state.grants)

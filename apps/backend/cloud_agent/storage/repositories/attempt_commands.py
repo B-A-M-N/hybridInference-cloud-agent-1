@@ -32,17 +32,20 @@ from cloud_agent.execution_profiles import (
 )
 from cloud_agent.host_pool import CLAIMABLE_STATUSES, HOST_ONLINE
 from cloud_agent.storage._sql.events import insert_event
+from cloud_agent.storage._sql.goals import arm_finish_wakeup, goal_after_terminal
 from cloud_agent.storage._sql.hosts import host_slots_exhausted, release_host_slot
 from cloud_agent.storage._sql.jobs import (
     QUALIFIED_JOB_COLUMNS,
     fail_discontinuous_follow_ups,
     fail_unrunnable_follow_ups,
+    lock_conversation_by_job,
 )
 from cloud_agent.storage._sql.rows import job_row_to_dict, load_json
 from cloud_agent.storage._sql.sandbox import THREAD_SANDBOX_SOURCE
 from cloud_agent.task_titles import thread_title_needs_generation
 
 if TYPE_CHECKING:
+    from cloud_agent.goals.report import GoalReportEnvelope
     from cloud_agent.ports.attempt_commands import TurnSummaryWrite
 
 #: What the ordering rules decide, before the caller writes anything.
@@ -193,6 +196,23 @@ class PostgresAttemptCommands:
                           AND earlier.turn_no < j.turn_no
                           AND earlier.state IN ('queued', 'running')
                   )
+                  -- An automatic round is re-checked against the goal it was
+                  -- created for, here, immediately before it is handed to a
+                  -- host. A round that was queued for an objective the owner
+                  -- has since replaced, paused or cleared must never run: it
+                  -- would work toward a withdrawn objective and pay for it.
+                  -- The sweep in ``sweep_goal_scheduling`` cancels what this
+                  -- skips, so nothing waits here forever.
+                  AND (
+                        j.turn_source <> 'goal'
+                        OR EXISTS (
+                            SELECT 1 FROM agent_threads goal_thread
+                            WHERE goal_thread.id = j.thread_id
+                              AND goal_thread.goal_state = 'active'
+                              AND goal_thread.goal_id = j.goal_id
+                              AND goal_thread.goal_revision = j.goal_revision
+                        )
+                  )
                   AND COALESCE(j.metadata->'requires', '[]'::jsonb) <@ $1::jsonb
                   AND (
                         t.execution_profile = '{ExecutionProfile.TRUSTED_V1.value}'
@@ -326,6 +346,15 @@ class PostgresAttemptCommands:
                 job_id,
                 attempt["id"],
             )
+            # Nothing is charged here. What this goal has spent is *derived*
+            # from the rounds that have actually started — see
+            # ``PostgresGoalRepository._ROUNDS_USED_SQL`` — so a round costs
+            # nothing until this INSERT runs and costs once however often it is
+            # retried. Keeping a counter here meant this statement also had to
+            # update ``agent_threads`` while already holding this job's row
+            # lock, which is the reverse of the thread-before-job order the
+            # rest of the repository takes and deadlocked against pausing or
+            # messaging at exactly the moment a runner claimed a round.
         claim = job_row_to_dict(job_row)
         claim["state"] = RUNNING
         claim["current_attempt_id"] = attempt["id"]
@@ -400,6 +429,10 @@ class PostgresAttemptCommands:
             if released_row is None:
                 return False
             released = released_row["job_id"]
+            # Attempt taken, conversation next, job last — the same order
+            # ``transition`` keeps. A release that lands on ``cancelled`` runs
+            # the terminal sweep, and that sweep can pause this goal.
+            await lock_conversation_by_job(conn, job_id=released)
             # The store's own answer, not the caller's. `agent_job_events.job_id`
             # has no foreign key, so a mismatched (job_id, attempt_id) pair would
             # write a control event into a different job's stream — potentially a
@@ -424,6 +457,13 @@ class PostgresAttemptCommands:
                 UPDATE agent_jobs
                 SET state = CASE WHEN cancel_requested THEN 'cancelled' ELSE 'queued' END,
                     terminal_resume_pending = cancel_requested,
+                    -- Cleared only on the way back to the queue. A cancelled
+                    -- turn keeps whatever it reported, because that is the
+                    -- answer it ended on; the next attempt has to give its own.
+                    goal_report_parse = CASE WHEN cancel_requested
+                                             THEN goal_report_parse END,
+                    goal_report_outcome = CASE WHEN cancel_requested
+                                               THEN goal_report_outcome END,
                     current_attempt_id = NULL,
                     updated_at = NOW()
                 WHERE id = $1 AND current_attempt_id = $2 AND state = 'running'
@@ -495,12 +535,18 @@ class PostgresAttemptCommands:
         to_state: str,
         detail: str | None = None,
         base_sha: str | None = None,
+        goal_envelope: GoalReportEnvelope | None = None,
     ) -> bool:
         """Move a job between states, fenced by the attempt's live lease.
 
         Terminal transitions also close the attempt (``finished``). Returns
         False when the caller lost the lease or the job is not in
         ``from_states`` — the caller must stop.
+
+        ``goal_envelope`` is how the turn's final message read, and it is
+        stored with the terminal state *and* the scheduling obligation it
+        implies, in one transaction: either the turn ended and the goal was told
+        to look at itself, or neither happened and the finish is retried.
 
         ``base_sha`` fills in the commit the worker resolved, and only when the
         job does not already have one: an owner who pinned a commit must get a
@@ -528,6 +574,10 @@ class PostgresAttemptCommands:
             )
             if live_attempt is None:
                 return False
+            # Then the conversation, before any job row: the terminal sweep below
+            # can pause this conversation's goal, and that write has to be taken
+            # on the way *down* the order rather than reached for at the end.
+            await lock_conversation_by_job(conn, job_id=job_id)
             # A success carries its native turn ordinal. The runner settles the
             # shared workspace before it reports success and settlement assigns
             # the ordinal; the schema refuses a succeeded row without one, and
@@ -552,6 +602,32 @@ class PostgresAttemptCommands:
                 ) from exc
             if updated is None:
                 return False
+            if goal_envelope is not None:
+                # The report and the outcome are one commit. Written here rather
+                # than after the transition because a terminal turn whose report
+                # landed later would be a turn the decision judged blind.
+                await conn.execute(
+                    """
+                    UPDATE agent_jobs
+                    SET goal_report_parse = $2, goal_report_outcome = $3,
+                        goal_report_reason = $4, goal_report_detail = $5,
+                        goal_report_evidence = $6, goal_report_digest = $7,
+                        updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    job_id,
+                    goal_envelope.parse_result,
+                    goal_envelope.outcome,
+                    goal_envelope.reason,
+                    goal_envelope.detail,
+                    # Serialized here rather than handed over as a list: this
+                    # pool has no JSONB codec registered, so the driver wants
+                    # the text a JSON column is written from.
+                    json.dumps(goal_envelope.evidence)
+                    if goal_envelope.evidence is not None
+                    else None,
+                    goal_envelope.source_digest,
+                )
             if to_state in TERMINAL_STATES:
                 sandbox_transition = None
                 # Close any retained-sandbox turn boundary in the same
@@ -712,6 +788,7 @@ class PostgresAttemptCommands:
                     and sandbox_transition["context_status"] == "lost"
                 ):
                     await fail_discontinuous_follow_ups(conn, parent_job_id=job_id)
+                await arm_finish_wakeup(conn, updated, job_id=job_id)
         return True
 
     async def append_event(
@@ -1154,8 +1231,12 @@ class PostgresAttemptCommands:
         cancel to the owner. Returns ``None`` for an unknown job.
         """
         async with self._pool.acquire() as conn, conn.transaction():
+            # Conversation first: cancelling a queued automatic round pauses its
+            # goal, and that write lands on ``agent_threads`` — which the pause
+            # and follow-up paths hold while reaching for this very job row.
+            await lock_conversation_by_job(conn, job_id=job_id)
             row = await conn.fetchrow(
-                "SELECT state FROM agent_jobs WHERE id = $1 "
+                "SELECT state, thread_id FROM agent_jobs WHERE id = $1 "
                 "AND ($2::text IS NULL OR user_id = $2) FOR UPDATE",
                 job_id,
                 user_id,
@@ -1169,9 +1250,26 @@ class PostgresAttemptCommands:
                     "terminal_resume_pending = TRUE, updated_at = NOW() WHERE id = $1",
                     job_id,
                 )
+                # A queued automatic round that has just been cancelled is a
+                # goal that can no longer continue itself. Cancel the round and
+                # the goal stops in the same transaction: there is no window in
+                # which a cancelled round leaves an active goal with nothing to
+                # run it.
+                await goal_after_terminal(
+                    conn,
+                    job_id=job_id,
+                    thread_id=row["thread_id"],
+                    state=CANCELLED,
+                    detail="the automatic round was cancelled before it ran",
+                )
                 await fail_discontinuous_follow_ups(conn, parent_job_id=job_id)
                 return CANCELLED
             if state == RUNNING:
+                # Deliberately no goal write here: this only asks the running
+                # turn to stop, and it stops by reaching a terminal state
+                # through ``transition``, which is where every other outcome is
+                # decided. Pausing now would race the decision that is about to
+                # be made about this same turn.
                 await conn.execute(
                     "UPDATE agent_jobs SET cancel_requested = TRUE, updated_at = NOW() "
                     "WHERE id = $1",
@@ -1193,7 +1291,7 @@ class PostgresAttemptCommands:
         async with self._pool.acquire() as conn, conn.transaction():
             expired = await conn.fetch(
                 """
-                SELECT a.id AS attempt_id, a.job_id, a.attempt_no, a.host_id,
+                SELECT a.id AS attempt_id, a.job_id, j.thread_id, a.attempt_no, a.host_id,
                        j.state, j.cancel_requested, j.current_attempt_id,
                        member.thread_id AS sandbox_thread_id,
                        member.sandbox_id,
@@ -1203,6 +1301,7 @@ class PostgresAttemptCommands:
                        member.residency_generation
                 FROM agent_attempts a
                 JOIN agent_jobs j ON j.id = a.job_id
+                JOIN agent_threads t ON t.id = j.thread_id
                 LEFT JOIN (
                     agent_thread_sandbox_memberships member
                     JOIN agent_sandboxes sandbox
@@ -1210,7 +1309,13 @@ class PostgresAttemptCommands:
                 ) ON member.thread_id = j.thread_id
                 WHERE a.status = 'running' AND a.lease_expires_at < NOW()
                 ORDER BY a.id
-                FOR UPDATE OF a, j SKIP LOCKED
+                -- The conversation is locked here, with the attempt and the
+                -- job, rather than reached for later when this pass pauses a
+                -- goal: taken in one statement it is covered by SKIP LOCKED,
+                -- so a conversation somebody is already pausing is left for
+                -- the next pass instead of waiting on a row that is waiting
+                -- on this one.
+                FOR UPDATE OF a, j, t SKIP LOCKED
                 """
             )
             for row in expired:
@@ -1461,9 +1566,29 @@ class PostgresAttemptCommands:
                     )
                 else:
                     action = QUEUED
+                    # The next attempt answers for itself. A report the
+                    # abandoned attempt left behind is not evidence about the
+                    # retry: inheriting a `complete` from a turn that never
+                    # finished would complete the goal on the strength of a
+                    # claim whose work was thrown away.
                     await conn.execute(
-                        "UPDATE agent_jobs SET state = 'queued', updated_at = NOW() WHERE id = $1",
+                        "UPDATE agent_jobs SET state = 'queued', "
+                        "goal_report_parse = NULL, goal_report_outcome = NULL, "
+                        "goal_report_reason = NULL, goal_report_detail = NULL, "
+                        "goal_report_evidence = NULL, "
+                        "goal_report_digest = NULL, updated_at = NOW() "
+                        "WHERE id = $1",
                         job_id,
+                    )
+                if action in TERMINAL_STATES:
+                    # Every terminal reaper outcome is a turn that did not end
+                    # workably from the goal's point of view. The ordinary
+                    # finish path decides the goal in ``maybe_continue_goal``;
+                    # a reaped turn never reaches it, so it is decided here —
+                    # and the only safe decision is to stop and wait for the
+                    # owner.
+                    await goal_after_terminal(
+                        conn, job_id=job_id, thread_id=row["thread_id"], state=action
                     )
                 if action in TERMINAL_STATES and not retained_activation_expired:
                     # A terminal reaper outcome is semantically the same turn
@@ -1526,7 +1651,8 @@ class PostgresAttemptCommands:
                       AND a.status = 'running'
                       AND a.lease_expires_at > NOW()
               )
-            RETURNING j.id, j.thread_id
+            RETURNING j.id, j.thread_id, j.goal_id, j.goal_revision,
+                      j.turn_source, j.parent_job_id
             """,
             job_id,
             attempt_id,

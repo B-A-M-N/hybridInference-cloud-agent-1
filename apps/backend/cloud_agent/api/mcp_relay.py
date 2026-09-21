@@ -38,7 +38,7 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
@@ -1174,6 +1174,19 @@ async def _host_catalogue(
     return catalogue
 
 
+class _Catalogued(Protocol):
+    """What a listing needs of the resolved binding it renders a tool from.
+
+    Narrowed to a protocol so the renderer cannot reach for more of a
+    connection than a name and an id, and so a test can hand it a stand-in.
+    """
+
+    @property
+    def alias(self) -> str: ...
+    @property
+    def connection_id(self) -> int: ...
+
+
 def _resource_entry(capability: Any, uri: str) -> dict[str, Any]:
     """Render one resource the way a client reads it."""
     schema = capability.input_schema if isinstance(capability.input_schema, dict) else {}
@@ -1213,7 +1226,7 @@ async def _host_session(authorized: Authorized, authorization: str | None) -> An
     return await _host().open(authorized.connection, secret=authorized.secret, key=key)
 
 
-def _host_tool_entry(presented: str, authorized: Authorized, capability: Any) -> dict[str, Any]:
+def _host_tool_entry(presented: str, authorized: _Catalogued, capability: Any) -> dict[str, Any]:
     """Render one merged catalogue entry the way a client reads it."""
     return {
         "name": presented,
@@ -1316,7 +1329,9 @@ async def _host_post(
                     {
                         "tools": [
                             _host_tool_entry(name, authorized, capability)
-                            for name, (authorized, capability) in sorted(catalogue.items())
+                            for name, (authorized, capability) in sorted(
+                                catalogue.items(), key=lambda item: item[0]
+                            )
                         ]
                     },
                     stateless=stateless,
@@ -1489,7 +1504,12 @@ async def _host_fetch(
                 f"{key!r} is not one of this session's prompts. Call prompts/list for the current set.",
             )
         try:
-            authorized, capability = await _refresh_catalogue_entry(entry, authorization, store)
+            # Resources and prompts are connections only: the platform's own
+            # tools are a tool surface, so this catalogue holds nothing that is
+            # not a resolved connection.
+            authorized, capability = await _refresh_catalogue_entry(
+                cast("tuple[Authorized, Any]", entry), authorization, store
+            )
         except HTTPException as exc:
             return _binding_error(request_id, exc)
     held = await _decide_call(
@@ -1565,7 +1585,9 @@ async def _host_call(
             f"{name!r} is not one of this session's tools. Call tools/list for the current set.",
         )
     try:
-        authorized, capability = await _refresh_catalogue_entry(entry, authorization, store)
+        authorized, capability = await _refresh_catalogue_entry(
+            cast("tuple[Authorized, Any]", entry), authorization, store
+        )
     except HTTPException as exc:
         return _binding_error(request_id, exc)
     held = await _decide_call(

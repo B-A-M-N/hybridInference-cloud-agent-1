@@ -1866,6 +1866,9 @@
             ],
             "title": "Github Install Url"
           },
+          "goal_limits": {
+            "$ref": "#/components/schemas/GoalLimits"
+          },
           "mcp_connections": {
             "description": "MCP servers this deployment offers. Empty means none are configured.",
             "items": {
@@ -2027,6 +2030,17 @@
             ],
             "description": "Further uploads for this turn. Omitted adds none — earlier turns' files are already under /uploads and are re-imported whenever the sandbox is rebuilt, so inheriting here would only copy them twice.",
             "title": "Attachment Ids"
+          },
+          "goal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GoalInput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Set or replace this conversation's completion condition along with this message. Omitted leaves the goal as it is. A turn queued by the goal itself never carries one."
           },
           "model": {
             "anyOf": [
@@ -2724,6 +2738,17 @@
             "description": "Commit SHA to work from.",
             "title": "Base Sha"
           },
+          "goal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GoalInput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A completion condition for this conversation. The platform judges it at the end of every turn and queues the next turn itself while the objective is unmet, up to max_rounds. Omitted means no goal: nothing continues without the owner asking again."
+          },
           "mcp_bindings": {
             "anyOf": [
               {
@@ -3127,6 +3152,96 @@
             ],
             "title": "Github Install Url"
           },
+          "goal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GoalView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "goal_repair_round": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Goal Repair Round"
+          },
+          "goal_report_detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Goal Report Detail"
+          },
+          "goal_report_outcome": {
+            "anyOf": [
+              {
+                "enum": [
+                  "complete",
+                  "needs_input"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Goal Report Outcome"
+          },
+          "goal_report_parse": {
+            "anyOf": [
+              {
+                "enum": [
+                  "absent",
+                  "valid",
+                  "invalid",
+                  "unavailable"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Goal Report Parse"
+          },
+          "goal_round": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Goal Round"
+          },
+          "goal_round_kind": {
+            "anyOf": [
+              {
+                "enum": [
+                  "work",
+                  "repair"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Goal Round Kind"
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -3418,6 +3533,15 @@
             "default": 1,
             "title": "Turn No",
             "type": "integer"
+          },
+          "turn_source": {
+            "default": "human",
+            "enum": [
+              "human",
+              "goal"
+            ],
+            "title": "Turn Source",
+            "type": "string"
           },
           "updated_at": {
             "anyOf": [
@@ -6203,6 +6327,277 @@
           }
         },
         "title": "GitHubConnectionResponse",
+        "type": "object"
+      },
+      "GoalClearedResponse": {
+        "description": "The conversation after removing its goal.",
+        "properties": {
+          "cleared": {
+            "default": true,
+            "title": "Cleared",
+            "type": "boolean"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "thread_id": {
+            "title": "Thread Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id",
+          "revision"
+        ],
+        "title": "GoalClearedResponse",
+        "type": "object"
+      },
+      "GoalInput": {
+        "description": "An owner's completion condition for one conversation.",
+        "properties": {
+          "max_rounds": {
+            "default": 10,
+            "maximum": 50.0,
+            "minimum": 1.0,
+            "title": "Max Rounds",
+            "type": "integer"
+          },
+          "objective": {
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Objective",
+            "type": "string"
+          }
+        },
+        "required": [
+          "objective"
+        ],
+        "title": "GoalInput",
+        "type": "object"
+      },
+      "GoalLimits": {
+        "description": "Advertise the server's goal bounds to clients before they submit.",
+        "properties": {
+          "default_rounds": {
+            "default": 10,
+            "title": "Default Rounds",
+            "type": "integer"
+          },
+          "max_objective_chars": {
+            "default": 4000,
+            "title": "Max Objective Chars",
+            "type": "integer"
+          },
+          "max_rounds": {
+            "default": 50,
+            "title": "Max Rounds",
+            "type": "integer"
+          }
+        },
+        "title": "GoalLimits",
+        "type": "object"
+      },
+      "GoalRequest": {
+        "description": "A goal write, with the revision the caller read it at.\n\n``revision`` is what makes two edits from two tabs resolvable: the second\none is refused rather than silently overwriting the first. Omitted means\n\"write it whatever it currently says\", which is what a first-time set from\nthe composer wants.",
+        "properties": {
+          "goal": {
+            "$ref": "#/components/schemas/GoalInput"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision"
+          }
+        },
+        "required": [
+          "goal"
+        ],
+        "title": "GoalRequest",
+        "type": "object"
+      },
+      "GoalResponse": {
+        "description": "The conversation's goal after a write that changed it.\n\nAnswered from the *thread*, not from a turn: a goal belongs to the\nconversation, and a conversation whose newest turn has been deleted still\nhas one. ``revision`` is echoed even when there is no goal, so a client can\ncompare and set without a separate read.",
+        "properties": {
+          "goal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GoalView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "thread_id": {
+            "title": "Thread Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id",
+          "revision"
+        ],
+        "title": "GoalResponse",
+        "type": "object"
+      },
+      "GoalRevisionRequest": {
+        "description": "An optional compare-and-set guard on a goal operation.\n\nOmitted means \"act on whatever the goal currently is\", which is what the\npause and resume buttons send: they are idempotent by nature, and refusing\nto press one because a round advanced a counter would be a worse answer than\ndoing what was asked.",
+        "properties": {
+          "revision": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision"
+          }
+        },
+        "title": "GoalRevisionRequest",
+        "type": "object"
+      },
+      "GoalView": {
+        "description": "The conversation's goal as its owner reads it.",
+        "properties": {
+          "completed_by_job_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed By Job Id"
+          },
+          "completion_basis": {
+            "anyOf": [
+              {
+                "const": "model_reported",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completion Basis"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "goal_id": {
+            "title": "Goal Id",
+            "type": "string"
+          },
+          "max_rounds": {
+            "title": "Max Rounds",
+            "type": "integer"
+          },
+          "objective": {
+            "title": "Objective",
+            "type": "string"
+          },
+          "pause_detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pause Detail"
+          },
+          "pause_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "user",
+                  "fork",
+                  "needs_input",
+                  "round_limit",
+                  "execution_failed",
+                  "cancelled",
+                  "report_invalid",
+                  "report_unavailable",
+                  "runtime_unsupported",
+                  "context_lost",
+                  "access_denied",
+                  "quota_unavailable",
+                  "scheduling_failed",
+                  "archived"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pause Reason"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "rounds_used": {
+            "title": "Rounds Used",
+            "type": "integer"
+          },
+          "state": {
+            "enum": [
+              "active",
+              "paused",
+              "complete"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "required": [
+          "goal_id",
+          "objective",
+          "state",
+          "revision",
+          "max_rounds",
+          "rounds_used"
+        ],
+        "title": "GoalView",
         "type": "object"
       },
       "GrantUsageDerivedTotals": {
@@ -20288,6 +20683,326 @@
         "tags": [
           "agent-skills"
         ]
+      }
+    },
+    "/v1/agent/threads/{thread_id}/goal": {
+      "delete": {
+        "description": "Remove the goal, and every automatic round that was queued for it.\n\nThe revision moves and the identity is cleared, so a report written about\nthe removed objective can never match whatever the owner sets next.",
+        "operationId": "clear_agent_goal_v1_agent_threads__thread_id__goal_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GoalClearedResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clear Agent Goal"
+      },
+      "get": {
+        "description": "The conversation's goal, or the fact that it has none.\n\nAnswered from the thread rather than from a turn, and answered with the\n*control revision* even when there is no goal: that revision is what the\nnext write's ``expected_revision`` is compared against, so a client can\ncreate the first goal on a conversation it just read without a second\nround trip.",
+        "operationId": "get_agent_goal_v1_agent_threads__thread_id__goal_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GoalResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Agent Goal"
+      },
+      "put": {
+        "description": "Create, replace or edit the conversation's completion condition.\n\nA new objective is a new authorization: it mints a new goal identity, starts\nthe round budget over, and becomes active. Editing the cap of an active goal\nleaves the identity and the rounds spent alone; editing a paused one leaves\nit paused, because changing the words is not resuming it.\n\n``revision`` is what makes two edits from two tabs resolvable — the second is\nrefused with a 409 rather than silently overwriting the first. Omitted means\n\"write it whatever it currently says\", which is what a first set wants.",
+        "operationId": "set_agent_goal_v1_agent_threads__thread_id__goal_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GoalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GoalResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Agent Goal"
+      }
+    },
+    "/v1/agent/threads/{thread_id}/goal/pause": {
+      "post": {
+        "description": "Stop the goal continuing itself; leave the turn that is already running.\n\nQueued automatic rounds are cancelled with it, so a round the goal asked for\ncannot start after the owner stopped it. A *running* round is deliberately\nleft alone: \"stop after this turn\" and \"stop this turn\" are different\nrequests, and the second one is the existing stop button.",
+        "operationId": "pause_agent_goal_v1_agent_threads__thread_id__goal_pause_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/GoalRevisionRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GoalResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pause Agent Goal"
+      }
+    },
+    "/v1/agent/threads/{thread_id}/goal/resume": {
+      "post": {
+        "description": "Start a paused goal moving again, and record the obligation to schedule.\n\nThe owner's authorization is the trigger: no model report is needed to start\nworking again, and the wakeup this writes is what makes the next round\nhappen — the request does not wait for it, and does not need to.",
+        "operationId": "resume_agent_goal_v1_agent_threads__thread_id__goal_resume_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/GoalRevisionRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GoalResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resume Agent Goal"
       }
     },
     "/v1/agent/uploads": {

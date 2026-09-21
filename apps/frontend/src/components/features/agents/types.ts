@@ -1,4 +1,5 @@
 import type { SelectedSkillApi } from '@/lib/api/skills';
+import type { GoalPauseReason, GoalReportOutcome, GoalReportParse } from '@/lib/api/agents';
 // UI types for the cloud agent sandbox (roadmap: issue #1041).
 //
 // The normalized event kinds mirror the agent_job_events schema decided in the
@@ -105,6 +106,8 @@ export interface AgentHistoryTurn {
   forkable: boolean;
   messages: AgentThreadMessage[];
   events: AgentEvent[];
+  /** How this turn came to exist and what it reported. Absent on older rows. */
+  goalTurn?: GoalTurn;
 }
 
 export interface DiffLine {
@@ -231,8 +234,39 @@ export interface TurnResources {
   processes?: ProcessObservation[];
 }
 
+/** The conversation's completion goal, as the job band reads it. */
+export interface AgentGoal {
+  objective: string;
+  state: 'active' | 'paused' | 'complete';
+  revision: number;
+  roundsUsed: number;
+  maxRounds: number;
+  /** Set while paused, paired with the sentence behind it. */
+  pauseReason?: GoalPauseReason;
+  pauseDetail?: string;
+  /** The basis the platform recorded when it accepted a completion. */
+  completionBasis?: 'model_reported';
+}
+
+/** How one turn came to exist, and what it said about the goal. */
+export interface GoalTurn {
+  source: 'human' | 'goal';
+  round?: number;
+  kind?: 'work' | 'repair';
+  /** How the platform read this turn's final message. */
+  reportParse?: GoalReportParse;
+  /** Set only when the parse was valid. */
+  reportOutcome?: GoalReportOutcome;
+  /** A failed parse's explanation, or the reason a valid report carried. */
+  reportDetail?: string;
+}
+
 export interface AgentJob {
   skills?: SelectedSkillApi[];
+  /** Present only on a conversation that has a goal. */
+  goal?: AgentGoal;
+  /** Present on every turn; `source` is `human` unless the platform queued it. */
+  goalTurn?: GoalTurn;
   id: string;
   /** Used to group conversation rows in the recent-tasks sidebar. */
   createdAt?: string | null;

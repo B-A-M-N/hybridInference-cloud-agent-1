@@ -23,6 +23,59 @@ class ConversationQueries(Protocol):
         """Fetch one job by id."""
         ...
 
+    async def latest_terminal_turn(self, *, thread_id: str) -> dict[str, Any] | None:
+        """The newest finished turn of this conversation, or ``None``.
+
+        The parent an owner-initiated automatic round hangs from. It is not
+        always the newest turn: a queued round can be cancelled, and a
+        conversation resumed afterwards continues the same linear chain from the
+        last turn that actually happened.
+        """
+        ...
+
+    async def latest_turn(self, *, thread_id: str) -> dict[str, Any] | None:
+        """The newest turn of this conversation, whatever state it is in.
+
+        Deliberately not :meth:`latest_terminal_turn`: the decision has to be
+        able to see a turn that is still running, because "a person's turn is in
+        flight" is the reason to wait rather than the reason to schedule.
+        """
+        ...
+
+    async def get_job_for_update(self, *, conn: Any, job_id: str) -> dict[str, Any] | None:
+        """Read one turn inside the caller's transaction, taking its row lock.
+
+        The decision re-reads the turn it is about to judge under the same
+        transaction that writes the outcome. Between the read that built the
+        context and this one the turn can have been reaped, retried or
+        superseded, and a decision made about a turn that has since changed is a
+        decision about nothing.
+        """
+        ...
+
+    async def latest_assistant_message_state(self, *, job_id: str) -> dict[str, Any] | None:
+        """The last assistant message, and whether the runtime clipped it.
+
+        ``truncated`` is the difference between "the model said nothing more"
+        and "the transport stopped carrying what it said". A report reader has
+        to tell those apart: the report block is at the *end* of a message, so a
+        clipped one is a message whose answer may have been removed, and reading
+        it as silence is exactly the failure the completeness rule exists to
+        prevent.
+        """
+        ...
+
+    async def latest_assistant_message(self, *, job_id: str) -> str | None:
+        """The last thing this turn said, or ``None`` if it said nothing.
+
+        Ordered by insert, not by time: every assistant message mirrors exactly
+        one ``message`` event, and the insert order *is* the order the runtime
+        emitted them. A turn that produced no assistant text reports ``None``
+        rather than the previous turn's words, which is what makes "no report"
+        distinguishable from "reported".
+        """
+        ...
+
     async def list_jobs(
         self, *, user_id: str, limit: int = 50, archived: bool = False, repo: str | None = None
     ) -> list[dict[str, Any]]:

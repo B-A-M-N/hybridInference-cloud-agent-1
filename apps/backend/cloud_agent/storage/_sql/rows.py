@@ -28,6 +28,46 @@ def sandbox_row_to_dict(row: Any) -> dict[str, Any]:
     return result
 
 
+def thread_goal(row: Any) -> dict[str, Any] | None:
+    """The conversation's live goal, or ``None`` when it has none.
+
+    Returned under one key rather than spread across the job's own, so that a
+    reader can never confuse the conversation's current objective with the
+    snapshot a particular turn was run against. Reads that do not join
+    ``agent_threads`` have no goal columns at all; they report ``None``.
+
+    The revision is read under whichever name the projection gave it:
+    ``JOB_SELECT`` aliases the thread's column because the job has one of the
+    same name, while a goal-only read of ``agent_threads`` has no collision to
+    avoid and selects the plain name.
+    """
+    if row.get("goal_objective") is None:
+        return None
+    revision = row.get("thread_goal_revision")
+    if revision is None:
+        revision = row.get("goal_revision")
+    return {
+        "goal_id": row.get("goal_id"),
+        "objective": row["goal_objective"],
+        "state": row["goal_state"],
+        "pause_reason": row.get("goal_pause_reason"),
+        "pause_detail": row.get("goal_pause_detail"),
+        "revision": revision or 0,
+        "max_rounds": row.get("goal_max_rounds"),
+        # Derived, so only a read that asked for it has it. A list read returns
+        # the objective and the state from the thread row but no count — a page
+        # of conversations has no business counting attempts for each of them —
+        # and zero there means "not fetched", which is what ``None`` says
+        # elsewhere in this module.
+        "rounds_used": row.get("goal_rounds_used") or 0,
+        "repairs_used": row.get("goal_repairs_used") or 0,
+        "completion_basis": row.get("goal_completion_basis"),
+        "completed_by_job_id": row.get("goal_completed_by_job_id"),
+        "created_at": row.get("goal_created_at"),
+        "updated_at": row.get("goal_updated_at"),
+    }
+
+
 def job_row_to_dict(row: Any) -> dict[str, Any]:
     """Convert an ``agent_jobs`` row to a plain dict."""
     return {
@@ -59,6 +99,28 @@ def job_row_to_dict(row: Any) -> dict[str, Any]:
         "skills": load_json(row.get("skills")),
         "attachments": load_json(row.get("attachments")),
         "fork_source_job_id": row["fork_source_job_id"],
+        # This turn's immutable goal snapshot: the objective it was created for,
+        # what kind of round it was, and how its final message read. Distinct
+        # from the conversation's live goal below — this one never changes when
+        # the objective is edited.
+        "turn_source": row.get("turn_source") or "human",
+        "goal_round": row.get("goal_round"),
+        "goal_round_kind": row.get("goal_round_kind"),
+        "round_goal_revision": row.get("goal_revision"),
+        "goal_id": row.get("goal_id"),
+        "goal_report_parse": row.get("goal_report_parse"),
+        "goal_report_outcome": row.get("goal_report_outcome"),
+        "goal_report_reason": row.get("goal_report_reason"),
+        "goal_report_detail": row.get("goal_report_detail"),
+        "goal_repair_round": row.get("goal_repair_round"),
+        "input_seq_at_create": row.get("input_seq_at_create") or 0,
+        "thread_user_input_seq": row.get("thread_user_input_seq") or 0,
+        # The immediately preceding turn's report, when the read provided it.
+        "parent_goal_report_parse": row.get("parent_goal_report_parse"),
+        "parent_goal_report_outcome": row.get("parent_goal_report_outcome"),
+        # The conversation's live goal, under the job's keys as every other
+        # thread-level value is. Present only on reads that join the thread.
+        "goal": thread_goal(row),
         "mcp_bindings": load_json(row.get("mcp_bindings")) or [],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],

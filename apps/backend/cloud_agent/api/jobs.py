@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query
 from cloud_agent.api._job_views import (
     _attempt_resources,
     _attempt_summary_response,
+    _goal_view,
     _iso,
     _job_response,
 )
@@ -35,6 +36,7 @@ from cloud_agent.api.deps import (
 from cloud_agent.application.job_admission import _create_job_as
 from cloud_agent.domain.execution import TERMINAL_STATES
 from cloud_agent.entitlement import REPO_PATTERN
+from cloud_agent.goals.models import GoalConflict
 from cloud_agent.logging_utils import get_logger
 from cloud_agent.schemas import (
     AgentAttemptTelemetry,
@@ -46,6 +48,10 @@ from cloud_agent.schemas import (
     AgentThreadPinResponse,
     AgentThreadRenameRequest,
     AgentThreadRenameResponse,
+    GoalClearedResponse,
+    GoalRequest,
+    GoalResponse,
+    GoalRevisionRequest,
 )
 from cloud_agent.terminal_coordination import resume_settled_terminal
 
@@ -56,6 +62,7 @@ if TYPE_CHECKING:
         ConversationCommands,
         ConversationQueries,
         ExecutionQueries,
+        GoalRepository,
         HostPoolRepository,
         McpConnectionRepository,
         SandboxRepository,
@@ -93,6 +100,7 @@ class _JobsStorage(Protocol):
     conversation_commands: ConversationCommands
     conversation_queries: ConversationQueries
     execution_queries: ExecutionQueries
+    goals: GoalRepository
     host_pool: HostPoolRepository
     mcp: McpConnectionRepository
     sandbox: SandboxRepository
@@ -187,6 +195,12 @@ async def get_agent_job(
     """Fetch one of the caller's agent jobs, with what it has spent so far."""
     job_store = _require_store(store)
     job = await _owned_job(job_store.conversation_queries, job_id, user)
+    # This is the read the goal band renders from, so it is the one that pays
+    # for the round count. The count is derived rather than stored (see
+    # the goal repository), and a list of conversations must not be charged for
+    # it.
+    if job.get("goal") is not None:
+        job = {**job, "goal": await job_store.goals.get_goal(thread_id=str(job["thread_id"]))}
     attempt_telemetry = await job_store.execution_queries.job_attempts_telemetry(job_id=job_id)
     telemetry = attempt_telemetry[-1] if attempt_telemetry else None
     # Existing clients keep the newest detail. The retry-aware client opts out
@@ -345,6 +359,244 @@ async def _set_agent_thread_pinned(
         thread_id=result["thread_id"],
         pinned=pinned,
         pinned_at=_iso(result["pinned_at"]),
+    )
+
+
+def _no_such_thread_error(thread_id: str) -> HTTPException:
+    """A goal read or write against a conversation this owner does not have."""
+    return HTTPException(
+        status_code=404,
+        detail={"error": {"type": "not_found", "message": f"No such task: {thread_id}"}},
+    )
+
+
+def _no_such_goal_error() -> HTTPException:
+    """A goal write against a conversation that no longer has one."""
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": {
+                "type": "goal_missing",
+                "message": "This conversation has had its goal cleared. Set a new one first.",
+            }
+        },
+    )
+
+
+def _goal_conflict_error() -> HTTPException:
+    """A goal write made against a revision the goal has already moved past."""
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": {
+                "type": "goal_revision_conflict",
+                "message": "This goal changed while you were editing it. Reload and try again.",
+            }
+        },
+    )
+
+
+@router.get("/threads/{thread_id}/goal", response_model=GoalResponse)
+async def get_agent_goal(
+    thread_id: str,
+    user: dict[str, Any] = Depends(require_agent_owner),
+    store: _JobsStorage | None = Depends(get_storage),
+) -> GoalResponse:
+    """The conversation's goal, or the fact that it has none.
+
+    Answered from the thread rather than from a turn, and answered with the
+    *control revision* even when there is no goal: that revision is what the
+    next write's ``expected_revision`` is compared against, so a client can
+    create the first goal on a conversation it just read without a second
+    round trip.
+    """
+    job_store = _require_store(store)
+    state = await job_store.goals.get_thread_goal_state(
+        user_id=user["user_id"], thread_id=thread_id
+    )
+    if state is None:
+        raise _no_such_thread_error(thread_id)
+    return GoalResponse(
+        thread_id=thread_id,
+        goal=_goal_view(state["goal"]),
+        revision=int(state["revision"]),
+    )
+
+
+@router.put("/threads/{thread_id}/goal", response_model=GoalResponse)
+async def set_agent_goal(
+    thread_id: str,
+    body: GoalRequest,
+    user: dict[str, Any] = Depends(require_agent_owner),
+    store: _JobsStorage | None = Depends(get_storage),
+) -> GoalResponse:
+    """Create, replace or edit the conversation's completion condition.
+
+    A new objective is a new authorization: it mints a new goal identity, starts
+    the round budget over, and becomes active. Editing the cap of an active goal
+    leaves the identity and the rounds spent alone; editing a paused one leaves
+    it paused, because changing the words is not resuming it.
+
+    ``revision`` is what makes two edits from two tabs resolvable — the second is
+    refused with a 409 rather than silently overwriting the first. Omitted means
+    "write it whatever it currently says", which is what a first set wants.
+    """
+    job_store = _require_store(store)
+    try:
+        goal = await job_store.goals.set_goal(
+            thread_id=thread_id,
+            user_id=user["user_id"],
+            goal=body.goal,
+            expected_revision=body.revision,
+        )
+    except GoalConflict as exc:
+        raise _goal_conflict_error() from exc
+    if goal is None:
+        raise _no_such_thread_error(thread_id)
+    logger.info(
+        "agent_goal_set",
+        extra={
+            "event": "agent_goal_set",
+            "thread_id": thread_id,
+            "goal_id": goal["goal_id"],
+            "goal_revision": goal["revision"],
+            "max_rounds": goal["max_rounds"],
+        },
+    )
+    return GoalResponse(
+        thread_id=thread_id,
+        goal=_goal_view(goal),
+        revision=int(goal["revision"]),
+    )
+
+
+@router.post("/threads/{thread_id}/goal/pause", response_model=GoalResponse)
+async def pause_agent_goal(
+    thread_id: str,
+    body: GoalRevisionRequest | None = None,
+    user: dict[str, Any] = Depends(require_agent_owner),
+    store: _JobsStorage | None = Depends(get_storage),
+) -> GoalResponse:
+    """Stop the goal continuing itself; leave the turn that is already running.
+
+    Queued automatic rounds are cancelled with it, so a round the goal asked for
+    cannot start after the owner stopped it. A *running* round is deliberately
+    left alone: "stop after this turn" and "stop this turn" are different
+    requests, and the second one is the existing stop button.
+    """
+    job_store = _require_store(store)
+    state = await job_store.goals.get_thread_goal_state(
+        user_id=user["user_id"], thread_id=thread_id
+    )
+    if state is None:
+        raise _no_such_thread_error(thread_id)
+    goal = state["goal"]
+    if goal is None:
+        raise _no_such_goal_error()
+    expected = body.revision if body is not None else None
+    if expected is not None and expected != int(state["revision"]):
+        raise _goal_conflict_error()
+    if goal["state"] == "active":
+        paused = await job_store.goals.pause_goal(
+            thread_id=thread_id, revision=int(goal["revision"]), reason="user"
+        )
+        if paused is None:
+            raise _goal_conflict_error()
+        goal = paused
+    logger.info(
+        "agent_goal_paused_by_owner",
+        extra={"event": "agent_goal_paused_by_owner", "thread_id": thread_id},
+    )
+    return GoalResponse(thread_id=thread_id, goal=_goal_view(goal), revision=int(goal["revision"]))
+
+
+@router.post("/threads/{thread_id}/goal/resume", response_model=GoalResponse)
+async def resume_agent_goal(
+    thread_id: str,
+    body: GoalRevisionRequest | None = None,
+    user: dict[str, Any] = Depends(require_agent_owner),
+    store: _JobsStorage | None = Depends(get_storage),
+) -> GoalResponse:
+    """Start a paused goal moving again, and record the obligation to schedule.
+
+    The owner's authorization is the trigger: no model report is needed to start
+    working again, and the wakeup this writes is what makes the next round
+    happen — the request does not wait for it, and does not need to.
+    """
+    job_store = _require_store(store)
+    state = await job_store.goals.get_thread_goal_state(
+        user_id=user["user_id"], thread_id=thread_id
+    )
+    if state is None:
+        raise _no_such_thread_error(thread_id)
+    goal = state["goal"]
+    if goal is None:
+        raise _no_such_goal_error()
+    expected = body.revision if body is not None else None
+    if expected is not None and expected != int(state["revision"]):
+        raise _goal_conflict_error()
+    if goal["state"] == "paused" and int(goal["rounds_used"]) >= int(goal["max_rounds"]):
+        # Resuming would authorize a round the budget cannot pay for. The owner
+        # has to raise the cap first, and telling them that here is better than
+        # a goal that becomes active and pauses itself on the next decision.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": {
+                    "type": "goal_rounds_exhausted",
+                    "message": (
+                        f"This goal has used all {goal['max_rounds']} of its automatic "
+                        "rounds. Raise the limit, then resume it."
+                    ),
+                }
+            },
+        )
+    if goal["state"] != "paused":
+        # Already active or complete. Active needs nothing; complete needs a new
+        # authorization, which is a set, not a resume.
+        return GoalResponse(
+            thread_id=thread_id, goal=_goal_view(goal), revision=int(goal["revision"])
+        )
+    resumed = await job_store.goals.resume_goal(
+        thread_id=thread_id, user_id=user["user_id"], revision=int(goal["revision"])
+    )
+    if resumed is None:
+        raise _goal_conflict_error()
+    logger.info(
+        "agent_goal_resumed",
+        extra={"event": "agent_goal_resumed", "thread_id": thread_id},
+    )
+    return GoalResponse(
+        thread_id=thread_id, goal=_goal_view(resumed), revision=int(resumed["revision"])
+    )
+
+
+@router.delete("/threads/{thread_id}/goal", response_model=GoalClearedResponse)
+async def clear_agent_goal(
+    thread_id: str,
+    user: dict[str, Any] = Depends(require_agent_owner),
+    store: _JobsStorage | None = Depends(get_storage),
+) -> GoalClearedResponse:
+    """Remove the goal, and every automatic round that was queued for it.
+
+    The revision moves and the identity is cleared, so a report written about
+    the removed objective can never match whatever the owner sets next.
+    """
+    job_store = _require_store(store)
+    cleared = await job_store.goals.clear_goal(thread_id=thread_id, user_id=user["user_id"])
+    state = await job_store.goals.get_thread_goal_state(
+        user_id=user["user_id"], thread_id=thread_id
+    )
+    if state is None:
+        raise _no_such_thread_error(thread_id)
+    logger.info(
+        "agent_goal_cleared",
+        extra={"event": "agent_goal_cleared", "thread_id": thread_id, "cleared": cleared},
+    )
+    return GoalClearedResponse(
+        thread_id=thread_id,
+        cleared=cleared,
+        revision=int(state["revision"]),
     )
 
 

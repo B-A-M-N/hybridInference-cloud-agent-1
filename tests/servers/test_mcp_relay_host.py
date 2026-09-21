@@ -342,6 +342,17 @@ def _tool_names(response: Any) -> list[str]:
     return [tool["name"] for tool in _result(response)["tools"]]
 
 
+def _catalogue(*connections: str) -> list[str]:
+    """The names the merged catalogue advertises, in listing order.
+
+    Every tool is a *connection's* tool now. The platform used to merge two of
+    its own goal tools into this surface; the report protocol moved into the
+    turn's final message instead, so a catalogue is exactly the connections'
+    namespaced tools and nothing else.
+    """
+    return sorted(connections)
+
+
 @pytest.fixture()
 async def client(store: FakeStore) -> AsyncClient:
     """Mount the relay router against the fake store."""
@@ -361,7 +372,7 @@ class TestTheMergedCatalogue:
         """A single URL has to distinguish two servers' tools by name alone."""
         response = await client.post(_HOST_URL, json=_rpc("tools/list"), headers=_auth())
         assert response.status_code == 200
-        assert _tool_names(response) == ["docs__search", "github__get_issue"]
+        assert _tool_names(response) == _catalogue("docs__search", "github__get_issue")
 
     async def test_a_capability_the_session_did_not_enable_is_not_advertised(
         self, client: AsyncClient
@@ -393,7 +404,7 @@ class TestTheMergedCatalogue:
         app.dependency_overrides[get_storage] = lambda: OneFake(store)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as api:
             response = await api.post(_HOST_URL, json=_rpc("tools/list"), headers=_auth())
-        assert _tool_names(response) == ["github__get_issue"]
+        assert _tool_names(response) == _catalogue("github__get_issue")
 
     async def test_an_alias_containing_the_separator_still_routes_by_lookup(
         self, client: AsyncClient, store: FakeStore, host: StubHost
@@ -412,6 +423,8 @@ class TestTheMergedCatalogue:
         store.snapshots = {7: _snapshot(7, "c"), 8: _snapshot(8, "b__c")}
 
         listing = await client.post(_HOST_URL, json=_rpc("tools/list"), headers=_auth())
+        # Two connections, each advertising one tool under the same presented
+        # name: the catalogue deduplicates by name, so two is the whole surface.
         assert len(set(_tool_names(listing))) == 2
         name = next(
             item["name"] for item in _result(listing)["tools"] if item["description"] == "c on 7"
@@ -631,7 +644,7 @@ class TestTheBarePrefix:
             _binding(7, "host", rules={"get_issue": {"policy": "allow", "fingerprint": ""}})
         ]
         merged = await client.post(_HOST_URL, json=_rpc("tools/list"), headers=_auth())
-        assert _tool_names(merged) == ["host__get_issue"]
+        assert _tool_names(merged) == _catalogue("host__get_issue")
 
         # The per-connection route still answers for the alias itself.
         per_connection = await client.post(
@@ -790,7 +803,9 @@ class TestAgainstARealProtocolHost:
         app.dependency_overrides[get_storage] = lambda: OneFake(store)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as api:
             response = await api.post(_HOST_URL, json=_rpc("tools/list"), headers=_auth())
-        assert [tool["name"] for tool in _result(response)["tools"]] == ["github__get_issue"]
+        assert [tool["name"] for tool in _result(response)["tools"]] == _catalogue(
+            "github__get_issue"
+        )
 
 
 class TestResourcesAndPrompts:
@@ -956,7 +971,14 @@ async def test_disabling_a_tool_does_not_reassign_its_cached_name(client, store,
     assert "error" in response.json()
     assert host.called == []
     listing = await client.post(_HOST_URL, json=_rpc("tools/list"), headers=_auth())
-    allowed_name = _result(listing)["tools"][0]["name"]
+    # By description, not by position: the catalogue also carries the
+    # platform's own tools, and which of them sorts first is not what this
+    # case is about.
+    allowed_name = next(
+        item["name"]
+        for item in _result(listing)["tools"]
+        if item["description"].endswith(f"{second} on 7")
+    )
     response = await client.post(
         _HOST_URL, json=_rpc("tools/call", name=allowed_name, arguments={}), headers=_auth()
     )
@@ -983,7 +1005,7 @@ async def test_inactive_connection_never_refreshes_or_delays_healthy_tools(
 
     monkeypatch.setattr(agent_mcp_router, "ensure_fresh", refresh)
     listed = await client.post(_HOST_URL, json=_rpc("tools/list"), headers=_auth())
-    assert _tool_names(listed) == ["docs__search"]
+    assert _tool_names(listed) == _catalogue("docs__search")
     assert refreshed == []
     for _ in range(2):
         response = await client.post(
@@ -1006,7 +1028,7 @@ async def test_legacy_duplicate_aliases_cannot_route_to_the_first_connection(
         "direct": _rpc("tools/call", name="get_issue"),
     }[surface]
     listed = await client.post(_HOST_URL, json=_rpc("tools/list"), headers=_auth())
-    assert _tool_names(listed) == ["docs__search"]
+    assert _tool_names(listed) == _catalogue("docs__search")
     response = await client.post(
         f"{_HOST_URL}/github" if surface == "direct" else _HOST_URL,
         json=request,

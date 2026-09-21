@@ -16,6 +16,7 @@ from cloud_agent.storage._sql.jobs import JOB_SELECT
 from cloud_agent.storage._sql.rows import job_row_to_dict, load_json, sandbox_row_to_dict
 from cloud_agent.storage._sql.sandbox import NATIVE_FORK_CAPABILITY_JSON, THREAD_SANDBOX_SOURCE
 from cloud_agent.storage.repositories.conversation_queries import PostgresConversationQueries
+from cloud_agent.storage.repositories.goals import new_goal_id
 
 if TYPE_CHECKING:
     import asyncpg
@@ -215,16 +216,35 @@ class PostgresSessionForkRepository:
             # history in, and a membership that already owns its resident
             # slot and can carry the residency the host is about to open.
             source_thread = await conn.fetchrow(
-                "SELECT repo, title, setup_script, execution_profile "
+                "SELECT repo, title, setup_script, execution_profile, "
+                "goal_objective, goal_max_rounds "
                 "FROM agent_threads WHERE id = $1",
                 source["thread_id"],
             )
+            # A fork inherits the objective, because the work it copies was
+            # work toward that objective. It does not inherit the right to keep
+            # spending on it: a fork is a different conversation exploring a
+            # different branch of the same task, and it starts paused so the
+            # person who made it decides when — and whether — it runs. The
+            # counters start over, so the new conversation gets the whole round
+            # budget and cannot be blocked by rounds its source spent.
             await conn.execute(
                 """
                 INSERT INTO agent_threads
                     (id, user_id, repo, title, title_source,
-                     setup_script, execution_profile)
-                VALUES ($1, $2, $3, $4, 'inherited', $5, $6)
+                     setup_script, execution_profile,
+                     goal_id, goal_objective, goal_state, goal_pause_reason,
+                     goal_pause_detail, goal_max_rounds, goal_revision,
+                     goal_created_at, goal_updated_at)
+                VALUES ($1, $2, $3, $4, 'inherited', $5, $6,
+                        CASE WHEN $7::text IS NULL THEN NULL ELSE $9 END,
+                        $7, CASE WHEN $7::text IS NULL THEN NULL ELSE 'paused' END,
+                        CASE WHEN $7::text IS NULL THEN NULL ELSE 'fork' END,
+                        CASE WHEN $7::text IS NULL THEN NULL
+                             ELSE 'copied from another conversation; resume it to start working' END,
+                        $8, CASE WHEN $7::text IS NULL THEN 0 ELSE 1 END,
+                        CASE WHEN $7::text IS NULL THEN NULL ELSE NOW() END,
+                        CASE WHEN $7::text IS NULL THEN NULL ELSE NOW() END)
                 """,
                 target_thread_id,
                 user_id,
@@ -232,6 +252,9 @@ class PostgresSessionForkRepository:
                 f"{source_thread['title']} (fork)"[:160],
                 source_thread["setup_script"],
                 source_thread["execution_profile"],
+                source_thread["goal_objective"],
+                source_thread["goal_max_rounds"],
+                new_goal_id(),
             )
             await conn.execute(
                 """

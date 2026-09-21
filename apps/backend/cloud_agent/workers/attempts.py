@@ -15,6 +15,7 @@ import contextlib
 from typing import TYPE_CHECKING, Any, Protocol
 
 from cloud_agent.gateway import GatewayError
+from cloud_agent.goals.controller import run_goal_wakeups
 from cloud_agent.grants import GRANT_TTL_S, RENEWAL_INTERVAL_S
 from cloud_agent.host_pool import HEARTBEAT_INTERVAL_S, MISSED_HEARTBEATS_BEFORE_OFFLINE
 from cloud_agent.logging_utils import get_logger
@@ -22,13 +23,17 @@ from cloud_agent.logging_utils import get_logger
 if TYPE_CHECKING:
     from cloud_agent.ports import (
         AttemptCommands,
+        ConversationCommands,
         ConversationQueries,
+        GoalRepository,
+        GoalWakeupRepository,
         GrantRepository,
         HostPoolRepository,
         ResidencyRepository,
         SandboxRepository,
         SessionForkRepository,
         SnapshotRepository,
+        SourceControlRepository,
     )
 
 #: The moved loop keeps logging under the module it came from: the deployment's
@@ -62,8 +67,12 @@ class _Reaping(Protocol):
     """
 
     attempt_commands: AttemptCommands
+    conversation_commands: ConversationCommands
     conversation_queries: ConversationQueries
+    goal_wakeups: GoalWakeupRepository
+    goals: GoalRepository
     grants: GrantRepository
+    source_control: SourceControlRepository
     host_pool: HostPoolRepository
     residency: ResidencyRepository
     sandbox: SandboxRepository
@@ -515,6 +524,7 @@ async def reap_expired_attempts(
     interval_seconds: float = REAP_INTERVAL_S,
     max_attempts: int = MAX_ATTEMPTS,
     grants: Any | None = None,
+    app_credentials: Any | None = None,
 ) -> None:
     """Periodically close attempts whose lease expired.
 
@@ -525,6 +535,11 @@ async def reap_expired_attempts(
         grants: The grant client, when this deployment mints grants. ``None``
             skips both grant passes entirely — the capabilities then expire at
             their own TTL, which is the same backstop revocation accelerates.
+        app_credentials: The GitHub App credential minter. A goal decision
+            checks the repository's entitlement before it schedules, and with no
+            minter that check can only see the deployment's allowlist — so a
+            repository the owner installed the App on would be reported as
+            access denied.
     """
     try:
         await _reconcile_settled_terminals(store)
@@ -567,6 +582,31 @@ async def reap_expired_attempts(
             await store.attempt_commands.sweep_queued_follow_ups()
         except Exception:
             logger.warning("Queued follow-up sweep failed", exc_info=True)
+        # Goal wakeups before the attempt pass. The obligation is written in the
+        # same transaction as the terminal transition, and it is normally
+        # drained synchronously by the finish that armed it — this pass exists
+        # for a process that died between the two. The sweep after it is the
+        # backstop for a *missing* obligation, and the only thing that pauses a
+        # goal: every ordinary way an active goal stops being able to continue
+        # says so where and when it happens.
+        try:
+            await run_goal_wakeups(store=store, app_credentials=app_credentials)
+        except Exception:
+            logger.warning("Goal wakeup consumer pass failed", exc_info=True)
+        try:
+            swept = await store.goals.sweep_goal_scheduling()
+            if swept["rearmed"] or swept["stalled"]:
+                logger.warning(
+                    "agent_goals_recovered",
+                    extra={
+                        "event": "agent_goals_recovered",
+                        "rearmed": len(swept["rearmed"]),
+                        "stalled": len(swept["stalled"]),
+                        "stalled_thread_ids": swept["stalled"],
+                    },
+                )
+        except Exception:
+            logger.warning("Goal scheduling sweep failed", exc_info=True)
         try:
             actions = await store.attempt_commands.reap_expired(max_attempts=max_attempts)
             await _cleanup_reaped_shared_residencies(store.host_pool, actions, grants)

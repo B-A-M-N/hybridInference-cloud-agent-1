@@ -23,6 +23,21 @@ from cloud_agent.capacity_protocol import (
 )
 from cloud_agent.entitlement import REPO_PATTERN
 from cloud_agent.execution_profiles import ExecutionProfile
+from cloud_agent.goals.models import (
+    GoalInput,
+    GoalLimits,
+    GoalRoundKind,
+    GoalView,
+)
+
+# Runtime imports, and they have to be: this module has `from __future__ import
+# annotations`, but pydantic resolves every annotation when it builds the model,
+# so hiding these behind TYPE_CHECKING leaves the job view unbuilt and raises at
+# the first request instead of at import.
+from cloud_agent.goals.report import (  # noqa: TC001
+    GoalReportOutcome,
+    GoalReportParse,
+)
 from cloud_agent.host_pool import ENROLL_TOKEN_TTL_S
 from cloud_agent.skills.models import (
     SelectedSkill,
@@ -155,6 +170,15 @@ class AgentJobCreate(BaseModel):
             "Staged uploads to place under /uploads in the sandbox. Omitted attaches "
             "nothing: unlike skills there are no account defaults, because an upload "
             "is something done for this one task rather than a standing preference."
+        ),
+    )
+    goal: GoalInput | None = Field(
+        None,
+        description=(
+            "A completion condition for this conversation. The platform judges it at "
+            "the end of every turn and queues the next turn itself while the objective "
+            "is unmet, up to max_rounds. Omitted means no goal: nothing continues "
+            "without the owner asking again."
         ),
     )
     metadata: dict[str, Any] | None = Field(None, description="Opaque caller metadata.")
@@ -595,6 +619,25 @@ class AgentJobResponse(BaseModel):
     # Set on turns created by a fork: the original turn this row copies.
     forked_from_job_id: str | None = None
     metadata: dict[str, Any] | None = None
+    # How this turn came to exist, and what it was asked to do about the
+    # conversation's goal. A snapshot: editing the objective later never
+    # rewrites what this turn was told or what it reported.
+    turn_source: Literal["human", "goal"] = "human"
+    goal_round: int | None = None
+    goal_round_kind: GoalRoundKind | None = None
+    # What this turn's final message said about the goal, and how it read.
+    # ``goal_report_parse`` is the platform's own reading — ``absent``,
+    # ``valid``, ``invalid`` or ``unavailable`` — and is what the owner's page
+    # renders the block from. ``goal_report_detail`` explains a parse that
+    # failed, or the sentence a valid report carried.
+    goal_report_parse: GoalReportParse | None = None
+    goal_report_outcome: GoalReportOutcome | None = None
+    goal_report_detail: str | None = None
+    goal_repair_round: int | None = None
+    # The conversation's *live* goal, on every turn of it, the way ``title`` is.
+    # Editing the objective is visible here immediately; ``goal_round`` above is
+    # what this particular turn ran against.
+    goal: GoalView | None = None
     # Labels and revisions only. The owner never sees a connection's address or
     # credential — those are the two things this service's MCP relay keeps off
     # the sandbox-facing wire.
@@ -673,6 +716,53 @@ class AgentJobListResponse(BaseModel):
     """A page of agent jobs."""
 
     jobs: list[AgentJobResponse]
+
+
+class GoalRequest(BaseModel):
+    """A goal write, with the revision the caller read it at.
+
+    ``revision`` is what makes two edits from two tabs resolvable: the second
+    one is refused rather than silently overwriting the first. Omitted means
+    "write it whatever it currently says", which is what a first-time set from
+    the composer wants.
+    """
+
+    goal: GoalInput
+    revision: int | None = Field(None, ge=0)
+
+
+class GoalRevisionRequest(BaseModel):
+    """An optional compare-and-set guard on a goal operation.
+
+    Omitted means "act on whatever the goal currently is", which is what the
+    pause and resume buttons send: they are idempotent by nature, and refusing
+    to press one because a round advanced a counter would be a worse answer than
+    doing what was asked.
+    """
+
+    revision: int | None = Field(None, ge=0)
+
+
+class GoalResponse(BaseModel):
+    """The conversation's goal after a write that changed it.
+
+    Answered from the *thread*, not from a turn: a goal belongs to the
+    conversation, and a conversation whose newest turn has been deleted still
+    has one. ``revision`` is echoed even when there is no goal, so a client can
+    compare and set without a separate read.
+    """
+
+    thread_id: str
+    goal: GoalView | None = None
+    revision: int
+
+
+class GoalClearedResponse(BaseModel):
+    """The conversation after removing its goal."""
+
+    thread_id: str
+    cleared: bool = True
+    revision: int
 
 
 AgentSessionState = Literal[
@@ -895,6 +985,14 @@ class AgentFollowUpRequest(BaseModel):
             f"{RESET_REASONING_EFFORT!r} resets to Auto — effort needs a way "
             "back that model never did, because null is a value a turn can "
             "legitimately hold rather than the absence of one."
+        ),
+    )
+    goal: GoalInput | None = Field(
+        None,
+        description=(
+            "Set or replace this conversation's completion condition along with "
+            "this message. Omitted leaves the goal as it is. A turn queued by the "
+            "goal itself never carries one."
         ),
     )
 
@@ -1883,6 +1981,7 @@ class AgentConfigResponse(BaseModel):
 
     skill_limits: SkillLimits = Field(default_factory=SkillLimits)
     attachment_limits: AttachmentLimits = Field(default_factory=AttachmentLimits)
+    goal_limits: GoalLimits = Field(default_factory=GoalLimits)
 
     repos: list[str] = Field(
         default_factory=list,

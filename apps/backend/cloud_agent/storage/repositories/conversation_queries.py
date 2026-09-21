@@ -13,6 +13,7 @@ import json
 from typing import TYPE_CHECKING
 
 from cloud_agent.storage._sql.jobs import (
+    JOB_SELECT,
     JOB_SUMMARY_SELECT,
     QUALIFIED_JOB_SUMMARY_COLUMNS,
     SESSION_DELETE_BLOCK_SQL,
@@ -107,6 +108,101 @@ class PostgresConversationQueries:
                 job_id,
             )
         return job_row_to_dict(row) if row else None
+
+    async def latest_turn(self, *, thread_id: str) -> dict[str, Any] | None:
+        """The newest turn of this conversation, whatever state it is in.
+
+        Deliberately not :meth:`latest_terminal_turn`: the decision has to be
+        able to see a turn that is still running, because "a person's turn is in
+        flight" is the reason to wait rather than the reason to schedule.
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""
+                SELECT {QUALIFIED_JOB_SUMMARY_COLUMNS}, t.title, t.title_source,
+                       t.pinned_at, t.archived_at, t.deleted_at,
+                       to_jsonb(s) AS thread_sandbox
+                FROM agent_jobs j
+                LEFT JOIN agent_threads t ON t.id = j.thread_id
+                LEFT JOIN {THREAD_SANDBOX_SOURCE} ON s.thread_id = j.thread_id
+                WHERE j.thread_id = $1
+                ORDER BY j.turn_no DESC LIMIT 1
+                """,
+                thread_id,
+            )
+        return None if row is None else job_row_to_dict(row)
+
+    async def get_job_for_update(self, *, conn: Any, job_id: str) -> dict[str, Any] | None:
+        """Read one turn inside the caller's transaction, taking its row lock.
+
+        The decision re-reads the turn it is about to judge under the same
+        transaction that writes the outcome. Between the read that built the
+        context and this one the turn can have been reaped, retried or
+        superseded, and a decision made about a turn that has since changed is a
+        decision about nothing.
+        """
+        row = await conn.fetchrow(
+            f"{JOB_SELECT} WHERE j.id = $1 FOR UPDATE OF j",
+            job_id,
+        )
+        return None if row is None else job_row_to_dict(row)
+
+    async def latest_terminal_turn(self, *, thread_id: str) -> dict[str, Any] | None:
+        """The newest finished turn of this conversation, or ``None``.
+
+        The parent an owner-initiated automatic round hangs from. It is not
+        always the newest turn: a queued round can be cancelled, and a
+        conversation resumed afterwards continues the same linear chain from the
+        last turn that actually happened.
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"{JOB_SELECT} WHERE j.thread_id = $1 "
+                "AND j.state IN ('succeeded', 'failed', 'cancelled') "
+                # ASC, because ``TRUE > FALSE``: DESC would put the cancelled
+                # turns first, which is the exact opposite of the rule this
+                # orders by. The boolean has to lead — a cancelled round is not
+                # somewhere new work can hang from — and turn_no breaks the tie
+                # among the turns that actually ran.
+                "ORDER BY (j.state = 'cancelled') ASC, j.turn_no DESC LIMIT 1",
+                thread_id,
+            )
+        return None if row is None else job_row_to_dict(row)
+
+    async def latest_assistant_message(self, *, job_id: str) -> str | None:
+        """The last thing this turn said, or ``None`` if it said nothing.
+
+        Ordered by insert, not by time: every assistant message mirrors exactly
+        one ``message`` event, and the insert order *is* the order the runtime
+        emitted them. A turn that produced no assistant text reports ``None``
+        rather than the previous turn's words, which is what makes "no report"
+        distinguishable from "reported".
+        """
+        message = await self.latest_assistant_message_state(job_id=job_id)
+        return None if message is None else message["content"]
+
+    async def latest_assistant_message_state(self, *, job_id: str) -> dict[str, Any] | None:
+        """The last assistant message, and whether the runtime clipped it.
+
+        ``truncated`` is the difference between "the model said nothing more"
+        and "the transport stopped carrying what it said". A report reader has
+        to tell those apart: the report block is at the *end* of a message, so a
+        clipped one is a message whose answer may have been removed, and reading
+        it as silence is exactly the failure the completeness rule exists to
+        prevent.
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT content, truncated FROM agent_thread_messages
+                WHERE job_id = $1 AND role = 'assistant'
+                ORDER BY id DESC LIMIT 1
+                """,
+                job_id,
+            )
+        if row is None or row["content"] is None:
+            return None
+        return {"content": str(row["content"]), "truncated": bool(row["truncated"])}
 
     async def list_jobs(
         self,
