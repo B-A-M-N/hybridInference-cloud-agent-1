@@ -19,9 +19,9 @@ vi.mock('@/lib/api/agents', () => ({
   clearAgentGoal: vi.fn(),
 }));
 
-// The band and the menu are rendered directly rather than through JobDetail:
-// what they say is the whole subject here, and mounting the page would bury
-// each assertion under a transcript.
+// The band is rendered directly rather than through JobDetail: what it says and
+// what its controls do is the whole subject here, and mounting the page would
+// bury each assertion under a transcript.
 
 function goal(overrides: Partial<AgentGoal> = {}): AgentGoal {
   return {
@@ -29,7 +29,9 @@ function goal(overrides: Partial<AgentGoal> = {}): AgentGoal {
     state: 'active',
     revision: 3,
     roundsUsed: 2,
-    maxRounds: 10,
+    // No bound, which is what the product creates: an objective and nothing
+    // else. Tests about a bound the owner stated one themselves.
+    maxRounds: null,
     ...overrides,
   };
 }
@@ -59,12 +61,26 @@ describe('GoalBar', () => {
     expect(screen.getByRole('status', { name: 'Completion condition' })).toBeInTheDocument();
   });
 
-  it('shows progress while the goal is running itself', () => {
+  it('counts the rounds that ran, and names no total for a goal without one', () => {
+    // "2/10" reported a limit nobody had set, and made "no limit" — the
+    // ordinary case — impossible to say.
     render(<GoalBar threadId="thread_1" goal={goal()} state={idle} onChanged={() => {}} />);
-    expect(screen.getByRole('status')).toHaveTextContent(
-      'Goal running · 2/10 rounds · no round in flight',
-    );
+    expect(screen.getByRole('status')).toHaveTextContent('Waiting for next round');
+    expect(screen.getByRole('status')).toHaveTextContent('2 rounds run');
+    expect(screen.getByRole('status')).not.toHaveTextContent('/');
     expect(screen.getByRole('button', { name: 'Pause' })).toBeInTheDocument();
+  });
+
+  it('names the total when, and only when, the owner set one', () => {
+    render(
+      <GoalBar
+        threadId="thread_1"
+        goal={goal({ maxRounds: 10 })}
+        state={idle}
+        onChanged={() => {}}
+      />,
+    );
+    expect(screen.getByRole('status')).toHaveTextContent('2 of at most 10 rounds');
   });
 
   it('shows the objective it is working toward, not just its state', () => {
@@ -77,7 +93,7 @@ describe('GoalBar', () => {
         onChanged={() => {}}
       />,
     );
-    expect(screen.getByRole('status')).toHaveTextContent('ship the release notes');
+    expect(screen.getByRole('button', { name: 'ship the release notes' })).toBeInTheDocument();
   });
 
   it('says a round is in flight rather than looking idle', () => {
@@ -89,7 +105,7 @@ describe('GoalBar', () => {
         onChanged={() => {}}
       />,
     );
-    expect(screen.getByRole('status')).toHaveTextContent('Goal in progress · 2/10 rounds');
+    expect(screen.getByRole('status')).toHaveTextContent('In progress');
   });
 
   it('names a repair round as its own state, not as more work', () => {
@@ -101,9 +117,7 @@ describe('GoalBar', () => {
         onChanged={() => {}}
       />,
     );
-    expect(screen.getByRole('status')).toHaveTextContent(
-      'Restating the completion report · 2/10 rounds',
-    );
+    expect(screen.getByRole('status')).toHaveTextContent('Updating report');
   });
 
   it('carries the reason a paused goal stopped, and the sentence behind it', () => {
@@ -120,7 +134,7 @@ describe('GoalBar', () => {
       />,
     );
     expect(screen.getByRole('status')).toHaveTextContent(
-      "Goal paused · the sandbox context was lost · the conversation's session is gone",
+      "the sandbox context was lost · the conversation's session is gone",
     );
     expect(screen.getByRole('button', { name: 'Resume' })).toBeInTheDocument();
   });
@@ -149,21 +163,23 @@ describe('GoalBar', () => {
     );
   });
 
-  it('separates running out of rounds from a report it could not read', () => {
+  it('separates reaching a stated bound from a report it could not read', () => {
     const { rerender } = render(
       <GoalBar
         threadId="thread_1"
         goal={goal({
           state: 'paused',
           pauseReason: 'round_limit',
-          pauseDetail: 'the goal used its whole automatic round budget',
+          pauseDetail: 'the goal reached the round limit its owner set',
+          roundsUsed: 10,
+          maxRounds: 10,
         })}
         state={idle}
         onChanged={() => {}}
       />,
     );
     expect(screen.getByRole('status')).toHaveTextContent(
-      'Goal paused · all rounds used · the goal used its whole automatic round budget',
+      'all rounds used · the goal reached the round limit its owner set',
     );
     rerender(
       <GoalBar
@@ -178,7 +194,7 @@ describe('GoalBar', () => {
       />,
     );
     expect(screen.getByRole('status')).toHaveTextContent(
-      'Goal paused · the completion report could not be read · the goal report could not be read (malformed_json)',
+      'the completion report could not be read · the goal report could not be read (malformed_json)',
     );
   });
 
@@ -193,7 +209,7 @@ describe('GoalBar', () => {
     const { rerender } = render(
       <GoalBar threadId="thread_1" goal={paused} state={idle} onChanged={() => {}} />,
     );
-    expect(screen.getByRole('status')).not.toHaveTextContent('use Stop');
+    expect(screen.queryByText(/use Stop/)).not.toBeInTheDocument();
 
     rerender(
       <GoalBar
@@ -203,9 +219,9 @@ describe('GoalBar', () => {
         onChanged={() => {}}
       />,
     );
-    expect(screen.getByRole('status')).toHaveTextContent(
-      'The round already running will finish; use Stop to end it now.',
-    );
+    expect(
+      screen.getByText('The round already running will finish; use Stop to end it now.'),
+    ).toBeInTheDocument();
   });
 
   it('offers nothing but clearing once the goal is done', () => {
@@ -217,10 +233,10 @@ describe('GoalBar', () => {
         onChanged={() => {}}
       />,
     );
-    expect(screen.getByRole('status')).toHaveTextContent(
-      'Goal complete · reported by the agent · 2/10 rounds',
-    );
-    expect(screen.getByRole('button', { name: 'Clear' })).toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('Reported complete by the agent.');
+    fireEvent.click(screen.getByRole('button', { name: 'Goal options' }));
+    expect(screen.getByRole('menuitem', { name: 'Clear goal' })).toBeInTheDocument();
+    expect(screen.queryByRole('menuitem', { name: 'Edit goal' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Pause' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Resume' })).not.toBeInTheDocument();
   });
@@ -236,8 +252,9 @@ describe('GoalBar', () => {
         onChanged={() => {}}
       />,
     );
-    expect(screen.getByRole('status')).toHaveTextContent('Goal complete · 2/10 rounds');
-    expect(screen.getByRole('status')).not.toHaveTextContent('reported by the agent');
+    expect(screen.getByRole('status')).toHaveTextContent('Complete');
+    expect(screen.getByRole('status')).toHaveTextContent('2 rounds run');
+    expect(screen.getByRole('status')).not.toHaveTextContent('Reported complete by the agent.');
   });
 });
 
@@ -245,15 +262,70 @@ describe('GoalBar', () => {
 // each one does — and, more importantly, what it does not do — is behaviour
 // worth pinning down.
 describe('GoalBar controls', () => {
+  it('keeps only Pause and the options trigger visible until the menu opens', () => {
+    render(<GoalBar threadId="thread_1" goal={goal()} state={idle} onChanged={() => {}} />);
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeVisible();
+    expect(screen.queryByRole('menuitem')).not.toBeInTheDocument();
+    const trigger = screen.getByRole('button', { name: 'Goal options' });
+    fireEvent.click(trigger);
+    expect(trigger).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('menuitem', { name: 'Edit goal' })).toHaveFocus();
+    fireEvent.keyDown(document.activeElement!, { key: 'ArrowDown' });
+    expect(screen.getByRole('menuitem', { name: 'Clear goal' })).toHaveFocus();
+    fireEvent.keyDown(document.activeElement!, { key: 'Home' });
+    expect(screen.getByRole('menuitem', { name: 'Edit goal' })).toHaveFocus();
+    fireEvent.keyDown(document.activeElement!, { key: 'Escape' });
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+    expect(clearAgentGoal).not.toHaveBeenCalled();
+  });
+
+  it('opens at the last menu item on ArrowUp and dismisses on an outside pointer', () => {
+    render(<GoalBar threadId="thread_1" goal={goal()} state={idle} onChanged={() => {}} />);
+    fireEvent.keyDown(screen.getByRole('button', { name: 'Goal options' }), { key: 'ArrowUp' });
+    expect(screen.getByRole('menuitem', { name: 'Clear goal' })).toHaveFocus();
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    expect(clearAgentGoal).not.toHaveBeenCalled();
+  });
+
+  it('returns focus to the menu trigger when an edit is cancelled', () => {
+    render(<GoalBar threadId="thread_1" goal={goal()} state={idle} onChanged={() => {}} />);
+    const trigger = screen.getByRole('button', { name: 'Goal options' });
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Edit goal' }));
+    expect(screen.getByLabelText('Objective')).toHaveFocus();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(trigger).toHaveFocus();
+  });
+
+  it('names a pause that needs input separately from an ordinary user pause', () => {
+    render(
+      <GoalBar
+        threadId="thread_1"
+        goal={goal({ state: 'paused', pauseReason: 'needs_input', pauseDetail: 'Which branch?' })}
+        state={idle}
+        onChanged={() => {}}
+      />,
+    );
+    expect(screen.getByRole('status')).toHaveTextContent('Needs your input');
+    expect(screen.getByRole('status')).toHaveTextContent('Which branch?');
+    expect(screen.getByRole('button', { name: 'Resume' })).toBeEnabled();
+  });
+
   it('names every control and says what it does', () => {
     render(<GoalBar threadId="thread_1" goal={goal()} state={idle} onChanged={() => {}} />);
+    expect(screen.getByRole('button', { name: 'Pause' })).toHaveAttribute(
+      'title',
+      expect.stringMatching(/round in flight/),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Goal options' }));
     const hints: [string, RegExp][] = [
-      ['Pause', /round in flight/],
-      ['Edit', /round in flight is left alone/],
-      ['Clear', /chat and its history stay/],
+      ['Edit goal', /round in flight is left alone/],
+      ['Clear goal', /chat and its history stay/],
     ];
     for (const [name, hint] of hints) {
-      const control = screen.getByRole('button', { name });
+      const control = screen.getByRole('menuitem', { name });
       expect(control.getAttribute('title')).toMatch(hint);
     }
   });
@@ -273,21 +345,52 @@ describe('GoalBar controls', () => {
     expect(onChanged).toHaveBeenCalled();
   });
 
-  it('edits a running goal in place, without pausing or interrupting it', async () => {
+  it('edits a running goal in place, without opening anything', async () => {
     render(<GoalBar threadId="thread_1" goal={goal()} state={idle} onChanged={() => {}} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Goal options' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Edit goal' }));
+    // In place: the band grows an editor, and no modal appears over the chat.
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     fireEvent.change(screen.getByLabelText('Objective'), {
       target: { value: 'ship the release notes' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Set condition' }));
-    // The revision the band was drawn from travels with the write.
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    // The revision the band was drawn from travels with the write, and the
+    // request says nothing about a round bound. That omission is the contract,
+    // not an oversight: the server reads an absent `max_rounds` as "leave the
+    // bound alone", so editing the words of a goal somebody bounded cannot
+    // delete that bound. Sending `null` here would be the removal.
     await waitFor(() =>
       expect(setAgentGoal).toHaveBeenCalledWith('thread_1', {
-        goal: { objective: 'ship the release notes', max_rounds: 10 },
+        goal: { objective: 'ship the release notes' },
         revision: 3,
       }),
     );
     expect(pauseAgentGoal).not.toHaveBeenCalled();
+  });
+
+  it('closes the editor on Cancel and abandons what was typed', async () => {
+    render(<GoalBar threadId="thread_1" goal={goal()} state={idle} onChanged={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Goal options' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Edit goal' }));
+    fireEvent.change(screen.getByLabelText('Objective'), { target: { value: 'never mind' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByLabelText('Objective')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'make `pytest` pass' })).toBeInTheDocument();
+    expect(setAgentGoal).not.toHaveBeenCalled();
+  });
+
+  it('saves on Cmd/Ctrl+Enter, and leaves plain Enter to break the line', async () => {
+    render(<GoalBar threadId="thread_1" goal={goal()} state={idle} onChanged={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Goal options' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Edit goal' }));
+    const field = screen.getByLabelText('Objective');
+    fireEvent.change(field, { target: { value: 'ship the release notes' } });
+    // Enter is a newline: an objective is prose and may run to several lines.
+    fireEvent.keyDown(field, { key: 'Enter' });
+    expect(setAgentGoal).not.toHaveBeenCalled();
+    fireEvent.keyDown(field, { key: 'Enter', metaKey: true });
+    await waitFor(() => expect(setAgentGoal).toHaveBeenCalledTimes(1));
   });
 
   it('leaves a paused goal paused when its objective is edited', async () => {
@@ -301,11 +404,12 @@ describe('GoalBar controls', () => {
         onChanged={() => {}}
       />,
     );
-    fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Goal options' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Edit goal' }));
     fireEvent.change(screen.getByLabelText('Objective'), {
       target: { value: 'ship the release notes' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Set condition' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
     await waitFor(() => expect(setAgentGoal).toHaveBeenCalledTimes(1));
     expect(resumeAgentGoal).not.toHaveBeenCalled();
   });
@@ -319,19 +423,23 @@ describe('GoalBar controls', () => {
         onChanged={() => {}}
       />,
     );
-    fireEvent.click(screen.getByRole('button', { name: 'Clear' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Goal options' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Clear goal' }));
     await waitFor(() => expect(clearAgentGoal).toHaveBeenCalledWith('thread_1'));
     expect(pauseAgentGoal).not.toHaveBeenCalled();
   });
 
-  it('refuses to resume a goal that has spent its budget, and says what to do', () => {
+  it('resumes a goal whose stated bound is spent, and says what that does', async () => {
+    // The bound is only ever there because the owner wrote it, and nothing in
+    // the product edits it — so Resume is the way past it. A disabled button
+    // plus "raise the limit" pointed at a form that no longer exists.
     render(
       <GoalBar
         threadId="thread_1"
         goal={goal({
           state: 'paused',
           pauseReason: 'round_limit',
-          pauseDetail: 'the goal used its whole automatic round budget',
+          pauseDetail: 'the goal reached the round limit its owner set',
           roundsUsed: 10,
           maxRounds: 10,
         })}
@@ -339,15 +447,35 @@ describe('GoalBar controls', () => {
         onChanged={() => {}}
       />,
     );
-    expect(screen.getByRole('button', { name: 'Resume' })).toBeDisabled();
-    expect(screen.getByRole('status')).toHaveTextContent(
-      'All 10 automatic rounds are used. Raise the limit to continue.',
+    const resume = screen.getByRole('button', { name: 'Resume' });
+    expect(resume).toBeEnabled();
+    expect(resume.getAttribute('title')).toMatch(/without the round limit/);
+    expect(
+      screen.getByText('Resuming continues without the 10-round limit you set for this goal.'),
+    ).toBeInTheDocument();
+    fireEvent.click(resume);
+    await waitFor(() => expect(resumeAgentGoal).toHaveBeenCalledWith('thread_1'));
+  });
+
+  it('says nothing about lifting a bound the goal has not reached', () => {
+    render(
+      <GoalBar
+        threadId="thread_1"
+        goal={goal({
+          state: 'paused',
+          pauseReason: 'user',
+          pauseDetail: 'paused by the user',
+          roundsUsed: 3,
+          maxRounds: 50,
+        })}
+        state={idle}
+        onChanged={() => {}}
+      />,
     );
-    // The way out is the control beside it, which keeps the goal paused and
-    // leaves the rounds already spent alone.
-    expect(screen.getByRole('button', { name: 'Edit' })).toBeEnabled();
-    fireEvent.click(screen.getByRole('button', { name: 'Resume' }));
-    expect(resumeAgentGoal).not.toHaveBeenCalled();
+    expect(screen.queryByText(/without the 50-round limit/)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Resume' }).getAttribute('title')).toMatch(
+      /queue its next round/,
+    );
   });
 
   it('keeps a refused write on screen and does not pretend it landed', async () => {
@@ -365,11 +493,12 @@ describe('GoalBar controls', () => {
       new APIError('goal_revision_conflict', 'This goal changed while you were editing it.'),
     );
     render(<GoalBar threadId="thread_1" goal={goal()} state={idle} onChanged={onChanged} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Goal options' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Edit goal' }));
     fireEvent.change(screen.getByLabelText('Objective'), {
       target: { value: 'ship the release notes' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Set condition' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
     // The revision this band holds is exactly what the server refused, so the
     // goal has to be re-read before the owner can try again.
     await waitFor(() => expect(onChanged).toHaveBeenCalled());
@@ -378,94 +507,75 @@ describe('GoalBar controls', () => {
     );
   });
 
-  it('lets a resume through once the round limit has been raised', async () => {
-    // `round_limit` is the history of why the goal stopped, not a standing
-    // verdict. Raising the cap leaves it on the row, and a band that refused on
-    // the reason alone would keep Resume disabled for a goal the server would
-    // now happily continue.
-    render(
-      <GoalBar
-        threadId="thread_1"
-        goal={goal({
-          state: 'paused',
-          pauseReason: 'round_limit',
-          pauseDetail: 'the goal used its whole automatic round budget',
-          roundsUsed: 1,
-          maxRounds: 2,
-        })}
-        state={idle}
-        onChanged={() => {}}
-      />,
-    );
-    expect(screen.getByRole('status')).not.toHaveTextContent('Raise the limit to continue.');
-    const resume = screen.getByRole('button', { name: 'Resume' });
-    expect(resume).toBeEnabled();
-    fireEvent.click(resume);
-    await waitFor(() => expect(resumeAgentGoal).toHaveBeenCalledWith('thread_1'));
-  });
-
-  it('keeps the dialog open, and the words in it, when an edit is refused', async () => {
+  it('keeps the editor open, and the words in it, when an edit is refused', async () => {
     vi.mocked(setAgentGoal).mockRejectedValueOnce(new Error('goal service unavailable'));
     render(<GoalBar threadId="thread_1" goal={goal()} state={idle} onChanged={() => {}} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Goal options' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Edit goal' }));
     fireEvent.change(screen.getByLabelText('Objective'), {
       target: { value: 'ship the release notes' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Set condition' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
 
     // Still open, still holding what was typed, and saying why: closing on the
     // way out would throw away the retry.
     expect(await screen.findByRole('alert')).toHaveTextContent('goal service unavailable');
-    expect(screen.getByRole('dialog')).toBeInTheDocument();
     expect(screen.getByLabelText('Objective')).toHaveValue('ship the release notes');
 
     vi.mocked(setAgentGoal).mockResolvedValue({ thread_id: 'thread_1', goal: null, revision: 5 });
-    fireEvent.click(screen.getByRole('button', { name: 'Set condition' }));
-    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(screen.queryByLabelText('Objective')).not.toBeInTheDocument());
   });
 
   it('keeps the draft through the re-read a conflict forces', async () => {
-    // A 409 makes the page re-read the goal, and the re-read moves `initial`
-    // under the open dialog. Typing the other tab's goal over this owner's
-    // words would throw away the retry the open dialog exists to allow.
+    // A 409 makes the page re-read the goal, and the re-read moves the band's
+    // objective under the open editor. Typing the other tab's goal over this
+    // owner's words would throw away the retry the open editor exists to allow.
     vi.mocked(setAgentGoal).mockRejectedValueOnce(
       new APIError('goal_revision_conflict', 'This goal changed while you were editing it.'),
     );
     const { rerender } = render(
       <GoalBar threadId="thread_1" goal={goal()} state={idle} onChanged={() => {}} />,
     );
-    fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Goal options' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Edit goal' }));
     fireEvent.change(screen.getByLabelText('Objective'), {
       target: { value: 'ship the release notes' },
     });
-    fireEvent.change(screen.getByLabelText('Maximum automatic rounds'), {
-      target: { value: '15' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Set condition' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
     await waitFor(() => expect(setAgentGoal).toHaveBeenCalledTimes(1));
 
     // What the other tab wrote, arriving as the re-read the refusal caused.
     rerender(
       <GoalBar
         threadId="thread_1"
-        goal={goal({ objective: 'the other tab’s objective', revision: 4, maxRounds: 20 })}
+        goal={goal({ objective: 'the other tab’s objective', revision: 4 })}
         state={idle}
         onChanged={() => {}}
       />,
     );
 
     expect(screen.getByLabelText('Objective')).toHaveValue('ship the release notes');
-    expect(screen.getByLabelText('Maximum automatic rounds')).toHaveValue(15);
 
     // And the retry goes out as written, against the revision the re-read brought.
     vi.mocked(setAgentGoal).mockResolvedValue({ thread_id: 'thread_1', goal: null, revision: 5 });
-    fireEvent.click(screen.getByRole('button', { name: 'Set condition' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
     await waitFor(() =>
       expect(setAgentGoal).toHaveBeenLastCalledWith('thread_1', {
-        goal: { objective: 'ship the release notes', max_rounds: 15 },
+        goal: { objective: 'ship the release notes' },
         revision: 4,
       }),
     );
+  });
+
+  it('will not save an empty objective', () => {
+    render(<GoalBar threadId="thread_1" goal={goal()} state={idle} onChanged={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Goal options' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Edit goal' }));
+    fireEvent.change(screen.getByLabelText('Objective'), { target: { value: '   ' } });
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(setAgentGoal).not.toHaveBeenCalled();
   });
 
   it('shows the whole objective on demand, however long it is', () => {

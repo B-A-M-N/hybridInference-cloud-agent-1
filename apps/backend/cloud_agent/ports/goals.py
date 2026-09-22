@@ -70,9 +70,15 @@ class GoalRepository(Protocol):
 
         Raises ``GoalConflict`` when ``expected_revision`` no longer matches.
         Replacing the objective mints a new ``goal_id`` and starts the round
-        budget over; editing only the cap keeps both. A completed goal set again
+        count over; editing only the bound keeps both. A completed goal set again
         is a new authorization and mints a new identity even when the text is
         identical. A paused goal that is edited stays paused.
+
+        ``goal.max_rounds`` is tri-state: omitted leaves whatever bound the goal
+        already carries untouched, a number sets one, and an explicit ``null``
+        lifts one. A writer reads :attr:`GoalInput.states_max_rounds` rather than
+        the field, or an edit that only rewrites the objective would delete a
+        limit its owner stated.
         """
         ...
 
@@ -103,6 +109,20 @@ class GoalRepository(Protocol):
         Returns the goal as written, or ``None`` when the revision moved under
         the caller. The owner's authorization is the trigger: no model report is
         needed to start working again.
+
+        **Resuming releases a bound that has been spent.** A goal is only ever
+        bounded because the owner stated a number, and a goal sitting at that
+        number cannot be started again while it still applies — the very next
+        decision would read the same fact and pause it straight back, which
+        makes the only Resume control in the product a no-op. There is no other
+        way out: the round bound has no configuration surface. So the owner's
+        own "continue" is what lifts it, the new bound travels back in the
+        response, and the goal continues unbounded until it finishes or stops
+        for one of the reasons that still apply.
+
+        A bound that has *not* been reached is left exactly as it was: this is
+        not a general amnesty, and an owner who said "at most fifty" and paused
+        at three still gets fifty.
         """
         ...
 

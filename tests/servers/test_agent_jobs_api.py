@@ -244,7 +244,14 @@ class FakeGoals:
             # Every accepted write moves the control version, even one that
             # only changed the cap.
             "revision": revision + 1,
-            "max_rounds": goal.max_rounds,
+            # The real store's tri-state: a request that says nothing about the
+            # bound leaves the goal's own alone, and only an explicit ``null``
+            # lifts it. Reading the field directly would clear it every time.
+            "max_rounds": (
+                goal.max_rounds
+                if goal.states_max_rounds or current is None
+                else current["max_rounds"]
+            ),
             # Rounds belong to the identity, so a minted one starts from zero.
             "rounds_used": 0 if minted else current["rounds_used"],
             "created_at": (current or {}).get("created_at"),
@@ -297,8 +304,14 @@ class FakeGoals:
         current = self._goal(thread_id)
         if current is None or current["revision"] != revision or current["state"] != "paused":
             return None
+        # The real store's rule, modelled here because the API test has to be
+        # able to observe it: a bound the goal has already reached is released
+        # by the owner's own resume, and a bound it has not reached is kept.
+        bound = current.get("max_rounds")
+        spent = bound is not None and int(current.get("rounds_used") or 0) >= bound
         written = {
             **current,
+            "max_rounds": None if spent else bound,
             "state": "active",
             "pause_reason": None,
             "pause_detail": None,

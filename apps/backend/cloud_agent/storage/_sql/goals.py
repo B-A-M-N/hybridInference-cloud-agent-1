@@ -53,6 +53,24 @@ ROUNDS_USED_SQL = """(
           )
     ) AS goal_rounds_used"""
 
+#: The same count as :data:`ROUNDS_USED_SQL`, as a scalar expression over one
+#: thread, for a statement that has to decide *inside itself* whether the
+#: owner's stated bound has been reached.
+#:
+#: Written once so the "what counts as a spent round" rule cannot drift between
+#: the counter the owner reads and the rule that governs resuming.
+SPENT_ROUNDS_SQL = """(
+        SELECT count(*) FROM agent_jobs work
+        WHERE work.thread_id = t.id
+          AND work.turn_source = 'goal'
+          AND work.goal_id = t.goal_id
+          AND work.goal_id IS NOT NULL
+          AND EXISTS (
+                SELECT 1 FROM agent_attempts a
+                WHERE a.job_id = work.id AND a.status <> 'aborted'
+          )
+    )"""
+
 #: Repair rounds spent on the *current* objective, which is what bounds the
 #: report-repair loop. Reset with the objective, exactly like the budget.
 REPAIRS_USED_SQL = """(
@@ -72,20 +90,30 @@ REPAIRS_USED_SQL = """(
 #: and there is no ordering of "set the objective" / "set the identity" /
 #: "set the state" that does.
 #:
-#: ``$2`` objective, ``$3`` max_rounds, ``$4`` the identity to mint, ``$5``
-#: the state to leave the goal in, ``$6`` force a fresh identity (a goal that
-#: had already completed, set again).
+#: ``$2`` objective, ``$3`` max_rounds or ``NULL``, ``$4`` the identity to
+#: mint, ``$5`` the state to leave the goal in, ``$6`` force a fresh identity (a
+#: goal that had already completed, set again), ``$7`` the sentence a paused
+#: edit leaves behind, ``$8`` whether the request said anything about the bound.
+#:
+#: ``$8`` is the tri-state, and it is why ``$3`` cannot simply be assigned.
+#: "Omitted" must leave the column alone: a request that only rewrites the
+#: objective is the ordinary edit, and a writer that read the field's default
+#: would answer it by deleting a bound its owner stated. ``$8`` true with ``$3``
+#: ``NULL`` is how a bound is lifted, and ``$8`` true with a number is how one
+#: is set. ``NULL`` in ``goal_max_rounds`` is the ordinary *value* for a goal
+#: nobody bounded, not a missing one, and it is never rendered as a large
+#: integer — here or anywhere downstream.
 #:
 #: A new objective mints a new ``goal_id`` *and* resets the repair counter: the
 #: rounds spent on the old objective are not rounds spent on this one, and a
 #: malformed report about the old objective has nothing to say about the new
 #: one. The revision moves on every accepted write, including one that changed
-#: only the cap, so a queued round carrying an older revision is discarded
+#: only the bound, so a queued round carrying an older revision is discarded
 #: rather than charged to the new one.
 SET_GOAL_SQL = """
 UPDATE agent_threads
 SET goal_objective = $2,
-    goal_max_rounds = $3,
+    goal_max_rounds = CASE WHEN $8 THEN $3 ELSE goal_max_rounds END,
     goal_id = CASE WHEN $6 OR goal_id IS NULL OR goal_objective IS DISTINCT FROM $2
                         OR goal_state = 'complete'
                    THEN $4 ELSE goal_id END,

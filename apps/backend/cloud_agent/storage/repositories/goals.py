@@ -30,6 +30,7 @@ from cloud_agent.storage._sql.goals import (
     REPAIRS_USED_SQL,
     ROUNDS_USED_SQL,
     SET_GOAL_SQL,
+    SPENT_ROUNDS_SQL,
 )
 from cloud_agent.storage._sql.rows import thread_goal
 
@@ -199,9 +200,15 @@ class PostgresGoalRepository:
 
         Raises ``GoalConflict`` when ``expected_revision`` no longer matches.
         Replacing the objective mints a new ``goal_id`` and starts the round
-        budget over; editing only the cap keeps both. A completed goal set again
+        count over; editing only the bound keeps both. A completed goal set again
         is a new authorization and mints a new identity even when the text is
         identical. A paused goal that is edited stays paused.
+
+        ``goal.max_rounds`` is tri-state: omitted leaves whatever bound the goal
+        already carries untouched, a number sets one, and an explicit ``null``
+        lifts one. A writer reads :attr:`GoalInput.states_max_rounds` rather than
+        the field, or an edit that only rewrites the objective would delete a
+        limit its owner stated.
         """
         async with self._pool.acquire() as conn, conn.transaction():
             current = await conn.fetchrow(
@@ -235,6 +242,11 @@ class PostgresGoalRepository:
                 state,
                 reauthorized,
                 EDITED_WHILE_PAUSED_DETAIL,
+                # Absence is not ``None``: a request that says nothing about the
+                # bound leaves the owner's alone, and only an explicit ``null``
+                # lifts it. Reading the field instead would make every edit that
+                # rewrites the objective a silent removal.
+                goal.states_max_rounds,
             )
             # A queued round belongs to the objective it was written for. Both
             # paths that replace an objective — this one and the follow-up
@@ -313,19 +325,41 @@ class PostgresGoalRepository:
         Returns the goal as written, or ``None`` when the revision moved under
         the caller. The owner's authorization is the trigger: no model report is
         needed to start working again.
+
+        **Resuming releases a bound that has been spent.** A goal is only ever
+        bounded because the owner stated a number, and a goal sitting at that
+        number cannot be started again while it still applies — the very next
+        decision would read the same fact and pause it straight back, which
+        makes the only Resume control in the product a no-op. There is no other
+        way out: the round bound has no configuration surface. So the owner's
+        own "continue" is what lifts it, the new bound travels back in the
+        response, and the goal continues unbounded until it finishes or stops
+        for one of the reasons that still apply.
+
+        A bound that has *not* been reached is left exactly as it was: this is
+        not a general amnesty, and an owner who said "at most fifty" and paused
+        at three still gets fifty.
         """
         async with self._pool.acquire() as conn, conn.transaction():
             written = await conn.fetchrow(
                 """
-                UPDATE agent_threads
+                UPDATE agent_threads t
                 SET goal_state = 'active', goal_pause_reason = NULL,
                     goal_pause_detail = NULL,
+                    goal_max_rounds = CASE
+                        WHEN t.goal_max_rounds IS NOT NULL
+                             AND t.goal_max_rounds <= """
+                + SPENT_ROUNDS_SQL
+                + """
+                        THEN NULL
+                        ELSE t.goal_max_rounds
+                    END,
                     goal_completion_basis = NULL, goal_completed_by_job_id = NULL,
                     goal_revision = goal_revision + 1,
                     goal_updated_at = NOW(), updated_at = NOW()
-                WHERE id = $1 AND user_id = $2 AND goal_revision = $3
-                  AND goal_state = 'paused'
-                RETURNING id, goal_id, goal_revision
+                WHERE t.id = $1 AND t.user_id = $2 AND t.goal_revision = $3
+                  AND t.goal_state = 'paused'
+                RETURNING t.id, t.goal_id, t.goal_revision
                 """,
                 thread_id,
                 user_id,
@@ -630,7 +664,7 @@ def _pause_detail(reason: str) -> str:
         "user": "paused by the user",
         "fork": "copied from another conversation; resume it to start working",
         "needs_input": "the agent stopped and asked for input",
-        "round_limit": "the goal used its whole automatic round budget",
+        "round_limit": "the goal reached the round limit its owner set",
         "execution_failed": "the automatic round that was running did not finish",
         "cancelled": "the automatic round was cancelled",
         "report_invalid": "the agent's completion report could not be read",
