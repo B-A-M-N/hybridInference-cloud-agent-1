@@ -18,7 +18,6 @@ import { basePath } from '@/config/env';
 import { useT } from '@/components/providers';
 import {
   cancelAgentJob,
-  followUpAgentJob,
   forkAgentJob,
   getAgentConfig,
   getAgentJobGit,
@@ -26,6 +25,7 @@ import {
   type AgentConfigApi,
   type AgentGitWorkspaceApi,
 } from '@/lib/api/agents';
+import { submitThreadMessage, type ThreadMessageResultApi } from '@/lib/api/pendingMessages';
 
 import { ownerFailureMessage, toDiffFileDetails } from './adapt';
 import {
@@ -72,6 +72,9 @@ import {
 } from './TrajectoryInspector';
 import { buildTrajectorySteps, turnContextFromJobs } from './trajectorySteps';
 import { shouldHoldReading, useConversationScroll } from './useConversationScroll';
+import { notDeliveredText, PendingMessageQueue } from './PendingMessageQueue';
+import { isSteerChord } from './composerKeys';
+import { usePendingMessages } from './usePendingMessages';
 import { useResizablePane } from './useResizablePane';
 import { WorkspaceFiles } from './WorkspaceFiles';
 import {
@@ -942,6 +945,11 @@ export function JobDetail({
 
   async function submitFollowUp(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    await sendDraft();
+  }
+
+  /** Send what the composer holds; the result, or `null` if nothing went. */
+  async function sendDraft(): Promise<ThreadMessageResultApi | null> {
     if (
       submitting ||
       contextLost ||
@@ -950,40 +958,57 @@ export function JobDetail({
       readingFiles ||
       mcp.saving
     )
-      return;
+      return null;
     // A command is not a message. It runs the thing it names and leaves
     // nothing behind for the model to read as a prompt.
-    if (await goalCommand.submit()) return;
+    if (await goalCommand.submit()) return null;
     const prompt = followUp.trim();
-    if (!prompt) return;
+    if (!prompt) return null;
     setSubmitting(true);
     setActionError(null);
     try {
-      const child = await followUpAgentJob(job.id, {
+      // One request whatever the conversation is doing: idle, the message is
+      // the next turn when this returns; busy, it waits in the queue above the
+      // composer. ``queue.apply`` shows the card or, for a turn, moves to it.
+      const result = await submitThreadMessage(threadId, {
         prompt,
         ...(chosenSkills !== null ? { skill_ids: chosenSkills.map((skill) => skill.id) } : {}),
         ...(attachments.ids.length ? { attachment_ids: attachments.ids } : {}),
         // Omitted controls inherit the parent's validated model and effort.
         ...composerOverrides(job, model, effort),
       });
-      // A router.push remounts the dynamic [jobId] segment even with
-      // scroll:false and a stable JobDetail key. Native history updates Next's
-      // usePathname without replacing the page, preserving the conversation
-      // while useAgentJob loads the next turn. Reload and Back keep real URLs.
-      window.history.pushState(null, '', `${basePath}/${encodeURIComponent(child.id)}`);
-      // The reader asked for this turn, so following its output is what they
-      // asked for — the one place besides "back to bottom" that resumes it.
-      scroll.followLatest();
-      // Also what the remount used to do. Without it the composer stayed
-      // disabled with the sent text still in it, because nothing else ever
-      // cleared either.
+      queue.apply(result);
+      // Without this the composer stayed disabled with the sent text still in
+      // it, because nothing else ever cleared either. A queued message keeps
+      // its uploads: they are pinned to it, not discarded with the draft.
       setFollowUp('');
       attachments.reset();
       setSubmitting(false);
+      return result;
     } catch (cause: unknown) {
-      setActionError(cause instanceof Error ? cause.message : 'Could not queue the follow-up');
+      setActionError(cause instanceof Error ? cause.message : 'Could not send the message');
       setSubmitting(false);
+      return null;
     }
+  }
+
+  /**
+   * Cmd/Ctrl+Enter while a turn that can take it is live: the draft goes into
+   * that turn, before the model's next tool call, instead of after it. Only the
+   * draft: what already waits was left for after the turn, and each has its
+   * own ↑ for changing that.
+   */
+  async function steerNow() {
+    const drafted = followUp.trim() ? await sendDraft() : null;
+    // Nothing to add, or nothing running: the draft simply became the next turn.
+    if (!drafted?.pending || (drafted.pending.attachments ?? []).length) return;
+    const sent = await queue.sendNow(drafted.pending);
+    if (!sent.ok) {
+      setActionError(sent.error);
+      return;
+    }
+    const reason = sent.result.not_delivered_reason;
+    if (reason) toast(notDeliveredText(reason, t));
   }
 
   // Fork creates a second native session in this chat's shared workspace and
@@ -1082,6 +1107,32 @@ export function JobDetail({
     turnKeys,
     conversationKey,
     active: tab === 'chat',
+  });
+  // The conversation's waiting messages. A message becomes a turn on the
+  // server, when the turn in front of it ends; the page follows it there when
+  // it asked for it, or when it was showing the turn the new one follows.
+  const followTurn = useCallback(
+    (jobId: string) => {
+      // A router.push remounts the dynamic [jobId] segment even with
+      // scroll:false and a stable JobDetail key. Native history updates Next's
+      // usePathname without replacing the page, preserving the conversation
+      // while useAgentJob loads the next turn. Reload and Back keep real URLs.
+      window.history.pushState(null, '', `${basePath}/${encodeURIComponent(jobId)}`);
+      // The reader asked for this turn, so following its output is what they
+      // asked for — the one place besides "back to bottom" that resumes it.
+      scroll.followLatest();
+    },
+    [scroll],
+  );
+  const viewedJobId = job.id;
+  const queue = usePendingMessages({
+    // The queue this page writes to is the one it reads.
+    threadId,
+    active: hasLiveWork(job),
+    onSent: (jobId, how) => {
+      if (jobId === viewedJobId) return;
+      if (how.requested || how.after === viewedJobId) followTurn(jobId);
+    },
   });
   // Announced only for a jump the reader asked for, never for a streamed
   // event: a transcript that talks on every token is one nobody can listen to.
@@ -1342,8 +1393,11 @@ export function JobDetail({
                     data-turn-key={currentTurn.key}
                   >
                     {threadMessages.map((message) => {
+                      // Only a prompt starts a turn a rewind could replace.
                       const rewindAnchor =
-                        message.role === 'user' && currentRewindAnchor !== message.jobId
+                        message.role === 'user' &&
+                        !message.midTurn &&
+                        currentRewindAnchor !== message.jobId
                           ? currentRewindAnchor
                           : undefined;
                       return (
@@ -1532,6 +1586,10 @@ export function JobDetail({
                   active={isActive}
                   approvalsOnly
                 />
+                {/* Its own card above the composer rather than inside it: the
+                    queue is what the conversation will send next, not part of
+                    the message being written. */}
+                <PendingMessageQueue queue={queue} disabled={isArchived || contextLost} />
                 <div
                   className={
                     isArchived
@@ -1646,6 +1704,11 @@ export function JobDetail({
                         // half of one to the model.
                         onKeyDown={(event) => {
                           goalCommand.onKeyDown(event);
+                          if (event.defaultPrevented) return;
+                          if (queue.canSendNow && isSteerChord(event)) {
+                            event.preventDefault();
+                            void steerNow();
+                          }
                         }}
                         // The list is this box's own popup, and the highlighted
                         // row is named to it — the caret never leaves here.
@@ -1710,7 +1773,8 @@ export function JobDetail({
                             />
                             {isActive ? (
                               <span className="min-w-0 truncate text-[11px] text-gray-400 dark:text-gray-500">
-                                · queued after this run
+                                · {t('queue.afterThisTurn')}
+                                {queue.canSendNow ? ` · ${t('queue.steerHint')}` : ''}
                               </span>
                             ) : null}
                           </>
@@ -1721,7 +1785,8 @@ export function JobDetail({
                               : job.state === 'cancelled'
                                 ? `Restores any saved changes · ${job.runtime} · ${job.model}`
                                 : `Inherits ${job.runtime} · ${job.model}`}
-                            {isActive ? ' · queued after this run' : ''}
+                            {isActive ? ` · ${t('queue.afterThisTurn')}` : ''}
+                            {queue.canSendNow ? ` · ${t('queue.steerHint')}` : ''}
                           </span>
                         )}
                         <ComposerSendButton

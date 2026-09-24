@@ -28,12 +28,14 @@ from cloud_agent.api._workspace_access import (
 )
 from cloud_agent.api.deps import (
     get_agent_app_credentials,
+    get_gateway_client,
     get_grant_client,
     get_source_control,
     get_storage,
     require_store,
 )
 from cloud_agent.application.job_admission import ENV_SANDBOX_MCP_URL
+from cloud_agent.application.pending_messages import settle_queue_when_possible
 from cloud_agent.application.residency import RESIDENCY_TTL_S, _mint_residency_grant
 from cloud_agent.attachments.models import AttachmentView
 from cloud_agent.attachments.selection import prompt_with_attachments
@@ -115,8 +117,10 @@ if TYPE_CHECKING:
         HostPoolRepository,
         McpConnectionRepository,
         OperationMeasurements,
+        PendingMessageRepository,
         ResidencyRepository,
         SandboxRepository,
+        SkillRepository,
         SourceControlRepository as SourceControlPort,
     )
     from cloud_agent.workspace_broker_client import WorkspaceBrokerClient
@@ -135,6 +139,8 @@ class _WorkerStorage(Protocol):
 
     ``attachments`` is here for the claim that tells a host how many uploads the
     conversation carries, and for the two endpoints that hand them over.
+    ``pending_messages`` and ``skills`` are the finish's: a turn that ends sends
+    the owner's next waiting message, checked like any message.
     """
 
     attachments: AttachmentRepository
@@ -148,8 +154,10 @@ class _WorkerStorage(Protocol):
     host_pool: HostPoolRepository
     mcp: McpConnectionRepository
     operation_measurements: OperationMeasurements
+    pending_messages: PendingMessageRepository
     residency: ResidencyRepository
     sandbox: SandboxRepository
+    skills: SkillRepository
     source_control: SourceControlPort
 
 
@@ -1597,12 +1605,17 @@ async def worker_finish(
     authorization: str | None = Header(None),
     store: _WorkerStorage | None = Depends(get_storage),
     source_control: SourceControlRuntime | None = Depends(get_source_control),
+    gateway: Any = Depends(get_gateway_client),
 ) -> WorkerAckResponse:
     """Drive the fenced terminal transition for this attempt.
 
+    Then, before acknowledging, act on what the ending means for the rest of
+    the conversation: the owner's waiting messages first, then the goal.
+
     Takes the source-control runtime rather than the App's credentials: a turn
     that finished is recorded and acknowledged whether or not the App can be
-    loaded right now (issue #47). Only the next goal round waits for it.
+    loaded right now (issue #47). Only sending the next waiting message and the
+    next goal round wait for it.
     """
     job_store = _require_store(store)
     claims = _worker_claims(authorization)
@@ -1684,6 +1697,30 @@ async def worker_finish(
             lease_generation=claims["lease_generation"],
         )
         raise _lease_lost()
+    # The owner's waiting messages go before anything the goal would add, so
+    # the queue is settled first: its first message becomes the next turn now,
+    # or a failed or cancelled ending pauses it. In its own guard for the same
+    # reason as the goal below — the turn is already decided, and a runner
+    # retrying a finish would find no transition left to make.
+    github_app = None if source_control is None else source_control.github
+    if job.get("thread_id") is not None:
+        try:
+            await settle_queue_when_possible(
+                job_store,
+                thread_id=str(job["thread_id"]),
+                gateway=gateway,
+                github_app=github_app,
+            )
+        except Exception:
+            logger.warning(
+                "agent_pending_queue_settle_failed",
+                extra={
+                    "event": "agent_pending_queue_settle_failed",
+                    "job_id": job_id,
+                    "thread_id": job.get("thread_id"),
+                },
+                exc_info=True,
+            )
     # Synchronously, and before the runner is acknowledged. The owner's page
     # watches the newest turn: if the next round did not exist by the time this
     # returned, the conversation would look finished for a moment and the page
@@ -1704,7 +1741,8 @@ async def worker_finish(
         await continue_after_finish(
             store=job_store,
             job_id=job_id,
-            github_app=None if source_control is None else source_control.github,
+            github_app=github_app,
+            gateway=gateway,
         )
     except Exception:
         logger.warning(

@@ -126,6 +126,17 @@ therefore covers
 source/child admission, group stop/restore, and completion of the final
 quiescent publication snapshot for all five CLIs.
 
+The local model answers at once. To act while a turn is still running — send
+messages that queue behind it, edit or delete them, press Stop — put
+`[local-hold:N]` in that turn's message: the gateway holds its answer for `N`
+seconds (at most 120). A marker in an earlier message has no effect.
+
+To send a waiting message *into* a running claude-code turn, the turn needs a tool
+in flight — that is when Claude takes one. `[local-tool:N]` makes the turn run
+`sleep N` through Bash first (at most 60 s); press ↑ on a waiting message while it
+runs, and the answer after the tool quotes what you sent. A codex turn takes one
+at any point, so `[local-hold:N]` is enough there.
+
 Useful commands:
 
 ```bash

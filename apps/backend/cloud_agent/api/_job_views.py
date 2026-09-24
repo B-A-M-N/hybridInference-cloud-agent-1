@@ -23,6 +23,8 @@ from cloud_agent.schemas import (
     AgentAttemptSummary,
     AgentJobEvent,
     AgentJobResponse,
+    AgentPendingMessageAttachment,
+    AgentPendingMessageResponse,
     AttemptResources,
     GoalView,
     McpBindingSummary,
@@ -107,6 +109,17 @@ def _goal_view(goal: dict[str, Any] | None) -> GoalView | None:
     if not goal:
         return None
     return GoalView.model_validate(goal)
+
+
+def mid_turn_input_supported(job: dict[str, Any]) -> bool:
+    """Whether a message can be sent into ``job``'s turn while it runs.
+
+    The host that holds the conversation says so, per runtime, in the
+    capabilities it enrolls with. Whether the turn is running *now* is the
+    caller's question; this one is only whether it could ever take one.
+    """
+    sandbox = job.get("thread_sandbox") or {}
+    return sandbox.get("shared_live") is True and sandbox.get("mid_turn_input_capable") is True
 
 
 def _job_response(
@@ -194,6 +207,7 @@ def _job_response(
         native_state=sandbox.get("native_state"),
         fork_anchor_job_id=sandbox.get("fork_anchor_job_id"),
         native_fork_available=native_fork_available,
+        mid_turn_input_supported=mid_turn_input_supported(job),
         workspace_publication_state=sandbox.get("workspace_publication_state"),
         workspace_epoch=sandbox.get("workspace_epoch"),
         started_at=_iso((telemetry or {}).get("started_at")),
@@ -215,4 +229,27 @@ def _event_response(event: dict[str, Any]) -> AgentJobEvent:
         event_type=event["event_type"],
         payload=event["payload"],
         created_at=_iso(event["created_at"]),
+    )
+
+
+def _pending_response(message: dict[str, Any]) -> AgentPendingMessageResponse:
+    """Shape a waiting message for its owner, without its idempotency key."""
+    return AgentPendingMessageResponse(
+        id=message["id"],
+        thread_id=message["thread_id"],
+        position=message["position"],
+        state=message["state"],
+        revision=message["revision"],
+        prompt=message["prompt"],
+        skill_ids=message.get("skill_ids"),
+        attachment_ids=message.get("attachment_ids"),
+        attachments=[
+            AgentPendingMessageAttachment(**attachment)
+            for attachment in message.get("attachments") or []
+        ],
+        model=message.get("model"),
+        reasoning_effort=message.get("reasoning_effort"),
+        last_error=message.get("last_error"),
+        created_at=_iso(message.get("created_at")),
+        updated_at=_iso(message.get("updated_at")),
     )

@@ -175,6 +175,7 @@ async def lifespan(app: FastAPI, *, background: bool = True) -> AsyncIterator[No
                 storage,
                 grants=app.state.grants,
                 github_app=app.state.source_control.github,
+                gateway=app.state.gateway,
             )
         )
         snapshot_coordinator = asyncio.create_task(coordinate_shared_snapshots(storage))

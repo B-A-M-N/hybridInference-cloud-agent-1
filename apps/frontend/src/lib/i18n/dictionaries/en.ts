@@ -422,6 +422,50 @@ export const en = {
   'connect.bodyTemporarilyUnavailable':
     'Repository access will come back on its own. Try again in a minute.',
 
+  // ── Pending message queue ───────────────────────────────────────────────
+  'queue.region': 'Queued messages',
+  'queue.countOne': '1 pending',
+  'queue.countMany': '{count} pending',
+  'queue.afterThisTurn': 'sent after this turn',
+  'queue.steerHint': '⌘/Ctrl+↵ to add to this turn',
+  'queue.state.editing': 'Editing',
+  'queue.state.refused': 'Not sent',
+  'queue.state.sending': 'Adding',
+  'queue.state.sendingTitle':
+    'Goes in before its next tool call; if this turn answers first, it is sent as the next turn.',
+  'queue.paused.stopped': 'Paused: stopped',
+  'queue.paused.failed': 'Paused: the last turn failed',
+  'queue.paused.archived': 'Paused: archived',
+  'queue.resume': 'Continue',
+  'queue.resumeLabel': 'Continue sending queued messages',
+  'queue.edit': 'Edit',
+  'queue.editLabel': 'Edit queued message',
+  'queue.delete': 'Delete',
+  'queue.deleteLabel': 'Delete queued message',
+  'queue.sendNow': 'Add to this turn',
+  'queue.sendNowLabel': 'Add to the turn in progress',
+  'queue.sendNowFiles':
+    'A message with files goes as a turn of its own; it cannot join the running one.',
+  'queue.notDelivered.turnEnded': 'The turn just ended; this message goes next.',
+  'queue.notDelivered.unreachable':
+    'Could not reach the host running this turn; it will be sent when the turn ends.',
+  'queue.notDelivered.other': 'The turn did not take it; it will be sent when the turn ends.',
+  'queue.sendNowRefused.notRunning': 'This turn is stopping; the message stays in line.',
+  'queue.sendNowRefused.unsupported':
+    'This conversation cannot take messages mid-turn; it will be sent when the turn ends.',
+  'queue.save': 'Save',
+  'queue.saving': 'Saving…',
+  'queue.cancelEdit': 'Cancel',
+  'queue.editHint': 'Held while you edit; nothing behind it is sent · ⏎ save · Esc cancel',
+  'queue.emptyPrompt': 'A queued message cannot be empty.',
+  'queue.conflict':
+    'This message changed in another tab. The card shows the latest version; your text is kept here.',
+  'queue.gone': 'This message was already sent or removed. Your text is kept here.',
+  'queue.latest': 'Latest:',
+  'queue.dismiss': 'Dismiss',
+  'queue.removed': 'Message removed',
+  'queue.attachmentsOne': '1 attachment',
+  'queue.attachmentsMany': '{count} attachments',
   // ── Shared ──────────────────────────────────────────────────────────────
   'common.loading': 'Loading…',
 } as const;
