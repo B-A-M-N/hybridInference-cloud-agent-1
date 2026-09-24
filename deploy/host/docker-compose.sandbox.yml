@@ -42,9 +42,12 @@ services:
       TUNNEL_SSH_PORT: ${AGENT_TUNNEL_SSH_PORT:-22}
       # Where the gateway listens *on that machine*. Loopback by default, which
       # is the setup this design keeps intact: the gateway need not be exposed
-      # to the network at all.
+      # to the network at all. The port is the gateway's agent entry, the one
+      # listener that honours an inference grant. Its API on 8080 refuses
+      # every grant, because a sandbox reaches the public internet and a grant
+      # can leave it.
       TUNNEL_REMOTE_HOST: ${AGENT_TUNNEL_REMOTE_HOST:-127.0.0.1}
-      TUNNEL_REMOTE_PORT: ${AGENT_TUNNEL_REMOTE_PORT:-8080}
+      TUNNEL_REMOTE_PORT: ${AGENT_TUNNEL_REMOTE_PORT:-8090}
       TUNNEL_LISTEN_PORT: ${AGENT_TUNNEL_LISTEN_PORT:-8080}
     volumes:
       # Read-only, and its own key: this one may open a single forwarded port

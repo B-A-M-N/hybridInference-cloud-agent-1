@@ -155,7 +155,7 @@ def _tunnels(compose: dict) -> dict[str, dict]:
     [
         ("AGENT_CONTROL_PLANE_URL", "8000", "claim, register and heartbeat"),
         ("AGENT_SANDBOX_MCP_URL", "8001", "the MCP relay, and nothing else"),
-        ("AGENT_GATEWAY_URL", "8080", "model calls"),
+        ("AGENT_GATEWAY_URL", "8090", "model calls, on the gateway's agent entry"),
     ],
 )
 def test_each_address_reaches_the_listener_it_names(
@@ -199,7 +199,7 @@ def test_nothing_on_the_relay_network_reaches_the_control_plane(compose: dict) -
         for name, svc in compose["services"].items()
         if "agent-relays" in (svc.get("networks") or {})
     }
-    assert on_relays == {"gateway-tunnel": "8080", "mcp-tunnel": "8001"}, on_relays
+    assert on_relays == {"gateway-tunnel": "8090", "mcp-tunnel": "8001"}, on_relays
 
 
 # ---------------------------------------------------------------------------

@@ -430,8 +430,10 @@ Recorded here as *what has to be decided*, not as anyone's actual answer.
   and public IPv4 on TCP 80/443 — the same during setup and the agent run. So
   the gateway's and control plane's public entry points must refuse sandbox
   credentials: tool calls are served only on the MCP-only listener, and
-  inference grants only on the gateway's internal entry. If a deployment fronts
-  either relay through a tunnel, the port allocation is overlay detail.
+  inference grants only on the gateway's agent entry (`GATEWAY_AGENT_ENTRY_PORT`
+  on the gateway, 8090 in its Compose file), which is where
+  `AGENT_TUNNEL_REMOTE_PORT` points by default. If a deployment fronts either
+  relay through a tunnel, the port allocation is overlay detail.
 - **Sandbox image registry**: where `AGENT_SANDBOX_IMAGE` is pulled from. Decide
   before D7.
 

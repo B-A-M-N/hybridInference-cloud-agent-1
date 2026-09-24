@@ -6,7 +6,7 @@
 
 **修订：** 2026-09-23，网络部分按[统一公网出口设计](2026-09-23-agent-public-egress-design.zh-CN.md)改为唯一网络：删除两阶段网络、网络档位与白名单代理。
 
-**状态：** 当前安全契约；Docker writable-layer quota 尚未实现，仍是 rollout gate；网关的推理令牌内部入口尚未完成，完成前不用真实用户凭据运行可出网的任务（见 §8.4）
+**状态：** 当前安全契约；Docker writable-layer quota 尚未实现，仍是 rollout gate；网关只在独立的 agent 入口接受推理令牌（HarvardMadSys/hybridInference#1471），推理中继默认指向它；某环境的网关上线该版本、中继切到 8090 之前，那个环境不用真实用户凭据运行可出网的任务（见 §8.4）
 
 **实现仓库：** `freeinference-cloud-agent`
 
@@ -238,7 +238,7 @@ Source preparer 的临时目录不是 checkpoint，也不能作为恢复或 Fork
 
 - TCP 80/443 只是端口约束，不检查内容，不承诺阻止 DoH 或这些端口上的隧道；
 - 不防外发：沙盒可以把仓库内容和自己的短期令牌发往公网；
-- 平台公网地址可能可达，所以公网入口必须拒绝沙盒令牌：MCP 工具调用只由 MCP 专用应用提供（#327，已完成）；网关只在独立内部入口接受推理 grant（尚未实现，属网关仓库）。后者完成前，不用真实用户凭据运行可出网的任务。
+- 平台公网地址可能可达，所以公网入口必须拒绝沙盒令牌：MCP 工具调用只由 MCP 专用应用提供（#327，已完成）；网关只在独立的 agent 入口接受推理 grant：同一进程的第二个监听端口（`GATEWAY_AGENT_ENTRY_PORT`，网关 Compose 中为 8090），由接受连接的监听器在 ASGI scope 上标记，不依赖请求头或回环地址；网关 API（8080）一律拒绝 grant（HarvardMadSys/hybridInference#1471）。推理中继 `AGENT_TUNNEL_REMOTE_PORT` 默认指向 8090。某环境的网关上线该版本、中继切换之前，那个环境不用真实用户凭据运行可出网的任务。
 
 ## 9. 容器与 runtime 隔离
 
@@ -515,7 +515,7 @@ Publisher 不能信任沙盒声明的目标 repository、branch 或 base；必�
 
 - Docker writable layer 仍是单一持久副本；host/data-root 丢失导致 `lost`。
 - 当前没有 per-container writable-layer quota；disk-pressure admission 不能替代资源隔离。
-- 公网出口按端口放行，不检查内容，也不防外发；公网入口拒绝沙盒令牌是防止直接重放的前提，其中网关推理内部入口尚未实现（§8.4）。
+- 公网出口按端口放行，不检查内容，也不防外发；公网入口拒绝沙盒令牌是防止直接重放的前提；网关一侧见 §8.4，按环境随网关版本上线生效。
 - Shared workspace 允许同一授权域内的 sibling 相互影响文件和项目级 state。
 - 普通 Docker 共享宿主内核，只适合相应信任等级。
 - Runtime-native state format 与并发行为受精确版本影响，升级必须重新 attestation。

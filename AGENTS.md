@@ -159,8 +159,10 @@ requirement, and rules 4 and 5 remain permanent service boundaries.
   a design change, not a configuration.
 - Because sandboxes reach the public internet, the platform's public entry
   points must refuse sandbox credentials: MCP tool calls are served only on
-  the MCP-only listener, and inference grants must be accepted only on the
-  gateway's internal entry. Neither may rest on a header or on loopback.
+  the MCP-only listener, and inference grants are accepted only on the
+  gateway's agent entry, a separate listener that the gateway relay forwards
+  to (`AGENT_TUNNEL_REMOTE_PORT`, 8090). Neither may rest on a header or on
+  loopback.
 - Long-lived account and service credentials never enter the sandbox. Each
   member receives its own scoped inference and MCP credentials; sibling
   members cannot read or reuse them. Spend remains governed by the gateway's
