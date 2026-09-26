@@ -11,6 +11,7 @@ vi.mock('@/lib/api/skills', () => ({ listSkills: vi.fn() }));
 vi.mock('@/lib/api/agents', () => ({
   getAgentIntegrations: vi.fn(),
   disconnectAgentIntegration: vi.fn(),
+  disconnectGitHubAccount: vi.fn(),
 }));
 
 // The MCP section loads its own connections; mocked empty so this file stays
@@ -22,7 +23,11 @@ vi.mock('@/lib/api/mcp', () => ({
   authorizeMcpConnection: vi.fn(),
 }));
 
-import { disconnectAgentIntegration, getAgentIntegrations } from '@/lib/api/agents';
+import {
+  disconnectAgentIntegration,
+  disconnectGitHubAccount,
+  getAgentIntegrations,
+} from '@/lib/api/agents';
 import { listMcpConnections } from '@/lib/api/mcp';
 
 const mockedGetIntegrations = getAgentIntegrations as unknown as ReturnType<typeof vi.fn>;
@@ -281,6 +286,8 @@ describe('IntegrationsView', () => {
     expect(screen.queryAllByText('Admin setup required')).toHaveLength(0);
   });
 
+  // Beside Manage rather than inside it: adding a personal account or another
+  // organization happens there, and behind a menu nobody found it.
   it('offers a repository configuration link for a connected installation', async () => {
     mockedGetIntegrations.mockResolvedValue({
       providers: [
@@ -295,7 +302,6 @@ describe('IntegrationsView', () => {
     render(<IntegrationsView />);
 
     await screen.findByText('Connected as HarvardMadSys · 2 repositories');
-    fireEvent.click(screen.getByText('Manage'));
 
     expect(screen.getByRole('link', { name: 'Configure repositories' })).toHaveAttribute(
       'href',
@@ -331,6 +337,29 @@ describe('IntegrationsView', () => {
     await waitFor(() => expect(mockedDisconnect).toHaveBeenCalledWith('github', 'gh-42'));
     expect(await screen.findByRole('status')).toHaveTextContent('HarvardMadSys disconnected.');
     expect(mockedGetIntegrations).toHaveBeenCalledTimes(2);
+  });
+
+  // The user's token is kept for GitHub to be asked as them; removing
+  // installations one by one leaves it, so the whole connection has its own way out.
+  it('disconnects GitHub as a whole and shows the state the service answers', async () => {
+    mockedGetIntegrations.mockResolvedValue(integrations);
+    vi.mocked(disconnectGitHubAccount).mockResolvedValue({
+      providers: [
+        { ...integrations.providers[0], connected: false, accounts: [], repositories: [] },
+        integrations.providers[1],
+      ],
+    });
+
+    render(<IntegrationsView />);
+    await screen.findByText('Connected as HarvardMadSys · 2 repositories');
+    fireEvent.click(screen.getByText('Manage'));
+    fireEvent.click(screen.getByRole('button', { name: 'Disconnect GitHub' }));
+
+    expect(await screen.findByRole('status')).toHaveTextContent('GitHub disconnected.');
+    expect(screen.queryByText(/Connected as/)).not.toBeInTheDocument();
+    expect(mockedDisconnect).not.toHaveBeenCalled();
+    // One request: the answer is the page's state, not a reason to reload it.
+    expect(mockedGetIntegrations).toHaveBeenCalledTimes(1);
   });
 
   it('keeps a connected GitLab account manageable', async () => {

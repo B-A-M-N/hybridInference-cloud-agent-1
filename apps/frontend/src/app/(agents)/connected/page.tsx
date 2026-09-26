@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { Suspense, useEffect, useRef, useState } from 'react';
+import { takeReturnPath } from '@/components/features/agents/githubReturn';
 import { connectGitHub, connectGitLab } from '@/lib/api/agents';
 import type { AgentIntegrationProvider } from '@/lib/api/agents';
 
@@ -11,7 +12,7 @@ function ConnectedInner() {
   const params = useSearchParams();
   const connectStarted = useRef(false);
   const [error, setError] = useState<string | null>(null);
-  const [installUrl, setInstallUrl] = useState<string | null>(null);
+  const [install, setInstall] = useState<{ url: string; alreadyReaches: boolean } | null>(null);
   const providerParam = params?.get('provider');
   const provider: AgentIntegrationProvider = providerParam === 'gitlab' ? 'gitlab' : 'github';
   const providerName = provider === 'gitlab' ? 'GitLab' : 'GitHub';
@@ -43,7 +44,20 @@ function ConnectedInner() {
       if (provider === 'github') {
         const connection = await connectGitHub(authCode, authState);
         if (connection.install_url) {
-          setInstallUrl(connection.install_url);
+          // The App is not on the owner's own account yet — perhaps on no
+          // account at all. Where the owner started stays noted: installing
+          // comes back through this page.
+          setInstall({
+            url: connection.install_url,
+            alreadyReaches: connection.connections.length > 0,
+          });
+          return;
+        }
+        // Back to where the trip started — a task half written in the
+        // composer — rather than to the Integrations page every time.
+        const back = takeReturnPath();
+        if (back) {
+          router.replace(back);
           return;
         }
       } else {
@@ -74,21 +88,36 @@ function ConnectedInner() {
     );
   }
 
-  if (installUrl) {
+  if (install) {
+    // Connected already reaches an organization's repositories when that
+    // organization installed the App; the owner's own repositories need an
+    // installation of their own. Asked here because it was nowhere else: a
+    // member of such an organization used to skip this page entirely.
     return (
       <div className="flex h-full flex-col items-center justify-center gap-3">
         <h1 className="text-xl font-semibold text-gray-900 dark:text-gray-50">
-          Install the GitHub App
+          {install.alreadyReaches ? 'Use your own repositories too' : 'Install the GitHub App'}
         </h1>
         <p className="max-w-md text-center text-sm text-gray-500 dark:text-gray-400">
-          GitHub authorization succeeded, but this account has no GitHub App installation yet.
+          {install.alreadyReaches
+            ? 'GitHub is connected, and the agent can already use repositories an organization gave the App. To choose repositories from your own account, install the App there too.'
+            : 'GitHub authorization succeeded, but this account has no GitHub App installation yet. Install it on your personal account or an organization, and choose the repositories the agent may work on.'}
         </p>
-        <a
-          href={installUrl}
-          className="rounded-lg bg-crimson px-4 py-2 text-sm font-medium text-white hover:bg-crimson-dark"
-        >
-          Install GitHub App
-        </a>
+        <div className="flex items-center gap-3">
+          <a
+            href={install.url}
+            className="rounded-lg bg-crimson px-4 py-2 text-sm font-medium text-white hover:bg-crimson-dark"
+          >
+            {install.alreadyReaches ? 'Install on my account' : 'Install GitHub App'}
+          </a>
+          <button
+            type="button"
+            onClick={() => router.replace(takeReturnPath() ?? '/integrations?connected=github')}
+            className="rounded-lg px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-white/10"
+          >
+            Not now
+          </button>
+        </div>
       </div>
     );
   }

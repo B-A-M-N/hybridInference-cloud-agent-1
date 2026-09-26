@@ -1,13 +1,20 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { disconnectAgentIntegration, getAgentIntegrations } from '@/lib/api/agents';
+import {
+  disconnectAgentIntegration,
+  disconnectGitHubAccount,
+  getAgentIntegrations,
+} from '@/lib/api/agents';
 import type { AgentIntegrationProvider, AgentIntegrationProviderApi } from '@/lib/api/agents';
 import { SkillsSection } from './skills/SkillsSection';
 import { McpConnectionsSection, type McpAuthorizationResult } from './mcp/McpConnectionsSection';
 import { SOURCE_CONTROL_RECHECK_MS } from './sourceControlRecovery';
 
 const PROVIDERS: AgentIntegrationProvider[] = ['github', 'gitlab'];
+
+/** What `disconnecting` holds while the whole GitHub connection is going. */
+const GITHUB_ACCOUNT = 'github-account';
 
 /** Providers shown, but not yet offered to connect.
  *
@@ -91,10 +98,12 @@ function ProviderActions({
   integration,
   disconnecting,
   onDisconnect,
+  onDisconnectAll,
 }: {
   integration: AgentIntegrationProviderApi;
   disconnecting: string | null;
   onDisconnect: (connectionId: string, label: string) => void;
+  onDisconnectAll: () => void;
 }) {
   const copy = PROVIDER_COPY[integration.provider];
 
@@ -142,56 +151,74 @@ function ProviderActions({
   }
 
   return (
-    <details className="group relative">
-      <summary className="flex cursor-pointer list-none items-center gap-1 rounded-lg border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 px-3 py-1.5 text-sm font-medium text-gray-800 dark:text-gray-200 shadow-sm hover:bg-gray-50 dark:hover:bg-white/5 [&::-webkit-details-marker]:hidden">
-        Manage
-        <svg
-          className="h-4 w-4 transition-transform group-open:rotate-180"
-          viewBox="0 0 20 20"
-          fill="none"
-          aria-hidden="true"
+    <div className="flex items-center gap-2">
+      {/* Out of the menu. It is the one way to add repositories — installing
+          the App on a personal account or another organization — and a member
+          of an organization that already had the App never saw it: connecting
+          found that installation, so GitHub's install page was skipped. */}
+      {integration.manage_url ? (
+        <a
+          href={integration.manage_url}
+          className="inline-flex items-center gap-1 rounded-lg border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 px-3 py-1.5 text-sm font-medium text-gray-800 dark:text-gray-200 shadow-sm hover:bg-gray-50 dark:hover:bg-white/5"
         >
-          <path
-            d="m7 8 3 3 3-3"
-            stroke="currentColor"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-        </svg>
-      </summary>
-      <div className="absolute right-0 z-10 mt-1 w-56 rounded-xl border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 p-1.5 shadow-lg">
-        {integration.connect_url ? (
-          <a
-            href={integration.connect_url}
-            className="block rounded-lg px-3 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-white/5"
+          Configure repositories
+        </a>
+      ) : null}
+      <details className="group relative">
+        <summary className="flex cursor-pointer list-none items-center gap-1 rounded-lg border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 px-3 py-1.5 text-sm font-medium text-gray-800 dark:text-gray-200 shadow-sm hover:bg-gray-50 dark:hover:bg-white/5 [&::-webkit-details-marker]:hidden">
+          Manage
+          <svg
+            className="h-4 w-4 transition-transform group-open:rotate-180"
+            viewBox="0 0 20 20"
+            fill="none"
+            aria-hidden="true"
           >
-            Reauthorize {copy.name}
-          </a>
-        ) : null}
-        {integration.manage_url ? (
-          <a
-            href={integration.manage_url}
-            className="block rounded-lg px-3 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-white/5"
-          >
-            Configure repositories
-          </a>
-        ) : null}
-        {integration.accounts.map((account) => (
-          <button
-            key={account.id}
-            type="button"
-            disabled={disconnecting === account.id}
-            onClick={() => onDisconnect(account.id, account.label)}
-            className="block w-full rounded-lg px-3 py-2 text-left text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {disconnecting === account.id
-              ? `Disconnecting ${account.label}…`
-              : `Disconnect ${account.label}`}
-          </button>
-        ))}
-      </div>
-    </details>
+            <path
+              d="m7 8 3 3 3-3"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </summary>
+        <div className="absolute right-0 z-10 mt-1 w-56 rounded-xl border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 p-1.5 shadow-lg">
+          {integration.connect_url ? (
+            <a
+              href={integration.connect_url}
+              className="block rounded-lg px-3 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-white/5"
+            >
+              Reauthorize {copy.name}
+            </a>
+          ) : null}
+          {integration.accounts.map((account) => (
+            <button
+              key={account.id}
+              type="button"
+              disabled={disconnecting === account.id}
+              onClick={() => onDisconnect(account.id, account.label)}
+              className="block w-full rounded-lg px-3 py-2 text-left text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {disconnecting === account.id
+                ? `Disconnecting ${account.label}…`
+                : `Disconnect ${account.label}`}
+            </button>
+          ))}
+          {integration.provider === 'github' ? (
+            // The stored token goes only with the whole connection: removing
+            // installations one by one here leaves it behind.
+            <button
+              type="button"
+              disabled={disconnecting === GITHUB_ACCOUNT}
+              onClick={onDisconnectAll}
+              className="block w-full rounded-lg px-3 py-2 text-left text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {disconnecting === GITHUB_ACCOUNT ? 'Disconnecting GitHub…' : 'Disconnect GitHub'}
+            </button>
+          ) : null}
+        </div>
+      </details>
+    </div>
   );
 }
 
@@ -262,6 +289,24 @@ export function IntegrationsView({
     const timer = window.setInterval(() => void load({ quiet: true }), SOURCE_CONTROL_RECHECK_MS);
     return () => window.clearInterval(timer);
   }, [githubUnavailable, load]);
+
+  async function disconnectGitHub() {
+    setDisconnecting(GITHUB_ACCOUNT);
+    setError(null);
+    setNotice(null);
+    // The answer is the page's whole state; a check already on its way must
+    // not land on top of it.
+    const request = ++latestLoad.current;
+    try {
+      const response = await disconnectGitHubAccount();
+      if (request === latestLoad.current) setProviders(response.providers);
+      setNotice('GitHub disconnected.');
+    } catch (cause: unknown) {
+      setError(cause instanceof Error ? cause.message : 'Could not disconnect GitHub.');
+    } finally {
+      setDisconnecting(null);
+    }
+  }
 
   async function disconnect(
     provider: AgentIntegrationProvider,
@@ -364,6 +409,7 @@ export function IntegrationsView({
                       onDisconnect={(connectionId, label) =>
                         void disconnect(provider, connectionId, label)
                       }
+                      onDisconnectAll={() => void disconnectGitHub()}
                     />
                   )}
                 </div>

@@ -131,6 +131,21 @@ async def consume_oauth_state(
     return cipher.decrypt(encrypted_verifier)
 
 
+def github_connect_configured(app_credentials: Any, env: dict[str, str] | None = None) -> bool:
+    """Whether a user can connect their own GitHub on this deployment.
+
+    The App, its OAuth half, and an installation URL to send people to. Short
+    of all three there is nothing for a user to press, and the deployment's
+    allowlist is the only way a repository becomes available.
+    """
+    source = env if env is not None else os.environ
+    return (
+        app_credentials is not None
+        and bool((source.get("AGENT_GITHUB_APP_INSTALL_URL") or "").strip())
+        and bool(getattr(app_credentials, "user_authorization_configured", True))
+    )
+
+
 def github_authorization_url(base_url: str, *, state: str) -> str:
     """Add state to an operator-configured GitHub authorization URL safely."""
     parsed = urlparse(base_url)

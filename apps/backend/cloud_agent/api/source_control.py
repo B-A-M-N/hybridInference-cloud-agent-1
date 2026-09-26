@@ -45,6 +45,7 @@ from cloud_agent.source_control import (
     SourceControlError,
     consume_oauth_state,
     github_authorization_url,
+    github_connect_configured,
     issue_oauth_state,
 )
 from cloud_agent.source_control_runtime import (  # noqa: TC001 — FastAPI resolves them.
@@ -106,22 +107,45 @@ async def _connect_github_for_user(
         user_id=user_id,
         provider="github",
     )
-    user_token = await app_credentials.exchange_user_code(body.code)
-    installations = await app_credentials.installations_for_user(user_token)
+    tokens = await app_credentials.exchange_user_code(body.code)
+    profile = await app_credentials.user_profile(tokens.access_token)
+    installations = await app_credentials.installations_for_user(tokens.access_token)
     install_url = None
-    if not installations:
+    # Offered whenever the App is not on the user's own account — not only when
+    # it is on no account at all. A member of an organization that already had
+    # the App found that installation, skipped GitHub's install page, and never
+    # learned that their own repositories needed one: the first user to connect
+    # saw the page only because nothing was installed anywhere yet.
+    own_account_installed = any(
+        installation.get("account_id") == profile["id"] for installation in installations
+    )
+    if not own_account_installed:
         github_install_url = (os.getenv("AGENT_GITHUB_APP_INSTALL_URL") or "").strip()
         if github_install_url:
             install_state = await issue_oauth_state(
                 store.source_control, user_id=user_id, provider="github"
             )
             install_url = github_authorization_url(github_install_url, state=install_state)
-    for installation in installations:
-        await store.source_control.record_repo_grant(
-            user_id=user_id,
-            installation_id=installation["installation_id"],
-            account_login=installation.get("account_login"),
-        )
+    # The account is recorded even with no installation: the user *has*
+    # connected, and what they lack is repository access. Treating the two as
+    # one sent them back to a Connect button they had just pressed.
+    # The token is kept — encrypted, in this service only — because which
+    # repositories the user may work on is asked of GitHub as them, long after
+    # this request: the publisher and the goal controller check again.
+    cipher = app_credentials.cipher
+    await store.source_control.connect_github_account(
+        user_id=user_id,
+        github_user_id=profile["id"],
+        login=profile["login"],
+        installations=installations,
+        access_token_ciphertext=cipher.encrypt(tokens.access_token),
+        access_expires_at=tokens.access_expires_at,
+        refresh_token_ciphertext=(
+            cipher.encrypt(tokens.refresh_token) if tokens.refresh_token else None
+        ),
+        refresh_expires_at=tokens.refresh_expires_at,
+    )
+    app_credentials.forget_user(user_id)
     logger.info(
         "agent_github_connected",
         extra={"event": "agent_github_connected", "installations": len(installations)},
@@ -152,11 +176,7 @@ async def _source_control_providers(
     their records: an outage must not look like a lost connection.
     """
     github_install_url = (os.getenv("AGENT_GITHUB_APP_INSTALL_URL") or "").strip()
-    github_configured = (
-        app_credentials is not None
-        and bool(github_install_url)
-        and bool(getattr(app_credentials, "user_authorization_configured", True))
-    )
+    github_configured = github_connect_configured(app_credentials)
     github_connect_url = None
     github_error = None
     if github_configured and app_credentials is not None:
@@ -170,6 +190,13 @@ async def _source_control_providers(
             github_error = str(exc)
 
     grants = await store.source_control.list_repo_grants(user_id=user_id)
+    github_account = await store.source_control.get_github_account(user_id=user_id)
+    # Connected is a connection GitHub can still be asked about as the user:
+    # one made before users' tokens were kept, or whose token GitHub refused,
+    # reads as not connected, and its Connect button is the way back. Whether
+    # any repository came with it is a separate question, answered by
+    # ``repositories``.
+    github_connected = bool(github_account and github_account.get("access_token_ciphertext"))
     # The install URL is the wrong way to *start* a connection — GitHub sends
     # an already-installed App there straight to its settings page instead of
     # through the callback — but that settings page is the only route to
@@ -179,7 +206,7 @@ async def _source_control_providers(
     # back through the same callback, and it is issued separately from the
     # connect state so that following one link cannot invalidate the other.
     github_manage_url = None
-    if github_configured and grants:
+    if github_configured and github_connected:
         try:
             manage_state = await issue_oauth_state(
                 store.source_control, user_id=user_id, provider="github"
@@ -204,7 +231,7 @@ async def _source_control_providers(
         SourceControlProviderResponse(
             provider="github",
             configured=github_configured,
-            connected=bool(grants),
+            connected=github_connected,
             connect_url=github_connect_url,
             manage_url=github_manage_url,
             capabilities=["Agent checkout", "branch discovery", "draft PR publishing"],
@@ -486,11 +513,55 @@ async def disconnect_github_integration(
     await job_store.source_control.revoke_repo_grant(
         user_id=user["user_id"], installation_id=installation_id
     )
+    if github.credentials is not None:
+        github.credentials.forget_user(user["user_id"])
     return GitHubConnectionResponse(
         connections=await job_store.source_control.list_repo_grants(user_id=user["user_id"]),
         repos=await repos_for_user(
             user["user_id"], store=job_store.source_control, app_credentials=github.credentials
         ),
+    )
+
+
+@router.delete("/integrations/github", response_model=SourceControlIntegrationsResponse)
+async def disconnect_github_account(
+    user: dict[str, Any] = Depends(require_agent_owner),
+    store: _SourceControlStorage | None = Depends(get_storage),
+    github: GitHubAppState = Depends(get_github_app_state),
+    gitlab_oauth: Any | None = Depends(get_agent_gitlab_oauth),
+    gitlab_load_status: LoadStatus = Depends(get_gitlab_load_status),
+) -> SourceControlIntegrationsResponse:
+    """Forget this user's GitHub connection: the account, its token, every grant.
+
+    The stored token is why this exists: removing installations one by one
+    leaves it behind. GitHub is also asked to withdraw the App's authorization,
+    best effort — the local rows go whether or not it answers. Works while the
+    App is unavailable: these are this service's own rows.
+    """
+    job_store = _require_store(store)
+    account = await job_store.source_control.get_github_account(user_id=user["user_id"])
+    credentials = github.credentials
+    if credentials is not None and account and account.get("access_token_ciphertext"):
+        try:
+            await credentials.revoke_user_authorization(
+                credentials.cipher.decrypt(account["access_token_ciphertext"])
+            )
+        except Exception:
+            logger.warning("agent_github_revoke_failed", exc_info=True)
+    await job_store.source_control.disconnect_github_account(user_id=user["user_id"])
+    if credentials is not None:
+        credentials.forget_user(user["user_id"])
+    logger.info("agent_github_disconnected", extra={"event": "agent_github_disconnected"})
+    return SourceControlIntegrationsResponse(
+        providers=await _source_control_providers(
+            user_id=user["user_id"],
+            store=job_store,
+            app_credentials=credentials,
+            gitlab_oauth=gitlab_oauth,
+            github_load_status=github.load_status,
+            gitlab_load_status=gitlab_load_status,
+        ),
+        mcp=await _mcp_integrations(user_id=user["user_id"], store=job_store),
     )
 
 
@@ -548,6 +619,8 @@ async def disconnect_github(
     await job_store.source_control.revoke_repo_grant(
         user_id=user["user_id"], installation_id=installation_id
     )
+    if github.credentials is not None:
+        github.credentials.forget_user(user["user_id"])
     return GitHubConnectionResponse(
         connections=await job_store.source_control.list_repo_grants(user_id=user["user_id"]),
         repos=await repos_for_user(

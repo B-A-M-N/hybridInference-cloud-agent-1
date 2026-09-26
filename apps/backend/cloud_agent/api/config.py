@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Protocol
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 
 from cloud_agent.api._owner_auth import require_agent_owner
 from cloud_agent.api.deps import (
@@ -23,6 +23,7 @@ from cloud_agent.entitlement import repos_for_user
 from cloud_agent.logging_utils import get_logger
 from cloud_agent.mcp.registry import resolve_connection
 from cloud_agent.schemas import AgentConfigResponse, McpConnectionSummary
+from cloud_agent.source_control import github_connect_configured
 from cloud_agent.source_control_runtime import GitHubAppState  # noqa: TC001 — FastAPI resolves it.
 from cloud_agent.visible_models import agent_model_reasoning_efforts, agent_visible_models
 from cloud_agent_host.runtimes import (
@@ -64,6 +65,13 @@ def _require_store(store: _ConfigStorage | None) -> _ConfigStorage:
 
 @router.get("/config", response_model=AgentConfigResponse)
 async def get_agent_config(
+    fresh: bool = Query(
+        False,
+        description=(
+            "Ask GitHub again for this user's repositories instead of reusing the "
+            "last minute's answer — for a repository just given to the App."
+        ),
+    ),
     user: dict[str, Any] = Depends(require_agent_owner),
     store: _ConfigStorage | None = Depends(get_storage),
     github: GitHubAppState = Depends(get_github_app_state),
@@ -79,6 +87,8 @@ async def get_agent_config(
     Answers while the GitHub App is unavailable — the models, runtimes and MCP
     connections are all still true — and says so in ``github_load_status``.
     """
+    if fresh and github.credentials is not None:
+        github.credentials.forget_user(user["user_id"])
     # This user's repositories, not the deployment's: what the picker offers
     # has to be what the create endpoint will accept for *them*.
     repos = await repos_for_user(
@@ -86,6 +96,30 @@ async def get_agent_config(
         store=None if store is None else store.source_control,
         app_credentials=github.credentials,
     )
+    github_account = None
+    if store is not None:
+        github_account = await store.source_control.get_github_account(user_id=user["user_id"])
+    if github.load_status == "unavailable":
+        # The create endpoint answers 503 until the App is back, so a form that
+        # looked ready would only fail on submit — whatever else is true.
+        github_connected = False
+    elif github_connect_configured(github.credentials):
+        # Where users can connect their own GitHub, connecting comes first —
+        # an operator-allowlisted repository does not stand in for it. It used
+        # to: "connected" was computed as "has any repository", so the
+        # allowlist let a user skip connecting, and a user who had connected
+        # but whose installations covered no repository was asked to connect
+        # again. Repository access is its own state: ``repos`` is empty.
+        #
+        # And a connection is one GitHub can still be asked about as the user:
+        # one from before users' tokens were kept, or whose token GitHub has
+        # refused, has to be made again — the composer's Connect does it.
+        github_connected = bool(github_account and github_account.get("access_token_ciphertext"))
+    else:
+        # Nothing to connect to: the allowlist is the whole entitlement, and an
+        # allowlisted public repository runs without a GitHub App at all (the
+        # runner clones it anonymously).
+        github_connected = bool(repos)
     return AgentConfigResponse(
         repos=repos,
         runtimes=registered_runtimes(),
@@ -112,20 +146,7 @@ async def get_agent_config(
             )
         ],
         mcp_runtimes=runtimes_supporting_mcp(),
-        # Both halves, and read from what is actually wired rather than from
-        # the environment: an App the platform can mint tokens from, and at
-        # least one repository this user may work on. Either alone leaves a
-        # composer that cannot produce a runnable job.
-        # The historical field name is narrower than its meaning in the UI:
-        # it gates whether the composer can create a runnable job. An
-        # operator-allowlisted public repository is runnable without a GitHub
-        # App (the runner clones it anonymously), so requiring App credentials
-        # here made the API accept the job while the browser disabled the form.
-        #
-        # False while the App is unavailable, whatever the allowlist offers: the
-        # create endpoint answers 503 until it is back, so a form that looked
-        # ready would only fail on submit.
-        github_connected=bool(repos) and github.load_status != "unavailable",
+        github_connected=github_connected,
         # OAuth must start on the authenticated integrations page so the
         # server can issue state bound to this user. Never expose the old raw
         # operator URL here: it had no CSRF binding.

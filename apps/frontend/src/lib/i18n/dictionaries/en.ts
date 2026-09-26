@@ -280,6 +280,17 @@ export const en = {
   'composer.placeholderDisconnected': 'Connect GitHub to describe a task',
   'composer.connectToRun': 'Connect GitHub to select a repository and run',
   'composer.repository': 'Repository',
+  'composer.repositoryPlaceholder': 'Select repository',
+  'composer.repositorySearch': 'Search repositories…',
+  'composer.repositoryEmpty': 'No repositories yet.',
+  'composer.repositoryNoMatch': 'Nothing matches “{query}”.',
+  'composer.repositoryMissing': 'A repository appears here once the GitHub App has access to it.',
+  'composer.repositoryConfigure': 'Configure repository access',
+  'composer.repositoryRefresh': 'Refresh',
+  'composer.repositoryRefreshing': 'Refreshing…',
+  'composer.repositoryUnavailable':
+    '{repo} is not available to you. Choose another repository, or configure repository access.',
+  'composer.chooseRepository': 'Choose a repository first',
   'composer.branch': 'Branch',
   'composer.agent': 'Agent',
   'composer.model': 'Model',
@@ -419,6 +430,11 @@ export const en = {
   'connect.action': 'Connect GitHub',
   'connect.actionUnavailable': 'View integrations',
   'connect.titleTemporarilyUnavailable': 'GitHub is temporarily unavailable',
+  'connect.titleRepositories': 'Give the GitHub App access to a repository',
+  'connect.bodyRepositories':
+    'GitHub is connected. Choose which repositories — your own or an organization’s — the agent may work on.',
+  'connect.actionRepositories': 'Configure repository access',
+  'connect.leaving': 'Opening GitHub…',
   'connect.bodyTemporarilyUnavailable':
     'Repository access will come back on its own. Try again in a minute.',
 

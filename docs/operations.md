@@ -209,19 +209,61 @@ closed: with neither, no job can be created at all.
 
 **A connection the user made.** They authorize the GitHub App, GitHub returns a
 code to `<frontend>/agents/connected`, and the platform exchanges it for a
-token that speaks _as that user_ to ask which installations they can reach.
-Those installation ids are recorded against the user, and the repositories they
-cover are what the composer offers. Every step is GitHub's answer rather than
-the requester's — which is the point, because the requester chooses the
-repository and the _platform_ mints the credential for it. Anything the
-requester could simply assert would be a confused deputy.
+token that speaks _as that user_ to ask who they are and which installations
+they can reach. The GitHub account is recorded in `agent_github_accounts`, and
+the user's installation grants in `agent_repo_grants` are made exactly the
+installations GitHub reported: a reconnect drops one the user can no longer
+reach. Every step is GitHub's answer rather than the requester's — which is
+the point, because the requester chooses the repository and the _platform_
+mints the credential for it. Anything the requester could simply assert would
+be a confused deputy.
+
+What the composer offers, and every entitlement check after it (job creation,
+claim, workspace reads, publishing), is asked of GitHub **as the user**: for
+each installation they connected, `/user/installations/{id}/repositories`
+with their token, keeping the repositories they can **push** to. It used to be
+every repository the installation covered, read with the installation's own
+token — and GitHub reports an organization's installation to anyone with access
+to one of its repositories, so an outside collaborator on one repository was
+offered the rest. Push is the bar because the agent's work ends as a branch
+pushed and a pull request opened. The answer is reused for a minute per user,
+so workspace reads stay off GitHub.
+
+That needs the user's token after the connect flow ends, so it is kept in
+`agent_github_accounts`, encrypted with `AGENT_SOURCE_CONTROL_ENCRYPTION_KEY`
+like a GitLab connection's, and never leaves the control plane. An App that
+expires user tokens (eight hours, with a six-month single-use refresh token) is
+renewed five minutes early under a lease on the row, so two callers never spend
+the same refresh token. A connection with no stored token — one made before
+tokens were kept, or one whose authorization GitHub has refused — grants
+nothing: the composer shows **Connect GitHub**, and the refusal says to
+reconnect. Connecting again is one click; GitHub skips the consent screen for
+an authorization it already has.
+
+Connecting and having repository access are separate states. Whenever the App
+is not installed on the user's own GitHub account — even if an organization's
+installation already reached them — connecting ends by offering to install it
+there, through GitHub's installation page, which asks which account and which
+repositories; the user may install or choose **Not now**. The offer used to be
+made only when no installation was found at all, so a member of an organization
+that already had the App never saw it and could only use that organization's
+repositories. A user connected with no repositories is sent to that page rather
+than asked to connect again.
+**Configure repositories** on the Integrations page, and **Configure repository
+access** in the composer, go to the same page.
 
 **The deployment allowlist** (`AGENT_REPO_ALLOWLIST`), for the single-tenant
 dogfood where the repository is the operator's own and there is no user to
-connect.
+connect. Where users _can_ connect — the App's OAuth half and
+`AGENT_GITHUB_APP_INSTALL_URL` are both configured — the composer asks them to
+connect before choosing any repository, allowlisted ones included. The create
+endpoint still honours the allowlist; it is the composer that no longer lets it
+stand in for connecting.
 
-Disconnecting removes the platform's half. Uninstalling the App on GitHub is
-the other half, and is what actually revokes the platform's reach.
+**Disconnect GitHub** (the Integrations page's Manage menu) forgets the
+account, its stored token and every installation grant, and asks GitHub to
+withdraw the App's authorization. Uninstalling the App on GitHub is the other
+half, and is what actually revokes the platform's reach.
 
 ## Reading a task's recorded events
 

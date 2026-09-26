@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { StrictMode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import AgentsConnectedPage from './page';
@@ -24,6 +24,7 @@ const mockedConnectGitLab = connectGitLab as unknown as ReturnType<typeof vi.fn>
 
 describe('AgentsConnectedPage', () => {
   beforeEach(() => {
+    sessionStorage.clear();
     navigation.search = '';
     navigation.replace.mockReset();
     mockedConnectGitHub.mockReset();
@@ -88,6 +89,96 @@ describe('AgentsConnectedPage', () => {
       'https://github.com/apps/freeinference/installations/new?state=fresh-state',
     );
     expect(navigation.replace).not.toHaveBeenCalled();
+  });
+
+  it('goes back to the task the owner left for GitHub, once', async () => {
+    sessionStorage.setItem(
+      'agents.github.return',
+      JSON.stringify({ value: '/?repo=owner%2Frepository', savedAt: Date.now() }),
+    );
+    navigation.search = 'provider=github&code=github-code&state=signed-state';
+    mockedConnectGitHub.mockResolvedValue({ connections: [{}], repos: [], install_url: null });
+
+    render(<AgentsConnectedPage />);
+
+    await waitFor(() =>
+      expect(navigation.replace).toHaveBeenCalledWith('/?repo=owner%2Frepository'),
+    );
+    expect(sessionStorage.getItem('agents.github.return')).toBeNull();
+  });
+
+  it('never follows a return path that leaves the app', async () => {
+    sessionStorage.setItem(
+      'agents.github.return',
+      JSON.stringify({ value: '//evil.example/steal', savedAt: Date.now() }),
+    );
+    navigation.search = 'provider=github&code=github-code&state=signed-state';
+    mockedConnectGitHub.mockResolvedValue({ connections: [{}], repos: [], install_url: null });
+
+    render(<AgentsConnectedPage />);
+
+    await waitFor(() =>
+      expect(navigation.replace).toHaveBeenCalledWith('/integrations?connected=github'),
+    );
+  });
+
+  it('keeps the way back while the App still has to be installed', async () => {
+    sessionStorage.setItem(
+      'agents.github.return',
+      JSON.stringify({ value: '/', savedAt: Date.now() }),
+    );
+    navigation.search = 'provider=github&code=github-code&state=signed-state';
+    mockedConnectGitHub.mockResolvedValue({
+      connections: [],
+      repos: [],
+      install_url: 'https://github.com/apps/freeinference/installations/new?state=fresh-state',
+    });
+
+    render(<AgentsConnectedPage />);
+
+    expect(await screen.findByRole('link', { name: 'Install GitHub App' })).toBeInTheDocument();
+    // Installing comes back through this page, which then returns to the task.
+    expect(sessionStorage.getItem('agents.github.return')).not.toBeNull();
+  });
+
+  it('asks to install on the owner’s own account when only an organization has the App', async () => {
+    sessionStorage.setItem(
+      'agents.github.return',
+      JSON.stringify({ value: '/?repo=acme%2Fservice', savedAt: Date.now() }),
+    );
+    navigation.search = 'provider=github&code=github-code&state=signed-state';
+    mockedConnectGitHub.mockResolvedValue({
+      connections: [{ installation_id: 77, account_login: 'acme' }],
+      repos: ['acme/service'],
+      install_url: 'https://github.com/apps/freeinference/installations/new?state=own',
+    });
+
+    render(<AgentsConnectedPage />);
+
+    expect(await screen.findByText('Use your own repositories too')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Install on my account' })).toHaveAttribute(
+      'href',
+      'https://github.com/apps/freeinference/installations/new?state=own',
+    );
+    expect(navigation.replace).not.toHaveBeenCalled();
+
+    // Not now is a real answer: back to where the owner came from, connected.
+    fireEvent.click(screen.getByRole('button', { name: 'Not now' }));
+    expect(navigation.replace).toHaveBeenCalledWith('/?repo=acme%2Fservice');
+  });
+
+  it('lets the owner skip installing, back to Integrations when they came from there', async () => {
+    navigation.search = 'provider=github&code=github-code&state=signed-state';
+    mockedConnectGitHub.mockResolvedValue({
+      connections: [],
+      repos: [],
+      install_url: 'https://github.com/apps/freeinference/installations/new?state=fresh-state',
+    });
+
+    render(<AgentsConnectedPage />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Not now' }));
+    expect(navigation.replace).toHaveBeenCalledWith('/integrations?connected=github');
   });
 
   it('does not exchange a code without connection state', async () => {

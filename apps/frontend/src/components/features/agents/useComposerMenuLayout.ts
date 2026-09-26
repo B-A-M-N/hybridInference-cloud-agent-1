@@ -26,7 +26,10 @@ export function useComposerMenuLayout(open: boolean, panel: RefObject<HTMLDivEle
       const bounds = anchor!.getBoundingClientRect();
       const above = bounds.top - top - 8;
       const below = bottom - bounds.bottom - 8;
-      const placeBelow = above < 120 && below > above;
+      // Below when there is more room there and the panel would not fit
+      // above. A composer near the top of the page left a tall panel, such as
+      // the repository list, three rows of space above it.
+      const placeBelow = (above < 120 || wantedHeight(panel.current) > above) && below > above;
       const maxHeight = Math.max(0, Math.floor(placeBelow ? below : above));
       setStyle({
         maxHeight,
@@ -47,4 +50,17 @@ export function useComposerMenuLayout(open: boolean, panel: RefObject<HTMLDivEle
     };
   }, [open, panel]);
   return style;
+}
+
+/**
+ * The height a panel would take unconstrained. What a scrolling child hides is
+ * counted too: that list is the part a short space squeezes.
+ */
+function wantedHeight(panel: HTMLElement | null): number {
+  if (!panel) return 0;
+  let height = panel.scrollHeight;
+  for (const child of Array.from(panel.children)) {
+    height += Math.max(0, child.scrollHeight - child.clientHeight);
+  }
+  return height;
 }

@@ -61,6 +61,7 @@ async def pool():
     async def _clear() -> None:
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM agent_repo_grants")
+            await conn.execute("DELETE FROM agent_github_accounts")
             await conn.execute("DELETE FROM agent_oauth_states")
             await conn.execute("DELETE FROM agent_gitlab_connections")
 
@@ -92,6 +93,234 @@ async def _connect_gitlab(
         refresh_token_ciphertext="rt",
         expires_at=datetime.now(UTC) + timedelta(hours=1),
     )
+
+
+# ── The GitHub account ────────────────────────────────────────────────
+
+
+async def _connect_github(
+    store: PostgresSourceControlRepository,
+    *,
+    user_id: str = _OWNER,
+    login: str = "octocat",
+    installations: tuple[tuple[int, str | None], ...] = (),
+) -> None:
+    """Record a GitHub connection the way the OAuth callback will."""
+    await store.connect_github_account(
+        user_id=user_id,
+        github_user_id=583231,
+        login=login,
+        installations=[
+            {"installation_id": installation_id, "account_login": account}
+            for installation_id, account in installations
+        ],
+    )
+
+
+async def test_a_github_account_is_recorded_with_no_installation(
+    store: PostgresSourceControlRepository,
+) -> None:
+    """Connecting and having repository access are separate states."""
+    await _connect_github(store)
+
+    account = await store.get_github_account(user_id=_OWNER)
+    assert account is not None
+    assert (account["github_user_id"], account["login"]) == (583231, "octocat")
+    assert await store.list_repo_grants(user_id=_OWNER) == []
+    assert await store.get_github_account(user_id=_OTHER) is None
+
+
+async def test_connecting_makes_the_grants_exactly_what_github_reported(
+    store: PostgresSourceControlRepository,
+) -> None:
+    """A reconnect drops an installation the user lost, keeps and relabels the rest."""
+    await _connect_github(store, installations=((7, "acme"), (8, "octocat")))
+    await _connect_github(store, installations=((8, "octocat-renamed"), (9, "neworg")))
+
+    assert await store.list_repo_grants(user_id=_OWNER) == [
+        {"installation_id": 8, "account_login": "octocat-renamed"},
+        {"installation_id": 9, "account_login": "neworg"},
+    ]
+
+
+async def test_connecting_leaves_another_users_grants_and_account_alone(
+    store: PostgresSourceControlRepository,
+) -> None:
+    """The replacement is scoped by user: one person reconnecting revokes nobody else."""
+    await _connect_github(store, user_id=_OTHER, login="other", installations=((7, "acme"),))
+    await _connect_github(store, installations=((8, "octocat"),))
+
+    assert await store.list_repo_grants(user_id=_OTHER) == [
+        {"installation_id": 7, "account_login": "acme"}
+    ]
+    other = await store.get_github_account(user_id=_OTHER)
+    assert other is not None and other["login"] == "other"
+
+
+async def test_reconnecting_as_another_github_account_replaces_it(
+    store: PostgresSourceControlRepository,
+) -> None:
+    """One account per user; the old account's installations go with it."""
+    await _connect_github(store, login="octocat", installations=((7, "octocat"),))
+    await _connect_github(store, login="hubot", installations=((9, "hubot"),))
+
+    account = await store.get_github_account(user_id=_OWNER)
+    assert account is not None and account["login"] == "hubot"
+    assert await store.list_repo_grants(user_id=_OWNER) == [
+        {"installation_id": 9, "account_login": "hubot"}
+    ]
+
+
+# ── The user's GitHub token ───────────────────────────────────────────
+
+
+async def _connect_with_token(
+    store: PostgresSourceControlRepository,
+    *,
+    user_id: str = _OWNER,
+    access: str = "ct-access",
+    expires_in: timedelta = timedelta(minutes=2),
+) -> None:
+    await store.connect_github_account(
+        user_id=user_id,
+        github_user_id=583231,
+        login="octocat",
+        installations=[{"installation_id": 7, "account_login": "acme"}],
+        access_token_ciphertext=access,
+        access_expires_at=datetime.now(UTC) + expires_in,
+        refresh_token_ciphertext="ct-refresh",
+        refresh_expires_at=datetime.now(UTC) + timedelta(days=180),
+    )
+
+
+async def test_one_caller_at_a_time_holds_the_refresh_lease(pool, store) -> None:
+    """A single-use refresh token must be spent by exactly one caller."""
+    await _connect_with_token(store)
+
+    first = await store.claim_github_token_refresh(
+        user_id=_OWNER, lease_seconds=30, margin_seconds=300
+    )
+    second = await store.claim_github_token_refresh(
+        user_id=_OWNER, lease_seconds=30, margin_seconds=300
+    )
+
+    assert first is not None and first["refresh_token_ciphertext"] == "ct-refresh"
+    assert second is None
+    # A holder that died leaves a lease, not a lock.
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_github_accounts SET refresh_lease_expires_at = NOW() - INTERVAL '1 second'"
+        )
+    third = await store.claim_github_token_refresh(
+        user_id=_OWNER, lease_seconds=30, margin_seconds=300
+    )
+    assert third is not None and third["refresh_generation"] > first["refresh_generation"]
+
+
+async def test_a_token_that_does_not_need_it_is_not_claimed(store) -> None:
+    await _connect_with_token(store, expires_in=timedelta(hours=8))
+
+    assert (
+        await store.claim_github_token_refresh(user_id=_OWNER, lease_seconds=30, margin_seconds=300)
+        is None
+    )
+
+
+async def test_only_the_lease_holder_writes_the_renewed_pair(store) -> None:
+    """A superseded refresher cannot overwrite what its successor wrote."""
+    await _connect_with_token(store)
+    claim = await store.claim_github_token_refresh(
+        user_id=_OWNER, lease_seconds=30, margin_seconds=300
+    )
+    assert claim is not None
+
+    stale = await store.store_github_tokens(
+        user_id=_OWNER,
+        refresh_generation=claim["refresh_generation"] - 1,
+        access_token_ciphertext="ct-stale",
+        access_expires_at=datetime.now(UTC) + timedelta(hours=8),
+        refresh_token_ciphertext="ct-stale-refresh",
+        refresh_expires_at=None,
+    )
+    fresh = await store.store_github_tokens(
+        user_id=_OWNER,
+        refresh_generation=claim["refresh_generation"],
+        access_token_ciphertext="ct-fresh",
+        access_expires_at=datetime.now(UTC) + timedelta(hours=8),
+        refresh_token_ciphertext="ct-fresh-refresh",
+        refresh_expires_at=None,
+    )
+
+    account = await store.get_github_account(user_id=_OWNER)
+    assert (stale, fresh) == (False, True)
+    assert account is not None
+    assert (account["access_token_ciphertext"], account["refresh_token_ciphertext"]) == (
+        "ct-fresh",
+        "ct-fresh-refresh",
+    )
+    assert account["refresh_lease_expires_at"] is None
+
+
+async def test_a_reconnect_takes_the_lease_from_a_refresh_in_flight(store) -> None:
+    """The new pair from connecting again is not overwritten by the old one's renewal."""
+    await _connect_with_token(store)
+    claim = await store.claim_github_token_refresh(
+        user_id=_OWNER, lease_seconds=30, margin_seconds=300
+    )
+    assert claim is not None
+    await _connect_with_token(store, access="ct-reconnected", expires_in=timedelta(hours=8))
+
+    wrote = await store.store_github_tokens(
+        user_id=_OWNER,
+        refresh_generation=claim["refresh_generation"],
+        access_token_ciphertext="ct-renewed-old",
+        access_expires_at=datetime.now(UTC) + timedelta(hours=8),
+        refresh_token_ciphertext=None,
+        refresh_expires_at=None,
+    )
+
+    account = await store.get_github_account(user_id=_OWNER)
+    assert wrote is False
+    assert account is not None and account["access_token_ciphertext"] == "ct-reconnected"
+
+
+async def test_forgetting_a_refused_token_spares_a_newer_one_and_other_users(store) -> None:
+    await _connect_with_token(store, access="ct-refused")
+    await _connect_with_token(store, user_id=_OTHER, access="ct-refused")
+
+    await _connect_with_token(store, access="ct-newer")
+    assert (
+        await store.clear_github_tokens(user_id=_OWNER, access_token_ciphertext="ct-refused")
+        is False
+    )
+    assert (
+        await store.clear_github_tokens(user_id=_OTHER, access_token_ciphertext="ct-refused")
+        is True
+    )
+
+    mine = await store.get_github_account(user_id=_OWNER)
+    theirs = await store.get_github_account(user_id=_OTHER)
+    assert mine is not None and mine["access_token_ciphertext"] == "ct-newer"
+    assert theirs is not None
+    assert (theirs["access_token_ciphertext"], theirs["refresh_token_ciphertext"]) == (None, None)
+    # The account and its grants stay: connecting again is how the token returns.
+    assert await store.list_repo_grants(user_id=_OTHER) == [
+        {"installation_id": 7, "account_login": "acme"}
+    ]
+
+
+async def test_disconnecting_github_removes_only_this_users_connection(store) -> None:
+    await _connect_with_token(store)
+    await _connect_with_token(store, user_id=_OTHER)
+
+    await store.disconnect_github_account(user_id=_OWNER)
+
+    assert await store.get_github_account(user_id=_OWNER) is None
+    assert await store.list_repo_grants(user_id=_OWNER) == []
+    assert await store.get_github_account(user_id=_OTHER) is not None
+    assert await store.list_repo_grants(user_id=_OTHER) == [
+        {"installation_id": 7, "account_login": "acme"}
+    ]
 
 
 # ── Repository grants ─────────────────────────────────────────────────
