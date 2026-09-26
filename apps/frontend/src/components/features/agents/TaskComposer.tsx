@@ -10,6 +10,7 @@ import { SOURCE_CONTROL_RECHECK_MS } from './sourceControlRecovery';
 import { highestEffort, offeredEfforts } from './effort';
 import { useT } from '@/components/providers';
 import { Picker } from './Picker';
+import { RepositoryPicker } from './RepositoryPicker';
 import { ComposerPlusMenu } from './ComposerPlusMenu';
 import { ComposerCommandMenu } from './ComposerCommandMenu';
 import { composerCommandMatches } from './composerCommands';
@@ -52,7 +53,17 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
   const taskBox = useRef<HTMLTextAreaElement>(null);
   const [config, setConfig] = useState<AgentConfigApi | null>(null);
   const [models, setModels] = useState<string[]>([]);
+  // Empty until the owner picks one. A task changes a real repository, so
+  // where it runs is never a default — see RepositoryPicker.
   const [repo, setRepo] = useState('');
+  const [repoPickerOpen, setRepoPickerOpen] = useState(false);
+  // Enter with no repository opens the picker; the choice then hands the caret
+  // back to the task, so a second Enter sends it.
+  const [repoPickerFromTask, setRepoPickerFromTask] = useState(false);
+  // A repository asked for by the link that opened this page, which this
+  // account cannot use. Said out loud rather than swapped for another one.
+  const [unavailableRepo, setUnavailableRepo] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const [branches, setBranches] = useState<string[]>([]);
   const [branch, setBranch] = useState('');
   const [runtime, setRuntime] = useState('');
@@ -78,20 +89,41 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
   const tRef = useRef(t);
   tRef.current = t;
 
-  const applyConfig = useCallback(
-    (cfg: AgentConfigApi) => {
-      // The config's model list is the create endpoint's own predicate;
-      // /v1/models answers for the browsing user and offered models whose
-      // first agent call then 404ed.
-      const modelIds = cfg.models ?? [];
-      setConfig(cfg);
-      setModels(modelIds);
-      setRepo(initialRepo && cfg.repos.includes(initialRepo) ? initialRepo : (cfg.repos[0] ?? ''));
-      setRuntime(cfg.runtimes[0] ?? '');
-      setModel(modelIds[0] ?? '');
-    },
-    [initialRepo],
-  );
+  const applyConfig = useCallback((cfg: AgentConfigApi) => {
+    // The config's model list is the create endpoint's own predicate;
+    // /v1/models answers for the browsing user and offered models whose
+    // first agent call then 404ed.
+    const modelIds = cfg.models ?? [];
+    setConfig(cfg);
+    setModels(modelIds);
+    // A re-read keeps every choice still on offer and drops only the ones that
+    // are not. The repository is never filled in: see the effect below.
+    setRepo((current) => (current && cfg.repos.includes(current) ? current : ''));
+    setRuntime((current) =>
+      current && cfg.runtimes.includes(current) ? current : (cfg.runtimes[0] ?? ''),
+    );
+    setModel((current) => (current && modelIds.includes(current) ? current : (modelIds[0] ?? '')));
+  }, []);
+
+  // The one place a repository is chosen for the owner: they opened the page
+  // from a project's "New task in …", which is them choosing it. Applied when
+  // the request changes rather than on every config read, so refreshing the
+  // list cannot overwrite a choice made since — and plain "New task" clears
+  // whatever the last project link chose. An unavailable request is reported
+  // and leaves the choice empty. It used to fall back to the first repository
+  // in the list: a task for one repository, silently sent to another.
+  //
+  // Not while GitHub is disconnected or down: the list is empty then for a
+  // reason that has nothing to do with the request, which is kept for when
+  // the repositories come back.
+  const appliedRequest = useRef<string | null>(null);
+  useEffect(() => {
+    if (!config?.github_connected || appliedRequest.current === (initialRepo ?? '')) return;
+    appliedRequest.current = initialRepo ?? '';
+    const available = Boolean(initialRepo && config.repos.includes(initialRepo));
+    setRepo(available ? initialRepo! : '');
+    setUnavailableRepo(initialRepo && !available ? initialRepo : null);
+  }, [config, initialRepo]);
 
   useEffect(() => {
     let cancelled = false;
@@ -149,8 +181,12 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
     if (!efforts.includes(effort)) setEffort(highestEffort(efforts));
   }, [config, efforts, effort]);
 
-  // Branches follow the selected repository, so they reload when it changes.
+  // Branches follow the selected repository, so they reload when it changes —
+  // and are dropped at once, so the previous repository's branch can never be
+  // sent with this one while the new list is on its way.
   useEffect(() => {
+    setBranches([]);
+    setBranch('');
     if (!repo || !config?.github_connected) return undefined;
     let cancelled = false;
     listRepoBranches(repo)
@@ -183,6 +219,7 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
 
   const disconnected = config?.github_connected === false;
   const busy = submitting || goalCommand.busy;
+  const missingRepository = config?.github_connected === true && !repo;
   const canRun =
     config?.github_connected === true &&
     task.trim().length > 0 &&
@@ -191,6 +228,38 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
     // without the attachment the user can see on screen.
     !attachments.uploading &&
     Boolean(repo && runtime && model);
+
+  function openRepositoryPicker(fromTask: boolean) {
+    setRepoPickerFromTask(fromTask);
+    setRepoPickerOpen(true);
+  }
+
+  function chooseRepository(next: string) {
+    setRepo(next);
+    setUnavailableRepo(null);
+  }
+
+  /**
+   * Read the repository list again, for a repository just given to the App.
+   * GitHub is the one that changed, so this is a re-read and nothing more:
+   * every choice still on offer survives it.
+   */
+  async function refreshRepositories() {
+    setRefreshing(true);
+    try {
+      const cfg = await getAgentConfig();
+      applyConfig(cfg);
+      // The repository the link asked for may be the one that just arrived.
+      if (unavailableRepo && cfg.repos.includes(unavailableRepo)) {
+        setRepo(unavailableRepo);
+        setUnavailableRepo(null);
+      }
+    } catch (cause: unknown) {
+      setError(cause instanceof Error ? cause.message : t('composer.loadConfigFailed'));
+    } finally {
+      setRefreshing(false);
+    }
+  }
 
   /**
    * The plus menu's Goal row: put `/goal ` in the box and leave the caret after
@@ -274,7 +343,12 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
   }
 
   async function run() {
-    if (!canRun) return;
+    if (!canRun) {
+      // The one thing missing is where to run it: ask, rather than ignore the
+      // key. Nothing is sent until a repository has actually been chosen.
+      if (missingRepository && task.trim() && !busy) openRepositoryPicker(true);
+      return;
+    }
     // A command is not a message. It runs the thing it names and, when that
     // succeeds, leaves nothing in the box to send to the model.
     if (await goalCommand.submit()) return;
@@ -430,11 +504,18 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
                 mcpBlockedReason={mcpBlockedReason}
               />
               <span className="h-4 w-px bg-gray-200 dark:bg-white/10" />
-              <Picker
-                label={t('composer.repository')}
+              <RepositoryPicker
+                repos={config?.repos ?? []}
                 value={repo}
-                options={config?.repos ?? []}
-                onChange={setRepo}
+                onChange={chooseRepository}
+                open={repoPickerOpen}
+                onOpenChange={(next) => {
+                  if (next) openRepositoryPicker(false);
+                  else setRepoPickerOpen(false);
+                }}
+                onRefresh={() => void refreshRepositories()}
+                refreshing={refreshing}
+                returnFocusTo={repoPickerFromTask ? taskBox : undefined}
               />
               <Picker
                 label={t('composer.branch')}
@@ -468,7 +549,7 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
             type="button"
             disabled={!canRun}
             onClick={() => void run()}
-            title={t('composer.runTitle')}
+            title={missingRepository ? t('composer.chooseRepository') : t('composer.runTitle')}
             className={`ml-auto inline-flex items-center gap-1.5 rounded-lg bg-crimson px-3.5 py-1.5 text-[13px] font-medium text-white shadow-sm transition-colors ${
               canRun ? 'hover:bg-crimson-dark' : 'cursor-not-allowed opacity-60'
             }`}
@@ -523,6 +604,12 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
       {goalHint ? (
         <p className="mt-3 text-center text-[13px] text-gray-500 dark:text-gray-400" role="status">
           {goalHint}
+        </p>
+      ) : null}
+
+      {unavailableRepo && !disconnected ? (
+        <p className="mt-3 text-center text-[13px] text-gray-500 dark:text-gray-400" role="status">
+          {t('composer.repositoryUnavailable', { repo: unavailableRepo })}
         </p>
       ) : null}
 
