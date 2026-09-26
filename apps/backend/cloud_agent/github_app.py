@@ -381,11 +381,15 @@ class GitHubAppCredentials:
             raise GitHubAppError(f"GitHub returned no user token: {body.get('error', 'unknown')}")
         return token
 
-    async def installations_for_user(self, user_token: str) -> list[dict[str, Any]]:
-        """List the installations this user can actually reach."""
+    async def user_profile(self, user_token: str) -> dict[str, Any]:
+        """Return ``{"id", "login"}`` for the GitHub user a token speaks as.
+
+        The account a connection belongs to is GitHub's answer for the token the
+        connect flow just exchanged, never a name the browser supplied.
+        """
         async with self._http() as client:
             response = await client.get(
-                f"{self._config.api_base}/user/installations",
+                f"{self._config.api_base}/user",
                 headers={
                     "Authorization": f"Bearer {user_token}",
                     "Accept": "application/vnd.github+json",
@@ -393,13 +397,51 @@ class GitHubAppCredentials:
                 },
             )
         if response.status_code >= 400:
-            raise GitHubAppError(
-                f"could not read the user's installations ({response.status_code})"
-            )
-        out = []
-        for entry in response.json().get("installations", []):
-            account = entry.get("account") or {}
-            out.append({"installation_id": entry.get("id"), "account_login": account.get("login")})
+            raise GitHubAppError(f"could not read the GitHub user ({response.status_code})")
+        body = response.json()
+        user_id, login = body.get("id"), body.get("login")
+        if not isinstance(user_id, int) or not isinstance(login, str) or not login:
+            raise GitHubAppError("GitHub returned no user for the authorization")
+        return {"id": user_id, "login": login}
+
+    async def installations_for_user(self, user_token: str) -> list[dict[str, Any]]:
+        """List every installation this user can actually reach.
+
+        Every page: the connect flow makes a user's grants exactly this list, so
+        stopping at GitHub's default thirty would revoke the thirty-first.
+        """
+        out: list[dict[str, Any]] = []
+        page = 1
+        async with self._http() as client:
+            while page <= 10:  # bounded, like the repository listing
+                response = await client.get(
+                    f"{self._config.api_base}/user/installations",
+                    params={"per_page": 100, "page": page},
+                    headers={
+                        "Authorization": f"Bearer {user_token}",
+                        "Accept": "application/vnd.github+json",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                )
+                if response.status_code >= 400:
+                    raise GitHubAppError(
+                        f"could not read the user's installations ({response.status_code})"
+                    )
+                entries = response.json().get("installations", [])
+                for entry in entries:
+                    account = entry.get("account") or {}
+                    out.append(
+                        {
+                            "installation_id": entry.get("id"),
+                            "account_login": account.get("login"),
+                            # The account's id, not its login: a login can be
+                            # renamed, and this is compared with the user's own.
+                            "account_id": account.get("id"),
+                        }
+                    )
+                if len(entries) < 100:
+                    break
+                page += 1
         return [item for item in out if isinstance(item["installation_id"], int)]
 
     async def repositories_for_installation(self, installation_id: int) -> list[str]:

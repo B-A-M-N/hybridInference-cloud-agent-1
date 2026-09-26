@@ -410,6 +410,11 @@ export const zhCN: Record<TranslationKey, string> = {
   'connect.action': '连接 GitHub',
   'connect.actionUnavailable': '查看集成',
   'connect.titleTemporarilyUnavailable': 'GitHub 暂时不可用',
+  'connect.titleRepositories': '给 GitHub App 授权仓库',
+  'connect.bodyRepositories':
+    'GitHub 已连接。选择 Agent 可以工作的仓库，个人仓库和组织仓库都可以。',
+  'connect.actionRepositories': '配置仓库权限',
+  'connect.leaving': '正在打开 GitHub…',
   'connect.bodyTemporarilyUnavailable': '仓库访问会自动恢复，请稍后再试。',
 
   // ── Pending message queue ───────────────────────────────────────────────

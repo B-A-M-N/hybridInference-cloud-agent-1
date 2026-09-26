@@ -36,6 +36,10 @@ vi.mock('@/lib/api/agents', () => ({
   listRepoBranches: vi.fn(),
 }));
 
+// Leaving for GitHub is a real navigation; the test stands in for the browser.
+import { githubAccessUrl, leaveFor } from './githubAccess';
+vi.mock('./githubAccess', () => ({ githubAccessUrl: vi.fn(), leaveFor: vi.fn() }));
+
 function config(overrides: Partial<AgentConfigApi> = {}): AgentConfigApi {
   return {
     repos: ['owner/repository'],
@@ -157,6 +161,9 @@ async function chooseRepository(name = 'owner/repository') {
 
 describe('TaskComposer source-control onboarding', () => {
   beforeEach(() => {
+    sessionStorage.clear();
+    vi.mocked(githubAccessUrl).mockReset();
+    vi.mocked(leaveFor).mockReset();
     vi.mocked(listSkills).mockResolvedValue([]);
     vi.mocked(listMcpConnections).mockResolvedValue({ connections: [], templates: [] });
     vi.mocked(getMcpConnectionCapabilities).mockResolvedValue([]);
@@ -176,24 +183,130 @@ describe('TaskComposer source-control onboarding', () => {
     vi.mocked(getAgentConfig).mockResolvedValue(
       config({
         github_connected: false,
-        github_install_url: 'https://github.com/apps/example/installations/new',
+        github_install_url: '/agents/integrations',
       }),
     );
+    vi.mocked(githubAccessUrl).mockResolvedValue('https://github.test/login/oauth/authorize');
 
-    render(<TaskComposer />);
+    render(<TaskComposer initialRepo="owner/repository" />);
 
     expect(await screen.findByText('Connect GitHub to start')).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'What should the agent do?' })).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: /Connect GitHub/ })).toHaveAttribute(
-      'href',
-      '/integrations',
-    );
     expect(screen.getByRole('textbox')).toBeDisabled();
+    // Straight to GitHub, noting where to come back to — the Integrations page
+    // used to be where the trip ended.
+    fireEvent.click(screen.getByRole('button', { name: /Connect GitHub/ }));
+    await waitFor(() =>
+      expect(leaveFor).toHaveBeenCalledWith('https://github.test/login/oauth/authorize'),
+    );
+    expect(githubAccessUrl).toHaveBeenCalledWith('connect');
+    expect(JSON.parse(sessionStorage.getItem('agents.github.return')!).value).toBe(
+      '/?repo=owner%2Frepository',
+    );
     expect(screen.getByRole('button', { name: /Run/ })).toBeDisabled();
     expect(screen.queryByLabelText('Repository')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Agent')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Model')).not.toBeInTheDocument();
     expect(listRepoBranches).not.toHaveBeenCalled();
+  });
+
+  // Connected, and the App reaches no repository: the next step is repository
+  // access, not connecting again, and the task typed so far survives the trip.
+  it('asks for repository access, not a second connection, when none came with it', async () => {
+    vi.mocked(getAgentConfig).mockResolvedValue(
+      config({ repos: [], github_install_url: '/agents/integrations' }),
+    );
+    vi.mocked(githubAccessUrl).mockResolvedValue(
+      'https://github.test/apps/agent/installations/new',
+    );
+
+    render(<TaskComposer />);
+
+    expect(
+      await screen.findByText('Give the GitHub App access to a repository'),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/GitHub is connected/)).toBeInTheDocument();
+    expect(screen.queryByText('Connect GitHub to start')).not.toBeInTheDocument();
+    const box = screen.getByRole('textbox');
+    expect(box).toBeEnabled();
+    fireEvent.change(box, { target: { value: 'Tidy the README' } });
+    expect(screen.getByRole('button', { name: /Run/ })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole('button', { name: /Configure repository access/ }));
+    await waitFor(() =>
+      expect(leaveFor).toHaveBeenCalledWith('https://github.test/apps/agent/installations/new'),
+    );
+    expect(githubAccessUrl).toHaveBeenCalledWith('manage');
+    expect(JSON.parse(sessionStorage.getItem('agents.composer.draft')!).value).toMatchObject({
+      task: 'Tidy the README',
+    });
+  });
+
+  it('puts the draft back after the trip to GitHub, and only once', async () => {
+    sessionStorage.setItem(
+      'agents.composer.draft',
+      JSON.stringify({
+        value: {
+          task: 'Fix the flaky test',
+          repo: 'owner/new',
+          runtime: 'codex',
+          model: 'model-b',
+        },
+        savedAt: Date.now(),
+      }),
+    );
+    vi.mocked(getAgentConfig).mockResolvedValue(
+      config({
+        repos: ['owner/new', 'owner/repository'],
+        runtimes: ['claude-code', 'codex'],
+        models: ['model-a', 'model-b'],
+      }),
+    );
+
+    render(<TaskComposer />);
+
+    expect(
+      await screen.findByRole('button', { name: 'Repository: owner/new' }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('textbox')).toHaveValue('Fix the flaky test');
+    expect(screen.getByLabelText('Agent')).toHaveValue('codex');
+    expect(screen.getByLabelText('Model')).toHaveValue('model-b');
+    expect(sessionStorage.getItem('agents.composer.draft')).toBeNull();
+  });
+
+  it('does not put back a draft from a trip long abandoned', async () => {
+    sessionStorage.setItem(
+      'agents.composer.draft',
+      JSON.stringify({
+        value: { task: 'Old idea', repo: 'owner/repository', runtime: '', model: '' },
+        savedAt: Date.now() - 31 * 60 * 1000,
+      }),
+    );
+    vi.mocked(getAgentConfig).mockResolvedValue(config());
+
+    render(<TaskComposer />);
+
+    expect(await repositoryButton()).toHaveAccessibleName('Repository: Select repository');
+    expect(screen.getByRole('textbox')).toHaveValue('');
+  });
+
+  it('adds repositories on GitHub from the repository list', async () => {
+    vi.mocked(getAgentConfig).mockResolvedValue(
+      config({ github_install_url: '/agents/integrations' }),
+    );
+    vi.mocked(githubAccessUrl).mockResolvedValue(
+      'https://github.test/apps/agent/installations/new',
+    );
+
+    render(<TaskComposer />);
+    fireEvent.click(await repositoryButton());
+    const dialog = await screen.findByRole('dialog', { name: 'Repository' });
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Configure repository access' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(leaveFor).toHaveBeenCalledWith('https://github.test/apps/agent/installations/new'),
+    );
   });
 
   it('uses friendly administrator copy when GitHub installation is unavailable', async () => {

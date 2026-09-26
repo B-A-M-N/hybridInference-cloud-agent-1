@@ -548,3 +548,53 @@ async def test_skill_contents_reuse_configured_client_and_bound_symbolic_ref_rea
         credentials.token_for.assert_awaited_with(
             "owner/repo", permissions={"contents": "read"}, repository_scoped=True
         )
+
+
+async def test_the_connected_account_is_the_token_s_own_user(config):
+    """Who connected is GitHub's answer for the exchanged token, nothing else."""
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json={"id": 583231, "login": "octocat", "name": "Mona"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        profile = await GitHubAppCredentials(config, client=client).user_profile("ghu_user")
+
+    assert profile == {"id": 583231, "login": "octocat"}
+    assert [request.url.path for request in requests] == ["/user"]
+    assert requests[0].headers["authorization"] == "Bearer ghu_user"
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [(401, {"message": "Bad credentials"}), (200, {"id": 1}), (200, {"login": "octocat"})],
+)
+async def test_an_unreadable_user_is_an_error_not_a_nameless_account(config, status, body):
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(status, json=body))
+    ) as client:
+        with pytest.raises(GitHubAppError):
+            await GitHubAppCredentials(config, client=client).user_profile("ghu_user")
+
+
+async def test_every_page_of_the_user_s_installations_is_read(config):
+    """A connection's grants become exactly this list, so a page left unread is
+    an installation revoked."""
+    pages = {
+        "1": [{"id": n, "account": {"login": f"org-{n}", "id": n}} for n in range(1, 101)],
+        "2": [{"id": 101, "account": {"login": "octocat", "id": 583231}}, {"id": "not-an-id"}],
+    }
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json={"installations": pages[request.url.params["page"]]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        found = await GitHubAppCredentials(config, client=client).installations_for_user("ghu")
+
+    assert [request.url.params["page"] for request in requests] == ["1", "2"]
+    assert all(request.url.params["per_page"] == "100" for request in requests)
+    assert len(found) == 101
+    assert found[-1] == {"installation_id": 101, "account_login": "octocat", "account_id": 583231}

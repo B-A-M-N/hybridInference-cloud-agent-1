@@ -3,9 +3,13 @@
 import Link from 'next/link';
 import { useT } from '@/components/providers';
 
-// Inline onboarding shown above the disabled composer. Keeping the task shape
-// visible gives the user context for why GitHub is needed without pretending
-// a repository can already be selected.
+// Inline onboarding shown above the composer. Keeping the task shape visible
+// gives the user context for why GitHub is needed without pretending a
+// repository can already be selected.
+//
+// Two steps, told apart: connecting GitHub at all, and — once connected —
+// giving the App a repository. They used to be one message, so a user who had
+// connected but whose App reached no repository was asked to connect again.
 //
 // `unavailable` is the deployment's GitHub App failing to load, which the
 // service retries on its own (issue #47). There is nothing for the user to
@@ -13,21 +17,55 @@ import { useT } from '@/components/providers';
 export function ConnectSourceControl({
   installUrl,
   unavailable = false,
+  step = 'connect',
+  onAction,
+  pending = false,
 }: {
   installUrl: string | null;
   unavailable?: boolean;
+  /** `repositories`: connected, but the App can reach no repository yet. */
+  step?: 'connect' | 'repositories';
+  /** Go to GitHub for this step directly; without it, the Integrations page. */
+  onAction?: () => void;
+  pending?: boolean;
 }) {
   const t = useT();
+  const repositories = step === 'repositories';
   const title = unavailable
     ? t('connect.titleTemporarilyUnavailable')
-    : installUrl
-      ? t('connect.title')
-      : t('connect.titleUnavailable');
+    : repositories
+      ? t('connect.titleRepositories')
+      : installUrl
+        ? t('connect.title')
+        : t('connect.titleUnavailable');
   const body = unavailable
     ? t('connect.bodyTemporarilyUnavailable')
-    : installUrl
-      ? t('connect.body')
-      : t('connect.bodyUnavailable');
+    : repositories
+      ? t('connect.bodyRepositories')
+      : installUrl
+        ? t('connect.body')
+        : t('connect.bodyUnavailable');
+  const actionLabel = pending
+    ? t('connect.leaving')
+    : repositories
+      ? t('connect.actionRepositories')
+      : installUrl
+        ? t('connect.action')
+        : t('connect.actionUnavailable');
+  const actionClass =
+    'inline-flex shrink-0 items-center justify-center gap-2 rounded-lg bg-gray-900 dark:bg-gray-100 px-3.5 py-2 text-[13px] font-medium text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-white disabled:cursor-wait disabled:opacity-70';
+  const arrow = (
+    <svg
+      className="h-3.5 w-3.5"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      aria-hidden="true"
+    >
+      <path strokeLinecap="round" strokeLinejoin="round" d="M7 17 17 7m0 0H8m9 0v9" />
+    </svg>
+  );
   return (
     <div
       role="status"
@@ -44,22 +82,15 @@ export function ConnectSourceControl({
           {body}
         </p>
       </div>
-      {unavailable ? null : (
-        <Link
-          href="/integrations"
-          className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg bg-gray-900 dark:bg-gray-100 px-3.5 py-2 text-[13px] font-medium text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-white"
-        >
-          {installUrl ? t('connect.action') : t('connect.actionUnavailable')}
-          <svg
-            className="h-3.5 w-3.5"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth={2}
-            aria-hidden="true"
-          >
-            <path strokeLinecap="round" strokeLinejoin="round" d="M7 17 17 7m0 0H8m9 0v9" />
-          </svg>
+      {unavailable ? null : onAction && (installUrl || repositories) ? (
+        <button type="button" onClick={onAction} disabled={pending} className={actionClass}>
+          {actionLabel}
+          {arrow}
+        </button>
+      ) : (
+        <Link href="/integrations" className={actionClass}>
+          {actionLabel}
+          {arrow}
         </Link>
       )}
     </div>

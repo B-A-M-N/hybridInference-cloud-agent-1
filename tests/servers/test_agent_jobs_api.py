@@ -587,6 +587,11 @@ class FakeStorage(EmptySkillLibrary, EmptyAttachments, AllCapabilities):
         del user_id
         return []
 
+    async def get_github_account(self, *, user_id: str) -> dict[str, Any] | None:
+        """No GitHub account connected either, for the same reason."""
+        del user_id
+        return None
+
     # -- owner surface --
     async def create_job(self, **kwargs: Any) -> dict[str, Any]:
         kwargs.pop("attachments", None)
@@ -5155,10 +5160,13 @@ async def test_a_worker_cannot_write_the_publish_record(client: AsyncClient):
 class _FakeGitHubApp:
     """Stands in for the App: a user token maps to installations, which cover repos."""
 
-    def __init__(self, installations, repos_by_installation, *, exchange_fails=False):
+    def __init__(
+        self, installations, repos_by_installation, *, exchange_fails=False, login="octocat"
+    ):
         self.installations = installations
         self.repos = repos_by_installation
         self.exchange_fails = exchange_fails
+        self.login = login
         self.exchanged: list[str] = []
 
     async def exchange_user_code(self, code: str) -> str:
@@ -5166,6 +5174,15 @@ class _FakeGitHubApp:
             raise RuntimeError("GitHub refused the code exchange")
         self.exchanged.append(code)
         return f"user-token-for-{code}"
+
+    async def user_profile(self, user_token: str) -> dict[str, Any]:
+        assert user_token.startswith("user-token-for-"), "the profile is the token's own"
+        return {"id": 583231, "login": self.login}
+
+    user_authorization_configured = True
+
+    def user_authorization_url(self, state: str) -> str:
+        return f"https://github.test/login/oauth/authorize?state={state}"
 
     async def installations_for_user(self, user_token: str) -> list[dict[str, Any]]:
         return self.installations
@@ -5202,10 +5219,29 @@ def _store_with_grants(store: FakeStorage) -> FakeStorage:
         store.consumed_oauth_states.add(state_hash)
         return {"code_verifier_ciphertext": None}
 
+    store.issued_oauth_states = []
+
+    async def create_oauth_state(**kwargs):
+        store.issued_oauth_states.append(kwargs)
+
+    store.github_accounts = {}
+
+    async def connect_github_account(*, user_id, github_user_id, login, installations):
+        store.github_accounts[user_id] = {"github_user_id": github_user_id, "login": login}
+        store.grants[user_id] = {
+            item["installation_id"]: item.get("account_login") for item in installations
+        }
+
+    async def get_github_account(*, user_id):
+        return store.github_accounts.get(user_id)
+
     store.record_repo_grant = record_repo_grant
     store.list_repo_grants = list_repo_grants
     store.revoke_repo_grant = revoke_repo_grant
     store.consume_oauth_state = consume_oauth_state
+    store.create_oauth_state = create_oauth_state
+    store.connect_github_account = connect_github_account
+    store.get_github_account = get_github_account
     return store
 
 
@@ -5339,6 +5375,202 @@ async def test_disconnecting_removes_the_entitlement(store: FakeStorage, monkeyp
         )
 
     assert after.status_code == 403
+
+
+_INSTALL_URL = "https://github.com/apps/agent-test/installations/new"
+
+
+def _connectable_app(store: FakeStorage, app_creds: _FakeGitHubApp) -> FastAPI:
+    """An app where users can connect their own GitHub: App, OAuth and install URL."""
+    from cloud_agent.api.deps import get_agent_app_credentials, get_github_app_state
+    from cloud_agent.source_control_runtime import GitHubAppState
+
+    app = _build_app(store)
+    app.dependency_overrides[get_agent_app_credentials] = lambda: app_creds
+    app.dependency_overrides[get_github_app_state] = lambda: GitHubAppState(
+        credentials=app_creds, load_status="ready"
+    )
+    return app
+
+
+async def test_connecting_records_the_account_even_before_any_installation(
+    store: FakeStorage, monkeypatch
+):
+    """Having connected and having repository access are two different states.
+
+    A user with no installation yet used to leave no row at all, and the
+    composer — which read "connected" as "has a repository" — sent them back to
+    a Connect button they had just pressed.
+    """
+    monkeypatch.delenv("AGENT_REPO_ALLOWLIST", raising=False)
+    monkeypatch.setenv("AGENT_GITHUB_APP_INSTALL_URL", _INSTALL_URL)
+    app_creds = _FakeGitHubApp(installations=[], repos_by_installation={})
+    grants_store = _store_with_grants(store)
+    app = _connectable_app(grants_store, app_creds)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        connected = await client.post(
+            "/v1/agent/integrations/github/connect",
+            json={"code": "abc123", "state": "test-state-value-123456"},
+        )
+        config = await client.get("/v1/agent/config")
+        integrations = await client.get("/v1/agent/integrations")
+
+    assert connected.status_code == 200
+    assert connected.json()["connections"] == []
+    assert connected.json()["install_url"].startswith(_INSTALL_URL)
+    # Who connected is GitHub's answer for the exchanged token.
+    assert grants_store.github_accounts[_OWNER] == {"github_user_id": 583231, "login": "octocat"}
+
+    assert config.json()["github_connected"] is True
+    assert config.json()["repos"] == []
+
+    github_row = integrations.json()["providers"][0]
+    assert github_row["connected"] is True
+    assert github_row["accounts"] == []
+    # Where repository access is added — including a personal account the App
+    # is not installed on yet — is offered without an installation to manage.
+    assert github_row["manage_url"].startswith(_INSTALL_URL)
+
+
+async def test_connecting_offers_the_install_page_until_the_app_is_on_the_users_own_account(
+    store: FakeStorage, monkeypatch
+):
+    """An organization's installation is not the user's own.
+
+    The install page used to be offered only when connecting found no
+    installation at all. A member of an organization that already had the App
+    found that one, skipped the page, and could not tell that their own
+    repositories needed an installation of their own.
+    """
+    monkeypatch.delenv("AGENT_REPO_ALLOWLIST", raising=False)
+    monkeypatch.setenv("AGENT_GITHUB_APP_INSTALL_URL", _INSTALL_URL)
+    app_creds = _FakeGitHubApp(
+        installations=[{"installation_id": 77, "account_login": "acme", "account_id": 1001}],
+        repos_by_installation={77: ["acme/service"], 88: ["octocat/dotfiles"]},
+    )
+    app = _connectable_app(_store_with_grants(store), app_creds)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        org_only = await client.post(
+            "/v1/agent/integrations/github/connect",
+            json={"code": "first", "state": "test-state-value-first-1"},
+        )
+        # The user installs the App on their own account and comes back through
+        # the same callback.
+        app_creds.installations = [
+            {"installation_id": 77, "account_login": "acme", "account_id": 1001},
+            {"installation_id": 88, "account_login": "octocat", "account_id": 583231},
+        ]
+        with_own = await client.post(
+            "/v1/agent/integrations/github/connect",
+            json={"code": "second", "state": "test-state-value-second-2"},
+        )
+
+    assert [row["installation_id"] for row in org_only.json()["connections"]] == [77]
+    assert org_only.json()["repos"] == ["acme/service"]
+    assert org_only.json()["install_url"].startswith(_INSTALL_URL)
+    assert with_own.json()["install_url"] is None
+    assert with_own.json()["repos"] == ["acme/service", "octocat/dotfiles"]
+
+
+async def test_reconnecting_keeps_only_the_installations_github_still_reports(
+    store: FakeStorage, monkeypatch
+):
+    """An installation the user lost stays granted only until they reconnect.
+
+    Grants were only ever added, so leaving an organization kept its
+    repositories until someone removed the connection by hand.
+    """
+    monkeypatch.delenv("AGENT_REPO_ALLOWLIST", raising=False)
+    monkeypatch.setenv("AGENT_GITHUB_APP_INSTALL_URL", _INSTALL_URL)
+    app_creds = _FakeGitHubApp(
+        installations=[
+            {"installation_id": 77, "account_login": "acme"},
+            {"installation_id": 88, "account_login": "octocat"},
+        ],
+        repos_by_installation={77: ["acme/service"], 88: ["octocat/dotfiles"]},
+    )
+    grants_store = _store_with_grants(store)
+    app = _connectable_app(grants_store, app_creds)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post(
+            "/v1/agent/integrations/github/connect",
+            json={"code": "first", "state": "test-state-value-first-1"},
+        )
+        before = await client.get("/v1/agent/config")
+        app_creds.installations = [{"installation_id": 88, "account_login": "octocat"}]
+        await client.post(
+            "/v1/agent/integrations/github/connect",
+            json={"code": "second", "state": "test-state-value-second-2"},
+        )
+        after = await client.get("/v1/agent/config")
+        lost = await client.post(
+            "/v1/agent/jobs",
+            json={"repo": "acme/service", "task_prompt": "fix it", "model": "m"},
+        )
+
+    assert before.json()["repos"] == ["acme/service", "octocat/dotfiles"]
+    assert after.json()["repos"] == ["octocat/dotfiles"]
+    assert grants_store.grants[_OWNER] == {88: "octocat"}
+    assert lost.status_code == 403
+
+
+async def test_an_allowlisted_repository_does_not_stand_in_for_connecting(
+    store: FakeStorage, monkeypatch
+):
+    """Where users can connect GitHub, they connect before choosing anything.
+
+    The allowlist is still an entitlement — the create endpoint honours it — but
+    it no longer makes the composer skip the connection: that is how a user ran
+    their first task without knowing it would change a GitHub repository.
+    """
+    monkeypatch.setenv("AGENT_REPO_ALLOWLIST", "acme/public")
+    monkeypatch.setenv("AGENT_GITHUB_APP_INSTALL_URL", _INSTALL_URL)
+    app_creds = _FakeGitHubApp(installations=[], repos_by_installation={})
+    app = _connectable_app(_store_with_grants(store), app_creds)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        config = await client.get("/v1/agent/config")
+
+    assert config.json()["repos"] == ["acme/public"]
+    assert config.json()["github_connected"] is False
+
+
+async def test_with_nothing_to_connect_to_the_allowlist_is_the_whole_entitlement(
+    store: FakeStorage, monkeypatch
+):
+    """The dogfood shape: no connectable App, so an allowlisted repository runs."""
+    monkeypatch.setenv("AGENT_REPO_ALLOWLIST", "acme/public")
+    monkeypatch.delenv("AGENT_GITHUB_APP_INSTALL_URL", raising=False)
+    app = _build_app(_store_with_grants(store))
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        config = await client.get("/v1/agent/config")
+
+    assert config.json()["repos"] == ["acme/public"]
+    assert config.json()["github_connected"] is True
+
+
+async def test_a_connection_from_before_accounts_were_recorded_still_counts(
+    store: FakeStorage, monkeypatch
+):
+    """Grants with no account row: still connected."""
+    monkeypatch.delenv("AGENT_REPO_ALLOWLIST", raising=False)
+    monkeypatch.setenv("AGENT_GITHUB_APP_INSTALL_URL", _INSTALL_URL)
+    grants_store = _store_with_grants(store)
+    await grants_store.record_repo_grant(user_id=_OWNER, installation_id=77, account_login="acme")
+    app_creds = _FakeGitHubApp(installations=[], repos_by_installation={77: ["acme/service"]})
+    app = _connectable_app(grants_store, app_creds)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        config = await client.get("/v1/agent/config")
+        integrations = await client.get("/v1/agent/integrations")
+
+    assert config.json()["github_connected"] is True
+    assert config.json()["repos"] == ["acme/service"]
+    assert integrations.json()["providers"][0]["connected"] is True
 
 
 # ── Issue #47: a GitHub App this process could not load ────────────────────

@@ -281,6 +281,8 @@ describe('IntegrationsView', () => {
     expect(screen.queryAllByText('Admin setup required')).toHaveLength(0);
   });
 
+  // Beside Manage rather than inside it: adding a personal account or another
+  // organization happens there, and behind a menu nobody found it.
   it('offers a repository configuration link for a connected installation', async () => {
     mockedGetIntegrations.mockResolvedValue({
       providers: [
@@ -295,7 +297,6 @@ describe('IntegrationsView', () => {
     render(<IntegrationsView />);
 
     await screen.findByText('Connected as HarvardMadSys · 2 repositories');
-    fireEvent.click(screen.getByText('Manage'));
 
     expect(screen.getByRole('link', { name: 'Configure repositories' })).toHaveAttribute(
       'href',

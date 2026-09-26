@@ -431,6 +431,11 @@ export const en = {
   'connect.action': 'Connect GitHub',
   'connect.actionUnavailable': 'View integrations',
   'connect.titleTemporarilyUnavailable': 'GitHub is temporarily unavailable',
+  'connect.titleRepositories': 'Give the GitHub App access to a repository',
+  'connect.bodyRepositories':
+    'GitHub is connected. Choose which repositories — your own or an organization’s — the agent may work on.',
+  'connect.actionRepositories': 'Configure repository access',
+  'connect.leaving': 'Opening GitHub…',
   'connect.bodyTemporarilyUnavailable':
     'Repository access will come back on its own. Try again in a minute.',
 

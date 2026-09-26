@@ -2160,6 +2160,10 @@ class AgentConfigResponse(BaseModel):
     # than offering pickers that submit something else: with no App installed
     # there is no repository to work on, and a task box that looks ready is a
     # worse answer than one that says what is missing.
+    #: Whether this user has done what this deployment asks before choosing a
+    #: repository: connected GitHub where users can, or — with no connectable
+    #: App — been given one by the allowlist. ``repos`` may still be empty; that
+    #: is a connection without repository access, not a missing connection.
     github_connected: bool = False
     github_install_url: str | None = None
     #: Whether this deployment's GitHub App is working in this process. While it
@@ -2181,6 +2185,8 @@ class GitHubConnectionResponse(BaseModel):
 
     connections: list[dict[str, Any]] = Field(default_factory=list)
     repos: list[str] = Field(default_factory=list)
+    #: GitHub's install page, when the App is not on the user's own account yet
+    #: — whether or not an organization's installation already reached them.
     install_url: str | None = None
 
 

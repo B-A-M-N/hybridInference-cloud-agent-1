@@ -648,6 +648,12 @@ export interface AgentConfigApi {
    * too old to answer these produces.
    */
   model_reasoning_efforts?: Record<string, string[]>;
+  /**
+   * Whether this user has done what the deployment asks before choosing a
+   * repository: connected GitHub where users can, or been given a repository by
+   * the operator's allowlist where they cannot. `repos` may still be empty — a
+   * connection without repository access, not a missing connection.
+   */
   github_connected: boolean;
   github_install_url: string | null;
   /**

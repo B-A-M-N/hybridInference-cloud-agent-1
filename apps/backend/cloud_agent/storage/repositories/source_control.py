@@ -63,6 +63,65 @@ class PostgresSourceControlRepository:
             )
         return deleted is not None
 
+    async def connect_github_account(
+        self,
+        *,
+        user_id: str,
+        github_user_id: int,
+        login: str,
+        installations: list[dict[str, Any]],
+    ) -> None:
+        """Record the GitHub account and make its grants exactly ``installations``."""
+        # One transaction, because the two are one answer: GitHub said who this
+        # is and what they can reach *now*. Grants were only ever added, so an
+        # installation the user had lost — removed from the organization, the
+        # App uninstalled — stayed granted until someone disconnected it by
+        # hand. Replacing them is what makes a reconnect mean what GitHub says
+        # today, including when the user reconnects as another GitHub account.
+        installation_ids = [int(item["installation_id"]) for item in installations]
+        async with self._pool.acquire() as conn, conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO agent_github_accounts (user_id, github_user_id, login)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    github_user_id = EXCLUDED.github_user_id,
+                    login = EXCLUDED.login,
+                    updated_at = NOW()
+                """,
+                user_id,
+                github_user_id,
+                login,
+            )
+            await conn.execute(
+                "DELETE FROM agent_repo_grants "
+                "WHERE user_id = $1 AND NOT (installation_id = ANY($2::bigint[]))",
+                user_id,
+                installation_ids,
+            )
+            for item in installations:
+                await conn.execute(
+                    """
+                    INSERT INTO agent_repo_grants (user_id, installation_id, account_login)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (user_id, installation_id)
+                    DO UPDATE SET account_login = EXCLUDED.account_login
+                    """,
+                    user_id,
+                    int(item["installation_id"]),
+                    item.get("account_login"),
+                )
+
+    async def get_github_account(self, *, user_id: str) -> dict[str, Any] | None:
+        """Return the GitHub account this user connected, if any."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT github_user_id, login, connected_at, updated_at "
+                "FROM agent_github_accounts WHERE user_id = $1",
+                user_id,
+            )
+        return dict(row) if row else None
+
     async def create_oauth_state(
         self,
         *,

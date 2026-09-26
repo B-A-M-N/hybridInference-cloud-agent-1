@@ -29,6 +29,21 @@ class SourceControlRepository(Protocol):
         """Drop one connection. Uninstalling on GitHub is the other half."""
         ...
 
+    async def connect_github_account(
+        self,
+        *,
+        user_id: str,
+        github_user_id: int,
+        login: str,
+        installations: list[dict[str, Any]],
+    ) -> None:
+        """Record the GitHub account and make its grants exactly ``installations``."""
+        ...
+
+    async def get_github_account(self, *, user_id: str) -> dict[str, Any] | None:
+        """Return the GitHub account this user connected, if any."""
+        ...
+
     async def create_oauth_state(
         self,
         *,

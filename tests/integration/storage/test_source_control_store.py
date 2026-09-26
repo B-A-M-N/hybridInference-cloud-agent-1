@@ -61,6 +61,7 @@ async def pool():
     async def _clear() -> None:
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM agent_repo_grants")
+            await conn.execute("DELETE FROM agent_github_accounts")
             await conn.execute("DELETE FROM agent_oauth_states")
             await conn.execute("DELETE FROM agent_gitlab_connections")
 
@@ -92,6 +93,82 @@ async def _connect_gitlab(
         refresh_token_ciphertext="rt",
         expires_at=datetime.now(UTC) + timedelta(hours=1),
     )
+
+
+# ── The GitHub account ────────────────────────────────────────────────
+
+
+async def _connect_github(
+    store: PostgresSourceControlRepository,
+    *,
+    user_id: str = _OWNER,
+    login: str = "octocat",
+    installations: tuple[tuple[int, str | None], ...] = (),
+) -> None:
+    """Record a GitHub connection the way the OAuth callback will."""
+    await store.connect_github_account(
+        user_id=user_id,
+        github_user_id=583231,
+        login=login,
+        installations=[
+            {"installation_id": installation_id, "account_login": account}
+            for installation_id, account in installations
+        ],
+    )
+
+
+async def test_a_github_account_is_recorded_with_no_installation(
+    store: PostgresSourceControlRepository,
+) -> None:
+    """Connecting and having repository access are separate states."""
+    await _connect_github(store)
+
+    account = await store.get_github_account(user_id=_OWNER)
+    assert account is not None
+    assert (account["github_user_id"], account["login"]) == (583231, "octocat")
+    assert await store.list_repo_grants(user_id=_OWNER) == []
+    assert await store.get_github_account(user_id=_OTHER) is None
+
+
+async def test_connecting_makes_the_grants_exactly_what_github_reported(
+    store: PostgresSourceControlRepository,
+) -> None:
+    """A reconnect drops an installation the user lost, keeps and relabels the rest."""
+    await _connect_github(store, installations=((7, "acme"), (8, "octocat")))
+    await _connect_github(store, installations=((8, "octocat-renamed"), (9, "neworg")))
+
+    assert await store.list_repo_grants(user_id=_OWNER) == [
+        {"installation_id": 8, "account_login": "octocat-renamed"},
+        {"installation_id": 9, "account_login": "neworg"},
+    ]
+
+
+async def test_connecting_leaves_another_users_grants_and_account_alone(
+    store: PostgresSourceControlRepository,
+) -> None:
+    """The replacement is scoped by user: one person reconnecting revokes nobody else."""
+    await _connect_github(store, user_id=_OTHER, login="other", installations=((7, "acme"),))
+    await _connect_github(store, installations=((8, "octocat"),))
+
+    assert await store.list_repo_grants(user_id=_OTHER) == [
+        {"installation_id": 7, "account_login": "acme"}
+    ]
+    other = await store.get_github_account(user_id=_OTHER)
+    assert other is not None and other["login"] == "other"
+
+
+async def test_reconnecting_as_another_github_account_replaces_it(
+    store: PostgresSourceControlRepository,
+) -> None:
+    """One account per user; the old account's installations go with it."""
+    await _connect_github(store, login="octocat", installations=((7, "octocat"),))
+    await _connect_github(store, login="hubot", installations=((9, "hubot"),))
+
+    account = await store.get_github_account(user_id=_OWNER)
+    assert account is not None and account["login"] == "hubot"
+    assert await store.list_repo_grants(user_id=_OWNER) == [
+        {"installation_id": 9, "account_login": "hubot"}
+    ]
 
 
 # ── Repository grants ─────────────────────────────────────────────────

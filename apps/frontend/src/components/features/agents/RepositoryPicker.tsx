@@ -19,6 +19,9 @@ import { useComposerMenuLayout } from './useComposerMenuLayout';
 // where a missing repository is fixed: GitHub decides what the App can see,
 // and Refresh reads GitHub's answer again.
 
+const CONFIGURE_CLASS =
+  'flex min-w-0 flex-1 items-center gap-2 rounded-lg px-3 py-2 text-left text-[13px] text-gray-700 hover:bg-gray-100 focus:bg-gray-100 focus:outline-none dark:text-gray-200 dark:hover:bg-white/10 dark:focus:bg-white/10';
+
 /** `owner/` and `name`, so the owner can be drawn quieter than the name. */
 function splitRepository(repo: string): [string, string] {
   const slash = repo.indexOf('/');
@@ -41,6 +44,7 @@ export function RepositoryPicker({
   onOpenChange,
   onRefresh,
   refreshing = false,
+  onConfigure,
   returnFocusTo,
 }: {
   repos: string[];
@@ -51,6 +55,8 @@ export function RepositoryPicker({
   /** Read the repository list again; absent means the footer offers no refresh. */
   onRefresh?: () => void;
   refreshing?: boolean;
+  /** Go straight to GitHub to add repositories; without it, the Integrations page. */
+  onConfigure?: () => void;
   /** Where focus goes after a choice. The trigger, unless the composer asked. */
   returnFocusTo?: RefObject<HTMLElement>;
 }) {
@@ -123,6 +129,21 @@ export function RepositoryPicker({
   }
 
   const [owner, name] = splitRepository(value);
+  const configure = (
+    <>
+      <svg
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={1.8}
+        aria-hidden="true"
+        className="h-4 w-4 shrink-0"
+      >
+        <path strokeLinecap="round" d="M12 5v14M5 12h14" />
+      </svg>
+      <span className="truncate">{t('composer.repositoryConfigure')}</span>
+    </>
+  );
 
   return (
     <>
@@ -252,22 +273,22 @@ export function RepositoryPicker({
             ) : null}
           </div>
           <div className="mt-1 flex shrink-0 items-center gap-1 border-t border-gray-100 pt-1 dark:border-white/5">
-            <Link
-              href="/integrations"
-              className="flex min-w-0 flex-1 items-center gap-2 rounded-lg px-3 py-2 text-[13px] text-gray-700 hover:bg-gray-100 focus:bg-gray-100 focus:outline-none dark:text-gray-200 dark:hover:bg-white/10 dark:focus:bg-white/10"
-            >
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth={1.8}
-                aria-hidden="true"
-                className="h-4 w-4 shrink-0"
+            {onConfigure ? (
+              <button
+                type="button"
+                onClick={() => {
+                  onOpenChange(false);
+                  onConfigure();
+                }}
+                className={CONFIGURE_CLASS}
               >
-                <path strokeLinecap="round" d="M12 5v14M5 12h14" />
-              </svg>
-              <span className="truncate">{t('composer.repositoryConfigure')}</span>
-            </Link>
+                {configure}
+              </button>
+            ) : (
+              <Link href="/integrations" className={CONFIGURE_CLASS}>
+                {configure}
+              </Link>
+            )}
             {onRefresh ? (
               <button
                 type="button"
