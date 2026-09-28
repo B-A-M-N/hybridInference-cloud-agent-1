@@ -1392,7 +1392,6 @@ class WorkerClaimAttestation(BaseModel):
     #: example the Claude SDK fork bridge). They ride the same attestation so
     #: the API cannot silently discard evidence used by capability gating.
     helper_versions: dict[str, str] = Field(default_factory=dict, max_length=64)
-    shared_sandbox_protocol: str | None = Field(None, max_length=32)
     runner_capabilities: list[str] = Field(default_factory=list, max_length=64)
     host_kernel: str | None = Field(None, max_length=256)
     guest_kernel: str | None = Field(None, max_length=256)

@@ -122,7 +122,6 @@ from cloud_agent_host.shared_protocol import (
     PROFILING_CONTROL_CAPABILITY,
     SHARED_SANDBOX_CAPABILITY,
     SHARED_SANDBOX_HELPER_PINS,
-    SHARED_SANDBOX_PROTOCOL,
     SHARED_SANDBOX_RUNTIME_PINS,
     shared_deployment_capability,
 )
@@ -1147,8 +1146,6 @@ def _shared_live_host_capabilities(
         return []
     digest = stamp.get("sandbox_image_digest")
     if not isinstance(digest, str) or not digest.strip():
-        return []
-    if stamp.get("shared_sandbox_protocol") != SHARED_SANDBOX_PROTOCOL:
         return []
     versions = stamp.get("runtime_versions")
     if not isinstance(versions, dict) or any(

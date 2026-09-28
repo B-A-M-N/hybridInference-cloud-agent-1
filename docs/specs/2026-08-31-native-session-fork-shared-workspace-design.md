@@ -467,9 +467,10 @@ feature switches. Names such as `shared-sandbox-v1` are protocol/capability
 identifiers used for exact claim attestation, not behavior toggles. The
 deployment-SHA marker is likewise a rolling-compatibility fence and cannot
 select another executor. Historical fork has its own
-`native-fork-at-anchor-v1` attestation. The shared protocol is v2 for new
-images; a v1 retained container may keep serving ordinary follow-ups, but its
-older helpers cannot receive an at-anchor request. The control plane exposes
+`native-fork-at-anchor-v1` attestation, and the in-image helper that
+interprets the anchor is pinned by its own version label
+(`claude-session-fork`) beside the other helpers; there is no separate
+shared-sandbox protocol number. The control plane exposes
 Fork only when the host advertises that capability and its current sandbox
 image digest matches the group's pinned digest, so an upgrade fails closed
 instead of silently forking the latest provider message.

@@ -30,7 +30,6 @@ from cloud_agent_host.shared_protocol import (
     NATIVE_FORK_AT_ANCHOR_CAPABILITY,
     SHARED_SANDBOX_CAPABILITY,
     SHARED_SANDBOX_HELPER_PINS,
-    SHARED_SANDBOX_PROTOCOL,
     SHARED_SANDBOX_RUNTIME_PINS,
     shared_deployment_capability,
 )
@@ -207,7 +206,6 @@ def _shared_claim_attestation() -> dict[str, object]:
     """Return the exact process-local fence required for shared work."""
     return {
         "sandbox_image_digest": "sha256:shared-image",
-        "shared_sandbox_protocol": SHARED_SANDBOX_PROTOCOL,
         "runner_capabilities": _SHARED_HOST_CAPABILITIES,
         "runtime_versions": dict(SHARED_SANDBOX_RUNTIME_PINS),
         "helper_versions": dict(SHARED_SANDBOX_HELPER_PINS),
@@ -2925,9 +2923,8 @@ async def test_retained_follow_up_keeps_owning_host_image_and_cli_pin_after_pool
         host="runner-a",
         claim_attestation={
             **_shared_claim_attestation(),
-            # v2 added historical Fork only. An old owner may continue the
-            # exact retained group it already holds after placement moves.
-            "shared_sandbox_protocol": "v1",
+            # An old owner may continue the exact retained group it already
+            # holds after placement moves, even from a rebuilt runner image.
             "sandbox_runtime": "runc",
             "sandbox_image_digest": "sha256:new-runner-image",
             "runtime_versions_available": {"claude-code": ["2.1.220", "2.1.999"]},
@@ -2956,25 +2953,6 @@ async def test_retained_follow_up_keeps_owning_host_image_and_cli_pin_after_pool
         host="runner-b",
     )
     assert new_claim is not None and new_claim["id"] == fresh["id"]
-
-
-async def test_compatible_v1_runner_cannot_materialize_a_new_group(store: Storage):
-    fresh = await _create_job(store)
-    v1_attestation = {
-        **_shared_claim_attestation(),
-        "shared_sandbox_protocol": "v1",
-    }
-
-    claim = await _claim(
-        store,
-        worker_id="v1-runner",
-        lease_ttl_seconds=60,
-        host="runner-a",
-        claim_attestation=v1_attestation,
-    )
-
-    assert claim is None
-    assert (await store.conversation_queries.get_job(fresh["id"]))["state"] == "queued"
 
 
 async def test_failed_preadmission_activation_requests_an_immediate_stop(
