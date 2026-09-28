@@ -1,35 +1,18 @@
 'use client';
 
 import Link from 'next/link';
-import { useSearchParams } from 'next/navigation';
-import { Suspense, useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
-import { useAuth } from '@/components/providers';
-import { hasAgentPermission } from '@/components/providers/AuthProvider';
-import type { AgentJobApiState } from '@/lib/api/agents';
 import { getAdminRuns, type AdminRunFilters, type AdminRunsPage } from '@/lib/api/adminRuns';
 import { getErrorMessage } from '@/lib/utils/errors';
 
-import { AdminNavigation } from '../AdminNavigation';
-import { presetKey } from '../usage/present';
 import { RunsTableScroll } from './RunsTableScroll';
 import {
   runResourceCells,
   type ResourceCompleteness,
   type TurnResourceCells,
 } from './presentTurnResources';
-import {
-  accessDenied,
-  AdminRequired,
-  BUTTON,
-  CARD,
-  dateTime,
-  ErrorNotice,
-  INPUT,
-  RunState,
-} from './shared';
-
-const STATES: AgentJobApiState[] = ['queued', 'running', 'succeeded', 'failed', 'cancelled'];
+import { accessDenied, BUTTON, CARD, dateTime, ErrorNotice, RunState } from './shared';
 
 // The column set is fixed: this list is metadata only, so every cell maps to a
 // field the runs endpoint already returns. Resources are three columns rather
@@ -37,7 +20,7 @@ const STATES: AgentJobApiState[] = ['queued', 'running', 'succeeded', 'failed', 
 // alike; process I/O is deliberately absent, since it belongs to the detail
 // view and would widen the list past what a reader scans here.
 const COLUMNS = [
-  { label: 'Run', width: 320 },
+  { label: 'Turn', width: 320 },
   { label: 'User', width: 160 },
   { label: 'Status', width: 128 },
   { label: 'Agent / model', width: 200 },
@@ -57,139 +40,32 @@ const NUMERIC_COLUMNS = new Set(['Tool calls', 'CPU', 'Peak memory']);
 
 const SKELETON_ROWS = 6;
 
-//: Said only when the list came from a usage breakdown row, where two of the
-//: filters are identities no control on this page displays.
-const LINKED_GROUP_BASIS =
-  'the usage filters from that page, including the user, model, agent or repository the row was grouped by';
-
-const DEFAULT_WINDOW_MS = 7 * 86_400_000;
-
-/** How long the applied window is, read from the window itself. */
-function windowLength(filters: AdminRunFilters): number {
-  const span = Date.parse(filters.until ?? '') - Date.parse(filters.since ?? '');
-  return Number.isFinite(span) && span > 0 ? span : DEFAULT_WINDOW_MS;
-}
-
 /**
- * Re-anchor a window of a given length at an instant.
+ * The turn level of the Sessions tab: every matching turn, from every session,
+ * newest first.
  *
- * The length is taken from the window on screen rather than from the preset
- * control: the control reads "Custom" for a linked or a grown-old window, and
- * a preset key is not a number of days.
+ * The filters belong to the page, so switching between sessions and turns
+ * keeps the selection; only what one row stands for changes.
  */
-function windowOfLength(
-  length: number,
-  keep: AdminRunFilters = {},
-  now: Date = new Date(),
-): AdminRunFilters {
-  return {
-    ...keep,
-    since: new Date(now.getTime() - length).toISOString(),
-    until: now.toISOString(),
-    limit: 50,
-  };
-}
-
-function windowFilters(
-  days: number,
-  keep: AdminRunFilters = {},
-  now: Date = new Date(),
-): AdminRunFilters {
-  return windowOfLength(days * 86_400_000, keep, now);
-}
-
-// Deep links from the Usage page arrive as query parameters. Only these are
-// read. A link that names a window this list cannot use is an error rather than
-// a fallback: answering with the default window would describe other runs, and
-// a missing end or an inverted one is a broken link, not an empty selection.
-const DEEP_LINK_KEYS = ['user_id', 'model', 'runtime', 'repo'] as const;
-
-interface RunLink {
-  filters: AdminRunFilters | null;
-  error: string | null;
-  linked: boolean;
-}
-
-function deepLink(query: string): RunLink {
-  const params = new URLSearchParams(query);
-  const unknown = [...params.keys()].filter(
-    (key) =>
-      key !== 'since' && key !== 'until' && !(DEEP_LINK_KEYS as readonly string[]).includes(key),
-  );
-  if (unknown.length) {
-    return { filters: null, error: `Unsupported filter: ${unknown[0]}`, linked: true };
-  }
-  const since = params.get('since');
-  const until = params.get('until');
-  const named = Boolean(since || until) || DEEP_LINK_KEYS.some((key) => params.get(key));
-  if (!named) return { filters: null, error: null, linked: false };
-  if (!since || !until) {
-    return { filters: null, error: 'This link is missing one end of its window.', linked: true };
-  }
-  if (!(Date.parse(since) < Date.parse(until))) {
-    return { filters: null, error: 'This link has an empty or inverted window.', linked: true };
-  }
-  const filters: AdminRunFilters = { since, until, limit: 50 };
-  for (const key of DEEP_LINK_KEYS) {
-    const value = params.get(key);
-    if (value) filters[key] = value;
-  }
-  return { filters, error: null, linked: true };
-}
-
-export default function AdminRunsPage() {
-  const { state } = useAuth();
-  if (!hasAgentPermission(state.user?.agent_access, 'agent.admin')) return <AdminRequired />;
-  return (
-    <Suspense fallback={<RunsSkeletonFallback />}>
-      <LinkedRunsList key={state.user?.id ?? 'admin'} />
-    </Suspense>
-  );
-}
-
-/** Read the linked filters once, keyed by the query so a new link remounts. */
-function LinkedRunsList() {
-  const query = useSearchParams().toString();
-  return <RunsList key={query} initialQuery={query} />;
-}
-
-function RunsSkeletonFallback() {
-  return (
-    <div className="min-w-0 flex-1">
-      <section className="w-full px-4 py-10 sm:px-6 lg:px-8 lg:py-14">
-        <div className={`${CARD} mt-8 h-64 animate-pulse`} />
-      </section>
-    </div>
-  );
-}
-
-function RunsList({ initialQuery }: { initialQuery: string }) {
-  // A link from the usage page carries an absolute window and the identities
-  // of the group it came from. It replaces the seven-day default and is kept
-  // for as long as the admin stays on this selection.
-  const linked = deepLink(initialQuery);
-  const [filters, setFilters] = useState<AdminRunFilters>(() => linked.filters ?? windowFilters(7));
-  // The window the admin is actually looking at, so the control names it
-  // instead of claiming the last preset that was clicked. A one-day link is
-  // Custom, and changing Status must not re-anchor it to seven days.
-  const windowDays = presetKey(filters);
-  // A linked window is absolute and stays exactly as linked; a window chosen
-  // here re-anchors on Refresh so the list picks up work finished meanwhile.
-  const [linkedWindow, setLinkedWindow] = useState(linked.linked);
+export function TurnResults({
+  filters,
+  onLoading,
+  onDenied,
+}: {
+  filters: AdminRunFilters;
+  onLoading: (loading: boolean) => void;
+  onDenied: () => void;
+}) {
   const [page, setPage] = useState<AdminRunsPage | null>(null);
-  const [loading, setLoading] = useState(!linked.error);
+  const [loading, setLoading] = useState(true);
   const [moreLoading, setMoreLoading] = useState(false);
-  const [error, setError] = useState<string | null>(linked.error);
-  const [denied, setDenied] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [revision, setRevision] = useState(0);
   const moreRequest = useRef<AbortController | null>(null);
 
+  useEffect(() => onLoading(loading), [loading, onLoading]);
+
   useEffect(() => {
-    if (linked.error) {
-      // A link this list cannot use is reported as it is. Requesting with a
-      // substituted window would return runs the link never named.
-      setLoading(false);
-      return;
-    }
     const controller = new AbortController();
     moreRequest.current?.abort();
     setMoreLoading(false);
@@ -202,7 +78,7 @@ function RunsList({ initialQuery }: { initialQuery: string }) {
       })
       .catch((e: unknown) => {
         if (!controller.signal.aborted) {
-          if (accessDenied(e)) setDenied(true);
+          if (accessDenied(e)) onDenied();
           else setError(getErrorMessage(e));
         }
       })
@@ -213,7 +89,7 @@ function RunsList({ initialQuery }: { initialQuery: string }) {
       controller.abort();
       moreRequest.current?.abort();
     };
-  }, [filters, linked.error]);
+  }, [filters, revision, onDenied]);
 
   async function loadMore() {
     if (!page?.next_cursor || moreLoading) return;
@@ -233,7 +109,7 @@ function RunsList({ initialQuery }: { initialQuery: string }) {
         );
     } catch (e) {
       if (!controller.signal.aborted) {
-        if (accessDenied(e)) setDenied(true);
+        if (accessDenied(e)) onDenied();
         else setError(getErrorMessage(e));
       }
     } finally {
@@ -241,131 +117,47 @@ function RunsList({ initialQuery }: { initialQuery: string }) {
     }
   }
 
-  if (denied) return <AdminRequired />;
   return (
-    <div className="min-w-0 flex-1">
-      <section className="w-full px-4 py-10 sm:px-6 lg:px-8 lg:py-14">
-        <h1 className="text-3xl font-semibold tracking-tight text-gray-900 dark:text-gray-50">
-          Admin
-        </h1>
-        <AdminNavigation current="runs" />
-
-        <div className="mt-8">
-          <h2 className="text-xl font-semibold text-gray-900 dark:text-gray-50">Runs</h2>
-          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
-            {linked
-              ? `Cross-user agent runs from a linked usage group: ${LINKED_GROUP_BASIS}`
-              : 'Cross-user agent runs in the selected window.'}
-          </p>
-        </div>
-
-        <div
-          role="group"
-          aria-label="Run filters"
-          className="mt-5 flex flex-wrap items-center gap-2"
-        >
-          <label className="w-40 shrink-0">
-            <span className="sr-only">Created</span>
-            <select
-              className={INPUT}
-              value={windowDays}
-              onChange={(e) => {
-                // Choosing a preset is the only action that re-anchors the
-                // window, and it keeps every other filter, including the
-                // identity a usage link arrived with.
-                const nextDays = Number(e.target.value);
-                setLinkedWindow(false);
-                setFilters((current) => windowFilters(nextDays, current));
-              }}
+    <>
+      {error && (
+        <ErrorNotice>
+          {error}
+          {!page && (
+            <button
+              type="button"
+              className="ml-3 underline"
+              onClick={() => setRevision((value) => value + 1)}
             >
-              <option value={7}>Last 7 days</option>
-              <option value={30}>Last 30 days</option>
-              <option value={90}>Last 90 days</option>
-              {windowDays === 'custom' && <option value="custom">Custom</option>}
-            </select>
-          </label>
-          <label className="w-40 shrink-0">
-            <span className="sr-only">Status</span>
-            <select
-              className={INPUT}
-              value={filters.state ?? ''}
-              onChange={(e) =>
-                // Status is not part of the window. Changing it keeps the exact
-                // since/until on screen: re-deriving them from a preset here
-                // widened a one-day link back to seven days.
-                setFilters((current) => ({
-                  ...current,
-                  state: (e.target.value || undefined) as AgentJobApiState | undefined,
-                }))
-              }
-            >
-              <option value="">All statuses</option>
-              {STATES.map((value) => (
-                <option key={value} value={value}>
-                  {value}
-                </option>
-              ))}
-            </select>
-          </label>
-          <button
-            className={`${BUTTON} ml-auto h-10`}
-            type="button"
-            disabled={loading}
-            onClick={() =>
-              setFilters((current) =>
-                // A linked window is absolute and stays as linked. Any other
-                // window keeps its own length and re-anchors at now, which is
-                // what refreshing a list is for.
-                linkedWindow ? { ...current } : windowOfLength(windowLength(current), current),
-              )
-            }
-          >
-            Refresh
-          </button>
-        </div>
-
-        {error && (
-          <ErrorNotice>
-            {error}
-            {/* A broken link has nothing to retry: the URL has to change. */}
-            {!page && !linked.error && (
-              <button
-                type="button"
-                className="ml-3 underline"
-                onClick={() => setFilters({ ...filters })}
-              >
-                Retry
-              </button>
+              Retry
+            </button>
+          )}
+        </ErrorNotice>
+      )}
+      {loading ? (
+        <LoadingTable />
+      ) : (
+        page && (
+          <>
+            <p className="mt-6 text-xs text-gray-500 dark:text-gray-400">
+              Turns created {dateTime(page.since)} – {dateTime(page.until)}
+            </p>
+            {page.runs.length === 0 ? <EmptyRuns /> : <RunsTable runs={page.runs} />}
+            {page.next_cursor && (
+              <div className="mt-5 flex justify-center">
+                <button
+                  type="button"
+                  className={BUTTON}
+                  disabled={moreLoading}
+                  onClick={() => void loadMore()}
+                >
+                  {moreLoading ? 'Loading…' : 'Load more turns'}
+                </button>
+              </div>
             )}
-          </ErrorNotice>
-        )}
-
-        {linked.error ? null : loading ? (
-          <LoadingTable />
-        ) : (
-          page && (
-            <>
-              <p className="mt-6 text-xs text-gray-500 dark:text-gray-400">
-                Created {dateTime(page.since)} – {dateTime(page.until)}
-              </p>
-              {page.runs.length === 0 ? <EmptyRuns /> : <RunsTable runs={page.runs} />}
-              {page.next_cursor && (
-                <div className="mt-5 flex justify-center">
-                  <button
-                    type="button"
-                    className={BUTTON}
-                    disabled={moreLoading}
-                    onClick={() => void loadMore()}
-                  >
-                    {moreLoading ? 'Loading…' : 'Load more runs'}
-                  </button>
-                </div>
-              )}
-            </>
-          )
-        )}
-      </section>
-    </div>
+          </>
+        )
+      )}
+    </>
   );
 }
 
@@ -385,7 +177,7 @@ function RunsTable({ runs }: { runs: AdminRunsPage['runs'] }) {
                 key={label}
                 className={`whitespace-nowrap px-4 py-3 font-medium ${
                   NUMERIC_COLUMNS.has(label) ? 'text-right' : ''
-                } ${label === 'Run' ? 'bg-gray-50 dark:bg-gray-900 lg:sticky lg:left-0 lg:z-10 lg:shadow-[inset_-1px_0_0_#e5e7eb] dark:lg:shadow-[inset_-1px_0_0_#374151]' : ''}`}
+                } ${label === 'Turn' ? 'bg-gray-50 dark:bg-gray-900 lg:sticky lg:left-0 lg:z-10 lg:shadow-[inset_-1px_0_0_#e5e7eb] dark:lg:shadow-[inset_-1px_0_0_#374151]' : ''}`}
                 scope="col"
               >
                 {label}
@@ -536,8 +328,8 @@ function RunResourceState({ cells }: { cells: TurnResourceCells }) {
 
 function LoadingTable() {
   return (
-    <div className={`${CARD} mt-6 overflow-hidden`} role="status" aria-label="Loading runs">
-      <span className="sr-only">Loading runs…</span>
+    <div className={`${CARD} mt-6 overflow-hidden`} role="status" aria-label="Loading turns">
+      <span className="sr-only">Loading turns…</span>
       <div className="divide-y divide-gray-100 dark:divide-white/5">
         {Array.from({ length: SKELETON_ROWS }, (_, row) => (
           <div key={row} className="flex items-center gap-5 px-5 py-4">
@@ -571,7 +363,7 @@ function EmptyRuns() {
         />
       </svg>
       <p className="text-sm font-medium text-gray-700 dark:text-gray-200">
-        No runs match these filters.
+        No turns match these filters.
       </p>
       <p className="text-xs text-gray-500 dark:text-gray-400">
         Widen the time window or adjust the filters.

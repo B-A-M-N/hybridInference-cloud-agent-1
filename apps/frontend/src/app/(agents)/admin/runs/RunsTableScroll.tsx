@@ -55,7 +55,7 @@ export function RunsTableScroll({ children }: { children: ReactNode }) {
           <div
             ref={scrollbar}
             role="scrollbar"
-            aria-label="Scroll runs horizontally"
+            aria-label="Scroll turns horizontally"
             aria-controls={id}
             aria-orientation="horizontal"
             aria-valuemin={0}
@@ -94,7 +94,7 @@ export function RunsTableScroll({ children }: { children: ReactNode }) {
         ref={viewport}
         id={id}
         role="region"
-        aria-label="Runs table"
+        aria-label="Turns table"
         tabIndex={0}
         onScroll={measure}
         className={`relative overflow-x-auto rounded-b-2xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-crimson dark:focus-visible:ring-crimson-light ${overflowing ? '' : 'rounded-t-2xl'}`}
