@@ -397,7 +397,7 @@ host must provide:
 - an enrolled host credential and fresh heartbeat;
 - an authenticated workspace broker URL reachable by the control plane;
 - the expected Docker data root and sandbox image digest;
-- exact runtime/helper versions and shared protocol attestation;
+- exact runtime/helper versions;
 - `native-fork-at-anchor-v1` from the current host image, with that image
   digest equal to the immutable digest of the retained group;
 - at least two host slots and enough runner replicas to execute fork siblings
@@ -417,8 +417,10 @@ host currently eligible to materialize a new chat. It also reverse-probes every
 online host that still owns a non-lost retained group, even when new-chat
 placement has moved elsewhere. Such an owner may remain on an older compatible
 generation for ordinary follow-ups; it does not need to claim new chats or
-advertise historical Fork. The scheduler admits that reviewed v1 tuple only to
-an existing group owned by that host; creating a new group still requires v2.
+advertise historical Fork. The scheduler admits such a replica only to an
+existing group owned by that host, and does not ask its image for the fork
+helper, which an ordinary turn never runs; creating a new group still
+requires the pinned fork helper.
 This runtime fence, not a serial Actions dependency, establishes
 host-before-new-API compatibility. Failure stops the rollout; it never falls
 back to an older sandbox path.

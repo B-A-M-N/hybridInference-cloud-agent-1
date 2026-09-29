@@ -1226,6 +1226,15 @@ def _claim_attestation(backend: SandboxBackend) -> dict[str, Any]:
     # needed to use it; a sibling replica's host heartbeat cannot stand in for
     # those process-local facts during a rolling deployment.
     stamp["runner_capabilities"] = _shared_live_host_capabilities(backend, stamp)
+    if stamp["runner_capabilities"]:
+        # For a control plane older than this release. Hosts roll out before
+        # the API, so a replacement runner polls that API for a while, and it
+        # refuses every claim that does not name the image's shared-sandbox
+        # protocol. This image has no such label. Its "v2" meant a fork
+        # helper that takes an anchor, which the capabilities above already
+        # required. This control plane reads nothing from it. Remove once
+        # every deployment's control plane is at least this release.
+        stamp["shared_sandbox_protocol"] = "v2"
     return stamp
 
 

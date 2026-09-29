@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from enum import StrEnum
 
 from cloud_agent_shared.shared_protocol import (
+    FORK_HELPER,
     NATIVE_FORK_AT_ANCHOR_CAPABILITY,
     SHARED_SANDBOX_CAPABILITY,
     SHARED_SANDBOX_HELPER_PINS,
@@ -46,16 +47,14 @@ RESERVED_EXECUTION_METADATA_KEYS = frozenset(
 )
 
 
-def compatible_shared_sandbox_followup_attested(attestation: Mapping[str, object]) -> bool:
-    """Whether a replica may continue a retained group it already owns.
+def _shared_sandbox_claim_attested(
+    attestation: Mapping[str, object], *, creates_group: bool
+) -> bool:
+    """Validate the image/runtime proof both claim gates share.
 
-    The proof is the image itself: an immutable digest, the shared-sandbox
-    capability from the claiming process, and every Agent CLI and in-image
-    helper at the exact version this control plane was reviewed against. What
-    it does not require is the completed target deployment. During a rolling
-    deployment the previous generation keeps serving the groups whose only
-    workspace and native state live in its Docker layer, while a new group
-    waits for a replica that also passes :func:`shared_sandbox_claim_attested`.
+    Only a replica that may create a group must prove the fork helper. A Fork
+    of that group runs it inside the group's own container; an ordinary turn
+    never runs it.
     """
     digest = attestation.get("sandbox_image_digest")
     if not isinstance(digest, str) or not digest.strip():
@@ -73,6 +72,7 @@ def compatible_shared_sandbox_followup_attested(attestation: Mapping[str, object
     return isinstance(helpers, Mapping) and all(
         helpers.get(helper_id) == version
         for helper_id, version in SHARED_SANDBOX_HELPER_PINS.items()
+        if creates_group or helper_id != FORK_HELPER
     )
 
 
@@ -93,7 +93,7 @@ def shared_sandbox_claim_attested(
     """
     capabilities = attestation.get("runner_capabilities")
     return (
-        compatible_shared_sandbox_followup_attested(attestation)
+        _shared_sandbox_claim_attested(attestation, creates_group=True)
         and isinstance(capabilities, list)
         and NATIVE_FORK_AT_ANCHOR_CAPABILITY in capabilities
         and has_shared_deployment_capability(
@@ -101,6 +101,20 @@ def shared_sandbox_claim_attested(
             expected_deployment_sha=expected_deployment_sha,
         )
     )
+
+
+def compatible_shared_sandbox_followup_attested(attestation: Mapping[str, object]) -> bool:
+    """Whether a replica may continue a retained group it already owns.
+
+    A follow-up needs neither the completed target deployment nor the fork
+    helper. During a rolling deployment a host that owns groups may stay on the
+    previous release for ordinary follow-ups, and a release from before the
+    fork helper had a label reports no version for it; an ordinary turn never
+    runs it. Every Agent CLI and every other helper must still match exactly,
+    so a replica whose turn-time contract changed stays refused until its
+    compatibility is reviewed here.
+    """
+    return _shared_sandbox_claim_attested(attestation, creates_group=False)
 
 
 def default_execution_profile(env: Mapping[str, str] | None = None) -> ExecutionProfile:

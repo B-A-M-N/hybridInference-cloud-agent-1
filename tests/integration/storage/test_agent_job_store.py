@@ -33,6 +33,7 @@ from cloud_agent_host.shared_protocol import (
     SHARED_SANDBOX_RUNTIME_PINS,
     shared_deployment_capability,
 )
+from cloud_agent_shared.shared_protocol import FORK_HELPER
 
 pytestmark = [pytest.mark.dbtest, pytest.mark.asyncio]
 
@@ -209,6 +210,29 @@ def _shared_claim_attestation() -> dict[str, object]:
         "runner_capabilities": _SHARED_HOST_CAPABILITIES,
         "runtime_versions": dict(SHARED_SANDBOX_RUNTIME_PINS),
         "helper_versions": dict(SHARED_SANDBOX_HELPER_PINS),
+    }
+
+
+def _previous_release_claim_attestation() -> dict[str, object]:
+    """A runner of the release from before the fork helper had its own label.
+
+    Its image reports every other helper, and it proves its own, older
+    deployment. The protocol number it also sends never reaches the store:
+    the claim model drops it.
+    """
+    return {
+        **_shared_claim_attestation(),
+        "runner_capabilities": [
+            SHARED_SANDBOX_CAPABILITY,
+            NATIVE_FORK_AT_ANCHOR_CAPABILITY,
+            shared_deployment_capability("previous-deployment"),
+            GOAL_REPORT_CAPABILITY,
+        ],
+        "helper_versions": {
+            helper_id: version
+            for helper_id, version in SHARED_SANDBOX_HELPER_PINS.items()
+            if helper_id != FORK_HELPER
+        },
     }
 
 
@@ -2922,9 +2946,10 @@ async def test_retained_follow_up_keeps_owning_host_image_and_cli_pin_after_pool
         lease_ttl_seconds=60,
         host="runner-a",
         claim_attestation={
-            **_shared_claim_attestation(),
-            # An old owner may continue the exact retained group it already
-            # holds after placement moves, even from a rebuilt runner image.
+            **_previous_release_claim_attestation(),
+            # An owner may stay on the previous release and keep continuing
+            # the exact retained group it holds after placement moves, even
+            # from a rebuilt runner image.
             "sandbox_runtime": "runc",
             "sandbox_image_digest": "sha256:new-runner-image",
             "runtime_versions_available": {"claude-code": ["2.1.220", "2.1.999"]},
@@ -2953,6 +2978,25 @@ async def test_retained_follow_up_keeps_owning_host_image_and_cli_pin_after_pool
         host="runner-b",
     )
     assert new_claim is not None and new_claim["id"] == fresh["id"]
+
+
+async def test_a_runner_of_the_previous_release_cannot_materialize_a_new_group(
+    store: Storage,
+):
+    fresh = await _create_job(store)
+
+    refused = await _claim(
+        store,
+        worker_id="previous-release-runner",
+        lease_ttl_seconds=60,
+        host="runner-a",
+        claim_attestation=_previous_release_claim_attestation(),
+    )
+
+    assert refused is None
+    assert (await store.conversation_queries.get_job(fresh["id"]))["state"] == "queued"
+    claim = await _claim(store, worker_id="current-runner", lease_ttl_seconds=60)
+    assert claim is not None and claim["id"] == fresh["id"]
 
 
 async def test_failed_preadmission_activation_requests_an_immediate_stop(

@@ -95,13 +95,19 @@ SHARED_SANDBOX_RUNTIME_PINS = {
     "opencode": "1.18.9",
     "kilo": "7.4.17",
 }
+#: The in-image helper that forks a native Claude session. Only a Fork runs it,
+#: inside the group's own container, so the control plane asks for it before a
+#: replica creates a group and never before a follow-up. That is also what lets
+#: a host still on the release from before this helper had a label keep
+#: serving the groups it owns during a rolling deployment.
+FORK_HELPER = "claude-session-fork"
 SHARED_SANDBOX_HELPER_PINS = {
     "claude-agent-sdk": "0.2.148",
     # 2 forks at the historical anchor a native fork request names; the first,
     # unlabelled helper ignored the anchor and forked the latest message. This
     # pin is the whole statement that an image's fork helper may be handed an
-    # anchor -- there is no separate shared-sandbox protocol number.
-    "claude-session-fork": "2",
+    # anchor; there is no separate shared-sandbox protocol number.
+    FORK_HELPER: "2",
     # The host's OpenCode/Kilo reply collector requires message-role metadata.
     "http-agent-live-bridge": "2",
     # Bumped with the observer's own protocol: the image that carries a v2
