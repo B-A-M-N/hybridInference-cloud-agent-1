@@ -48,7 +48,6 @@ _JOB = ClaimedJob(
 def _stamp() -> dict:
     return {
         "sandbox_image_digest": "sha256:shared-image",
-        "shared_sandbox_protocol": runner_mod.SHARED_SANDBOX_PROTOCOL,
         "runtime_versions": dict(runner_mod.SHARED_SANDBOX_RUNTIME_PINS),
         "runtime_versions_available": {
             key: [value] for key, value in runner_mod.SHARED_SANDBOX_RUNTIME_PINS.items()
@@ -162,6 +161,29 @@ def test_shared_live_attestation_requires_every_pinned_runtime_and_helper(monkey
     assert runner_mod._shared_live_host_capabilities(ContainerBackend(image="img"), stamp) == []
     del stamp["helper_versions"][helper_id]
     assert runner_mod._shared_live_host_capabilities(ContainerBackend(image="img"), stamp) == []
+
+
+def test_a_claim_names_protocol_v2_for_a_control_plane_older_than_this_release(monkeypatch):
+    """Hosts roll out before the API, so a replacement runner polls the old one.
+
+    That control plane refuses every claim without the image's shared-sandbox
+    protocol, which this image no longer labels. The runner states the v2 its
+    image would have declared, and only once its own checks have passed.
+    """
+    _configure_host(monkeypatch)
+    backend = ContainerBackend(image="img")
+    monkeypatch.setattr(backend, "version_stamp", _stamp)
+    assert runner_mod._claim_attestation(backend)["shared_sandbox_protocol"] == "v2"
+
+    def without_fork_helper() -> dict:
+        stamp = _stamp()
+        del stamp["helper_versions"]["claude-session-fork"]
+        return stamp
+
+    monkeypatch.setattr(backend, "version_stamp", without_fork_helper)
+    refused = runner_mod._claim_attestation(backend)
+    assert refused["runner_capabilities"] == []
+    assert "shared_sandbox_protocol" not in refused
 
 
 def test_shared_live_attestation_refuses_a_non_container_backend(monkeypatch):

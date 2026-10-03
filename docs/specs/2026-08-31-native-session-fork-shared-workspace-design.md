@@ -397,7 +397,7 @@ host must provide:
 - an enrolled host credential and fresh heartbeat;
 - an authenticated workspace broker URL reachable by the control plane;
 - the expected Docker data root and sandbox image digest;
-- exact runtime/helper versions and shared protocol attestation;
+- exact runtime/helper versions;
 - `native-fork-at-anchor-v1` from the current host image, with that image
   digest equal to the immutable digest of the retained group;
 - at least two host slots and enough runner replicas to execute fork siblings
@@ -417,8 +417,10 @@ host currently eligible to materialize a new chat. It also reverse-probes every
 online host that still owns a non-lost retained group, even when new-chat
 placement has moved elsewhere. Such an owner may remain on an older compatible
 generation for ordinary follow-ups; it does not need to claim new chats or
-advertise historical Fork. The scheduler admits that reviewed v1 tuple only to
-an existing group owned by that host; creating a new group still requires v2.
+advertise historical Fork. The scheduler admits such a replica only to an
+existing group owned by that host, and does not ask its image for the fork
+helper, which an ordinary turn never runs; creating a new group still
+requires the pinned fork helper.
 This runtime fence, not a serial Actions dependency, establishes
 host-before-new-API compatibility. Failure stops the rollout; it never falls
 back to an older sandbox path.
@@ -467,9 +469,10 @@ feature switches. Names such as `shared-sandbox-v1` are protocol/capability
 identifiers used for exact claim attestation, not behavior toggles. The
 deployment-SHA marker is likewise a rolling-compatibility fence and cannot
 select another executor. Historical fork has its own
-`native-fork-at-anchor-v1` attestation. The shared protocol is v2 for new
-images; a v1 retained container may keep serving ordinary follow-ups, but its
-older helpers cannot receive an at-anchor request. The control plane exposes
+`native-fork-at-anchor-v1` attestation, and the in-image helper that
+interprets the anchor is pinned by its own version label
+(`claude-session-fork`) beside the other helpers; there is no separate
+shared-sandbox protocol number. The control plane exposes
 Fork only when the host advertises that capability and its current sandbox
 image digest matches the group's pinned digest, so an upgrade fails closed
 instead of silently forking the latest provider message.
