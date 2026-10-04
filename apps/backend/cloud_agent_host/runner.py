@@ -3059,38 +3059,53 @@ def _serve_turn(
     process could fail at without consequence belongs above the answer, and
     everything a user or an operator could notice belongs below it.
 
-    Preflight is above it for exactly that reason. It observes Docker, the
-    image and the network and changes nothing, so failing it means the turn
-    has not begun — and answering first would instead strand that turn behind
+    Preflight is above it for exactly that reason. It checks Docker, the
+    image and the network without running the turn, so failing it means the
+    turn has not begun — and answering first would instead strand that turn behind
     a lease it will never use, having spent one of its attempts.
     """
     # Drained first, and before anything slow, so the host is never left
     # blocked writing a long prompt into a pipe this process has not read yet.
     raw = sys.stdin.read()
+    # Recover only the parent's optional timing selection before preflight.
+    # This does not accept the turn or reserve a slot: declined children
+    # discard their timing without emitting, and the host retains its budget.
+    # Malformed measurement metadata must never prevent the actual probe or
+    # the turn; it merely leaves this child unmeasured.
+    payload = None
+    measurement = None
+    with contextlib.suppress(Exception):
+        payload = decode_turn(raw)
+        if payload is not None:
+            measurement = operation_profiling.attach_selection(payload.get("_profiling"))
 
-    # Then the read-only probe of Docker, the image and the network. It runs
-    # before the payload is even looked at so that a turn process started with
-    # nothing on its input still proves this machine could have run one, which
-    # is what the deployment check needs of it.
+    # Probe Docker, the image and the network before validating or accepting
+    # the turn. Empty or malformed input still exercises the full preflight,
+    # which is what the deployment check needs of this process.
+    operation_profiling.mark(measurement, "preflight")
     try:
-        backend = build_backend_from_env()
-        backend.preflight()
+        with operation_profiling.span(measurement, "preflight"):
+            backend = build_backend_from_env()
+            backend.preflight()
     except Exception as exc:
         # Non-zero: the deployment check reads this exit status, and an image
         # that cannot run turns has to fail a rollout rather than pass it. For
         # a real turn the host puts it straight back and, after a run of these,
         # stops claiming and says why — so a machine in this state costs the
         # queue nothing while somebody fixes it.
+        operation_profiling.discard(measurement)
         write_handover(handover_fd, f"{HANDOVER_DECLINED} {exc}")
         return 2
 
-    payload = decode_turn(raw)
+    operation_profiling.mark(measurement, "handover")
     if payload is None:
+        operation_profiling.discard(measurement)
         write_handover(handover_fd, f"{HANDOVER_DECLINED} no turn was delivered")
         return 0
     try:
         job = ClaimedJob.from_response(payload)
     except (KeyError, TypeError, ValueError) as exc:
+        operation_profiling.discard(measurement)
         write_handover(handover_fd, f"{HANDOVER_DECLINED} unusable turn ({type(exc).__name__})")
         return 0
 
@@ -3101,12 +3116,8 @@ def _serve_turn(
     # it did when a replica ran one job at a time.
     _drain_on_sigterm()
     write_handover(handover_fd, f"{HANDOVER_ACCEPTED} {job.job_id}")
-    # Everything worth measuring happens *below* the answer, so the selection
-    # the host made has to be reattached here and not before it: timing a turn
-    # this process then declines would report a startup that never ran. The
-    # slot belongs to the host, so an unusable selection simply means this
-    # child does not measure -- it never means the turn is refused.
-    measurement = operation_profiling.attach_selection(payload.get("_profiling"))
+    # Only an accepted turn can finish and deliver the inherited measurement,
+    # now including the preflight the user waited through before this answer.
     return run_turn(
         job,
         base_url=base_url,

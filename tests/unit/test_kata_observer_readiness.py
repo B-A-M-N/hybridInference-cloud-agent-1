@@ -174,10 +174,17 @@ def test_kata_exec_delivers_eof_and_preserves_input_and_literal_arguments(monkey
         "member_cleanup",
         "marker",
         "marker_transport",
+        "kernel_missing",
+        "kernel_empty",
+        "kernel_type",
+        "kernel_shared",
+        "status_type",
     ],
 )
 def test_readiness_requires_events_and_member_isolation_and_cleans_up(monkeypatch, failure):
     manager = _manager()
+    manager.backend.image = "registry.example/sandbox@sha256:abc"
+    monkeypatch.setattr(chat_sandbox.os, "uname", lambda: SimpleNamespace(release="host-kernel"))
     calls = []
     privileged_calls = []
     cleanup_calls = []
@@ -193,9 +200,26 @@ def test_readiness_requires_events_and_member_isolation_and_cleans_up(monkeypatc
                 returncode=int(failure == "member_cleanup"), stdout=b"", stderr=b"cleanup failed"
             )
         if argv[0] == "python3":
-            status = {"uid": 10001, "nnp": 1, "seccomp": 2, "effective": 0, "permitted": 0}
+            status = {
+                "kernel": "guest-kernel",
+                "uid": 10001,
+                "nnp": 1,
+                "seccomp": 2,
+                "effective": 0,
+                "permitted": 0,
+            }
             if failure in {"seccomp", "nnp", "effective"}:
                 status[failure] = 0 if failure != "effective" else 1
+            if failure == "kernel_missing":
+                del status["kernel"]
+            elif failure == "kernel_empty":
+                status["kernel"] = ""
+            elif failure == "kernel_type":
+                status["kernel"] = 42
+            elif failure == "kernel_shared":
+                status["kernel"] = "host-kernel"
+            elif failure == "status_type":
+                return SimpleNamespace(returncode=0, stdout=b"[]", stderr=b"")
             return SimpleNamespace(returncode=0, stdout=json.dumps(status).encode(), stderr=b"")
         return SimpleNamespace(
             returncode=int(failure == "marker"), stdout=b"freeinference-tool-mark-v1\n", stderr=b""
@@ -235,20 +259,33 @@ def test_readiness_requires_events_and_member_isolation_and_cleans_up(monkeypatc
         ),
     )
     if failure is None:
-        manager.probe_guest_observer()
+        assert manager.probe_guest_observer() == "guest-kernel"
     else:
         with pytest.raises(SandboxError):
             manager.probe_guest_observer()
     assert calls[0][calls[0].index("--network") + 1] == "none"
     assert calls[-1][1:3] == ["rm", "--force"]
     created = [call for call in calls if call[1:2] == ["create"]]
+    assert created[0][created[0].index("--runtime") + 1] == KATA_RUNTIME
+    assert created[0][created[0].index("--entrypoint") + 2] == "registry.example/sandbox@sha256:abc"
     assert calls[-1][-1] == created[-1][created[-1].index("--name") + 1]
-    if failure not in {"seccomp", "nnp", "effective"}:
+    early_failure = failure in {
+        "seccomp",
+        "nnp",
+        "effective",
+        "kernel_missing",
+        "kernel_empty",
+        "kernel_type",
+        "kernel_shared",
+        "status_type",
+    }
+    if not early_failure:
         assert cleanup_calls[0][0] == [MEMBER_REAPER_TARGET, "reap", str(MEMBER_UID_BASE)]
         assert cleanup_calls[0][1]["input_bytes"] == b""
         assert cleanup_calls[0][1]["user_uid"] == MEMBER_UID_BASE
-    if failure in {"seccomp", "nnp", "effective", "member_cleanup"}:
+    if early_failure or failure == "member_cleanup":
         assert privileged_calls == []
+        assert len(created) == 1, "deterministic isolation failures must not be retried"
     else:
         # A lost race is retried on a sandbox of its own, so the self-test runs
         # once per attempt; everything else answers the same way every time and
@@ -260,10 +297,10 @@ def test_readiness_requires_events_and_member_isolation_and_cleans_up(monkeypatc
 
 def test_backend_refuses_claim_readiness_when_observer_probe_fails(monkeypatch):
     backend = _manager().backend
+    backend._kernel_probe["guest_kernel"] = "previous-guest-kernel"
     monkeypatch.setattr(
         "cloud_agent_host.sandbox.subprocess.run", lambda *a, **kw: SimpleNamespace(returncode=0)
     )
-    monkeypatch.setattr(backend, "_probe_kernel_boundary", lambda: None)
 
     def refuse(self):
         raise SandboxError("no real lifecycle events")
@@ -271,6 +308,7 @@ def test_backend_refuses_claim_readiness_when_observer_probe_fails(monkeypatch):
     monkeypatch.setattr(ChatSandboxManager, "probe_guest_observer", refuse)
     with pytest.raises(SandboxError, match="no real lifecycle events"):
         backend.preflight()
+    assert backend._kernel_probe["guest_kernel"] is None
 
 
 @pytest.mark.parametrize(
@@ -490,7 +528,14 @@ def _probe_stubs(monkeypatch, manager, *, cursor, observations):
         if argv[0] == MEMBER_REAPER_TARGET:
             return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
         if argv[0] == "python3":
-            status = {"uid": 10001, "nnp": 1, "seccomp": 2, "effective": 0, "permitted": 0}
+            status = {
+                "kernel": "guest-kernel",
+                "uid": 10001,
+                "nnp": 1,
+                "seccomp": 2,
+                "effective": 0,
+                "permitted": 0,
+            }
             return SimpleNamespace(returncode=0, stdout=json.dumps(status).encode(), stderr=b"")
         return SimpleNamespace(returncode=0, stdout=b"freeinference-tool-mark-v1\n", stderr=b"")
 

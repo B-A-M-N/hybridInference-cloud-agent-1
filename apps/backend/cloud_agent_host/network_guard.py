@@ -57,6 +57,23 @@ _HELPER_TIMEOUT_S = 60
 _RULE = re.compile(r"^add rule (\w+) (\S+) (\w+) ")
 _BASE_CHAIN = re.compile(r"^add chain (\w+) (\S+) (\w+) \{ type filter hook (\w+) ")
 
+# Reads still execute independently and in order, but share one disposable
+# helper. No shell, persistent helper or cached kernel state is involved.
+_NFT_LIST_BATCH = """
+import json
+import subprocess
+import sys
+
+listings = []
+for args in json.load(sys.stdin):
+    result = subprocess.run(["nft", "-j", *args], capture_output=True, text=True)
+    if result.returncode:
+        sys.stderr.write(result.stderr or result.stdout)
+        sys.exit(1)
+    listings.append(json.loads(result.stdout))
+json.dump(listings, sys.stdout)
+"""
+
 Runner = Callable[[list[str], str | None], subprocess.CompletedProcess[str]]
 
 
@@ -141,8 +158,9 @@ class HostNetworkGuard:
             self._verified_at = None
             rendered = render_ruleset(self.network)
             self._nft(["-f", "-"], stdin=rendered)
-            self._verify(rendered)
-            self._refuse_overlapping_pools()
+            listings = self._list_many([*self._verification_reads(), ["list", "tables", "inet"]])
+            self._verify(rendered, listings=listings[:-1])
+            self._refuse_overlapping_pools(listing=listings[-1])
             self._refuse_overlapping_routes()
             self._verified_at = time.monotonic()
 
@@ -159,8 +177,8 @@ class HostNetworkGuard:
             wanted = {(bridge, address, port) for address, port in endpoints}
             remove: dict[str, list[tuple[str, str, int]]] = {}
             add: set[tuple[str, str, int]] = set()
-            for family in RELAY_FAMILIES:
-                current = {element for element in self._relay_set(family) if element[0] == bridge}
+            for family, elements in self._relay_sets().items():
+                current = {element for element in elements if element[0] == bridge}
                 if doomed := sorted(current - wanted):
                     remove[family] = doomed
                 add |= wanted - current
@@ -175,19 +193,25 @@ class HostNetworkGuard:
         """The exceptions both tables currently hold for one bridge."""
         with self._lock:
             held = [
-                {
-                    (address, port)
-                    for owner, address, port in self._relay_set(family)
-                    if owner == bridge
-                }
-                for family in RELAY_FAMILIES
+                {(address, port) for owner, address, port in elements if owner == bridge}
+                for elements in self._relay_sets().values()
             ]
         return held[0] & held[1]
 
     # ── verification ────────────────────────────────────────────────────
 
-    def _verify(self, rendered: str) -> None:
+    def _verification_reads(self) -> list[list[str]]:
         table = self.network.table
+        return [
+            *(["list", "table", family, table] for family in RELAY_FAMILIES),
+            ["list", "set", "inet", table, "protected4"],
+            ["list", "set", "inet", table, "pool4"],
+        ]
+
+    def _verify(self, rendered: str, *, listings: list[list[Any]] | None = None) -> None:
+        table = self.network.table
+        if listings is None:
+            listings = self._list_many(self._verification_reads())
         expected_rules: dict[tuple[str, str], int] = {}
         expected_hooks: dict[tuple[str, str], str] = {}
         for line in rendered.splitlines():
@@ -198,8 +222,7 @@ class HostNetworkGuard:
                 family, _, chain, hook = match.groups()
                 expected_hooks[(family, chain)] = hook
 
-        for family in RELAY_FAMILIES:
-            listing = self._list(["list", "table", family, table])
+        for family, listing in zip(RELAY_FAMILIES, listings[:-2], strict=True):
             chains = {
                 item["chain"]["name"]: item["chain"]
                 for item in listing
@@ -228,14 +251,14 @@ class HostNetworkGuard:
                         f"{family} {table} chain {chain!r} is not hooked on {hook!r}"
                     )
 
-        protected = _networks(self._set_elements("inet", table, "protected4"))
+        protected = _networks(self._set_elements(listings[-2], "inet", table, "protected4"))
         if protected != list(ipaddress.collapse_addresses(self.network.protected)):
             raise NetworkGuardError(f"inet {table} protects {protected}, not the configured set")
-        pool = _networks(self._set_elements("inet", table, "pool4"))
+        pool = _networks(self._set_elements(listings[-1], "inet", table, "pool4"))
         if pool != [self.network.pool]:
             raise NetworkGuardError(f"inet {table} registers pool {pool}, not {self.network.pool}")
 
-    def _refuse_overlapping_pools(self) -> None:
+    def _refuse_overlapping_pools(self, *, listing: list[Any]) -> None:
         """Refuse to run beside an earlier deployment whose pool overlaps ours.
 
         Earlier is the table the kernel created first (a lower handle). The
@@ -246,16 +269,16 @@ class HostNetworkGuard:
         """
         own = self.network.table
         tables: dict[str, int] = {}
-        for item in self._list(["list", "tables", "inet"]):
+        for item in listing:
             table = item.get("table") if isinstance(item, dict) else None
             if isinstance(table, dict) and str(table.get("name", "")).startswith(TABLE_PREFIX):
                 tables[str(table["name"])] = int(table.get("handle", 0))
         if own not in tables:
             raise NetworkGuardError(f"inet {own} disappeared while it was being checked")
-        for name, handle in tables.items():
-            if name == own or handle > tables[own]:
-                continue
-            for neighbour in _networks(self._set_elements("inet", name, "pool4")):
+        earlier = [name for name, handle in tables.items() if name != own and handle <= tables[own]]
+        listings = self._list_many([["list", "set", "inet", name, "pool4"] for name in earlier])
+        for name, listing in zip(earlier, listings, strict=True):
+            for neighbour in _networks(self._set_elements(listing, "inet", name, "pool4")):
                 if neighbour.overlaps(self.network.pool):
                     raise NetworkGuardError(
                         f"this deployment's pool {self.network.pool} overlaps {neighbour}, "
@@ -307,26 +330,41 @@ class HostNetworkGuard:
 
     # ── nft through the helper ─────────────────────────────────────────
 
-    def _relay_set(self, family: str) -> set[tuple[str, str, int]]:
-        return _relay_elements(self._set_elements(family, self.network.table, "relays"))
+    def _relay_sets(self) -> dict[str, set[tuple[str, str, int]]]:
+        table = self.network.table
+        listings = self._list_many(
+            [["list", "set", family, table, "relays"] for family in RELAY_FAMILIES]
+        )
+        return {
+            family: _relay_elements(self._set_elements(listing, family, table, "relays"))
+            for family, listing in zip(RELAY_FAMILIES, listings, strict=True)
+        }
 
-    def _set_elements(self, family: str, table: str, name: str) -> list[Any]:
-        for item in self._list(["list", "set", family, table, name]):
+    @staticmethod
+    def _set_elements(listing: list[Any], family: str, table: str, name: str) -> list[Any]:
+        for item in listing:
             if isinstance(item, dict) and "set" in item:
                 elements = item["set"].get("elem") or []
                 return elements if isinstance(elements, list) else [elements]
         raise NetworkGuardError(f"{family} {table} has no set {name!r}")
 
-    def _list(self, argv: list[str]) -> list[Any]:
-        result = self._nft(["-j", *argv])
+    def _list_many(self, commands: list[list[str]]) -> list[list[Any]]:
+        if not commands:
+            return []
+        result = self._helper("python3", ["-c", _NFT_LIST_BATCH], stdin=json.dumps(commands))
         try:
-            payload = json.loads(result.stdout or "{}")
+            payloads = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
             raise NetworkGuardError("nft returned unreadable JSON") from exc
-        items = payload.get("nftables") if isinstance(payload, dict) else None
-        if not isinstance(items, list):
+        if not isinstance(payloads, list) or len(payloads) != len(commands):
             raise NetworkGuardError("nft returned an unexpected listing")
-        return items
+        listings: list[list[Any]] = []
+        for payload in payloads:
+            items = payload.get("nftables") if isinstance(payload, dict) else None
+            if not isinstance(items, list):
+                raise NetworkGuardError("nft returned an unexpected listing")
+            listings.append(items)
+        return listings
 
     def _nft(
         self, args: list[str], *, stdin: str | None = None

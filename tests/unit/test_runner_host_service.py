@@ -484,7 +484,8 @@ def test_a_bad_default_limit_is_a_startup_error_naming_the_variable(service, mon
 # ── The child ──────────────────────────────────────────────────────────
 
 
-def test_a_turn_process_declines_an_empty_delivery_and_runs_nothing(monkeypatch, capsys):
+@pytest.mark.parametrize("raw", ["", "{", "[]"])
+def test_a_turn_process_declines_an_empty_delivery_and_runs_nothing(monkeypatch, raw):
     """What the deployment check exercises, and what a hand-started process does.
 
     It declines, but only after preflighting — so a rollout that runs this
@@ -494,7 +495,7 @@ def test_a_turn_process_declines_an_empty_delivery_and_runs_nothing(monkeypatch,
     import os
 
     read_fd, write_fd = os.pipe()
-    monkeypatch.setattr("sys.stdin", __import__("io").StringIO(""))
+    monkeypatch.setattr("sys.stdin", __import__("io").StringIO(raw))
     ran: list[str] = []
     monkeypatch.setattr(runner_mod, "run_turn", lambda *a, **k: ran.append("ran") or 0)
     preflighted: list[str] = []
@@ -568,7 +569,8 @@ def test_a_turn_process_accepts_before_it_runs_the_turn(monkeypatch):
     os.close(read_fd)
 
 
-def test_a_turn_process_declines_when_its_backend_is_not_usable(monkeypatch):
+@pytest.mark.parametrize("empty_delivery", [False, True])
+def test_a_turn_process_declines_when_its_backend_is_not_usable(monkeypatch, empty_delivery):
     """Preflight is a read-only probe, so it belongs before the acceptance.
 
     Failing it afterwards would strand the turn: the host has been told the
@@ -595,7 +597,9 @@ def test_a_turn_process_declines_when_its_backend_is_not_usable(monkeypatch):
         "worker_token": "ajt.a.b",
         "sandbox_token": "grant",
     }
-    monkeypatch.setattr("sys.stdin", io.StringIO(encode_turn(payload).decode()))
+    monkeypatch.setattr(
+        "sys.stdin", io.StringIO("" if empty_delivery else encode_turn(payload).decode())
+    )
     ran: list[str] = []
     monkeypatch.setattr(runner_mod, "run_turn", lambda *a, **k: ran.append("ran") or 0)
 
@@ -900,12 +904,16 @@ def test_a_turn_process_reattaches_the_selection_it_was_handed(monkeypatch):
     """The child times the turn; it does not select one or spend a slot."""
     import io
     import os
+    import time
 
     from cloud_agent_host.host_runtime import encode_turn
     from cloud_agent_shared import operation_profiling
 
     _run_descriptor(monkeypatch)
+    clock = [time.monotonic_ns()]
+    monkeypatch.setattr(operation_profiling.time, "monotonic_ns", lambda: clock[0])
     read_fd, write_fd = os.pipe()
+    os.set_blocking(read_fd, False)
     payload = {
         "job_id": "ajob_1",
         "thread_id": "athr_1",
@@ -923,6 +931,7 @@ def test_a_turn_process_reattaches_the_selection_it_was_handed(monkeypatch):
             "operation": "attempt.startup",
             "producer": "runner",
             "coverage_scope": "host_startup",
+            "started_mono_ns": clock[0] - 1_000_000_000,
             "facts": {"operation": "attempt.startup", "job_id": "ajob_1"},
             "call_id": "",
             "expires_at": __import__("time").time() + 600,
@@ -932,10 +941,20 @@ def test_a_turn_process_reattaches_the_selection_it_was_handed(monkeypatch):
     backend = ProcessBackend(acknowledged_unsafe=True)
     monkeypatch.setattr(runner_mod, "build_backend_from_env", lambda: backend)
 
+    def preflight(**_kwargs: Any) -> None:
+        # Measuring early must not move acceptance ahead of the actual check.
+        with pytest.raises(BlockingIOError):
+            os.read(read_fd, 256)
+        clock[0] += 5_000_000_000
+
+    monkeypatch.setattr(backend, "preflight", preflight)
+
     handed: list[Any] = []
 
     def _capture(*_args: Any, **kwargs: Any) -> int:
+        assert os.read(read_fd, 256).decode().strip() == "accepted ajob_1"
         handed.append(kwargs.get("measurement"))
+        operation_profiling.mark(kwargs.get("measurement"), "validate")
         return 0
 
     monkeypatch.setattr(runner_mod, "run_turn", _capture)
@@ -960,17 +979,28 @@ def test_a_turn_process_reattaches_the_selection_it_was_handed(monkeypatch):
     assert measurement.reserved is False, "the slot belongs to the host that claimed it"
     assert measurement.facts["job_id"] == "ajob_1"
     assert measurement.coverage_scope == "host_startup"
+    record = operation_profiling.to_record(measurement, outcome="dispatched")
+    assert record["duration_us"] == 6_000_000, "the parent's start is still the total boundary"
+    preflight_span = next(item for item in record["spans"] if item["name"] == "preflight")
+    assert preflight_span["start_offset_us"] == 1_000_000
+    assert preflight_span["duration_us"] == 5_000_000
+    preflight_stage = next(item for item in record["stages"] if item["stage"] == "preflight")
+    assert preflight_stage["duration_us"] == 5_000_000
     os.close(read_fd)
     operation_profiling.reset_cache()
 
 
-def test_a_child_never_refuses_a_turn_over_an_unusable_selection(monkeypatch):
+@pytest.mark.parametrize("selection", [None, "invalid", "another_run", "malformed_facts"])
+def test_a_child_never_refuses_a_turn_over_an_unusable_selection(monkeypatch, selection):
     """A measurement setting is not a reason to drop a user's turn."""
     import io
     import os
+    import time
 
     from cloud_agent_host.host_runtime import encode_turn
+    from cloud_agent_shared import operation_profiling
 
+    _run_descriptor(monkeypatch)
     read_fd, write_fd = os.pipe()
     payload = {
         "job_id": "ajob_1",
@@ -983,13 +1013,24 @@ def test_a_child_never_refuses_a_turn_over_an_unusable_selection(monkeypatch):
         "model": "m",
         "worker_token": "ajt.a.b",
         "sandbox_token": "grant",
-        # A run this process is not configured for: nothing may be measured,
-        # and the turn still runs.
-        "_profiling": {"run_id": "another-run", "expires_at": 2**31},
+        "_profiling": selection,
     }
+    if selection == "another_run":
+        payload["_profiling"] = {"run_id": "another-run", "expires_at": 2**31}
+    elif selection == "malformed_facts":
+        # Otherwise valid, but attach_selection cannot read this facts shape.
+        # Metadata errors must not bypass preflight or prevent the user turn.
+        payload["_profiling"] = {
+            "run_id": "run-1",
+            "operation": "attempt.startup",
+            "expires_at": time.time() + 600,
+            "facts": ["malformed"],
+        }
     monkeypatch.setattr("sys.stdin", io.StringIO(encode_turn(payload).decode()))
     backend = ProcessBackend(acknowledged_unsafe=True)
     monkeypatch.setattr(runner_mod, "build_backend_from_env", lambda: backend)
+    preflighted: list[str] = []
+    monkeypatch.setattr(backend, "preflight", lambda **_kw: preflighted.append("yes"))
     handed: list[Any] = []
     monkeypatch.setattr(
         runner_mod, "run_turn", lambda *a, **k: handed.append(k.get("measurement")) or 0
@@ -1007,7 +1048,95 @@ def test_a_child_never_refuses_a_turn_over_an_unusable_selection(monkeypatch):
 
     assert code == 0
     assert handed == [None], "the turn runs, unmeasured"
+    assert preflighted == ["yes"]
+    assert os.read(read_fd, 256).decode().strip() == "accepted ajob_1"
     os.close(read_fd)
+    operation_profiling.reset_cache()
+
+
+@pytest.mark.parametrize("failure", ["preflight", "payload"])
+def test_a_declining_child_does_not_emit_or_refund_the_parent_selection(monkeypatch, failure):
+    """Only the parent decides how to report a handover that never succeeded."""
+    import io
+    import os
+
+    from cloud_agent_host.host_runtime import encode_turn
+    from cloud_agent_host.sandbox import SandboxError
+    from cloud_agent_shared import operation_profiling
+
+    _run_descriptor(monkeypatch, max_operations=1)
+    parent = operation_profiling.start_operation(
+        operation=operation_profiling.STARTUP_OPERATION, host="host-a"
+    )
+    assert parent is not None
+    payload = {
+        "job_id": "ajob_1",
+        "thread_id": "athr_1",
+        "attempt_id": 7,
+        "attempt_no": 1,
+        "repo": "o/n",
+        "task_prompt": "do it",
+        "runtime": "claude-code",
+        "model": "m",
+        "worker_token": "ajt.a.b",
+        "sandbox_token": "grant",
+    }
+    assert runner_mod._bound_measurement(parent, payload) is parent
+    payload["_profiling"] = operation_profiling.handoff_context(parent)
+    if failure == "payload":
+        del payload["thread_id"]
+    monkeypatch.setattr("sys.stdin", io.StringIO(encode_turn(payload).decode()))
+    inherited: list[Any] = []
+    attach = operation_profiling.attach_selection
+
+    def capture_selection(context: Any) -> Any:
+        child = attach(context)
+        inherited.append(child)
+        return child
+
+    monkeypatch.setattr(operation_profiling, "attach_selection", capture_selection)
+    monkeypatch.setattr(
+        operation_profiling,
+        "finish",
+        lambda *a, **k: pytest.fail("a declining child must not emit a startup"),
+    )
+    monkeypatch.setattr(
+        runner_mod, "run_turn", lambda *a, **k: pytest.fail("a declining child must not execute")
+    )
+    backend = ProcessBackend(acknowledged_unsafe=True)
+
+    def preflight(**_kwargs: Any) -> None:
+        if failure == "preflight":
+            raise SandboxError("unavailable")
+
+    monkeypatch.setattr(backend, "preflight", preflight)
+    monkeypatch.setattr(runner_mod, "build_backend_from_env", lambda: backend)
+    read_fd, write_fd = os.pipe()
+    code = runner_mod._serve_turn(
+        handover_fd=write_fd,
+        base_url="http://control",
+        gateway_url="http://gateway",
+        worker_id="runner-a",
+        lease_ttl=120.0,
+        agent_timeout_s=3600.0,
+        host="host-a",
+    )
+
+    assert code == (2 if failure == "preflight" else 0)
+    assert os.read(read_fd, 256).decode().startswith("declined")
+    os.close(read_fd)
+    assert len(inherited) == 1 and inherited[0] is not None
+    assert inherited[0].finished and not inherited[0].selected
+    assert inherited[0].reserved is False
+    assert parent.reserved and not parent.finished
+    assert (
+        operation_profiling.start_operation(
+            operation=operation_profiling.STARTUP_OPERATION, host="host-a"
+        )
+        is None
+    ), "discarding an inherited selection must not refund the parent's only slot"
+    operation_profiling.discard(parent)
+    operation_profiling.reset_cache()
 
 
 def test_a_poll_that_claimed_nothing_spends_no_slot(monkeypatch):

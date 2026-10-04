@@ -22,6 +22,16 @@ pins. A failure leaves the old marker and runners alone. The checks on the
 actual replacement runners, relays and broker still run before mark-ready;
 their failure uses the existing recorded-generation recovery.
 
+Each turn still completes a fresh preflight before accepting its handover.
+The Kata probe reads the guest kernel from the same temporary container that
+exercises member isolation and observer delivery, avoiding a second VM boot.
+Network rule reads share a disposable helper; route reads keep their separate,
+capability-free helper. These changes do not cache qualification across turns
+or change the checks, guard recheck interval, network policy, or failure handling.
+Selected startup measurements now attribute this work to a `preflight` stage;
+the total remains claim request to prompt dispatch, excluding queue wait and
+model response time. Declined children do not publish a successful startup.
+
 CI additionally runs the same candidate check on the real Kata host for
 reviewed commits on `dev`, before `CI Gate` can release the staging workflow.
 It builds uniquely tagged candidate images and never invokes Compose on the

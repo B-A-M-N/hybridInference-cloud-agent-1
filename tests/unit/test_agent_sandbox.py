@@ -203,9 +203,19 @@ def test_the_process_env_does_inherit_the_host(monkeypatch):
 
 
 def test_container_preflight_proves_guest_kernel_with_the_exact_runtime_and_image(monkeypatch):
-    # Observer/isolation failures have their own behavioural tests.
+    # The combined probe's container flags and failure modes are exercised in
+    # test_kata_observer_readiness. This checks the exact configured backend
+    # supplies the evidence preflight advertises, without another VM boot.
+    probed: list[ContainerBackend] = []
+
+    def observer_probe(manager):
+        probed.append(manager.backend)
+        assert manager.backend.runtime == KATA_RUNTIME
+        assert manager.backend.image == "registry.example/sandbox@sha256:abc"
+        return "guest-kernel"
+
     monkeypatch.setattr(
-        "cloud_agent_host.chat_sandbox.ChatSandboxManager.probe_guest_observer", lambda self: None
+        "cloud_agent_host.chat_sandbox.ChatSandboxManager.probe_guest_observer", observer_probe
     )
     calls: list[list[str]] = []
     monkeypatch.setattr(sandbox_mod.os, "uname", lambda: SimpleNamespace(release="host-kernel"))
@@ -234,12 +244,32 @@ def test_container_preflight_proves_guest_kernel_with_the_exact_runtime_and_imag
 
     backend.preflight()
 
-    probe = next(argv for argv in calls if argv[1] == "run")
-    assert probe[probe.index("--runtime") + 1] == KATA_RUNTIME
-    assert probe[probe.index("--entrypoint") + 2] == "registry.example/sandbox@sha256:abc"
+    assert probed == [backend]
+    assert not any(argv[1] == "run" for argv in calls), "the observer supplies the kernel proof"
     stamp = backend.version_stamp()
     assert stamp["host_kernel"] == "host-kernel"
     assert stamp["guest_kernel"] == "guest-kernel"
+
+
+@pytest.mark.parametrize("guest_kernel", [None, "", "host-kernel"])
+def test_combined_preflight_never_attests_missing_or_shared_kernel(monkeypatch, guest_kernel):
+    monkeypatch.setattr(sandbox_mod.os, "uname", lambda: SimpleNamespace(release="host-kernel"))
+    monkeypatch.setattr(
+        sandbox_mod.subprocess,
+        "run",
+        lambda argv, **kwargs: SimpleNamespace(returncode=0, stdout="27.0\n", stderr=""),
+    )
+    monkeypatch.setattr(
+        "cloud_agent_host.chat_sandbox.ChatSandboxManager.probe_guest_observer",
+        lambda self: guest_kernel,
+    )
+    backend = ContainerBackend(image="img:1", runtime=KATA_RUNTIME)
+    backend._kernel_probe["guest_kernel"] = "previous-guest-kernel"
+
+    with pytest.raises(SandboxError, match=r"guest kernel|reported the host kernel"):
+        backend.preflight(check_network=False)
+
+    assert backend._kernel_probe == {"host_kernel": "host-kernel", "guest_kernel": None}
 
 
 @pytest.mark.parametrize(

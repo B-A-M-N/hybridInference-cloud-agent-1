@@ -8,9 +8,11 @@ external tier runs the same guard against a real kernel.
 
 from __future__ import annotations
 
+import io
 import json
 import re
 import subprocess
+import sys
 from typing import Any
 
 import pytest
@@ -55,6 +57,13 @@ class FakeNft:
             assert args == ["-4", "-j", "route", "show", "table", "all"], args
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.routes), "")
         try:
+            if entrypoint == "python3":
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    json.dumps([self.listing(command) for command in json.loads(stdin or "[]")]),
+                    "",
+                )
             if args[:2] == ["-f", "-"]:
                 self.apply(stdin or "")
                 return subprocess.CompletedProcess(argv, 0, "", "")
@@ -62,6 +71,13 @@ class FakeNft:
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.listing(args[1:])), "")
         except KeyError as exc:
             return subprocess.CompletedProcess(argv, 1, "", f"No such file or directory: {exc}")
+
+    def transactions(self) -> list[tuple[list[str], str | None]]:
+        return [
+            (argv, stdin)
+            for argv, stdin in self.calls
+            if "--entrypoint" in argv and argv[argv.index("--entrypoint") + 1] == "nft" and stdin
+        ]
 
     def table(self, family: str, name: str) -> dict[str, Any]:
         return self.tables[(family, name)]
@@ -176,11 +192,49 @@ def test_ensure_installs_both_tables_and_trusts_the_result_for_a_while() -> None
     network = guard.network
     guard.ensure()
     assert {("inet", network.table), ("bridge", network.table)} <= set(nft.tables)
-    installs = sum(1 for _, stdin in nft.calls if stdin)
+    installs = len(nft.transactions())
     guard.ensure()
-    assert sum(1 for _, stdin in nft.calls if stdin) == installs, "a fresh check is reused"
+    assert len(nft.transactions()) == installs, "a fresh check is reused"
     guard.ensure(max_age_s=0)
-    assert sum(1 for _, stdin in nft.calls if stdin) == installs + 1
+    assert len(nft.transactions()) == installs + 1
+
+
+def test_ensure_batches_nft_readback_after_install_and_keeps_routes_unprivileged() -> None:
+    nft = FakeNft()
+    guard = _guard(nft)
+    guard.ensure()
+    assert [argv[argv.index("--entrypoint") + 1] for argv, _ in nft.calls] == [
+        "nft",
+        "python3",
+        "ip",
+    ]
+    command, stdin = nft.calls[1]
+    assert json.loads(stdin or "[]") == [
+        ["list", "table", "inet", guard.network.table],
+        ["list", "table", "bridge", guard.network.table],
+        ["list", "set", "inet", guard.network.table, "protected4"],
+        ["list", "set", "inet", guard.network.table, "pool4"],
+        ["list", "tables", "inet"],
+    ]
+    assert command[command.index("--cap-add") + 1] == "NET_ADMIN"
+    assert "--cap-add" not in nft.calls[2][0]
+
+
+def test_relay_reads_share_one_helper_without_a_write_when_unchanged() -> None:
+    nft = FakeNft()
+    guard = _guard(nft)
+    guard.ensure()
+    bridge = guard.network.bridge_name("freeinference-chat-net-x")
+    guard.sync_relays(bridge, {("10.240.0.3", 8080)})
+    calls = len(nft.calls)
+    guard.sync_relays(bridge, {("10.240.0.3", 8080)})
+    assert len(nft.calls) == calls + 1
+    argv, stdin = nft.calls[-1]
+    assert argv[argv.index("--entrypoint") + 1] == "python3"
+    assert json.loads(stdin or "[]") == [
+        ["list", "set", "inet", guard.network.table, "relays"],
+        ["list", "set", "bridge", guard.network.table, "relays"],
+    ]
 
 
 def test_a_flushed_chain_is_detected_and_repaired() -> None:
@@ -303,9 +357,9 @@ def test_relay_exceptions_follow_the_bridge_exactly() -> None:
     guard.sync_relays(bridge, {("10.240.0.5", 8080), ("10.240.0.4", 8000)})
     assert guard.relay_endpoints(bridge) == {("10.240.0.5", 8080), ("10.240.0.4", 8000)}
     assert guard.relay_endpoints(other) == {("10.240.0.11", 8080)}, "another bridge is untouched"
-    calls = len(nft.calls)
+    transactions = len(nft.transactions())
     guard.sync_relays(bridge, {("10.240.0.5", 8080), ("10.240.0.4", 8000)})
-    assert not any(stdin for _, stdin in nft.calls[calls:]), "no transaction when nothing changed"
+    assert len(nft.transactions()) == transactions, "no transaction when nothing changed"
     guard.ensure(max_age_s=0)
     assert guard.relay_endpoints(bridge), "a reinstall keeps live exceptions"
     guard.sync_relays(bridge, set())
@@ -360,3 +414,96 @@ def test_a_failing_helper_reports_nft_stderr_and_trusts_nothing() -> None:
         guard.ensure()
     with pytest.raises(NetworkGuardError):
         guard.ensure()  # no cached success to fall back on
+
+
+def test_failed_batch_readback_invalidates_an_earlier_success() -> None:
+    nft = FakeNft()
+    guard = _guard(nft)
+    guard.ensure()
+    failures = 0
+
+    def run(argv, stdin):
+        nonlocal failures
+        if argv[argv.index("--entrypoint") + 1] == "python3":
+            failures += 1
+            return subprocess.CompletedProcess(argv, 1, "", "table disappeared")
+        return nft(argv, stdin)
+
+    guard._run = run
+    with pytest.raises(NetworkGuardError, match="table disappeared"):
+        guard.ensure(max_age_s=0)
+    with pytest.raises(NetworkGuardError, match="table disappeared"):
+        guard.ensure()
+    assert failures == 2
+
+
+def test_a_missing_relay_set_in_either_family_prevents_updates() -> None:
+    nft = FakeNft()
+    guard = _guard(nft)
+    guard.ensure()
+    del nft.table("bridge", guard.network.table)["sets"]["relays"]
+    bridge = guard.network.bridge_name("freeinference-chat-net-x")
+    transactions = len(nft.transactions())
+    with pytest.raises(NetworkGuardError, match="No such file"):
+        guard.sync_relays(bridge, {("10.240.0.3", 8080)})
+    assert len(nft.transactions()) == transactions
+    assert nft.table("inet", guard.network.table)["sets"]["relays"] == []
+
+
+def test_batch_helper_runs_nft_without_a_shell_and_returns_each_listing(monkeypatch) -> None:
+    from cloud_agent_host.network_guard import _NFT_LIST_BATCH
+
+    commands = [["list", "table", "inet", "example"], ["list", "tables", "inet"]]
+    calls: list[list[str]] = []
+    listings = [{"nftables": [{"table": {"name": "example"}}]}, {"nftables": []}]
+
+    def run(argv, *, capture_output, text):
+        assert capture_output and text
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, json.dumps(listings[len(calls) - 1]), "")
+
+    output = io.StringIO()
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(commands)))
+    monkeypatch.setattr(sys, "stdout", output)
+    exec(_NFT_LIST_BATCH, {})
+    assert calls == [["nft", "-j", *command] for command in commands]
+    assert json.loads(output.getvalue()) == listings
+
+
+def test_batch_helper_fails_without_partial_output_when_a_read_fails(monkeypatch) -> None:
+    from cloud_agent_host.network_guard import _NFT_LIST_BATCH
+
+    calls: list[list[str]] = []
+
+    def run(argv, *, capture_output, text):
+        calls.append(argv)
+        if len(calls) == 2:
+            return subprocess.CompletedProcess(argv, 1, "", "table disappeared")
+        return subprocess.CompletedProcess(argv, 0, '{"nftables": []}', "")
+
+    output, error = io.StringIO(), io.StringIO()
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps([["list", "tables", "inet"]] * 3)))
+    monkeypatch.setattr(sys, "stdout", output)
+    monkeypatch.setattr(sys, "stderr", error)
+    with pytest.raises(SystemExit) as failure:
+        exec(_NFT_LIST_BATCH, {})
+    assert failure.value.code == 1
+    assert len(calls) == 2
+    assert output.getvalue() == ""
+    assert error.getvalue() == "table disappeared"
+
+
+@pytest.mark.parametrize("output", ["not json", "{}", "[]", '[{"nftables": []}]', "[{}, {}]"])
+def test_missing_or_malformed_batch_results_are_refused(output) -> None:
+    nft = FakeNft()
+    guard = _guard(nft)
+    guard.ensure()
+
+    def run(argv, stdin):
+        return subprocess.CompletedProcess(argv, 0, output, "")
+
+    guard._run = run
+    with pytest.raises(NetworkGuardError, match="nft returned"):
+        guard.relay_endpoints(guard.network.bridge_name("freeinference-chat-net-x"))

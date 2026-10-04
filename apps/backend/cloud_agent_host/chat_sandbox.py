@@ -2815,8 +2815,8 @@ class ChatSandboxManager:
         ]
         return self._run(command, timeout=timeout_s)
 
-    def probe_guest_observer(self) -> None:
-        """Exercise retained exec isolation and real eBPF delivery before claiming.
+    def probe_guest_observer(self) -> str | None:
+        """Prove the guest kernel, retained exec isolation and real eBPF delivery.
 
         The observation stages are retried because they race a guest that is
         still starting. Everything before them is a property of the image and
@@ -2834,13 +2834,12 @@ class ChatSandboxManager:
         next day.
         """
         if self.backend.runtime != KATA_RUNTIME:
-            return
+            return None
         attempts = 0
         while True:
             attempts += 1
             try:
-                self._probe_guest_observer_once()
-                return
+                return self._probe_guest_observer_once()
             except _ObserverProbeRace as exc:
                 if attempts >= GUEST_OBSERVER_PROBE_ATTEMPTS:
                     raise SandboxError(
@@ -2853,7 +2852,7 @@ class ChatSandboxManager:
                 )
                 time.sleep(GUEST_OBSERVER_PROBE_RETRY_S)
 
-    def _probe_guest_observer_once(self) -> None:
+    def _probe_guest_observer_once(self) -> str:
         """One probe, on a sandbox of its own that is removed however it ends."""
         token = secrets.token_hex(12)
         spec = ChatSandboxSpec(
@@ -2884,7 +2883,7 @@ class ChatSandboxManager:
                     "import json, os; "
                     "s=dict(line.split(':',1) for line in open('/proc/self/status') "
                     "if ':' in line); "
-                    "print(json.dumps(dict(uid=os.getuid(), "
+                    "print(json.dumps(dict(kernel=os.uname().release, uid=os.getuid(), "
                     "nnp=int(s['NoNewPrivs']), seccomp=int(s['Seccomp']), "
                     "effective=int(s['CapEff'],16), permitted=int(s['CapPrm'],16))))",
                 ],
@@ -2897,6 +2896,13 @@ class ChatSandboxManager:
                 raise SandboxError(
                     "Kata observer probe could not inspect member isolation"
                 ) from exc
+            if not isinstance(observed, dict):
+                raise SandboxError("Kata observer probe could not inspect member isolation")
+            guest_kernel = self.backend.validate_guest_kernel(observed.pop("kernel", None))
+            # validate_guest_kernel refuses a shared kernel for Kata; keep
+            # that requirement explicit before any guest-root helper runs.
+            if guest_kernel is None:
+                raise SandboxError("Kata observer probe returned no guest kernel")
             if (
                 isolation.returncode != 0
                 or observed
@@ -2981,6 +2987,7 @@ class ChatSandboxManager:
                     f"marks={delivered!r} "
                     + (f"detail={observation.detail}" if observation.detail else "")
                 )
+            return guest_kernel
         finally:
             self._run(
                 [self.backend.docker_binary, "rm", "--force", spec.container_name], timeout=30
