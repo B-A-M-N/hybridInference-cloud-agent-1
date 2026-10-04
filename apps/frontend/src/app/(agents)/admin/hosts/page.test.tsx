@@ -4,6 +4,8 @@ import '@testing-library/jest-dom/vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import type { ReactNode } from 'react';
+
 import type { AgentRunnerHostPool } from '@/lib/api/admin';
 import type { AgentAccessApi } from '@/lib/api/session';
 import { APIError } from '@/lib/utils/errors';
@@ -44,6 +46,7 @@ vi.mock('@/lib/api/admin', () => ({
 
 import {
   drainAgentRunnerHost,
+  forgetAgentRunnerHost,
   getAgentRunnerHostCapacityHistory,
   getAgentRunnerHosts,
   removeAgentRunnerHost,
@@ -56,11 +59,33 @@ import { reasonLabel } from './capacity';
 import { formatAge, runtimeMenu } from './format';
 import AdminHostsPage from './page';
 
+// Exercise the parent's Host commands and polling through its scoped render contract.
+// ComputeResources.test verifies the real drawer selection and navigation.
+vi.mock('./ComputeResources', () => ({
+  default: ({
+    renderHostControls,
+    serverGroups,
+    placementControl,
+  }: {
+    placementControl?: ReactNode;
+    renderHostControls: (hosts: string[]) => ReactNode;
+    serverGroups?: { members: { host: string }[] }[];
+  }) => (
+    <section aria-label="Servers">
+      {placementControl}
+      {renderHostControls(
+        (serverGroups ?? []).flatMap((server) => server.members.map((host) => host.host)),
+      )}
+    </section>
+  ),
+}));
+
 const mocked = {
   list: getAgentRunnerHosts as unknown as ReturnType<typeof vi.fn>,
   history: getAgentRunnerHostCapacityHistory as unknown as ReturnType<typeof vi.fn>,
   pin: setActiveAgentRunnerHost as unknown as ReturnType<typeof vi.fn>,
   drain: drainAgentRunnerHost as unknown as ReturnType<typeof vi.fn>,
+  forget: forgetAgentRunnerHost as unknown as ReturnType<typeof vi.fn>,
   remove: removeAgentRunnerHost as unknown as ReturnType<typeof vi.fn>,
   slots: setAgentRunnerHostSlots as unknown as ReturnType<typeof vi.fn>,
   setVersion: setAgentRuntimeVersion as unknown as ReturnType<typeof vi.fn>,
@@ -217,6 +242,10 @@ async function openPanel(name = 'runner-a'): Promise<void> {
   fireEvent.click(target());
 }
 
+function renderPage() {
+  return render(<AdminHostsPage />);
+}
+
 describe('AdminHostsPage', () => {
   beforeEach(() => {
     auth.role = 'admin';
@@ -235,7 +264,7 @@ describe('AdminHostsPage', () => {
 
   it('refuses an admin with only agent.use without asking the control plane', async () => {
     auth.access = { allowed: true, permissions: ['agent.use'] };
-    render(<AdminHostsPage />);
+    renderPage();
 
     expect(await screen.findByText('Admin access required')).toBeInTheDocument();
     // Not merely hidden: a page that renders the refusal *and* fetches has told
@@ -243,16 +272,29 @@ describe('AdminHostsPage', () => {
     expect(mocked.list).not.toHaveBeenCalled();
   });
 
+  it('keeps placement inside Servers with harness controls below', async () => {
+    renderPage();
+    const servers = screen.getByRole('region', { name: 'Servers' });
+    const location = within(servers).getByLabelText('New sandbox location');
+    expect(screen.queryByRole('heading', { name: 'Global settings' })).not.toBeInTheDocument();
+    const server = await screen.findByRole('rowheader', { name: 'runner-a' });
+    const harness = screen.getByLabelText('claude-code');
+    expect(
+      location.compareDocumentPosition(server) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(server.compareDocumentPosition(harness) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it('admits a free account granted Agent administration', async () => {
     auth.role = 'free';
-    render(<AdminHostsPage />);
-    expect(await screen.findByText('runner-a')).toBeInTheDocument();
+    renderPage();
+    expect(await screen.findByRole('rowheader', { name: 'runner-a' })).toBeInTheDocument();
     expect(mocked.list).toHaveBeenCalledTimes(1);
   });
 
   it('refuses an old admin profile without an explicit decision', async () => {
     auth.access = undefined;
-    render(<AdminHostsPage />);
+    renderPage();
     expect(await screen.findByText('Admin access required')).toBeInTheDocument();
     expect(mocked.list).not.toHaveBeenCalled();
   });
@@ -272,7 +314,7 @@ describe('AdminHostsPage', () => {
         }),
       ]),
     );
-    render(<AdminHostsPage />);
+    renderPage();
 
     expect(await screen.findByText('legacy-box')).toBeInTheDocument();
     // No ceiling declared: the quota says so instead of inventing a free count.
@@ -301,7 +343,7 @@ describe('AdminHostsPage', () => {
         'gpu-box-kata',
       ),
     );
-    render(<AdminHostsPage />);
+    renderPage();
     const row = (await screen.findByRole('rowheader', { name: 'gpu-box' })).closest('tr')!;
     expect(within(row).getByText('0 / 3 in use')).toBeInTheDocument();
     expect(within(row).getByText('3 free')).toBeInTheDocument();
@@ -310,13 +352,13 @@ describe('AdminHostsPage', () => {
     expect(screen.queryByText('pinned')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Any host' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Pin' })).not.toBeInTheDocument();
-    expect(screen.queryByLabelText('New chats')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('New sandbox location')).toBeInTheDocument();
     mocked.drain.mockResolvedValue(
       pool([
         host({ host: 'gpu-box-kata', labels: { physical_host: 'gpu-box' }, status: 'draining' }),
       ]),
     );
-    fireEvent.click(within(row).getByRole('button', { name: 'Drain' }));
+    fireEvent.click(within(row).getByRole('button', { name: 'Pause new work' }));
     await waitFor(() => expect(mocked.drain).toHaveBeenCalledWith('gpu-box-kata'));
   });
 
@@ -324,12 +366,12 @@ describe('AdminHostsPage', () => {
     const rows = [host({ active: true }), host({ host: 'runner-b' })];
     mocked.list.mockResolvedValue(pool(rows, 'runner-a'));
     mocked.pin.mockResolvedValue(pool([host(), host({ host: 'runner-b' })]));
-    render(<AdminHostsPage />);
-    const select = await screen.findByLabelText('New chats');
+    renderPage();
+    const select = await screen.findByLabelText('New sandbox location');
     expect(select).toHaveValue('runner-a');
     fireEvent.change(select, { target: { value: '' } });
     await waitFor(() => expect(mocked.pin).toHaveBeenCalledWith(null));
-    expect(screen.getByLabelText('New chats')).toHaveValue('');
+    expect(screen.getByLabelText('New sandbox location')).toHaveValue('');
     expect(await screen.findByRole('status')).toHaveTextContent('assigned automatically');
   });
 
@@ -337,10 +379,27 @@ describe('AdminHostsPage', () => {
     const rows = [host(), host({ host: 'gpu-box-kata', labels: { physical_host: 'gpu-box' } })];
     mocked.list.mockResolvedValue(pool(rows));
     mocked.pin.mockResolvedValue(pool(rows, 'gpu-box-kata'));
-    render(<AdminHostsPage />);
-    fireEvent.change(await screen.findByLabelText('New chats'), { target: { value: 'gpu-box' } });
+    renderPage();
+    fireEvent.change(await screen.findByLabelText('New sandbox location'), {
+      target: { value: 'gpu-box-kata' },
+    });
     await waitFor(() => expect(mocked.pin).toHaveBeenCalledWith('gpu-box-kata'));
     expect(await screen.findByRole('status')).toHaveTextContent('Existing retained chats stay');
+  });
+
+  it('selects the exact Host when a physical server has multiple ready environments', async () => {
+    const rows = [
+      host({ host: 'gpu-kata-a', labels: { physical_host: 'gpu-box' } }),
+      host({ host: 'gpu-kata-b', labels: { physical_host: 'gpu-box' } }),
+    ];
+    mocked.list.mockResolvedValue(pool(rows));
+    mocked.pin.mockResolvedValue(pool(rows, 'gpu-kata-b'));
+    renderPage();
+    const select = await screen.findByLabelText('New sandbox location');
+    await waitFor(() => expect(within(select).getAllByRole('option')).toHaveLength(3));
+    fireEvent.change(select, { target: { value: 'gpu-kata-b' } });
+    await waitFor(() => expect(mocked.pin).toHaveBeenCalledWith('gpu-kata-b'));
+    expect(select).toHaveValue('gpu-kata-b');
   });
 
   it('allows clearing a stale selection even with only one available server', async () => {
@@ -348,11 +407,11 @@ describe('AdminHostsPage', () => {
       pool([host(), host({ host: 'old', status: 'disabled', active: true })], 'old'),
     );
     mocked.pin.mockResolvedValue(pool([host()]));
-    render(<AdminHostsPage />);
+    renderPage();
     fireEvent.click(await screen.findByRole('button', { name: 'Clear unavailable selection' }));
     await waitFor(() => expect(mocked.pin).toHaveBeenCalledWith(null));
     await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
-    expect(screen.queryByLabelText('New chats')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('New sandbox location')).toBeInTheDocument();
   });
 
   it('keeps a fixed server visible if it becomes unavailable', async () => {
@@ -366,8 +425,8 @@ describe('AdminHostsPage', () => {
         'runner-a',
       ),
     );
-    render(<AdminHostsPage />);
-    expect(await screen.findByLabelText('New chats')).toHaveValue('__unavailable__');
+    renderPage();
+    expect(await screen.findByLabelText('New sandbox location')).toHaveValue('__unavailable__');
     expect(screen.getByRole('option', { name: 'Selected server unavailable' })).toBeDisabled();
   });
 
@@ -379,28 +438,59 @@ describe('AdminHostsPage', () => {
         host({ host: 'disabled', status: 'disabled' }),
       ]),
     );
-    render(<AdminHostsPage />);
-    const select = await screen.findByLabelText('New chats');
+    renderPage();
+    const select = await screen.findByLabelText('New sandbox location');
     expect(within(select).getAllByRole('option')).toHaveLength(3);
     expect(within(select).queryByRole('option', { name: 'disabled' })).not.toBeInTheDocument();
   });
 
   it('drains without touching the pin', async () => {
     mocked.drain.mockResolvedValue(pool([host({ status: 'draining' })]));
-    render(<AdminHostsPage />);
+    renderPage();
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Drain' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Pause new work' }));
 
     await waitFor(() => expect(mocked.drain).toHaveBeenCalledWith('runner-a'));
     expect(mocked.pin).not.toHaveBeenCalled();
-    expect(await screen.findByRole('button', { name: 'Undrain' })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Resume new work' })).toBeInTheDocument();
+  });
+
+  it('forgets only a disabled Host record after explaining the scope', async () => {
+    mocked.list.mockResolvedValue(pool([host({ host: 'retired', status: 'disabled' })]));
+    mocked.forget.mockResolvedValue(pool([]));
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    renderPage();
+    fireEvent.click(await screen.findByText('Unavailable servers and removed Host records'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Forget retired' }));
+    await waitFor(() => expect(mocked.forget).toHaveBeenCalledWith('retired'));
+    expect(confirm).toHaveBeenCalledWith(
+      expect.stringContaining('leaves the machine and its files intact'),
+    );
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'machine and its files were not deleted',
+    );
+  });
+
+  it('keeps a record visible when retained dependencies block forgetting', async () => {
+    mocked.list.mockResolvedValue(pool([host({ host: 'retired', status: 'disabled' })]));
+    mocked.forget.mockRejectedValue(
+      new APIError('resource_bound', 'Retained sandboxes block forgetting.', 409),
+    );
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    renderPage();
+    fireEvent.click(await screen.findByText('Unavailable servers and removed Host records'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Forget retired' }));
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'Retained sandboxes block forgetting.',
+    );
+    expect(screen.getByRole('button', { name: 'Forget retired' })).toBeInTheDocument();
   });
 
   it('removes a quiet host unforced', async () => {
     mocked.remove.mockResolvedValue(pool([]));
-    render(<AdminHostsPage />);
+    renderPage();
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Remove' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove from pool' }));
 
     await waitFor(() => expect(mocked.remove).toHaveBeenCalledWith('runner-a', false));
   });
@@ -409,9 +499,9 @@ describe('AdminHostsPage', () => {
     mocked.list.mockResolvedValue(pool([host({ slots_used: 2 })]));
     const confirm = vi.fn().mockReturnValue(false);
     vi.stubGlobal('confirm', confirm);
-    render(<AdminHostsPage />);
+    renderPage();
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Remove' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove from pool' }));
 
     expect(confirm).toHaveBeenCalledTimes(1);
     // The consequence has to be in the prompt: force does not stop the
@@ -421,7 +511,7 @@ describe('AdminHostsPage', () => {
 
     confirm.mockReturnValue(true);
     mocked.remove.mockResolvedValue(pool([]));
-    fireEvent.click(screen.getByRole('button', { name: 'Remove' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Remove from pool' }));
     await waitFor(() => expect(mocked.remove).toHaveBeenCalledWith('runner-a', true));
   });
 
@@ -429,16 +519,16 @@ describe('AdminHostsPage', () => {
     mocked.list.mockResolvedValue(
       pool([host({ active: true, seconds_since_seen: 3600 })], 'runner-a'),
     );
-    render(<AdminHostsPage />);
+    renderPage();
 
     expect(await screen.findByText(/may be unavailable/)).toBeInTheDocument();
   });
 
   it('does not warn when an unpinned host is quiet — nothing depends on it', async () => {
     mocked.list.mockResolvedValue(pool([host({ seconds_since_seen: 3600 })], null));
-    render(<AdminHostsPage />);
+    renderPage();
 
-    await screen.findByText('runner-a');
+    await screen.findByRole('rowheader', { name: 'runner-a' });
     expect(screen.queryByText(/the queue is stopped/)).not.toBeInTheDocument();
   });
 
@@ -447,19 +537,19 @@ describe('AdminHostsPage', () => {
     // so it cannot claim to be another one, and every runner in this pool is
     // ours — the control answered a question nobody operating this page asks.
     // The endpoint and its client are untouched for the rare new host.
-    render(<AdminHostsPage />);
+    renderPage();
 
-    await screen.findByText('runner-a');
+    await screen.findByRole('rowheader', { name: 'runner-a' });
     expect(screen.queryByRole('button', { name: 'Issue token' })).not.toBeInTheDocument();
     expect(screen.queryByText(/enrol/i)).not.toBeInTheDocument();
   });
 
   it('clears everything and refuses the page when access is revoked mid-session', async () => {
     mocked.list.mockRejectedValueOnce(new APIError('FORBIDDEN', 'revoked', 403));
-    render(<AdminHostsPage />);
+    renderPage();
 
     expect(await screen.findByText('Admin access required')).toBeInTheDocument();
-    expect(screen.queryByText('runner-a')).not.toBeInTheDocument();
+    expect(screen.queryByRole('rowheader', { name: 'runner-a' })).not.toBeInTheDocument();
   });
 });
 
@@ -482,7 +572,7 @@ describe('capacity columns', () => {
         }),
       ]),
     );
-    render(<AdminHostsPage />);
+    renderPage();
 
     const row = (await screen.findByRole('rowheader', { name: 'runner-a' })).closest('tr')!;
     expect(within(row).getByText('2 / 3 in use')).toBeInTheDocument();
@@ -518,7 +608,7 @@ describe('capacity columns', () => {
 
   it('names Storage in the header and spans the full width when a row opens', async () => {
     mocked.list.mockResolvedValue(pool([host({ capacity: capacity() })]));
-    render(<AdminHostsPage />);
+    renderPage();
     await openPanel();
 
     const headers = screen.getAllByRole('columnheader').map((cell) => cell.textContent);
@@ -546,7 +636,7 @@ describe('capacity columns', () => {
       if (key.startsWith('storage_')) delete (legacy as Record<string, unknown>)[key];
     }
     mocked.list.mockResolvedValue(pool([host({ capacity: legacy })]));
-    render(<AdminHostsPage />);
+    renderPage();
 
     const row = (await screen.findByRole('rowheader', { name: 'runner-a' })).closest('tr')!;
     // CPU and memory are still measured; only Storage is missing.
@@ -561,7 +651,7 @@ describe('capacity columns', () => {
     mocked.slots.mockResolvedValue(
       pool([host({ slots_total: 4, slots_used: 1, slots_desired: 6 })]),
     );
-    render(<AdminHostsPage />);
+    renderPage();
 
     const input = await screen.findByLabelText('Turns at once for runner-a');
     // Pre-filled with what the host runs, so Apply without typing asks for
@@ -589,7 +679,7 @@ describe('capacity columns', () => {
 
   it('offers no reset: the saved number is simply the number the host has', async () => {
     mocked.list.mockResolvedValue(pool([host({ slots_total: 4, slots_desired: 3 })]));
-    render(<AdminHostsPage />);
+    renderPage();
 
     expect(await screen.findByLabelText('Turns at once for runner-a')).toHaveValue(3);
     expect(screen.queryByRole('button', { name: 'Host default' })).not.toBeInTheDocument();
@@ -597,7 +687,7 @@ describe('capacity columns', () => {
 
   it('refuses a number outside the protocol bounds without asking the control plane', async () => {
     mocked.list.mockResolvedValue(pool([host()]));
-    render(<AdminHostsPage />);
+    renderPage();
 
     const input = await screen.findByLabelText('Turns at once for runner-a');
     fireEvent.change(input, { target: { value: '1' } });
@@ -612,7 +702,7 @@ describe('capacity columns', () => {
     mocked.list.mockResolvedValue(
       pool([host({ capabilities: ['kata'], slots_total: 3, slots_desired: 6 })]),
     );
-    render(<AdminHostsPage />);
+    renderPage();
 
     const row = (await screen.findByRole('rowheader', { name: 'runner-a' })).closest('tr')!;
     expect(within(row).getByText('0 / 3 in use')).toBeInTheDocument();
@@ -629,7 +719,7 @@ describe('capacity columns', () => {
     mocked.list.mockResolvedValue(
       pool([host({ slots_total: 5, slots_used: 5, slots_desired: 2 })]),
     );
-    render(<AdminHostsPage />);
+    renderPage();
 
     const row = (await screen.findByRole('rowheader', { name: 'runner-a' })).closest('tr')!;
     expect(within(row).getByText('5 / 2 in use')).toBeInTheDocument();
@@ -646,7 +736,7 @@ describe('capacity columns', () => {
         }),
       ]),
     );
-    render(<AdminHostsPage />);
+    renderPage();
 
     const row = (await screen.findByRole('rowheader', { name: 'runner-a' })).closest('tr')!;
     expect(within(row).getByText('3 free · not claiming')).toBeInTheDocument();
@@ -663,7 +753,7 @@ describe('capacity columns', () => {
         host({ host: 'silent', capacity: null }),
       ]),
     );
-    render(<AdminHostsPage />);
+    renderPage();
 
     const warm = (await screen.findByRole('rowheader', { name: 'warm' })).closest('tr')!;
     expect(within(warm).getByText('Warming up')).toBeInTheDocument();
@@ -707,7 +797,7 @@ describe('capacity columns', () => {
         }),
       ]),
     );
-    render(<AdminHostsPage />);
+    renderPage();
 
     const row = (await screen.findByRole('rowheader', { name: 'gpu-box' })).closest('tr')!;
     // The freshest observation is what the machine's load cells show.
@@ -734,7 +824,7 @@ describe('capacity columns', () => {
       runtime_versions: {},
       execution_profile: 'untrusted-kata-v1',
     });
-    render(<AdminHostsPage />);
+    renderPage();
 
     const row = (await screen.findByRole('rowheader', { name: 'legacy' })).closest('tr')!;
     // Both load cells say they have nothing, and neither says zero.
@@ -742,7 +832,7 @@ describe('capacity columns', () => {
     expect(within(row).queryByText('0%')).not.toBeInTheDocument();
     // The rest of the row is untouched: slots and actions still work.
     expect(within(row).getByText('0 / 4 in use')).toBeInTheDocument();
-    expect(within(row).getByRole('button', { name: 'Drain' })).toBeEnabled();
+    expect(within(row).getByRole('button', { name: 'Pause new work' })).toBeEnabled();
   });
 
   it('counts a renamed machine once, not as a partial of two records', async () => {
@@ -766,7 +856,7 @@ describe('capacity columns', () => {
         }),
       ]),
     );
-    render(<AdminHostsPage />);
+    renderPage();
 
     const row = (await screen.findByRole('rowheader', { name: 'rtx6000b' })).closest('tr')!;
     expect(within(row).getByText('0 running · 18 stopped')).toBeInTheDocument();
@@ -783,7 +873,7 @@ describe('capacity columns', () => {
         }),
       ]),
     );
-    render(<AdminHostsPage />);
+    renderPage();
 
     const row = (await screen.findByRole('rowheader', { name: 'runner-a' })).closest('tr')!;
     expect(within(row).getByText('≥3 observed · Partial')).toBeInTheDocument();
@@ -813,7 +903,7 @@ describe('capacity panel', () => {
         host({ host: 'runner-b', labels: { physical_host: 'box-b' }, capacity: capacity() }),
       ]),
     );
-    render(<AdminHostsPage />);
+    renderPage();
 
     const toggleA = await screen.findByRole('button', { name: 'Show capacity for box-a' });
     const toggleB = screen.getByRole('button', { name: 'Show capacity for box-b' });
@@ -833,7 +923,7 @@ describe('capacity panel', () => {
   });
 
   it('does not show sampling implementation details around the charts', async () => {
-    render(<AdminHostsPage />);
+    renderPage();
     await openPanel();
 
     await vi.waitFor(() =>
@@ -846,7 +936,7 @@ describe('capacity panel', () => {
   });
 
   it('does not repeat a healthy single-source sandbox count in the panel', async () => {
-    render(<AdminHostsPage />);
+    renderPage();
     await openPanel();
 
     const row = (await screen.findByRole('rowheader', { name: 'runner-a' })).closest('tr')!;
@@ -858,7 +948,7 @@ describe('capacity panel', () => {
   });
 
   it('reads one hour by default and switches window on request', async () => {
-    render(<AdminHostsPage />);
+    renderPage();
     await openPanel();
 
     await waitFor(() =>
@@ -904,7 +994,7 @@ describe('capacity panel', () => {
         }),
       ]),
     );
-    render(<AdminHostsPage />);
+    renderPage();
     await openPanel('gpu-box');
 
     // The default is the enrollment the row's own numbers came from.
@@ -936,7 +1026,7 @@ describe('capacity panel', () => {
     mocked.history.mockImplementation(async (_host: string) =>
       history({ capacity_epoch: '22222222-2222-4222-8222-222222222222' }),
     );
-    render(<AdminHostsPage />);
+    renderPage();
     await openPanel();
 
     await waitFor(() => expect(mocked.history).toHaveBeenCalled());
@@ -959,8 +1049,10 @@ describe('capacity panel', () => {
         points: [historyPoint(0, cpu), historyPoint(1, cpu)],
       }),
     );
-    render(<AdminHostsPage />);
-    await vi.waitFor(() => expect(screen.getByText('runner-a')).toBeInTheDocument());
+    renderPage();
+    await vi.waitFor(() =>
+      expect(screen.getByRole('rowheader', { name: 'runner-a' })).toBeInTheDocument(),
+    );
     await openPanel();
     await vi.waitFor(() =>
       expect(screen.getAllByText(/Highest observed in range: 10.0%/).length).toBe(1),
@@ -981,8 +1073,10 @@ describe('capacity panel', () => {
 
   it('polls the open panel and pauses both channels while the tab is hidden', async () => {
     vi.useFakeTimers();
-    render(<AdminHostsPage />);
-    await vi.waitFor(() => expect(screen.getByText('runner-a')).toBeInTheDocument());
+    renderPage();
+    await vi.waitFor(() =>
+      expect(screen.getByRole('rowheader', { name: 'runner-a' })).toBeInTheDocument(),
+    );
     await openPanel();
     await vi.waitFor(() => expect(mocked.history).toHaveBeenCalledTimes(1));
     const poolCalls = mocked.list.mock.calls.length;
@@ -1019,7 +1113,7 @@ describe('capacity panel', () => {
     mocked.history.mockImplementation(async (name: string) =>
       history({ host: name, capacity_epoch: name === 'box-b' ? 'epoch-b' : 'epoch-a' }),
     );
-    render(<AdminHostsPage />);
+    renderPage();
     await vi.waitFor(() =>
       expect(screen.getByRole('rowheader', { name: 'box' })).toBeInTheDocument(),
     );
@@ -1056,7 +1150,7 @@ describe('capacity panel', () => {
     mocked.history.mockImplementation(async (name: string) =>
       history({ host: name, capacity_epoch: name === 'box-b' ? 'epoch-b' : 'epoch-a' }),
     );
-    render(<AdminHostsPage />);
+    renderPage();
 
     await openPanel('box');
     await vi.waitFor(() =>
@@ -1091,7 +1185,7 @@ describe('capacity panel', () => {
         }),
       ]),
     );
-    render(<AdminHostsPage />);
+    renderPage();
 
     await openPanel('rtx6000b');
 
@@ -1125,7 +1219,7 @@ describe('capacity panel', () => {
         }),
       ]),
     );
-    render(<AdminHostsPage />);
+    renderPage();
 
     await openPanel('rtx6000b');
 
@@ -1145,7 +1239,7 @@ describe('capacity panel', () => {
         host({ host: 'box-runc', labels: { physical_host: 'box' }, status: 'draining' }),
       ]),
     );
-    render(<AdminHostsPage />);
+    renderPage();
 
     await openPanel('box');
 
@@ -1172,7 +1266,7 @@ describe('capacity panel', () => {
       ]),
     );
     mocked.history.mockImplementation(async (name: string) => history({ host: name }));
-    render(<AdminHostsPage />);
+    renderPage();
 
     await openPanel('box');
     await vi.waitFor(() => expect(screen.getByLabelText('Curve source')).toBeInTheDocument());
@@ -1204,8 +1298,10 @@ describe('capacity panel', () => {
 
   it('stops polling a panel that has been closed', async () => {
     vi.useFakeTimers();
-    render(<AdminHostsPage />);
-    await vi.waitFor(() => expect(screen.getByText('runner-a')).toBeInTheDocument());
+    renderPage();
+    await vi.waitFor(() =>
+      expect(screen.getByRole('rowheader', { name: 'runner-a' })).toBeInTheDocument(),
+    );
     await openPanel();
     await vi.waitFor(() => expect(mocked.history).toHaveBeenCalledTimes(1));
 
@@ -1233,7 +1329,7 @@ describe('capacity panel', () => {
         }),
       ]),
     );
-    render(<AdminHostsPage />);
+    renderPage();
     await openPanel();
 
     const panel = panelFor();
@@ -1265,8 +1361,10 @@ describe('polling and actions', () => {
     const spy = vi.spyOn(performance, 'now').mockImplementation(() => clock.ms);
     try {
       mocked.list.mockResolvedValueOnce(pool([host({ capacity: capacity() })]));
-      render(<AdminHostsPage />);
-      await vi.waitFor(() => expect(screen.getByText('runner-a')).toBeInTheDocument());
+      renderPage();
+      await vi.waitFor(() =>
+        expect(screen.getByRole('rowheader', { name: 'runner-a' })).toBeInTheDocument(),
+      );
 
       mocked.list.mockRejectedValue(new Error('gateway down'));
       clock.ms += 30_000;
@@ -1274,7 +1372,7 @@ describe('polling and actions', () => {
 
       // Stale numbers are a smaller lie than an empty page — but unlabelled
       // stale numbers are the lie, so the failure is stated.
-      expect(screen.getByText('runner-a')).toBeInTheDocument();
+      expect(screen.getByRole('rowheader', { name: 'runner-a' })).toBeInTheDocument();
       expect(screen.getByText('37%')).toBeInTheDocument();
       expect(screen.queryByText('gateway down')).not.toBeInTheDocument();
       expect(screen.getByText(/Refresh failed/)).toBeInTheDocument();
@@ -1294,8 +1392,10 @@ describe('polling and actions', () => {
       mocked.list.mockResolvedValueOnce(
         pool([host({ capacity: capacity({ sample_age_seconds: 12, freshness: 'fresh' }) })]),
       );
-      render(<AdminHostsPage />);
-      await vi.waitFor(() => expect(screen.getByText('runner-a')).toBeInTheDocument());
+      renderPage();
+      await vi.waitFor(() =>
+        expect(screen.getByRole('rowheader', { name: 'runner-a' })).toBeInTheDocument(),
+      );
       expect(screen.queryByText('Capacity stale')).not.toBeInTheDocument();
 
       mocked.list.mockRejectedValue(new Error('gateway down'));
@@ -1329,7 +1429,7 @@ describe('polling and actions', () => {
       ]),
     );
     mocked.history.mockImplementation(async (name: string) => history({ host: name }));
-    render(<AdminHostsPage />);
+    renderPage();
 
     await vi.waitFor(() =>
       expect(screen.getByRole('rowheader', { name: 'box' })).toBeInTheDocument(),
@@ -1358,8 +1458,10 @@ describe('polling and actions', () => {
   it('does not let a poll issued before an action overwrite the action result', async () => {
     vi.useFakeTimers();
     mocked.list.mockResolvedValueOnce(pool([host()]));
-    render(<AdminHostsPage />);
-    await vi.waitFor(() => expect(screen.getByText('runner-a')).toBeInTheDocument());
+    renderPage();
+    await vi.waitFor(() =>
+      expect(screen.getByRole('rowheader', { name: 'runner-a' })).toBeInTheDocument(),
+    );
 
     // A poll starts and hangs.
     let landPoll: (value: AgentRunnerHostPool) => void = () => {};
@@ -1373,15 +1475,15 @@ describe('polling and actions', () => {
 
     // The action answers first.
     mocked.drain.mockResolvedValue(pool([host({ status: 'draining' })]));
-    fireEvent.click(screen.getByRole('button', { name: 'Drain' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Pause new work' }));
     await vi.waitFor(() =>
-      expect(screen.getByRole('button', { name: 'Undrain' })).toBeInTheDocument(),
+      expect(screen.getByRole('button', { name: 'Resume new work' })).toBeInTheDocument(),
     );
 
     // The older read lands afterwards and must be discarded.
     landPoll(pool([host()]));
     await vi.advanceTimersByTimeAsync(0);
-    expect(screen.getByRole('button', { name: 'Undrain' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Resume new work' })).toBeInTheDocument();
   });
 });
 
@@ -1405,7 +1507,7 @@ describe('harness version selection', () => {
   afterEach(cleanup);
 
   it('offers every version the pool holds, with the image default first', async () => {
-    render(<AdminHostsPage />);
+    renderPage();
 
     const select = (await screen.findByLabelText('claude-code')) as HTMLSelectElement;
     expect([...select.options].map((o) => o.textContent)).toEqual([
@@ -1420,7 +1522,7 @@ describe('harness version selection', () => {
 
   it('shows the deployment-wide selection, not a per-host value', async () => {
     mocked.list.mockResolvedValue(pool([host()], null, { 'claude-code': '2.1.235' }));
-    render(<AdminHostsPage />);
+    renderPage();
 
     const select = (await screen.findByLabelText('claude-code')) as HTMLSelectElement;
     await waitFor(() => expect(select.value).toBe('2.1.235'));
@@ -1428,7 +1530,7 @@ describe('harness version selection', () => {
 
   it('sends the choice and takes the whole pool back', async () => {
     mocked.setVersion.mockResolvedValue(pool([host()], null, { 'claude-code': '2.1.235' }));
-    render(<AdminHostsPage />);
+    renderPage();
 
     const select = await screen.findByLabelText('claude-code');
     fireEvent.change(select, { target: { value: '2.1.235' } });
@@ -1444,7 +1546,7 @@ describe('harness version selection', () => {
   it('clears back to the image default with null, not an empty string', async () => {
     mocked.list.mockResolvedValue(pool([host()], null, { 'claude-code': '2.1.235' }));
     mocked.setVersion.mockResolvedValue(pool([host()]));
-    render(<AdminHostsPage />);
+    renderPage();
 
     const select = await screen.findByLabelText('claude-code');
     fireEvent.change(select, { target: { value: '' } });
@@ -1452,14 +1554,14 @@ describe('harness version selection', () => {
     await waitFor(() => expect(mocked.setVersion).toHaveBeenCalledWith('claude-code', null));
   });
 
-  it('hides the selector when no host reports a menu', async () => {
-    // A pool of pre-menu hosts. An empty control that cannot do anything is
-    // worse than no control: it reads as broken rather than as absent.
+  it('explains an unavailable harness menu without hiding the setting', async () => {
     mocked.list.mockResolvedValue(pool([host({ runtime_versions_available: null })]));
-    render(<AdminHostsPage />);
+    renderPage();
 
-    await screen.findByText('runner-a');
-    expect(screen.queryByText('Harness version')).not.toBeInTheDocument();
+    await screen.findByRole('rowheader', { name: 'runner-a' });
+    expect(screen.getByText('Harness version')).toBeInTheDocument();
+    expect(screen.getByText('No server has reported available versions yet.')).toBeInTheDocument();
+    expect(screen.queryByLabelText('claude-code')).not.toBeInTheDocument();
   });
 });
 
@@ -1479,7 +1581,7 @@ describe('the harness section reads as a choice, not a list', () => {
     // table below, that a running conversation keeps its version is in the
     // confirmation after the change, and how to add a version is deployment
     // documentation. Written here it was a third telling every time.
-    render(<AdminHostsPage />);
+    renderPage();
 
     await screen.findByLabelText('claude-code');
     expect(screen.queryByText(/also built in/)).not.toBeInTheDocument();
@@ -1501,7 +1603,7 @@ describe('the harness section reads as a choice, not a list', () => {
         }),
       ]),
     );
-    render(<AdminHostsPage />);
+    renderPage();
 
     const codex = (await screen.findByLabelText('codex')) as HTMLSelectElement;
     expect([...codex.options].map((o) => o.textContent)).toEqual(['Image default', '0.145.0']);

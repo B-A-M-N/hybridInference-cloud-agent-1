@@ -1,0 +1,417 @@
+'use client';
+
+import { useRef, useState } from 'react';
+
+import {
+  extendComputeAllocation,
+  getComputeOperations,
+  getRetirementImpact,
+  retireComputeAllocation,
+  setComputePolicy,
+  type ComputeAllocation,
+  type ComputeOperation,
+  type RenewalPolicy,
+  type RetirementImpact,
+} from '@/lib/api/compute';
+import { getErrorMessage } from '@/lib/utils/errors';
+
+import {
+  absoluteTime,
+  buttonClass,
+  ErrorNotice,
+  Field,
+  inputClass,
+  primaryClass,
+  Reasons,
+  remainingTime,
+} from './compute-ui';
+
+export default function ComputeResourcePanel({
+  allocation,
+  onSaved,
+  onOperation,
+  section = 'all',
+}: {
+  allocation: ComputeAllocation;
+  onSaved: (allocation: ComputeAllocation) => void;
+  onOperation: (operation: ComputeOperation) => void;
+  section?: 'all' | 'lease' | 'retire' | 'details';
+}) {
+  const [policy, setPolicy] = useState(allocation.policy);
+  const [adoptManagement, setAdoptManagement] = useState(false);
+  const [revision, setRevision] = useState(allocation.revision);
+  const [target, setTarget] = useState('');
+  const [reason, setReason] = useState('');
+  const [impact, setImpact] = useState<RetirementImpact | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const requestIds = useRef<{ extend?: string; retire?: string }>({});
+  const allows = (action: string) => allocation.allowed_actions.includes(action);
+  const needsDeployment =
+    allocation.management_mode === 'observe' && !allocation.nodes.some((node) => node.hosts.length);
+
+  async function intent(kind: 'extend' | 'retire') {
+    if (busy) return;
+    setBusy(kind);
+    setError(null);
+    const requestId = requestIds.current[kind] ?? crypto.randomUUID();
+    requestIds.current[kind] = requestId;
+    try {
+      let result;
+      if (kind === 'extend') {
+        result = await extendComputeAllocation(allocation.id, {
+          request_id: requestId,
+          target_expires_at: new Date(target).toISOString(),
+          reason,
+        });
+      } else {
+        result = await retireComputeAllocation(allocation.id, {
+          request_id: requestId,
+          expected_revision: impact!.revision,
+        });
+      }
+      onOperation(result.operation);
+    } catch (error) {
+      try {
+        const recovered = await getComputeOperations(requestId);
+        const operation = recovered.operations.find((item) => item.request_id === requestId);
+        if (operation) {
+          onOperation(operation);
+          return;
+        }
+      } catch {
+        /* Preserve the same intent ID when the result is not yet known. */
+      }
+      setError(getErrorMessage(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      {(section === 'all' || section === 'lease') && (
+        <div className="rounded-xl bg-gray-50 p-4 dark:bg-white/5">
+          <p className="text-xs text-gray-500 dark:text-gray-400">
+            {allocation.provider_id === 'existing_ssh' ? 'Lease' : 'Confirmed expiry'}
+          </p>
+          <p className="mt-1 text-xl font-semibold tracking-tight">
+            {allocation.expires_at
+              ? remainingTime(allocation.expires_at)
+              : allocation.provider_id === 'existing_ssh'
+                ? 'Not managed'
+                : 'Not reported'}
+          </p>
+          {allocation.expires_at && (
+            <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
+              {absoluteTime(allocation.expires_at)}
+            </p>
+          )}
+        </div>
+      )}
+      {(section === 'all' || section === 'details') && (
+        <>
+          <Reasons reasons={allocation.blocked_reasons} />
+          {needsDeployment && (
+            <p className="text-sm text-amber-800 dark:text-amber-300">
+              Agent not installed. Use Add server → Connect existing with this resource ID to
+              deploy.
+            </p>
+          )}
+          <details className="text-sm" open={!allows('policy')}>
+            <summary className="cursor-pointer text-gray-600 dark:text-gray-300">
+              Server details
+            </summary>
+            <div className="mt-3 space-y-2 text-gray-500 dark:text-gray-400">
+              <p className="break-all">ID: {allocation.external_id ?? 'Pending acquisition'}</p>
+              <p>
+                Status:{' '}
+                {allocation.state === 'absent'
+                  ? 'Deregistered (machine still exists)'
+                  : allocation.state}
+              </p>
+              <ul className="space-y-1">
+                {allocation.nodes.map((node) => (
+                  <li key={node.id}>
+                    {node.name} · {node.hosts.join(', ') || 'Awaiting agent'}
+                  </li>
+                ))}
+              </ul>
+              <p>Last observed: {absoluteTime(allocation.observed_at)}</p>
+              {allocation.check_interval_seconds != null && (
+                <p>
+                  Periodic provider checks: about every {allocation.check_interval_seconds} seconds.
+                  Pending operations can delay a check.
+                </p>
+              )}
+            </div>
+          </details>
+        </>
+      )}
+      {(section === 'all' || section === 'lease') && allows('policy') && (
+        <form
+          className="space-y-3 border-t border-gray-200 pt-4 dark:border-white/10"
+          onSubmit={async (event) => {
+            event.preventDefault();
+            if (busy) return;
+            setBusy('policy');
+            setError(null);
+            setNotice(null);
+            try {
+              const result = await setComputePolicy(
+                allocation.id,
+                policy,
+                revision,
+                adoptManagement ? 'manage' : undefined,
+              );
+              setRevision(result.allocation.revision);
+              setPolicy(result.allocation.policy);
+              onSaved(result.allocation);
+              setNotice(
+                'Policy saved. The expiry updates after the provider confirms an extension.',
+              );
+            } catch (error) {
+              setError(getErrorMessage(error));
+            } finally {
+              setBusy(null);
+            }
+          }}
+        >
+          <h3 className="font-semibold">Automatic renewal</h3>
+          {allocation.management_mode === 'observe' && (
+            <label className="flex items-start gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={adoptManagement}
+                onChange={(event) => setAdoptManagement(event.target.checked)}
+              />
+              I authorize lifecycle management of this entire allocation and all its nodes,
+              including renewal and release after dependency checks.
+            </label>
+          )}
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={policy.enabled}
+              onChange={(event) => setPolicy({ ...policy, enabled: event.target.checked })}
+            />
+            Request renewal automatically
+          </label>
+          <div className="grid gap-3 sm:grid-cols-2">
+            {(
+              [
+                ['renew_before_seconds', 'Request before expiry (minutes)'],
+                ['extend_to_horizon_seconds', 'Extend ahead of now (minutes)'],
+              ] as const
+            ).map(([key, label]) => (
+              <PolicyNumber
+                key={key}
+                field={key}
+                label={label}
+                policy={policy}
+                onChange={setPolicy}
+              />
+            ))}
+          </div>
+          <Field label="Renewal reason">
+            <textarea
+              className={inputClass}
+              required={policy.enabled}
+              maxLength={2000}
+              value={policy.reason}
+              onChange={(event) => setPolicy({ ...policy, reason: event.target.value })}
+            />
+          </Field>
+          <details>
+            <summary className="cursor-pointer text-sm">Advanced timing</summary>
+            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+              <PolicyNumber
+                field="stop_new_groups_before_seconds"
+                label="Stop new sandboxes before expiry (minutes)"
+                policy={policy}
+                onChange={setPolicy}
+              />
+              <PolicyNumber
+                field="stop_claims_before_seconds"
+                label="Stop all new turns before expiry (minutes)"
+                policy={policy}
+                onChange={setPolicy}
+              />
+            </div>
+            <p className="mt-3 text-xs text-gray-500 dark:text-gray-400">
+              Renewal starts before sandbox admission closes. The extension horizon must exceed the
+              renewal lead time.
+            </p>
+          </details>
+          {allocation.policy.enabled && !policy.enabled && (
+            <p className="text-xs text-amber-800 dark:text-amber-300">
+              Requests already submitted will still complete.
+            </p>
+          )}
+          {revision !== allocation.revision && (
+            <div className="space-y-2 text-sm text-amber-800 dark:text-amber-300">
+              <p>The resource changed since this form was opened. Your edits are preserved.</p>
+              <button
+                type="button"
+                className={buttonClass}
+                onClick={() => {
+                  setRevision(allocation.revision);
+                  setPolicy(allocation.policy);
+                  setError(null);
+                }}
+              >
+                Discard edits and load current policy
+              </button>
+            </div>
+          )}
+          <button className={primaryClass} disabled={busy !== null} type="submit">
+            Save renewal policy
+          </button>
+        </form>
+      )}
+
+      {(section === 'all' || section === 'lease') && allows('extend') && (
+        <details className="border-t border-gray-200 pt-4 dark:border-white/10">
+          <summary className="cursor-pointer text-sm font-medium">Extend now</summary>
+          <form
+            className="space-y-3 border-t border-gray-200 pt-4 dark:border-white/10"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void intent('extend');
+            }}
+          >
+            <Field label="Requested expiry (your local time)">
+              <input
+                className={inputClass}
+                type="datetime-local"
+                required
+                value={target}
+                onChange={(event) => {
+                  setTarget(event.target.value);
+                  delete requestIds.current.extend;
+                }}
+              />
+            </Field>
+            <Field label="Extension reason">
+              <textarea
+                className={inputClass}
+                maxLength={2000}
+                required
+                value={reason}
+                onChange={(event) => {
+                  setReason(event.target.value);
+                  delete requestIds.current.extend;
+                }}
+              />
+            </Field>
+            <button className={buttonClass} type="submit" disabled={busy !== null}>
+              Request extension
+            </button>
+          </form>
+        </details>
+      )}
+
+      {(section === 'all' || section === 'retire') && allows('retire') && (
+        <details className="border-t border-gray-200 pt-4 dark:border-white/10">
+          <summary className="cursor-pointer text-sm font-medium text-red-600 dark:text-red-400">
+            {allocation.provider_id === 'existing_ssh'
+              ? 'Disconnect server'
+              : 'Release cloud resource'}
+          </summary>
+          <div className="mt-4 space-y-3">
+            <p className="text-sm">
+              {allocation.provider_id === 'existing_ssh'
+                ? 'Disconnects this server. The machine is not deleted.'
+                : 'Releases the entire cloud resource and every node in it.'}{' '}
+              Existing sandboxes must be cleared first.
+            </p>
+            <button
+              type="button"
+              className={buttonClass}
+              disabled={busy !== null}
+              onClick={async () => {
+                setBusy('preview');
+                setError(null);
+                try {
+                  setImpact(await getRetirementImpact(allocation.id));
+                  delete requestIds.current.retire;
+                } catch (error) {
+                  setError(getErrorMessage(error));
+                } finally {
+                  setBusy(null);
+                }
+              }}
+            >
+              Preview retirement impact
+            </button>
+            {impact && (
+              <div className="space-y-2 rounded-lg border border-amber-300 p-3 text-sm dark:border-amber-700">
+                <p>
+                  {impact.nodes.length} nodes · {impact.hosts.length} Host environments
+                </p>
+                <p>
+                  {impact.active_attempts} running attempts · {impact.retained_groups} retained
+                  sandbox groups
+                </p>
+                <p>Affected Hosts: {impact.hosts.join(', ') || 'None registered'}</p>
+                {impact.global_active_host && (
+                  <p>Global sandbox location refers to {impact.global_active_host}.</p>
+                )}
+                <Reasons reasons={impact.blocked_reasons} />
+                <p>
+                  Admission closes when retirement starts. The server rechecks dependencies before
+                  release.
+                </p>
+                <button
+                  className={buttonClass}
+                  type="button"
+                  disabled={busy !== null || !impact.allowed_actions.includes('retire')}
+                  onClick={() => void intent('retire')}
+                >
+                  Start retirement for entire resource
+                </button>
+              </div>
+            )}
+          </div>
+        </details>
+      )}
+      {notice && (
+        <p role="status" className="text-sm">
+          {notice}
+        </p>
+      )}
+      <ErrorNotice error={error} />
+    </div>
+  );
+}
+
+function PolicyNumber({
+  field,
+  label,
+  policy,
+  onChange,
+}: {
+  field:
+    | 'renew_before_seconds'
+    | 'extend_to_horizon_seconds'
+    | 'stop_new_groups_before_seconds'
+    | 'stop_claims_before_seconds';
+  label: string;
+  policy: RenewalPolicy;
+  onChange: (policy: RenewalPolicy) => void;
+}) {
+  return (
+    <Field label={label}>
+      <input
+        className={inputClass}
+        type="number"
+        min={0}
+        step={1}
+        required
+        value={policy[field] / 60}
+        onChange={(event) => onChange({ ...policy, [field]: Number(event.target.value) * 60 })}
+      />
+    </Field>
+  );
+}

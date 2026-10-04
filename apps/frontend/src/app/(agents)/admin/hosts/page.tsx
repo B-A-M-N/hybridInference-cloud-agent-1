@@ -1,17 +1,11 @@
 'use client';
 
-// The runner host pool — the whole of this service's operations surface.
+// Host admission and capacity, alongside the independent compute resource lifecycle.
 //
 // Runners pull work, so nothing here moves a sandbox to a machine. The pin
 // chooses where chats without a sandbox may be materialized; an existing
 // retained chat remains claimable only by its Docker-owning host. "Pinned",
 // not "assigned"; "last polled", not "online".
-//
-// Enrolment is deliberately absent. Minting a host credential is a real
-// operation and its endpoint stays, but it exists to stop a machine claiming
-// to be a machine it is not — and every runner in this pool is ours, so the
-// control was answering a question nobody here asks. Issue a token from the
-// API on the rare day a new host needs one.
 //
 // ── Capacity ──────────────────────────────────────────────────────────
 //
@@ -50,6 +44,7 @@ import type {
 import { MAX_HOST_SLOTS, MIN_HOST_SLOTS } from '@/lib/api/admin';
 import {
   drainAgentRunnerHost,
+  forgetAgentRunnerHost,
   getAgentRunnerHostCapacityHistory,
   getAgentRunnerHosts,
   removeAgentRunnerHost,
@@ -58,9 +53,12 @@ import {
   setAgentRuntimeVersion,
   undrainAgentRunnerHost,
 } from '@/lib/api/admin';
+import type { ComputeServerSnapshot } from '@/lib/api/compute';
 import { APIError, getErrorMessage } from '@/lib/utils/errors';
 
 import CapacityPanel from './CapacityPanel';
+import ComputeResources from './ComputeResources';
+import hostStyles from './host-controls.module.css';
 import {
   type CapacityCell,
   type HostGroupCapacity,
@@ -184,9 +182,10 @@ function RowToggle({
     <button
       type="button"
       aria-expanded={open}
+      aria-label={`${open ? 'Hide capacity for' : 'Show capacity for'} ${name}`}
       aria-controls={panelId}
       onClick={onClick}
-      className="rounded-md border border-gray-200 p-1 text-gray-500 hover:bg-gray-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-crimson disabled:opacity-40 dark:border-white/10 dark:text-gray-400 dark:hover:bg-white/5 dark:focus-visible:ring-crimson-light"
+      className="inline-flex items-center gap-1.5 rounded-md border border-gray-200 px-2 py-1 text-xs text-gray-500 hover:bg-gray-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-crimson disabled:opacity-40 dark:border-white/10 dark:text-gray-400 dark:hover:bg-white/5 dark:focus-visible:ring-crimson-light"
     >
       <svg
         viewBox="0 0 12 12"
@@ -202,9 +201,7 @@ function RowToggle({
           strokeLinejoin="round"
         />
       </svg>
-      <span className="sr-only">
-        {open ? 'Hide capacity for' : 'Show capacity for'} {name}
-      </span>
+      <span aria-hidden="true">Usage history</span>
     </button>
   );
 }
@@ -289,6 +286,7 @@ function panelIdFor(name: string): string {
 }
 
 function HostsView() {
+  const [computeInventory, setComputeInventory] = useState<ComputeServerSnapshot | null>(null);
   const [pool, setPool] = useState<PoolSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -482,20 +480,25 @@ function HostsView() {
     () => serverInventory(hosts, executionProfile),
     [hosts, executionProfile],
   );
-  const availableServers = servers.filter((server) => server.available);
+  const availableHosts = hosts.filter(
+    (host) =>
+      computeInventory?.hosts.find((resource) => resource.host === host.host)?.allows_new_groups !==
+        false &&
+      host.enrolled &&
+      host.status === 'online' &&
+      (executionProfile === 'trusted-v1' || host.sandbox_runtime === 'io.containerd.kata.v2'),
+  );
   const visibleServers = servers.filter(
     (server) => server.host && server.host.status !== 'disabled',
   );
-  const inactiveServers = servers.filter(
-    (server) => !server.host || server.host.status === 'disabled',
-  );
   const activeHost = pool?.activeHost ?? null;
-  const selectedServer = servers.find((server) => server.selected);
   const selectionUnavailable = Boolean(
     activeHost &&
     !hosts.some(
       (host) =>
         host.host === activeHost &&
+        computeInventory?.hosts.find((resource) => resource.host === host.host)
+          ?.allows_new_groups !== false &&
         host.enrolled &&
         host.status === 'online' &&
         (executionProfile === 'trusted-v1' || host.sandbox_runtime === 'io.containerd.kata.v2'),
@@ -626,6 +629,20 @@ function HostsView() {
     void run(() => removeAgentRunnerHost(host, slotsUsed > 0), `Removed ${host} from the pool.`);
   };
 
+  const handleForget = (host: string) => {
+    if (
+      !window.confirm(
+        `Forget the management record for ${host}? This leaves the machine and its files intact. ` +
+          'Retained sandboxes, running work, placement references, or managed cloud resources block this action.',
+      )
+    )
+      return;
+    void run(
+      () => forgetAgentRunnerHost(host),
+      `Forgot ${host}. The machine and its files were not deleted.`,
+    );
+  };
+
   const toggleServer = (server: string, facts: HostGroupCapacity) => {
     if (expanded === server) {
       setExpanded(null);
@@ -674,6 +691,313 @@ function HostsView() {
     setPanelEpoch(member?.capacity_epoch ?? null);
   };
 
+  const renderHostControls = (hostIds: string[]) => {
+    const scopedHosts = hosts.filter((host) => hostIds.includes(host.host));
+    const scopedServers = serverInventory(scopedHosts, executionProfile);
+    const scopedVisible = scopedServers.filter(
+      (server) => server.host && server.host.status !== 'disabled',
+    );
+    const scopedInactive = scopedServers.filter(
+      (server) => !server.host || server.host.status === 'disabled',
+    );
+    return (
+      <div className={hostStyles.controls}>
+        {refreshFailed && (
+          <p aria-live="polite" className="mt-3 text-xs text-amber-700 dark:text-amber-300">
+            Refresh failed — showing the last successful read
+            {pool?.observedAt ? ` from ${formatUtcTimestamp(pool.observedAt)}` : ''}.
+          </p>
+        )}
+        {loading && pool === null ? (
+          <TableSkeleton />
+        ) : scopedVisible.length === 0 ? (
+          <p className="mt-4 text-sm text-gray-500 dark:text-gray-400">No servers available.</p>
+        ) : (
+          <div className="mt-4 overflow-x-auto rounded-2xl border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 shadow-sm">
+            <table className={`${hostStyles.table} w-full text-left text-sm`}>
+              <thead className="border-b border-gray-100 bg-gray-50/60 text-xs text-gray-500 dark:border-white/5 dark:bg-white/[0.02] dark:text-gray-400">
+                <tr>
+                  <th className="px-6 py-3 font-medium">Server</th>
+                  <th className="px-3 py-3 font-medium">Status</th>
+                  <th className="px-3 py-3 font-medium whitespace-nowrap">Execution slots</th>
+                  <th className="px-3 py-3 font-medium">CPU</th>
+                  <th className="px-3 py-3 font-medium">Memory</th>
+                  <th className="px-3 py-3 font-medium">Storage</th>
+                  <th className="px-3 py-3 font-medium whitespace-nowrap">Sandboxes</th>
+                  <th className="px-6 py-3 text-right font-medium">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100 dark:divide-white/5">
+                {scopedVisible.map(({ name, host, members }) => {
+                  if (!host) return null;
+                  const facts = groupCapacityFacts(members, elapsedMs);
+                  const open = expanded === name;
+                  const panelId = panelIdFor(name);
+                  const concurrency = concurrencyFacts(host);
+                  const sandboxTitle = [
+                    facts.sandboxes.explanation,
+                    ...facts.sandboxes.reasons.map(reasonLabel),
+                  ]
+                    .filter((part): part is string => Boolean(part))
+                    .join(' ');
+                  return (
+                    <Fragment key={name}>
+                      <tr
+                        className={hostStyles.hostRow}
+                        onClick={(event) => {
+                          // Buttons inside the row keep their own meaning; a
+                          // row click is a convenience for the toggle, not a
+                          // second way to press Drain.
+                          if ((event.target as HTMLElement).closest('button, a, select, input')) {
+                            return;
+                          }
+                          toggleServer(name, facts);
+                        }}
+                      >
+                        <th
+                          scope="row"
+                          aria-label={name}
+                          className="px-6 py-4 font-medium text-gray-900 dark:text-gray-50"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span>{name}</span>
+                            {/* The row header keeps the server's own name:
+                                  the toggle speaks for itself inside it, so a
+                                  reader asking "which machine is this row?"
+                                  is not answered with a button's label. */}
+                            <RowToggle
+                              open={open}
+                              name={name}
+                              panelId={panelId}
+                              onClick={() => toggleServer(name, facts)}
+                            />
+                          </div>
+                        </th>
+                        <td data-label="Status" className="px-3 py-4">
+                          <StatusBadge status={host.status} />
+                          {facts.stale && (
+                            <span className="mt-1 block whitespace-nowrap text-[11px] font-medium text-amber-700 dark:text-amber-300">
+                              Capacity stale
+                            </span>
+                          )}
+                        </td>
+                        <td data-label="Concurrent turns" className="px-3 py-4">
+                          <CapabilityCell cell={executionSlotsCell(host)} muted={facts.stale} />
+                          {/* The control sits under the number it changes.
+                                It asks for a limit, not a fleet size: the host
+                                starts a process per turn as it claims one, so
+                                the input is bounded only by the protocol's
+                                floor and a typo guard, and no machine capacity
+                                is implied by either.
+
+                                The field is uncontrolled and re-keyed on the
+                                saved value, so a poll landing mid-edit does not
+                                overwrite what the operator is typing, and a
+                                saved change does replace it.
+
+                                Saving is not applying, and the cell's own note
+                                says which happened — "applying 8" until the
+                                host confirms, "not applied" for an offline
+                                host, "redeploy to change" for a runner that
+                                predates remote limits — with the longer reason
+                                on hover. Nothing else is written under the
+                                field: the number is the host's number, and an
+                                operator who wants a different one types it. */}
+                          <form
+                            className="mt-1.5 flex items-center gap-1.5"
+                            onSubmit={(event) => {
+                              event.preventDefault();
+                              const value = Number(new FormData(event.currentTarget).get('slots'));
+                              if (
+                                !Number.isInteger(value) ||
+                                value < MIN_HOST_SLOTS ||
+                                value > MAX_HOST_SLOTS
+                              ) {
+                                return;
+                              }
+                              void handleSlots(host.host, value);
+                            }}
+                          >
+                            <input
+                              key={`${host.host}:${concurrency.requested ?? 'default'}`}
+                              name="slots"
+                              type="number"
+                              min={MIN_HOST_SLOTS}
+                              max={MAX_HOST_SLOTS}
+                              step={1}
+                              defaultValue={
+                                concurrency.requested ?? host.slots_total ?? MIN_HOST_SLOTS
+                              }
+                              aria-label={`Turns at once for ${name}`}
+                              disabled={busy}
+                              className="w-16 rounded-md border border-gray-200 bg-white px-1.5 py-0.5 text-[11px] tabular-nums text-gray-700 shadow-sm disabled:opacity-40 dark:border-white/10 dark:bg-gray-900 dark:text-gray-200"
+                            />
+                            <button
+                              type="submit"
+                              disabled={busy}
+                              className="rounded-md border border-gray-200 bg-white px-1.5 py-0.5 text-[11px] font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-40 dark:border-white/10 dark:bg-transparent dark:text-gray-200 dark:hover:bg-white/5"
+                            >
+                              Apply
+                            </button>
+                          </form>
+                          {concurrency.launchError !== null && (
+                            <span
+                              role="alert"
+                              className="mt-1 block max-w-[15rem] text-[11px] text-red-600 dark:text-red-400"
+                            >
+                              {concurrency.launchError}
+                            </span>
+                          )}
+                        </td>
+                        <td data-label="CPU" className="px-3 py-4">
+                          <CapabilityCell
+                            cell={cpuCell(facts.capacity)}
+                            muted={facts.stale}
+                            meter={facts.capacity?.cpu_percent ?? null}
+                          />
+                        </td>
+                        <td data-label="Memory" className="px-3 py-4">
+                          <CapabilityCell
+                            cell={memoryCell(facts.capacity)}
+                            muted={facts.stale}
+                            meter={facts.capacity?.memory_used_percent ?? null}
+                          />
+                        </td>
+                        <td data-label="Storage" className="px-3 py-4">
+                          <CapabilityCell
+                            cell={storageCell(facts.capacity)}
+                            muted={facts.stale}
+                            meter={facts.capacity?.storage_used_percent ?? null}
+                          />
+                        </td>
+                        <td
+                          data-label="Sandboxes"
+                          className="px-3 py-4"
+                          title={sandboxTitle || undefined}
+                        >
+                          <span
+                            className={`block whitespace-nowrap ${
+                              facts.sandboxes.staleOnly
+                                ? 'text-amber-700 dark:text-amber-300'
+                                : 'text-gray-800 dark:text-gray-200'
+                            }`}
+                          >
+                            {facts.sandboxes.text}
+                          </span>
+                          {facts.sandboxes.partial && (
+                            <span className="mt-0.5 block text-[11px] text-amber-700 dark:text-amber-300">
+                              {facts.sandboxes.reasons.length > 0
+                                ? facts.sandboxes.reasons.map(reasonLabel).join(' · ')
+                                : 'Partial coverage'}
+                            </span>
+                          )}
+                        </td>
+                        <td className={`${hostStyles.actions} px-6 py-4`}>
+                          <div className="flex items-center justify-end gap-2">
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() =>
+                                void run(
+                                  () =>
+                                    host.status === 'draining'
+                                      ? undrainAgentRunnerHost(host.host)
+                                      : drainAgentRunnerHost(host.host),
+                                  host.status === 'draining'
+                                    ? `${name} is taking work again.`
+                                    : `${name} stops taking new work; running attempts finish.`,
+                                )
+                              }
+                              className="rounded-lg border border-gray-200 bg-white px-2.5 py-1 text-xs font-medium text-gray-700 transition-colors hover:bg-gray-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-crimson disabled:opacity-40 dark:border-white/10 dark:bg-transparent dark:text-gray-200 dark:hover:bg-white/5 dark:focus-visible:ring-crimson-light"
+                            >
+                              {host.status === 'draining' ? 'Resume new work' : 'Pause new work'}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => handleRemove(host.host, host.slots_used)}
+                              className="rounded-lg border border-transparent px-2.5 py-1 text-xs font-medium text-red-600 transition-colors hover:bg-red-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 disabled:opacity-40 dark:text-red-400 dark:hover:bg-red-500/10"
+                            >
+                              Remove from pool
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                      {open && openServer && openFacts && (
+                        // No second card inside this one: the band is the
+                        // detail surface, and the panel draws on it directly
+                        // at the table's own first-column padding.
+                        <tr className="bg-gray-50/70 dark:bg-white/[0.03]">
+                          <td colSpan={8} className="px-6 pb-6 pt-4">
+                            <CapacityPanel
+                              id={panelId}
+                              name={name}
+                              source={openSource?.host ?? null}
+                              sources={openSources}
+                              onSourceChange={selectSource}
+                              sandboxes={openFacts.sandboxes}
+                              stale={openFacts.stale}
+                              range={range}
+                              onRangeChange={setRange}
+                              history={
+                                sameTarget(history?.key ?? null, historyTarget)
+                                  ? (history?.data ?? null)
+                                  : null
+                              }
+                              loading={historyLoading}
+                              error={historyError}
+                              onRetry={() => void loadHistory()}
+                              restarted={
+                                panelEpoch !== null &&
+                                openSource?.capacity_epoch != null &&
+                                openSource.capacity_epoch !== panelEpoch
+                              }
+                            />
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {(scopedInactive.length > 0 || scopedHosts.some((host) => host.status === 'disabled')) && (
+          <details className="mt-4 text-sm text-gray-500 dark:text-gray-400">
+            <summary className="cursor-pointer">
+              Unavailable servers and removed Host records
+            </summary>
+            <ul className="mt-2 space-y-2">
+              {scopedInactive
+                .filter((server) => !server.members.some((host) => host.status === 'disabled'))
+                .map((server) => (
+                  <li key={server.name}>
+                    {server.name} — {server.host?.status ?? 'unavailable'}
+                  </li>
+                ))}
+              {scopedHosts
+                .filter((host) => host.status === 'disabled')
+                .map((host) => (
+                  <li key={host.host} className="flex flex-wrap items-center gap-3">
+                    <span>{host.host} — disabled</span>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => handleForget(host.host)}
+                      className="rounded-md border border-gray-200 px-2 py-1 text-xs hover:bg-gray-50 disabled:opacity-40 dark:border-white/10 dark:hover:bg-white/5"
+                    >
+                      Forget {host.host}
+                    </button>
+                  </li>
+                ))}
+            </ul>
+          </details>
+        )}
+      </div>
+    );
+  };
+
   if (denied) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-3 p-8">
@@ -693,12 +1017,6 @@ function HostsView() {
 
   return (
     <div className="flex-1 overflow-y-auto">
-      {/* The page shell the rest of the app uses (see IntegrationsView): one
-          wide column, a real heading, and sections that are cards rather than
-          controls floating between paragraphs. This page had grown its own
-          denser dialect, which read as unfinished beside every other screen.
-          Wide, because the capacity columns are what an operator compares
-          across a fleet and two of them do not fit a column of prose. */}
       <section className="mx-auto w-full max-w-7xl px-6 py-12 lg:px-12 lg:py-16">
         {/* This is the admin area, not a page about one subject — which is
             what "Runner hosts" made it, with the harness selector reading as a
@@ -744,414 +1062,142 @@ function HostsView() {
           </div>
         )}
 
-        {/* Physical inventory groups independently enrolled execution environments.
-            Actions still target the original deployment identity. */}
-        <div className="mt-10">
-          <div className="flex flex-wrap items-baseline gap-x-3">
-            <h2 className="text-base font-semibold text-gray-900 dark:text-gray-50">Servers</h2>
-            {refreshFailed && (
-              <span
-                aria-live="polite"
-                className="ml-auto text-[11px] text-amber-700 dark:text-amber-300"
-              >
-                Refresh failed — showing the last successful read
-                {pool?.observedAt ? ` from ${formatUtcTimestamp(pool.observedAt)}` : ''}.
-              </span>
-            )}
-          </div>
-
-          {availableServers.length > 1 && (
-            <div className="mt-3 flex items-center gap-3">
-              <label
-                htmlFor="server-placement"
-                className="text-sm text-gray-600 dark:text-gray-400"
-              >
-                New chats
-              </label>
-              <select
-                id="server-placement"
-                disabled={busy}
-                value={
-                  activeHost
-                    ? selectionUnavailable
-                      ? '__unavailable__'
-                      : (selectedServer?.name ?? '__unavailable__')
-                    : ''
-                }
-                onChange={(event) => {
-                  const chosen = availableServers.find(
-                    (server) => server.name === event.target.value,
-                  );
-                  void handlePin(chosen?.host?.host ?? null);
-                }}
-                className="rounded-lg border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 px-3 py-1.5 text-sm"
-              >
-                <option value="">Automatic</option>
-                {selectionUnavailable && (
-                  <option value="__unavailable__" disabled>
-                    Selected server unavailable
-                  </option>
-                )}
-                {availableServers.map((server) => (
-                  <option key={server.name} value={server.name}>
-                    {server.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-          {selectionUnavailable && (
-            <div role="alert" className="mt-3 text-sm text-amber-700 dark:text-amber-300">
-              The selected server cannot accept new chats.
-              <button
-                type="button"
-                disabled={busy}
-                onClick={() => void handlePin(null)}
-                className="ml-2 underline"
-              >
-                Clear unavailable selection
-              </button>
-            </div>
-          )}
-
-          {loading && pool === null ? (
-            <TableSkeleton />
-          ) : visibleServers.length === 0 ? (
-            <p className="mt-4 text-sm text-gray-500 dark:text-gray-400">No servers available.</p>
-          ) : (
-            <div className="mt-4 overflow-x-auto rounded-2xl border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 shadow-sm">
-              <table className="min-w-[1120px] w-full text-left text-sm">
-                <thead className="border-b border-gray-100 bg-gray-50/60 text-xs text-gray-500 dark:border-white/5 dark:bg-white/[0.02] dark:text-gray-400">
-                  <tr>
-                    <th className="px-6 py-3 font-medium">Server</th>
-                    <th className="px-3 py-3 font-medium">Status</th>
-                    <th className="px-3 py-3 font-medium whitespace-nowrap">Execution slots</th>
-                    <th className="px-3 py-3 font-medium">CPU</th>
-                    <th className="px-3 py-3 font-medium">Memory</th>
-                    <th className="px-3 py-3 font-medium">Storage</th>
-                    <th className="px-3 py-3 font-medium whitespace-nowrap">Sandboxes</th>
-                    <th className="px-6 py-3 text-right font-medium">Actions</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-100 dark:divide-white/5">
-                  {visibleServers.map(({ name, host, members }) => {
-                    if (!host) return null;
-                    const facts = groupCapacityFacts(members, elapsedMs);
-                    const open = expanded === name;
-                    const panelId = panelIdFor(name);
-                    const concurrency = concurrencyFacts(host);
-                    const sandboxTitle = [
-                      facts.sandboxes.explanation,
-                      ...facts.sandboxes.reasons.map(reasonLabel),
-                    ]
-                      .filter((part): part is string => Boolean(part))
-                      .join(' ');
+        <ComputeResources
+          placementControl={
+            <div className="mb-4 rounded-xl border border-gray-200 bg-gray-50/70 p-4 dark:border-white/10 dark:bg-white/[0.03]">
+              <div className="flex flex-wrap items-center justify-between gap-4">
+                <label
+                  htmlFor="server-placement"
+                  className="text-sm font-semibold text-gray-900 dark:text-gray-100"
+                >
+                  New sandbox location
+                </label>
+                <select
+                  id="server-placement"
+                  disabled={busy || pool === null}
+                  value={activeHost ? (selectionUnavailable ? '__unavailable__' : activeHost) : ''}
+                  onChange={(event) => void handlePin(event.target.value || null)}
+                  className="rounded-lg border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 px-3 py-1.5 text-sm"
+                >
+                  <option value="">Automatic — available servers</option>
+                  {selectionUnavailable && (
+                    <option value="__unavailable__" disabled>
+                      Selected server unavailable
+                    </option>
+                  )}
+                  {availableHosts.map((host) => {
+                    const physicalName = servers.find((server) =>
+                      server.members.some((member) => member.host === host.host),
+                    )?.name;
+                    const allocationId = computeInventory?.hosts.find(
+                      (item) => item.host === host.host,
+                    )?.allocation_id;
+                    const allocation = computeInventory?.allocations.find(
+                      (item) => item.id === allocationId,
+                    );
+                    const allocationHosts = allocation?.nodes.flatMap((node) => node.hosts) ?? [];
+                    const displayName = allocation
+                      ? allocationHosts.length > 1
+                        ? `${allocation.name} / ${host.host}`
+                        : allocation.name
+                      : physicalName && physicalName !== host.host
+                        ? `${physicalName} / ${host.host}`
+                        : host.host;
                     return (
-                      <Fragment key={name}>
-                        <tr
-                          className="cursor-pointer align-top hover:bg-gray-50/60 dark:hover:bg-white/[0.03]"
-                          onClick={(event) => {
-                            // Buttons inside the row keep their own meaning; a
-                            // row click is a convenience for the toggle, not a
-                            // second way to press Drain.
-                            if ((event.target as HTMLElement).closest('button, a, select, input')) {
-                              return;
-                            }
-                            toggleServer(name, facts);
-                          }}
-                        >
-                          <th
-                            scope="row"
-                            aria-label={name}
-                            className="px-6 py-4 font-medium text-gray-900 dark:text-gray-50"
-                          >
-                            <div className="flex items-center gap-2">
-                              {/* The row header keeps the server's own name:
-                                  the toggle speaks for itself inside it, so a
-                                  reader asking "which machine is this row?"
-                                  is not answered with a button's label. */}
-                              <RowToggle
-                                open={open}
-                                name={name}
-                                panelId={panelId}
-                                onClick={() => toggleServer(name, facts)}
-                              />
-                              <span>{name}</span>
-                            </div>
-                          </th>
-                          <td className="px-3 py-4">
-                            <StatusBadge status={host.status} />
-                            {facts.stale && (
-                              <span className="mt-1 block whitespace-nowrap text-[11px] font-medium text-amber-700 dark:text-amber-300">
-                                Capacity stale
-                              </span>
-                            )}
-                          </td>
-                          <td className="px-3 py-4">
-                            <CapabilityCell cell={executionSlotsCell(host)} muted={facts.stale} />
-                            {/* The control sits under the number it changes.
-                                It asks for a limit, not a fleet size: the host
-                                starts a process per turn as it claims one, so
-                                the input is bounded only by the protocol's
-                                floor and a typo guard, and no machine capacity
-                                is implied by either.
-
-                                The field is uncontrolled and re-keyed on the
-                                saved value, so a poll landing mid-edit does not
-                                overwrite what the operator is typing, and a
-                                saved change does replace it.
-
-                                Saving is not applying, and the cell's own note
-                                says which happened — "applying 8" until the
-                                host confirms, "not applied" for an offline
-                                host, "redeploy to change" for a runner that
-                                predates remote limits — with the longer reason
-                                on hover. Nothing else is written under the
-                                field: the number is the host's number, and an
-                                operator who wants a different one types it. */}
-                            <form
-                              className="mt-1.5 flex items-center gap-1.5"
-                              onSubmit={(event) => {
-                                event.preventDefault();
-                                const value = Number(
-                                  new FormData(event.currentTarget).get('slots'),
-                                );
-                                if (
-                                  !Number.isInteger(value) ||
-                                  value < MIN_HOST_SLOTS ||
-                                  value > MAX_HOST_SLOTS
-                                ) {
-                                  return;
-                                }
-                                void handleSlots(host.host, value);
-                              }}
-                            >
-                              <input
-                                key={`${host.host}:${concurrency.requested ?? 'default'}`}
-                                name="slots"
-                                type="number"
-                                min={MIN_HOST_SLOTS}
-                                max={MAX_HOST_SLOTS}
-                                step={1}
-                                defaultValue={
-                                  concurrency.requested ?? host.slots_total ?? MIN_HOST_SLOTS
-                                }
-                                aria-label={`Turns at once for ${name}`}
-                                disabled={busy}
-                                className="w-16 rounded-md border border-gray-200 bg-white px-1.5 py-0.5 text-[11px] tabular-nums text-gray-700 shadow-sm disabled:opacity-40 dark:border-white/10 dark:bg-gray-900 dark:text-gray-200"
-                              />
-                              <button
-                                type="submit"
-                                disabled={busy}
-                                className="rounded-md border border-gray-200 bg-white px-1.5 py-0.5 text-[11px] font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-40 dark:border-white/10 dark:bg-transparent dark:text-gray-200 dark:hover:bg-white/5"
-                              >
-                                Apply
-                              </button>
-                            </form>
-                            {concurrency.launchError !== null && (
-                              <span
-                                role="alert"
-                                className="mt-1 block max-w-[15rem] text-[11px] text-red-600 dark:text-red-400"
-                              >
-                                {concurrency.launchError}
-                              </span>
-                            )}
-                          </td>
-                          <td className="px-3 py-4">
-                            <CapabilityCell
-                              cell={cpuCell(facts.capacity)}
-                              muted={facts.stale}
-                              meter={facts.capacity?.cpu_percent ?? null}
-                            />
-                          </td>
-                          <td className="px-3 py-4">
-                            <CapabilityCell
-                              cell={memoryCell(facts.capacity)}
-                              muted={facts.stale}
-                              meter={facts.capacity?.memory_used_percent ?? null}
-                            />
-                          </td>
-                          <td className="px-3 py-4">
-                            <CapabilityCell
-                              cell={storageCell(facts.capacity)}
-                              muted={facts.stale}
-                              meter={facts.capacity?.storage_used_percent ?? null}
-                            />
-                          </td>
-                          <td className="px-3 py-4" title={sandboxTitle || undefined}>
-                            <span
-                              className={`block whitespace-nowrap ${
-                                facts.sandboxes.staleOnly
-                                  ? 'text-amber-700 dark:text-amber-300'
-                                  : 'text-gray-800 dark:text-gray-200'
-                              }`}
-                            >
-                              {facts.sandboxes.text}
-                            </span>
-                            {facts.sandboxes.partial && (
-                              <span className="mt-0.5 block text-[11px] text-amber-700 dark:text-amber-300">
-                                {facts.sandboxes.reasons.length > 0
-                                  ? facts.sandboxes.reasons.map(reasonLabel).join(' · ')
-                                  : 'Partial coverage'}
-                              </span>
-                            )}
-                          </td>
-                          <td className="px-6 py-4">
-                            <div className="flex items-center justify-end gap-2">
-                              <button
-                                type="button"
-                                disabled={busy}
-                                onClick={() =>
-                                  void run(
-                                    () =>
-                                      host.status === 'draining'
-                                        ? undrainAgentRunnerHost(host.host)
-                                        : drainAgentRunnerHost(host.host),
-                                    host.status === 'draining'
-                                      ? `${name} is taking work again.`
-                                      : `${name} stops taking new work; running attempts finish.`,
-                                  )
-                                }
-                                className="rounded-lg border border-gray-200 bg-white px-2.5 py-1 text-xs font-medium text-gray-700 transition-colors hover:bg-gray-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-crimson disabled:opacity-40 dark:border-white/10 dark:bg-transparent dark:text-gray-200 dark:hover:bg-white/5 dark:focus-visible:ring-crimson-light"
-                              >
-                                {host.status === 'draining' ? 'Undrain' : 'Drain'}
-                              </button>
-                              <button
-                                type="button"
-                                disabled={busy}
-                                onClick={() => handleRemove(host.host, host.slots_used)}
-                                className="rounded-lg border border-transparent px-2.5 py-1 text-xs font-medium text-red-600 transition-colors hover:bg-red-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 disabled:opacity-40 dark:text-red-400 dark:hover:bg-red-500/10"
-                              >
-                                Remove
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                        {open && openServer && openFacts && (
-                          // No second card inside this one: the band is the
-                          // detail surface, and the panel draws on it directly
-                          // at the table's own first-column padding.
-                          <tr className="bg-gray-50/70 dark:bg-white/[0.03]">
-                            <td colSpan={8} className="px-6 pb-6 pt-4">
-                              <CapacityPanel
-                                id={panelId}
-                                name={name}
-                                source={openSource?.host ?? null}
-                                sources={openSources}
-                                onSourceChange={selectSource}
-                                sandboxes={openFacts.sandboxes}
-                                stale={openFacts.stale}
-                                range={range}
-                                onRangeChange={setRange}
-                                history={
-                                  sameTarget(history?.key ?? null, historyTarget)
-                                    ? (history?.data ?? null)
-                                    : null
-                                }
-                                loading={historyLoading}
-                                error={historyError}
-                                onRetry={() => void loadHistory()}
-                                restarted={
-                                  panelEpoch !== null &&
-                                  openSource?.capacity_epoch != null &&
-                                  openSource.capacity_epoch !== panelEpoch
-                                }
-                              />
-                            </td>
-                          </tr>
-                        )}
-                      </Fragment>
+                      <option key={host.host} value={host.host}>
+                        {displayName}
+                      </option>
                     );
                   })}
-                </tbody>
-              </table>
-            </div>
-          )}
-          {inactiveServers.length > 0 && (
-            <details className="mt-4 text-sm text-gray-500 dark:text-gray-400">
-              <summary className="cursor-pointer">
-                Unavailable servers ({inactiveServers.length})
-              </summary>
-              <ul className="mt-2 space-y-1">
-                {inactiveServers.map((server) => (
-                  <li key={server.name}>
-                    {server.name} — {server.host?.status ?? 'unavailable'}
-                  </li>
-                ))}
-              </ul>
-            </details>
-          )}
-        </div>
-
-        {/* ── Harness version ──────────────────────────────────────────
-            One row per runtime, because the previous inline strip put five
-            selects and five bare runtime names on a single line: five copies
-            of "Image default" with nothing to say which was which, and no
-            room to explain that the options come from the image.
-
-            Two layers the wording has to keep apart: the *menu* is built into
-            each sandbox image and changes only by rebuilding; this picks which
-            item on it new work runs. A runtime with one option is an image
-            holding one version — add more through that host's
-            `*_EXTRA_VERSIONS`.
-
-            Below the table: capacity is what an operator opens this page for,
-            and a configuration control above it pushed the fleet below the
-            fold. */}
-        {menu.length > 0 && (
-          <div className="mt-10">
-            {/* No subtitle, unlike the section above, because both of the
-                things one would say are already said where they land: that a
-                running conversation keeps its version is in the confirmation
-                after the change, and where the options come from — and how to
-                add one — is deployment documentation, in `.env.example` and
-                ENVIRONMENT.md, read by the person editing the `.env` rather
-                than by anyone standing on this page. */}
-            <h2 className="text-base font-semibold text-gray-900 dark:text-gray-50">
-              Harness version
-            </h2>
-            <div className="mt-4 rounded-2xl border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 px-6 shadow-sm">
-              {/* A name and its control. Nothing here pre-announces what opening
-                  the control would show: the versions on offer are in the
-                  select, and the version each host is actually holding is in
-                  the table below — said twice already, and the second telling
-                  was the abstract one. */}
-              {menu.map(([runtime, versions], index) => (
-                <div
-                  key={runtime}
-                  className={`flex flex-col justify-center gap-3 py-2.5 sm:flex-row sm:items-center ${
-                    index > 0 ? 'border-t border-gray-100 dark:border-white/5' : ''
-                  }`}
-                >
-                  <div className="min-w-0 flex-1">
-                    <label
-                      htmlFor={`harness-version-${runtime}`}
-                      className="text-sm text-gray-700 dark:text-gray-300"
-                    >
-                      {runtime}
-                    </label>
-                  </div>
-                  <div className="flex shrink-0 justify-end">
-                    <select
-                      id={`harness-version-${runtime}`}
-                      disabled={busy}
-                      value={runtimeVersions[runtime] ?? ''}
-                      onChange={(event) => void handleVersion(runtime, event.target.value)}
-                      className="rounded-lg border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 px-3 py-1.5 text-sm font-medium text-gray-800 dark:text-gray-200 shadow-sm hover:bg-gray-50 dark:hover:bg-white/5 disabled:opacity-40"
-                    >
-                      <option value="">Image default</option>
-                      {versions.map((version) => (
-                        <option key={version} value={version}>
-                          {version}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
+                </select>
+              </div>
+              <p className="mt-3 text-sm text-gray-500 dark:text-gray-400">
+                All new sandboxes use this location. Existing sandboxes stay on their current
+                server.
+              </p>
+              {selectionUnavailable && (
+                <div role="alert" className="mt-3 text-sm text-amber-700 dark:text-amber-300">
+                  The selected server cannot accept new chats.
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void handlePin(null)}
+                    className="ml-2 underline"
+                  >
+                    Clear unavailable selection
+                  </button>
                 </div>
-              ))}
+              )}
             </div>
+          }
+          onHostsChanged={() => void load(true)}
+          onInventory={setComputeInventory}
+          activeHost={activeHost}
+          serverGroups={pool === null ? undefined : servers}
+          renderHostControls={renderHostControls}
+          onHostControlsClosed={() => {
+            setExpanded(null);
+            setSourceChoice(null);
+            setNotice(null);
+          }}
+          eligibleHosts={availableHosts.map((host) => host.host)}
+          onUseHost={(host) => void handlePin(host)}
+          settingBusy={busy}
+          hostNotice={notice}
+        />
+
+        <div className="mt-8 rounded-2xl border border-gray-200 bg-white p-5 dark:border-white/10 dark:bg-gray-900">
+          {/* No subtitle, unlike the section above, because both of the
+              things one would say are already said where they land: that a
+              running conversation keeps its version is in the confirmation
+              after the change, and where the options come from — and how to
+              add one — is deployment documentation, in `.env.example` and
+              ENVIRONMENT.md, read by the person editing the `.env` rather
+              than by anyone standing on this page. */}
+          <h2 className="text-base font-semibold text-gray-900 dark:text-gray-50">
+            Harness version
+          </h2>
+          <div className="mt-2">
+            {menu.length === 0 && (
+              <p className="py-2 text-sm text-gray-500 dark:text-gray-400">
+                No server has reported available versions yet.
+              </p>
+            )}
+            {menu.map(([runtime, versions], index) => (
+              <div
+                key={runtime}
+                className={`flex flex-col justify-center gap-3 py-2.5 sm:flex-row sm:items-center ${
+                  index > 0 ? 'border-t border-gray-100 dark:border-white/5' : ''
+                }`}
+              >
+                <div className="min-w-0 flex-1">
+                  <label
+                    htmlFor={`harness-version-${runtime}`}
+                    className="text-sm text-gray-700 dark:text-gray-300"
+                  >
+                    {runtime}
+                  </label>
+                </div>
+                <div className="flex shrink-0 justify-end">
+                  <select
+                    id={`harness-version-${runtime}`}
+                    disabled={busy}
+                    value={runtimeVersions[runtime] ?? ''}
+                    onChange={(event) => void handleVersion(runtime, event.target.value)}
+                    className="rounded-lg border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 px-3 py-1.5 text-sm font-medium text-gray-800 dark:text-gray-200 shadow-sm hover:bg-gray-50 dark:hover:bg-white/5 disabled:opacity-40"
+                  >
+                    <option value="">Image default</option>
+                    {versions.map((version) => (
+                      <option key={version} value={version}>
+                        {version}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            ))}
           </div>
-        )}
+        </div>
       </section>
     </div>
   );
