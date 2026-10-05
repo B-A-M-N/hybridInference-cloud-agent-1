@@ -1588,6 +1588,30 @@ cmd_preflight() {
   kata_smoke_test
 }
 
+initialize_kata_epoch() {
+  local runner_image="$1" backend="$2" runtime_root state_dir image_id
+  [[ "$backend" == "kata" ]] || return 0
+  runtime_root="${KATA_EXTRACT_ROOT:-/}"
+  state_dir="${runtime_root%/}/var/lib/freeinference/kata-runtime"
+  # Existing hosts predate the epoch file. This check is verification-only;
+  # an installer racing it publishes its own generation under the same lock,
+  # which the initializer preserves rather than replacing with a stale verdict.
+  "$KATA_SETUP_SCRIPT" --check || die "cannot initialize Kata runtime epoch before host verification"
+  python3 "$SCRIPT_DIR/kata_runtime_epoch.py" verify-path --root "$runtime_root" \
+    || die "Kata runtime epoch path is not trusted"
+  image_id="$(docker image inspect --format '{{.Id}}' "$runner_image")"
+  [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die "cannot resolve the trusted epoch initializer image"
+  log "initializing the host-wide Kata runtime epoch if absent"
+  # Docker creates only this dedicated directory when it is missing. The
+  # deploy user need not own /var/lib; root inside this networkless helper
+  # owns the marker. No Docker socket or runtime/config tree is mounted.
+  docker run --rm -i --pull never --runtime runc --network none \
+    --user 0:0 --cap-drop ALL --security-opt no-new-privileges --read-only \
+    -v "$state_dir:/run/agent-kata-runtime" --entrypoint python \
+    "$image_id" - initialize --mounted <"$SCRIPT_DIR/kata_runtime_epoch.py" \
+    || die "Kata epoch initialization failed; repair the runtime before deploying"
+}
+
 check_candidate() {
   # Compose resolves both the source-built name and artifact-mode digest.
   # Use a separate container with no live stack mounts or credentials. This
@@ -1623,6 +1647,7 @@ check_candidate() {
     -e "AGENT_SANDBOX_MCP_URL=http://${MCP_HOSTNAME}:${MCP_TUNNEL_PORT}" \
     "$runner_image" python -c 'from cloud_agent_shared.egress import network_from_env; network_from_env()' \
     || die "the sandbox network settings were refused (see the error above); fix AGENT_EGRESS_CHAT_NETWORK_POOL, AGENT_EGRESS_DNS_SERVER or AGENT_EGRESS_PROTECTED_CIDRS before any runner is drained"
+  initialize_kata_epoch "$runner_image" "${backend:-kata}"
 }
 
 # This machine's name in the admin host switch. Resolved here because the

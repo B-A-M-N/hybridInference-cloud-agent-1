@@ -699,10 +699,14 @@ class ContainerBackend(SandboxBackend):
 
         Retained chat workspaces live in Docker's writable layer, so this
         preflight deliberately has no host-path or bind-mount probe.
-        ``check_network=False`` is for the candidate check alone: it validates
-        an image and a kernel with no deployment around it, so there are no
-        host rules for it to install.
+        ``check_network=False`` validates only the runtime: candidate checks
+        have no deployment network, and host qualification leaves mutable
+        host rules for each child to verify before accepting its turn.
         """
+        if self.runtime == KATA_RUNTIME:
+            from cloud_agent_host.runtime_qualification import check_runtime_state
+
+            check_runtime_state()
         try:
             result = subprocess.run(
                 [self.docker_binary, "version", "--format", "{{.Server.Version}}"],
@@ -814,6 +818,10 @@ class ContainerBackend(SandboxBackend):
             for alias, address in sorted(addresses.items())
             for part in ("--add-host", f"{alias}={address}")
         ]
+
+    def check_network(self) -> None:
+        """Revalidate mutable network state even when runtime evidence is inherited."""
+        self._check_sandbox_network()
 
     def _check_sandbox_network(self) -> None:
         """Refuse to accept work until this host enforces the sandbox network.

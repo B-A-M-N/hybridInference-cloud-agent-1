@@ -11,9 +11,11 @@ it reads pointed at fixtures — `uname` faked on PATH, `/proc/cpuinfo` and
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -219,6 +221,7 @@ def test_check_refuses_a_host_that_has_no_kata(tmp_path: Path) -> None:
     assert "Kata is not installed" in result.stderr
     assert _download_count(tmp_path) == 0
     assert not (tmp_path / "root" / "opt").exists()
+    assert not (tmp_path / "root/var").exists(), "--check must not initialize epoch state"
 
 
 # ── The install path ─────────────────────────────────────────────────────
@@ -249,7 +252,11 @@ def test_installs_links_the_shim_and_passes_its_own_check(tmp_path: Path) -> Non
     )
 
     # And the deploy-time check now passes on this host.
+    epoch = tmp_path / "root/var/lib/freeinference/kata-runtime/epoch.json"
+    before = epoch.read_bytes()
+    assert json.loads(before)["state"] == "ready"
     assert _run(tmp_path, "--check").returncode == 0
+    assert epoch.read_bytes() == before, "verification must not change the runtime generation"
 
 
 @pytest.mark.skipif(not _HAS_ZSTD, reason="zstd is needed to build a release-shaped fixture")
@@ -268,6 +275,11 @@ def test_install_refuses_a_release_without_the_ebpf_guest_kernel(tmp_path: Path)
 
     assert result.returncode != 0
     assert "eBPF/BTF guest kernel" in result.stderr
+    marker = tmp_path / "root/var/lib/freeinference/kata-runtime/epoch.json"
+    assert json.loads(marker.read_text())["state"] == "updating"
+    before = marker.read_bytes()
+    assert _run(tmp_path, "--check").returncode != 0
+    assert marker.read_bytes() == before
 
 
 @pytest.mark.skipif(not _HAS_ZSTD, reason="zstd is needed to build a release-shaped fixture")
@@ -278,12 +290,36 @@ def test_a_second_run_downloads_nothing(tmp_path: Path) -> None:
 
     assert _run(tmp_path, tarball=tarball, env_overrides=env).returncode == 0
     assert _download_count(tmp_path) == 1
+    marker = tmp_path / "root/var/lib/freeinference/kata-runtime/epoch.json"
+    previous_generation = json.loads(marker.read_text())["generation"]
 
     second = _run(tmp_path, tarball=tarball, env_overrides=env)
 
     assert second.returncode == 0
     assert "already installed" in second.stdout
     assert _download_count(tmp_path) == 1, "a repeat run re-downloaded the release"
+    current = json.loads(marker.read_text())
+    assert current["state"] == "ready"
+    assert current["generation"] != previous_generation
+
+
+@pytest.mark.skipif(not _HAS_ZSTD, reason="zstd is needed to build a release-shaped fixture")
+def test_epoch_is_updating_before_the_first_runtime_write(tmp_path: Path) -> None:
+    tarball = _fake_release_tarball(tmp_path)
+    real_tar = shutil.which("tar")
+    fake_bin = _fake_bin(tmp_path)
+    _write_executable(
+        fake_bin / "tar",
+        f"#!{sys.executable}\n"
+        "import json, os, pathlib, sys\n"
+        "if '-xf' in sys.argv:\n"
+        "    marker = pathlib.Path(os.environ['KATA_EXTRACT_ROOT']) / "
+        "'var/lib/freeinference/kata-runtime/epoch.json'\n"
+        "    assert json.loads(marker.read_text())['state'] == 'updating'\n"
+        f"os.execv({real_tar!r}, [{real_tar!r}, *sys.argv[1:]])\n",
+    )
+    result = _run(tmp_path, tarball=tarball, env_overrides={"KATA_SHA256": _digest(tarball)})
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.skipif(not _HAS_ZSTD, reason="zstd is needed to build a release-shaped fixture")

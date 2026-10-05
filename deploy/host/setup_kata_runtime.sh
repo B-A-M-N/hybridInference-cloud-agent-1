@@ -47,6 +47,7 @@ KATA_VERSION="${KATA_VERSION:-3.32.0}"
 KATA_EXTRACT_ROOT="${KATA_EXTRACT_ROOT:-/}"
 KATA_LINK_DIR="${KATA_LINK_DIR:-/usr/local/bin}"
 KATA_DOWNLOAD_BASE="${KATA_DOWNLOAD_BASE:-https://github.com/kata-containers/kata-containers/releases/download}"
+KATA_EPOCH_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/kata_runtime_epoch.py"
 
 # Upstream publishes no checksum file, so these come from the GitHub release
 # API's own asset digests. A version that is not listed here must supply
@@ -315,6 +316,9 @@ cmd_install() {
   require_tools
 
   if runtime_is_installed; then
+    # Invalidate before a possible config repair, even when no download is
+    # needed. The parent holds the host-wide lock until verification succeeds.
+    python3 "$KATA_EPOCH_HELPER" begin --root "$KATA_EXTRACT_ROOT"
     if ! debug_kernel_is_configured || ! guest_seccomp_is_configured; then
       configure_ebpf_kernel
     fi
@@ -343,6 +347,9 @@ cmd_install() {
   archive="${workdir}/kata-static.tar.zst"
 
   download_and_verify "$archive" "$expected"
+  # Downloads do not change the running runtime. Keep the old ready epoch
+  # through that potentially long wait, and invalidate before the first write.
+  python3 "$KATA_EPOCH_HELPER" begin --root "$KATA_EXTRACT_ROOT"
   extract "$archive"
   link_binaries
   configure_ebpf_kernel
@@ -382,6 +389,16 @@ case "${1:-install}" in
   # 32 is the last header line; 33 onwards is `set -Eeuo pipefail` and the
   # version-pin rationale, which is not usage text.
   --help | -h) sed -n '2,32p' "$0" ;;
-  install) cmd_install ;;
+  install)
+    # One lock across extraction, symlinks, configuration and the final check.
+    # A failed mutation leaves `updating`; only this parent publishes `ready`.
+    python3 "$KATA_EPOCH_HELPER" install --root "$KATA_EXTRACT_ROOT" -- \
+      bash "$0" --install-under-lock
+    ;;
+  --install-under-lock)
+    [[ -n "${_KATA_RUNTIME_EPOCH_LOCK_FD:-}" ]] || die "installer lock is missing"
+    cmd_install
+    cmd_check
+    ;;
   *) die "usage: $0 [install|--check]" ;;
 esac

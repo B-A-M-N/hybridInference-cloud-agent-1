@@ -378,6 +378,15 @@ services:
       # restart. The lock is taken on this directory, so a replaced container
       # and its predecessor cannot both spend a token during a rollout.
       - ${AGENT_HOST_STATE_ROOT:-/var/lib/hybridinference/agent-host}:${AGENT_HOST_STATE_ROOT:-/var/lib/hybridinference/agent-host}
+      # Host-wide Kata updates invalidate every deployment's cached probe.
+      # Bind the directory so atomic epoch replacements remain visible. An
+      # empty directory never qualifies a runtime: it requires full probes.
+      - type: bind
+        source: /var/lib/freeinference/kata-runtime
+        target: /run/agent-kata-runtime
+        read_only: true
+        bind:
+          create_host_path: true
       # The deploy user owns the readiness file; runners only read it. Keep it
       # separate from the container-owned enrollment directory. Refuse a missing
       # file instead of letting Docker create a root-owned directory in its place.

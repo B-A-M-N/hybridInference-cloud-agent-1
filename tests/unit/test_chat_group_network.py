@@ -732,6 +732,284 @@ def test_a_kata_guest_is_given_its_relays_and_the_one_resolver(monkeypatch):
     assert "/etc/resolv.conf" in argv[2] and "O_NOFOLLOW" in argv[2]
 
 
+def _running_kata_group(monkeypatch):
+    manager, docker, guard = _world(monkeypatch, runtime=KATA_RUNTIME)
+    spec = _spec()
+    docker.add_sandbox(spec, running=True)
+    name = manager._ensure_group_network(spec)
+    network = docker.network(name)
+    network["Created"] = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    docker.connect(network["Id"], "sandbox-container", [])
+    synced: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        manager,
+        "_kata_privileged_exec",
+        lambda _spec, argv, **_kwargs: (
+            synced.append(json.loads(argv[3])) or subprocess.CompletedProcess(argv, 0, "", "")
+        ),
+    )
+    docker.calls.clear()
+    return manager, docker, guard, spec, name, synced
+
+
+@pytest.mark.parametrize("operation", ["require_network", "start"])
+def test_hot_network_reconciliation_reuses_only_its_own_inspections(monkeypatch, operation):
+    manager, docker, guard, spec, name, synced = _running_kata_group(monkeypatch)
+    checked = guard.ensured
+    for attempt in range(2):
+        docker.calls.clear()
+        getattr(manager, operation)(spec)
+        inspections = [
+            argv
+            for argv in docker.calls
+            if argv[1:3] in (["network", "inspect"], ["container", "inspect"])
+        ]
+        # Previously 19 inspections per call, before the guest helper's own
+        # identity check. Reusing data inside one call must not become a cache
+        # across commands: the second call gathers the same fresh evidence.
+        assert len(inspections) == 10
+        assert ["docker", "container", "inspect", "relay-gateway"] not in inspections
+        assert ["docker", "container", "inspect", "relay-mcp"] not in inspections
+        assert not any(
+            argv[1:3] in (["network", "connect"], ["network", "disconnect"])
+            for argv in docker.calls
+        )
+        assert guard.ensured == checked + attempt + 1
+    endpoints = docker.network(name)["endpoints"]
+    expected = {
+        "agent-gateway": endpoints["relay-gateway"]["ip"],
+        "agent-mcp": endpoints["relay-mcp"]["ip"],
+    }
+    assert synced == [expected, expected], "guest file protections are checked on every call"
+
+
+def test_a_later_command_observes_new_relay_owners_and_guest_addresses(monkeypatch):
+    manager, docker, guard, spec, name, synced = _running_kata_group(monkeypatch)
+    manager.require_network(spec)
+    relays = docker.network("agent-relays")
+    relays["endpoints"].pop("relay-gateway")
+    docker.containers["relay-gateway"]["running"] = False
+    docker.add_container("relay-gateway-new", running=True)
+    docker.connect(relays["Id"], "relay-gateway-new", ["agent-gateway"])
+
+    manager.require_network(spec)
+
+    endpoints = docker.network(name)["endpoints"]
+    assert "relay-gateway" not in endpoints
+    assert synced[-1]["agent-gateway"] == endpoints["relay-gateway-new"]["ip"]
+    assert guard.relays[manager._network().bridge_name(name)] == {
+        (synced[-1]["agent-gateway"], 8080),
+        (synced[-1]["agent-mcp"], 8000),
+    }
+    # The next command must also notice a new untrusted peer even though the
+    # previous reconciliation passed for this exact sandbox generation.
+    docker.add_container("stranger", running=True)
+    docker.connect(docker.network(name)["Id"], "stranger", ["untrusted"])
+    with pytest.raises(SandboxError, match="unexpected peer"):
+        manager.require_network(spec)
+    assert len(synced) == 2
+
+
+@pytest.mark.parametrize(
+    "mutation", ["peer", "relay_address", "bridge_id", "extra_network", "sandbox_endpoint"]
+)
+def test_activation_refuses_topology_changes_after_the_rule_sync(monkeypatch, mutation):
+    manager, docker, guard, spec, name, synced = _running_kata_group(monkeypatch)
+    sync = guard.sync_relays
+
+    def mutate_after_sync(bridge, endpoints):
+        sync(bridge, endpoints)
+        network = docker.network(name)
+        if mutation == "peer":
+            docker.add_container("stranger", running=True)
+            docker.connect(network["Id"], "stranger", ["untrusted"])
+        elif mutation == "relay_address":
+            network["endpoints"]["relay-gateway"]["ip"] = "10.240.99.6"
+        elif mutation == "bridge_id":
+            network["Id"] = "replacement-with-the-same-name"
+        elif mutation == "sandbox_endpoint":
+            network["endpoints"].pop("sandbox-container")
+        else:
+            foreign = docker.add_network("unguarded", subnet="172.19.0.0/24")
+            docker.connect(foreign["Id"], "sandbox-container", [])
+
+    monkeypatch.setattr(guard, "sync_relays", mutate_after_sync)
+    with pytest.raises(SandboxError, match="changed during activation"):
+        manager.start(spec)
+    assert synced == [], "a failed snapshot must never reach the privileged guest helper"
+
+
+def test_relay_replacement_during_reconciliation_refuses_old_addresses(monkeypatch):
+    manager, docker, guard, spec, _name, synced = _running_kata_group(monkeypatch)
+    discoveries = 0
+    previous_syncs = guard.events.count("sync_relays")
+
+    def replace_during_discovery(argv, **kwargs):
+        nonlocal discoveries
+        if argv[1:] == ["network", "inspect", "agent-relays"]:
+            discoveries += 1
+            if discoveries == 2:
+                relays = docker.network("agent-relays")
+                relays["endpoints"].pop("relay-gateway")
+                docker.containers["relay-gateway"]["running"] = False
+                docker.add_container("relay-gateway-new", running=True)
+                docker.connect(relays["Id"], "relay-gateway-new", ["agent-gateway"])
+        return docker(argv, **kwargs)
+
+    monkeypatch.setattr(manager, "_run", replace_during_discovery)
+    with pytest.raises(SandboxError, match="relay owners changed"):
+        manager.require_network(spec)
+    assert guard.events.count("sync_relays") == previous_syncs
+    assert synced == []
+    # A fresh call can reconcile the completed rollout; no failed snapshot is
+    # retained by the manager.
+    manager.require_network(spec)
+    assert len(synced) == 1
+
+
+@pytest.mark.parametrize("change", ["alias", "gateway_priority", "missing"])
+def test_relay_endpoint_change_is_detected_by_the_final_discovery(monkeypatch, change):
+    manager, docker, guard, spec, name, synced = _running_kata_group(monkeypatch)
+    discoveries = 0
+    previous_syncs = guard.events.count("sync_relays")
+
+    def change_endpoint(argv, **kwargs):
+        nonlocal discoveries
+        if argv[1:] == ["network", "inspect", "agent-relays"]:
+            discoveries += 1
+            if discoveries == 2:
+                networks = docker.containers["relay-gateway"]["networks"]
+                if change == "alias":
+                    networks[name]["Aliases"] = []
+                    networks[name]["DNSNames"] = []
+                elif change == "gateway_priority":
+                    networks[name]["GwPriority"] = 0
+                else:
+                    networks.pop(name)
+        return docker(argv, **kwargs)
+
+    monkeypatch.setattr(manager, "_run", change_endpoint)
+    with pytest.raises(SandboxError, match="relay endpoint changed"):
+        manager.require_network(spec)
+    assert guard.events.count("sync_relays") == previous_syncs
+    assert synced == []
+
+
+@pytest.mark.parametrize("race", ["relay_rollout", "bridge_replacement"])
+def test_attach_discards_network_evidence_from_before_connection(monkeypatch, race):
+    manager, docker, guard = _world(monkeypatch, runtime=KATA_RUNTIME)
+    spec = _spec()
+    sandbox = docker.add_sandbox(spec)
+    name = manager.network_for(spec)
+    synced: list[dict[str, str]] = []
+    old_gateway_address = ""
+    mutated = False
+
+    def connect_then_change(argv, **kwargs):
+        nonlocal mutated, old_gateway_address
+        result = docker(argv, **kwargs)
+        if not mutated and argv[1:] == ["network", "connect", name, "sandbox-container"]:
+            mutated = True
+            network = docker.network(name)
+            old_gateway_address = network["endpoints"]["relay-gateway"]["ip"]
+            # Another trusted lifecycle actor starts the just-connected
+            # container before this caller's post-connect inspection.
+            sandbox["running"] = True
+            sandbox["status"] = "running"
+            sandbox["networks"][name]["NetworkID"] = network["Id"]
+            if race == "relay_rollout":
+                relays = docker.network("agent-relays")
+                relays["endpoints"].pop("relay-gateway")
+                docker.containers["relay-gateway"]["running"] = False
+                docker.add_container("relay-gateway-new", running=True)
+                docker.connect(relays["Id"], "relay-gateway-new", ["agent-gateway"])
+            else:
+                docker.networks.pop(network["Id"])
+                docker.add_network(
+                    name,
+                    subnet=network["IPAM"]["Config"][0]["Subnet"],
+                    options=network["Options"],
+                    labels=network["Labels"],
+                )
+        return result
+
+    monkeypatch.setattr(manager, "_run", connect_then_change)
+    monkeypatch.setattr(
+        manager,
+        "_kata_privileged_exec",
+        lambda _spec, argv, **_kwargs: (
+            synced.append(json.loads(argv[3])) or subprocess.CompletedProcess(argv, 0, "", "")
+        ),
+    )
+    if race == "bridge_replacement":
+        with pytest.raises(SandboxError, match="did not end up on exactly its group bridge"):
+            manager.require_network(spec)
+        assert synced == []
+    else:
+        manager.require_network(spec)
+        endpoints = docker.network(name)["endpoints"]
+        assert "relay-gateway" not in endpoints
+        assert synced == [
+            {
+                "agent-gateway": endpoints["relay-gateway-new"]["ip"],
+                "agent-mcp": endpoints["relay-mcp"]["ip"],
+            }
+        ]
+        assert synced[0]["agent-gateway"] != old_gateway_address
+        assert (synced[0]["agent-gateway"], 8080) in guard.relays[
+            manager._network().bridge_name(name)
+        ]
+    assert mutated
+
+
+def test_guest_network_snapshot_still_checks_files_and_skips_unchanged_writes(
+    monkeypatch, tmp_path
+):
+    manager, _docker, _guard, spec, _name, _synced = _running_kata_group(monkeypatch)
+    hosts = tmp_path / "hosts"
+    resolv = tmp_path / "resolv.conf"
+    hosts.write_text("127.0.0.1 localhost\n")
+    resolv.write_text("nameserver 127.0.0.11\n")
+    paths = {"/etc/hosts": hosts, "/etc/resolv.conf": resolv}
+    actual_open, actual_stat = os.open, os.fstat
+    monkeypatch.setattr(os, "open", lambda path, flags: actual_open(paths.get(path, path), flags))
+    monkeypatch.setattr(
+        os, "fstat", lambda fd: SimpleNamespace(st_uid=0, st_mode=actual_stat(fd).st_mode)
+    )
+
+    def run_script(_spec, argv, **_kwargs):
+        monkeypatch.setattr(sys, "argv", ["-c", *argv[3:]])
+        try:
+            exec(compile(argv[2], "<guest-network>", "exec"), {})
+        except (RuntimeError, OSError) as exc:
+            return subprocess.CompletedProcess(argv, 1, "", str(exc))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(manager, "_kata_privileged_exec", run_script)
+    current = manager._require(spec)
+    addresses = {"agent-gateway": "10.240.9.2", "agent-mcp": "10.240.9.3"}
+    manager._sync_kata_guest_network(spec, current, addresses)
+    unchanged_mtime = 1_000_000_000
+    for path in (hosts, resolv):
+        os.utime(path, ns=(unchanged_mtime, unchanged_mtime))
+    manager._sync_kata_guest_network(spec, current, addresses)
+    assert [path.stat().st_mtime_ns for path in (hosts, resolv)] == [unchanged_mtime] * 2
+
+    # Supplying already resolved addresses never skips the guest-owned-file
+    # refusal or symlink protection, even after an earlier successful sync.
+    resolv.chmod(0o666)
+    with pytest.raises(SandboxError, match="root-owned and protected"):
+        manager._sync_kata_guest_network(spec, current, addresses)
+    resolv.chmod(0o644)
+    hosts.write_text("127.0.0.1 localhost\n# BEGIN FREEINFERENCE RELAYS\nunterminated\n")
+    with pytest.raises(SandboxError, match="invalid managed relay block"):
+        manager._sync_kata_guest_network(spec, current, addresses)
+    hosts.unlink()
+    hosts.symlink_to(resolv)
+    with pytest.raises(SandboxError, match="network sync failed"):
+        manager._sync_kata_guest_network(spec, current, addresses)
+
+
 # ── releasing and pruning ─────────────────────────────────────────────
 
 

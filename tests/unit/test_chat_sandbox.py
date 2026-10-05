@@ -67,6 +67,11 @@ def _plain_group_network(monkeypatch):
     monkeypatch.setattr(
         ChatSandboxManager, "_ensure_group_network", lambda _self, _spec: "agent-net"
     )
+    monkeypatch.setattr(
+        ChatSandboxManager,
+        "_require_group_network",
+        lambda self, spec, _current, *_snapshot: self._require(spec),
+    )
     monkeypatch.setattr(ChatSandboxManager, "_sync_kata_guest_network", lambda *_args: None)
     monkeypatch.setattr(ChatSandboxManager, "_verify_guest_network", lambda *_args: None)
     monkeypatch.setattr(

@@ -22,12 +22,32 @@ pins. A failure leaves the old marker and runners alone. The checks on the
 actual replacement runners, relays and broker still run before mark-ready;
 their failure uses the existing recorded-generation recovery.
 
-Each turn still completes a fresh preflight before accepting its handover.
-The Kata probe reads the guest kernel from the same temporary container that
-exercises member isolation and observer delivery, avoiding a second VM boot.
+The host now qualifies Kata before polling for turns and can reuse that proof
+for up to 60 seconds. Its original Docker HTTP connection must remain live
+without reconnecting, and the current image ID, runtime configuration, host
+kernel, deployment marker, backend settings and installer epoch must still
+match. A restart or change requires a new full probe. The installer marks its
+root-owned epoch `updating` before any runtime mutation and `ready` only after
+verification; an updating or malformed epoch blocks acceptance. Existing hosts
+initialize the epoch during deployment after their normal runtime check.
+
+Each child obtains evidence through a private inherited socket, checks its
+configuration and the proof's five-second handoff lifetime, then verifies the
+current host network before accepting its turn. Claims cannot supply a proof.
+Missing epoch or unsupported Docker transport retains full per-turn preflight.
+No-payload deployment canaries always run the full probe. That probe reads the
+guest kernel from the same temporary container that exercises member isolation
+and observer delivery, avoiding a second VM boot.
+
 Network rule reads share a disposable helper; route reads keep their separate,
-capability-free helper. These changes do not cache qualification across turns
-or change the checks, guard recheck interval, network policy, or failure handling.
+capability-free helper. Group reconciliation reuses inspections only within
+one command, rereads after mutations and verifies the final bridge identity,
+membership and relay addresses. Every subsequent command still checks again.
+Unchanged guest hosts/resolver files avoid writes while retaining their file
+ownership, mode and symlink checks. Network policy and guard freshness remain
+unchanged. A full host checks for completed children every second; empty-queue
+polling and failure backoff retain their five-second intervals.
+
 Selected startup measurements now attribute this work to a `preflight` stage;
 the total remains claim request to prompt dispatch, excluding queue wait and
 model response time. Declined children do not publish a successful startup.

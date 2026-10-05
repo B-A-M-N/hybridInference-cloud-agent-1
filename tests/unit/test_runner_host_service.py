@@ -160,6 +160,411 @@ def _job(n: int) -> dict:
     return {"job_id": f"ajob_{n}", "attempt_id": n, "worker_token": f"ajt.{n}"}
 
 
+def _delivered_job() -> dict[str, Any]:
+    return {
+        **_job(1),
+        "thread_id": "athr_1",
+        "attempt_no": 1,
+        "repo": "o/n",
+        "task_prompt": "do it",
+        "runtime": "claude-code",
+        "model": "m",
+        "sandbox_token": "grant",
+    }
+
+
+@pytest.mark.parametrize("proof", ["valid", "missing", "invalid", "network_failure"])
+def test_qualified_child_checks_network_before_accepting(monkeypatch, proof):
+    import io
+    import os
+    import socket
+
+    from cloud_agent_host.sandbox import ContainerBackend, SandboxError
+
+    events = []
+    parent, child = socket.socketpair()
+    read_fd, write_fd = os.pipe()
+    backend = ContainerBackend(image="sandbox", runtime="io.containerd.kata.v2")
+    monkeypatch.setattr(runner_mod, "build_backend_from_env", lambda: backend)
+    monkeypatch.setattr(backend, "preflight", lambda: events.append("full"))
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_delivered_job())))
+    monkeypatch.setenv("AGENT_DEPLOYMENT_SHA", "deploy-sha")
+    monkeypatch.setenv("AGENT_SHARED_LIVE_READY_FILE", "/trusted/ready")
+
+    def qualify(actual, channel, **kwargs):
+        assert actual is backend
+        assert channel.fileno() > 2
+        assert kwargs == {"deployment_sha": "deploy-sha", "readiness_path": "/trusted/ready"}
+        events.append("qualify")
+        if proof == "invalid":
+            raise SandboxError("runtime changed")
+        return proof != "missing"
+
+    def network():
+        events.append("network")
+        if proof == "network_failure":
+            raise SandboxError("network changed")
+
+    def run(_job, **_kwargs):
+        events.append("run")
+        assert os.read(read_fd, 256).decode().startswith("accepted")
+        return 0
+
+    monkeypatch.setattr(runner_mod, "use_qualification", qualify)
+    monkeypatch.setattr(backend, "check_network", network)
+    monkeypatch.setattr(runner_mod, "run_turn", run)
+    try:
+        code = runner_mod._serve_turn(
+            handover_fd=write_fd,
+            qualification_fd=child.detach(),
+            base_url="http://control",
+            gateway_url="http://gateway",
+            worker_id="runner-a",
+            lease_ttl=120.0,
+            agent_timeout_s=3600.0,
+            host="host-a",
+        )
+        assert parent.recv(1) == b"", "private handoff FD must close before a turn runs"
+        if proof in {"invalid", "network_failure"}:
+            assert code == 2
+            assert os.read(read_fd, 256).decode().startswith("declined")
+            assert "run" not in events
+        else:
+            assert code == 0
+        assert (
+            events
+            == {
+                "valid": ["qualify", "network", "run"],
+                "missing": ["qualify", "full", "run"],
+                "invalid": ["qualify"],
+                "network_failure": ["qualify", "network"],
+            }[proof]
+        )
+    finally:
+        parent.close()
+        child.close()
+        os.close(read_fd)
+
+
+@pytest.mark.parametrize("raw", ["", "{", "[]"])
+def test_deployment_canary_never_uses_private_qualification(monkeypatch, raw):
+    import io
+    import os
+    import socket
+
+    from cloud_agent_host.sandbox import ContainerBackend
+
+    parent, child = socket.socketpair()
+    read_fd, write_fd = os.pipe()
+    backend = ContainerBackend(image="sandbox")
+    events = []
+    monkeypatch.setattr("sys.stdin", io.StringIO(raw))
+    monkeypatch.setattr(runner_mod, "build_backend_from_env", lambda: backend)
+    monkeypatch.setattr(
+        runner_mod, "use_qualification", lambda *a, **k: pytest.fail("canary reuse")
+    )
+
+    def preflight():
+        parent.settimeout(0.1)
+        assert parent.recv(1) == b"", "parent must not wait on a canary's full probe"
+        events.append("full")
+
+    monkeypatch.setattr(backend, "preflight", preflight)
+    try:
+        assert (
+            runner_mod._serve_turn(
+                handover_fd=write_fd,
+                qualification_fd=child.detach(),
+                base_url="http://control",
+                gateway_url="http://gateway",
+                worker_id="runner-a",
+                lease_ttl=120.0,
+                agent_timeout_s=3600.0,
+                host="host-a",
+            )
+            == 0
+        )
+        assert events == ["full"]
+        assert os.read(read_fd, 256).decode().startswith("declined")
+    finally:
+        parent.close()
+        child.close()
+        os.close(read_fd)
+
+
+def test_claim_json_cannot_supply_runtime_qualification(monkeypatch):
+    import io
+    import os
+
+    from cloud_agent_host.sandbox import ContainerBackend
+
+    read_fd, write_fd = os.pipe()
+    events = []
+    payload = {**_delivered_job(), "_qualification": {"qualified": True}, "qualification_fd": 1}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    backend = ContainerBackend(image="sandbox")
+    monkeypatch.setattr(runner_mod, "build_backend_from_env", lambda: backend)
+    monkeypatch.setattr(backend, "preflight", lambda: events.append("full"))
+    monkeypatch.setattr(runner_mod, "use_qualification", lambda *a, **k: pytest.fail("claim reuse"))
+    monkeypatch.setattr(runner_mod, "run_turn", lambda *a, **k: events.append("run") or 0)
+    try:
+        assert (
+            runner_mod._serve_turn(
+                handover_fd=write_fd,
+                base_url="http://control",
+                gateway_url="http://gateway",
+                worker_id="runner-a",
+                lease_ttl=120.0,
+                agent_timeout_s=3600.0,
+                host="host-a",
+            )
+            == 0
+        )
+        assert events == ["full", "run"]
+    finally:
+        os.close(read_fd)
+
+
+def test_parent_qualification_travels_on_a_private_inherited_socket(monkeypatch):
+    import subprocess
+    import sys
+
+    real_popen = subprocess.Popen
+    events = []
+
+    class Qualification:
+        def serve(self, channel):
+            channel.settimeout(5)
+            assert channel.recv(32) == b"request"
+            events.append("served")
+            channel.sendall(b"qualified")
+
+    def popen(argv, **kwargs):
+        assert "ajt.1" not in argv and "grant" not in argv
+        handover_fd = argv[argv.index("--handover-fd") + 1]
+        qualification_fd = argv[argv.index("--qualification-fd") + 1]
+        assert kwargs["pass_fds"] == (int(handover_fd), int(qualification_fd))
+        return real_popen(
+            [
+                sys.executable,
+                "-c",
+                """
+import json, os, socket, sys
+payload = json.load(sys.stdin)
+assert payload['worker_token'] == 'ajt.1'
+assert '_qualification' not in payload
+with socket.socket(fileno=int(sys.argv[2])) as channel:
+    channel.sendall(b'request')
+    assert channel.recv(32) == b'qualified'
+os.write(int(sys.argv[1]), b'accepted ajob_1\\n')
+os.close(int(sys.argv[1]))
+""",
+                handover_fd,
+                qualification_fd,
+            ],
+            **kwargs,
+        )
+
+    monkeypatch.setattr(runner_mod.subprocess, "Popen", popen)
+    result = runner_mod._spawn_turn(
+        {**_delivered_job(), "_qualification": "untrusted"},
+        base_url="http://control",
+        gateway_url="http://gateway",
+        worker_id="runner-a",
+        lease_ttl=120.0,
+        agent_timeout_s=3600.0,
+        host="host-a",
+        qualification=Qualification(),
+    )
+    assert result.outcome == LAUNCH_STARTED
+    assert events == ["served"]
+    assert result.handle.wait(timeout=5) == 0
+
+
+def test_proof_wait_shares_the_existing_handover_deadline(monkeypatch):
+    import io
+    import os
+    from types import SimpleNamespace
+
+    now = [100.0]
+
+    class Qualification:
+        def serve(self, _channel):
+            now[0] += 40.0
+
+    process = SimpleNamespace(stdin=io.BytesIO())
+    monkeypatch.setattr(runner_mod.subprocess, "Popen", lambda *a, **k: process)
+    monkeypatch.setattr(runner_mod.time, "monotonic", lambda: now[0])
+
+    def read(fd, *, timeout_s):
+        assert timeout_s == runner_mod.HANDOVER_TIMEOUT_S - 40.0
+        os.close(fd)
+        return None
+
+    monkeypatch.setattr(runner_mod, "read_handover", read)
+    result = runner_mod._spawn_turn(
+        _delivered_job(),
+        base_url="http://control",
+        gateway_url="http://gateway",
+        worker_id="runner-a",
+        lease_ttl=120.0,
+        agent_timeout_s=3600.0,
+        host="host-a",
+        qualification=Qualification(),
+    )
+    assert result.outcome == LAUNCH_UNCERTAIN
+    assert result.handle is process
+
+
+def test_runtime_qualification_failure_pauses_claims_until_recovered(service, monkeypatch):
+    from cloud_agent_host.sandbox import ContainerBackend, SandboxError
+
+    _identity, _backend, _released = service
+    backend = ContainerBackend(image="sandbox")
+    monkeypatch.setattr(backend, "preflight", lambda: None)
+    monkeypatch.setattr(backend, "version_stamp", lambda: {})
+    monkeypatch.setattr(backend, "check_gateway_reachable", lambda _url: None)
+    events = []
+
+    class Qualification:
+        calls = 0
+
+        def refresh(self):
+            self.calls += 1
+            events.append("refresh")
+            if self.calls == 1:
+                raise SandboxError("runtime updating")
+            return True
+
+        def close(self):
+            events.append("close")
+
+    qualification = Qualification()
+    monkeypatch.setattr(runner_mod, "HostQualification", lambda *a, **k: qualification)
+
+    def sleep(seconds):
+        assert seconds == 5
+        assert "runtime updating" in FakeHeartbeat.last.kwargs["launch_error"]()
+        events.append("backoff")
+
+    def claim(**_kwargs):
+        events.append("claim")
+        assert FakeHeartbeat.last.kwargs["launch_error"]() == ""
+        runner_mod._STOPPING.set()
+        return _job(1)
+
+    def spawn(payload, **kwargs):
+        assert kwargs["qualification"] is qualification
+        events.append("launch")
+        handle = FakeHandle()
+        handle.exit_code = 0
+        return LaunchResult(LAUNCH_STARTED, handle)
+
+    monkeypatch.setattr(runner_mod.time, "sleep", sleep)
+    monkeypatch.setattr(runner_mod, "claim_payload", claim)
+    monkeypatch.setattr(runner_mod, "_spawn_turn", spawn)
+    assert (
+        runner_mod.run_forever(
+            base_url="http://control", worker_id="runner-a", backend=backend, host="host-a"
+        )
+        == 0
+    )
+    assert events == ["refresh", "backoff", "refresh", "claim", "launch", "close"]
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_freed_slots_are_detected_without_faster_empty_queue_polling(service, monkeypatch, full):
+    _identity, backend, _released = service
+    waits = []
+    launched = []
+
+    def sleep(seconds):
+        waits.append(seconds)
+        runner_mod._STOPPING.set()
+
+    def launch(_payload):
+        launched.append(FakeHandle())
+        return LaunchResult(LAUNCH_STARTED, launched[-1])
+
+    monkeypatch.setattr(runner_mod.time, "sleep", sleep)
+    monkeypatch.setattr(
+        runner_mod, "claim_payload", lambda **_k: _job(len(launched)) if full else None
+    )
+    assert (
+        runner_mod.run_forever(
+            base_url="http://control",
+            worker_id="runner-a",
+            backend=backend,
+            host="host-a",
+            spawn_turn=launch,
+        )
+        == 0
+    )
+    # Shutdown may sleep while draining live handles; the service's first
+    # sleep is the relevant interval and never triggers an extra API claim.
+    assert waits[0] == (1.0 if full else 5.0)
+    assert len(launched) == (3 if full else 0)
+
+
+@pytest.mark.parametrize("reusable", [False, True])
+def test_repaired_image_is_refreshed_but_claims_always_require_current_attestation(
+    service, monkeypatch, reusable
+):
+    from cloud_agent_host.sandbox import ContainerBackend
+
+    backend = ContainerBackend(image="sandbox")
+    monkeypatch.setattr(backend, "preflight", lambda: None)
+    monkeypatch.setattr(backend, "check_gateway_reachable", lambda _url: None)
+    events = []
+
+    class Qualification:
+        calls = 0
+
+        def refresh(self):
+            self.calls += 1
+            events.append("refresh")
+            return reusable
+
+        def close(self):
+            events.append("close")
+
+    qualification = Qualification()
+    monkeypatch.setattr(runner_mod, "HostQualification", lambda *a, **k: qualification)
+    monkeypatch.setattr(backend, "version_stamp", lambda: {"compatible": qualification.calls >= 2})
+
+    def ready(_backend, stamp):
+        events.append("gate")
+        return stamp["compatible"]
+
+    def sleep(_seconds):
+        events.append("wait")
+        assert events.count("wait") <= 1, "stale attestation must not prevent checking a repair"
+        assert "claim" not in events, "an incompatible image must never claim"
+
+    def claim(**_kwargs):
+        assert qualification.calls == 2
+        events.append("claim")
+        runner_mod._STOPPING.set()
+        return _job(1)
+
+    def spawn(_payload, **_kwargs):
+        handle = FakeHandle()
+        handle.exit_code = 0
+        return LaunchResult(LAUNCH_STARTED, handle)
+
+    monkeypatch.setattr(runner_mod, "_shared_live_deployment_ready", ready)
+    monkeypatch.setattr(runner_mod.time, "sleep", sleep)
+    monkeypatch.setattr(runner_mod, "claim_payload", claim)
+    monkeypatch.setattr(runner_mod, "_spawn_turn", spawn)
+    assert (
+        runner_mod.run_forever(
+            base_url="http://control", worker_id="runner-a", backend=backend, host="host-a"
+        )
+        == 0
+    )
+    assert events == ["refresh", "gate", "wait", "refresh", "gate", "claim", "close"]
+
+
 # ── The limit ──────────────────────────────────────────────────────────
 
 
@@ -669,6 +1074,7 @@ def test_the_cli_routes_turn_mode_and_hides_its_flags(monkeypatch):
     assert parser.parse_args(["--turn", "--handover-fd", "3"]).handover_fd == 3
     assert "--turn" not in parser.format_help()
     assert "--handover-fd" not in parser.format_help()
+    assert "--qualification-fd" not in parser.format_help()
 
     calls: dict[str, Any] = {}
     monkeypatch.setenv("AGENT_CONTROL_PLANE_URL", "http://control")
@@ -678,11 +1084,15 @@ def test_the_cli_routes_turn_mode_and_hides_its_flags(monkeypatch):
         runner_mod, "run_forever", lambda **kw: calls.setdefault("service", kw) and 0
     )
 
-    runner_mod.main(["--turn", "--handover-fd", "9", "--host", "host-a"])
+    runner_mod.main(
+        ["--turn", "--handover-fd", "9", "--qualification-fd", "10", "--host", "host-a"]
+    )
     runner_mod.main(["--host", "host-a"])
 
     assert calls["turn"]["handover_fd"] == 9
+    assert calls["turn"]["qualification_fd"] == 10
     assert "handover_fd" not in calls["service"]
+    assert "qualification_fd" not in calls["service"]
 
 
 def test_turn_mode_without_a_handover_descriptor_is_refused(monkeypatch):

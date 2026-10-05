@@ -368,6 +368,15 @@ class ChatSandboxInspection:
 
 
 @dataclass
+class _GroupNetworkSnapshot:
+    """One reconciliation's evidence; never retained across commands or starts."""
+
+    network: dict[str, Any] | None = None
+    owners: dict[str, list[str]] = field(default_factory=dict)
+    addresses: dict[str, str] | None = None
+
+
+@dataclass
 class SandboxActionFacts:
     """What one activation actually did to the container.
 
@@ -582,8 +591,8 @@ class ChatSandboxManager:
                 resolved[container_id] = aliases
         return resolved
 
-    def _relay_owners(self) -> dict[str, list[str]]:
-        """Resolve each relay alias to one running container on the relay network."""
+    def _discover_relays(self) -> tuple[dict[str, list[str]], dict[str, dict[str, Any]]]:
+        """Resolve owners and keep their inspected endpoints for this operation."""
         base = self._network().relay_network
         aliases = self._relay_aliases()
         network = self._inspect_network(base)
@@ -632,7 +641,11 @@ class ChatSandboxManager:
                     f"{base!r}; refusing an ambiguous group network"
                 )
             owners.setdefault(unique[0], []).append(alias)
-        return owners
+        return owners, inspected
+
+    def _relay_owners(self) -> dict[str, list[str]]:
+        """Resolve each relay alias to one running container on the relay network."""
+        return self._discover_relays()[0]
 
     def _container_network_aliases(self, container_id: str, network: str) -> set[str] | None:
         """One container's names on ``network``; ``None`` if it is not on it."""
@@ -644,7 +657,16 @@ class ChatSandboxManager:
             return {}
         owners = self._relay_owners()
         raw = self._inspect_network(network)
+        return self._relay_addresses_from(owners, raw)
+
+    @staticmethod
+    def _relay_addresses_from(
+        owners: dict[str, list[str]], raw: dict[str, Any] | None
+    ) -> dict[str, str]:
+        """Read relay addresses from the same bridge whose membership was checked."""
         endpoints = (raw or {}).get("Containers") or {}
+        if not isinstance(endpoints, dict):
+            raise SandboxError("Docker returned invalid group-network endpoints")
         addresses: dict[str, str] = {}
         for container_id, names in owners.items():
             endpoint = endpoints.get(container_id) or {}
@@ -659,7 +681,10 @@ class ChatSandboxManager:
         return addresses
 
     def _sync_kata_guest_network(
-        self, spec: ChatSandboxSpec, current: ChatSandboxInspection
+        self,
+        spec: ChatSandboxSpec,
+        current: ChatSandboxInspection,
+        addresses: dict[str, str] | None = None,
     ) -> None:
         """Write the guest's relay names and its one resolver after activation.
 
@@ -676,7 +701,8 @@ class ChatSandboxManager:
         network = self.network_for(spec)
         if current.networks != (network,):
             return
-        addresses = self.relay_addresses(network)
+        if addresses is None:
+            addresses = self.relay_addresses(network)
         script = (
             "import fcntl, ipaddress, json, os, stat, sys\n"
             "entries=json.loads(sys.argv[1])\n"
@@ -691,7 +717,8 @@ class ChatSandboxManager:
             "with os.fdopen(fd, 'r+') as f:\n"
             " fcntl.flock(f.fileno(), fcntl.LOCK_EX)\n"
             " protected(f, 'hosts file')\n"
-            " text=f.read(65537)\n"
+            " original=f.read(65537)\n"
+            " text=original\n"
             " if len(text)>65536: raise RuntimeError('guest hosts file is too large')\n"
             " if begin in text:\n"
             "  before, rest=text.split(begin,1)\n"
@@ -699,12 +726,15 @@ class ChatSandboxManager:
             "  text=before+rest.split(end,1)[1]\n"
             " text=text.rstrip()+'\\n'+begin\n"
             " text+=''.join(ip+' '+host+'\\n' for host,ip in sorted(entries.items()))\n"
-            " f.seek(0); f.write(text+end); f.truncate()\n"
+            " if original != text+end:\n"
+            "  f.seek(0); f.write(text+end); f.truncate()\n"
             "fd=os.open('/etc/resolv.conf', os.O_RDWR | os.O_NOFOLLOW)\n"
             "with os.fdopen(fd, 'r+') as f:\n"
             " fcntl.flock(f.fileno(), fcntl.LOCK_EX)\n"
             " protected(f, 'resolv.conf')\n"
-            " f.seek(0); f.write('nameserver '+resolver+'\\n'); f.truncate()\n"
+            " desired='nameserver '+resolver+'\\n'\n"
+            " if f.read(len(desired)+1) != desired:\n"
+            "  f.seek(0); f.write(desired); f.truncate()\n"
         )
         result = self._kata_privileged_exec(
             spec,
@@ -717,7 +747,13 @@ class ChatSandboxManager:
     def _relay_endpoint(self, container_id: str, network: str) -> tuple[set[str], int] | None:
         """A relay's names and gateway priority on ``network``; ``None`` if absent."""
         raw = self._inspect_containers([container_id]).get(container_id)
-        names = None if raw is None else self._endpoint_aliases(raw, network)
+        return self._relay_endpoint_from(raw, network)
+
+    @classmethod
+    def _relay_endpoint_from(
+        cls, raw: dict[str, Any] | None, network: str
+    ) -> tuple[set[str], int] | None:
+        names = None if raw is None else cls._endpoint_aliases(raw, network)
         if raw is None or names is None:
             return None
         endpoint = raw["NetworkSettings"]["Networks"][network]
@@ -733,8 +769,13 @@ class ChatSandboxManager:
         network: str,
         container_id: str,
         aliases: builtins.list[str],
+        inspected: dict[str, Any] | None = None,
     ) -> None:
-        existing = self._relay_endpoint(container_id, network)
+        existing = (
+            self._relay_endpoint_from(inspected, network)
+            if inspected is not None
+            else self._relay_endpoint(container_id, network)
+        )
         if existing is not None:
             names, priority = existing
             if not set(aliases).issubset(names):
@@ -779,7 +820,8 @@ class ChatSandboxManager:
         spec: ChatSandboxSpec,
         service_ids: set[str],
         service_aliases: tuple[str, ...],
-    ) -> None:
+        sandbox: ChatSandboxInspection | None = None,
+    ) -> dict[str, Any]:
         """Keep a group bridge limited to this chat and its current relays.
 
         Compose replaces relay containers during a rollout. Their old endpoints
@@ -797,7 +839,8 @@ class ChatSandboxManager:
             raise SandboxError("Docker returned invalid group-network endpoints")
 
         permitted = set(service_ids)
-        sandbox = self.inspect(spec.container_name)
+        if sandbox is None:
+            sandbox = self.inspect(spec.container_name)
         if sandbox is not None:
             self._verify_identity(sandbox, spec)
             permitted.add(sandbox.container_id)
@@ -831,12 +874,16 @@ class ChatSandboxManager:
         refreshed = self._inspect_network(network)
         if refreshed is None:
             raise SandboxError("group network disappeared during reconciliation")
+        self._verify_group_network(refreshed, spec)
+        if refreshed.get("Id") != inspected.get("Id"):
+            raise SandboxError("group network identity changed during reconciliation")
         refreshed_containers = refreshed.get("Containers") or {}
         if not isinstance(refreshed_containers, dict):
             raise SandboxError("Docker returned invalid group-network endpoints")
         actual = set(map(str, refreshed_containers))
         if not service_ids.issubset(actual) or actual - permitted:
             raise SandboxError("group network membership is not exact")
+        return refreshed
 
     def _candidate_chat_subnets(self, network_name: str) -> Iterator[ipaddress.IPv4Network]:
         """Yield every /29 once, starting from a stable per-network hash.
@@ -910,22 +957,28 @@ class ChatSandboxManager:
             + (f": {last_conflict}" if last_conflict else "")
         )
 
-    def _attach_relays(self, network: str) -> set[str]:
+    def _attach_relays(
+        self,
+        network: str,
+        discovery: tuple[dict[str, list[str]], dict[str, dict[str, Any]]] | None = None,
+    ) -> set[str]:
         """Attach the exact currently discovered relay endpoints to one bridge."""
-        owners = self._relay_owners()
+        owners, inspected = discovery if discovery is not None else self._discover_relays()
         for container_id, owned_aliases in owners.items():
             self._ensure_service_connection(
                 network=network,
                 container_id=container_id,
                 aliases=owned_aliases,
+                inspected=inspected.get(container_id),
             )
         return set(owners)
 
-    def _sync_relay_exceptions(self, network: str) -> None:
+    def _sync_relay_exceptions(self, network: str, addresses: dict[str, str] | None = None) -> None:
         """Make the host's relay exceptions for one bridge match its relays."""
         config = self._network()
         ports = {relay.host: relay.port for relay in config.relays}
-        addresses = self.relay_addresses(network)
+        if addresses is None:
+            addresses = self.relay_addresses(network)
         self.backend.network_guard().sync_relays(
             config.bridge_name(network),
             {(address, ports[alias]) for alias, address in addresses.items()},
@@ -948,19 +1001,50 @@ class ChatSandboxManager:
                 extra={"network": network_name, "detail": str(exc)[:300]},
             )
 
-    def _ensure_group_services(self, network: str, spec: ChatSandboxSpec) -> None:
+    def _ensure_group_services(
+        self,
+        network: str,
+        spec: ChatSandboxSpec,
+        *,
+        sandbox: ChatSandboxInspection | None = None,
+    ) -> _GroupNetworkSnapshot:
         """Attach and verify the relays, then mirror them into the host's rules."""
         aliases = self._relay_aliases()
-        service_ids = self._attach_relays(network) if aliases else set()
-        self._reconcile_group_members(
+        discovery = self._discover_relays() if aliases else ({}, {})
+        owners = discovery[0]
+        service_ids = self._attach_relays(network, discovery) if aliases else set()
+        reconciled = self._reconcile_group_members(
             network=network,
             spec=spec,
             service_ids=service_ids,
             service_aliases=aliases,
+            sandbox=sandbox,
         )
-        self._sync_relay_exceptions(network)
+        # Compose can replace a relay while reconciliation runs. Refuse that
+        # race rather than giving an old owner's address to the guest or nft.
+        if aliases:
+            latest_owners, latest_inspected = self._discover_relays()
+            if latest_owners != owners:
+                raise SandboxError("relay owners changed during group network reconciliation")
+            for container_id, owned_aliases in owners.items():
+                endpoint = self._relay_endpoint_from(latest_inspected.get(container_id), network)
+                if (
+                    endpoint is None
+                    or not set(owned_aliases).issubset(endpoint[0])
+                    or endpoint[1] >= 0
+                ):
+                    raise SandboxError("relay endpoint changed during group network reconciliation")
+        addresses = self._relay_addresses_from(owners, reconciled)
+        self._sync_relay_exceptions(network, addresses)
+        return _GroupNetworkSnapshot(network=reconciled, owners=owners, addresses=addresses)
 
-    def _ensure_group_network(self, spec: ChatSandboxSpec) -> str:
+    def _ensure_group_network(
+        self,
+        spec: ChatSandboxSpec,
+        *,
+        current: ChatSandboxInspection | None = None,
+        snapshot: _GroupNetworkSnapshot | None = None,
+    ) -> str:
         """Create/reconcile the group bridge, its relays and their exceptions."""
         # Rules first: no group bridge exists on a host that has not proved it
         # enforces them.
@@ -968,8 +1052,8 @@ class ChatSandboxManager:
         expected = self.network_for(spec)
         network = self._inspect_network(expected)
         if network is not None and self._network_is_stale_for_prune(network):
-            sandbox = self.inspect(spec.container_name)
-            if sandbox is None or not self._endpoint_is_current(sandbox, expected):
+            sandbox = current if current is not None else self.inspect(spec.container_name)
+            if sandbox is None or not self._endpoint_is_current(sandbox, expected, network):
                 network_id = str(network.get("Id") or "") or None
                 self._release_owned_network(
                     expected,
@@ -983,7 +1067,11 @@ class ChatSandboxManager:
         if network is None:
             raise SandboxError("Docker created the group network but it cannot be inspected")
         self._verify_group_network(network, spec)
-        self._ensure_group_services(expected, spec)
+        result = self._ensure_group_services(expected, spec, sandbox=current)
+        if snapshot is not None:
+            snapshot.network = result.network
+            snapshot.owners = result.owners
+            snapshot.addresses = result.addresses
         return expected
 
     def _owned_network_matches(self, network_name: str, spec: ChatSandboxSpec) -> bool:
@@ -1306,6 +1394,7 @@ class ChatSandboxManager:
         self,
         current: ChatSandboxInspection,
         network_name: str,
+        network: dict[str, Any] | None = None,
     ) -> bool:
         """Distinguish a live/pending endpoint from Docker's stale stopped metadata."""
         if network_name not in current.networks:
@@ -1320,7 +1409,8 @@ class ChatSandboxManager:
             # Docker records a stopped container's pending connection by name
             # and fills NetworkID only when the container starts.
             return True
-        network = self._inspect_network(network_name)
+        if network is None:
+            network = self._inspect_network(network_name)
         if network is None:
             return False
         current_id = str(network.get("Id") or "")
@@ -1333,8 +1423,13 @@ class ChatSandboxManager:
         self,
         spec: ChatSandboxSpec,
         current: ChatSandboxInspection,
+        snapshot: _GroupNetworkSnapshot | None = None,
     ) -> ChatSandboxInspection:
         expected = self.network_for(spec)
+        if snapshot is not None:
+            snapshot.network = None
+            snapshot.owners = {}
+            snapshot.addresses = None
         sources = tuple(current.networks)
         for source in sources:
             if source in (expected, CHAT_NULL_NETWORK):
@@ -1356,7 +1451,7 @@ class ChatSandboxManager:
                 "a running retained chat is not on exactly its group bridge; stop it "
                 "before it can be resumed"
             )
-        expected = self._ensure_group_network(spec)
+        expected = self._ensure_group_network(spec, current=current)
         if not self._endpoint_is_current(current, expected):
             connected = self._run(
                 [
@@ -1382,20 +1477,65 @@ class ChatSandboxManager:
         moved = self._require(spec)
         if set(moved.networks) != {expected} or not self._endpoint_is_current(moved, expected):
             raise SandboxError("retained chat did not end up on exactly its group bridge")
-        return moved
+        # Connect/disconnect may race a relay rollout or bridge replacement.
+        # Evidence read before those mutations cannot be handed to the guest:
+        # reconcile again and apply the same final check as a hot activation.
+        observed = snapshot if snapshot is not None else _GroupNetworkSnapshot()
+        self._ensure_group_network(spec, current=moved, snapshot=observed)
+        verified = self._verify_group_snapshot(spec, moved, observed)
+        if verified is None:
+            raise SandboxError("group network changed while the retained chat was attaching")
+        return verified
+
+    def _verify_group_snapshot(
+        self,
+        spec: ChatSandboxSpec,
+        current: ChatSandboxInspection,
+        observed: _GroupNetworkSnapshot,
+    ) -> ChatSandboxInspection | None:
+        """Finish one reconciliation with fresh container and bridge evidence."""
+        expected = self.network_for(spec)
+        refreshed = self._require(spec)
+        if refreshed.container_id != current.container_id or set(refreshed.networks) != {expected}:
+            raise SandboxError("retained chat identity or networks changed during activation")
+        network = self._inspect_network(expected)
+        if network is not None:
+            self._verify_group_network(network, spec)
+            # A snapshot is useful only if it still names this bridge and its
+            # exact peers. Fail a mutation instead of using old addresses.
+            endpoints = network.get("Containers") or {}
+            if not isinstance(endpoints, dict):
+                raise SandboxError("Docker returned invalid group-network endpoints")
+            services = set(observed.owners)
+            permitted = services | {refreshed.container_id}
+            peers = set(map(str, endpoints))
+            if (
+                observed.network is None
+                or network.get("Id") != observed.network.get("Id")
+                or not services.issubset(peers)
+                or peers - permitted
+                or (refreshed.running and refreshed.container_id not in peers)
+                or self._relay_addresses_from(observed.owners, network) != observed.addresses
+            ):
+                raise SandboxError("group network changed during activation")
+        if network is not None and self._endpoint_is_current(refreshed, expected, network):
+            return refreshed
+        return None
 
     def _require_group_network(
         self,
         spec: ChatSandboxSpec,
         current: ChatSandboxInspection,
+        snapshot: _GroupNetworkSnapshot | None = None,
     ) -> ChatSandboxInspection:
         expected = self.network_for(spec)
         if set(current.networks) == {expected}:
-            self._ensure_group_network(spec)
-            refreshed = self._require(spec)
-            if self._endpoint_is_current(refreshed, expected):
+            observed = snapshot if snapshot is not None else _GroupNetworkSnapshot()
+            self._ensure_group_network(spec, current=current, snapshot=observed)
+            refreshed = self._verify_group_snapshot(spec, current, observed)
+            if refreshed is not None:
                 return refreshed
-        return self._attach_to_group_network(spec, current)
+        return self._attach_to_group_network(spec, current, snapshot)
 
     def _verify_guest_network(self, spec: ChatSandboxSpec) -> None:
         """Check, from inside the guest, that it sits behind the group's rules.
@@ -1762,13 +1902,14 @@ class ChatSandboxManager:
         :meth:`_verify_guest_network`.
         """
         current = self._require(spec)
+        network_snapshot = _GroupNetworkSnapshot()
         with substage(observer, "group_network"):
-            current = self._require_group_network(spec, current)
+            current = self._require_group_network(spec, current, network_snapshot)
         if current.running:
             if facts is not None:
                 facts.note("reuse")
             with substage(observer, "guest_network_sync"):
-                self._sync_kata_guest_network(spec, current)
+                self._sync_kata_guest_network(spec, current, network_snapshot.addresses)
             return current
         if current.status is ChatSandboxStatus.PAUSED:
             raise SandboxError("a paused chat sandbox is not a valid stopped activation")
@@ -1831,8 +1972,9 @@ class ChatSandboxManager:
         last verification is reused for a minute, and the relays and their
         host exceptions are reconciled against what Docker reports now.
         """
+        snapshot = _GroupNetworkSnapshot()
         with substage(observer, "network_ensure"):
-            current = self._require_group_network(spec, self._require(spec))
+            current = self._require_group_network(spec, self._require(spec), snapshot)
         expected = self.network_for(spec)
         if set(current.networks) != {expected}:
             raise SandboxError(
@@ -1840,7 +1982,7 @@ class ChatSandboxManager:
                 f"bridge {expected!r}"
             )
         with substage(observer, "guest_network_sync"):
-            self._sync_kata_guest_network(spec, current)
+            self._sync_kata_guest_network(spec, current, snapshot.addresses)
 
     def build_exec_command(
         self,
