@@ -11,9 +11,11 @@ import pytest
 
 from cloud_agent_host import chat_sandbox
 from cloud_agent_host.chat_sandbox import (
+    CHAT_PROBE_LABEL,
     GUEST_OBSERVER_PROBE_ATTEMPTS,
     MEMBER_REAPER_TARGET,
     MEMBER_UID_BASE,
+    PROBE_ABANDONED_AFTER_S,
     ChatSandboxInspection,
     ChatSandboxManager,
     ChatSandboxSpec,
@@ -263,9 +265,10 @@ def test_readiness_requires_events_and_member_isolation_and_cleans_up(monkeypatc
     else:
         with pytest.raises(SandboxError):
             manager.probe_guest_observer()
-    assert calls[0][calls[0].index("--network") + 1] == "none"
-    assert calls[-1][1:3] == ["rm", "--force"]
     created = [call for call in calls if call[1:2] == ["create"]]
+    assert created[0][created[0].index("--network") + 1] == "none"
+    assert any(arg.startswith(f"{CHAT_PROBE_LABEL}=") for arg in created[0])
+    assert calls[-1][1:3] == ["rm", "--force"]
     assert created[0][created[0].index("--runtime") + 1] == KATA_RUNTIME
     assert created[0][created[0].index("--entrypoint") + 2] == "registry.example/sandbox@sha256:abc"
     assert calls[-1][-1] == created[-1][created[-1].index("--name") + 1]
@@ -293,6 +296,61 @@ def test_readiness_requires_events_and_member_isolation_and_cleans_up(monkeypatc
         probes = GUEST_OBSERVER_PROBE_ATTEMPTS if failure == "marker_transport" else 1
         assert privileged_calls == [[GUEST_OBSERVER_BINARY, "--self-test"]] * probes
         assert len(created) == probes
+
+
+def test_a_probe_removes_only_its_own_namespaces_abandoned_probes(monkeypatch):
+    """Discovery no longer stops probes, so a process killed mid-probe leaks one.
+
+    Only a probe far older than any probe takes, in this stack's namespace,
+    may be removed: a sibling stack's probe, or one still running, is not ours.
+    """
+    manager = ChatSandboxManager(
+        ContainerBackend(image="img", runtime=KATA_RUNTIME, sandbox_namespace="this-stack")
+    )
+    now = 1_800_000_000
+    monkeypatch.setattr(chat_sandbox.time, "time", lambda: now)
+    rows = [
+        {
+            "id": "abandoned",
+            "namespace": "this-stack",
+            "created": str(now - PROBE_ABANDONED_AFTER_S - 1),
+        },
+        {"id": "running", "namespace": "this-stack", "created": str(now - 30)},
+        {
+            "id": "sibling",
+            "namespace": "sibling-stack",
+            "created": str(now - 10 * PROBE_ABANDONED_AFTER_S),
+        },
+        {"id": "unreadable", "namespace": "this-stack", "created": "yesterday"},
+    ]
+    calls = []
+
+    def run(argv, **_kwargs):
+        calls.append(argv)
+        if argv[1:3] == ["container", "ls"]:
+            assert f"label={CHAT_PROBE_LABEL}" in argv
+            return SimpleNamespace(
+                returncode=0, stdout="\n".join(json.dumps(row) for row in rows), stderr=""
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(manager, "_run", run)
+    manager._remove_abandoned_probes()
+    assert [argv[-1] for argv in calls if argv[1:3] == ["rm", "--force"]] == ["abandoned"]
+
+
+def test_retained_discovery_never_adopts_a_probe(monkeypatch):
+    """The broker's reconcile stopped probes as orphan chats, mid-probe."""
+    manager = ChatSandboxManager(ContainerBackend(image="img", sandbox_namespace="this-stack"))
+
+    def run(argv, **_kwargs):
+        if argv[1:3] == ["container", "ls"]:
+            row = {"id": "probe-container", "namespace": "this-stack", "probe": "1800000000"}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(row), stderr="")
+        raise AssertionError(f"a probe must not be inspected or adopted: {argv}")
+
+    monkeypatch.setattr(manager, "_run", run)
+    assert manager.list() == []
 
 
 def test_backend_refuses_claim_readiness_when_observer_probe_fails(monkeypatch):

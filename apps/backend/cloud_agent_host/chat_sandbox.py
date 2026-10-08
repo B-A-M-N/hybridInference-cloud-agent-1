@@ -81,6 +81,13 @@ CHAT_CPU_LIMIT_LABEL = "org.freeinference.chat-cpu-limit"
 CHAT_STOP_TIMEOUT_LABEL = "org.freeinference.chat-stop-timeout-seconds"
 CHAT_SHARED_LABEL = "org.freeinference.chat-shared-live"
 CHAT_RESIDENT_CAPACITY_LABEL = "org.freeinference.chat-resident-slot-capacity"
+#: Marks a disposable preflight probe with its creation time (Unix seconds).
+#: Retained-container discovery skips it: the broker adopted probes as orphan
+#: chats and stopped them mid-probe, failing the host's runtime qualification.
+CHAT_PROBE_LABEL = "org.freeinference.chat-probe-created"
+#: A probe older than this was abandoned by a process killed mid-probe. Since
+#: discovery no longer stops it, the next probe in the namespace removes it.
+PROBE_ABANDONED_AFTER_S = 3600
 CHAT_NETWORK_LABEL = "org.freeinference.chat-sandbox-network"
 CHAT_NETWORK_SANDBOX_ID_LABEL = "org.freeinference.chat-sandbox-id"
 CHAT_NETWORK_GENERATION_LABEL = "org.freeinference.chat-generation"
@@ -1861,7 +1868,11 @@ class ChatSandboxManager:
                 "--all",
                 "--no-trunc",
                 "--format",
-                '{"id":{{json .ID}},"namespace":{{json (.Label "' + CHAT_NAMESPACE_LABEL + '")}}}',
+                '{"id":{{json .ID}},"namespace":{{json (.Label "'
+                + CHAT_NAMESPACE_LABEL
+                + '")}},"probe":{{json (.Label "'
+                + CHAT_PROBE_LABEL
+                + '")}}}',
                 "--filter",
                 f"label={CHAT_SANDBOX_LABEL}=true",
             ],
@@ -1874,15 +1885,17 @@ class ChatSandboxManager:
             try:
                 row = json.loads(line)
                 container_id, namespace = row["id"], row["namespace"]
+                probe = row.get("probe") or ""
                 if not isinstance(container_id, str) or not container_id:
                     raise ValueError("missing container id")
-                if not isinstance(namespace, str):
-                    raise ValueError("invalid namespace")
+                if not isinstance(namespace, str) or not isinstance(probe, str):
+                    raise ValueError("invalid labels")
             except (KeyError, TypeError, ValueError) as exc:
                 raise SandboxError("Docker returned an invalid chat sandbox listing") from exc
             # Read ownership from ls before making a per-container RPC: a
-            # wedged foreign Kata shim can block even docker inspect.
-            if namespace != self.backend.sandbox_namespace:
+            # wedged foreign Kata shim can block even docker inspect. A probe
+            # belongs to the process running it and is never a chat to adopt.
+            if namespace != self.backend.sandbox_namespace or probe:
                 continue
             # A foreign namespace cannot make this broker fail startup by
             # carrying policy-invalid mounts. Apply this stack's mount fence
@@ -2999,8 +3012,51 @@ class ChatSandboxManager:
                 )
                 time.sleep(GUEST_OBSERVER_PROBE_RETRY_S)
 
+    def _remove_abandoned_probes(self) -> None:
+        """Remove this namespace's probes left behind by a process killed mid-probe.
+
+        Best effort: a listing that fails leaves them for the next probe, and
+        the probe about to run reports a Docker that is genuinely unusable.
+        """
+        listed = self._run(
+            [
+                self.backend.docker_binary,
+                "container",
+                "ls",
+                "--all",
+                "--no-trunc",
+                "--filter",
+                f"label={CHAT_PROBE_LABEL}",
+                "--format",
+                '{"id":{{json .ID}},"namespace":{{json (.Label "'
+                + CHAT_NAMESPACE_LABEL
+                + '")}},"created":{{json (.Label "'
+                + CHAT_PROBE_LABEL
+                + '")}}}',
+            ],
+            timeout=30,
+        )
+        if listed.returncode != 0:
+            return
+        abandoned_before = time.time() - PROBE_ABANDONED_AFTER_S
+        for line in listed.stdout.splitlines():
+            try:
+                row = json.loads(line)
+                container_id = row["id"]
+                if (
+                    not isinstance(container_id, str)
+                    or not container_id
+                    or row["namespace"] != self.backend.sandbox_namespace
+                    or int(row["created"]) > abandoned_before
+                ):
+                    continue
+            except (KeyError, TypeError, ValueError):
+                continue
+            self._run([self.backend.docker_binary, "rm", "--force", container_id], timeout=30)
+
     def _probe_guest_observer_once(self) -> str:
         """One probe, on a sandbox of its own that is removed however it ends."""
+        self._remove_abandoned_probes()
         token = secrets.token_hex(12)
         spec = ChatSandboxSpec(
             thread_id=f"athr_preflight_{token}",
@@ -3008,6 +3064,7 @@ class ChatSandboxManager:
             generation=1,
             runtime_id="preflight",
             resident_slot_capacity=2,
+            labels={CHAT_PROBE_LABEL: str(int(time.time()))},
         )
         command = self.build_create_command(spec)
         # Use the production creation/exec flags, without attaching any relay

@@ -38,7 +38,9 @@ booting a probe VM every minute, and the next turn runs its own full preflight,
 which reopens the window. A deployment still marked `pending:<sha>` has no proof
 and reports no failure; the readiness gate waits it out. A failed qualification
 stops claims, is reported once, and is probed again only after a backoff of
-five seconds doubling to five minutes.
+five seconds doubling to five minutes. Probe containers carry
+`org.freeinference.chat-probe-created`, so the broker never adopts one as an
+orphan chat; the next probe removes any its namespace abandoned over an hour ago.
 
 Each child obtains evidence through a private inherited socket, checks its
 configuration and the proof's five-second handoff lifetime, then verifies the
