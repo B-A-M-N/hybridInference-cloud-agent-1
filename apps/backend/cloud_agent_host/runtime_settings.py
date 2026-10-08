@@ -121,12 +121,24 @@ class RuntimeSettings:
     def report(self) -> tuple[dict[str, int | float], dict[str, int | float]]:
         """``(applied, local)`` for the next heartbeat.
 
-        The runner's own resolution wins for a setting both processes apply:
-        it is the value this host reports to the control plane when a turn
-        settles, which is what decides when the sandbox is stopped.
+        A setting both processes apply is in force only once both agree. It is
+        reported at the runner's value when the broker confirmed the same one,
+        at the broker's when it confirmed another, and not at all when the
+        broker has not answered — so the page keeps showing it as applying
+        while the broker still sweeps with its old value. With no broker at
+        all, the runner's value is the whole truth. The runner's own value
+        wins in ``local``: it is the one it reports when a turn settles.
         """
         with self._lock:
-            applied = {**self._broker_applied, **resolve(self._admin, self._local)}
+            runner = resolve(self._admin, self._local)
+            applied: dict[str, int | float] = {**self._broker_applied, **runner}
+            if self._broker is not None:
+                for key in RUNNER_SETTING_KEYS & BROKER_SETTING_KEYS:
+                    confirmed = self._broker_applied.get(key)
+                    if confirmed is None:
+                        applied.pop(key, None)
+                    elif confirmed != runner.get(key):
+                        applied[key] = confirmed
             local = {**self._broker_local, **self._local}
         return reported_values(applied) or {}, reported_values(local) or {}
 

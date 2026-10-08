@@ -63,7 +63,7 @@ function SettingForm({
   return (
     <div>
       <form
-        className="flex flex-wrap items-center justify-end gap-1.5"
+        className="flex flex-nowrap items-center justify-end gap-1.5 whitespace-nowrap"
         onSubmit={(event) => {
           event.preventDefault();
           const parsed = parseSettingInput(
@@ -94,23 +94,27 @@ function SettingForm({
           disabled={busy || disabled}
           className={INPUT_CLASS}
         />
-        {unit && <span className="text-xs text-gray-500 dark:text-gray-400">{unit}</span>}
+        {/* The unit and the clear button keep their space on every row, so the
+            inputs line up down the column whether or not a row has a unit or
+            a value to clear. A row with nothing to clear holds an inert,
+            hidden button rather than none. */}
+        <span className="w-7 text-xs text-gray-500 dark:text-gray-400">{unit}</span>
         <button type="submit" disabled={busy || disabled} className={BUTTON_CLASS}>
           Save
         </button>
-        {saved !== null && (
-          <button
-            type="button"
-            disabled={busy || disabled}
-            onClick={() => {
-              setError(null);
-              onChange(definition.key, null);
-            }}
-            className={CLEAR_CLASS}
-          >
-            {clearLabel}
-          </button>
-        )}
+        <button
+          type="button"
+          disabled={busy || disabled || saved === null}
+          aria-hidden={saved === null ? true : undefined}
+          tabIndex={saved === null ? -1 : undefined}
+          onClick={() => {
+            setError(null);
+            onChange(definition.key, null);
+          }}
+          className={`${CLEAR_CLASS} ${saved === null ? 'invisible' : ''}`}
+        >
+          {clearLabel}
+        </button>
       </form>
       {error !== null && (
         <p
@@ -241,15 +245,19 @@ export function ServerSettingsPanel({
                   <span className="block whitespace-nowrap tabular-nums text-gray-800 dark:text-gray-200">
                     {fact.inUse === null ? '—' : formatSettingValue(definition, fact.inUse)}
                   </span>
-                  <span
-                    className={`block text-[11px] ${
-                      fact.state === 'applied'
-                        ? 'text-gray-500 dark:text-gray-400'
-                        : 'text-amber-700 dark:text-amber-300'
-                    }`}
-                  >
-                    {factNote(fact)}
-                  </span>
+                  {/* A runner that cannot apply settings says so once, above
+                      the table, rather than on every row. */}
+                  {supported && (
+                    <span
+                      className={`block text-[11px] ${
+                        fact.state === 'applied'
+                          ? 'text-gray-500 dark:text-gray-400'
+                          : 'text-amber-700 dark:text-amber-300'
+                      }`}
+                    >
+                      {factNote(fact)}
+                    </span>
+                  )}
                 </td>
                 <td className="py-2 align-top">
                   <SettingForm

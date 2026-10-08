@@ -205,3 +205,46 @@ def test_the_runners_share_is_in_force_before_the_broker_is_asked():
     settings.apply({"agent_timeout_s": 900})
 
     assert seen_during_push == [{**LOCAL, "agent_timeout_s": 900}]
+
+
+@pytest.mark.parametrize(
+    ("broker", "reported"),
+    [
+        # The broker confirmed the same value: in force in both processes.
+        (_Broker(), 600),
+        # The broker did not answer: not reported, so the page keeps saying applying.
+        (_Broker(fail=True), None),
+    ],
+)
+def test_a_setting_both_processes_apply_is_reported_only_when_both_agree(broker, reported):
+    settings = RuntimeSettings(LOCAL, broker=broker)
+
+    settings.apply({"chat_idle_timeout_s": 600})
+
+    applied, _local = settings.report()
+    assert applied.get("chat_idle_timeout_s") == reported
+    assert settings.turn_settings()["chat_idle_timeout_s"] == 600, (
+        "the runner applies it either way"
+    )
+
+
+def test_a_broker_that_applies_another_value_is_reported_at_its_own():
+    """A broker on an older release can drop a value the runner accepted."""
+
+    def stubborn(_settings: dict[str, int]) -> dict:
+        return {"applied": {"chat_idle_timeout_s": 1800}, "local": {"chat_idle_timeout_s": 1800}}
+
+    settings = RuntimeSettings(LOCAL, broker=stubborn)
+    settings.apply({"chat_idle_timeout_s": 600})
+
+    applied, _local = settings.report()
+    assert applied["chat_idle_timeout_s"] == 1800
+
+
+def test_with_no_broker_the_runners_value_is_the_whole_truth():
+    settings = RuntimeSettings(LOCAL)
+
+    settings.apply({"chat_idle_timeout_s": 600})
+
+    applied, _local = settings.report()
+    assert applied["chat_idle_timeout_s"] == 600
