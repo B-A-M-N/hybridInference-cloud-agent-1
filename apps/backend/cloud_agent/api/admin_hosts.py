@@ -15,7 +15,9 @@ credentials are not accepted.
 The pin decides *which* enrolled host may claim a chat with no sandbox; the pool
 lifecycle (drain, undrain, remove) decides whether a host is allowed to claim at
 all; the requested slot count decides how many turns it runs at once, which
-the host applies to itself on its next heartbeat.
+the host applies to itself on its next heartbeat. The runtime settings —
+time limits, the repository import limit, chats per sandbox, terminal limits —
+reach the host the same way, set for every server or for one.
 """
 
 from __future__ import annotations
@@ -51,9 +53,12 @@ from cloud_agent.schemas import (
     IssueHostEnrollTokenResponse,
     ListAgentRunnerHostsResponse,
     SetActiveAgentRunnerHostRequest,
+    SetHostSettingsRequest,
     SetHostSlotsRequest,
     SetRuntimeVersionRequest,
+    host_setting_definitions,
 )
+from cloud_agent_shared.host_settings import admin_values, reported_values
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
@@ -154,6 +159,11 @@ def _to_item(row: dict[str, Any], *, now: datetime | None = None) -> AgentRunner
             sampled_at=row.get("capacity_sampled_at"),
             now=read_at,
         ),
+        # Through the same filter the heartbeat answer uses, so the page never
+        # shows a value the host would not be sent.
+        settings_desired=admin_values(row.get("settings_desired")),
+        settings_applied=reported_values(row.get("settings_applied")),
+        settings_local=reported_values(row.get("settings_local")),
     )
 
 
@@ -173,11 +183,17 @@ async def _snapshot(store: HostPoolRepository) -> ListAgentRunnerHostsResponse:
     it is.
     """
     rows, active, selected_versions, observed_at = await store.runner_pool()
+    # Read beside the pool rather than inside its snapshot. A global value
+    # saved between the two reads is the ordinary state of a setting hosts
+    # have not applied yet, which every host row already reports as such.
+    global_settings = await store.host_settings()
     return ListAgentRunnerHostsResponse(
         execution_profile=default_execution_profile().value,
         hosts=[_to_item(row, now=observed_at) for row in rows],
         active_host=active,
         runtime_versions=selected_versions,
+        host_settings=admin_values(global_settings),
+        host_setting_definitions=host_setting_definitions(),
         observed_at=observed_at,
     )
 
@@ -256,6 +272,77 @@ async def set_agent_runtime_version(
             "runtime": payload.runtime,
             "old_version": previous.get(payload.runtime),
             "new_version": payload.version,
+        },
+        actor_id=_admin_id,
+    )
+    return await _snapshot(job_store.host_pool)
+
+
+@router.put("/agent/host-settings", response_model=ListAgentRunnerHostsResponse)
+async def set_agent_host_settings(
+    request: Request,
+    payload: SetHostSettingsRequest,
+    _admin_id: str = Depends(verify_admin_access),
+    store: _AdminHostsStorage | None = Depends(get_storage),
+) -> ListAgentRunnerHostsResponse:
+    """Set or clear runtime settings for every server, without a redeploy.
+
+    Each host picks the values up from its next heartbeat answer, except where
+    a value set for that server wins. ``null`` clears a setting, and each host
+    goes back to its own ``.env`` or built-in default for it.
+
+    **Saving is not applying.** Each host reports what it applied, and the page
+    shows the hosts that have not caught up yet. Nothing running is
+    interrupted: a turn keeps the time limit it started with, an existing
+    sandbox keeps its chat capacity, and the terminal limits apply from the
+    broker's next sweep.
+    """
+    job_store = _require_store(store)
+    previous = await _apply(HostCommands(job_store.host_pool).global_settings(payload.settings))
+
+    await log_admin_action(
+        job_store,
+        get_client_ip(request),
+        "agent.host_settings.set",
+        None,
+        {
+            "changes": payload.settings,
+            "old_values": {key: previous.get(key) for key in payload.settings},
+        },
+        actor_id=_admin_id,
+    )
+    return await _snapshot(job_store.host_pool)
+
+
+@router.put("/agent/runner-hosts/{host}/settings", response_model=ListAgentRunnerHostsResponse)
+async def set_agent_runner_host_settings(
+    request: Request,
+    host: str,
+    payload: SetHostSettingsRequest,
+    _admin_id: str = Depends(verify_admin_access),
+    store: _AdminHostsStorage | None = Depends(get_storage),
+) -> ListAgentRunnerHostsResponse:
+    """Set or clear runtime settings for one server, over the global values.
+
+    A value set here wins over the one set for every server. ``null`` clears
+    it, and the server goes back to the global value, or to its own when there
+    is none. Applied from the host's next heartbeat, like the global values,
+    and kept through heartbeats and re-enrollment.
+    """
+    job_store = _require_store(store)
+    previous = await _apply(
+        HostCommands(job_store.host_pool).settings(host=host, changes=payload.settings)
+    )
+
+    await log_admin_action(
+        job_store,
+        get_client_ip(request),
+        "agent.runner_host.set_settings",
+        None,
+        {
+            "host": host,
+            "changes": payload.settings,
+            "old_values": {key: previous.get(key) for key in payload.settings},
         },
         actor_id=_admin_id,
     )

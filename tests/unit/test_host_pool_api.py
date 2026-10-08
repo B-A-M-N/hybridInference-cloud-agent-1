@@ -61,6 +61,7 @@ class FakeHostPoolStore(AllCapabilities):
         self.tokens: dict[str, dict[str, Any]] = {}
         self.active_host: str | None = None
         self.runtime_versions: dict[str, str] = {}
+        self.global_settings: dict[str, Any] = {}
         self.establish_answer: dict[str, Any] | None = None
         self.linked: list[tuple[str, int, str]] = []
         self.link_ok = True
@@ -178,6 +179,8 @@ class FakeHostPoolStore(AllCapabilities):
         sandbox_image_digest: str | None = None,
         runtime_versions: dict[str, str] | None = None,
         runtime_versions_available: dict[str, list[str]] | None = None,
+        settings_applied: dict[str, Any] | None = None,
+        settings_local: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         row = self.rows.get(host)
         if row is None:
@@ -198,6 +201,8 @@ class FakeHostPoolStore(AllCapabilities):
             ("sandbox_image_digest", sandbox_image_digest),
             ("runtime_versions", runtime_versions),
             ("runtime_versions_available", runtime_versions_available),
+            ("settings_applied", settings_applied),
+            ("settings_local", settings_local),
         ):
             if value is not None:
                 row[field] = value
@@ -271,6 +276,9 @@ class FakeHostPoolStore(AllCapabilities):
     ) -> tuple[list[dict[str, Any]], str | None, dict[str, str], datetime]:
         rows = [{**row, "is_active": row["host"] == self.active_host} for row in self.rows.values()]
         return rows, self.active_host, dict(self.runtime_versions), datetime.now(UTC)
+
+    async def host_settings(self) -> dict[str, Any]:
+        return dict(self.global_settings)
 
     async def host_capacity_history(
         self, *, host: str, range_seconds: int
@@ -844,6 +852,59 @@ async def test_a_heartbeat_answers_with_the_requested_limit(client):
         headers={"Authorization": f"Bearer {credential}"},
     )
     assert response.json()["slots_desired"] is None
+
+
+async def test_a_heartbeat_answers_with_this_servers_settings_over_the_global_ones(client):
+    """The whole set each time, so a cleared value reaches the host as an absence."""
+    async_client, store = client
+    credential = await _enroll(async_client, store)
+    auth = {"Authorization": f"Bearer {credential}"}
+    store.global_settings = {"agent_timeout_s": 7200, "terminal_max_sessions": 32}
+    store.rows["runner-a"]["settings_desired"] = {"agent_timeout_s": 900}
+
+    body = (await async_client.post("/v1/agent/host/heartbeat", json={}, headers=auth)).json()
+    assert body["settings"] == {"agent_timeout_s": 900, "terminal_max_sessions": 32}
+
+    store.rows["runner-a"]["settings_desired"] = {}
+    store.global_settings = {"agent_timeout_s": 7200}
+    body = (await async_client.post("/v1/agent/host/heartbeat", json={}, headers=auth)).json()
+    assert body["settings"] == {"agent_timeout_s": 7200}
+
+
+async def test_a_heartbeat_never_sends_a_stored_value_the_host_could_not_apply(client):
+    """A bound a release narrowed, or a retired key, falls back rather than travels."""
+    async_client, store = client
+    credential = await _enroll(async_client, store)
+    store.global_settings = {"terminal_max_sessions": 0, "retired": 5, "agent_timeout_s": 900}
+
+    body = (
+        await async_client.post(
+            "/v1/agent/host/heartbeat",
+            json={},
+            headers={"Authorization": f"Bearer {credential}"},
+        )
+    ).json()
+
+    assert body["settings"] == {"agent_timeout_s": 900}
+
+
+async def test_a_heartbeat_stores_the_settings_report_reduced_to_known_numbers(client):
+    async_client, store = client
+    credential = await _enroll(async_client, store)
+
+    response = await async_client.post(
+        "/v1/agent/host/heartbeat",
+        json={
+            "settings_applied": {"agent_timeout_s": 900.0, "from_a_newer_host": 1},
+            "settings_local": {"agent_timeout_s": 3600, "chat_idle_timeout_s": 15.5},
+        },
+        headers={"Authorization": f"Bearer {credential}"},
+    )
+
+    assert response.status_code == 200
+    row = store.rows["runner-a"]
+    assert row["settings_applied"] == {"agent_timeout_s": 900}
+    assert row["settings_local"] == {"agent_timeout_s": 3600, "chat_idle_timeout_s": 15.5}
 
 
 async def test_a_heartbeat_without_a_credential_is_refused(client):

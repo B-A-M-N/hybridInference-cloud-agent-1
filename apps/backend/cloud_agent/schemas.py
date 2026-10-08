@@ -12,7 +12,7 @@ import binascii
 from datetime import datetime  # noqa: TC003
 from typing import Annotated, Any, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from cloud_agent.agent_access import AgentAccess  # noqa: TC001 — Pydantic resolves this at runtime.
 from cloud_agent.attachments.models import AttachmentLimits, AttachmentRef, AttachmentView
@@ -47,6 +47,13 @@ from cloud_agent.source_control_runtime import (
     LoadStatus,  # noqa: TC001 — Pydantic resolves this at runtime.
 )
 from cloud_agent_shared.event_payloads import bound_event_payload
+from cloud_agent_shared.host_settings import (
+    HOST_SETTINGS,
+    MAX_SETTINGS_KEYS,
+    SettingScope,
+    SettingUnit,
+    validate_admin_change,
+)
 from cloud_agent_shared.shared_protocol import (
     HOST_CONCURRENCY_MAX_SLOTS,
     HOST_CONCURRENCY_MIN_SLOTS,
@@ -2400,6 +2407,69 @@ class AgentRunnerHost(BaseModel):
             "machine, and is rendered as unavailable rather than as zero."
         ),
     )
+    settings_desired: dict[str, int] = Field(
+        default_factory=dict,
+        description=(
+            "Runtime settings set for this server on the admin page, by key "
+            "(see host_setting_definitions). They win over the global values; "
+            "a setting absent here uses the global value, or the host's own."
+        ),
+    )
+    settings_applied: dict[str, int | float] | None = Field(
+        None,
+        description=(
+            "The runtime settings this host reported applying on its last "
+            "heartbeat. Null means it has never reported — a runner that "
+            "predates admin settings, or one that has not beaten since it "
+            "enrolled."
+        ),
+    )
+    settings_local: dict[str, int | float] | None = Field(
+        None,
+        description=(
+            "What this host's own environment gives each setting with no admin "
+            "value: its .env, or the built-in default. Clearing an admin value "
+            "returns the host to this."
+        ),
+    )
+
+
+class HostSettingDefinition(BaseModel):
+    """One runtime setting an admin may set, with its unit and bounds."""
+
+    key: str
+    env: str = Field(..., description="The host environment variable it overrides.")
+    label: str
+    description: str
+    unit: SettingUnit
+    default: int = Field(..., description="Built-in value when neither an admin nor .env sets it.")
+    minimum: int
+    maximum: int
+    scope: SettingScope = Field(
+        ...,
+        description=(
+            "Which host process applies it: the runner, as it starts each turn; "
+            "the workspace broker, which runs terminals and the idle sweep; or both."
+        ),
+    )
+
+
+def host_setting_definitions() -> list[HostSettingDefinition]:
+    """Every runtime setting an admin may set, in the order the page lists them."""
+    return [
+        HostSettingDefinition(
+            key=setting.key,
+            env=setting.env,
+            label=setting.label,
+            description=setting.description,
+            unit=setting.unit,
+            default=setting.default,
+            minimum=setting.minimum,
+            maximum=setting.maximum,
+            scope=setting.scope,
+        )
+        for setting in HOST_SETTINGS
+    ]
 
 
 class ListAgentRunnerHostsResponse(BaseModel):
@@ -2423,6 +2493,17 @@ class ListAgentRunnerHostsResponse(BaseModel):
             "The deployment's chosen CLI version per runtime id. A runtime "
             "absent here runs its claiming host's default."
         ),
+    )
+    host_settings: dict[str, int] = Field(
+        default_factory=dict,
+        description=(
+            "Runtime settings set for every server. A value set for one server "
+            "wins over these; a setting set nowhere uses each host's own."
+        ),
+    )
+    host_setting_definitions: list[HostSettingDefinition] = Field(
+        default_factory=list,
+        description="Every runtime setting an admin may set, with its unit and bounds.",
     )
     observed_at: datetime | None = Field(
         None,
@@ -2481,6 +2562,29 @@ class SetHostSlotsRequest(BaseModel):
             "running. Null returns the host to its AGENT_HOST_SLOTS default."
         ),
     )
+
+
+class SetHostSettingsRequest(BaseModel):
+    """Set or clear runtime settings, for every server or for one."""
+
+    settings: dict[str, StrictInt | None] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_SETTINGS_KEYS,
+        description=(
+            "The settings to change, by key (see host_setting_definitions), each "
+            "a whole number inside that setting's bounds, or null to clear it so "
+            "the next level applies: a server's value falls back to the global "
+            "one, and a global value to each host's own .env or default. "
+            "Settings not named keep their values. Hosts apply the result from "
+            "their next heartbeat answer."
+        ),
+    )
+
+    @field_validator("settings")
+    @classmethod
+    def _known_and_in_bounds(cls, value: dict[str, int | None]) -> dict[str, int | None]:
+        return validate_admin_change(value)
 
 
 # ── Host pool: enrollment and heartbeat ────────────────────────────────
@@ -2757,6 +2861,23 @@ class HostHeartbeatRequest(BaseModel):
             "generations and never treats an omitted row as deletion."
         ),
     )
+    settings_applied: dict[str, int | float] | None = Field(
+        None,
+        max_length=MAX_SETTINGS_KEYS,
+        description=(
+            "The runtime settings this host is applying now, by key — the "
+            "workspace broker's as it last confirmed them. Null means not "
+            "reported and keeps what is stored."
+        ),
+    )
+    settings_local: dict[str, int | float] | None = Field(
+        None,
+        max_length=MAX_SETTINGS_KEYS,
+        description=(
+            "What this host's own environment gives each setting with no admin "
+            "value. Null means not reported and keeps what is stored."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -2803,6 +2924,15 @@ class HostHeartbeatResponse(BaseModel):
             "host's own default. The host serves it as its limit from here on; "
             "the claim already admits against the lower of this and the limit "
             "the host last reported."
+        ),
+    )
+    settings: dict[str, int] = Field(
+        default_factory=dict,
+        description=(
+            "The runtime settings an admin set for this host — its own values "
+            "over the global ones. A setting absent here is the host's own: "
+            "its .env, or the built-in default. Always the whole set, so a "
+            "value cleared on the admin page is absent rather than unchanged."
         ),
     )
     residencies_lost: list[ResidencyBeat] = Field(

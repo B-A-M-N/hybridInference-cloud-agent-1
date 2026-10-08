@@ -98,6 +98,7 @@ from cloud_agent_host.profiling_policy import ProfilingPolicySync
 from cloud_agent_host.resident_transport import ResidentLaunch
 from cloud_agent_host.resources import shared_member_resource_rollup
 from cloud_agent_host.runtime_qualification import HostQualification, use_qualification
+from cloud_agent_host.runtime_settings import RuntimeSettings
 from cloud_agent_host.runtimes import (
     AgentRuntime,
     NormalizedEvent,
@@ -128,11 +129,24 @@ from cloud_agent_host.shared_protocol import (
 )
 from cloud_agent_host.source_archive import build_base_bundle, build_source_archive
 from cloud_agent_shared import operation_profiling
-from cloud_agent_shared.git.source_archive import build_upload_archive
-from cloud_agent_shared.shared_protocol import FORK_HELPER, mid_turn_input_capability
+from cloud_agent_shared.git.source_archive import (
+    DEFAULT_MAX_SOURCE_ARCHIVE_BYTES,
+    build_upload_archive,
+)
+from cloud_agent_shared.host_settings import RUNNER_SETTING_KEYS, reported_values
+from cloud_agent_shared.shared_protocol import (
+    FORK_HELPER,
+    HOST_SETTINGS_CAPABILITY,
+    mid_turn_input_capability,
+)
 
 DEFAULT_LEASE_TTL_S = 120.0
 HEARTBEAT_INTERVAL_S = 30.0
+#: How long a freshly started host waits for its first heartbeat answer — which
+#: carries the runtime settings an admin set — before claiming with its own.
+#: The first beat is sent at once, so this is normally well under a second; the
+#: bound is for a control plane whose heartbeat is failing while claims are not.
+FIRST_SETTINGS_WAIT_S = 30.0
 # Heartbeats use a short per-request timeout and retry promptly, so a slow
 # control request cannot consume the remaining lease in normal cadence sleeps.
 # Idempotent lifecycle receipts reuse the same short retry interval.
@@ -202,6 +216,12 @@ _REPO_SLUG = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 # The default remains GitHub. This is deliberately read only by the runner: a
 # job request cannot choose where the platform sends a repository credential.
 ENV_REPO_CLONE_BASE_URL = "AGENT_REPO_CLONE_BASE_URL"
+
+# This host's cap on one first-turn checkout: working tree plus the fetched
+# commit's Git objects, in MiB. Deployment configuration, never a job's choice.
+ENV_SOURCE_IMPORT_MAX_MIB = "AGENT_SOURCE_IMPORT_MAX_MIB"
+#: A typo guard, not a statement about any machine.
+MAX_SOURCE_IMPORT_MIB = 64 * 1024
 
 # Hermetic git for anything the *runner* runs: no user config, no hooks, no
 # credential helpers, no prompts.
@@ -974,6 +994,30 @@ def repo_clone_base_url(
     return base.rstrip("/")
 
 
+def source_import_max_bytes(env: dict[str, str] | None = None) -> int:
+    """Return this host's limit on one retained checkout import.
+
+    An unset, malformed or out-of-range value keeps the built-in limit rather
+    than failing every turn, as the host's other numeric settings do.
+    """
+    source = env if env is not None else os.environ
+    raw = (source.get(ENV_SOURCE_IMPORT_MAX_MIB) or "").strip()
+    if not raw:
+        return DEFAULT_MAX_SOURCE_ARCHIVE_BYTES
+    try:
+        mib = int(raw)
+    except ValueError:
+        mib = 0
+    if not 1 <= mib <= MAX_SOURCE_IMPORT_MIB:
+        print(
+            f"ignoring {ENV_SOURCE_IMPORT_MAX_MIB}={raw!r}: "
+            f"not a whole number of MiB from 1 through {MAX_SOURCE_IMPORT_MIB}",
+            file=sys.stderr,
+        )
+        return DEFAULT_MAX_SOURCE_ARCHIVE_BYTES
+    return mib * 1024 * 1024
+
+
 def checkout_output_branch(workdir: str, branch_id: str) -> str:
     """Put a fresh durable worktree on the publisher's local output branch."""
     branch = branch_name_for(branch_id)
@@ -1378,8 +1422,13 @@ def _prepare_retained_checkout(
     job: ClaimedJob,
     manager: ChatSandboxManager,
     spec: ChatSandboxSpec,
+    max_bytes: int | None = None,
 ) -> str:
-    """Clone outside the chat, scrub credentials, then stream a normalized tar."""
+    """Clone outside the chat, scrub credentials, then stream a normalized tar.
+
+    ``max_bytes`` is the import limit this turn runs with; ``None`` reads this
+    host's own, for a turn started without the runner's settings.
+    """
     with tempfile.TemporaryDirectory(prefix="freeinference-source-") as source:
         base_sha = prepare_worktree(
             workdir=source,
@@ -1389,12 +1438,19 @@ def _prepare_retained_checkout(
             remote_base=repo_clone_base_url(clone_token=job.clone_token),
         )
         checkout_output_branch(source, job.thread_id)
-        archive = build_source_archive(
-            source,
-            uid=manager.backend.uid,
-            gid=manager.backend.gid,
-        )
-        manager.import_archive(spec, CHAT_WORKDIR, archive)
+        # Unnamed and outside the checkout: the archive is spooled to disk, not
+        # held in this process, and gone when the file is closed.
+        with tempfile.TemporaryFile(prefix="freeinference-source-", suffix=".tar") as archive:
+            build_source_archive(
+                source,
+                archive,
+                uid=manager.backend.uid,
+                gid=manager.backend.gid,
+                max_bytes=source_import_max_bytes() if max_bytes is None else max_bytes,
+            )
+            archive.flush()
+            archive.seek(0)
+            manager.import_archive(spec, CHAT_WORKDIR, archive)
     return base_sha
 
 
@@ -1774,13 +1830,19 @@ def _run_shared_live_attempt(
     agent_timeout_s: float,
     finish_attempt: Any,
     measurement: operation_profiling.Measurement | None = None,
+    host_settings: Mapping[str, float] | None = None,
 ) -> int:
     """Deliver one chat turn to its supervisor-owned resident CLI member.
 
     ``measurement`` is the opt-in startup timing for this attempt. It is
     ``None`` unless an experiment selected it, and every call on it is a no-op
     in that case, so the delivery path is unchanged when profiling is off.
+
+    ``host_settings`` are the runtime settings the runner resolved for this
+    turn — an admin's values over the host's own. A setting absent from it is
+    read from this process's environment, as a turn started by hand does.
     """
+    settings = host_settings or {}
     operation_profiling.mark(measurement, "validate")
     if not isinstance(backend, ContainerBackend):
         finish_attempt("failed", "shared live chats require the container or kata backend")
@@ -1812,8 +1874,11 @@ def _run_shared_live_attempt(
         finish_attempt("failed", "shared chat execution profile cannot change in place")
         return 2
 
+    # An existing group keeps the capacity it was created with: its member
+    # slots are built into the container. Only a new group takes the setting.
     capacity = int(
         existing.get("resident_slot_capacity")
+        or settings.get("shared_resident_capacity")
         or os.environ.get("AGENT_SHARED_RESIDENT_CAPACITY")
         or 8
     )
@@ -1901,7 +1966,7 @@ def _run_shared_live_attempt(
     failure_detail: str | None = None
     stage = _stage(measurement, "supervisor_acquire")
     context_status = "restored" if has_context else "new"
-    idle_timeout_s = _chat_idle_timeout_s()
+    idle_timeout_s = float(settings.get("chat_idle_timeout_s") or _chat_idle_timeout_s())
 
     def abandon_before_finish(*, lost: bool, detail: str | None) -> None:
         nonlocal abandoned
@@ -2008,7 +2073,13 @@ def _run_shared_live_attempt(
             stage = _stage(measurement, "workspace_reset")
             manager.reset_unsettled_state(spec)
             stage = _stage(measurement, "checkout")
-            base_sha = _prepare_retained_checkout(job=job, manager=manager, spec=spec)
+            import_mib = settings.get("source_import_max_mib")
+            base_sha = _prepare_retained_checkout(
+                job=job,
+                manager=manager,
+                spec=spec,
+                max_bytes=None if import_mib is None else int(import_mib) * 1024 * 1024,
+            )
             reused_workspace = False
             if job.setup_script:
                 stage = _stage(measurement, "setup")
@@ -2510,6 +2581,7 @@ def run_turn(
     backend: SandboxBackend | None = None,
     host: str | None = None,
     measurement: operation_profiling.Measurement | None = None,
+    host_settings: Mapping[str, float] | None = None,
 ) -> int:
     """Deliver one already-claimed turn, then report what it measured.
 
@@ -2529,6 +2601,7 @@ def run_turn(
             backend=backend,
             host=host,
             measurement=measurement,
+            host_settings=host_settings,
         )
     finally:
         # A bounded sweep, not the delivery itself for the common case: the
@@ -2724,6 +2797,7 @@ def _run_turn(
     backend: SandboxBackend | None = None,
     host: str | None = None,
     measurement: operation_profiling.Measurement | None = None,
+    host_settings: Mapping[str, float] | None = None,
 ) -> int:
     """Deliver one already-claimed turn, and report its outcome.
 
@@ -2780,6 +2854,7 @@ def _run_turn(
             agent_timeout_s=agent_timeout_s,
             finish_attempt=finish_attempt,
             measurement=measurement,
+            host_settings=host_settings,
         )
     except LeaseLost as exc:
         _log_control_failure("attempt_dispatch_fenced", job.job_id, exc)
@@ -2922,12 +2997,32 @@ def _start_host_capacity_collector(backend: SandboxBackend) -> HostCapacityColle
     return collector
 
 
+#: The parent's additions a turn's child does read: the profiling selection,
+#: and the runtime settings the turn runs with. Every other underscore key is
+#: parent bookkeeping.
+_CHILD_HANDOFF_KEYS = frozenset({"_profiling", "_host_settings"})
+
+
 def _child_turn_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Strip parent bookkeeping while preserving the profiling handoff."""
+    """Strip parent bookkeeping while preserving the profiling and settings handoff."""
     return {
         key: value
         for key, value in payload.items()
-        if not key.startswith("_") or key == "_profiling"
+        if not key.startswith("_") or key in _CHILD_HANDOFF_KEYS
+    }
+
+
+def _turn_host_settings(raw: Any) -> dict[str, float]:
+    """The runner's share of the runtime settings a turn was handed, checked again.
+
+    The parent already resolved them, so this only drops what no turn should
+    act on: a key the runner does not apply, or a value that is not a positive
+    finite number. A setting dropped here is read from the environment instead.
+    """
+    return {
+        key: float(value)
+        for key, value in (reported_values(raw) or {}).items()
+        if key in RUNNER_SETTING_KEYS and value > 0
     }
 
 
@@ -3179,16 +3274,22 @@ def _serve_turn(
     write_handover(handover_fd, f"{HANDOVER_ACCEPTED} {job.job_id}")
     # Only an accepted turn can finish and deliver the inherited measurement,
     # now including the preflight the user waited through before this answer.
+    # The settings the parent resolved when it handed this turn over: an
+    # admin's values over the host's own. Fixed for the turn from here, so a
+    # change on the admin page applies to the next turn, never halfway
+    # through this one.
+    host_settings = _turn_host_settings(payload.get("_host_settings"))
     return run_turn(
         job,
         base_url=base_url,
         gateway_url=gateway_url,
         worker_id=worker_id,
         lease_ttl=lease_ttl,
-        agent_timeout_s=agent_timeout_s,
+        agent_timeout_s=host_settings.get("agent_timeout_s", agent_timeout_s),
         backend=backend,
         host=host,
         measurement=measurement,
+        host_settings=host_settings,
     )
 
 
@@ -3260,7 +3361,7 @@ def run_forever(
     # says this runner applies ``slots_desired``, which is what lets the admin
     # page tell a host that will honour a new number from one that needs a
     # redeploy to change.
-    host_capabilities = [*capabilities, HOST_CONCURRENCY_CAPABILITY]
+    host_capabilities = [*capabilities, HOST_CONCURRENCY_CAPABILITY, HOST_SETTINGS_CAPABILITY]
     identity = ensure_enrolled(
         base_url=base_url,
         host=host,
@@ -3302,6 +3403,20 @@ def run_forever(
     # a control plane that is briefly unreachable leaves the host running what
     # it last confirmed rather than falling back to a default nobody chose.
     limit = host_default
+
+    # The runtime settings an admin sets on the Servers page, over this host's
+    # own. Adopted from each heartbeat answer on the heartbeat thread, which
+    # also hands the broker its share; read here as each turn is handed over.
+    # Until the first answer, every setting is this host's own, which is also
+    # what an unreachable control plane leaves in place.
+    try:
+        settings_broker: SessionSupervisorClient | None = _session_supervisor_from_env()
+    except Exception:
+        settings_broker = None
+    runtime_settings = RuntimeSettings(
+        _runner_local_settings(agent_timeout_s),
+        broker=None if settings_broker is None else settings_broker.apply_host_settings,
+    )
 
     capacity = _start_host_capacity_collector(backend)
     # The policy sync is installed *before* the host starts taking work, so
@@ -3354,6 +3469,7 @@ def run_forever(
             # runtime configuration from one that needs a redeploy, which is
             # the same distinction the concurrency capability draws.
             PROFILING_CONTROL_CAPABILITY,
+            HOST_SETTINGS_CAPABILITY,
         ],
         runner_version=_runner_version(),
         sandbox_runtime=stamp.get("sandbox_runtime"),
@@ -3367,6 +3483,10 @@ def run_forever(
         # is older than the protocol allows: an unsent observation reads as
         # stale on the page, which is the truth.
         capacity_beats=None if capacity is None else lambda: capacity.latest()[0],
+        settings_report=runtime_settings.report,
+        # A changed report goes out now rather than an interval later, so the
+        # admin page stops saying "applying" as soon as it is true.
+        on_settings=lambda admin: pool.wake() if runtime_settings.apply(admin) else None,
         on_residencies_lost=_handle_host_residencies_lost,
         on_retained_sandboxes_stop=_stop_retained_sandboxes,
     )
@@ -3376,6 +3496,7 @@ def run_forever(
         # to be noticed.
         policy_sync.start()
     pool.start()
+    settings_deadline = time.monotonic() + FIRST_SETTINGS_WAIT_S
     _drain_on_sigterm()
 
     def stop_all() -> None:
@@ -3391,6 +3512,8 @@ def run_forever(
             policy_sync.stop()
         if capacity is not None:
             capacity.stop()
+        if settings_broker is not None:
+            settings_broker.close()
         if qualification is not None:
             qualification.close()
 
@@ -3490,6 +3613,13 @@ def run_forever(
             if not _shared_live_deployment_ready(backend, stamp):
                 time.sleep(idle_wait)
                 continue
+            # A host that restarted can claim before its first heartbeat answer
+            # arrives, and a turn claimed then would run with this host's own
+            # settings rather than an admin's. Wait for that answer, but only so
+            # long: claiming must not come to depend on the heartbeat.
+            if not runtime_settings.adopted and time.monotonic() < settings_deadline:
+                time.sleep(idle_wait)
+                continue
 
             # A distinct lease owner per turn. Fencing never reads this
             # string, but "which turn is stuck" stops being answerable the
@@ -3545,6 +3675,7 @@ def run_forever(
                 base_url=base_url,
                 worker_id=turn_worker_id,
                 measurement=_bound_measurement(measurement, payload),
+                host_settings=runtime_settings.turn_settings(),
             )
     except KeyboardInterrupt:
         immediate = True
@@ -3769,6 +3900,7 @@ def _hand_over_turn(
     base_url: str,
     worker_id: str,
     measurement: operation_profiling.Measurement | None = None,
+    host_settings: Mapping[str, float] | None = None,
 ) -> None:
     """Give one claimed turn to a child, and requeue it only if it never began.
 
@@ -3815,6 +3947,9 @@ def _hand_over_turn(
         **payload,
         "_worker_id": worker_id,
         **({"_profiling": context} if context else {}),
+        # The runtime settings as of this handover. The child runs the whole
+        # turn with them, so a change on the admin page never lands mid-turn.
+        **({"_host_settings": dict(host_settings)} if host_settings else {}),
     }
     try:
         result = turns.launch(payload)
@@ -3911,6 +4046,21 @@ def _chat_idle_timeout_s() -> float:
     never be used to decide that a healthy chat is inactive.
     """
     return _env_float("AGENT_CHAT_IDLE_TIMEOUT_S", DEFAULT_CHAT_IDLE_TIMEOUT_S)
+
+
+def _runner_local_settings(agent_timeout_s: float) -> dict[str, float]:
+    """This host's own value for each setting the runner applies.
+
+    Read the way each one always was, from the environment or its default, so
+    a host with no admin value behaves exactly as before. ``agent_timeout_s``
+    is the runner's own, already read from ``AGENT_TIMEOUT_S`` or its flag.
+    """
+    return {
+        "agent_timeout_s": agent_timeout_s,
+        "chat_idle_timeout_s": _chat_idle_timeout_s(),
+        "source_import_max_mib": source_import_max_bytes() // (1024 * 1024),
+        "shared_resident_capacity": int(os.environ.get("AGENT_SHARED_RESIDENT_CAPACITY") or 8),
+    }
 
 
 def default_worker_id() -> str:

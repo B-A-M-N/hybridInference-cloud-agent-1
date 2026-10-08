@@ -38,7 +38,10 @@ vi.mock('@/lib/api/admin', () => ({
   undrainAgentRunnerHost: vi.fn(),
   removeAgentRunnerHost: vi.fn(),
   setAgentRunnerHostSlots: vi.fn(),
+  setAgentHostSettings: vi.fn(),
+  setAgentRunnerHostSettings: vi.fn(),
   HOST_CONCURRENCY_CAPABILITY: 'host-concurrency-v1',
+  HOST_SETTINGS_CAPABILITY: 'host-settings-v1',
   MIN_HOST_SLOTS: 2,
   MAX_HOST_SLOTS: 128,
   setAgentRuntimeVersion: vi.fn(),
@@ -51,6 +54,8 @@ import {
   getAgentRunnerHosts,
   removeAgentRunnerHost,
   setActiveAgentRunnerHost,
+  setAgentHostSettings,
+  setAgentRunnerHostSettings,
   setAgentRunnerHostSlots,
   setAgentRuntimeVersion,
 } from '@/lib/api/admin';
@@ -89,6 +94,8 @@ const mocked = {
   remove: removeAgentRunnerHost as unknown as ReturnType<typeof vi.fn>,
   slots: setAgentRunnerHostSlots as unknown as ReturnType<typeof vi.fn>,
   setVersion: setAgentRuntimeVersion as unknown as ReturnType<typeof vi.fn>,
+  globalSettings: setAgentHostSettings as unknown as ReturnType<typeof vi.fn>,
+  serverSettings: setAgentRunnerHostSettings as unknown as ReturnType<typeof vi.fn>,
 };
 
 const GIB = 1024 ** 3;
@@ -237,7 +244,7 @@ function panelFor(name = 'runner-a'): HTMLElement {
 /** Waits for the row, then opens it. `vi.waitFor` also works under fake timers. */
 async function openPanel(name = 'runner-a'): Promise<void> {
   const target = (): HTMLElement =>
-    screen.getByRole('button', { name: `Show capacity for ${name}` });
+    screen.getByRole('button', { name: `Show details for ${name}` });
   await vi.waitFor(() => expect(target()).toBeInTheDocument());
   fireEvent.click(target());
 }
@@ -905,8 +912,8 @@ describe('capacity panel', () => {
     );
     renderPage();
 
-    const toggleA = await screen.findByRole('button', { name: 'Show capacity for box-a' });
-    const toggleB = screen.getByRole('button', { name: 'Show capacity for box-b' });
+    const toggleA = await screen.findByRole('button', { name: 'Show details for box-a' });
+    const toggleB = screen.getByRole('button', { name: 'Show details for box-b' });
     expect(toggleA).toHaveAttribute('aria-expanded', 'false');
 
     fireEvent.click(toggleA);
@@ -1305,7 +1312,7 @@ describe('capacity panel', () => {
     await openPanel();
     await vi.waitFor(() => expect(mocked.history).toHaveBeenCalledTimes(1));
 
-    fireEvent.click(screen.getByRole('button', { name: 'Hide capacity for runner-a' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Hide details for runner-a' }));
     await vi.advanceTimersByTimeAsync(90_000);
     expect(mocked.history).toHaveBeenCalledTimes(1);
   });
@@ -1622,5 +1629,166 @@ describe('version and image cells', () => {
       ['claude-code', ['2.1.220', '2.1.235']],
       ['pi', ['0.73.1']],
     ]);
+  });
+});
+
+describe('runtime settings', () => {
+  const definitions = [
+    {
+      key: 'agent_timeout_s',
+      env: 'AGENT_TIMEOUT_S',
+      label: 'Turn time limit',
+      description: 'How long one agent turn may run before the host stops it.',
+      unit: 'seconds',
+      default: 3600,
+      minimum: 60,
+      maximum: 86400,
+      scope: 'runner',
+    },
+    {
+      key: 'terminal_max_sessions',
+      env: 'AGENT_TERMINAL_MAX_SESSIONS',
+      label: 'Terminals per server',
+      description: 'How many interactive terminals one server may hold open at once.',
+      unit: 'count',
+      default: 64,
+      minimum: 1,
+      maximum: 4096,
+      scope: 'broker',
+    },
+  ] as AgentRunnerHostPool['host_setting_definitions'];
+
+  function settingsHost(over: Partial<Record<string, unknown>> = {}) {
+    return host({
+      capabilities: ['kata', 'host-concurrency-v1', 'host-settings-v1'],
+      settings_desired: {},
+      settings_applied: { agent_timeout_s: 3600, terminal_max_sessions: 64 },
+      settings_local: { agent_timeout_s: 3600, terminal_max_sessions: 64 },
+      ...over,
+    });
+  }
+
+  function settingsPool(hosts: unknown[], values: Record<string, number> = {}) {
+    return { ...pool(hosts), host_settings: values, host_setting_definitions: definitions };
+  }
+
+  beforeEach(() => {
+    auth.role = 'admin';
+    Object.values(mocked).forEach((m) => m.mockReset());
+    mocked.history.mockResolvedValue(history());
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it('is not offered by a control plane that defines no settings', async () => {
+    mocked.list.mockResolvedValue(pool([host()]));
+    renderPage();
+
+    await screen.findByRole('rowheader', { name: 'runner-a' });
+    expect(screen.queryByRole('heading', { name: 'Runtime settings' })).not.toBeInTheDocument();
+  });
+
+  it('saves one global value and says how far it has reached', async () => {
+    mocked.list.mockResolvedValue(settingsPool([settingsHost()]));
+    mocked.globalSettings.mockResolvedValue(
+      settingsPool([settingsHost()], { agent_timeout_s: 7200 }),
+    );
+    renderPage();
+
+    const input = await screen.findByLabelText('Turn time limit for all servers');
+    expect(screen.getAllByText('Each server uses its own .env value, or 1 h')).toHaveLength(1);
+    fireEvent.change(input, { target: { value: '7200' } });
+    fireEvent.submit(input.closest('form')!);
+
+    await waitFor(() =>
+      expect(mocked.globalSettings).toHaveBeenCalledWith({ agent_timeout_s: 7200 }),
+    );
+    // Saved is not applied: the host still reports its own hour.
+    expect(await screen.findByText('Applied on 0 of 1 server')).toBeInTheDocument();
+    expect(screen.getByText('2 h')).toBeInTheDocument();
+  });
+
+  it('refuses a value outside its bounds without asking the control plane', async () => {
+    mocked.list.mockResolvedValue(settingsPool([settingsHost()]));
+    renderPage();
+
+    const input = await screen.findByLabelText('Turn time limit for all servers');
+    fireEvent.change(input, { target: { value: '30' } });
+    fireEvent.submit(input.closest('form')!);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Enter a whole number from 60 to 86400 s.',
+    );
+    expect(mocked.globalSettings).not.toHaveBeenCalled();
+  });
+
+  it('clears a global value so each server falls back to its own', async () => {
+    mocked.list.mockResolvedValue(settingsPool([settingsHost()], { terminal_max_sessions: 16 }));
+    mocked.globalSettings.mockResolvedValue(settingsPool([settingsHost()]));
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: "Use each server's own" }));
+
+    await waitFor(() =>
+      expect(mocked.globalSettings).toHaveBeenCalledWith({ terminal_max_sessions: null }),
+    );
+  });
+
+  it('shows what a server uses and where from, and sets a value for it alone', async () => {
+    mocked.list.mockResolvedValue(
+      settingsPool(
+        [settingsHost({ settings_applied: { agent_timeout_s: 7200, terminal_max_sessions: 64 } })],
+        { agent_timeout_s: 7200 },
+      ),
+    );
+    mocked.serverSettings.mockResolvedValue(
+      settingsPool([settingsHost({ settings_desired: { terminal_max_sessions: 8 } })], {
+        agent_timeout_s: 7200,
+      }),
+    );
+    renderPage();
+    await openPanel();
+
+    const panel = screen.getByRole('region', { name: 'Runtime settings for runner-a' });
+    const timeout = within(panel)
+      .getByRole('rowheader', { name: 'Turn time limit' })
+      .closest('tr')!;
+    expect(within(timeout).getByText('2 h')).toBeInTheDocument();
+    expect(within(timeout).getByText('set for all servers')).toBeInTheDocument();
+    const sessions = within(panel)
+      .getByRole('rowheader', { name: 'Terminals per server' })
+      .closest('tr')!;
+    expect(within(sessions).getByText('server default')).toBeInTheDocument();
+
+    const input = within(panel).getByLabelText('Terminals per server for runner-a');
+    fireEvent.change(input, { target: { value: '8' } });
+    fireEvent.submit(input.closest('form')!);
+
+    await waitFor(() =>
+      expect(mocked.serverSettings).toHaveBeenCalledWith('runner-a', {
+        terminal_max_sessions: 8,
+      }),
+    );
+    expect(
+      await within(sessions).findByText('set for this server · applying 8'),
+    ).toBeInTheDocument();
+  });
+
+  it('says a server that predates settings needs a redeploy, and offers it no input', async () => {
+    mocked.list.mockResolvedValue(
+      settingsPool([
+        settingsHost({ capabilities: ['kata'], settings_applied: null, settings_local: null }),
+      ]),
+    );
+    renderPage();
+    await openPanel();
+
+    const panel = screen.getByRole('region', { name: 'Runtime settings for runner-a' });
+    expect(within(panel).getByText(/Redeploy it to manage them here/)).toBeInTheDocument();
+    expect(within(panel).getByLabelText('Turn time limit for runner-a')).toBeDisabled();
+    expect(screen.getAllByText(/1 server needs a redeploy/)).toHaveLength(2);
   });
 });

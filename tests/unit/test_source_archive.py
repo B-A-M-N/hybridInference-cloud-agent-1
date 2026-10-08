@@ -6,11 +6,19 @@ import io
 import os
 import subprocess
 import tarfile
+import tempfile
 
 import pytest
 
 from cloud_agent_host.sandbox import SandboxError
 from cloud_agent_host.source_archive import build_base_bundle, build_source_archive
+
+
+def _archive(root, **kwargs) -> bytes:
+    out = io.BytesIO()
+    written = build_source_archive(str(root), out, uid=10001, gid=10001, **kwargs)
+    assert written == out.tell()
+    return out.getvalue()
 
 
 def _checkout(tmp_path):
@@ -26,7 +34,7 @@ def _checkout(tmp_path):
 def test_source_archive_contains_git_files_and_normalizes_ownership(tmp_path):
     root = _checkout(tmp_path)
 
-    payload = build_source_archive(str(root), uid=10001, gid=10001)
+    payload = _archive(root)
 
     with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as archive:
         members = {member.name: member for member in archive.getmembers()}
@@ -44,7 +52,7 @@ def test_source_archive_never_follows_a_symlink_outside_the_checkout(tmp_path):
     outside.write_text("must-not-enter")
     os.symlink(outside, root / "outside-link")
 
-    payload = build_source_archive(str(root), uid=10001, gid=10001)
+    payload = _archive(root)
 
     with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as archive:
         link = archive.getmember("outside-link")
@@ -57,7 +65,7 @@ def test_source_archive_requires_a_real_git_checkout(tmp_path):
     empty.mkdir()
 
     with pytest.raises(SandboxError, match="no Git checkout"):
-        build_source_archive(str(empty), uid=10001, gid=10001)
+        _archive(empty)
 
 
 def test_source_archive_refuses_oversized_checkout_before_import(tmp_path):
@@ -65,7 +73,42 @@ def test_source_archive_refuses_oversized_checkout_before_import(tmp_path):
     (root / "large.bin").write_bytes(b"x" * 1024)
 
     with pytest.raises(SandboxError, match="size limit"):
-        build_source_archive(str(root), uid=10001, gid=10001, max_bytes=512)
+        _archive(root, max_bytes=512)
+
+
+def test_oversized_checkout_refusal_names_its_size_and_the_limit(tmp_path):
+    root = _checkout(tmp_path)
+    (root / "large.bin").write_bytes(b"x" * (3 * 1024 * 1024))
+
+    with pytest.raises(SandboxError) as refused:
+        _archive(root, max_bytes=2 * 1024 * 1024)
+
+    message = str(refused.value)
+    assert "3.00 MiB including its Git objects" in message
+    assert "2.00 MiB retained import size limit" in message
+
+
+def test_source_archive_refuses_tar_overhead_past_the_limit(tmp_path):
+    root = _checkout(tmp_path)
+    file_bytes = sum(
+        p.stat().st_size for p in root.rglob("*") if p.is_file() and not p.is_symlink()
+    )
+
+    with pytest.raises(SandboxError, match=r"source archive exceeds .* size limit"):
+        _archive(root, max_bytes=file_bytes + 1)
+
+
+def test_source_archive_streams_into_a_real_file(tmp_path):
+    root = _checkout(tmp_path)
+
+    with tempfile.TemporaryFile() as out:
+        written = build_source_archive(str(root), out, uid=10001, gid=10001)
+        out.seek(0)
+        with tarfile.open(fileobj=out, mode="r:") as archive:
+            names = set(archive.getnames())
+
+    assert written > 0
+    assert {".git/config", "src/main.py", "link.py"} <= names
 
 
 def test_source_archive_refuses_special_files(tmp_path):
@@ -75,7 +118,7 @@ def test_source_archive_refuses_special_files(tmp_path):
 
     try:
         with pytest.raises(SandboxError, match="refused file type"):
-            build_source_archive(str(root), uid=10001, gid=10001)
+            _archive(root)
     finally:
         fifo.unlink(missing_ok=True)
 

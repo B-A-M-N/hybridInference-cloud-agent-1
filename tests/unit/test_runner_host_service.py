@@ -26,6 +26,7 @@ from cloud_agent_host.host_runtime import (
     LaunchResult,
 )
 from cloud_agent_host.sandbox import ProcessBackend
+from cloud_agent_shared.shared_protocol import HOST_SETTINGS_CAPABILITY
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -53,6 +54,9 @@ class FakeHeartbeat:
     """What the loop reads off ``HostHeartbeat``: status, removal, credential."""
 
     last: FakeHeartbeat | None = None
+    #: Whether ``start`` delivers a first heartbeat answer, as a reachable
+    #: control plane does. Turned off to stand for one whose heartbeat fails.
+    answers_on_start = True
 
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
@@ -77,6 +81,10 @@ class FakeHeartbeat:
 
     def start(self) -> None:
         self.started = True
+        # A real host beats at once, and that first answer carries the runtime
+        # settings; a fake that never answered would hold every claim back.
+        if FakeHeartbeat.answers_on_start and self.kwargs.get("on_settings") is not None:
+            self.kwargs["on_settings"](dict(self.identity.settings))
 
     def stop(self) -> None:
         self.stopped = True
@@ -610,6 +618,73 @@ def test_a_saved_limit_is_taken_up_and_reported_back(service, monkeypatch):
     assert beat.kwargs["slots_total"]() == 5
     assert HOST_CONCURRENCY_CAPABILITY in beat.kwargs["capabilities"]()
     assert beat.wakes >= 1, "a limit this host adopted is told to the scheduler now"
+
+
+def test_each_turn_is_handed_the_admin_settings_from_the_latest_beat(service, monkeypatch):
+    """A value saved between two claims reaches the second turn and never the first."""
+    _identity, backend, _released = service
+    monkeypatch.setattr(runner_mod, "claim_payload", _queue([_job(0), _job(1)]))
+    handed: list[dict] = []
+
+    def launch(payload: dict) -> LaunchResult:
+        handed.append(payload)
+        if len(handed) == 1:
+            # The heartbeat thread adopting an answer, between the two claims.
+            FakeHeartbeat.last.kwargs["on_settings"](
+                {"agent_timeout_s": 900, "terminal_max_sessions": 16}
+            )
+        handle = FakeHandle()
+        handle.exit_code = 0
+        return LaunchResult(LAUNCH_STARTED, handle)
+
+    _serve(backend, launch=launch)
+
+    assert handed[0]["_host_settings"]["agent_timeout_s"] == runner_mod.DEFAULT_AGENT_TIMEOUT_S
+    assert handed[1]["_host_settings"]["agent_timeout_s"] == 900
+    assert "terminal_max_sessions" not in handed[1]["_host_settings"], "the broker's, not a turn's"
+    beat = FakeHeartbeat.last
+    assert HOST_SETTINGS_CAPABILITY in beat.kwargs["capabilities"]()
+    applied, local = beat.kwargs["settings_report"]()
+    assert (applied["agent_timeout_s"], local["agent_timeout_s"]) == (
+        900,
+        runner_mod.DEFAULT_AGENT_TIMEOUT_S,
+    )
+    assert beat.wakes >= 1, "a changed report is sent now, not an interval later"
+
+
+def test_a_restarted_host_waits_for_its_first_answer_before_claiming(service, monkeypatch):
+    """A turn claimed before the admin's settings arrive would run without them."""
+    _identity, backend, _released = service
+    monkeypatch.setattr(FakeHeartbeat, "answers_on_start", False)
+    monkeypatch.setattr(runner_mod, "claim_payload", _queue([_job(0)]))
+    launched: list[dict] = []
+
+    _serve(
+        backend,
+        launch=lambda payload: launched.append(payload) or LaunchResult(LAUNCH_STARTED, None),
+    )
+
+    assert launched == [], "no answer within the wait, and the wait has not run out"
+
+
+def test_a_host_whose_heartbeat_fails_still_claims_once_the_wait_runs_out(service, monkeypatch):
+    """Claiming never comes to depend on the heartbeat: the wait is bounded."""
+    _identity, backend, _released = service
+    monkeypatch.setattr(FakeHeartbeat, "answers_on_start", False)
+    monkeypatch.setattr(runner_mod, "FIRST_SETTINGS_WAIT_S", 0.0)
+    monkeypatch.setattr(runner_mod, "claim_payload", _queue([_job(0)]))
+    launched: list[dict] = []
+
+    def launch(payload: dict) -> LaunchResult:
+        launched.append(payload)
+        handle = FakeHandle()
+        handle.exit_code = 0
+        return LaunchResult(LAUNCH_STARTED, handle)
+
+    _serve(backend, launch=launch)
+
+    assert len(launched) == 1
+    assert launched[0]["_host_settings"]["agent_timeout_s"] == runner_mod.DEFAULT_AGENT_TIMEOUT_S
 
 
 def test_a_lowered_limit_stops_claiming_without_touching_a_running_turn(service, monkeypatch):

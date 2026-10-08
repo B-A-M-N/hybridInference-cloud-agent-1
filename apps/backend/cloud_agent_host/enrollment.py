@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from cloud_agent_host.logging_utils import get_logger
+from cloud_agent_shared.host_settings import admin_values
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -129,6 +130,11 @@ class HostIdentity:
     #: heartbeat, or ``None`` when it returned none. Read by the runner's own
     #: policy sync, which is the only thing that writes the collector's store.
     profiling_policy: dict[str, Any] | None = None
+    #: The runtime settings an admin set for this host, as the last answered
+    #: heartbeat carried them; a setting absent here is the host's own. Replaced
+    #: whole on every answer, so a cleared value does not linger, and kept
+    #: through a failed beat, so an outage does not revert anything.
+    settings: dict[str, int] = field(default_factory=dict)
 
 
 def credential_path() -> Path:
@@ -309,6 +315,8 @@ def heartbeat(
     retained_sandboxes: list[dict[str, Any]] | None = None,
     capacity: dict[str, Any] | None = None,
     profiling: dict[str, Any] | None = None,
+    settings_applied: dict[str, int | float] | None = None,
+    settings_local: dict[str, int | float] | None = None,
     on_residencies_lost: Callable[[list[dict[str, Any]]], None] | None = None,
     on_retained_sandboxes_stop: Callable[[list[dict[str, Any]]], None] | None = None,
 ) -> HostIdentity:
@@ -333,6 +341,10 @@ def heartbeat(
     It is optional in both directions: a host that does not collect it omits
     it, and a control plane that cannot use it drops it without refusing the
     beat. Liveness never depends on a monitoring field.
+
+    ``settings_applied`` and ``settings_local`` report the runtime settings
+    this host applies and what its own environment would give it; the answer's
+    ``settings`` are the values an admin set for it, kept on the identity.
     """
     answer = _post(
         f"{base_url.rstrip('/')}/v1/agent/host/heartbeat",
@@ -350,6 +362,8 @@ def heartbeat(
             "retained_sandboxes": retained_sandboxes,
             "capacity": capacity,
             "profiling": profiling,
+            "settings_applied": settings_applied,
+            "settings_local": settings_local,
             "physical_host": os.environ.get("AGENT_PHYSICAL_HOST", "").strip() or None,
         },
         bearer=identity.credential,
@@ -375,6 +389,11 @@ def heartbeat(
     identity.slots_desired = (
         int(desired) if isinstance(desired, int) and not isinstance(desired, bool) else None
     )
+    # Checked again here against the bounds this host was built with: a
+    # control plane from another release can know a setting, or a bound, that
+    # this host does not. A control plane predating settings sends none, which
+    # leaves every setting on the host's own .env.
+    identity.settings = admin_values(answer.get("settings"))
     # The profiling policy rides this same answer, and the caller applies it to
     # its own process's policy store. Returning it rather than applying it here
     # keeps this module about talking to the control plane: the store belongs to
@@ -504,6 +523,10 @@ class HostHeartbeat:
         retained_sandbox_beats: Callable[[], list[dict[str, Any]] | None] | None = None,
         capacity_beats: Callable[[], dict[str, Any] | None] | None = None,
         profiling: Callable[[], dict[str, Any] | None] | None = None,
+        settings_report: (
+            Callable[[], tuple[dict[str, int | float], dict[str, int | float]]] | None
+        ) = None,
+        on_settings: Callable[[dict[str, int]], None] | None = None,
         on_residencies_lost: Callable[[list[dict[str, Any]]], None] | None = None,
         on_retained_sandboxes_stop: Callable[[list[dict[str, Any]]], None] | None = None,
     ) -> None:
@@ -552,6 +575,11 @@ class HostHeartbeat:
         # heard about the Stop" from "this host is not there" -- two different
         # problems with two different fixes.
         self._profiling = profiling
+        # Asked per beat for what this host applies now, and told after each
+        # answered beat what an admin set. The callback runs on this thread and
+        # must not raise; one that does is logged and the beats go on.
+        self._settings_report = settings_report
+        self._on_settings = on_settings
         self._on_residencies_lost = on_residencies_lost
         self._on_retained_sandboxes_stop = on_retained_sandboxes_stop
         self._stop = threading.Event()
@@ -616,6 +644,9 @@ class HostHeartbeat:
                 capabilities = (
                     self._capabilities() if callable(self._capabilities) else self._capabilities
                 )
+                settings_applied, settings_local = (
+                    self._settings_report() if self._settings_report is not None else (None, None)
+                )
                 heartbeat(
                     base_url=self._base_url,
                     identity=self._identity,
@@ -642,9 +673,12 @@ class HostHeartbeat:
                     ),
                     capacity=(self._capacity_beats() if self._capacity_beats is not None else None),
                     profiling=(self._profiling() if self._profiling is not None else None),
+                    settings_applied=settings_applied,
+                    settings_local=settings_local,
                     on_residencies_lost=self._on_residencies_lost,
                     on_retained_sandboxes_stop=self._on_retained_sandboxes_stop,
                 )
+                self._apply_settings()
             except HostRemoved:
                 # Definitive: this credential is not one the control plane
                 # accepts. Stop claiming and stop asking — retrying a refusal
@@ -684,6 +718,18 @@ class HostHeartbeat:
                     extra={"event": "agent_host_heartbeat_crashed", "host": self._identity.host},
                 )
             self._wait_for_next_beat()
+
+    def _apply_settings(self) -> None:
+        """Hand the answered settings on, without letting a failure stop the beats."""
+        if self._on_settings is None:
+            return
+        try:
+            self._on_settings(dict(self._identity.settings))
+        except Exception:
+            logger.exception(
+                "agent_host_settings_apply_failed",
+                extra={"event": "agent_host_settings_apply_failed", "host": self._identity.host},
+            )
 
     def _wait_for_next_beat(self) -> None:
         """Sleep one interval, waking early for a marker move or a nudge.

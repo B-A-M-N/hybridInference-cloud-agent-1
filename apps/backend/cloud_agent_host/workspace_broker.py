@@ -85,6 +85,7 @@ from cloud_agent_host.workspace_browser import (
     WorkspacePathError,
     normalize_workspace_path,
 )
+from cloud_agent_shared.host_settings import BROKER_SETTING_KEYS, admin_values, resolve
 from cloud_agent_shared.operation_profiling import PROFILING_CONTEXT_HEADER
 
 logger = get_logger(__name__)
@@ -758,6 +759,22 @@ class _TerminalManager:
         self._stop = threading.Event()
         self._reaper: threading.Thread | None = None
 
+    def configure(self, *, idle_ttl_s: float, hard_ttl_s: float, max_sessions: int) -> None:
+        """Change the limits at runtime, as the admin page asks.
+
+        Open terminals are judged by the new lifetimes from the next sweep, so
+        a shortened one closes those already past it. A lower session limit
+        refuses new terminals and closes none.
+        """
+        if idle_ttl_s <= 0 or hard_ttl_s <= 0:
+            raise ValueError("terminal TTL values must be positive")
+        if not 1 <= max_sessions <= 4096:
+            raise ValueError("terminal global session limit must be between 1 and 4096")
+        with self._lock:
+            self._idle_ttl_s = idle_ttl_s
+            self._hard_ttl_s = hard_ttl_s
+            self._max_sessions = max_sessions
+
     def start(self) -> None:
         """Start periodic TTL cleanup once the app lifespan begins."""
         with self._lock:
@@ -1041,9 +1058,14 @@ class _TerminalManager:
                         self._sessions.pop(workspace_id, None)
 
     def _reap_loop(self) -> None:
-        interval = max(0.1, min(30.0, self._idle_ttl_s / 2, self._hard_ttl_s / 2))
-        while not self._stop.wait(interval):
+        # Recomputed each pass: the lifetimes can change at runtime, and an
+        # interval fixed at start would sweep a shortened one late.
+        while not self._stop.wait(self._reap_interval()):
             self.reap()
+
+    def _reap_interval(self) -> float:
+        with self._lock:
+            return max(0.1, min(30.0, self._idle_ttl_s / 2, self._hard_ttl_s / 2))
 
 
 def _relative_path(raw: str | None) -> str:
@@ -1348,6 +1370,43 @@ def create_app(
         every selection, however well-formed the header that carried it.
         """
         return broker_profiling_policy.apply_received_policy(body)
+
+    # This broker's own values for the settings an admin can also set: its
+    # environment, or the built-in defaults. Fixed for the process's life; an
+    # admin value is applied over them, and clearing it returns to them.
+    local_settings: dict[str, float] = {
+        "terminal_idle_ttl_s": idle_ttl_s,
+        "terminal_hard_ttl_s": hard_ttl_s,
+        "terminal_max_sessions": max_sessions,
+        "chat_idle_timeout_s": chat_idle_timeout_s,
+    }
+
+    @app.post("/host-settings")
+    def host_settings(
+        body: dict[str, Any],
+        _: None = Depends(authenticate),
+    ) -> dict[str, Any]:
+        """Apply the runtime settings an admin set, over this broker's own.
+
+        The runner sends them after every heartbeat, over the same
+        shared-token channel the profiling policy uses: the broker holds no
+        host credential and must not be given one. The whole set every time,
+        so a value an admin cleared arrives as an absence and this broker goes
+        back to its own. A value it cannot apply — unknown, or outside the
+        bounds this release accepts — is ignored the same way.
+
+        Answers with what it now applies and what its own would be, which the
+        runner reports to the control plane as this host's confirmation.
+        """
+        admin = admin_values(body.get("settings"), BROKER_SETTING_KEYS)
+        applied = resolve(admin, local_settings)
+        terminals.configure(
+            idle_ttl_s=float(applied["terminal_idle_ttl_s"]),
+            hard_ttl_s=float(applied["terminal_hard_ttl_s"]),
+            max_sessions=int(applied["terminal_max_sessions"]),
+        )
+        shared_supervisor.set_idle_timeout_s(float(applied["chat_idle_timeout_s"]))
+        return {"applied": applied, "local": local_settings}
 
     @app.get("/health")
     def health(_: None = Depends(authenticate)) -> dict[str, Any]:

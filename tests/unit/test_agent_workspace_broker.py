@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import logging
+import threading
 import time
 from types import SimpleNamespace
 
@@ -142,6 +143,9 @@ def _descriptor(thread_id: str = "athr_source") -> SharedSessionDescriptor:
 
 class _SharedSupervisor:
     idle_timeout_s = 30.0
+
+    def set_idle_timeout_s(self, idle_timeout_s: float) -> None:
+        self.idle_timeout_s = idle_timeout_s
 
     def __init__(self) -> None:
         self.workspace_backend = _WorkspaceBackend()
@@ -655,6 +659,112 @@ def test_shared_one_shot_terminal_uses_group_writable_umask():
     )
     assert result["exit_code"] == 0
     assert backend.spawned[0].argv[-1].startswith("umask 0002; ")
+
+
+@pytest.mark.asyncio
+async def test_the_runner_sets_the_brokers_runtime_settings_over_its_own():
+    """Applied at runtime, answered with what is applied, and cleared back to its own."""
+    supervisor = _SharedSupervisor()
+    app = create_app(
+        backend=ProcessBackend(acknowledged_unsafe=True),
+        token="broker-secret",
+        shared_session_supervisor=supervisor,  # type: ignore[arg-type]
+        terminal_idle_ttl_s=1800,
+        terminal_hard_ttl_s=28800,
+        terminal_max_sessions=64,
+        session_idle_timeout_s=1800,
+    )
+    headers = {"X-Agent-Workspace-Token": "broker-secret"}
+    own = {
+        "terminal_idle_ttl_s": 1800,
+        "terminal_hard_ttl_s": 28800,
+        "terminal_max_sessions": 64,
+        "chat_idle_timeout_s": 1800,
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://broker") as client:
+        denied = await client.post("/host-settings", json={"settings": {}})
+        applied = await client.post(
+            "/host-settings",
+            headers=headers,
+            json={
+                "settings": {
+                    "terminal_max_sessions": 16,
+                    "chat_idle_timeout_s": 600,
+                    # Not the broker's, and outside its bounds: both ignored.
+                    "agent_timeout_s": 900,
+                    "terminal_idle_ttl_s": 1,
+                }
+            },
+        )
+        terminals = app.state.terminal_manager
+        assert (terminals._max_sessions, terminals._idle_ttl_s) == (16, 1800)
+        assert supervisor.idle_timeout_s == 600
+        cleared = await client.post("/host-settings", headers=headers, json={"settings": {}})
+
+    assert denied.status_code == 401
+    assert applied.json() == {
+        "applied": {**own, "terminal_max_sessions": 16, "chat_idle_timeout_s": 600},
+        "local": own,
+    }
+    assert cleared.json() == {"applied": own, "local": own}
+    assert terminals._max_sessions == 64
+    assert supervisor.idle_timeout_s == 1800
+
+
+class _RunningTerminalProcess(_TerminalProcess):
+    """A shell that stays open, silent, until it is killed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._killed = threading.Event()
+
+    def chunks(self):
+        self._killed.wait(timeout=5)
+        yield from ()
+
+    def kill(self) -> None:
+        super().kill()
+        self._killed.set()
+
+
+def test_a_shortened_terminal_lifetime_closes_terminals_already_past_it():
+    terminals = _TerminalManager(idle_ttl_s=1800, hard_ttl_s=28800, max_sessions=8)
+    process = _RunningTerminalProcess()
+    session = _TerminalSession(
+        terminal_id="term_old",
+        process=process,
+        workdir=None,
+        rows=24,
+        cols=80,
+        now=time.monotonic() - 600,
+        idle_ttl_s=None,
+        on_closed=None,
+    )
+    session.start()
+    terminals._sessions["athr_source"] = {"term_old": session}
+
+    terminals.reap()
+    assert "athr_source" in terminals._sessions, "ten minutes is inside half an hour"
+
+    terminals.configure(idle_ttl_s=300, hard_ttl_s=28800, max_sessions=8)
+    assert terminals._reap_interval() == 30.0
+    terminals.reap()
+    assert "athr_source" not in terminals._sessions
+    assert process.killed
+
+
+@pytest.mark.parametrize(
+    ("idle", "hard", "sessions"),
+    [(0, 60, 8), (60, -1, 8), (60, 60, 0), (60, 60, 4097)],
+)
+def test_terminal_limits_are_refused_outside_the_bounds_the_broker_starts_with(
+    idle, hard, sessions
+):
+    terminals = _TerminalManager(idle_ttl_s=30, hard_ttl_s=60, max_sessions=8)
+
+    with pytest.raises(ValueError):
+        terminals.configure(idle_ttl_s=idle, hard_ttl_s=hard, max_sessions=sessions)
+    assert (terminals._idle_ttl_s, terminals._hard_ttl_s, terminals._max_sessions) == (30, 60, 8)
 
 
 def test_terminal_suspensions_are_reference_counted_per_concurrent_turn():

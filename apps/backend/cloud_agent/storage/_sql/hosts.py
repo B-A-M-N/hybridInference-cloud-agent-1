@@ -35,6 +35,12 @@ HOST_COLUMN_NAMES = (
     "sandbox_image_digest",
     "runtime_versions",
     "runtime_versions_available",
+    # A few numbers each, unlike the capacity snapshot below: small enough to
+    # ride every projection, and the heartbeat answer needs the server's own
+    # values from the row it just wrote.
+    "settings_desired",
+    "settings_applied",
+    "settings_local",
 )
 
 

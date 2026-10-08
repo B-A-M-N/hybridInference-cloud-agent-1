@@ -22,8 +22,11 @@ from cloud_agent_shared.errors import SandboxError
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from typing import BinaryIO
 
 
+#: Counts the working tree *and* the fetched commit's Git objects, so the
+#: largest checkout that fits is well under this. A host may raise it.
 DEFAULT_MAX_SOURCE_ARCHIVE_BYTES = 1024 * 1024 * 1024
 DEFAULT_MAX_BASE_BUNDLE_BYTES = 1024 * 1024 * 1024
 #: Uploads are bounded far below the checkout: the control plane caps one task
@@ -49,14 +52,28 @@ def _entries(root: pathlib.Path) -> Iterator[pathlib.Path]:
             yield parent / name
 
 
+def _human_size(size: int) -> str:
+    for unit, scale in (("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)):
+        if size >= scale:
+            return f"{size / scale:.2f} {unit}"
+    return f"{size} B"
+
+
 def build_source_archive(
     workdir: str,
+    out: BinaryIO,
     *,
     uid: int,
     gid: int,
     max_bytes: int = DEFAULT_MAX_SOURCE_ARCHIVE_BYTES,
-) -> bytes:
-    """Build a normalized tar of one prepared checkout, complete or refuse."""
+) -> int:
+    """Write a normalized tar of one prepared checkout to ``out``, complete or refuse.
+
+    The tar goes to the caller's file rather than into memory: a checkout near
+    the limit would otherwise be held in the turn process, twice, before Docker
+    read any of it. Returns the bytes written. After a refusal ``out`` holds a
+    partial archive and must be discarded.
+    """
     root = pathlib.Path(workdir).resolve()
     if max_bytes <= 0:
         raise ValueError("source archive size limit must be positive")
@@ -75,10 +92,13 @@ def build_source_archive(
             estimated += info.st_size
         elif not (stat.S_ISDIR(mode) or stat.S_ISLNK(mode)):
             raise SandboxError(f"source checkout contains refused file type at {path.name!r}")
-        if estimated > max_bytes:
-            raise SandboxError("source checkout exceeds the retained import size limit")
-
-    buffer = io.BytesIO()
+    # Measured to the end, not to the first byte over: the size is what tells
+    # the user this is the repository and not a transient failure to retry.
+    if estimated > max_bytes:
+        raise SandboxError(
+            f"source checkout ({_human_size(estimated)} including its Git objects) exceeds "
+            f"this host's {_human_size(max_bytes)} retained import size limit"
+        )
 
     def normalize(member: tarfile.TarInfo) -> tarfile.TarInfo:
         name = pathlib.PurePosixPath(member.name)
@@ -94,19 +114,24 @@ def build_source_archive(
         member.mode &= 0o1777
         return member
 
+    # Tar headers and padding on top of the file bytes measured above.
+    over_limit = SandboxError(
+        f"source archive exceeds this host's {_human_size(max_bytes)} retained import size limit"
+    )
+    start = out.tell()
     try:
-        with tarfile.open(fileobj=buffer, mode="w", dereference=False) as archive:
+        with tarfile.open(fileobj=out, mode="w", dereference=False) as archive:
             for path in paths:
                 relative = path.relative_to(root).as_posix()
                 archive.add(path, arcname=relative, recursive=False, filter=normalize)
-                if buffer.tell() > max_bytes:
-                    raise SandboxError("source archive exceeds the retained import size limit")
+                if out.tell() - start > max_bytes:
+                    raise over_limit
     except (OSError, tarfile.TarError) as exc:
         raise SandboxError(f"source checkout could not be archived: {exc}") from exc
-    payload = buffer.getvalue()
-    if len(payload) > max_bytes:
-        raise SandboxError("source archive exceeds the retained import size limit")
-    return payload
+    written = out.tell() - start
+    if written > max_bytes:
+        raise over_limit
+    return written
 
 
 def build_base_bundle(
