@@ -37,8 +37,10 @@ while every slot is busy. Past that window an idle host lets it lapse instead of
 booting a probe VM every minute, and the next turn runs its own full preflight,
 which reopens the window. A deployment still marked `pending:<sha>` has no proof
 and reports no failure; the readiness gate waits it out. A failed qualification
-stops claims, is reported once, and is probed again only after a backoff of
-five seconds doubling to five minutes. Probe containers carry
+stops claims until a probe succeeds, is reported once, and is probed again on a
+backoff of five seconds doubling to five minutes, whether or not turns are
+still wanted: the failure withdrew the host's guest-kernel attestation, so it
+must not resume claiming without one. Probe containers carry
 `org.freeinference.chat-probe-created`, so the broker never adopts one as an
 orphan chat; the next probe removes any its namespace abandoned over an hour ago.
 

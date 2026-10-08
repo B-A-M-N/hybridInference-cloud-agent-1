@@ -411,6 +411,40 @@ def test_a_failing_qualification_backs_off_instead_of_probing_every_poll(lab, mo
     assert _request(lab), "a recovered runtime is reused at once"
 
 
+def test_a_failed_qualification_is_retried_after_demand_lapses(lab, monkeypatch):
+    """A failure must not end in a host that looks healthy and never works again.
+
+    A failed probe withdraws the guest-kernel attestation, and a failing host
+    claims nothing, so no claim ever renews demand. Letting the proof lapse
+    then would resume claiming without the attestation, receive no Kata work
+    and never probe again.
+    """
+    clock = [1000.0]
+    monkeypatch.setattr(qualification.time, "monotonic", lambda: clock[0])
+    failing = [True]
+
+    def preflight(*, check_network):
+        lab.probes.append("probe")
+        lab.backend._kernel_probe = {"host_kernel": os.uname().release, "guest_kernel": None}
+        if failing[0]:
+            raise SandboxError("observer self-test failed")
+        lab.backend._kernel_probe["guest_kernel"] = "guest-kernel"
+
+    monkeypatch.setattr(lab.backend, "preflight", preflight)
+    lab.authority.note_demand()
+    with pytest.raises(SandboxError, match="self-test"):
+        lab.authority.refresh()
+    clock[0] += qualification.WARM_FOR_S
+    assert lab.authority.renewal_due(), "a host that is full of old turns retries too"
+    with pytest.raises(SandboxError, match="self-test"):
+        lab.authority.refresh()
+    assert lab.probes == ["probe", "probe"]
+    clock[0] += qualification.LAUNCH_BACKOFF_CAP_S
+    failing[0] = False
+    assert lab.authority.refresh() is True
+    assert lab.backend._kernel_probe["guest_kernel"] == "guest-kernel"
+
+
 def test_a_deployment_that_is_not_published_yet_is_not_a_failure(lab):
     """Every rollout spends a while on ``pending:<sha>``; the claim gate waits it out."""
     lab.ready.write_text("pending:deployment-a")

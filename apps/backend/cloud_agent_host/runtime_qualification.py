@@ -355,10 +355,14 @@ class HostQualification:
         """Whether a host with no free slot should renew now, ahead of its next claim."""
         now = time.monotonic()
         with self._lock:
-            if not self._supported or now >= self._wanted_until:
+            if not self._supported:
+                return False
+            if self._failure:
+                return now >= self._retry_at
+            if now >= self._wanted_until:
                 return False
             if self._evidence is None:
-                return not (self._failure and now < self._retry_at)
+                return True
             return bool(self._evidence["expires_mono"] - now < _RENEW_MARGIN_S)
 
     def _local(self) -> dict[str, Any] | None:
@@ -418,13 +422,17 @@ class HostQualification:
                 pass
             self._invalidate()
             now = time.monotonic()
-            if now >= self._wanted_until:
+            if self._failure:
+                # A failed probe withdrew this host's guest-kernel attestation.
+                # Going quiet now would claim without it, receive no Kata work,
+                # note no demand and never probe again, so a failure is retried
+                # on its backoff, with claims stopped, whether wanted or not.
+                if now < self._retry_at:
+                    raise SandboxError(self._failure)
+            elif now >= self._wanted_until:
                 # No turn has been claimed for a while. Booting a VM to keep a
                 # proof nobody uses is the cost this window exists to avoid.
-                self._failure, self._failures = "", 0
                 return False
-            if self._failure and now < self._retry_at:
-                raise SandboxError(self._failure)
             try:
                 self._qualify(local, path)
             except BaseException as exc:
