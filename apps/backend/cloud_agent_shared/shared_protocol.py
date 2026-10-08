@@ -86,6 +86,10 @@ PROFILING_POLICY_HEADER = "X-Agent-Profiling-Policy"
 #: the load the same page reports is for.
 HOST_CONCURRENCY_MIN_SLOTS = 2
 HOST_CONCURRENCY_MAX_SLOTS = 128
+#: The longest ``launch_error`` a heartbeat may carry. The control plane
+#: refuses a longer one together with the whole beat, so the host trims to it:
+#: a long explanation must never be what takes a host offline.
+HOST_LAUNCH_ERROR_MAX_CHARS = 500
 SHARED_DEPLOYMENT_CAPABILITY_PREFIX = "shared-sandbox-deployment:"
 ENV_DEPLOYMENT_SHA = "AGENT_DEPLOYMENT_SHA"
 #: Stored in the legacy-named ``sampler_version`` field for a current retained
