@@ -384,11 +384,13 @@ validate_retained_config() {
     || die "AGENT_CHAT_IDLE_TIMEOUT_S must be a positive number of seconds (got '$chat_idle_timeout')"
   # The runner would fall back to 1024 on anything else; refusing here means
   # an operator who raised it is not left on the default without noticing.
+  # Base 10 and at most five significant digits, so neither a leading zero
+  # (octal to Bash) nor an overlong value (wraps) decides differently from the
+  # runner's int().
   source_import_max="$(env_or_dotenv AGENT_SOURCE_IMPORT_MAX_MIB)"
   source_import_max="${source_import_max:-1024}"
-  [[ "$source_import_max" =~ ^[0-9]+$ \
-     && "$source_import_max" -ge 1 \
-     && "$source_import_max" -le 65536 ]] \
+  [[ "$source_import_max" =~ ^0*[1-9][0-9]{0,4}$ ]] \
+    && (( 10#$source_import_max <= 65536 )) \
     || die "AGENT_SOURCE_IMPORT_MAX_MIB must be a whole number of MiB from 1 through 65536 (got '$source_import_max')"
 
   # Docker DNS returns every container that claims an alias. If two relays use
