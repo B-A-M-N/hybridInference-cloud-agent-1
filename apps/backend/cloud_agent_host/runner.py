@@ -127,7 +127,10 @@ from cloud_agent_host.shared_protocol import (
 )
 from cloud_agent_host.source_archive import build_base_bundle, build_source_archive
 from cloud_agent_shared import operation_profiling
-from cloud_agent_shared.git.source_archive import build_upload_archive
+from cloud_agent_shared.git.source_archive import (
+    DEFAULT_MAX_SOURCE_ARCHIVE_BYTES,
+    build_upload_archive,
+)
 from cloud_agent_shared.shared_protocol import FORK_HELPER, mid_turn_input_capability
 
 DEFAULT_LEASE_TTL_S = 120.0
@@ -201,6 +204,12 @@ _REPO_SLUG = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 # The default remains GitHub. This is deliberately read only by the runner: a
 # job request cannot choose where the platform sends a repository credential.
 ENV_REPO_CLONE_BASE_URL = "AGENT_REPO_CLONE_BASE_URL"
+
+# This host's cap on one first-turn checkout: working tree plus the fetched
+# commit's Git objects, in MiB. Deployment configuration, never a job's choice.
+ENV_SOURCE_IMPORT_MAX_MIB = "AGENT_SOURCE_IMPORT_MAX_MIB"
+#: A typo guard, not a statement about any machine.
+MAX_SOURCE_IMPORT_MIB = 64 * 1024
 
 # Hermetic git for anything the *runner* runs: no user config, no hooks, no
 # credential helpers, no prompts.
@@ -973,6 +982,30 @@ def repo_clone_base_url(
     return base.rstrip("/")
 
 
+def source_import_max_bytes(env: dict[str, str] | None = None) -> int:
+    """Return this host's limit on one retained checkout import.
+
+    An unset, malformed or out-of-range value keeps the built-in limit rather
+    than failing every turn, as the host's other numeric settings do.
+    """
+    source = env if env is not None else os.environ
+    raw = (source.get(ENV_SOURCE_IMPORT_MAX_MIB) or "").strip()
+    if not raw:
+        return DEFAULT_MAX_SOURCE_ARCHIVE_BYTES
+    try:
+        mib = int(raw)
+    except ValueError:
+        mib = 0
+    if not 1 <= mib <= MAX_SOURCE_IMPORT_MIB:
+        print(
+            f"ignoring {ENV_SOURCE_IMPORT_MAX_MIB}={raw!r}: "
+            f"not a whole number of MiB from 1 through {MAX_SOURCE_IMPORT_MIB}",
+            file=sys.stderr,
+        )
+        return DEFAULT_MAX_SOURCE_ARCHIVE_BYTES
+    return mib * 1024 * 1024
+
+
 def checkout_output_branch(workdir: str, branch_id: str) -> str:
     """Put a fresh durable worktree on the publisher's local output branch."""
     branch = branch_name_for(branch_id)
@@ -1388,12 +1421,19 @@ def _prepare_retained_checkout(
             remote_base=repo_clone_base_url(clone_token=job.clone_token),
         )
         checkout_output_branch(source, job.thread_id)
-        archive = build_source_archive(
-            source,
-            uid=manager.backend.uid,
-            gid=manager.backend.gid,
-        )
-        manager.import_archive(spec, CHAT_WORKDIR, archive)
+        # Unnamed and outside the checkout: the archive is spooled to disk, not
+        # held in this process, and gone when the file is closed.
+        with tempfile.TemporaryFile(prefix="freeinference-source-", suffix=".tar") as archive:
+            build_source_archive(
+                source,
+                archive,
+                uid=manager.backend.uid,
+                gid=manager.backend.gid,
+                max_bytes=source_import_max_bytes(),
+            )
+            archive.flush()
+            archive.seek(0)
+            manager.import_archive(spec, CHAT_WORKDIR, archive)
     return base_sha
 
 
