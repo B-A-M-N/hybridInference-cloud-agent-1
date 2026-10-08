@@ -130,6 +130,26 @@ def test_third_party_services_keep_their_own_images() -> None:
     assert document["services"]["edge"]["image"] == "nginx:1.27.5-alpine"
 
 
+@pytest.mark.parametrize("artifact", [False, True])
+def test_kata_epoch_mount_is_host_wide_read_only_and_tracks_atomic_replacements(artifact):
+    document = rendered("host", None) if artifact else source("host")
+    mounts = document["services"]["runner"]["volumes"]
+    matches = [
+        item
+        for item in mounts
+        if isinstance(item, dict) and item.get("target") == "/run/agent-kata-runtime"
+    ]
+    assert matches == [
+        {
+            "type": "bind",
+            "source": "/var/lib/freeinference/kata-runtime",
+            "target": "/run/agent-kata-runtime",
+            "read_only": True,
+            "bind": {"create_host_path": True},
+        }
+    ]
+
+
 def test_supported_services_receive_the_opt_in_profiling_descriptor() -> None:
     """Values in a Compose .env are inert unless each producer passes them.
 

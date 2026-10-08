@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Any
 
 from cloud_agent_host.logging_utils import get_logger
 from cloud_agent_shared.host_settings import admin_values
+from cloud_agent_shared.shared_protocol import HOST_LAUNCH_ERROR_MAX_CHARS
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -350,7 +351,12 @@ def heartbeat(
         f"{base_url.rstrip('/')}/v1/agent/host/heartbeat",
         {
             "slots_total": slots_total,
-            "launch_error": launch_error,
+            # Trimmed rather than sent whole: the control plane refuses an
+            # overlong reason with the beat, and a host that cannot beat goes
+            # offline over its own explanation.
+            "launch_error": (
+                None if launch_error is None else launch_error[:HOST_LAUNCH_ERROR_MAX_CHARS]
+            ),
             "broker_url": broker_url,
             "capabilities": capabilities,
             "runner_version": runner_version,

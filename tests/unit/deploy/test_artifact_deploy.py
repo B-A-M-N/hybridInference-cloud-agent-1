@@ -112,6 +112,8 @@ elif a[:1] == ["pull"]:
     raise SystemExit(int(os.getenv("TEST_SANDBOX_PULL_EXIT", "0")))
 elif a[:1] == ["info"]:
     if "--format" in a: print("/var/lib/docker")
+elif a[:2] == ["image", "inspect"]:
+    print("sha256:" + "1" * 64)
 elif a[:1] == ["inspect"]:
     print(json.dumps([{"NetworkSettings": {"Networks": {
         "artifact-test-agent-relays": {"IPAddress": "172.24.0.2"}}}}]))
@@ -124,7 +126,10 @@ elif a[:1] == ["exec"]:
     elif "retained_docker_data_root" in command: print("/var/lib/docker")
     elif "AGENT_CONTROL_PLANE_URL" in command: print("200")
 elif a[:1] == ["run"]:
-    if a[-1] == "uname -r":
+    if a[-2:] == ["initialize", "--mounted"]:
+        sys.stdin.read()
+        raise SystemExit(int(os.getenv("TEST_EPOCH_EXIT", "0")))
+    elif a[-1] == "uname -r":
         if os.getenv("TEST_BAD_KATA") == "1": print(os.uname().release)
         else: print("isolated-guest-kernel")
     else: print("200", end="")
@@ -196,6 +201,8 @@ def deployment(tmp_path: Path, stack: str, *, real_compose: bool = False) -> tup
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
+    kata_root = tmp_path / "kata-root"
+    kata_root.mkdir()
     executable(fake_bin / "docker", f"#!{sys.executable}\n{DOCKER}")
     executable(fake_bin / "git", '#!/bin/sh\necho "git was invoked" >&2\nexit 93\n')
     executable(fake_bin / "curl", '#!/bin/sh\nprintf "%s\\n" "$*" >> "$TEST_CURL_LOG"\n')
@@ -218,6 +225,7 @@ def deployment(tmp_path: Path, stack: str, *, real_compose: bool = False) -> tup
             "TEST_COMMAND_LOG": str(tmp_path / "commands.jsonl"),
             "TEST_CURL_LOG": str(tmp_path / "curl.log"),
             "KATA_SETUP_SCRIPT": str(fake_bin / "kata-check"),
+            "KATA_EXTRACT_ROOT": str(kata_root),
             "HEALTH_TIMEOUT": "1",
             "SHARED_READY_TIMEOUT": "1",
         }
@@ -332,6 +340,27 @@ def test_host_requires_real_isolation_before_draining(tmp_path: Path):
     assert result.returncode != 0
     assert "NOT" in result.stderr and "VM-isolated" in result.stderr
     assert all("stop" not in c["args"] for c in calls)
+
+
+def test_host_epoch_initialization_failure_keeps_the_serving_generation(tmp_path: Path):
+    script, env = deployment(tmp_path, "host")
+    env["TEST_EPOCH_EXIT"] = "19"
+    result, calls = run(script, env)
+    assert result.returncode != 0
+    assert "Kata epoch initialization failed" in result.stderr
+    assert all("stop" not in c["args"] and "up" not in c["args"] for c in calls)
+    assert (
+        Path(env["DEPLOY_ROOT"]) / ".shared-live-ready"
+    ).read_text().strip() == "previous-generation"
+    initializer = next(c["args"] for c in calls if c["args"][-2:] == ["initialize", "--mounted"])
+    assert initializer[initializer.index("--network") + 1] == "none"
+    assert initializer[initializer.index("--runtime") + 1] == "runc"
+    assert initializer[initializer.index("--cap-drop") + 1] == "ALL"
+    assert initializer.count("-v") == 1
+    assert initializer[initializer.index("-v") + 1].endswith(
+        "/var/lib/freeinference/kata-runtime:/run/agent-kata-runtime"
+    )
+    assert "sha256:" + "1" * 64 in initializer
 
 
 def test_artifact_host_refuses_a_stray_even_with_the_legacy_override(tmp_path: Path):

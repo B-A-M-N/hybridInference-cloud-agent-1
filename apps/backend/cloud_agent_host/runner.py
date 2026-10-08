@@ -97,6 +97,7 @@ from cloud_agent_host.patch_gate import branch_name_for
 from cloud_agent_host.profiling_policy import ProfilingPolicySync
 from cloud_agent_host.resident_transport import ResidentLaunch
 from cloud_agent_host.resources import shared_member_resource_rollup
+from cloud_agent_host.runtime_qualification import VERDICT_KEY, HostQualification, adopt_verdict
 from cloud_agent_host.runtime_settings import RuntimeSettings
 from cloud_agent_host.runtimes import (
     AgentRuntime,
@@ -3059,6 +3060,7 @@ def _spawn_turn(
     lease_ttl: float,
     agent_timeout_s: float,
     host: str,
+    qualification: HostQualification | None = None,
 ) -> LaunchResult:
     """Start a child for one claimed turn and find out whether it took it.
 
@@ -3076,6 +3078,12 @@ def _spawn_turn(
     alive is not evidence of anything — the turn stays claimed and its lease
     remains the backstop.
     """
+    child = _child_turn_payload(payload)
+    verdict = qualification.verdict() if qualification is not None else None
+    if verdict is not None:
+        # Added after the claim's own underscore keys were stripped: only this
+        # host, which proved the runtime itself, can spare the child the probe.
+        child[VERDICT_KEY] = verdict
     read_fd, write_fd = os.pipe()
     argv = [
         sys.executable,
@@ -3117,7 +3125,7 @@ def _spawn_turn(
         # Most underscore-prefixed keys are parent bookkeeping. Profiling is
         # the one intentional child handoff: stripping it makes the deployed
         # multi-process path silently measure nothing.
-        process.stdin.write(encode_turn(_child_turn_payload(payload)))
+        process.stdin.write(encode_turn(child))
         process.stdin.close()
     except OSError as exc:
         os.close(read_fd)
@@ -3179,38 +3187,57 @@ def _serve_turn(
     process could fail at without consequence belongs above the answer, and
     everything a user or an operator could notice belongs below it.
 
-    Preflight is above it for exactly that reason. It observes Docker, the
-    image and the network and changes nothing, so failing it means the turn
-    has not begun — and answering first would instead strand that turn behind
+    Preflight is above it for exactly that reason. It checks Docker, the
+    image and the network without running the turn, so failing it means the
+    turn has not begun — and answering first would instead strand that turn behind
     a lease it will never use, having spent one of its attempts.
     """
     # Drained first, and before anything slow, so the host is never left
     # blocked writing a long prompt into a pipe this process has not read yet.
     raw = sys.stdin.read()
+    # Recover only the parent's optional timing selection before preflight.
+    # This does not accept the turn or reserve a slot: declined children
+    # discard their timing without emitting, and the host retains its budget.
+    # Malformed measurement metadata must never prevent the actual probe or
+    # the turn; it merely leaves this child unmeasured.
+    payload = None
+    measurement = None
+    with contextlib.suppress(Exception):
+        payload = decode_turn(raw)
+        if payload is not None:
+            measurement = operation_profiling.attach_selection(payload.get("_profiling"))
 
-    # Then the read-only probe of Docker, the image and the network. It runs
-    # before the payload is even looked at so that a turn process started with
-    # nothing on its input still proves this machine could have run one, which
-    # is what the deployment check needs of it.
+    # Empty or undecodable input always exercises the full deployment canary.
+    # A real turn may carry the host's runtime verdict, so the child repeats
+    # only what can change between turns: the update marker and the network.
+    operation_profiling.mark(measurement, "preflight")
     try:
-        backend = build_backend_from_env()
-        backend.preflight()
+        with operation_profiling.span(measurement, "preflight"):
+            backend = build_backend_from_env()
+            verdict = payload.get(VERDICT_KEY) if payload is not None else None
+            if isinstance(backend, ContainerBackend) and adopt_verdict(backend, verdict):
+                backend.check_network()
+            else:
+                backend.preflight()
     except Exception as exc:
         # Non-zero: the deployment check reads this exit status, and an image
         # that cannot run turns has to fail a rollout rather than pass it. For
         # a real turn the host puts it straight back and, after a run of these,
         # stops claiming and says why — so a machine in this state costs the
         # queue nothing while somebody fixes it.
+        operation_profiling.discard(measurement)
         write_handover(handover_fd, f"{HANDOVER_DECLINED} {exc}")
         return 2
 
-    payload = decode_turn(raw)
+    operation_profiling.mark(measurement, "handover")
     if payload is None:
+        operation_profiling.discard(measurement)
         write_handover(handover_fd, f"{HANDOVER_DECLINED} no turn was delivered")
         return 0
     try:
         job = ClaimedJob.from_response(payload)
     except (KeyError, TypeError, ValueError) as exc:
+        operation_profiling.discard(measurement)
         write_handover(handover_fd, f"{HANDOVER_DECLINED} unusable turn ({type(exc).__name__})")
         return 0
 
@@ -3221,12 +3248,8 @@ def _serve_turn(
     # it did when a replica ran one job at a time.
     _drain_on_sigterm()
     write_handover(handover_fd, f"{HANDOVER_ACCEPTED} {job.job_id}")
-    # Everything worth measuring happens *below* the answer, so the selection
-    # the host made has to be reattached here and not before it: timing a turn
-    # this process then declines would report a startup that never ran. The
-    # slot belongs to the host, so an unusable selection simply means this
-    # child does not measure -- it never means the turn is refused.
-    measurement = operation_profiling.attach_selection(payload.get("_profiling"))
+    # Only an accepted turn can finish and deliver the inherited measurement,
+    # now including the preflight the user waited through before this answer.
     # The settings the parent resolved when it handed this turn over: an
     # admin's values over the host's own. Fixed for the turn from here, so a
     # change on the admin page applies to the next turn, never halfway
@@ -3280,7 +3303,17 @@ def run_forever(
     never creates or bind-mounts a host worktree.
     """
     backend = backend or build_backend_from_env()
-    backend.preflight()
+    # The host proves its runtime here, once, and its children inherit that
+    # verdict rather than each booting a probe guest of its own.
+    qualification = (
+        HostQualification(backend)
+        if isinstance(backend, ContainerBackend) and spawn_turn is None
+        else None
+    )
+    if qualification is not None and qualification.refresh():
+        qualification.backend.check_network()
+    else:
+        backend.preflight()
 
     checker = getattr(backend, "check_gateway_reachable", None)
     if checker is not None:
@@ -3329,6 +3362,7 @@ def run_forever(
             "configure AGENT_ENROLL_TOKEN or a persisted host credential"
         )
 
+    qualification_error = ""
     launch = spawn_turn or (
         lambda payload: _spawn_turn(
             payload,
@@ -3338,6 +3372,7 @@ def run_forever(
             lease_ttl=lease_ttl,
             agent_timeout_s=agent_timeout_s,
             host=host,
+            qualification=qualification,
         )
     )
     turns = TurnPool(launch=launch)
@@ -3403,7 +3438,7 @@ def run_forever(
         # the control plane admits claims against the lower of it and the
         # operator's number.
         slots_total=lambda: limit,
-        launch_error=lambda: turns.launch_error,
+        launch_error=lambda: qualification_error or turns.launch_error,
         capabilities=lambda: [
             *_shared_live_host_capabilities(backend, stamp),
             HOST_CONCURRENCY_CAPABILITY,
@@ -3522,9 +3557,35 @@ def run_forever(
                 # than up to an interval from now.
                 pool.wake()
 
-            if not pool.claimable or not turns.may_claim(limit):
+            if not pool.claimable:
                 time.sleep(idle_wait)
                 continue
+            if not turns.may_claim(limit):
+                # A freed local slot should be noticed promptly. This does
+                # not increase empty-queue polls or retry traffic to the API.
+                slot_wait = min(idle_wait, 1.0) if turns.running() >= limit else idle_wait
+                time.sleep(slot_wait)
+                continue
+            if qualification is not None:
+                try:
+                    qualification.refresh()
+                    stamp = qualification.backend.version_stamp()
+                except SandboxError as exc:
+                    # Reported once per reason. The retry already backs off
+                    # inside refresh(); a traceback and an extra beat on every
+                    # poll would only bury the first report.
+                    error = f"runtime qualification failed: {exc}"
+                    if error != qualification_error:
+                        qualification_error = error
+                        logger.warning("agent_runtime_qualification_failed", exc_info=True)
+                        pool.wake()
+                    time.sleep(idle_wait)
+                    continue
+                if qualification_error:
+                    qualification_error = ""
+                    pool.wake()
+            # Always gate claims after refreshing the image attestation. A
+            # cached invalid image must not prevent qualification of a repair.
             # Keep the old control plane safe during a parallel rollout. It
             # does not enforce this generation's exact-SHA attestation, so this
             # host stays idle until its own checks complete.
@@ -3597,8 +3658,11 @@ def run_forever(
             )
     except KeyboardInterrupt:
         immediate = True
-    turns.shutdown(immediate=immediate)
-    stop_all()
+    finally:
+        try:
+            turns.shutdown(immediate=immediate)
+        finally:
+            stop_all()
     return 0
 
 

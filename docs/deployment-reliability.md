@@ -22,6 +22,43 @@ pins. A failure leaves the old marker and runners alone. The checks on the
 actual replacement runners, relays and broker still run before mark-ready;
 their failure uses the existing recorded-generation recovery.
 
+The host service proves its Kata runtime itself, instead of every turn's child
+booting a probe guest of its own. It runs the full probe when it starts, again
+whenever the installer's root-owned epoch or the sandbox image changes, and at
+least every 30 minutes, which bounds how long a change made outside the
+installer can go unnoticed. A Docker restart restarts the runner with it, so the
+new process proves the runtime from the start. The installer marks its epoch
+`updating` before any runtime mutation and `ready` only after verification; an
+updating or malformed epoch blocks acceptance. Existing hosts initialize the
+epoch during deployment after their normal runtime check. A failed probe stops
+claims until one succeeds, is reported once, and is retried on a backoff of five
+seconds doubling to five minutes. Probe containers carry
+`org.freeinference.chat-probe-created`, so the broker never adopts one as an
+orphan chat; the next probe removes any its namespace abandoned over an hour ago.
+
+Each child receives the verdict inside the turn payload the host already writes
+to its standard input. The host adds it after the claim's own underscore keys
+are stripped, so a claim cannot supply one. The child reads the epoch again,
+declining while an update is in progress and probing for itself if the epoch
+changed, then verifies the current host network before accepting its turn. A
+missing epoch keeps the full per-turn preflight. No-payload deployment canaries
+always run the full probe. That probe reads the guest kernel from the same
+temporary container that exercises member isolation and observer delivery,
+avoiding a second VM boot.
+
+Network rule reads share a disposable helper; route reads keep their separate,
+capability-free helper. Group reconciliation reuses inspections only within
+one command, rereads after mutations and verifies the final bridge identity,
+membership and relay addresses. Every subsequent command still checks again.
+Unchanged guest hosts/resolver files avoid writes while retaining their file
+ownership, mode and symlink checks. Network policy and guard freshness remain
+unchanged. A full host checks for completed children every second; empty-queue
+polling retains its five-second interval.
+
+Selected startup measurements now attribute this work to a `preflight` stage;
+the total remains claim request to prompt dispatch, excluding queue wait and
+model response time. Declined children do not publish a successful startup.
+
 CI additionally runs the same candidate check on the real Kata host for
 reviewed commits on `dev`, before `CI Gate` can release the staging workflow.
 It builds uniquely tagged candidate images and never invokes Compose on the

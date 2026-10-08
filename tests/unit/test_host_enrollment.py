@@ -27,7 +27,9 @@ from typing import Any
 import pytest
 
 from cloud_agent import host_pool
+from cloud_agent.schemas import HostHeartbeatRequest
 from cloud_agent_host import enrollment, runner
+from cloud_agent_shared.shared_protocol import HOST_LAUNCH_ERROR_MAX_CHARS
 
 
 class _Response:
@@ -225,6 +227,36 @@ def test_every_status_this_module_writes_is_one_the_schema_allows() -> None:
     written = set(re.findall(r'status[^\n]*?["\'](\w+)["\'](?![:)\]])', source))
     unknown = written - set(host_pool.HOST_STATUSES)
     assert not unknown, f"statuses no schema row can carry: {sorted(unknown)}"
+
+
+def test_an_overlong_launch_error_is_trimmed_to_what_the_control_plane_accepts(monkeypatch) -> None:
+    """A long reason must not cost the host its heartbeat.
+
+    The control plane refuses a beat whose ``launch_error`` is longer than its
+    schema allows, and refuses the whole beat: the host then misses its
+    intervals, is marked offline and stops renewing its residencies, all over
+    the length of an explanation. A failing Kata probe's stderr is that long.
+    """
+    bodies: list[dict[str, Any]] = []
+
+    def record(url, body, bearer=""):
+        bodies.append(body)
+        return {"status": "online"}
+
+    monkeypatch.setattr(enrollment, "_post", record)
+    identity = enrollment.HostIdentity(host="h1", credential="c")
+
+    enrollment.heartbeat(base_url="http://cp", identity=identity, launch_error="x" * 2000)
+    enrollment.heartbeat(base_url="http://cp", identity=identity, launch_error="")
+    enrollment.heartbeat(base_url="http://cp", identity=identity)
+
+    trimmed = bodies[0]["launch_error"]
+    assert trimmed == "x" * HOST_LAUNCH_ERROR_MAX_CHARS
+    HostHeartbeatRequest(launch_error=trimmed)
+    with pytest.raises(ValueError, match="launch_error"):
+        HostHeartbeatRequest(launch_error=trimmed + "x")
+    assert bodies[1]["launch_error"] == "", "an empty report must still clear the stored reason"
+    assert bodies[2]["launch_error"] is None, "an unreported reason must stay unreported"
 
 
 def test_a_registration_without_a_status_claims_nothing_yet(credential_file, monkeypatch) -> None:

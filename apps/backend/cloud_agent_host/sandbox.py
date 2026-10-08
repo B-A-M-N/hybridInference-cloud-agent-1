@@ -699,10 +699,14 @@ class ContainerBackend(SandboxBackend):
 
         Retained chat workspaces live in Docker's writable layer, so this
         preflight deliberately has no host-path or bind-mount probe.
-        ``check_network=False`` is for the candidate check alone: it validates
-        an image and a kernel with no deployment around it, so there are no
-        host rules for it to install.
+        ``check_network=False`` validates only the runtime: candidate checks
+        have no deployment network, and host qualification leaves mutable
+        host rules for each child to verify before accepting its turn.
         """
+        if self.runtime == KATA_RUNTIME:
+            from cloud_agent_host.runtime_qualification import check_runtime_state
+
+            check_runtime_state()
         try:
             result = subprocess.run(
                 [self.docker_binary, "version", "--format", "{{.Server.Version}}"],
@@ -715,12 +719,18 @@ class ContainerBackend(SandboxBackend):
             raise SandboxError(f"{self.docker_binary} is not usable: {exc}") from exc
         if result.returncode != 0:
             raise SandboxError(f"{self.docker_binary} is not usable: {result.stderr.strip()[:200]}")
-        self._probe_kernel_boundary()
         if self.runtime == KATA_RUNTIME:
             # Import here: retained operations depend on these base primitives.
             from cloud_agent_host.chat_sandbox import ChatSandboxManager
 
-            ChatSandboxManager(self).probe_guest_observer()
+            # The observer probe already boots a fresh container with the
+            # production runtime and image. Observe its kernel too, instead
+            # of booting another microVM just to run uname.
+            self._kernel_probe = {"host_kernel": os.uname().release, "guest_kernel": None}
+            guest_kernel = ChatSandboxManager(self).probe_guest_observer()
+            self._kernel_probe["guest_kernel"] = self.validate_guest_kernel(guest_kernel)
+        else:
+            self._probe_kernel_boundary()
         if check_network:
             self._check_sandbox_network()
         if not self.is_vm_isolated:
@@ -777,16 +787,24 @@ class ContainerBackend(SandboxBackend):
             raise SandboxError(
                 f"sandbox runtime {self.runtime!r} returned no guest kernel from uname -r"
             )
-        guest_kernel = lines[-1]
-        host_kernel = str(self._kernel_probe["host_kernel"])
+        self._kernel_probe["guest_kernel"] = self.validate_guest_kernel(lines[-1])
+
+    def validate_guest_kernel(self, guest_kernel: object) -> str | None:
+        """Accept observed kernel evidence, never a missing or shared Kata kernel."""
+        if not isinstance(guest_kernel, str) or not guest_kernel.strip():
+            raise SandboxError(
+                f"sandbox runtime {self.runtime!r} returned no guest kernel from uname -r"
+            )
+        guest_kernel = guest_kernel.strip()
+        host_kernel = os.uname().release
         if guest_kernel == host_kernel:
             if self.runtime == KATA_RUNTIME:
                 raise SandboxError(
                     f"sandbox runtime {self.runtime!r} reported the host kernel "
                     f"{host_kernel!r}; refusing to claim VM isolation"
                 )
-            return
-        self._kernel_probe["guest_kernel"] = guest_kernel
+            return None
+        return guest_kernel
 
     def _kata_relay_host_args(self, network: str) -> list[str]:
         """Give disposable Kata probes the same fixed relay resolution as chats."""
@@ -800,6 +818,10 @@ class ContainerBackend(SandboxBackend):
             for alias, address in sorted(addresses.items())
             for part in ("--add-host", f"{alias}={address}")
         ]
+
+    def check_network(self) -> None:
+        """Revalidate mutable network state even when runtime evidence is inherited."""
+        self._check_sandbox_network()
 
     def _check_sandbox_network(self) -> None:
         """Refuse to accept work until this host enforces the sandbox network.

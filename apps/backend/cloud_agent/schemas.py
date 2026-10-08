@@ -57,6 +57,7 @@ from cloud_agent_shared.host_settings import (
 from cloud_agent_shared.shared_protocol import (
     HOST_CONCURRENCY_MAX_SLOTS,
     HOST_CONCURRENCY_MIN_SLOTS,
+    HOST_LAUNCH_ERROR_MAX_CHARS,
     SHARED_MEMBER_ACCOUNTING_VERSION,
 )
 
@@ -2781,7 +2782,7 @@ class HostHeartbeatRequest(BaseModel):
     slots_total: int | None = Field(None, gt=0, le=1024)
     launch_error: str | None = Field(
         None,
-        max_length=500,
+        max_length=HOST_LAUNCH_ERROR_MAX_CHARS,
         description=(
             "Why this host is claiming nothing despite having room. The empty "
             "string is a positive report that nothing is wrong and clears what "

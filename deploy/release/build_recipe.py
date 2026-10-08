@@ -69,6 +69,7 @@ RECIPE_FILES: tuple[str, ...] = (
     "deploy/host/docker-compose.sandbox.yml",
     "deploy/host/agent-gateway-tunnel.sh",
     "deploy/host/setup_kata_runtime.sh",
+    "deploy/host/kata_runtime_epoch.py",
     "deploy/host/.env.example",
     "deploy/reverse-proxy/agents-under-gateway.conf",
     "deploy/release/artifact_compose.py",
