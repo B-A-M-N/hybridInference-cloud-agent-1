@@ -31,6 +31,15 @@ root-owned epoch `updating` before any runtime mutation and `ready` only after
 verification; an updating or malformed epoch blocks acceptance. Existing hosts
 initialize the epoch during deployment after their normal runtime check.
 
+The proof is renewed only while turns are being claimed: each claim keeps it
+fresh for the next ten minutes, renewing it 15 seconds before expiry, including
+while every slot is busy. Past that window an idle host lets it lapse instead of
+booting a probe VM every minute, and the next turn runs its own full preflight,
+which reopens the window. A deployment still marked `pending:<sha>` has no proof
+and reports no failure; the readiness gate waits it out. A failed qualification
+stops claims, is reported once, and is probed again only after a backoff of
+five seconds doubling to five minutes.
+
 Each child obtains evidence through a private inherited socket, checks its
 configuration and the proof's five-second handoff lifetime, then verifies the
 current host network before accepting its turn. Claims cannot supply a proof.
@@ -46,7 +55,7 @@ membership and relay addresses. Every subsequent command still checks again.
 Unchanged guest hosts/resolver files avoid writes while retaining their file
 ownership, mode and symlink checks. Network policy and guard freshness remain
 unchanged. A full host checks for completed children every second; empty-queue
-polling and failure backoff retain their five-second intervals.
+polling retains its five-second interval.
 
 Selected startup measurements now attribute this work to a `preflight` stage;
 the total remains claim request to prompt dispatch, excluding queue wait and

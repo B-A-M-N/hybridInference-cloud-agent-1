@@ -350,6 +350,79 @@ def test_expiry_between_refresh_and_handoff_requests_full_child_probe(lab):
     assert lab.probes == ["probe"]
 
 
+def test_an_idle_host_lets_its_proof_lapse_instead_of_booting_a_probe(lab):
+    """A probe VM every minute for a proof nobody uses is the cost being avoided."""
+    assert lab.authority.refresh()
+    lab.authority._wanted_until = time.monotonic() - 1
+    assert lab.authority.refresh(), "a proof that is still current keeps serving"
+    lab.authority._evidence["expires_mono"] = time.monotonic() - 1
+    assert lab.authority.refresh() is False
+    assert _request(lab) is False, "the next turn runs its own full preflight"
+    assert lab.probes == ["probe"]
+    lab.authority.note_demand()
+    assert lab.authority.refresh()
+    assert lab.probes == ["probe", "probe"]
+
+
+def test_a_proof_is_renewed_before_it_could_expire_during_a_handoff(lab):
+    assert lab.authority.refresh()
+    assert not lab.authority.renewal_due()
+    lab.authority._evidence["expires_mono"] = time.monotonic() + qualification._RENEW_MARGIN_S - 1
+    assert lab.authority.renewal_due()
+    assert lab.authority.refresh()
+    assert lab.probes == ["probe", "probe"]
+    assert not lab.authority.renewal_due()
+    lab.authority._evidence["expires_mono"] = time.monotonic() + qualification._HANDOFF_TTL_S - 1
+    assert _request(lab) is False, "a proof that could lapse mid-handoff is not handed over"
+    assert lab.authority.renewal_due(), "the dropped proof is renewed before the next claim"
+    lab.authority._wanted_until = time.monotonic() - 1
+    assert not lab.authority.renewal_due(), "an idle host is never due"
+
+
+def test_a_failing_qualification_backs_off_instead_of_probing_every_poll(lab, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(qualification.time, "monotonic", lambda: clock[0])
+    lab.authority.note_demand()
+    failing = [True]
+
+    def preflight(*, check_network):
+        lab.probes.append("probe")
+        lab.backend._kernel_probe = {"host_kernel": os.uname().release, "guest_kernel": "guest"}
+        if failing[0]:
+            raise SandboxError("observer self-test failed")
+
+    monkeypatch.setattr(lab.backend, "preflight", preflight)
+    for _ in range(3):
+        with pytest.raises(SandboxError, match="self-test"):
+            lab.authority.refresh()
+    assert lab.probes == ["probe"], "a failed probe is not repeated inside its backoff"
+    clock[0] += qualification.LAUNCH_BACKOFF_S
+    with pytest.raises(SandboxError, match="self-test"):
+        lab.authority.refresh()
+    assert lab.probes == ["probe", "probe"]
+    clock[0] += qualification.LAUNCH_BACKOFF_S
+    with pytest.raises(SandboxError, match="self-test"):
+        lab.authority.refresh()
+    assert lab.probes == ["probe", "probe"], "each failure doubles the wait"
+    clock[0] += qualification.LAUNCH_BACKOFF_S
+    failing[0] = False
+    assert lab.authority.refresh()
+    assert lab.probes == ["probe", "probe", "probe"]
+    assert _request(lab), "a recovered runtime is reused at once"
+
+
+def test_a_deployment_that_is_not_published_yet_is_not_a_failure(lab):
+    """Every rollout spends a while on ``pending:<sha>``; the claim gate waits it out."""
+    lab.ready.write_text("pending:deployment-a")
+    assert lab.authority.refresh() is False
+    assert not lab.authority.renewal_due(), "a full host must not poll Docker for nothing"
+    assert _request(lab) is False
+    assert not lab.probes
+    lab.ready.write_text("deployment-a")
+    assert lab.authority.refresh()
+    assert lab.probes == ["probe"]
+
+
 def test_partial_messages_cannot_restart_the_handover_deadline(monkeypatch):
     elapsed = [0.0]
     timeouts = []

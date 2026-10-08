@@ -3585,26 +3585,34 @@ def run_forever(
             if not pool.claimable:
                 time.sleep(idle_wait)
                 continue
-            if not turns.may_claim(limit):
-                # A freed local slot should be noticed promptly. This does
-                # not increase empty-queue polls or retry traffic to the API.
-                slot_wait = min(idle_wait, 1.0) if turns.running() >= limit else idle_wait
-                time.sleep(slot_wait)
-                continue
-            if qualification is not None:
+            may_claim = turns.may_claim(limit)
+            # A host with no free slot renews only as its proof nears expiry,
+            # so the slot that frees next is not kept waiting by a probe.
+            if qualification is not None and (may_claim or qualification.renewal_due()):
                 try:
                     qualification.refresh()
                     assert isinstance(backend, ContainerBackend)
                     stamp = backend.version_stamp()
                 except SandboxError as exc:
-                    qualification_error = f"runtime qualification failed: {exc}"
-                    logger.warning("agent_runtime_qualification_failed", exc_info=True)
-                    pool.wake()
+                    # Reported once per reason. The retry already backs off
+                    # inside refresh(); a traceback and an extra beat on every
+                    # poll would only bury the first report.
+                    error = f"runtime qualification failed: {exc}"
+                    if error != qualification_error:
+                        qualification_error = error
+                        logger.warning("agent_runtime_qualification_failed", exc_info=True)
+                        pool.wake()
                     time.sleep(idle_wait)
                     continue
                 if qualification_error:
                     qualification_error = ""
                     pool.wake()
+            if not may_claim:
+                # A freed local slot should be noticed promptly. This does
+                # not increase empty-queue polls or retry traffic to the API.
+                slot_wait = min(idle_wait, 1.0) if turns.running() >= limit else idle_wait
+                time.sleep(slot_wait)
+                continue
             # Always gate claims after refreshing the image attestation. A
             # cached invalid image must not prevent qualification of a repair.
             # Keep the old control plane safe during a parallel rollout. It
@@ -3669,6 +3677,10 @@ def run_forever(
                 time.sleep(idle_wait)
                 continue
 
+            if qualification is not None:
+                # Turns arrive in conversations: keep the proof fresh for the
+                # ones likely to follow this, and let it lapse once they stop.
+                qualification.note_demand()
             _hand_over_turn(
                 payload,
                 turns=turns,

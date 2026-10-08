@@ -444,6 +444,12 @@ def test_runtime_qualification_failure_pauses_claims_until_recovered(service, mo
                 raise SandboxError("runtime updating")
             return True
 
+        def renewal_due(self):
+            return False
+
+        def note_demand(self):
+            pass
+
         def close(self):
             events.append("close")
 
@@ -478,6 +484,101 @@ def test_runtime_qualification_failure_pauses_claims_until_recovered(service, mo
         == 0
     )
     assert events == ["refresh", "backoff", "refresh", "claim", "launch", "close"]
+
+
+def test_a_persisting_qualification_failure_is_reported_once(service, monkeypatch):
+    """The retry backs off inside the qualification; the loop must not add noise.
+
+    A traceback and a forced heartbeat on every poll buried the first report
+    under copies of itself, for as long as the runtime stayed broken.
+    """
+    from cloud_agent_host.sandbox import ContainerBackend, SandboxError
+
+    backend = ContainerBackend(image="sandbox")
+    monkeypatch.setattr(backend, "preflight", lambda: None)
+    monkeypatch.setattr(backend, "version_stamp", lambda: {})
+    monkeypatch.setattr(backend, "check_gateway_reachable", lambda _url: None)
+    warnings: list[str] = []
+
+    class Qualification:
+        calls = 0
+
+        def refresh(self):
+            self.calls += 1
+            if self.calls <= 3:
+                raise SandboxError("observer self-test failed")
+            return True
+
+        def renewal_due(self):
+            return False
+
+        def note_demand(self):
+            pass
+
+        def close(self):
+            pass
+
+    def claim(**_kwargs):
+        runner_mod._STOPPING.set()
+
+    monkeypatch.setattr(runner_mod, "HostQualification", lambda *a, **k: Qualification())
+    monkeypatch.setattr(runner_mod.logger, "warning", lambda event, *a, **k: warnings.append(event))
+    monkeypatch.setattr(runner_mod, "claim_payload", claim)
+    assert (
+        runner_mod.run_forever(
+            base_url="http://control", worker_id="runner-a", backend=backend, host="host-a"
+        )
+        == 0
+    )
+    assert warnings.count("agent_runtime_qualification_failed") == 1
+    assert FakeHeartbeat.last.wakes == 2, "one beat reports the failure and one clears it"
+
+
+def test_a_full_host_renews_its_proof_before_a_slot_frees(service, monkeypatch):
+    """Without this, the first claim after a long full stretch always waited for a probe."""
+    from cloud_agent_host.sandbox import ContainerBackend
+
+    backend = ContainerBackend(image="sandbox")
+    monkeypatch.setattr(backend, "preflight", lambda: None)
+    monkeypatch.setattr(backend, "version_stamp", lambda: {})
+    monkeypatch.setattr(backend, "check_gateway_reachable", lambda _url: None)
+    launched: list[FakeHandle] = []
+    events: list[tuple[str, int]] = []
+
+    class Qualification:
+        due_checks = 0
+
+        def refresh(self):
+            events.append(("refresh", len(launched)))
+            return True
+
+        def renewal_due(self):
+            self.due_checks += 1
+            return self.due_checks == 2
+
+        def note_demand(self):
+            events.append(("demand", len(launched)))
+
+        def close(self):
+            pass
+
+    def spawn(_payload, **_kwargs):
+        launched.append(FakeHandle())
+        return LaunchResult(LAUNCH_STARTED, launched[-1])
+
+    monkeypatch.setattr(runner_mod, "HostQualification", lambda *a, **k: Qualification())
+    monkeypatch.setattr(runner_mod, "claim_payload", lambda **_k: _job(len(launched)))
+    monkeypatch.setattr(runner_mod, "_spawn_turn", spawn)
+    assert (
+        runner_mod.run_forever(
+            base_url="http://control", worker_id="runner-a", backend=backend, host="host-a"
+        )
+        == 0
+    )
+    assert [n for event, n in events if event == "demand"] == [0, 1, 2], "each claim is demand"
+    assert [n for event, n in events if event == "refresh"] == [0, 1, 2, 3], (
+        "a full host renews once, when renewal falls due, and never polls Docker otherwise"
+    )
 
 
 @pytest.mark.parametrize("full", [False, True])
@@ -532,6 +633,12 @@ def test_repaired_image_is_refreshed_but_claims_always_require_current_attestati
             self.calls += 1
             events.append("refresh")
             return reusable
+
+        def renewal_due(self):
+            return False
+
+        def note_demand(self):
+            pass
 
         def close(self):
             events.append("close")
