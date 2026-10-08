@@ -360,7 +360,7 @@ validate_retained_config() {
   [[ "$storage_probe" == "overlay_root" || "$storage_probe" == "off" ]] \
     || die "AGENT_HOST_STORAGE_PROBE must be 'overlay_root' or 'off' (got '$storage_probe')"
 
-  local slots resident_capacity chat_idle_timeout
+  local slots resident_capacity chat_idle_timeout source_import_max
   # The limit this host serves until an admin sets one. The Servers page sets
   # size afterwards; this only has to be a valid starting point. Two is the
   # shared-live floor and 128 the pool's own ceiling.
@@ -382,6 +382,14 @@ validate_retained_config() {
   [[ "$chat_idle_timeout" =~ ^[0-9]+([.][0-9]+)?$ \
      ]] && awk -v value="$chat_idle_timeout" 'BEGIN { exit !(value > 0) }' \
     || die "AGENT_CHAT_IDLE_TIMEOUT_S must be a positive number of seconds (got '$chat_idle_timeout')"
+  # The runner would fall back to 1024 on anything else; refusing here means
+  # an operator who raised it is not left on the default without noticing.
+  source_import_max="$(env_or_dotenv AGENT_SOURCE_IMPORT_MAX_MIB)"
+  source_import_max="${source_import_max:-1024}"
+  [[ "$source_import_max" =~ ^[0-9]+$ \
+     && "$source_import_max" -ge 1 \
+     && "$source_import_max" -le 65536 ]] \
+    || die "AGENT_SOURCE_IMPORT_MAX_MIB must be a whole number of MiB from 1 through 65536 (got '$source_import_max')"
 
   # Docker DNS returns every container that claims an alias. If two relays use
   # one name, requests are round-robined to services that listen on different

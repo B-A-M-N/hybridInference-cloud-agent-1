@@ -10,6 +10,7 @@ import pytest
 
 from cloud_agent_host.chat_sandbox import (
     ACTIVATION_TMPFS,
+    ARCHIVE_IMPORT_TIMEOUT_PER_GIB_S,
     CHAT_BOOTSTRAP_NETWORK,
     CHAT_IMAGE_DIGEST_LABEL,
     CHAT_NAMESPACE_LABEL,
@@ -1191,6 +1192,43 @@ def test_base_bundle_import_uses_activation_tmpfs_and_preserves_git_state(monkey
     assert "git reset" not in command[-4]
     assert "git checkout" not in command[-4]
     assert command[-3:] == ["sh", commit, f"{commit}^{{commit}}"]
+
+
+def test_archive_import_streams_a_file_to_docker_cp(monkeypatch, tmp_path):
+    spec = _spec()
+    manager = ChatSandboxManager(ContainerBackend(image="img"))
+    payload = _inspect_payload(spec, status="running", running=True)
+    calls: list[tuple[list[str], dict]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        if argv[1:3] == ["container", "inspect"]:
+            return SimpleNamespace(returncode=0, stdout=payload, stderr="")
+        if argv[1] == "cp":
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr("cloud_agent_host.chat_sandbox.subprocess.run", fake_run)
+    archive_path = tmp_path / "checkout.tar"
+    archive_path.write_bytes(b"\0" * 1024)
+    # Sparse, so the test asserts the timeout for a 3 GiB archive without
+    # writing one.
+    with archive_path.open("r+b") as archive:
+        archive.truncate(3 << 30)
+        manager.import_archive(spec, CHAT_WORKDIR, archive)
+
+        command, kwargs = calls[-1]
+        assert command[-2:] == ["-", f"{spec.container_name}:{CHAT_WORKDIR}"]
+        assert kwargs["stdin"] is archive
+        assert kwargs["input"] is None
+        assert kwargs["timeout"] == 3 * ARCHIVE_IMPORT_TIMEOUT_PER_GIB_S
+
+    manager.import_archive(spec, CHAT_WORKDIR, b"small tar")
+
+    _command, kwargs = calls[-1]
+    assert kwargs["input"] == b"small tar"
+    assert kwargs["stdin"] is None
+    assert kwargs["timeout"] == ARCHIVE_IMPORT_TIMEOUT_PER_GIB_S
 
 
 def test_retained_backend_reports_the_cli_version_pinned_in_its_container(monkeypatch):

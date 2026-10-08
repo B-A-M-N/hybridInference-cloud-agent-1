@@ -63,6 +63,7 @@ from cloud_agent_shared.operation_profiling import StageObserver, substage
 if TYPE_CHECKING:
     import builtins
     from collections.abc import Iterator, Sequence
+    from typing import BinaryIO
 
     from cloud_agent_shared.egress import SandboxNetwork
 
@@ -115,6 +116,10 @@ CHAT_WORKDIR = "/workspace"
 #: request. Root-owned and read-only to the sandbox — see
 #: ``build_upload_archive``, and the Dockerfile that creates the directory.
 CHAT_UPLOADS_DIR = "/uploads"
+#: ``docker cp`` time allowed per GiB of an imported archive, and the floor for
+#: a smaller one: the two minutes a 1 GiB checkout always had, kept in step with
+#: a host that raised its source import limit.
+ARCHIVE_IMPORT_TIMEOUT_PER_GIB_S = 120.0
 CHAT_STATE_DIR = "/agent-state"
 ACTIVATION_TMPFS = "/run/agent-activation"
 MEMBER_TMPFS_ROOT = "/run/agent-members"
@@ -3481,10 +3486,20 @@ class ChatSandboxManager:
             )
         return result.stdout
 
-    def import_archive(self, spec: ChatSandboxSpec, path: str, archive: bytes) -> None:
-        """Write a validated caller-provided tar through Docker's archive boundary."""
+    def import_archive(self, spec: ChatSandboxSpec, path: str, archive: bytes | BinaryIO) -> None:
+        """Write a validated caller-provided tar through Docker's archive boundary.
+
+        ``archive`` is the tar itself or a real file positioned at its start. A
+        file becomes ``docker cp``'s standard input, so a large checkout is never
+        read into this process.
+        """
         self._require(spec)
         self._validate_container_path(path)
+        if isinstance(archive, bytes):
+            size, input_bytes, stdin = len(archive), archive, None
+        else:
+            size = os.fstat(archive.fileno()).st_size - archive.tell()
+            input_bytes, stdin = None, archive
         result = self._run_bytes(
             [
                 self.backend.docker_binary,
@@ -3492,8 +3507,9 @@ class ChatSandboxManager:
                 "-",
                 f"{spec.container_name}:{path}",
             ],
-            timeout=120,
-            input_bytes=archive,
+            timeout=ARCHIVE_IMPORT_TIMEOUT_PER_GIB_S * max(1.0, size / (1 << 30)),
+            input_bytes=input_bytes,
+            stdin=stdin,
         )
         if result.returncode != 0:
             raise SandboxError(
@@ -3610,13 +3626,18 @@ class ChatSandboxManager:
 
     @staticmethod
     def _run_bytes(
-        argv: builtins.list[str], *, timeout: float, input_bytes: bytes | None = None
+        argv: builtins.list[str],
+        *,
+        timeout: float,
+        input_bytes: bytes | None = None,
+        stdin: BinaryIO | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
         try:
             return subprocess.run(
                 argv,
                 env={**os.environ},
                 input=input_bytes,
+                stdin=stdin,
                 capture_output=True,
                 timeout=timeout,
                 check=False,

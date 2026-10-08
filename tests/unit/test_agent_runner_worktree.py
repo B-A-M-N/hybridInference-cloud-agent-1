@@ -15,7 +15,9 @@ from cloud_agent_host.runner import (
     checkout_output_branch,
     prepare_worktree,
     repo_clone_base_url,
+    source_import_max_bytes,
 )
+from cloud_agent_shared.git.source_archive import DEFAULT_MAX_SOURCE_ARCHIVE_BYTES
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -46,6 +48,20 @@ def test_clone_origin_defaults_to_github_and_accepts_a_local_git_service():
         repo_clone_base_url({"AGENT_REPO_CLONE_BASE_URL": "git://local-repo/"})
         == "git://local-repo"
     )
+
+
+def test_source_import_limit_is_a_host_setting_in_mib():
+    assert source_import_max_bytes({}) == DEFAULT_MAX_SOURCE_ARCHIVE_BYTES
+    assert source_import_max_bytes({"AGENT_SOURCE_IMPORT_MAX_MIB": " 4096 "}) == 4096 << 20
+
+
+@pytest.mark.parametrize("raw", ["4G", "1.5", "0", "-1", "65537"])
+def test_source_import_limit_keeps_the_default_for_an_unusable_value(raw, capsys):
+    assert (
+        source_import_max_bytes({"AGENT_SOURCE_IMPORT_MAX_MIB": raw})
+        == DEFAULT_MAX_SOURCE_ARCHIVE_BYTES
+    )
+    assert "ignoring AGENT_SOURCE_IMPORT_MAX_MIB" in capsys.readouterr().err
 
 
 def test_clone_origin_never_sends_a_credential_over_plaintext():
