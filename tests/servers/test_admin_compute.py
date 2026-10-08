@@ -423,8 +423,8 @@ async def test_concurrent_setup_selection_recovers_duplicate_before_capacity_ref
     commands = app.state.compute_commands
     configure = commands._configuration
     allocate = repo.create_allocation_operation
-    both_requests_entered = asyncio.Event()
     first_request_entered = asyncio.Event()
+    both_requests_entered = asyncio.Event()
     first_allocated = asyncio.Event()
     entered = 0
 
@@ -455,17 +455,16 @@ async def test_concurrent_setup_selection_recovers_duplicate_before_capacity_ref
     }
     second_body = {**body, "name": "Changed"} if changed_input else body
 
-    async def second_request():
-        # Authentication may schedule the HTTP requests in either order.
-        # Fix which body reaches the barrier first while retaining the
-        # overlap before allocation that this regression must exercise.
+    async def submit_second_request():
+        # HTTP dependencies can reorder requests before they reach the command.
+        # Start the duplicate only once the original is blocked in configuration.
         await first_request_entered.wait()
         return await client.post("/admin/agent/servers", headers=ADMIN, json=second_body)
 
     first, second = await asyncio.wait_for(
         asyncio.gather(
             client.post("/admin/agent/servers", headers=ADMIN, json=body),
-            second_request(),
+            submit_second_request(),
         ),
         timeout=5,
     )
