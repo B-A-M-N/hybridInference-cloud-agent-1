@@ -1610,6 +1610,26 @@ can carry — the CPU and memory on the same page are. The saved number survives
 heartbeats, restarts and re-enrolment: it is a decision about the named
 machine, and only _Host default_ returns it to the environment.
 
+**Runtime settings are set from the admin page too.** The turn time limit,
+the idle-sandbox stop, the repository import limit, chats per sandbox and the
+three terminal limits sit in the _Runtime settings_ card below _Harness
+version_, once for every server, and in each server's _Details_ band for that
+server alone; the API is `PUT /admin/agent/host-settings` and
+`PUT /admin/agent/runner-hosts/<host>/settings` with
+`{"settings": {"<key>": N}}`, where `null` clears a key. A server's own value
+wins over the global one, and a setting set in neither place keeps the host's
+`.env` value or built-in default — `ENVIRONMENT.md` §_Runtime settings from the
+admin page_ lists the precedence and the variables. They ride the heartbeat
+answer like the slot limit, so nothing is redeployed, and the same rule holds:
+saving is not applying. Each host reports what it applies, the runner's share
+as it hands each turn over and the workspace broker's as the broker confirms
+it, and the page shows _applying_ until the report matches. Nothing running is
+cut short: a turn keeps the time limit it started with, an existing sandbox
+keeps the chat capacity built into it, and a shortened terminal lifetime
+closes terminals already past it on the broker's next sweep. A runner that
+does not advertise `host-settings-v1` keeps its `.env` values until it is
+redeployed.
+
 **A turn that never started goes back to the queue; one that started does
 not.** When the host cannot start a turn's process, or that process exits
 without taking delivery, the turn provably never began and the host returns it

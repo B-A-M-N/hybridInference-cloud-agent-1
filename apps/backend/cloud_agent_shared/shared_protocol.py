@@ -27,6 +27,11 @@ HOST_CONCURRENCY_CAPABILITY = "host-concurrency-v1"
 #: not answered yet, because the two need different fixes: a redeploy and a
 #: network, respectively.
 PROFILING_CONTROL_CAPABILITY = "operation-profiling-control-v1"
+#: Advertised by a runner that applies the runtime settings an admin sets on
+#: the Servers page (``cloud_agent_shared.host_settings``) from its heartbeat
+#: answer and reports back what it applied. A host without it keeps the values
+#: in its ``.env`` until it is redeployed, and the page says so.
+HOST_SETTINGS_CAPABILITY = "host-settings-v1"
 #: Advertised once per runtime by a host whose broker can hand a message to a
 #: running turn of that runtime (``POST /shared-sandboxes/{thread}/input``).
 #: Per runtime because each CLI takes mid-turn input through its own channel,

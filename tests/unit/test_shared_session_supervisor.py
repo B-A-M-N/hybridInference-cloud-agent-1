@@ -482,6 +482,22 @@ def test_invalid_terminal_close_keeps_reference_for_a_valid_retry():
     assert closed.idle_deadline_monotonic == 120.0
 
 
+def test_a_changed_idle_timeout_arms_the_next_quiet_moment_with_the_new_value():
+    manager = _Manager()
+    supervisor = SharedChatSessionSupervisor(manager, idle_timeout_s=30, clock=lambda: 100.0)
+    supervisor.register_manifest(_spec(), _members())
+    token, _ = supervisor.terminal_opened("athr_source")
+
+    supervisor.set_idle_timeout_s(600)
+    closed = supervisor.terminal_closed("athr_source", token, last_activity_monotonic=90.0)
+
+    assert supervisor.idle_timeout_s == 600
+    assert closed.idle_deadline_monotonic == 690.0
+    with pytest.raises(ValueError, match="must be positive"):
+        supervisor.set_idle_timeout_s(0)
+    assert supervisor.idle_timeout_s == 600
+
+
 def test_native_fork_journal_uses_the_docker_layer_owner_not_capabilityless_root():
     class JournalManager:
         def __init__(self) -> None:

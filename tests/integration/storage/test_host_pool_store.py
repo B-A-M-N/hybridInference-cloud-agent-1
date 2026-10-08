@@ -941,6 +941,110 @@ async def test_the_schema_refuses_a_non_positive_request(db, store, hosts):
             )
 
 
+async def test_global_host_settings_change_one_key_at_a_time(
+    store, hosts: PostgresHostPoolRepository
+):
+    """Setting one value leaves the others; None clears only the one named."""
+    assert await hosts.host_settings() == {}
+
+    assert await hosts.set_host_settings(changes={"agent_timeout_s": 7200}) == {}
+    previous = await hosts.set_host_settings(
+        changes={"terminal_max_sessions": 32, "agent_timeout_s": 900}
+    )
+    assert previous == {"agent_timeout_s": 7200}
+    assert await hosts.host_settings() == {"agent_timeout_s": 900, "terminal_max_sessions": 32}
+
+    await hosts.set_host_settings(changes={"agent_timeout_s": None})
+    assert await hosts.host_settings() == {"terminal_max_sessions": 32}
+
+
+async def test_global_host_settings_survive_a_missing_policy_row(
+    db, store, hosts: PostgresHostPoolRepository
+):
+    """An upsert, like the pin: a bare UPDATE would report success and store nothing."""
+    async with db.acquire() as conn:
+        await conn.execute("DELETE FROM agent_runner_policy")
+
+    await hosts.set_host_settings(changes={"chat_idle_timeout_s": 600})
+
+    assert await hosts.host_settings() == {"chat_idle_timeout_s": 600}
+
+
+async def test_server_settings_are_kept_apart_from_what_the_host_reports(
+    store, hosts: PostgresHostPoolRepository
+):
+    await _enrol(store, "runner-a", hosts=hosts)
+    row = await hosts.get_host(host="runner-a")
+    assert (row["settings_desired"], row["settings_applied"], row["settings_local"]) == (
+        {},
+        None,
+        None,
+    )
+
+    assert (
+        await hosts.set_runner_host_settings(
+            host="runner-a", changes={"source_import_max_mib": 4096}
+        )
+        == {}
+    )
+    await hosts.record_host_heartbeat(
+        host="runner-a",
+        settings_applied={"source_import_max_mib": 4096},
+        settings_local={"source_import_max_mib": 1024},
+    )
+
+    row = await hosts.get_host(host="runner-a")
+    assert row["settings_desired"] == {"source_import_max_mib": 4096}
+    assert row["settings_applied"] == {"source_import_max_mib": 4096}
+    assert row["settings_local"] == {"source_import_max_mib": 1024}
+
+    # A beat that does not report settings leaves the last report in place.
+    await hosts.record_host_heartbeat(host="runner-a", slots_total=3)
+    assert (await hosts.get_host(host="runner-a"))["settings_applied"] == {
+        "source_import_max_mib": 4096
+    }
+
+
+async def test_server_settings_survive_re_enrollment_and_the_report_does_not(
+    store, hosts: PostgresHostPoolRepository
+):
+    """The admin's values are about the name; the report is about the runner behind it."""
+    await _enrol(store, "runner-a", hosts=hosts)
+    await hosts.set_runner_host_settings(host="runner-a", changes={"agent_timeout_s": 900})
+    await hosts.record_host_heartbeat(
+        host="runner-a",
+        settings_applied={"agent_timeout_s": 900},
+        settings_local={"agent_timeout_s": 3600},
+    )
+
+    await hosts.register_host(host="runner-a", credential_hash=hash_secret("new"))
+
+    row = await hosts.get_host(host="runner-a")
+    assert row["settings_desired"] == {"agent_timeout_s": 900}
+    assert (row["settings_applied"], row["settings_local"]) == (None, None)
+
+
+async def test_setting_an_unknown_server_writes_nothing(store, hosts: PostgresHostPoolRepository):
+    assert (
+        await hosts.set_runner_host_settings(host="nope", changes={"agent_timeout_s": 900}) is None
+    )
+
+
+async def test_the_schema_refuses_settings_that_are_not_an_object(db, store, hosts):
+    import asyncpg
+
+    await _enrol(store, "runner-a", hosts=hosts)
+
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                "UPDATE agent_runner_hosts SET settings_desired = '[]'::jsonb "
+                "WHERE host = 'runner-a'"
+            )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute("UPDATE agent_runner_policy SET host_settings = '1'::jsonb")
+
+
 async def test_a_host_reports_why_it_is_not_claiming_and_can_clear_it(
     store, hosts: PostgresHostPoolRepository
 ):

@@ -18,6 +18,7 @@ import { fetchWithAuth, jsonOrThrow } from './client';
 const API_BASE = config.apiBase;
 const HOSTS = '/admin/agent/runner-hosts';
 const RUNTIME_VERSIONS = '/admin/agent/runtime-versions';
+const HOST_SETTINGS = '/admin/agent/host-settings';
 
 /** Status values the control plane stores; see `cloud_agent/host_pool.py`. */
 export type AgentHostStatus = 'enrolling' | 'online' | 'draining' | 'disabled' | 'offline';
@@ -230,7 +231,48 @@ export interface AgentRunnerHost {
    * is not the same as an idle machine and must not be rendered as zero.
    */
   capacity: AgentHostCapacity | null;
+  /**
+   * Runtime settings set for this server on the admin page, by key. They win
+   * over the global values. Absent from a control plane older than settings.
+   */
+  settings_desired?: HostSettingValues;
+  /**
+   * The runtime settings this host reported applying on its last heartbeat, or
+   * null when it never has — a runner that predates admin settings.
+   */
+  settings_applied?: HostSettingValues | null;
+  /**
+   * What this host's own `.env` (or the built-in default) gives each setting
+   * with no admin value. Clearing an admin value returns the host to this.
+   */
+  settings_local?: HostSettingValues | null;
 }
+
+/** Which unit a runtime setting's whole number counts. */
+export type HostSettingUnit = 'seconds' | 'MiB' | 'count';
+
+/**
+ * One runtime setting an admin may set, as the control plane defines it
+ * (`cloud_agent_shared/host_settings.py`). The page renders from this list
+ * rather than its own copy, so a bound can never drift from the server's.
+ */
+export interface HostSettingDefinition {
+  key: string;
+  /** The host environment variable it overrides. */
+  env: string;
+  label: string;
+  description: string;
+  unit: HostSettingUnit;
+  /** The built-in value when neither an admin nor the host's `.env` sets it. */
+  default: number;
+  minimum: number;
+  maximum: number;
+  /** Which host process applies it. */
+  scope: 'runner' | 'broker' | 'both';
+}
+
+/** Runtime setting values by key. */
+export type HostSettingValues = Record<string, number>;
 
 export interface AgentRunnerHostPool {
   execution_profile?: string;
@@ -242,6 +284,14 @@ export interface AgentRunnerHostPool {
    * runs whatever its claiming host reports as the image default.
    */
   runtime_versions: Record<string, string>;
+  /**
+   * Runtime settings set for every server. A server's own value wins over
+   * these; a setting set nowhere uses each host's own. Absent from a control
+   * plane older than settings.
+   */
+  host_settings?: HostSettingValues;
+  /** Every runtime setting an admin may set, with its unit and bounds. */
+  host_setting_definitions?: HostSettingDefinition[];
   /**
    * The database instant this read was taken at, by the server's clock. Every
    * age on the page is measured from it, plus locally observed elapsed time,
@@ -426,6 +476,49 @@ export async function setAgentRunnerHostSlots(
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ slots }),
+  });
+  return jsonOrThrow<AgentRunnerHostPool>(resp);
+}
+
+/**
+ * Advertised on the heartbeat by a runner that applies the runtime settings set
+ * on this page and reports what it applied. Mirrors `HOST_SETTINGS_CAPABILITY`
+ * in `cloud_agent_shared/shared_protocol.py`; a host without it keeps its
+ * `.env` values until it is redeployed.
+ */
+export const HOST_SETTINGS_CAPABILITY = 'host-settings-v1';
+
+/**
+ * Set or clear runtime settings for every server. Each value is a whole number
+ * inside its setting's bounds, or null to clear it so each host uses its own.
+ * Settings not named keep their values.
+ *
+ * **Saving is not applying.** Each host takes the values up from its next
+ * heartbeat answer; the host rows in the response say which have.
+ */
+export async function setAgentHostSettings(
+  settings: Record<string, number | null>,
+): Promise<AgentRunnerHostPool> {
+  const resp = await fetchWithAuth(API_BASE, HOST_SETTINGS, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ settings }),
+  });
+  return jsonOrThrow<AgentRunnerHostPool>(resp);
+}
+
+/**
+ * Set or clear runtime settings for one server, over the global values. Null
+ * clears one, and the server goes back to the global value, or its own.
+ */
+export async function setAgentRunnerHostSettings(
+  host: string,
+  settings: Record<string, number | null>,
+): Promise<AgentRunnerHostPool> {
+  const resp = await fetchWithAuth(API_BASE, `${HOSTS}/${encodeURIComponent(host)}/settings`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ settings }),
   });
   return jsonOrThrow<AgentRunnerHostPool>(resp);
 }

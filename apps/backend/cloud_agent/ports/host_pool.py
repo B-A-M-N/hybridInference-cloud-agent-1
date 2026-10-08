@@ -135,6 +135,8 @@ class HostPoolRepository(Protocol):
         sandbox_image_digest: str | None = None,
         runtime_versions: dict[str, str] | None = None,
         runtime_versions_available: dict[str, list[str]] | None = None,
+        settings_applied: Mapping[str, int | float] | None = None,
+        settings_local: Mapping[str, int | float] | None = None,
     ) -> dict[str, Any] | None:
         """Record a heartbeat, promoting the host to ``online`` when it may.
 
@@ -185,6 +187,9 @@ class HostPoolRepository(Protocol):
             sandbox_image_digest: Digest of the sandbox image it launches.
             runtime_versions: Default CLI version per runtime.
             runtime_versions_available: Every CLI version its image holds.
+            settings_applied: The runtime settings the host is applying now.
+            settings_local: What its own environment would give it with no
+                admin value. Either ``None`` leaves what is stored in place.
 
         Returns:
             The updated host row, or ``None`` when the host no longer exists.
@@ -217,6 +222,27 @@ class HostPoolRepository(Protocol):
         ``COALESCE`` nor the registration upsert names this column. Bounds are
         the request schema's business; the column refuses only a non-positive
         size, which is not a size.
+        """
+        ...
+
+    async def set_runner_host_settings(
+        self, *, host: str, changes: Mapping[str, int | None]
+    ) -> dict[str, Any] | None:
+        """Set or clear runtime settings for one server, over the global values.
+
+        ``changes`` names only the settings to change, and ``None`` clears one
+        so the global value, or the host's own, applies again. Settings it does
+        not name keep their values. The host applies the result from its next
+        heartbeat answer.
+
+        Like ``slots_desired``, the values survive heartbeats and
+        re-enrollment: they are a decision about the named machine. Validation
+        is the caller's (``cloud_agent_shared.host_settings``). The row is
+        locked for the read-modify-write, so two admins changing different
+        settings on the same server both land.
+
+        Returns the server's values before the change, or ``None`` for an
+        unknown host.
         """
         ...
 
@@ -345,6 +371,29 @@ class HostPoolRepository(Protocol):
         Same lock order as ``set_active_runner_host`` — policy row first, then
         the host rows it is checked against — so the two admin writes and the
         claim's shared read serialize with no cycle to deadlock on.
+        """
+        ...
+
+    async def host_settings(self) -> dict[str, Any]:
+        """The runtime settings set for every server, as stored.
+
+        A server's own values win over these, and a setting set nowhere falls
+        back to the host's environment. Read through
+        ``cloud_agent_shared.host_settings.admin_values``, which drops anything
+        a release can no longer apply.
+        """
+        ...
+
+    async def set_host_settings(self, *, changes: Mapping[str, int | None]) -> dict[str, Any]:
+        """Set or clear runtime settings for every server.
+
+        ``changes`` names only the settings to change, and ``None`` clears one.
+        Every host applies the result from its next heartbeat answer, except
+        where a value set for that server wins. The policy row is locked for
+        the read-modify-write, the same first lock every other policy writer
+        takes, so this serializes with them and with a concurrent change to
+        another setting. Returns the values before the change, for the audit
+        record.
         """
         ...
 

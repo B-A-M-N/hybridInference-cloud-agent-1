@@ -554,6 +554,81 @@ def test_the_heartbeat_reads_the_requested_executor_count_and_forgets_a_cleared_
     assert identity.slots_desired is None, "a boolean is not a count"
 
 
+def test_the_heartbeat_carries_the_settings_report_and_reads_the_admin_values(
+    monkeypatch,
+) -> None:
+    """The answer replaces the settings whole; a value this host cannot apply is dropped."""
+    identity = enrollment.HostIdentity(host="h1", credential="c")
+    bodies: list[dict] = []
+    answers = iter(
+        [
+            {"status": "online", "settings": {"agent_timeout_s": 900, "unknown": 1}},
+            {"status": "online", "settings": {"terminal_max_sessions": 0}},
+            {"status": "online"},
+        ]
+    )
+
+    def post(url, body, bearer=""):
+        bodies.append(body)
+        return next(answers)
+
+    monkeypatch.setattr(enrollment, "_post", post)
+
+    enrollment.heartbeat(
+        base_url="http://cp",
+        identity=identity,
+        settings_applied={"agent_timeout_s": 3600},
+        settings_local={"agent_timeout_s": 3600},
+    )
+    assert bodies[0]["settings_applied"] == {"agent_timeout_s": 3600}
+    assert bodies[0]["settings_local"] == {"agent_timeout_s": 3600}
+    assert identity.settings == {"agent_timeout_s": 900}
+
+    enrollment.heartbeat(base_url="http://cp", identity=identity)
+    assert identity.settings == {}, "a value outside this host's bounds is not applied"
+
+    identity.settings = {"agent_timeout_s": 900}
+    enrollment.heartbeat(base_url="http://cp", identity=identity)
+    assert identity.settings == {}, "a control plane with no settings leaves the host's own"
+
+
+def test_the_beat_hands_on_the_settings_and_survives_a_failing_handler(monkeypatch) -> None:
+    identity = enrollment.HostIdentity(host="h1", credential="c")
+    seen: list[dict] = []
+    beats = [0]
+    reports = iter([({"agent_timeout_s": 3600}, {"agent_timeout_s": 3600}), ({}, {})])
+
+    def on_settings(settings: dict) -> None:
+        seen.append(settings)
+        raise RuntimeError("broker exploded")
+
+    beat = enrollment.HostHeartbeat(
+        base_url="http://cp",
+        identity=identity,
+        settings_report=lambda: next(reports),
+        on_settings=on_settings,
+    )
+    bodies: list[dict] = []
+
+    def post(url, body, bearer=""):
+        bodies.append(body)
+        beats[0] += 1
+        if beats[0] == 2:
+            beat._stop.set()
+        return {
+            "status": "online",
+            "settings": {"agent_timeout_s": 900},
+            # Short, so the test does not wait out a real interval between beats.
+            "heartbeat_interval_seconds": 0.01,
+        }
+
+    monkeypatch.setattr(enrollment, "_post", post)
+    beat._run()
+
+    assert [body["settings_applied"] for body in bodies] == [{"agent_timeout_s": 3600}, {}]
+    assert seen == [{"agent_timeout_s": 900}, {"agent_timeout_s": 900}]
+
+
 def test_a_callable_slot_count_is_read_fresh_on_every_beat(monkeypatch) -> None:
     """The supervisor's live executor count moves; the beat must carry the current one."""
     identity = enrollment.HostIdentity(host="h1", credential="c")

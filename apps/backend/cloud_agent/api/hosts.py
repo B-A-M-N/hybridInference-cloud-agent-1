@@ -40,6 +40,7 @@ from cloud_agent.schemas import (
     RetainedSandboxStop,
 )
 from cloud_agent.tokens import InvalidHostToken, mint_host_token, parse_host_token
+from cloud_agent_shared.host_settings import merge_admin_values, reported_values
 
 if TYPE_CHECKING:
     from cloud_agent.ports import (
@@ -266,6 +267,11 @@ async def heartbeat_host(
         sandbox_image_digest=body.sandbox_image_digest,
         runtime_versions=body.runtime_versions,
         runtime_versions_available=body.runtime_versions_available,
+        # Reduced to known settings and finite numbers before they are stored:
+        # a host can be newer than this control plane, and JSON's Infinity is
+        # not a number Postgres will keep.
+        settings_applied=reported_values(body.settings_applied),
+        settings_local=reported_values(body.settings_local),
     )
     if updated is None:
         # The row vanished between authentication and the write — a forget
@@ -376,6 +382,13 @@ async def heartbeat_host(
         # carried the host's current one: the host adopts it, and the next beat
         # reports it back as the limit it is now serving.
         slots_desired=updated.get("slots_desired"),
+        # The whole set every time, this server's values over the global ones,
+        # so a value cleared on the admin page reaches the host as an absence
+        # and the host falls back to its own .env for it.
+        settings=merge_admin_values(
+            await job_store.host_pool.host_settings(),
+            updated.get("settings_desired"),
+        ),
         residencies_lost=lost,
         retained_sandboxes_stop=retained_stops,
         heartbeat_interval_seconds=HEARTBEAT_INTERVAL_S,
