@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any
 from cloud_agent.host_pool import hash_secret, new_enroll_token
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from cloud_agent.ports.host_pool import HostPoolRepository
 
 
@@ -114,6 +116,17 @@ class HostCommands:
                 f"{host!r} is still running attempts. Drain it first, or repeat with "
                 "force=true to let their leases expire under the retained-context fail-closed policy.",
             )
+
+    async def global_settings(self, changes: Mapping[str, int | None]) -> dict[str, Any]:
+        """Change runtime settings for every server; return the old values for audit."""
+        return await self.repository.set_host_settings(changes=changes)
+
+    async def settings(self, *, host: str, changes: Mapping[str, int | None]) -> dict[str, Any]:
+        """Change one server's runtime settings; return its old values for audit."""
+        previous = await self.repository.set_runner_host_settings(host=host, changes=changes)
+        if previous is None:
+            raise HostCommandError(404, f"Unknown runner host: {host}")
+        return previous
 
     async def slots(self, *, host: str, slots: int | None) -> dict[str, Any]:
         """Save desired capacity and return the old observation for audit."""

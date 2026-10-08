@@ -130,6 +130,32 @@ class SessionSupervisorClient:
             raise SessionSupervisorError(502, "workspace broker returned invalid data")
         return body
 
+    def apply_host_settings(
+        self, settings: dict[str, int], *, timeout: float = 5.0
+    ) -> dict[str, Any]:
+        """Hand the broker the runtime settings an admin set and read its answer.
+
+        ``settings`` is the broker's share of what the last heartbeat carried,
+        the whole set: a setting absent from it returns the broker to its own
+        value. The answer says what the broker now applies, which is what this
+        host reports — not what it sent. Bounded well under the heartbeat
+        interval, because it runs on the heartbeat thread.
+        """
+        try:
+            response = self._client.post(
+                f"{self._base_url}/host-settings", json={"settings": settings}, timeout=timeout
+            )
+        except httpx.HTTPError as exc:
+            raise SessionSupervisorError(503, "workspace broker is unavailable") from exc
+        if response.is_error:
+            raise SessionSupervisorError(
+                response.status_code, "workspace broker rejected the runtime settings"
+            )
+        body = response.json()
+        if not isinstance(body, dict):
+            raise SessionSupervisorError(502, "workspace broker returned invalid data")
+        return body
+
     def list(self) -> builtins.list[dict[str, Any]]:
         """Observe every retained container owned by this host's broker."""
         try:

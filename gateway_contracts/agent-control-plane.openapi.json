@@ -4493,6 +4493,58 @@
             "title": "Seconds Since Seen",
             "type": "number"
           },
+          "settings_applied": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "number"
+                    }
+                  ]
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The runtime settings this host reported applying on its last heartbeat. Null means it has never reported — a runner that predates admin settings, or one that has not beaten since it enrolled.",
+            "title": "Settings Applied"
+          },
+          "settings_desired": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "description": "Runtime settings set for this server on the admin page, by key (see host_setting_definitions). They win over the global values; a setting absent here uses the global value, or the host's own.",
+            "title": "Settings Desired",
+            "type": "object"
+          },
+          "settings_local": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "number"
+                    }
+                  ]
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What this host's own environment gives each setting with no admin value: its .env, or the built-in default. Clearing an admin value returns the host to this.",
+            "title": "Settings Local"
+          },
           "slots_desired": {
             "anyOf": [
               {
@@ -8366,6 +8418,52 @@
             "description": "The container runtime jobs actually execute under, e.g. 'io.containerd.kata.v2'. Empty string is a positive statement — shared-kernel runc — where omitting the field means 'not reported' and keeps the last known value. This is the isolation attestation the scheduler and admin read; it must say what runs, not what the deployment intended.",
             "title": "Sandbox Runtime"
           },
+          "settings_applied": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "number"
+                    }
+                  ]
+                },
+                "maxProperties": 32,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The runtime settings this host is applying now, by key — the workspace broker's as it last confirmed them. Null means not reported and keeps what is stored.",
+            "title": "Settings Applied"
+          },
+          "settings_local": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "number"
+                    }
+                  ]
+                },
+                "maxProperties": 32,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What this host's own environment gives each setting with no admin value. Null means not reported and keeps what is stored.",
+            "title": "Settings Local"
+          },
           "slots_total": {
             "anyOf": [
               {
@@ -8422,6 +8520,14 @@
             },
             "title": "Retained Sandboxes Stop",
             "type": "array"
+          },
+          "settings": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "description": "The runtime settings an admin set for this host — its own values over the global ones. A setting absent here is the host's own: its .env, or the built-in default. Always the whole set, so a value cleared on the admin page is absent rather than unchanged.",
+            "title": "Settings",
+            "type": "object"
           },
           "slots_desired": {
             "anyOf": [
@@ -8612,6 +8718,73 @@
           "ttl_seconds"
         ],
         "title": "HostResidencyEstablishResponse",
+        "type": "object"
+      },
+      "HostSettingDefinition": {
+        "description": "One runtime setting an admin may set, with its unit and bounds.",
+        "properties": {
+          "default": {
+            "description": "Built-in value when neither an admin nor .env sets it.",
+            "title": "Default",
+            "type": "integer"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "env": {
+            "description": "The host environment variable it overrides.",
+            "title": "Env",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "maximum": {
+            "title": "Maximum",
+            "type": "integer"
+          },
+          "minimum": {
+            "title": "Minimum",
+            "type": "integer"
+          },
+          "scope": {
+            "description": "Which host process applies it: the runner, as it starts each turn; the workspace broker, which runs terminals and the idle sweep; or both.",
+            "enum": [
+              "runner",
+              "broker",
+              "both"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "unit": {
+            "enum": [
+              "seconds",
+              "MiB",
+              "count"
+            ],
+            "title": "Unit",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "env",
+          "label",
+          "description",
+          "unit",
+          "default",
+          "minimum",
+          "maximum",
+          "scope"
+        ],
+        "title": "HostSettingDefinition",
         "type": "object"
       },
       "ImportComputeRequest": {
@@ -9121,6 +9294,22 @@
             "description": "Server-owned policy for new chats; used to show eligible servers in admin.",
             "title": "Execution Profile",
             "type": "string"
+          },
+          "host_setting_definitions": {
+            "description": "Every runtime setting an admin may set, with its unit and bounds.",
+            "items": {
+              "$ref": "#/components/schemas/HostSettingDefinition"
+            },
+            "title": "Host Setting Definitions",
+            "type": "array"
+          },
+          "host_settings": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "description": "Runtime settings set for every server. A value set for one server wins over these; a setting set nowhere uses each host's own.",
+            "title": "Host Settings",
+            "type": "object"
           },
           "hosts": {
             "items": {
@@ -10280,6 +10469,33 @@
           }
         },
         "title": "SetActiveAgentRunnerHostRequest",
+        "type": "object"
+      },
+      "SetHostSettingsRequest": {
+        "description": "Set or clear runtime settings, for every server or for one.",
+        "properties": {
+          "settings": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "description": "The settings to change, by key (see host_setting_definitions), each a whole number inside that setting's bounds, or null to clear it so the next level applies: a server's value falls back to the global one, and a global value to each host's own .env or default. Settings not named keep their values. Hosts apply the result from their next heartbeat answer.",
+            "maxProperties": 32,
+            "minProperties": 1,
+            "title": "Settings",
+            "type": "object"
+          }
+        },
+        "required": [
+          "settings"
+        ],
+        "title": "SetHostSettingsRequest",
         "type": "object"
       },
       "SetHostSlotsRequest": {
@@ -15135,6 +15351,63 @@
         "summary": "Get Admin Conversation"
       }
     },
+    "/admin/agent/host-settings": {
+      "put": {
+        "description": "Set or clear runtime settings for every server, without a redeploy.\n\nEach host picks the values up from its next heartbeat answer, except where\na value set for that server wins. ``null`` clears a setting, and each host\ngoes back to its own ``.env`` or built-in default for it.\n\n**Saving is not applying.** Each host reports what it applied, and the page\nshows the hosts that have not caught up yet. Nothing running is\ninterrupted: a turn keeps the time limit it started with, an existing\nsandbox keeps its chat capacity, and the terminal limits apply from the\nbroker's next sweep.",
+        "operationId": "set_agent_host_settings_admin_agent_host_settings_put",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetHostSettingsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListAgentRunnerHostsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Agent Host Settings"
+      }
+    },
     "/admin/agent/measurement-writer": {
       "get": {
         "description": "Return this replica's bounded diagnostic-writer state and loss counts.",
@@ -16240,6 +16513,72 @@
           }
         },
         "summary": "Remove Agent Runner Host"
+      }
+    },
+    "/admin/agent/runner-hosts/{host}/settings": {
+      "put": {
+        "description": "Set or clear runtime settings for one server, over the global values.\n\nA value set here wins over the one set for every server. ``null`` clears\nit, and the server goes back to the global value, or to its own when there\nis none. Applied from the host's next heartbeat, like the global values,\nand kept through heartbeats and re-enrollment.",
+        "operationId": "set_agent_runner_host_settings_admin_agent_runner_hosts__host__settings_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host",
+            "required": true,
+            "schema": {
+              "title": "Host",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetHostSettingsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListAgentRunnerHostsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Agent Runner Host Settings"
       }
     },
     "/admin/agent/runner-hosts/{host}/slots": {

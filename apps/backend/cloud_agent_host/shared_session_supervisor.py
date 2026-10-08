@@ -382,6 +382,19 @@ class SharedChatSessionSupervisor:
         """Return the one group inactivity timeout."""
         return self._idle_timeout_s
 
+    def set_idle_timeout_s(self, idle_timeout_s: float) -> None:
+        """Change the inactivity timeout at runtime, as the admin page asks.
+
+        A group's deadline is armed when it goes quiet, so the new value
+        applies from each group's next quiet moment; a deadline already armed
+        keeps the value it was armed with rather than moving under a group that
+        is about to be stopped.
+        """
+        if idle_timeout_s <= 0:
+            raise ValueError("shared sandbox timeout values must be positive")
+        with self._lock:
+            self._idle_timeout_s = idle_timeout_s
+
     def start(self) -> None:
         """Reconstruct shared containers and start the group idle sweep."""
         with self._lock:

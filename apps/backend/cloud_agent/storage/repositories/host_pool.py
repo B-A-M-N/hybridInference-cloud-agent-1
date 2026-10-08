@@ -50,6 +50,19 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _changed_settings(
+    stored: Mapping[str, Any], changes: Mapping[str, int | None]
+) -> dict[str, Any]:
+    """Apply an admin's change to stored settings: set each value, or drop it on None."""
+    updated = dict(stored)
+    for key, value in changes.items():
+        if value is None:
+            updated.pop(key, None)
+        else:
+            updated[key] = value
+    return updated
+
+
 class PostgresHostPoolRepository:
     """The runner-host pool: enrollment, heartbeats, and placement."""
 
@@ -193,6 +206,12 @@ class PostgresHostPoolRepository:
                     capacity_sampled_at = NULL,
                     capacity_sample_id = NULL,
                     capacity_epoch = gen_random_uuid(),
+                    -- What a host reports about its runtime settings belongs to
+                    -- the runner that reported it, which re-enrollment may
+                    -- have replaced; its next heartbeat says again. The values
+                    -- an admin set for this name stay, as slots_desired does.
+                    settings_applied = NULL,
+                    settings_local = NULL,
                     slots_used = (
                         SELECT count(*) FROM agent_attempts
                         WHERE host_id = EXCLUDED.host AND status = 'running'
@@ -247,6 +266,8 @@ class PostgresHostPoolRepository:
         sandbox_image_digest: str | None = None,
         runtime_versions: dict[str, str] | None = None,
         runtime_versions_available: dict[str, list[str]] | None = None,
+        settings_applied: Mapping[str, int | float] | None = None,
+        settings_local: Mapping[str, int | float] | None = None,
     ) -> dict[str, Any] | None:
         """Record a heartbeat, promoting the host to ``online`` when it may.
 
@@ -297,6 +318,9 @@ class PostgresHostPoolRepository:
             sandbox_image_digest: Digest of the sandbox image it launches.
             runtime_versions: Default CLI version per runtime.
             runtime_versions_available: Every CLI version its image holds.
+            settings_applied: The runtime settings the host is applying now.
+            settings_local: What its own environment would give it with no
+                admin value. Either ``None`` leaves what is stored in place.
 
         Returns:
             The updated host row, or ``None`` when the host no longer exists.
@@ -324,7 +348,9 @@ class PostgresHostPoolRepository:
                     -- "" survives COALESCE for the same reason an empty
                     -- sandbox runtime does: it is the host saying nothing is
                     -- wrong, which has to be able to clear a stale reason.
-                    launch_error = COALESCE($11, launch_error)
+                    launch_error = COALESCE($11, launch_error),
+                    settings_applied = COALESCE($12::jsonb, settings_applied),
+                    settings_local = COALESCE($13::jsonb, settings_local)
                 WHERE host = $1
                 RETURNING {HOST_COLUMNS}
                 """,
@@ -345,6 +371,8 @@ class PostgresHostPoolRepository:
                 ),
                 json.dumps({"physical_host": physical_host} if physical_host is not None else {}),
                 launch_error,
+                None if settings_applied is None else json.dumps(dict(settings_applied)),
+                None if settings_local is None else json.dumps(dict(settings_local)),
             )
             if row is None:
                 return None
@@ -407,6 +435,40 @@ class PostgresHostPoolRepository:
                 slots,
             )
         return "ok" if updated is not None else "unknown"
+
+    async def set_runner_host_settings(
+        self, *, host: str, changes: Mapping[str, int | None]
+    ) -> dict[str, Any] | None:
+        """Set or clear runtime settings for one server, over the global values.
+
+        ``changes`` names only the settings to change, and ``None`` clears one
+        so the global value, or the host's own, applies again. Settings it does
+        not name keep their values. The host applies the result from its next
+        heartbeat answer.
+
+        Like ``slots_desired``, the values survive heartbeats and
+        re-enrollment: they are a decision about the named machine. Validation
+        is the caller's (``cloud_agent_shared.host_settings``). The row is
+        locked for the read-modify-write, so two admins changing different
+        settings on the same server both land.
+
+        Returns the server's values before the change, or ``None`` for an
+        unknown host.
+        """
+        async with self._pool.acquire() as conn, conn.transaction():
+            current = await conn.fetchrow(
+                "SELECT settings_desired FROM agent_runner_hosts WHERE host = $1 FOR UPDATE",
+                host,
+            )
+            if current is None:
+                return None
+            previous = dict(load_json(current["settings_desired"]) or {})
+            await conn.execute(
+                "UPDATE agent_runner_hosts SET settings_desired = $2::jsonb WHERE host = $1",
+                host,
+                json.dumps(_changed_settings(previous, changes)),
+            )
+        return previous
 
     async def remove_host(self, *, host: str, force: bool = False) -> str:
         """Revoke a host's credential and take it out of the pool.
@@ -730,6 +792,47 @@ class PostgresHostPoolRepository:
             )
             return True
 
+    async def host_settings(self) -> dict[str, Any]:
+        """The runtime settings set for every server, as stored.
+
+        A server's own values win over these, and a setting set nowhere falls
+        back to the host's environment. Read through
+        ``cloud_agent_shared.host_settings.admin_values``, which drops anything
+        a release can no longer apply.
+        """
+        async with self._pool.acquire() as conn:
+            stored = await conn.fetchval("SELECT host_settings FROM agent_runner_policy WHERE id")
+        return dict(load_json(stored) or {})
+
+    async def set_host_settings(self, *, changes: Mapping[str, int | None]) -> dict[str, Any]:
+        """Set or clear runtime settings for every server.
+
+        ``changes`` names only the settings to change, and ``None`` clears one.
+        Every host applies the result from its next heartbeat answer, except
+        where a value set for that server wins. The policy row is locked for
+        the read-modify-write, the same first lock every other policy writer
+        takes, so this serializes with them and with a concurrent change to
+        another setting. Returns the values before the change, for the audit
+        record.
+        """
+        async with self._pool.acquire() as conn, conn.transaction():
+            stored = await conn.fetchval(
+                "SELECT host_settings FROM agent_runner_policy WHERE id FOR UPDATE"
+            )
+            previous = dict(load_json(stored) or {})
+            # Upsert for the same reason the pin and the version selection are
+            # one: against a database whose singleton row is missing, a bare
+            # UPDATE touches nothing and still reports success.
+            await conn.execute(
+                """
+                INSERT INTO agent_runner_policy (id, host_settings) VALUES (TRUE, $1::jsonb)
+                ON CONFLICT (id) DO UPDATE
+                SET host_settings = EXCLUDED.host_settings, updated_at = NOW()
+                """,
+                json.dumps(_changed_settings(previous, changes)),
+            )
+        return previous
+
     async def set_active_runner_host(self, *, host: str | None) -> bool:
         """Pin new-chat placement to one host, or unpin with ``None``.
 
@@ -860,6 +963,12 @@ class PostgresHostPoolRepository:
         # None (never reported) and {} (reported: no labels) stay distinct.
         host["runtime_versions"] = load_json(host.get("runtime_versions"))
         host["runtime_versions_available"] = load_json(host.get("runtime_versions_available"))
+        # Read with ``.get`` like the capacity columns: a row from a projection
+        # that predates them must still decode. The report keeps None (never
+        # reported) apart from {} (reported, nothing to say).
+        host["settings_desired"] = load_json(host.get("settings_desired")) or {}
+        host["settings_applied"] = load_json(host.get("settings_applied"))
+        host["settings_local"] = load_json(host.get("settings_local"))
         # Absent from most projections, so read with ``.get``: a row that never
         # selected the capacity columns must decode to "no observation", not
         # raise a KeyError on a path that has nothing to do with capacity.

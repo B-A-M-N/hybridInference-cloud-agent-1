@@ -1,0 +1,250 @@
+"""What a host applies for each runtime setting, and what it reports applying."""
+
+from __future__ import annotations
+
+import json
+
+import httpx
+import pytest
+
+from cloud_agent_host.runtime_settings import RuntimeSettings
+from cloud_agent_host.session_supervisor_client import (
+    SessionSupervisorClient,
+    SessionSupervisorError,
+)
+
+LOCAL = {
+    "agent_timeout_s": 3600.0,
+    "chat_idle_timeout_s": 1800.0,
+    "source_import_max_mib": 1024,
+    "shared_resident_capacity": 8,
+}
+
+
+class _Broker:
+    """The broker's side of the push: resolve its share over its own values."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.sent: list[dict[str, int]] = []
+        self.local = {
+            "terminal_idle_ttl_s": 1800,
+            "terminal_hard_ttl_s": 28800,
+            "terminal_max_sessions": 64,
+            "chat_idle_timeout_s": 1800,
+        }
+
+    def __call__(self, settings: dict[str, int]) -> dict:
+        self.sent.append(settings)
+        if self.fail:
+            raise ConnectionError("broker down")
+        return {"applied": {**self.local, **settings}, "local": self.local}
+
+
+def test_with_no_admin_values_every_setting_is_the_hosts_own():
+    settings = RuntimeSettings(LOCAL)
+
+    assert settings.turn_settings() == LOCAL
+    applied, local = settings.report()
+    assert (
+        applied
+        == local
+        == {
+            "agent_timeout_s": 3600,
+            "chat_idle_timeout_s": 1800,
+            "source_import_max_mib": 1024,
+            "shared_resident_capacity": 8,
+        }
+    )
+
+
+def test_admin_values_win_for_the_next_turn_and_clearing_one_returns_the_hosts_own():
+    settings = RuntimeSettings(LOCAL)
+
+    assert settings.apply({"agent_timeout_s": 900, "source_import_max_mib": 4096}) is True
+    assert settings.turn_settings() == {
+        **LOCAL,
+        "agent_timeout_s": 900,
+        "source_import_max_mib": 4096,
+    }
+
+    settings.apply({"agent_timeout_s": 900})
+    assert settings.turn_settings()["source_import_max_mib"] == 1024
+
+
+def test_the_broker_is_sent_only_its_share_and_its_answer_is_what_is_reported():
+    broker = _Broker()
+    settings = RuntimeSettings(LOCAL, broker=broker)
+
+    settings.apply(
+        {"agent_timeout_s": 900, "terminal_max_sessions": 16, "chat_idle_timeout_s": 600}
+    )
+
+    assert broker.sent == [{"terminal_max_sessions": 16, "chat_idle_timeout_s": 600}]
+    applied, local = settings.report()
+    assert applied == {
+        "agent_timeout_s": 900,
+        "chat_idle_timeout_s": 600,
+        "source_import_max_mib": 1024,
+        "shared_resident_capacity": 8,
+        "terminal_idle_ttl_s": 1800,
+        "terminal_hard_ttl_s": 28800,
+        "terminal_max_sessions": 16,
+    }
+    assert local["terminal_max_sessions"] == 64
+    assert local["agent_timeout_s"] == 3600
+
+
+def test_an_unreachable_broker_leaves_its_settings_unconfirmed_not_assumed():
+    """The page must see the broker's settings as not applied, never guess they were."""
+    broker = _Broker(fail=True)
+    settings = RuntimeSettings(LOCAL, broker=broker)
+
+    settings.apply({"terminal_max_sessions": 16})
+
+    applied, local = settings.report()
+    assert "terminal_max_sessions" not in applied
+    assert "terminal_max_sessions" not in local
+    # The runner's own share is unaffected by the broker being down.
+    assert applied["agent_timeout_s"] == 3600
+
+
+def test_apply_reports_a_change_only_when_the_report_would_change():
+    """A changed report is sent at once; an unchanged one waits for the interval."""
+    settings = RuntimeSettings(LOCAL, broker=_Broker())
+
+    assert settings.apply({}) is True  # the broker's first confirmation
+    assert settings.apply({}) is False
+    assert settings.apply({"agent_timeout_s": 900}) is True
+    assert settings.apply({"agent_timeout_s": 900}) is False
+
+
+@pytest.mark.parametrize(
+    "admin",
+    [
+        {"agent_timeout_s": 10},
+        {"agent_timeout_s": True},
+        {"agent_timeout_s": "900"},
+        {"from_a_newer_release": 3},
+    ],
+)
+def test_a_value_this_host_cannot_apply_is_ignored(admin):
+    settings = RuntimeSettings(LOCAL)
+
+    settings.apply(admin)
+
+    assert settings.turn_settings() == LOCAL
+
+
+def test_the_runner_never_holds_a_setting_only_the_broker_applies():
+    settings = RuntimeSettings({**LOCAL, "terminal_max_sessions": 64})
+
+    settings.apply({"terminal_max_sessions": 16})
+
+    assert "terminal_max_sessions" not in settings.turn_settings()
+
+
+def _client(handler) -> SessionSupervisorClient:
+    client = SessionSupervisorClient("http://broker", "broker-secret")
+    client._client = httpx.Client(
+        transport=httpx.MockTransport(handler), headers={"X-Agent-Workspace-Token": "broker-secret"}
+    )
+    return client
+
+
+def test_the_broker_client_sends_the_settings_and_returns_the_brokers_answer():
+    seen: list[tuple[str, dict, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(
+            (
+                request.url.path,
+                json.loads(request.content),
+                request.headers["X-Agent-Workspace-Token"],
+            )
+        )
+        return httpx.Response(200, json={"applied": {"terminal_max_sessions": 16}, "local": {}})
+
+    client = _client(handler)
+    try:
+        answer = client.apply_host_settings({"terminal_max_sessions": 16})
+    finally:
+        client.close()
+
+    assert seen == [
+        ("/host-settings", {"settings": {"terminal_max_sessions": 16}}, "broker-secret")
+    ]
+    assert answer == {"applied": {"terminal_max_sessions": 16}, "local": {}}
+
+
+@pytest.mark.parametrize("status", [401, 422, 503])
+def test_a_broker_refusal_is_an_error_not_a_confirmation(status):
+    client = _client(lambda _request: httpx.Response(status, json={"detail": "no"}))
+    try:
+        with pytest.raises(SessionSupervisorError) as raised:
+            client.apply_host_settings({})
+    finally:
+        client.close()
+
+    assert raised.value.status_code == status
+
+
+def test_the_runners_share_is_in_force_before_the_broker_is_asked():
+    """A slow broker must not hold up the values the next turn is handed."""
+    seen_during_push: list[dict[str, float]] = []
+    settings: RuntimeSettings
+
+    def slow_broker(_settings: dict[str, int]) -> dict:
+        seen_during_push.append(settings.turn_settings())
+        assert settings.adopted
+        raise TimeoutError("broker did not answer")
+
+    settings = RuntimeSettings(LOCAL, broker=slow_broker)
+    assert not settings.adopted
+
+    settings.apply({"agent_timeout_s": 900})
+
+    assert seen_during_push == [{**LOCAL, "agent_timeout_s": 900}]
+
+
+@pytest.mark.parametrize(
+    ("broker", "reported"),
+    [
+        # The broker confirmed the same value: in force in both processes.
+        (_Broker(), 600),
+        # The broker did not answer: not reported, so the page keeps saying applying.
+        (_Broker(fail=True), None),
+    ],
+)
+def test_a_setting_both_processes_apply_is_reported_only_when_both_agree(broker, reported):
+    settings = RuntimeSettings(LOCAL, broker=broker)
+
+    settings.apply({"chat_idle_timeout_s": 600})
+
+    applied, _local = settings.report()
+    assert applied.get("chat_idle_timeout_s") == reported
+    assert settings.turn_settings()["chat_idle_timeout_s"] == 600, (
+        "the runner applies it either way"
+    )
+
+
+def test_a_broker_that_applies_another_value_is_reported_at_its_own():
+    """A broker on an older release can drop a value the runner accepted."""
+
+    def stubborn(_settings: dict[str, int]) -> dict:
+        return {"applied": {"chat_idle_timeout_s": 1800}, "local": {"chat_idle_timeout_s": 1800}}
+
+    settings = RuntimeSettings(LOCAL, broker=stubborn)
+    settings.apply({"chat_idle_timeout_s": 600})
+
+    applied, _local = settings.report()
+    assert applied["chat_idle_timeout_s"] == 1800
+
+
+def test_with_no_broker_the_runners_value_is_the_whole_truth():
+    settings = RuntimeSettings(LOCAL)
+
+    settings.apply({"chat_idle_timeout_s": 600})
+
+    applied, _local = settings.report()
+    assert applied["chat_idle_timeout_s"] == 600

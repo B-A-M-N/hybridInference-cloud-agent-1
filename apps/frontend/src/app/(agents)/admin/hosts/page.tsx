@@ -40,6 +40,8 @@ import type {
   AgentRunnerHost,
   AgentRunnerHostPool,
   CapacityRange,
+  HostSettingDefinition,
+  HostSettingValues,
 } from '@/lib/api/admin';
 import { MAX_HOST_SLOTS, MIN_HOST_SLOTS } from '@/lib/api/admin';
 import {
@@ -49,6 +51,8 @@ import {
   getAgentRunnerHosts,
   removeAgentRunnerHost,
   setActiveAgentRunnerHost,
+  setAgentHostSettings,
+  setAgentRunnerHostSettings,
   setAgentRunnerHostSlots,
   setAgentRuntimeVersion,
   undrainAgentRunnerHost,
@@ -58,6 +62,7 @@ import { APIError, getErrorMessage } from '@/lib/utils/errors';
 
 import CapacityPanel from './CapacityPanel';
 import ComputeResources from './ComputeResources';
+import { GlobalSettingsCard, ServerSettingsPanel } from './HostSettings';
 import hostStyles from './host-controls.module.css';
 import {
   type CapacityCell,
@@ -182,7 +187,7 @@ function RowToggle({
     <button
       type="button"
       aria-expanded={open}
-      aria-label={`${open ? 'Hide capacity for' : 'Show capacity for'} ${name}`}
+      aria-label={`${open ? 'Hide details for' : 'Show details for'} ${name}`}
       aria-controls={panelId}
       onClick={onClick}
       className="inline-flex items-center gap-1.5 rounded-md border border-gray-200 px-2 py-1 text-xs text-gray-500 hover:bg-gray-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-crimson disabled:opacity-40 dark:border-white/10 dark:text-gray-400 dark:hover:bg-white/5 dark:focus-visible:ring-crimson-light"
@@ -201,7 +206,9 @@ function RowToggle({
           strokeLinejoin="round"
         />
       </svg>
-      <span aria-hidden="true">Usage history</span>
+      {/* The band holds the server's usage history and its runtime settings,
+          so the toggle names neither one. */}
+      <span aria-hidden="true">Details</span>
     </button>
   );
 }
@@ -227,6 +234,11 @@ function normalizeHosts(hosts: AgentRunnerHost[]): AgentRunnerHost[] {
     // must read as "not set" rather than leave the cell and its control to
     // disagree.
     slots_desired: host.slots_desired ?? null,
+    // Runtime settings arrived last of all. Nothing set and nothing reported
+    // are the honest readings of a control plane that sends neither.
+    settings_desired: host.settings_desired ?? {},
+    settings_applied: host.settings_applied ?? null,
+    settings_local: host.settings_local ?? null,
   }));
 }
 
@@ -255,6 +267,10 @@ interface PoolSnapshot {
   executionProfile: string;
   activeHost: string | null;
   runtimeVersions: Record<string, string>;
+  /** Runtime settings set for every server. */
+  hostSettings: HostSettingValues;
+  /** Every runtime setting an admin may set; empty from an older control plane. */
+  hostSettingDefinitions: HostSettingDefinition[];
   observedAt: string | null;
   /** A monotonic reading taken when this snapshot was applied. */
   appliedAtMs: number;
@@ -340,6 +356,8 @@ function HostsView() {
       executionProfile: next.execution_profile ?? DEFAULT_EXECUTION_PROFILE,
       activeHost: next.active_host,
       runtimeVersions: next.runtime_versions ?? {},
+      hostSettings: next.host_settings ?? {},
+      hostSettingDefinitions: next.host_setting_definitions ?? [],
       observedAt: next.observed_at,
       appliedAtMs: monotonicNow(),
     });
@@ -473,6 +491,8 @@ function HostsView() {
 
   const executionProfile = pool?.executionProfile ?? DEFAULT_EXECUTION_PROFILE;
   const runtimeVersions = pool?.runtimeVersions ?? {};
+  const hostSettings = pool?.hostSettings ?? {};
+  const settingDefinitions = pool?.hostSettingDefinitions ?? [];
   // Memoised so the inventory below is not rebuilt on every age tick: the
   // pool object only changes when a response lands.
   const hosts = useMemo(() => pool?.hosts ?? [], [pool]);
@@ -614,6 +634,13 @@ function HostsView() {
   // has taken it up is on the row, where it keeps being true.
   const handleSlots = (host: string, slots: number) =>
     run(() => setAgentRunnerHostSlots(host, slots), null);
+
+  // No notice either: each setting's own line says how far a saved value has
+  // reached, and keeps saying it as the servers take it up.
+  const handleGlobalSetting = (key: string, value: number | null) =>
+    void run(() => setAgentHostSettings({ [key]: value }), null);
+  const handleServerSetting = (host: string, key: string, value: number | null) =>
+    void run(() => setAgentRunnerHostSettings(host, { [key]: value }), null);
 
   const handleRemove = (host: string, slotsUsed: number) => {
     // The unforced call 409s on a busy host, and the operator would then have
@@ -953,6 +980,18 @@ function HostsView() {
                                 openSource.capacity_epoch !== panelEpoch
                               }
                             />
+                            {settingDefinitions.length > 0 && (
+                              <ServerSettingsPanel
+                                name={name}
+                                host={host}
+                                definitions={settingDefinitions}
+                                globalValues={hostSettings}
+                                busy={busy}
+                                onChange={(key, value) =>
+                                  handleServerSetting(host.host, key, value)
+                                }
+                              />
+                            )}
                           </td>
                         </tr>
                       )}
@@ -1198,6 +1237,16 @@ function HostsView() {
             ))}
           </div>
         </div>
+
+        {settingDefinitions.length > 0 && (
+          <GlobalSettingsCard
+            definitions={settingDefinitions}
+            values={hostSettings}
+            hosts={visibleServers.flatMap((server) => (server.host ? [server.host] : []))}
+            busy={busy}
+            onChange={handleGlobalSetting}
+          />
+        )}
       </section>
     </div>
   );

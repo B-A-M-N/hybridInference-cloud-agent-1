@@ -51,9 +51,10 @@ class FakeHostStore(AllCapabilities):
 
     def __init__(self) -> None:
         self.rows: dict[str, dict[str, Any]] = {}
-        # The singleton policy row: two facts, in one place, as in the store.
+        # The singleton policy row: three facts, in one place, as in the store.
         self.active_host: str | None = None
         self.runtime_versions: dict[str, str] = {}
+        self.global_settings: dict[str, Any] = {}
         self.audit = _AuditTrail()
 
     def seed(self, host: str, *, active: bool = False, seen_minutes_ago: float = 0.0) -> None:
@@ -121,6 +122,36 @@ class FakeHostStore(AllCapabilities):
             return "unknown"
         row["slots_desired"] = slots
         return "ok"
+
+    async def host_settings(self) -> dict[str, Any]:
+        return dict(self.global_settings)
+
+    async def set_host_settings(self, *, changes: dict[str, int | None]) -> dict[str, Any]:
+        previous = dict(self.global_settings)
+        self.global_settings = _changed(previous, changes)
+        return previous
+
+    async def set_runner_host_settings(
+        self, *, host: str, changes: dict[str, int | None]
+    ) -> dict[str, Any] | None:
+        # Mirrors the store: an unknown host changes nothing and says so.
+        row = self.rows.get(host)
+        if row is None:
+            return None
+        previous = dict(row.get("settings_desired") or {})
+        row["settings_desired"] = _changed(previous, changes)
+        return previous
+
+
+def _changed(stored: dict[str, Any], changes: dict[str, int | None]) -> dict[str, Any]:
+    """Merge an admin's change the way the store does: None clears one key."""
+    updated = dict(stored)
+    for key, value in changes.items():
+        if value is None:
+            updated.pop(key, None)
+        else:
+            updated[key] = value
+    return updated
 
 
 def _admin_app(store: FakeHostStore | None) -> FastAPI:
@@ -466,6 +497,170 @@ async def test_a_size_change_is_audited_with_both_values(admin_client):
         "old_slots": 3,
         "new_slots": 6,
         "reported": 4,
+    }
+
+
+@pytest.mark.asyncio
+async def test_the_pool_lists_every_setting_an_admin_may_set_with_its_bounds(admin_client):
+    """The page renders the settings from this list, so it cannot drift from the server's."""
+    client, _ = admin_client
+
+    body = (await client.get("/admin/agent/runner-hosts", headers=ADMIN)).json()
+
+    assert body["host_settings"] == {}
+    definitions = {item["key"]: item for item in body["host_setting_definitions"]}
+    assert set(definitions) == {
+        "agent_timeout_s",
+        "chat_idle_timeout_s",
+        "source_import_max_mib",
+        "shared_resident_capacity",
+        "terminal_idle_ttl_s",
+        "terminal_hard_ttl_s",
+        "terminal_max_sessions",
+    }
+    assert definitions["source_import_max_mib"] | {"label": None, "description": None} == {
+        "key": "source_import_max_mib",
+        "env": "AGENT_SOURCE_IMPORT_MAX_MIB",
+        "label": None,
+        "description": None,
+        "unit": "MiB",
+        "default": 1024,
+        "minimum": 1,
+        "maximum": 65536,
+        "scope": "runner",
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_global_setting_is_saved_changed_and_cleared_one_key_at_a_time(admin_client):
+    client, store = admin_client
+
+    response = await client.put(
+        "/admin/agent/host-settings",
+        json={"settings": {"agent_timeout_s": 7200, "terminal_max_sessions": 32}},
+        headers=ADMIN,
+    )
+    assert response.status_code == 200
+    assert response.json()["host_settings"] == {
+        "agent_timeout_s": 7200,
+        "terminal_max_sessions": 32,
+    }
+
+    response = await client.put(
+        "/admin/agent/host-settings", json={"settings": {"agent_timeout_s": None}}, headers=ADMIN
+    )
+    assert response.json()["host_settings"] == {"terminal_max_sessions": 32}
+    assert store.global_settings == {"terminal_max_sessions": 32}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"agent_timeout_s": 59},
+        {"shared_resident_capacity": 129},
+        {"no_such_setting": 1},
+        {"terminal_max_sessions": True},
+        {"terminal_max_sessions": "32"},
+        {},
+    ],
+)
+async def test_a_setting_outside_its_bounds_is_refused_and_nothing_is_stored(
+    admin_client, settings
+):
+    client, store = admin_client
+    store.seed("runner-a")
+
+    for path in ("/admin/agent/host-settings", "/admin/agent/runner-hosts/runner-a/settings"):
+        response = await client.put(path, json={"settings": settings}, headers=ADMIN)
+        assert response.status_code == 422
+
+    assert store.global_settings == {}
+    assert not store.rows["runner-a"].get("settings_desired")
+    assert len(store.audit) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_server_setting_is_kept_on_its_row_and_reported_beside_the_hosts_own(
+    admin_client,
+):
+    client, store = admin_client
+    store.seed("runner-a")
+    store.rows["runner-a"].update(
+        settings_applied={"source_import_max_mib": 1024},
+        settings_local={"source_import_max_mib": 1024},
+    )
+
+    response = await client.put(
+        "/admin/agent/runner-hosts/runner-a/settings",
+        json={"settings": {"source_import_max_mib": 4096}},
+        headers=ADMIN,
+    )
+
+    assert response.status_code == 200
+    (row,) = response.json()["hosts"]
+    # Saved, not yet applied: the host still reports the value it runs with.
+    assert row["settings_desired"] == {"source_import_max_mib": 4096}
+    assert row["settings_applied"] == {"source_import_max_mib": 1024}
+    assert row["settings_local"] == {"source_import_max_mib": 1024}
+
+
+@pytest.mark.asyncio
+async def test_setting_an_unknown_server_is_a_404(admin_client):
+    client, _ = admin_client
+
+    response = await client.put(
+        "/admin/agent/runner-hosts/nope/settings",
+        json={"settings": {"agent_timeout_s": 900}},
+        headers=ADMIN,
+    )
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_a_value_no_host_could_apply_is_not_shown_as_set(admin_client):
+    """What the page shows is what the heartbeat would send, nothing more."""
+    client, store = admin_client
+    store.seed("runner-a")
+    store.global_settings = {"terminal_max_sessions": 0, "retired": 3, "agent_timeout_s": 900}
+    store.rows["runner-a"]["settings_desired"] = {"agent_timeout_s": 10**9}
+
+    body = (await client.get("/admin/agent/runner-hosts", headers=ADMIN)).json()
+
+    assert body["host_settings"] == {"agent_timeout_s": 900}
+    assert body["hosts"][0]["settings_desired"] == {}
+
+
+@pytest.mark.asyncio
+async def test_setting_changes_are_audited_with_the_old_and_new_values(admin_client):
+    client, store = admin_client
+    store.seed("runner-a")
+    store.global_settings = {"agent_timeout_s": 7200}
+    store.rows["runner-a"]["settings_desired"] = {"terminal_max_sessions": 8}
+
+    await client.put(
+        "/admin/agent/host-settings",
+        json={"settings": {"agent_timeout_s": 900, "chat_idle_timeout_s": 600}},
+        headers=ADMIN,
+    )
+    await client.put(
+        "/admin/agent/runner-hosts/runner-a/settings",
+        json={"settings": {"terminal_max_sessions": None}},
+        headers=ADMIN,
+    )
+
+    global_entry, server_entry = store.audit[-2], store.audit[-1]
+    assert global_entry["action"] == "agent.host_settings.set"
+    assert global_entry["details"] == {
+        "changes": {"agent_timeout_s": 900, "chat_idle_timeout_s": 600},
+        "old_values": {"agent_timeout_s": 7200, "chat_idle_timeout_s": None},
+    }
+    assert server_entry["action"] == "agent.runner_host.set_settings"
+    assert server_entry["details"] == {
+        "host": "runner-a",
+        "changes": {"terminal_max_sessions": None},
+        "old_values": {"terminal_max_sessions": 8},
     }
 
 
