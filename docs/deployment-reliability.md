@@ -22,35 +22,29 @@ pins. A failure leaves the old marker and runners alone. The checks on the
 actual replacement runners, relays and broker still run before mark-ready;
 their failure uses the existing recorded-generation recovery.
 
-The host now qualifies Kata before polling for turns and can reuse that proof
-for up to 60 seconds. Its original Docker HTTP connection must remain live
-without reconnecting, and the current image ID, runtime configuration, host
-kernel, deployment marker, backend settings and installer epoch must still
-match. A restart or change requires a new full probe. The installer marks its
-root-owned epoch `updating` before any runtime mutation and `ready` only after
-verification; an updating or malformed epoch blocks acceptance. Existing hosts
-initialize the epoch during deployment after their normal runtime check.
-
-The proof is renewed only while turns are being claimed: each claim keeps it
-fresh for the next ten minutes, renewing it 15 seconds before expiry, including
-while every slot is busy. Past that window an idle host lets it lapse instead of
-booting a probe VM every minute, and the next turn runs its own full preflight,
-which reopens the window. A deployment still marked `pending:<sha>` has no proof
-and reports no failure; the readiness gate waits it out. A failed qualification
-stops claims until a probe succeeds, is reported once, and is probed again on a
-backoff of five seconds doubling to five minutes, whether or not turns are
-still wanted: the failure withdrew the host's guest-kernel attestation, so it
-must not resume claiming without one. Probe containers carry
+The host service proves its Kata runtime itself, instead of every turn's child
+booting a probe guest of its own. It runs the full probe when it starts, again
+whenever the installer's root-owned epoch or the sandbox image changes, and at
+least every 30 minutes, which bounds how long a change made outside the
+installer can go unnoticed. A Docker restart restarts the runner with it, so the
+new process proves the runtime from the start. The installer marks its epoch
+`updating` before any runtime mutation and `ready` only after verification; an
+updating or malformed epoch blocks acceptance. Existing hosts initialize the
+epoch during deployment after their normal runtime check. A failed probe stops
+claims until one succeeds, is reported once, and is retried on a backoff of five
+seconds doubling to five minutes. Probe containers carry
 `org.freeinference.chat-probe-created`, so the broker never adopts one as an
 orphan chat; the next probe removes any its namespace abandoned over an hour ago.
 
-Each child obtains evidence through a private inherited socket, checks its
-configuration and the proof's five-second handoff lifetime, then verifies the
-current host network before accepting its turn. Claims cannot supply a proof.
-Missing epoch or unsupported Docker transport retains full per-turn preflight.
-No-payload deployment canaries always run the full probe. That probe reads the
-guest kernel from the same temporary container that exercises member isolation
-and observer delivery, avoiding a second VM boot.
+Each child receives the verdict inside the turn payload the host already writes
+to its standard input. The host adds it after the claim's own underscore keys
+are stripped, so a claim cannot supply one. The child reads the epoch again,
+declining while an update is in progress and probing for itself if the epoch
+changed, then verifies the current host network before accepting its turn. A
+missing epoch keeps the full per-turn preflight. No-payload deployment canaries
+always run the full probe. That probe reads the guest kernel from the same
+temporary container that exercises member isolation and observer delivery,
+avoiding a second VM boot.
 
 Network rule reads share a disposable helper; route reads keep their separate,
 capability-free helper. Group reconciliation reuses inspections only within

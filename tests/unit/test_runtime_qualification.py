@@ -1,16 +1,10 @@
-"""Runtime reuse follows a living daemon connection, not a reusable daemon ID."""
+"""The host proves its Kata runtime once, again only on change, and its children inherit that."""
 
 from __future__ import annotations
 
-import contextlib
-import http.server
 import json
 import os
-import socket
-import socketserver
 import stat
-import threading
-import time
 import uuid
 from types import SimpleNamespace
 
@@ -20,49 +14,9 @@ from cloud_agent_host import runtime_qualification as qualification
 from cloud_agent_host.sandbox import KATA_RUNTIME, ContainerBackend, ProcessBackend, SandboxError
 
 
-class Daemon(socketserver.ThreadingUnixStreamServer):
-    daemon_threads = True
-
-    def __init__(self, path):
-        self.connections = []
-        self.info = {
-            "ID": "unchanged-daemon-id",
-            "ServerVersion": "28.0",
-            "KernelVersion": "host-kernel",
-            "Runtimes": {KATA_RUNTIME: {"path": "kata-shim"}},
-        }
-        self.image = {"Id": "sha256:original-image"}
-        self.close_response = False
-        self.status = 200
-        super().__init__(str(path), Handler)
-
-    def disconnect(self):
-        for connection in self.connections:
-            with contextlib.suppress(OSError):
-                connection.shutdown(socket.SHUT_RDWR)
-                connection.close()
-        self.connections.clear()
-
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def setup(self):
-        super().setup()
-        self.server.connections.append(self.connection)
-
-    def do_GET(self):
-        document = self.server.info if self.path == "/info" else self.server.image
-        raw = json.dumps(document).encode()
-        self.send_response(self.server.status)
-        self.send_header("Content-Length", str(len(raw)))
-        if self.server.close_response:
-            self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(raw)
-
-    def log_message(self, *_args):
-        pass
+def _write_epoch(path, *, state="ready"):
+    path.write_text(json.dumps({"version": 1, "state": state, "generation": str(uuid.uuid4())}))
+    path.chmod(0o644)
 
 
 @pytest.fixture
@@ -78,21 +32,16 @@ def lab(tmp_path, monkeypatch):
     runtime = tmp_path / "runtime"
     runtime.mkdir(mode=0o700)
     epoch = runtime / "epoch.json"
-    epoch.write_text(json.dumps({"version": 1, "state": "ready", "generation": str(uuid.uuid4())}))
-    epoch.chmod(0o644)
-    ready = tmp_path / "ready"
-    ready.write_text("deployment-a")
-    ready.chmod(0o644)
-    # macOS Unix socket paths are limited to roughly one hundred bytes.
-    path = f"/tmp/ca-qual-{uuid.uuid4().hex[:12]}.sock"
-    daemon = Daemon(path)
-    thread = threading.Thread(target=daemon.serve_forever, daemon=True)
-    thread.start()
-    monkeypatch.setenv("DOCKER_HOST", f"unix://{path}")
-    for name in ("DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"):
-        monkeypatch.delenv(name, raising=False)
+    _write_epoch(epoch)
+    image = {"id": "sha256:original-image", "inspections": 0}
+
+    def image_id(_backend):
+        image["inspections"] += 1
+        return image["id"]
+
+    monkeypatch.setattr(qualification, "_image_id", image_id)
     backend = ContainerBackend(image="fixture@sha256:abc", runtime=KATA_RUNTIME)
-    probes = []
+    probes: list[str] = []
 
     def preflight(*, check_network=True):
         assert check_network is False, "mutable network verification remains per turn"
@@ -101,153 +50,131 @@ def lab(tmp_path, monkeypatch):
 
     monkeypatch.setattr(backend, "preflight", preflight)
     monkeypatch.setattr(backend, "version_stamp", lambda: dict(backend._kernel_probe))
-    authority = qualification.HostQualification(
-        backend,
-        deployment_sha="deployment-a",
-        readiness_path=str(ready),
-        runtime_state_path=str(epoch),
-    )
-    yield SimpleNamespace(
-        backend=backend, daemon=daemon, authority=authority, probes=probes, epoch=epoch, ready=ready
-    )
-    authority.close()
-    daemon.disconnect()
-    daemon.shutdown()
-    daemon.server_close()
-    thread.join(timeout=2)
-    with contextlib.suppress(FileNotFoundError):
-        os.unlink(path)
+    host = qualification.HostQualification(backend, runtime_state_path=str(epoch))
+    return SimpleNamespace(backend=backend, host=host, probes=probes, epoch=epoch, image=image)
 
 
-def _request(lab, *, backend=None):
-    parent, child = socket.socketpair()
-    thread = threading.Thread(target=lab.authority.serve, args=(parent,))
-    thread.start()
-    try:
-        return qualification.use_qualification(
-            backend or lab.backend,
-            child,
-            deployment_sha="deployment-a",
-            readiness_path=str(lab.ready),
-            runtime_state_path=str(lab.epoch),
-        )
-    finally:
-        child.close()
-        thread.join(timeout=2)
-        parent.close()
-        assert not thread.is_alive()
+def _child(lab, verdict, *, backend=None):
+    """Adopt ``verdict`` the way a turn process would, on a backend of its own."""
+    child = backend or ContainerBackend(image="fixture@sha256:abc", runtime=KATA_RUNTIME)
+    adopted = qualification.adopt_verdict(child, verdict, runtime_state_path=str(lab.epoch))
+    return adopted, child
 
 
-def test_one_full_probe_is_reused_only_through_a_private_handoff(lab):
-    assert lab.authority.refresh()
+def test_one_probe_serves_every_turn_until_something_changes(lab):
+    assert lab.host.refresh()
+    verdicts = []
     for _ in range(3):
-        assert lab.authority.refresh()
-        assert _request(lab)
+        assert lab.host.refresh()
+        verdicts.append(lab.host.verdict())
     assert lab.probes == ["probe"]
-    assert len(lab.daemon.connections) == 1
-    assert lab.backend._kernel_probe["guest_kernel"] == "guest-kernel"
+    adopted, child = _child(lab, verdicts[-1])
+    assert adopted
+    assert child._kernel_probe["guest_kernel"] == "guest-kernel"
+    assert verdicts[0] == verdicts[-1]
 
 
-def test_daemon_restart_with_same_id_and_version_requires_a_new_full_probe(lab):
-    assert lab.authority.refresh()
-    lab.daemon.disconnect()
-    assert lab.authority.refresh()
-    assert lab.probes == ["probe", "probe"]
-    assert _request(lab)
+def test_a_verdict_survives_the_json_handoff(lab):
+    """The child reads the verdict back from the turn payload on its stdin."""
+    assert lab.host.refresh()
+    adopted, _child_backend = _child(lab, json.loads(json.dumps(lab.host.verdict())))
+    assert adopted
 
 
-def test_handover_after_daemon_restart_refuses_before_a_new_probe(lab):
-    assert lab.authority.refresh()
-    lab.daemon.disconnect()
-    with pytest.raises(SandboxError, match="refused"):
-        _request(lab)
-    assert lab.probes == ["probe"], "serve must remain bounded and not boot a probe VM"
-
-
-def test_replaced_socket_path_cannot_reuse_a_still_living_old_connection(lab):
-    assert lab.authority.refresh()
-    path = lab.authority._connection.path
-    os.unlink(path)
-    # The first fake daemon and its established connection still live, but
-    # a CLI using the pathname would no longer reach that daemon.
-    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        replacement.bind(path)
-        assert _request(lab) is False
-        assert lab.probes == ["probe"]
-    finally:
-        replacement.close()
-
-
-@pytest.mark.parametrize(
-    "change", ["image", "runtime", "epoch", "ready", "configuration", "expiry"]
-)
-def test_each_environment_change_requires_a_fresh_probe(lab, change):
-    assert lab.authority.refresh()
-    if change == "image":
-        lab.daemon.image["Id"] = "sha256:replacement-image"
-    elif change == "runtime":
-        lab.daemon.info["Runtimes"][KATA_RUNTIME]["path"] = "new-shim"
-    elif change == "epoch":
-        lab.epoch.write_text(
-            json.dumps({"version": 1, "state": "ready", "generation": str(uuid.uuid4())})
-        )
-    elif change == "ready":
-        lab.ready.write_text("deployment-a")
-    elif change == "configuration":
-        lab.backend.extra_args.append("--cpus=2")
+@pytest.mark.parametrize("change", ["epoch", "image", "recheck"])
+def test_each_visible_change_requires_a_new_probe(lab, change):
+    assert lab.host.refresh()
+    if change == "epoch":
+        _write_epoch(lab.epoch)
+    elif change == "image":
+        lab.image["id"] = "sha256:rebuilt-image"
     else:
-        lab.authority._evidence["expires_mono"] = time.monotonic() - 1
-    assert lab.authority.refresh()
+        lab.host._checked_at -= qualification.RECHECK_S
+    if change != "recheck":
+        assert lab.host.verdict() is None, "a turn handed over now probes for itself"
+    assert lab.host.refresh()
     assert lab.probes == ["probe", "probe"]
+    assert lab.host.verdict() is not None
 
 
-@pytest.mark.parametrize("failure", ["disconnect", "image_change", "epoch_change", "probe_error"])
-def test_failed_or_changed_probe_never_leaves_usable_evidence(lab, monkeypatch, failure):
+def test_a_verdict_from_before_an_update_is_not_adopted(lab):
+    assert lab.host.refresh()
+    verdict = lab.host.verdict()
+    _write_epoch(lab.epoch)
+    adopted, child = _child(lab, verdict)
+    assert not adopted, "the verdict describes a runtime that is no longer installed"
+    assert child._kernel_probe["guest_kernel"] is None
+
+
+@pytest.mark.parametrize("failure", ["epoch_change", "image_change", "probe_error"])
+def test_a_change_during_the_probe_leaves_no_verdict(lab, monkeypatch, failure):
     def preflight(*, check_network):
         lab.backend._kernel_probe["guest_kernel"] = "guest-kernel"
-        if failure == "disconnect":
-            lab.daemon.disconnect()
+        if failure == "epoch_change":
+            _write_epoch(lab.epoch)
         elif failure == "image_change":
-            lab.daemon.image["Id"] = "sha256:changed-during-probe"
-        elif failure == "epoch_change":
-            lab.ready.write_text("pending:deployment-a")
+            lab.image["id"] = "sha256:rebuilt-during-probe"
         else:
             raise SandboxError("probe failed")
 
     monkeypatch.setattr(lab.backend, "preflight", preflight)
     with pytest.raises(SandboxError):
-        lab.authority.refresh()
-    assert lab.authority._evidence is None
-    assert lab.authority._connection is None
+        lab.host.refresh()
+    assert lab.host.verdict() is None
 
 
-def test_server_connection_close_cannot_be_replaced_silently(lab):
-    lab.daemon.close_response = True
-    with pytest.raises(SandboxError, match="unusable response"):
-        lab.authority.refresh()
-    assert not lab.probes
-    assert lab.authority._evidence is None
+def test_a_failing_probe_backs_off_instead_of_running_on_every_poll(lab, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(qualification.time, "monotonic", lambda: clock[0])
+    failing = [True]
+
+    def preflight(*, check_network):
+        lab.probes.append("probe")
+        lab.backend._kernel_probe = {"host_kernel": os.uname().release, "guest_kernel": None}
+        if failing[0]:
+            raise SandboxError("observer self-test failed")
+        lab.backend._kernel_probe["guest_kernel"] = "guest-kernel"
+
+    monkeypatch.setattr(lab.backend, "preflight", preflight)
+    for _ in range(3):
+        with pytest.raises(SandboxError, match="self-test"):
+            lab.host.refresh()
+    assert lab.probes == ["probe"], "a failed probe is not repeated inside its backoff"
+    clock[0] += qualification.LAUNCH_BACKOFF_S
+    with pytest.raises(SandboxError, match="self-test"):
+        lab.host.refresh()
+    assert lab.probes == ["probe", "probe"]
+    clock[0] += qualification.LAUNCH_BACKOFF_S
+    with pytest.raises(SandboxError, match="self-test"):
+        lab.host.refresh()
+    assert lab.probes == ["probe", "probe"], "each failure doubles the wait"
+    clock[0] += qualification.LAUNCH_BACKOFF_S
+    failing[0] = False
+    assert lab.host.refresh()
+    assert lab.probes == ["probe", "probe", "probe"]
+    assert lab.host.verdict() is not None, "a recovered runtime is reused at once"
 
 
-def test_missing_epoch_unsupported_daemon_and_non_kata_fall_back(lab, monkeypatch):
+def test_without_an_epoch_or_kata_every_child_probes_for_itself(lab):
     lab.epoch.unlink()
-    assert lab.authority.refresh() is False
-    assert _request(lab) is False
+    assert lab.host.refresh() is False
+    assert lab.host.verdict() is None
     assert not lab.probes
-    monkeypatch.setenv("DOCKER_HOST", "tcp://elsewhere:2375")
-    assert lab.authority.refresh() is False
-    assert _request(lab, backend=ProcessBackend(acknowledged_unsafe=True)) is False
+    runc = ContainerBackend(image="fixture", runtime="runc")
+    assert qualification.HostQualification(runc).refresh() is False
+    adopted, _child_backend = _child(lab, {"guest_kernel": "guest"}, backend=runc)
+    assert not adopted
+    assert qualification.adopt_verdict(ProcessBackend(acknowledged_unsafe=True), {}) is False
 
 
-def test_runtime_update_blocks_reuse_and_full_probe(lab, monkeypatch):
-    lab.epoch.write_text(
-        json.dumps({"version": 1, "state": "updating", "generation": str(uuid.uuid4())})
-    )
+def test_a_runtime_update_stops_claims_turns_and_full_probes(lab, monkeypatch):
+    assert lab.host.refresh()
+    verdict = lab.host.verdict()
+    _write_epoch(lab.epoch, state="updating")
     with pytest.raises(SandboxError, match="being updated"):
-        lab.authority.refresh()
+        lab.host.refresh()
     with pytest.raises(SandboxError, match="being updated"):
-        _request(lab)
+        _child(lab, verdict)
     monkeypatch.setattr(
         qualification,
         "check_runtime_state",
@@ -257,14 +184,39 @@ def test_runtime_update_blocks_reuse_and_full_probe(lab, monkeypatch):
         ContainerBackend(image="fixture", runtime=KATA_RUNTIME).preflight()
 
 
-def test_runtime_update_does_not_block_an_unrelated_runc_backend(lab):
-    lab.epoch.write_text(
-        json.dumps({"version": 1, "state": "updating", "generation": str(uuid.uuid4())})
+@pytest.mark.parametrize(
+    "verdict",
+    [
+        None,
+        "not-a-verdict",
+        {"epoch": "stale"},
+        {"guest_kernel": None},
+        {"guest_kernel": ""},
+        {"guest_kernel": os.uname().release},
+    ],
+)
+def test_a_child_probes_for_itself_rather_than_trust_an_unusable_verdict(lab, verdict):
+    if isinstance(verdict, dict) and "epoch" not in verdict:
+        verdict = {**verdict, "epoch": qualification.check_runtime_state(str(lab.epoch))}
+    adopted, child = _child(lab, verdict)
+    assert not adopted
+    assert child._kernel_probe["guest_kernel"] is None
+
+
+def test_the_image_id_comes_from_docker_or_not_at_all(monkeypatch):
+    backend = ContainerBackend(image="fixture", runtime=KATA_RUNTIME)
+    answers = iter(
+        [
+            SimpleNamespace(returncode=0, stdout="sha256:abc\n", stderr=""),
+            SimpleNamespace(returncode=1, stdout="", stderr="No such image"),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ]
     )
-    lab.backend.runtime = "runc"
-    assert lab.authority.refresh() is False
-    assert _request(lab) is False
-    assert not lab.probes
+    monkeypatch.setattr(qualification.subprocess, "run", lambda *a, **k: next(answers))
+    assert qualification._image_id(backend) == "sha256:abc"
+    for _ in range(2):
+        with pytest.raises(SandboxError, match="could not be inspected"):
+            qualification._image_id(backend)
 
 
 @pytest.mark.parametrize(
@@ -296,177 +248,3 @@ def test_runtime_marker_must_be_root_owned():
     observed = SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=1234)
     with pytest.raises(SandboxError, match="ownership"):
         qualification._require_safe_mode(observed, directory=False, root=True)
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("guest_kernel", None),
-        ("guest_kernel", os.uname().release),
-        ("issued_mono", -1),
-        ("expires_mono", float("inf")),
-        ("expires_mono", True),
-        ("local", {}),
-        ("nonce", "wrong"),
-    ],
-)
-def test_child_rejects_malformed_stale_or_mismatched_evidence(lab, field, value):
-    assert lab.authority.refresh()
-    parent, child = socket.socketpair()
-
-    def answer():
-        request = qualification._receive(parent)
-        proof = {
-            "version": 1,
-            "nonce": request["nonce"],
-            "qualified": True,
-            **lab.authority._evidence,
-            "issued_mono": time.monotonic(),
-            field: value,
-        }
-        qualification._send(parent, proof)
-
-    thread = threading.Thread(target=answer)
-    thread.start()
-    try:
-        with pytest.raises(SandboxError):
-            qualification.use_qualification(
-                lab.backend,
-                child,
-                deployment_sha="deployment-a",
-                readiness_path=str(lab.ready),
-                runtime_state_path=str(lab.epoch),
-            )
-    finally:
-        child.close()
-        thread.join(timeout=2)
-        parent.close()
-
-
-def test_expiry_between_refresh_and_handoff_requests_full_child_probe(lab):
-    assert lab.authority.refresh()
-    lab.authority._evidence["expires_mono"] = time.monotonic() - 1
-    assert _request(lab) is False
-    assert lab.probes == ["probe"]
-
-
-def test_an_idle_host_lets_its_proof_lapse_instead_of_booting_a_probe(lab):
-    """A probe VM every minute for a proof nobody uses is the cost being avoided."""
-    assert lab.authority.refresh()
-    lab.authority._wanted_until = time.monotonic() - 1
-    assert lab.authority.refresh(), "a proof that is still current keeps serving"
-    lab.authority._evidence["expires_mono"] = time.monotonic() - 1
-    assert lab.authority.refresh() is False
-    assert _request(lab) is False, "the next turn runs its own full preflight"
-    assert lab.probes == ["probe"]
-    lab.authority.note_demand()
-    assert lab.authority.refresh()
-    assert lab.probes == ["probe", "probe"]
-
-
-def test_a_proof_is_renewed_before_it_could_expire_during_a_handoff(lab):
-    assert lab.authority.refresh()
-    assert not lab.authority.renewal_due()
-    lab.authority._evidence["expires_mono"] = time.monotonic() + qualification._RENEW_MARGIN_S - 1
-    assert lab.authority.renewal_due()
-    assert lab.authority.refresh()
-    assert lab.probes == ["probe", "probe"]
-    assert not lab.authority.renewal_due()
-    lab.authority._evidence["expires_mono"] = time.monotonic() + qualification._HANDOFF_TTL_S - 1
-    assert _request(lab) is False, "a proof that could lapse mid-handoff is not handed over"
-    assert lab.authority.renewal_due(), "the dropped proof is renewed before the next claim"
-    lab.authority._wanted_until = time.monotonic() - 1
-    assert not lab.authority.renewal_due(), "an idle host is never due"
-
-
-def test_a_failing_qualification_backs_off_instead_of_probing_every_poll(lab, monkeypatch):
-    clock = [1000.0]
-    monkeypatch.setattr(qualification.time, "monotonic", lambda: clock[0])
-    lab.authority.note_demand()
-    failing = [True]
-
-    def preflight(*, check_network):
-        lab.probes.append("probe")
-        lab.backend._kernel_probe = {"host_kernel": os.uname().release, "guest_kernel": "guest"}
-        if failing[0]:
-            raise SandboxError("observer self-test failed")
-
-    monkeypatch.setattr(lab.backend, "preflight", preflight)
-    for _ in range(3):
-        with pytest.raises(SandboxError, match="self-test"):
-            lab.authority.refresh()
-    assert lab.probes == ["probe"], "a failed probe is not repeated inside its backoff"
-    clock[0] += qualification.LAUNCH_BACKOFF_S
-    with pytest.raises(SandboxError, match="self-test"):
-        lab.authority.refresh()
-    assert lab.probes == ["probe", "probe"]
-    clock[0] += qualification.LAUNCH_BACKOFF_S
-    with pytest.raises(SandboxError, match="self-test"):
-        lab.authority.refresh()
-    assert lab.probes == ["probe", "probe"], "each failure doubles the wait"
-    clock[0] += qualification.LAUNCH_BACKOFF_S
-    failing[0] = False
-    assert lab.authority.refresh()
-    assert lab.probes == ["probe", "probe", "probe"]
-    assert _request(lab), "a recovered runtime is reused at once"
-
-
-def test_a_failed_qualification_is_retried_after_demand_lapses(lab, monkeypatch):
-    """A failure must not end in a host that looks healthy and never works again.
-
-    A failed probe withdraws the guest-kernel attestation, and a failing host
-    claims nothing, so no claim ever renews demand. Letting the proof lapse
-    then would resume claiming without the attestation, receive no Kata work
-    and never probe again.
-    """
-    clock = [1000.0]
-    monkeypatch.setattr(qualification.time, "monotonic", lambda: clock[0])
-    failing = [True]
-
-    def preflight(*, check_network):
-        lab.probes.append("probe")
-        lab.backend._kernel_probe = {"host_kernel": os.uname().release, "guest_kernel": None}
-        if failing[0]:
-            raise SandboxError("observer self-test failed")
-        lab.backend._kernel_probe["guest_kernel"] = "guest-kernel"
-
-    monkeypatch.setattr(lab.backend, "preflight", preflight)
-    lab.authority.note_demand()
-    with pytest.raises(SandboxError, match="self-test"):
-        lab.authority.refresh()
-    clock[0] += qualification.WARM_FOR_S
-    assert lab.authority.renewal_due(), "a host that is full of old turns retries too"
-    with pytest.raises(SandboxError, match="self-test"):
-        lab.authority.refresh()
-    assert lab.probes == ["probe", "probe"]
-    clock[0] += qualification.LAUNCH_BACKOFF_CAP_S
-    failing[0] = False
-    assert lab.authority.refresh() is True
-    assert lab.backend._kernel_probe["guest_kernel"] == "guest-kernel"
-
-
-def test_a_deployment_that_is_not_published_yet_is_not_a_failure(lab):
-    """Every rollout spends a while on ``pending:<sha>``; the claim gate waits it out."""
-    lab.ready.write_text("pending:deployment-a")
-    assert lab.authority.refresh() is False
-    assert not lab.authority.renewal_due(), "a full host must not poll Docker for nothing"
-    assert _request(lab) is False
-    assert not lab.probes
-    lab.ready.write_text("deployment-a")
-    assert lab.authority.refresh()
-    assert lab.probes == ["probe"]
-
-
-def test_partial_messages_cannot_restart_the_handover_deadline(monkeypatch):
-    elapsed = [0.0]
-    timeouts = []
-
-    def read(_size):
-        elapsed[0] += 30
-        return b"x"
-
-    channel = SimpleNamespace(settimeout=timeouts.append, recv=read)
-    monkeypatch.setattr(qualification.time, "monotonic", lambda: elapsed[0])
-    with pytest.raises(SandboxError, match="timed out"):
-        qualification._receive(channel)
-    assert timeouts == [45, 15]

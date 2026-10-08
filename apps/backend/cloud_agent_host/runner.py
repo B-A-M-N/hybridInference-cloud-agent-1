@@ -97,7 +97,7 @@ from cloud_agent_host.patch_gate import branch_name_for
 from cloud_agent_host.profiling_policy import ProfilingPolicySync
 from cloud_agent_host.resident_transport import ResidentLaunch
 from cloud_agent_host.resources import shared_member_resource_rollup
-from cloud_agent_host.runtime_qualification import HostQualification, use_qualification
+from cloud_agent_host.runtime_qualification import VERDICT_KEY, HostQualification, adopt_verdict
 from cloud_agent_host.runtime_settings import RuntimeSettings
 from cloud_agent_host.runtimes import (
     AgentRuntime,
@@ -3053,9 +3053,12 @@ def _spawn_turn(
     alive is not evidence of anything — the turn stays claimed and its lease
     remains the backstop.
     """
-    # Only the trusted parent can supply qualification. No claim field or
-    # environment switch can bypass the child's full fallback preflight.
-    parent_socket, child_socket = socket.socketpair() if qualification is not None else (None, None)
+    child = _child_turn_payload(payload)
+    verdict = qualification.verdict() if qualification is not None else None
+    if verdict is not None:
+        # Added after the claim's own underscore keys were stripped: only this
+        # host, which proved the runtime itself, can spare the child the probe.
+        child[VERDICT_KEY] = verdict
     read_fd, write_fd = os.pipe()
     argv = [
         sys.executable,
@@ -3077,64 +3080,36 @@ def _spawn_turn(
         "--agent-timeout",
         str(agent_timeout_s),
     ]
-    pass_fds: tuple[int, ...] = (write_fd,)
-    if child_socket is not None:
-        argv.extend(["--qualification-fd", str(child_socket.fileno())])
-        pass_fds += (child_socket.fileno(),)
     try:
         process = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
-            pass_fds=pass_fds,
+            pass_fds=(write_fd,),
         )
     except OSError as exc:
         os.close(read_fd)
         os.close(write_fd)
-        if parent_socket is not None:
-            parent_socket.close()
-        if child_socket is not None:
-            child_socket.close()
         return LaunchResult(
             outcome=LAUNCH_NOT_STARTED, detail=f"could not start a turn process: {exc}"
         )
     # This process's copy, closed so the read below ends at end-of-file when
     # the child exits rather than waiting out the handover deadline.
     os.close(write_fd)
-    if child_socket is not None:
-        child_socket.close()
     try:
         assert process.stdin is not None
         # Most underscore-prefixed keys are parent bookkeeping. Profiling is
         # the one intentional child handoff: stripping it makes the deployed
         # multi-process path silently measure nothing.
-        process.stdin.write(encode_turn(_child_turn_payload(payload)))
+        process.stdin.write(encode_turn(child))
         process.stdin.close()
     except OSError as exc:
         os.close(read_fd)
-        if parent_socket is not None:
-            parent_socket.close()
         _reap_unstarted(process)
         return LaunchResult(
             outcome=LAUNCH_NOT_STARTED, detail=f"the turn could not be delivered: {exc}"
         )
 
-    handover_started = time.monotonic()
-    if parent_socket is not None:
-        with parent_socket:
-            try:
-                assert qualification is not None
-                qualification.serve(parent_socket)
-            except Exception:
-                # Closing the private channel makes the child fall back or
-                # decline. Only its handover answer decides ownership.
-                logger.warning("agent_qualification_handover_failed", exc_info=True)
-
-    # Qualification shares the existing ownership deadline; a stalled proof
-    # must not add a second full wait before the host reports uncertainty.
-    answer = read_handover(
-        read_fd,
-        timeout_s=max(0.0, HANDOVER_TIMEOUT_S - (time.monotonic() - handover_started)),
-    )
+    answer = read_handover(read_fd)
     if answer is None:
         return LaunchResult(
             outcome=LAUNCH_UNCERTAIN,
@@ -3177,7 +3152,6 @@ def _serve_turn(
     lease_ttl: float,
     agent_timeout_s: float,
     host: str | None,
-    qualification_fd: int | None = None,
 ) -> int:
     """Run the one turn delivered on standard input, or decline having none.
 
@@ -3209,37 +3183,14 @@ def _serve_turn(
             measurement = operation_profiling.attach_selection(payload.get("_profiling"))
 
     # Empty or undecodable input always exercises the full deployment canary.
-    # A real turn may reuse the parent's live runtime proof; mutable network
-    # rules are still verified here before accepting ownership.
+    # A real turn may carry the host's runtime verdict, so the child repeats
+    # only what can change between turns: the update marker and the network.
     operation_profiling.mark(measurement, "preflight")
     try:
-        with (
-            operation_profiling.span(measurement, "preflight"),
-            contextlib.ExitStack() as resources,
-        ):
-            channel = (
-                resources.enter_context(socket.socket(fileno=qualification_fd))
-                if qualification_fd is not None
-                else None
-            )
-            if payload is None and channel is not None:
-                channel.close()
+        with operation_profiling.span(measurement, "preflight"):
             backend = build_backend_from_env()
-            if not isinstance(backend, ContainerBackend) and channel is not None:
-                channel.close()
-            qualified = (
-                payload is not None
-                and channel is not None
-                and isinstance(backend, ContainerBackend)
-                and use_qualification(
-                    backend,
-                    channel,
-                    deployment_sha=(os.environ.get("AGENT_DEPLOYMENT_SHA") or "").strip(),
-                    readiness_path=_shared_live_ready_file(),
-                )
-            )
-            if qualified:
-                assert isinstance(backend, ContainerBackend)
+            verdict = payload.get(VERDICT_KEY) if payload is not None else None
+            if isinstance(backend, ContainerBackend) and adopt_verdict(backend, verdict):
                 backend.check_network()
             else:
                 backend.preflight()
@@ -3327,7 +3278,17 @@ def run_forever(
     never creates or bind-mounts a host worktree.
     """
     backend = backend or build_backend_from_env()
-    backend.preflight()
+    # The host proves its runtime here, once, and its children inherit that
+    # verdict rather than each booting a probe guest of its own.
+    qualification = (
+        HostQualification(backend)
+        if isinstance(backend, ContainerBackend) and spawn_turn is None
+        else None
+    )
+    if qualification is not None and qualification.refresh():
+        qualification.backend.check_network()
+    else:
+        backend.preflight()
 
     checker = getattr(backend, "check_gateway_reachable", None)
     if checker is not None:
@@ -3376,15 +3337,6 @@ def run_forever(
             "configure AGENT_ENROLL_TOKEN or a persisted host credential"
         )
 
-    qualification = (
-        HostQualification(
-            backend,
-            deployment_sha=(os.environ.get("AGENT_DEPLOYMENT_SHA") or "").strip(),
-            readiness_path=_shared_live_ready_file(),
-        )
-        if isinstance(backend, ContainerBackend) and spawn_turn is None
-        else None
-    )
     qualification_error = ""
     launch = spawn_turn or (
         lambda payload: _spawn_turn(
@@ -3514,8 +3466,6 @@ def run_forever(
             capacity.stop()
         if settings_broker is not None:
             settings_broker.close()
-        if qualification is not None:
-            qualification.close()
 
     print(
         f"agent runner {worker_id} serving host {identity.host} (enrolled; "
@@ -3585,14 +3535,16 @@ def run_forever(
             if not pool.claimable:
                 time.sleep(idle_wait)
                 continue
-            may_claim = turns.may_claim(limit)
-            # A host with no free slot renews only as its proof nears expiry,
-            # so the slot that frees next is not kept waiting by a probe.
-            if qualification is not None and (may_claim or qualification.renewal_due()):
+            if not turns.may_claim(limit):
+                # A freed local slot should be noticed promptly. This does
+                # not increase empty-queue polls or retry traffic to the API.
+                slot_wait = min(idle_wait, 1.0) if turns.running() >= limit else idle_wait
+                time.sleep(slot_wait)
+                continue
+            if qualification is not None:
                 try:
                     qualification.refresh()
-                    assert isinstance(backend, ContainerBackend)
-                    stamp = backend.version_stamp()
+                    stamp = qualification.backend.version_stamp()
                 except SandboxError as exc:
                     # Reported once per reason. The retry already backs off
                     # inside refresh(); a traceback and an extra beat on every
@@ -3607,12 +3559,6 @@ def run_forever(
                 if qualification_error:
                     qualification_error = ""
                     pool.wake()
-            if not may_claim:
-                # A freed local slot should be noticed promptly. This does
-                # not increase empty-queue polls or retry traffic to the API.
-                slot_wait = min(idle_wait, 1.0) if turns.running() >= limit else idle_wait
-                time.sleep(slot_wait)
-                continue
             # Always gate claims after refreshing the image attestation. A
             # cached invalid image must not prevent qualification of a repair.
             # Keep the old control plane safe during a parallel rollout. It
@@ -3677,10 +3623,6 @@ def run_forever(
                 time.sleep(idle_wait)
                 continue
 
-            if qualification is not None:
-                # Turns arrive in conversations: keep the proof fresh for the
-                # ones likely to follow this, and let it lapse once they stop.
-                qualification.note_demand()
             _hand_over_turn(
                 payload,
                 turns=turns,
@@ -4169,7 +4111,6 @@ def build_parser() -> argparse.ArgumentParser:
     # declines, and exits.
     parser.add_argument("--turn", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--handover-fd", type=int, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--qualification-fd", type=int, default=None, help=argparse.SUPPRESS)
     return parser
 
 
@@ -4193,7 +4134,6 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--turn requires --handover-fd; the host service supplies both")
         return _serve_turn(
             handover_fd=args.handover_fd,
-            qualification_fd=args.qualification_fd,
             base_url=args.base_url,
             gateway_url=args.gateway_url or args.base_url,
             worker_id=args.worker_id,

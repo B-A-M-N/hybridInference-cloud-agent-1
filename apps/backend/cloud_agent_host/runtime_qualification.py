@@ -1,50 +1,38 @@
-"""Reuse a host's runtime probe only while its observed Docker connection lives.
+"""Prove a host's Kata runtime once, and again only when something changes.
 
-Evidence stays in the trusted runner, crosses a private inherited socket, and
-expires within a minute. A Docker ID is not a daemon generation: the original
-HTTP connection must still answer, without reconnecting. The installer epoch
-also fences Kata changes that do not restart Docker. Mutable network rules are
-deliberately outside this evidence and remain a check on every turn.
-
-The proof is kept fresh only while turns are being claimed. An idle host lets
-it lapse rather than boot a probe VM every minute; the next turn runs its own
-full preflight, as every turn did before, and claiming it renews the demand.
+The full probe boots a throwaway Kata guest (``ContainerBackend.preflight``),
+so the long-lived host service runs it rather than every turn's child: when it
+starts, whenever the installer's runtime epoch or the sandbox image changes,
+and at least every half hour. Each child receives the verdict inside the turn
+payload the host already writes to its standard input. A claim's own
+underscore keys are stripped before delivery, so only this host can supply it.
+Mutable network rules stay outside the verdict: every child checks them before
+it accepts its turn.
 """
 
 from __future__ import annotations
 
-import contextlib
-import dataclasses
-import http.client
 import json
 import os
 import pathlib
-import secrets
-import socket
 import stat
 import subprocess
-import threading
 import time
 import uuid
 from typing import Any
-from urllib.parse import quote
 
 from cloud_agent_host.host_runtime import LAUNCH_BACKOFF_CAP_S, LAUNCH_BACKOFF_S
 from cloud_agent_host.sandbox import KATA_RUNTIME, ContainerBackend, SandboxBackend
 from cloud_agent_shared.errors import SandboxError
 
 RUNTIME_STATE_PATH = "/run/agent-kata-runtime/epoch.json"
-QUALIFICATION_TTL_S = 60.0
-#: How long after the last claimed turn the proof is kept fresh. Each claim
-#: extends it; past it, an expired proof is not renewed until the next claim.
-WARM_FOR_S = 600.0
-#: Renew this long before expiry: a proof that passed the pre-claim check must
-#: outlive the claim, the child's start and the handoff that follow it.
-_RENEW_MARGIN_S = 15.0
-_HANDOFF_TTL_S = 5.0
-_WIRE_TIMEOUT_S = 45.0
-_WIRE_LIMIT = 65536
-_API_LIMIT = 2 * 1024 * 1024
+#: The turn-payload key a verdict travels under. The parent adds it after the
+#: claim's underscore keys are stripped, so a claim can never supply one.
+VERDICT_KEY = "_runtime"
+#: How long a verdict stands when nothing it can see has changed. It bounds how
+#: long a change made outside the installer, which no marker records, can go
+#: unnoticed.
+RECHECK_S = 1800.0
 
 
 def _file_identity(observed: os.stat_result) -> list[int]:
@@ -126,436 +114,139 @@ def check_runtime_state(path: str = RUNTIME_STATE_PATH) -> dict[str, Any] | None
     return {"generation": generation, "identity": identity}
 
 
-def _backend_identity(backend: ContainerBackend) -> dict[str, Any]:
-    return {
-        "image": backend.image,
-        "runtime": backend.runtime,
-        "docker_binary": backend.docker_binary,
-        "extra_args": list(backend.extra_args),
-        "uid": backend.uid,
-        "gid": backend.gid,
-        "home": backend.home,
-        "namespace": backend.sandbox_namespace,
-        "network": json.loads(json.dumps(dataclasses.asdict(backend.sandbox_network), default=str))
-        if backend.sandbox_network is not None
-        else None,
-    }
-
-
-def _local_identity(
-    backend: ContainerBackend, deployment_sha: str, readiness_path: str, runtime_state_path: str
-) -> dict[str, Any] | None:
-    runtime = check_runtime_state(runtime_state_path)
-    if runtime is None or not deployment_sha or not readiness_path:
-        return None
-    ready = _read_marker(readiness_path, root=False)
-    if ready is None or ready[0] != deployment_sha:
-        # Every rollout spends a while on ``pending:<sha>``. There is nothing
-        # to reuse until it is published, and the claim gate already keeps the
-        # host idle meanwhile, so this is the full-probe path, not a failure.
-        return None
-    return {
-        "backend": _backend_identity(backend),
-        "deployment_sha": deployment_sha,
-        "ready": [ready[0], ready[1]],
-        "runtime_epoch": runtime,
-        "host_kernel": os.uname().release,
-    }
-
-
-def _docker_socket(backend: ContainerBackend) -> str | None:
-    """Use only a direct local daemon, resolved through the same Docker CLI."""
-    if backend.runtime != KATA_RUNTIME or os.environ.get("DOCKER_CONTEXT"):
-        return None
-    if os.environ.get("DOCKER_TLS_VERIFY") or os.environ.get("DOCKER_CERT_PATH"):
-        return None
-    endpoint = os.environ.get("DOCKER_HOST", "")
-    if not endpoint:
-        try:
-            result = subprocess.run(
-                [
-                    backend.docker_binary,
-                    "context",
-                    "inspect",
-                    "--format",
-                    "{{json .Endpoints.docker.Host}}",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=3,
-                check=False,
-            )
-            endpoint = json.loads(result.stdout) if result.returncode == 0 else ""
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            return None
-    if not isinstance(endpoint, str) or not endpoint.startswith("unix://"):
-        return None
-    path = endpoint.removeprefix("unix://")
-    return path if path.startswith("/") and "\x00" not in path else None
-
-
-class _DaemonConnection(http.client.HTTPConnection):
-    """One accepted Docker connection; losing it must never reconnect silently."""
-
-    def __init__(self, path: str) -> None:
-        super().__init__("docker", timeout=5)
-        self.path = path
-        self._connected_once = False
-        self._socket_identity: list[int] | None = None
-
-    def same_endpoint(self) -> bool:
-        """Reject replacement of the socket path even if the old daemon still lives."""
-        try:
-            observed = os.stat(self.path)
-        except OSError as exc:
-            raise SandboxError("qualified Docker socket disappeared") from exc
-        return stat.S_ISSOCK(observed.st_mode) and _file_identity(observed) == self._socket_identity
-
-    def connect(self) -> None:
-        """Connect once, then force the authority to requalify after any loss."""
-        if self._connected_once:
-            raise SandboxError("qualified Docker connection was lost")
-        self._connected_once = True
-        connected = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            observed = os.stat(self.path)
-            if not stat.S_ISSOCK(observed.st_mode):
-                raise SandboxError("Docker endpoint is not a Unix socket")
-            self._socket_identity = _file_identity(observed)
-            connected.settimeout(self.timeout)
-            connected.connect(self.path)
-            if not self.same_endpoint():
-                raise SandboxError("Docker socket changed while connecting")
-        except BaseException:
-            connected.close()
-            raise
-        self.sock = connected
-
-    def document(self, path: str) -> dict[str, Any]:
-        """Read one bounded document without a retry or replacement connection."""
-        try:
-            self.request("GET", path)
-            response = self.getresponse()
-            raw = response.read(_API_LIMIT + 1)
-            if response.status != 200 or response.will_close or len(raw) > _API_LIMIT:
-                raise SandboxError("qualified Docker connection returned an unusable response")
-            value = json.loads(raw)
-            if not isinstance(value, dict):
-                raise ValueError("not an object")
-            return value
-        except (OSError, http.client.HTTPException, ValueError) as exc:
-            self.close()
-            raise SandboxError("qualified Docker connection failed") from exc
-
-
-def _daemon_identity(connection: _DaemonConnection, backend: ContainerBackend) -> dict[str, Any]:
-    info = connection.document("/info")
-    image = connection.document(f"/images/{quote(backend.image, safe='')}/json")
-    if not connection.same_endpoint():
-        raise SandboxError("Docker socket changed while reading qualification state")
-    image_id = image.get("Id")
-    if not isinstance(image_id, str) or not image_id.startswith("sha256:"):
-        raise SandboxError("runtime qualification could not resolve the sandbox image")
-    if not isinstance(info.get("Runtimes"), dict) or not info.get("KernelVersion"):
-        raise SandboxError("runtime qualification received incomplete Docker configuration")
-    return {
-        "image_id": image_id,
-        "daemon": {
-            key: info.get(key)
-            for key in (
-                "ID",
-                "ServerVersion",
-                "KernelVersion",
-                "OSType",
-                "Architecture",
-                "DefaultRuntime",
-                "Runtimes",
-                "SecurityOptions",
-                "Driver",
-            )
-        },
-    }
-
-
-def _wire_timeout(channel: socket.socket, deadline: float) -> None:
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise SandboxError("runtime qualification channel timed out")
-    channel.settimeout(remaining)
-
-
-def _receive(channel: socket.socket, *, deadline: float | None = None) -> dict[str, Any]:
-    deadline = time.monotonic() + _WIRE_TIMEOUT_S if deadline is None else deadline
-    chunks = bytearray()
-    while len(chunks) <= _WIRE_LIMIT:
-        _wire_timeout(channel, deadline)
-        part = channel.recv(min(4096, _WIRE_LIMIT + 1 - len(chunks)))
-        if not part:
-            raise SandboxError("runtime qualification channel closed without an answer")
-        chunks.extend(part)
-        if b"\n" in part:
-            line, _, trailing = chunks.partition(b"\n")
-            if trailing:
-                raise SandboxError("runtime qualification channel sent trailing data")
-            try:
-                value = json.loads(line)
-            except (ValueError, UnicodeDecodeError) as exc:
-                raise SandboxError("runtime qualification channel sent invalid JSON") from exc
-            if not isinstance(value, dict):
-                raise SandboxError("runtime qualification channel sent an invalid message")
-            return value
-    raise SandboxError("runtime qualification message is too large")
-
-
-def _send(
-    channel: socket.socket, message: dict[str, Any], *, deadline: float | None = None
-) -> None:
-    raw = json.dumps(message, separators=(",", ":")).encode() + b"\n"
-    if len(raw) > _WIRE_LIMIT:
-        raise SandboxError("runtime qualification message is too large")
-    _wire_timeout(channel, time.monotonic() + _WIRE_TIMEOUT_S if deadline is None else deadline)
-    channel.sendall(raw)
+def _image_id(backend: ContainerBackend) -> str:
+    """The image a new sandbox would start from, as Docker resolves it now."""
+    try:
+        result = subprocess.run(
+            [backend.docker_binary, "image", "inspect", "--format", "{{.Id}}", backend.image],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SandboxError(f"the sandbox image could not be inspected: {exc}") from exc
+    image_id = result.stdout.strip()
+    if result.returncode != 0 or not image_id.startswith("sha256:"):
+        raise SandboxError(
+            "the sandbox image could not be inspected: "
+            + (result.stderr.strip()[:200] or "no image id")
+        )
+    return image_id
 
 
 class HostQualification:
-    """Refresh host evidence before claims and attest it over a private socket."""
+    """The host service's proof that its Kata runtime is sound, renewed on change."""
 
     def __init__(
-        self,
-        backend: ContainerBackend,
-        *,
-        deployment_sha: str,
-        readiness_path: str,
-        runtime_state_path: str = RUNTIME_STATE_PATH,
+        self, backend: ContainerBackend, *, runtime_state_path: str = RUNTIME_STATE_PATH
     ) -> None:
         self.backend = backend
-        self.deployment_sha = deployment_sha
-        self.readiness_path = readiness_path
         self.runtime_state_path = runtime_state_path
-        self._connection: _DaemonConnection | None = None
-        self._evidence: dict[str, Any] | None = None
-        # A host that has just started expects work, so its first turn should
-        # not wait for a probe. Afterwards only claimed turns keep it wanted.
-        self._wanted_until = time.monotonic() + WARM_FOR_S
-        # A failed probe is not repeated until its backoff has passed.
+        self._verdict: dict[str, Any] | None = None
+        self._image_id = ""
+        self._checked_at = 0.0
+        # A failed probe stops claims and is retried on a backoff, so a broken
+        # runtime neither takes work nor boots a probe guest on every poll.
         self._failure = ""
         self._failures = 0
         self._retry_at = 0.0
-        # Whether the last look found an epoch, a published deployment and a
-        # local socket; without them there is never anything to renew.
-        self._supported = False
-        self._lock = threading.Lock()
-
-    def note_demand(self) -> None:
-        """Keep the proof fresh for the turns likely to follow a claimed one."""
-        with self._lock:
-            self._wanted_until = time.monotonic() + WARM_FOR_S
-
-    def renewal_due(self) -> bool:
-        """Whether a host with no free slot should renew now, ahead of its next claim."""
-        now = time.monotonic()
-        with self._lock:
-            if not self._supported:
-                return False
-            if self._failure:
-                return now >= self._retry_at
-            if now >= self._wanted_until:
-                return False
-            if self._evidence is None:
-                return True
-            return bool(self._evidence["expires_mono"] - now < _RENEW_MARGIN_S)
-
-    def _local(self) -> dict[str, Any] | None:
-        if self.backend.runtime != KATA_RUNTIME:
-            return None
-        return _local_identity(
-            self.backend, self.deployment_sha, self.readiness_path, self.runtime_state_path
-        )
-
-    def _invalidate(self) -> None:
-        if self._connection is not None:
-            self._connection.close()
-        self._connection = None
-        self._evidence = None
-
-    def close(self) -> None:
-        """Forget all evidence and release the original daemon connection."""
-        with self._lock:
-            self._invalidate()
-
-    def _current(self, local: dict[str, Any], path: str, *, margin_s: float) -> bool:
-        """Whether the proof still holds, with ``margin_s`` of its lifetime left."""
-        if self._connection is None or self._evidence is None:
-            return False
-        return (
-            self._connection.path == path
-            and self._connection.same_endpoint()
-            and time.monotonic() + margin_s < self._evidence["expires_mono"]
-            and local == self._evidence["local"]
-            and _daemon_identity(self._connection, self.backend) == self._evidence["daemon"]
-        )
 
     def refresh(self) -> bool:
-        """Qualify before claiming; ``False`` leaves each child to its own full probe.
+        """Keep the proof current before a claim.
 
-        Unsupported transport, an absent epoch, a deployment not yet published
-        and an idle host all return ``False``. A wanted qualification that
-        fails raises, and is not probed again until its backoff has passed.
+        ``False`` leaves every child to its own full probe: the backend is not
+        Kata, or there is no runtime epoch by which an update could be noticed.
+        Raises while the runtime is being updated or its probe is failing, and
+        the host claims nothing meanwhile.
         """
-        with self._lock:
-            try:
-                local = self._local()
-                path = None if local is None else _docker_socket(self.backend)
-            except BaseException:
-                self._invalidate()
-                raise
-            self._supported = local is not None and path is not None
-            if local is None or path is None:
-                self._invalidate()
-                return False
-            try:
-                if self._current(local, path, margin_s=_RENEW_MARGIN_S):
-                    return True
-            except SandboxError:
-                # A replacement daemon may be healthy. A fresh connection can
-                # prove it, but only by repeating the complete probe.
-                pass
-            self._invalidate()
-            now = time.monotonic()
-            if self._failure:
-                # A failed probe withdrew this host's guest-kernel attestation.
-                # Going quiet now would claim without it, receive no Kata work,
-                # note no demand and never probe again, so a failure is retried
-                # on its backoff, with claims stopped, whether wanted or not.
-                if now < self._retry_at:
-                    raise SandboxError(self._failure)
-            elif now >= self._wanted_until:
-                # No turn has been claimed for a while. Booting a VM to keep a
-                # proof nobody uses is the cost this window exists to avoid.
-                return False
-            try:
-                self._qualify(local, path)
-            except BaseException as exc:
-                self._invalidate()
-                if isinstance(exc, SandboxError):
-                    self._failures += 1
-                    self._failure = str(exc) or "runtime qualification failed"
-                    self._retry_at = now + min(
-                        LAUNCH_BACKOFF_S * 2 ** (self._failures - 1), LAUNCH_BACKOFF_CAP_S
-                    )
-                raise
-            self._failure, self._failures = "", 0
+        if self.backend.runtime != KATA_RUNTIME:
+            return False
+        epoch = check_runtime_state(self.runtime_state_path)
+        if epoch is None:
+            self._verdict = None
+            return False
+        now = time.monotonic()
+        if (
+            self._verdict is not None
+            and self._verdict["epoch"] == epoch
+            and now < self._checked_at + RECHECK_S
+        ):
             return True
+        self._verdict = None
+        if self._failure and now < self._retry_at:
+            raise SandboxError(self._failure)
+        try:
+            self._prove(epoch)
+        except SandboxError as exc:
+            self._failures += 1
+            self._failure = str(exc) or "runtime qualification failed"
+            self._retry_at = now + min(
+                LAUNCH_BACKOFF_S * 2 ** (self._failures - 1), LAUNCH_BACKOFF_CAP_S
+            )
+            raise
+        self._failure, self._failures = "", 0
+        return True
 
-    def _qualify(self, local: dict[str, Any], path: str) -> None:
-        """Run the complete probe over a fresh connection that must outlive it."""
-        connection = _DaemonConnection(path)
-        self._connection = connection
-        before = _daemon_identity(connection, self.backend)
+    def _prove(self, epoch: dict[str, Any]) -> None:
+        image = _image_id(self.backend)
         self.backend.preflight(check_network=False)
-        after = _daemon_identity(connection, self.backend)
-        if before != after or local != self._local():
-            raise SandboxError("runtime changed while it was being qualified")
+        # An update or a rebuilt image during the probe would leave the verdict
+        # describing the runtime as it was rather than as it is.
+        if (
+            check_runtime_state(self.runtime_state_path) != epoch
+            or _image_id(self.backend) != image
+        ):
+            raise SandboxError("runtime changed while it was being checked")
         guest_kernel = self.backend.validate_guest_kernel(
             self.backend.version_stamp().get("guest_kernel")
         )
         self.backend._version_stamp = None
-        self._evidence = {
-            "local": local,
-            "daemon": after,
-            "guest_kernel": guest_kernel,
-            "expires_mono": time.monotonic() + QUALIFICATION_TTL_S,
-        }
+        self._verdict = {"guest_kernel": guest_kernel, "epoch": epoch}
+        self._image_id = image
+        self._checked_at = time.monotonic()
 
-    def serve(self, channel: socket.socket) -> None:
-        """Answer one private request; never run a slow probe during handover."""
-        deadline = time.monotonic() + _WIRE_TIMEOUT_S
+    def verdict(self) -> dict[str, Any] | None:
+        """The verdict for a turn handed over now, or ``None`` for a full child probe."""
+        if self._verdict is None:
+            return None
         try:
-            request = _receive(channel, deadline=deadline)
-            nonce = request.get("nonce")
-            if (
-                type(request.get("version")) is not int
-                or request["version"] != 1
-                or not isinstance(nonce, str)
-                or len(nonce) != 32
-            ):
-                raise SandboxError("invalid runtime qualification request")
-            with self._lock:
-                local = self._local()
-                path = None if local is None else _docker_socket(self.backend)
-                # A proof that could expire during the child's own check is not
-                # handed over: the child would refuse it instead of probing.
-                if (
-                    local is None
-                    or path is None
-                    or not self._current(local, path, margin_s=_HANDOFF_TTL_S)
-                ):
-                    self._invalidate()
-                    answer: dict[str, Any] = {"qualified": False}
-                else:
-                    # Narrow the transferable lifetime even if the host's
-                    # qualification has most of its minute left.
-                    answer = {
-                        "qualified": True,
-                        **(self._evidence or {}),
-                        "issued_mono": time.monotonic(),
-                    }
-            _send(channel, {"version": 1, "nonce": nonce, **answer}, deadline=deadline)
-        except Exception as exc:
-            self.close()
-            with contextlib.suppress(OSError, SandboxError):
-                _send(channel, {"version": 1, "error": str(exc)[:300]}, deadline=deadline)
+            current = (
+                check_runtime_state(self.runtime_state_path) == self._verdict["epoch"]
+                and _image_id(self.backend) == self._image_id
+            )
+        except SandboxError:
+            current = False
+        if not current:
+            # The next refresh proves the runtime as it is now.
+            self._verdict = None
+            return None
+        return dict(self._verdict)
 
 
-def use_qualification(
+def adopt_verdict(
     backend: SandboxBackend,
-    channel: socket.socket,
+    verdict: object,
     *,
-    deployment_sha: str,
-    readiness_path: str,
     runtime_state_path: str = RUNTIME_STATE_PATH,
 ) -> bool:
-    """Use only a fresh answer on the parent's inherited socket, or require a probe."""
-    nonce = secrets.token_hex(16)
-    deadline = time.monotonic() + _WIRE_TIMEOUT_S
-    try:
-        _send(channel, {"version": 1, "nonce": nonce}, deadline=deadline)
-        answer = _receive(channel, deadline=deadline)
-    except (OSError, SandboxError) as exc:
-        raise SandboxError("runtime qualification could not be received") from exc
-    if "error" in answer:
-        raise SandboxError("runtime qualification refused: " + str(answer["error"])[:300])
-    if (
-        type(answer.get("version")) is not int
-        or answer["version"] != 1
-        or answer.get("nonce") != nonce
-    ):
-        raise SandboxError("runtime qualification response does not match its request")
+    """Take the host's verdict for this turn, or return ``False`` for a full probe.
+
+    The epoch is read once more: an update that began after the host's check
+    stops this turn (``check_runtime_state`` raises), and one that finished
+    means the verdict describes a runtime that is no longer installed.
+    """
     if not isinstance(backend, ContainerBackend) or backend.runtime != KATA_RUNTIME:
         return False
-    local = _local_identity(backend, deployment_sha, readiness_path, runtime_state_path)
-    if local is None:
+    if not isinstance(verdict, dict):
         return False
-    if answer.get("qualified") is False:
+    epoch = check_runtime_state(runtime_state_path)
+    if epoch is None or verdict.get("epoch") != epoch:
         return False
-    issued, expires = answer.get("issued_mono"), answer.get("expires_mono")
-    now = time.monotonic()
-    if (
-        not isinstance(issued, (int, float))
-        or isinstance(issued, bool)
-        or not isinstance(expires, (int, float))
-        or isinstance(expires, bool)
-    ):
-        raise SandboxError("runtime qualification has invalid expiry")
-    if (
-        answer.get("qualified") is not True
-        or not issued <= now < min(expires, issued + _HANDOFF_TTL_S)
-        or expires > issued + QUALIFICATION_TTL_S
-        or answer.get("local") != local
-        or local != _local_identity(backend, deployment_sha, readiness_path, runtime_state_path)
-    ):
-        raise SandboxError("runtime qualification is stale or belongs to another configuration")
-    guest = backend.validate_guest_kernel(answer.get("guest_kernel"))
-    backend._kernel_probe = {"host_kernel": os.uname().release, "guest_kernel": guest}
+    try:
+        guest_kernel = backend.validate_guest_kernel(verdict.get("guest_kernel"))
+    except SandboxError:
+        return False
+    backend._kernel_probe = {"host_kernel": os.uname().release, "guest_kernel": guest_kernel}
     backend._version_stamp = None
     return True
