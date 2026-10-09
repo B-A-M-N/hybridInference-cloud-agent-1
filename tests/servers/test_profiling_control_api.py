@@ -343,6 +343,11 @@ def test_the_same_request_id_returns_the_same_experiment() -> None:
     assert first.status_code == 201 and second.status_code == 201
     assert first.json()["run_id"] == second.json()["run_id"]
     assert first.json()["revision"] == second.json()["revision"]
+    # The retry is audited as a replay, so the Audit log can say it changed
+    # nothing rather than show measurements turned on twice.
+    starts = [e for e in storage.audit.entries if e["action"] == "agent.profiling.start"]
+    assert [e["details"]["outcome"] for e in starts] == ["applied", "replayed"]
+    assert all(e["success"] is True for e in starts)
     assert (
         first.json()["control"]["run"]["expires_at"]
         == (second.json()["control"]["run"]["expires_at"])
@@ -379,6 +384,13 @@ def test_a_stale_revision_is_refused_with_the_number_to_re_read() -> None:
     assert error["type"] == CONTROL_REFUSED_ALREADY_ACTIVE
     assert error["revision"] == 1
     assert error["run_id"] == first.json()["run_id"]
+    # The refused Start is recorded as one: not successful, and with why.
+    refused = storage.audit.entries[-1]
+    assert refused["action"] == "agent.profiling.start"
+    assert refused["success"] is False
+    assert refused["details"]["outcome"] == "refused"
+    assert refused["details"]["reason"] == CONTROL_REFUSED_ALREADY_ACTIVE
+    assert storage.audit.entries[0]["success"] is True
 
 
 def test_invalid_requests_are_refused_without_touching_the_control_row() -> None:
@@ -477,6 +489,43 @@ def test_stop_is_idempotent_and_states_what_it_stopped() -> None:
     # click.
     assert second.status_code == 200, second.text
     assert second.json()["revision"] == 2
+    stops = [e for e in storage.audit.entries if e["action"] == "agent.profiling.stop"]
+    assert [e["details"]["outcome"] for e in stops] == ["applied", "replayed"]
+    assert all(e["success"] is True for e in stops)
+
+
+def test_a_retried_stop_of_an_old_experiment_leaves_the_new_one_running() -> None:
+    """Start A, stop A, start B, retry A's Stop: a replay, and B keeps running."""
+    storage = _FakeStorage()
+    start = {"operations": ["files.open"], "target": {}, "duration_seconds": 600}
+    with _client(storage) as client:
+        a = client.post(
+            "/admin/agent/profiling-runs",
+            json={"request_id": "start-a", "expected_revision": 0, **start},
+        )
+        run_a = a.json()["run_id"]
+        stopped = client.post(
+            f"/admin/agent/profiling-runs/{run_a}/stop", json={"request_id": "stop-a"}
+        )
+        b = client.post(
+            "/admin/agent/profiling-runs",
+            json={
+                "request_id": "start-b",
+                "expected_revision": stopped.json()["revision"],
+                **start,
+            },
+        )
+        retried = client.post(
+            f"/admin/agent/profiling-runs/{run_a}/stop", json={"request_id": "stop-a"}
+        )
+    assert b.status_code == 201, b.text
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["control"]["run"]["run_id"] == b.json()["run_id"]
+    assert retried.json()["control"]["run_active"] is True
+    last = storage.audit.entries[-1]
+    assert last["action"] == "agent.profiling.stop"
+    assert last["details"]["outcome"] == "replayed"
+    assert last["success"] is True
 
 
 def test_a_page_open_on_an_old_experiment_cannot_stop_the_new_one() -> None:
@@ -505,6 +554,12 @@ def test_a_page_open_on_an_old_experiment_cannot_stop_the_new_one() -> None:
         )
     assert refusal.status_code == 409, refusal.text
     assert refusal.json()["detail"]["error"]["type"] == "run_already_finished"
+    # Measurements are still on, so the audit row must not read as a Stop.
+    refused = storage.audit.entries[-1]
+    assert refused["action"] == "agent.profiling.stop"
+    assert refused["success"] is False
+    assert refused["details"]["outcome"] == "refused"
+    assert refused["details"]["reason"] == "run_already_finished"
 
 
 def test_a_deployment_without_admin_control_says_so() -> None:
