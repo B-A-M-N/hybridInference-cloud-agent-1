@@ -24,7 +24,8 @@ from tests.integration.storage.test_agent_job_store import (
 from tests.integration.storage.test_schema_upgrade import _db_config
 from tests.support.migrations import apply_migrations, downgrade_to
 
-from cloud_agent.workers.work_signal import CHANNEL, WorkSignal, listen_for_work
+from cloud_agent.workers.notifications import listen
+from cloud_agent.workers.work_signal import CHANNEL, WorkSignal
 
 pytestmark = [pytest.mark.dbtest, pytest.mark.asyncio]
 
@@ -134,7 +135,7 @@ async def test_a_queued_job_wakes_a_waiting_host_through_the_listener(store):
     )
     signal = WorkSignal()
     before_listening = signal.token
-    listener = asyncio.create_task(listen_for_work(dsn, signal))
+    listener = asyncio.create_task(listen(dsn, (signal,)))
     try:
         # The listener announces itself once it is listening.
         await asyncio.wait_for(signal.wait(before_listening, 10), 10)

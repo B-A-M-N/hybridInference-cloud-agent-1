@@ -18,8 +18,10 @@ from typing import TYPE_CHECKING, Any
 
 from cloud_agent.logging_utils import get_logger
 from cloud_agent.workers.attempts import reap_expired_attempts
+from cloud_agent.workers.job_event_signal import JobEventSignal
+from cloud_agent.workers.notifications import listen
 from cloud_agent.workers.snapshots import coordinate_shared_snapshots
-from cloud_agent.workers.work_signal import WorkSignal, listen_for_work
+from cloud_agent.workers.work_signal import WorkSignal
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -232,14 +234,17 @@ async def lifespan(app: FastAPI, *, background: bool = True) -> AsyncIterator[No
         app.state.queue_monitor_task = asyncio.create_task(monitor_queue(storage.host_pool))
         _BACKGROUND_TASKS.add(app.state.queue_monitor_task)
         app.state.queue_monitor_task.add_done_callback(_BACKGROUND_TASKS.discard)
-        # Idle hosts park on the worker wait endpoint, and this connection to
-        # Postgres is what answers them when a job is queued, requeued or ends.
+        # One connection to Postgres answers what waits on a change: idle hosts
+        # parked on the worker wait endpoint (a job was queued, requeued or
+        # ended), and owners' event streams (their job stored an event or
+        # changed state).
         app.state.work_signal = WorkSignal()
-        app.state.work_listener_task = asyncio.create_task(
-            listen_for_work(dsn, app.state.work_signal)
+        app.state.job_event_signal = JobEventSignal()
+        app.state.notification_listener_task = asyncio.create_task(
+            listen(dsn, (app.state.work_signal, app.state.job_event_signal))
         )
-        _BACKGROUND_TASKS.add(app.state.work_listener_task)
-        app.state.work_listener_task.add_done_callback(_BACKGROUND_TASKS.discard)
+        _BACKGROUND_TASKS.add(app.state.notification_listener_task)
+        app.state.notification_listener_task.add_done_callback(_BACKGROUND_TASKS.discard)
         _start_publisher(app, storage)
         logger.info("cloud agent control plane started")
     else:
@@ -255,7 +260,8 @@ async def lifespan(app: FastAPI, *, background: bool = True) -> AsyncIterator[No
         app.state.queue_monitor_task = None
         app.state.publish_task = None
         app.state.work_signal = None
-        app.state.work_listener_task = None
+        app.state.job_event_signal = None
+        app.state.notification_listener_task = None
         logger.info("cloud agent relay listener started")
 
     # Each listener owns upstream sockets in its own process, even when it
@@ -292,7 +298,7 @@ async def lifespan(app: FastAPI, *, background: bool = True) -> AsyncIterator[No
             app.state.publish_task,
             app.state.profiling_policy_task,
             app.state.compute_resource_task,
-            app.state.work_listener_task,
+            app.state.notification_listener_task,
         ):
             if task is None:
                 continue
