@@ -37,7 +37,19 @@ export interface AgentAttempt {
 export type AgentEvent =
   | { kind: 'lifecycle'; text: string; attemptNo?: number; sourceEventId?: number }
   | { kind: 'thinking'; text: string; attemptNo?: number; sourceEventId?: number }
-  | { kind: 'message'; text: string; attemptNo?: number; sourceEventId?: number }
+  | {
+      kind: 'message';
+      text: string;
+      attemptNo?: number;
+      sourceEventId?: number;
+      /** The answer this text completes or previews, when the host previewed it. */
+      previewId?: string;
+      /**
+       * Still being written: the answer's pieces so far. The complete message
+       * with the same `previewId` replaces the row in place.
+       */
+      streaming?: boolean;
+    }
   | {
       kind: 'tool_use';
       tool: string;

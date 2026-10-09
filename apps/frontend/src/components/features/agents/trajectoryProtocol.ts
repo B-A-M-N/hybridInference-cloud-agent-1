@@ -85,6 +85,32 @@ export function isRuntimeNotification(notification: Record<string, unknown>): bo
   );
 }
 
+/** A piece of an answer, reported while the model was still writing it. */
+export interface ReplyPreviewPiece {
+  previewId: string;
+  text: string;
+  /** The text replaces what was shown so far instead of extending it. */
+  reset: boolean;
+}
+
+/**
+ * Read a stored answer preview. Every harness's host batches the answer text
+ * into these `raw` records; the complete `message` with the same `preview_id`
+ * replaces them.
+ */
+export function replyPreviewPiece(event: StoredEvent): ReplyPreviewPiece | null {
+  if (event.event_type !== 'raw') return null;
+  const payload = record(event.payload);
+  if (
+    payload.protocol !== 'reply-preview' ||
+    typeof payload.preview_id !== 'string' ||
+    typeof payload.delta !== 'string'
+  ) {
+    return null;
+  }
+  return { previewId: payload.preview_id, text: payload.delta, reset: payload.reset === true };
+}
+
 function scope(event: StoredEvent, id: string): string {
   return `${'job_id' in event ? event.job_id : ''}:${event.attempt_id}:${id}`;
 }
@@ -98,6 +124,18 @@ export function projectProtocolEvents(events: StoredEvent[]): StoredEvent[] {
     }),
   );
   return events.map((event) => {
+    const piece = replyPreviewPiece(event);
+    if (piece) {
+      return {
+        ...event,
+        event_type: 'message',
+        payload: {
+          text: piece.text,
+          preview_id: piece.previewId,
+          stream_state: piece.reset ? 'reset' : 'delta',
+        },
+      };
+    }
     const notification = rawNotification(event);
     if (!notification || notificationHasError(notification)) return event;
     const payload = record(event.payload);

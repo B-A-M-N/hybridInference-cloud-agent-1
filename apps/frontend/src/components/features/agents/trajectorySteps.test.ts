@@ -579,6 +579,99 @@ describe('buildTrajectorySteps', () => {
     expect(steps[2].label).toBe('mystery');
   });
 
+  const piece = (id: number, preview_id: string, delta: string) =>
+    event({
+      id,
+      job_id: 'a',
+      turn_no: 1,
+      event_type: 'raw',
+      payload: { protocol: 'reply-preview', preview_id, delta },
+    });
+
+  it('shows an answer growing until its complete message takes the step over', () => {
+    const streaming = [
+      event({
+        id: 1,
+        job_id: 'a',
+        turn_no: 1,
+        event_type: 'thinking',
+        payload: { text: 'plan', usage_id: 'msg_1' },
+      }),
+      piece(2, 'msg_1:1', 'Let me '),
+      piece(3, 'msg_1:1', 'look.'),
+    ];
+    const live = buildTrajectorySteps(streaming, { isAttemptActive: () => true });
+
+    expect(live.map((step) => step.kind)).toEqual(['assistant', 'assistant']);
+    expect(live[1]).toMatchObject({ streaming: true, status: 'waiting', detail: 'Let me look.' });
+    expect(live[1].nativeMessageId).toBeUndefined();
+
+    const settled = buildTrajectorySteps(
+      [
+        ...streaming,
+        event({
+          id: 4,
+          job_id: 'a',
+          turn_no: 1,
+          payload: { text: 'Let me look.', usage_id: 'msg_1', preview_id: 'msg_1:1' },
+        }),
+      ],
+      idle,
+    );
+
+    expect(settled).toHaveLength(1);
+    expect(settled[0]).toMatchObject({ status: 'completed', nativeMessageId: 'msg_1' });
+    expect(settled[0].blocks).toEqual([
+      { type: 'thinking', text: 'plan' },
+      { type: 'text', text: 'Let me look.' },
+    ]);
+    // The stored pieces stay reachable for Raw and export.
+    expect(settled[0].sourceEvents.map((source) => source.event_type)).toEqual([
+      'thinking',
+      'raw',
+      'raw',
+      'message',
+    ]);
+  });
+
+  it('keeps a part that completes at settlement where it was written', () => {
+    const steps = buildTrajectorySteps(
+      [
+        piece(1, 'first', 'Let me check.'),
+        event({
+          id: 2,
+          job_id: 'a',
+          turn_no: 1,
+          event_type: 'tool_use',
+          payload: { id: 'call', name: 'bash', input: { command: 'pwd' } },
+        }),
+        piece(3, 'second', 'All done.'),
+        event({
+          id: 4,
+          job_id: 'a',
+          turn_no: 1,
+          payload: { text: 'Let me check.', preview_id: 'first' },
+        }),
+        event({
+          id: 5,
+          job_id: 'a',
+          turn_no: 1,
+          payload: { text: 'All done.', preview_id: 'second' },
+        }),
+      ],
+      idle,
+    );
+
+    expect(
+      steps.map((step) => [step.kind, step.kind === 'tool' ? step.callId : step.detail]),
+    ).toEqual([
+      ['assistant', 'Let me check.'],
+      ['tool', 'call'],
+      ['assistant', 'All done.'],
+    ]);
+    expect(steps.some((step) => step.streaming)).toBe(false);
+  });
+
   it('counts hundreds of Codex streaming notifications as one inspectable log', () => {
     const notifications = Array.from({ length: 400 }, (_, index) =>
       event({

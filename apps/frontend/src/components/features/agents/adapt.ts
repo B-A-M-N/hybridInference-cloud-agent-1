@@ -32,6 +32,7 @@ import type {
   ProcessObservation,
   TurnResources,
 } from './types';
+import { replyPreviewPiece } from './trajectoryProtocol';
 
 /**
  * Preserve a server result as a per-turn display state.
@@ -120,7 +121,15 @@ export function toDisplayEvent(event: AgentJobEventApi): AgentEvent | null {
   // Never carry chain-of-thought into the display model. The UI represents
   // this as a compact reasoning status, not as model-authored hidden text.
   if (type === 'thinking') return { kind: 'thinking', text: '', sourceEventId };
-  if (type === 'message') return { kind: 'message', text: asText(payload, 'text'), sourceEventId };
+  if (type === 'message') {
+    const previewId = asText(payload, 'preview_id');
+    return {
+      kind: 'message',
+      text: asText(payload, 'text'),
+      sourceEventId,
+      ...(previewId ? { previewId } : {}),
+    };
+  }
   if (type === 'usage') return { kind: 'usage', text: asText(payload, 'text'), sourceEventId };
   // A message the owner sent into the running turn reads where it arrived,
   // between what the agent did before it and what it did after.
@@ -206,8 +215,20 @@ export function toDisplayEvent(event: AgentJobEventApi): AgentEvent | null {
       : null;
   }
   if (type === 'raw') {
-    // Raw records are unclassified runtime protocol data. They remain available
-    // through the events API, but are not terminal commands or output.
+    // An answer while it is being written: shown, then replaced by the
+    // complete message (see `displayEvents`).
+    const piece = replyPreviewPiece(event);
+    if (piece) {
+      return {
+        kind: 'message',
+        text: piece.text,
+        sourceEventId,
+        previewId: piece.previewId,
+        streaming: true,
+      };
+    }
+    // Other raw records are unclassified runtime protocol data. They remain
+    // available through the events API, but are not terminal commands or output.
     return null;
   }
 
@@ -456,6 +477,34 @@ function displayEvents(events: AgentJobEventApi[]): AgentEvent[] {
           // here, while both ends are in hand.
           ...durationBetween(target.at, row.at),
         };
+        continue;
+      }
+    }
+
+    if (row.kind === 'message' && row.previewId) {
+      // Pieces of an answer grow one row, and the complete message takes that
+      // row's place, between whatever came before and after it.
+      let previewIndex = rows.length - 1;
+      for (; previewIndex >= 0; previewIndex -= 1) {
+        const item = rows[previewIndex];
+        if (
+          item.kind === 'message' &&
+          item.streaming === true &&
+          item.previewId === row.previewId &&
+          item.attemptNo === row.attemptNo
+        ) {
+          break;
+        }
+      }
+      const preview = rows[previewIndex];
+      if (preview?.kind === 'message') {
+        // The first piece's id stays the row's identity, live and on reload,
+        // so completing the answer never moves the reading anchor.
+        rows[previewIndex] = !row.streaming
+          ? { ...row, sourceEventId: preview.sourceEventId }
+          : replyPreviewPiece(event)?.reset
+            ? { ...preview, text: row.text }
+            : { ...preview, text: preview.text + row.text };
         continue;
       }
     }
