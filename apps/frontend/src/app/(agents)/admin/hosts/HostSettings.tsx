@@ -1,42 +1,58 @@
 'use client';
 
-// Runtime settings — time limits, the repository import limit, chats per
-// sandbox, terminal limits — set here instead of in each server's `.env`.
+// Sandbox settings — the turn time limit, the repository size limit,
+// sessions per sandbox, idle timeouts and terminal limits — set from the admin
+// pages instead of in each server's `.env`.
 //
-// Two places, one precedence: the card sets a value for every server, and a
-// server's own panel can set one that wins over it. Clearing a value falls back
-// a level, ending at the server's own `.env` or built-in default. Nothing here
-// claims a value is in force until the server reports applying it.
+// Two places, one precedence: the Settings page sets a value for every server,
+// and a server's own panel on the Servers page can set one that wins over it.
+// Clearing a value falls back a level, ending at the server's own `.env` or
+// built-in default. Nothing here claims a value is in force until the server
+// reports applying it.
 
+import Link from 'next/link';
 import { useState } from 'react';
 
 import type { AgentRunnerHost, HostSettingDefinition, HostSettingValues } from '@/lib/api/admin';
 
 import {
+  amountIn,
   factNote,
   formatSettingValue,
+  type InputUnit,
+  inputUnits,
   parseSettingInput,
   rolloutText,
   settingFact,
+  shorteningEffect,
   supportsSettings,
-  unitLabel,
+  unitFor,
 } from './settings';
 
 type OnChange = (key: string, value: number | null) => void;
 
+/** A server as the admin pages name it, with the host that speaks for it. */
+export interface NamedHost {
+  name: string;
+  host: AgentRunnerHost;
+}
+
 const INPUT_CLASS =
-  'w-24 rounded-md border border-gray-200 bg-white px-1.5 py-0.5 text-xs tabular-nums text-gray-700 shadow-sm disabled:opacity-40 aria-[invalid=true]:border-red-400 dark:border-white/10 dark:bg-gray-900 dark:text-gray-200';
+  'w-20 shrink-0 rounded-md border border-gray-200 bg-white px-1.5 py-0.5 text-xs tabular-nums text-gray-700 shadow-sm disabled:opacity-40 aria-[invalid=true]:border-red-400 dark:border-white/10 dark:bg-gray-900 dark:text-gray-200';
+const UNIT_CLASS =
+  'w-16 shrink-0 rounded-md border border-gray-200 bg-white px-1 py-0.5 text-xs text-gray-700 shadow-sm disabled:opacity-40 dark:border-white/10 dark:bg-gray-900 dark:text-gray-200';
 const BUTTON_CLASS =
   'rounded-md border border-gray-200 bg-white px-1.5 py-0.5 text-xs font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-40 dark:border-white/10 dark:bg-transparent dark:text-gray-200 dark:hover:bg-white/5';
 const CLEAR_CLASS =
   'rounded-md px-1.5 py-0.5 text-xs text-gray-500 hover:bg-gray-50 hover:text-gray-700 disabled:opacity-40 dark:text-gray-400 dark:hover:bg-white/5 dark:hover:text-gray-200';
 
 /**
- * One value's input, Save and clear.
+ * One value's amount, unit, Save and clear.
  *
- * Uncontrolled and re-keyed on the saved value, like the execution-slots
- * field: a poll landing mid-edit does not overwrite what the admin is typing,
- * and a saved change does replace it.
+ * Re-keyed on the saved value by its parent, like the execution-slots field:
+ * a poll landing mid-edit does not reset what the admin is typing, and a saved
+ * change does replace it. The amount is typed in a unit — 8 h, not 28800 —
+ * and sent in the setting's own seconds or MiB.
  */
 function SettingForm({
   definition,
@@ -57,19 +73,29 @@ function SettingForm({
   disabled?: boolean;
   onChange: OnChange;
 }) {
+  // What this level uses now: its own value, else the one it inherits.
+  const current = saved ?? placeholder;
+  const units = inputUnits(definition);
+  const startUnit = unitFor(definition, current ?? definition.default);
+  const startAmount = saved === null ? '' : amountIn(saved, startUnit);
+  const [unit, setUnit] = useState<InputUnit | null>(startUnit);
+  const [amount, setAmount] = useState(startAmount);
   const [error, setError] = useState<string | null>(null);
-  const unit = unitLabel(definition);
+  const dirty = amount !== startAmount || (amount !== '' && unit !== startUnit);
+  const typed = amount.trim() === '' ? null : parseSettingInput(definition, amount, unit);
+  const effect =
+    typed !== null && 'value' in typed && current !== null && typed.value < current
+      ? shorteningEffect(definition, typed.value)
+      : null;
   const errorId = `setting-error-${label.replace(/[^a-zA-Z0-9_-]/g, '-')}`;
   return (
     <div>
       <form
-        className="flex flex-nowrap items-center justify-end gap-1.5 whitespace-nowrap"
+        noValidate
+        className="flex flex-wrap items-center justify-end gap-1.5 whitespace-nowrap"
         onSubmit={(event) => {
           event.preventDefault();
-          const parsed = parseSettingInput(
-            definition,
-            String(new FormData(event.currentTarget).get('value') ?? ''),
-          );
+          const parsed = parseSettingInput(definition, amount, unit);
           if ('error' in parsed) {
             setError(parsed.error);
             return;
@@ -79,15 +105,16 @@ function SettingForm({
         }}
       >
         <input
-          key={`${definition.key}:${saved ?? 'unset'}`}
           name="value"
           type="number"
-          inputMode="numeric"
-          min={definition.minimum}
-          max={definition.maximum}
-          step={1}
-          defaultValue={saved ?? ''}
-          placeholder={placeholder === null ? undefined : String(placeholder)}
+          inputMode={units.length > 0 ? 'decimal' : 'numeric'}
+          step="any"
+          value={amount}
+          onChange={(event) => {
+            setAmount(event.target.value);
+            setError(null);
+          }}
+          placeholder={current === null ? undefined : amountIn(current, unit)}
           aria-label={label}
           aria-invalid={error !== null}
           aria-describedby={error !== null ? errorId : undefined}
@@ -98,8 +125,27 @@ function SettingForm({
             inputs line up down the column whether or not a row has a unit or
             a value to clear. A row with nothing to clear holds an inert,
             hidden button rather than none. */}
-        <span className="w-7 text-xs text-gray-500 dark:text-gray-400">{unit}</span>
-        <button type="submit" disabled={busy || disabled} className={BUTTON_CLASS}>
+        {units.length > 0 ? (
+          <select
+            aria-label={`${label} unit`}
+            value={unit ?? undefined}
+            onChange={(event) => {
+              setUnit(event.target.value as InputUnit);
+              setError(null);
+            }}
+            disabled={busy || disabled}
+            className={UNIT_CLASS}
+          >
+            {units.map((option) => (
+              <option key={option} value={option}>
+                {option}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <span aria-hidden className="w-16 shrink-0" />
+        )}
+        <button type="submit" disabled={busy || disabled || !dirty} className={BUTTON_CLASS}>
           Save
         </button>
         <button
@@ -111,12 +157,12 @@ function SettingForm({
             setError(null);
             onChange(definition.key, null);
           }}
-          className={`${CLEAR_CLASS} ${saved === null ? 'invisible' : ''}`}
+          className={`${CLEAR_CLASS} ${saved === null ? 'hidden sm:block sm:invisible' : ''}`}
         >
           {clearLabel}
         </button>
       </form>
-      {error !== null && (
+      {error !== null ? (
         <p
           id={errorId}
           role="alert"
@@ -124,6 +170,10 @@ function SettingForm({
         >
           {error}
         </p>
+      ) : (
+        effect !== null && (
+          <p className="mt-1 text-right text-[11px] text-amber-700 dark:text-amber-300">{effect}</p>
+        )
       )}
     </div>
   );
@@ -131,25 +181,26 @@ function SettingForm({
 
 /** The values set for every server, each with how far it has reached. */
 export function GlobalSettingsCard({
+  title,
   definitions,
   values,
-  hosts,
+  servers,
   busy,
   onChange,
 }: {
+  title: string;
   definitions: HostSettingDefinition[];
   values: HostSettingValues;
-  hosts: AgentRunnerHost[];
+  servers: NamedHost[];
   busy: boolean;
   onChange: OnChange;
 }) {
+  const hosts = servers.map(({ host }) => host);
+  const names = new Map(servers.map(({ name, host }) => [host.host, name] as const));
+  const nameOf = (host: AgentRunnerHost) => names.get(host.host) ?? host.host;
   return (
     <div className="mt-8 rounded-2xl border border-gray-200 bg-white p-5 dark:border-white/10 dark:bg-gray-900">
-      <h2 className="text-base font-semibold text-gray-900 dark:text-gray-50">Runtime settings</h2>
-      <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
-        For every server. A value set on one server wins; a cleared value falls back to each
-        server&apos;s own .env.
-      </p>
+      <h2 className="text-base font-semibold text-gray-900 dark:text-gray-50">{title}</h2>
       <div className="mt-2">
         {definitions.map((definition, index) => {
           const saved = values[definition.key] ?? null;
@@ -173,16 +224,17 @@ export function GlobalSettingsCard({
                   {definition.description}
                 </p>
                 <p className="mt-1 text-[11px] text-gray-500 dark:text-gray-400">
-                  {rolloutText(definition, values, hosts)}
+                  {rolloutText(definition, values, hosts, nameOf)}
                 </p>
               </div>
               <div className="shrink-0">
                 <SettingForm
+                  key={`${definition.key}:${saved ?? 'unset'}`}
                   definition={definition}
                   saved={saved}
                   placeholder={definition.default}
                   label={`${definition.label} for all servers`}
-                  clearLabel="Use each server's own"
+                  clearLabel="Use server defaults"
                   busy={busy}
                   onChange={onChange}
                 />
@@ -213,8 +265,18 @@ export function ServerSettingsPanel({
 }) {
   const supported = supportsSettings(host);
   return (
-    <section aria-label={`Runtime settings for ${name}`} className="mt-6">
-      <h3 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Runtime settings</h3>
+    <section aria-label={`Sandbox settings for ${name}`} className="mt-6">
+      <h3 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Sandbox</h3>
+      <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+        Values set here override the global defaults in{' '}
+        <Link
+          href="/admin/settings"
+          className="underline hover:text-gray-700 dark:hover:text-gray-200"
+        >
+          Settings
+        </Link>
+        .
+      </p>
       {!supported && (
         <p className="mt-1 text-xs text-amber-700 dark:text-amber-300">
           This server&apos;s runner predates settings from this page and keeps its .env values.
@@ -261,11 +323,12 @@ export function ServerSettingsPanel({
                 </td>
                 <td className="py-2 align-top">
                   <SettingForm
+                    key={`${definition.key}:${override ?? 'unset'}`}
                     definition={definition}
                     saved={override}
                     placeholder={fact.admin ?? fact.own ?? definition.default}
                     label={`${definition.label} for ${name}`}
-                    clearLabel="Clear"
+                    clearLabel="Use default"
                     busy={busy}
                     disabled={!supported}
                     onChange={onChange}
