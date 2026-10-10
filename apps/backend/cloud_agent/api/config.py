@@ -17,7 +17,6 @@ from cloud_agent.api.deps import (
     get_gateway_client,
     get_github_app_state,
     get_storage,
-    require_store,
 )
 from cloud_agent.entitlement import repos_for_user
 from cloud_agent.logging_utils import get_logger
@@ -56,11 +55,6 @@ class _ConfigStorage(Protocol):
     conversation_queries: ConversationQueries
     mcp: McpConnectionRepository
     source_control: SourceControlPort
-
-
-def _require_store(store: _ConfigStorage | None) -> _ConfigStorage:
-    """Return the store or fail with a clear 503 when the DB is absent."""
-    return require_store(store)
 
 
 @router.get("/config", response_model=AgentConfigResponse)
@@ -136,7 +130,7 @@ async def get_agent_config(
             gateway, user_id=user["user_id"]
         ),
         # This user's connected servers, not the deployment's: same reason the
-        # repository list above is theirs. Public fields only — McpServerSummary
+        # repository list above is theirs. Public fields only — McpConnectionSummary
         # has nowhere to put a URL or a credential, which is how it stays that
         # way.
         mcp_connections=[
