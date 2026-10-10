@@ -7,20 +7,24 @@ fixed resource identity and request parameters bound the external effects.
 
 from __future__ import annotations
 
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from pydantic import SecretStr
 
+from cloud_agent.application.compute_rotation import ComputeRotation
 from cloud_agent.application.host_commands import HostCommands
 from cloud_agent.broker_routing import broker_for_host
 from cloud_agent.compute_secrets import ComputeSecretError
 from cloud_agent.domain.compute import ComputeRefusal
+from cloud_agent.host_pool import hash_secret
 from cloud_agent.logging_utils import get_logger
 from cloud_agent.ports.external.compute_provider import (
     AcquireRequest,
     ExtendRequest,
     NodeObservation,
+    NodeRegistration,
     OperationIntent,
     ProviderError,
     ProviderReceipt,
@@ -63,6 +67,34 @@ _PREFLIGHT_CHECKS = {
 }
 
 
+# How long past its recorded deadline a missing resource is taken as ended.
+_EXPIRY_GRACE = timedelta(minutes=10)
+# A node registers at first boot; provisioning plus boot fit well inside this.
+_REGISTRATION_TTL_SECONDS = 2 * 3600
+_HOST_KEY_PREFERENCE = (
+    "ssh-ed25519",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "ssh-rsa",
+)
+
+
+def _preferred_host_key(keys: list[str]) -> str:
+    """Pin the strongest key type the node registered."""
+    ranked = sorted(
+        keys,
+        key=lambda key: (
+            _HOST_KEY_PREFERENCE.index(key.split()[0])
+            if key.split()[0] in _HOST_KEY_PREFERENCE
+            else len(_HOST_KEY_PREFERENCE)
+        ),
+    )
+    if not ranked or ranked[0].split()[0] not in _HOST_KEY_PREFERENCE:
+        raise ProviderError("registration_invalid", "The node registered no supported host key")
+    return ranked[0]
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -83,6 +115,7 @@ class ComputeReconciler:
         self.repository = commands.repository
         self.host_pool = host_pool
         self.bootstrap = bootstrap
+        self.rotation = ComputeRotation(self)
 
     async def schedule(self) -> None:
         """Observe leases and submit renewals even while retirement is blocked."""
@@ -119,6 +152,20 @@ class ComputeReconciler:
                 seconds=policy.renew_before_seconds
             ):
                 continue
+            lifecycle = await self.repository.list_operations(
+                allocation_id=row["id"], kinds=["extend", "rotate"]
+            )
+            trigger = self.rotation.due(row, policy, lifecycle, now, expires)
+            if trigger is not None:
+                await self.rotation.start(row, trigger, expires)
+            await self.rotation.remind(row, lifecycle, now, expires)
+            stalled = any(
+                op["kind"] == "rotate" and op["state"] in {"blocked", "failed"} for op in lifecycle
+            )
+            if self.rotation.replaces_renewal(row, policy, now) and not stalled:
+                # A node at its maximum age is replaced rather than extended,
+                # unless its replacement is stuck: then time still helps.
+                continue
             request_id = f"renew:{row['id']}:{int(expires.timestamp())}:{row['revision']}"
             if any(op["request_id"] == request_id for op in operations):
                 continue
@@ -152,12 +199,18 @@ class ComputeReconciler:
                 await self._extend(operation, allocation)
             elif kind == "retire":
                 await self._retire(operation, allocation)
+            elif kind == "rotate":
+                await self.rotation.rotate(operation, allocation)
+            elif kind == "discard":
+                await self.rotation.discard(operation, allocation)
             else:
                 raise ProviderError("unsupported_operation", "Unknown compute operation")
         except (ProviderError, ComputeRefusal, ComputeSecretError) as exc:
             code = getattr(exc, "code", "credential_unavailable")
             retryable = bool(getattr(exc, "retryable", False))
-            if operation.get("allocation_id"):
+            if operation.get("allocation_id") and operation["kind"] != "rotate":
+                # A failed move says nothing about the old node's lease; recording
+                # it would stop new chats there until the next observation.
                 await self.repository.record_observation_error(
                     allocation_id=operation["allocation_id"], message=code, **self._fence(operation)
                 )
@@ -318,6 +371,12 @@ class ComputeReconciler:
         await self._save_observation(operation, allocation, observation)
         if observation.state == "terminated":
             raise ProviderError("resource_terminated", "The allocated resource has terminated")
+        if observation.state == "failed":
+            await self._release_failed_acquisition(operation, allocation)
+            raise ProviderError(
+                "resource_failed",
+                "The provider could not set up this resource; it was released",
+            )
         if observation.state != "ready":
             await self._finish(
                 operation,
@@ -344,9 +403,18 @@ class ComputeReconciler:
             )
         allocation = await self._allocation(allocation["id"])
         node = allocation["nodes"][0]
-        observed_node = observation.nodes[0]
+        registered = await self._registered_node(operation, allocation, node, observation.nodes[0])
+        if registered is None:
+            return
+        observed_node = registered
         profile = DeploymentProfile.model_validate(allocation["deployment_profile"])
         intent = self._bootstrap_intent(operation, allocation, node)
+        if operation.get("parameters", {}).get("rotation_operation_id"):
+            # A replacement node: staged and filled with a copy, never started here.
+            await self.rotation.stage_candidate(
+                operation, allocation, observed_node, profile, intent
+            )
+            return
         await self.repository.prepare_bootstrap_binding(
             node_id=node["id"], host=intent.host, **self._fence(operation)
         )
@@ -436,18 +504,151 @@ class ComputeReconciler:
         self, operation: dict[str, Any], allocation: dict[str, Any]
     ) -> ResourceObservation:
         provider = self.commands.registry.get(allocation["provider_id"]).provider
-        observation = await provider.inspect(self._ref(allocation))
+        try:
+            observation = await provider.inspect(self._ref(allocation))
+        except ProviderError as exc:
+            expired = self._expired_absence(allocation, exc)
+            if expired is None:
+                raise
+            observation = expired
         await self._save_observation(operation, allocation, observation)
         return observation
+
+    def _expired_absence(
+        self, allocation: dict[str, Any], exc: ProviderError
+    ) -> ResourceObservation | None:
+        """Treat a missing resource as ended only once its own recorded lease has run out.
+
+        Absence alone never proves deletion: visibility or credentials can
+        change. Past the lease the provider has ended it regardless, so the
+        recorded deadline is the evidence.
+        """
+        expires = _moment(allocation.get("expires_at"))
+        if (
+            exc.code != "resource_visibility_unknown"
+            or not allocation.get("expiration_known")
+            or expires is None
+            or _now() < expires + _EXPIRY_GRACE
+        ):
+            return None
+        return ResourceObservation(
+            ref=self._ref(allocation),
+            state="terminated",
+            raw_state="expired_not_found",
+            observed_at=_now(),
+            expires_at=expires,
+            lease_known=True,
+            scope_complete=True,
+        )
+
+    @staticmethod
+    def _registers_host_keys(allocation: dict[str, Any]) -> bool:
+        return (allocation.get("configuration") or {}).get("host_key_source") == "registration"
+
+    async def _open_registration(
+        self, operation: dict[str, Any], allocation: dict[str, Any]
+    ) -> NodeRegistration:
+        """Mint the one-time token this acquisition's node registers its host keys with.
+
+        Each submission gets a fresh token; only the newest one of an
+        allocation can register, and only its hash is stored.
+        """
+        url = self.commands.configuration.registration_url
+        if not url:
+            raise ProviderError(
+                "registration_unavailable",
+                "Set the public API address before nodes can register their host keys",
+            )
+        token = secrets.token_urlsafe(32)
+        await self.repository.create_node_registration(
+            allocation_id=allocation["id"],
+            token_hash=hash_secret(token),
+            ttl_seconds=_REGISTRATION_TTL_SECONDS,
+            **self._fence(operation),
+        )
+        return NodeRegistration(url=url, token=SecretStr(token))
+
+    async def _registered_node(
+        self,
+        operation: dict[str, Any],
+        allocation: dict[str, Any],
+        node: dict[str, Any],
+        observed: NodeObservation,
+    ) -> NodeObservation | None:
+        """Return the node with the host key it registered, or None while waiting.
+
+        Nodes trusted through an administrator's verified list are unchanged.
+        A registering node is reached over SSH only once its key is pinned.
+        """
+        connection = observed.connection
+        if connection is None or not self._registers_host_keys(allocation):
+            return observed
+        pinned = (node.get("connection") or {}).get("host_key")
+        if not pinned:
+            registration = await self.repository.node_registration(allocation_id=allocation["id"])
+            if registration is None or (
+                not registration.get("registered_at") and registration.get("expired")
+            ):
+                raise ProviderError(
+                    "registration_expired",
+                    "The node did not register its SSH host keys in time",
+                )
+            if not registration.get("registered_at"):
+                await self._finish(
+                    operation,
+                    "waiting",
+                    "waiting_for_registration",
+                    "Waiting for the node to register its SSH host keys.",
+                    retry=15,
+                )
+                return None
+            pinned = _preferred_host_key(registration["host_keys"])
+            await self.repository.record_host_key(
+                node_id=node["id"], host_key=pinned, **self._fence(operation)
+            )
+        return observed.model_copy(
+            update={"connection": connection.model_copy(update={"host_key": pinned})}
+        )
+
+    async def _release_failed_acquisition(
+        self, operation: dict[str, Any], allocation: dict[str, Any]
+    ) -> None:
+        """Delete a resource the provider failed to set up.
+
+        No Host ever ran there: deployment starts only once a resource is ready.
+        Left alone it would hold machines and this deployment setup until its
+        lease ends.
+        """
+        if allocation["mode"] != "provision" or allocation.get("management_mode") != "manage":
+            return
+        provider = self.commands.registry.get(allocation["provider_id"]).provider
+        if not provider.capabilities().can_release:
+            return
+        # The caller's copy predates the identity this acquisition just saved.
+        allocation = await self._allocation(allocation["id"])
+        await self._checkpoint(operation, "releasing_failed", {"external_pending": True})
+        receipt = await provider.release(self._ref(allocation), self._intent(operation, allocation))
+        observation = receipt.observation or await provider.inspect(self._ref(allocation))
+        await self._save_observation(operation, allocation, observation)
+        if observation.state != "terminated":
+            raise ProviderError(
+                "release_pending",
+                "Waiting for the provider to remove the failed resource",
+                retryable=True,
+            )
+        await self._checkpoint(operation, "failed_resource_released", {"external_pending": False})
 
     async def _submit_acquisition(
         self, operation: dict[str, Any], allocation: dict[str, Any]
     ) -> ProviderReceipt:
         provider = self.commands.registry.get(allocation["provider_id"]).provider
-        try:
-            return await provider.acquire(
-                self._request(allocation), self._intent(operation, allocation)
+        request = self._request(allocation)
+        if self._registers_host_keys(allocation):
+            request = request.model_copy(
+                update={"registration": await self._open_registration(operation, allocation)}
             )
+        try:
+            return await provider.acquire(request, self._intent(operation, allocation))
         except (ProviderError, ComputeSecretError) as exc:
             if getattr(exc, "code", "credential_unavailable") != "result_unknown":
                 # A definite rejection is safe to retry after credentials or
@@ -839,11 +1040,13 @@ class ComputeReconciler:
     def _bootstrap_intent(
         operation: dict[str, Any], allocation: dict[str, Any], node: dict[str, Any]
     ) -> BootstrapIntent:
+        # A node that took a Host over keeps that Host's name and namespace.
         return BootstrapIntent(
             operation_id=operation["id"],
             allocation_id=allocation["id"],
             node_id=node["id"],
-            host="compute-" + node["id"].replace("-", ""),
+            host=allocation.get("slot_host") or "compute-" + node["id"].replace("-", ""),
+            namespace=allocation.get("slot_namespace"),
         )
 
     @staticmethod
