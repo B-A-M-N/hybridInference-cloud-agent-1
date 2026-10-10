@@ -293,13 +293,15 @@ describe('TurnFooter', () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it('opens the per-tool table and labels its timing as approximate', () => {
+  it('reveals a full tool detail and labels its timing as approximate', () => {
+    const fullDetail =
+      'git -C /workspace/repositories/freeinference-cloud-agent status --short --branch';
     const withTools = job({
       events: [
         {
           kind: 'tool_use',
           tool: 'Bash',
-          detail: 'cargo build',
+          detail: fullDetail,
           id: 't1',
           at: '2026-08-19T10:00:00.000Z',
         },
@@ -314,7 +316,14 @@ describe('TurnFooter', () => {
     });
     render(<TurnFooter job={withTools} />);
     fireEvent.click(screen.getByRole('button', { name: '1 tool call' }));
-    expect(screen.getByText('cargo build')).toBeInTheDocument();
+    const detail = screen.getByTitle(fullDetail);
+    fireEvent.click(detail);
+    expect(detail.parentElement).toHaveAttribute('open');
+    expect(detail).toHaveTextContent(fullDetail);
+    expect(screen.getByRole('region', { name: 'Tool call measurements' })).toHaveAttribute(
+      'tabindex',
+      '0',
+    );
     expect(screen.getByText('15s')).toBeInTheDocument();
     expect(screen.getByTitle('Approximate duration')).toHaveTextContent('15s');
   });
