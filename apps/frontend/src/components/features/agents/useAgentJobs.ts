@@ -28,6 +28,12 @@ import { getConversationState } from './conversationState';
 import { isActiveJobState, isActiveConversationState } from './conversationJob';
 import { hasActiveGoal } from './goal/liveWork';
 import { preserveResolvedTaskTitle, taskTitleNeedsGeneration } from './taskTitles';
+import {
+  onAgentRecordsChanged,
+  overlayPushed,
+  PUSH_FALLBACK_POLL_MS,
+  useAgentPushLive,
+} from './agentPush';
 
 const ACTIVE_ATTEMPT_PHASES = new Set([
   'started',
@@ -388,7 +394,7 @@ export function useAgentJob(
       .then(([job, foundThread, foundEvents]) => {
         if (cancelled || requestGeneration !== generation.current) return;
         const ownEvents = foundEvents.filter((event) => event.job_id === jobId);
-        setApi((current) => preserveResolvedTaskTitle(current, job));
+        setApi((current) => preserveResolvedTaskTitle(current, overlayPushed(job)));
         setEvents(ownEvents);
         setThreadEvents(foundEvents);
         setThread(foundThread);
@@ -463,14 +469,50 @@ export function useAgentJob(
     return () => controller.abort();
   }, [active, currentTurnNo, jobId, isLive, reload]);
 
+  // The owner's change stream reports this conversation's title, and any turn
+  // of it changing. What it sends is patched in at once; the turn's own row is
+  // then read for the fields a push does not carry (detail, goal, attempt).
+  const pushLive = useAgentPushLive();
+  const pushThreadId = api?.id === jobId ? api.thread_id : undefined;
+  useEffect(() => {
+    if (!active || !jobId) return undefined;
+    let cancelled = false;
+    let latestRead = 0;
+    const unsubscribe = onAgentRecordsChanged((change) => {
+      const touched =
+        change.resync ||
+        change.jobs.some(
+          (job) =>
+            job.id === jobId || (pushThreadId !== undefined && job.thread_id === pushThreadId),
+        ) ||
+        change.threads.some((thread) => thread.id === pushThreadId);
+      if (!touched) return;
+      setApi((current) => (current?.id === jobId ? overlayPushed(current) : current));
+      const read = ++latestRead;
+      void getAgentJob(jobId)
+        .then((latest) => {
+          if (!cancelled && read === latestRead)
+            setApi((current) => preserveResolvedTaskTitle(current, overlayPushed(latest)));
+        })
+        .catch(() => {
+          // The next change, or the fallback clock below, reads it again.
+        });
+    });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [active, jobId, pushThreadId]);
+
   // A claim may recover an earlier failed title, including on a follow-up.
   // Outlast the server's bounded 120s retry window without waiting for SSE to end.
+  // While pushes flow, the generated title arrives with its conversation's row.
   const awaitingTitle =
     api?.id === jobId &&
     taskTitleNeedsGeneration(api) &&
     (state === 'running' || state === 'publishing' || state === 'succeeded');
   useEffect(() => {
-    if (!active || !awaitingTitle) return;
+    if (!active || !awaitingTitle || pushLive) return;
     let cancelled = false;
     let requests = 0;
     let pending = false;
@@ -515,7 +557,7 @@ export function useAgentJob(
       cancelled = true;
       clearInterval(timer);
     };
-  }, [active, awaitingTitle, jobId, tick]);
+  }, [active, awaitingTitle, jobId, pushLive, tick]);
 
   // A queued or terminal turn's stream cannot report another turn finishing.
   // Refresh shared activity until this turn takes over or the conversation
@@ -532,6 +574,7 @@ export function useAgentJob(
     (publicationActive ||
       goalActive ||
       (state !== 'running' && state !== 'publishing' && conversationActive));
+  const metadataInterval = pushLive && !publicationActive ? PUSH_FALLBACK_POLL_MS : 5_000;
   useEffect(() => {
     if (!active || !jobId || !metadataActive) return undefined;
     let cancelled = false;
@@ -546,7 +589,7 @@ export function useAgentJob(
       void getAgentJob(jobId)
         .then((latest) => {
           if (!cancelled && generation.current === version)
-            setApi((current) => preserveResolvedTaskTitle(current, latest));
+            setApi((current) => preserveResolvedTaskTitle(current, overlayPushed(latest)));
         })
         .catch(() => {
           // This is a background freshness aid. Keep the last good terminal
@@ -555,12 +598,14 @@ export function useAgentJob(
         .finally(() => {
           pending = false;
         });
-    }, 5_000);
+      // Publication progress lives outside the rows the change stream watches,
+      // so it keeps the short clock even while pushes flow.
+    }, metadataInterval);
     return () => {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [active, jobId, metadataActive, tick]);
+  }, [active, jobId, metadataActive, metadataInterval, tick]);
 
   const visibleThread = useMemo(() => {
     if (!hideForkedHistory || !thread) return thread;

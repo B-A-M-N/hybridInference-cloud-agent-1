@@ -128,15 +128,27 @@ async def test_the_triggers_go_with_a_downgrade_and_come_back_with_the_upgrade(s
         "agent_notify_job_state_changed",
     }
     assert ours <= await installed()
+    # Claimed at head: the store reads columns a downgraded schema lacks, so
+    # once downgraded the event and the state change are written directly.
+    job = await _create_job(store)
+    claim = await _claim(store, worker_id="w1", lease_ttl_seconds=60)
+    assert claim is not None
     try:
         downgrade_to(config, "0029_work_available_notify")
         assert not ours & await installed()
         assert {"agent_jobs_work_queued", "agent_jobs_work_released"} <= await installed()
         heard = await _listen()
         try:
-            await _create_job(store)
-            claim = await _claim(store, worker_id="w1", lease_ttl_seconds=60)
-            assert claim is not None
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO agent_job_events (job_id, attempt_id, seq, event_type) "
+                    "VALUES ($1, $2, 1, 'message')",
+                    job["id"],
+                    claim["attempt_id"],
+                )
+                await conn.execute(
+                    "UPDATE agent_jobs SET state = 'failed' WHERE id = $1", job["id"]
+                )
             assert await _nothing_heard_since(heard, pool)
         finally:
             await heard.connection.close()

@@ -74,6 +74,7 @@ if TYPE_CHECKING:
     from cloud_agent.ports import AuditRepository
     from cloud_agent.storage.assembly import Storage
     from cloud_agent.workers.job_event_signal import JobEventSignal
+    from cloud_agent.workers.owner_change_signal import OwnerChangeSignal
     from cloud_agent.workers.work_signal import WorkSignal
 
 
@@ -153,6 +154,15 @@ def get_job_event_signal(request: Request) -> JobEventSignal | None:
     application that has not set one. Streams there read on a clock instead.
     """
     return getattr(request.app.state, "job_event_signal", None)
+
+
+def get_owner_change_signal(request: Request) -> OwnerChangeSignal | None:
+    """Dependency to obtain the per-owner change sets tabs' change streams read.
+
+    ``None`` where nothing listens for owner changes: the MCP relay, and a test
+    application that has not set one. Tabs there read on their own clocks.
+    """
+    return getattr(request.app.state, "owner_change_signal", None)
 
 
 def get_source_control(request: Request) -> SourceControlRuntime | None:

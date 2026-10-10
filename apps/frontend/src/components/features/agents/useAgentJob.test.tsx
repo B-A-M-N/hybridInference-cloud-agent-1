@@ -15,6 +15,14 @@ import {
   type AgentThreadEventApi,
 } from '@/lib/api/agents';
 
+import {
+  PUSH_BATCH_MS,
+  PUSH_FALLBACK_POLL_MS,
+  receiveJobChange,
+  receiveThreadChange,
+  resetAgentPush,
+  setAgentPushLive,
+} from './agentPush';
 import { buildTrajectorySteps, turnContextFromJobs } from './trajectorySteps';
 import { useAgentJob } from './useAgentJobs';
 
@@ -351,5 +359,121 @@ describe('useAgentJob live turn rows', () => {
       'not_recorded',
       'waiting',
     ]);
+  });
+});
+
+describe('useAgentJob with the owner change stream', () => {
+  afterEach(() => resetAgentPush());
+
+  const settled = {
+    id: 'settled-job',
+    state: 'succeeded',
+    conversation_state: 'idle',
+    thread_id: 'live-thread',
+    turn_no: 1,
+    task_prompt: 'Fix it',
+    runtime: 'codex',
+    model: 'test',
+    title: 'Fix it',
+    title_source: 'fallback',
+    published_pr_url: null,
+    revision: 2,
+    thread_revision: 3,
+  } as AgentJobApi;
+
+  function serve(job: AgentJobApi): void {
+    vi.mocked(getAgentJob).mockResolvedValue(job);
+    vi.mocked(getAgentJobThread).mockResolvedValue({
+      thread_id: job.thread_id,
+      jobs: [job],
+      messages: [],
+    } as unknown as AgentThreadApi);
+    vi.mocked(listAllAgentThreadEvents).mockResolvedValue([]);
+  }
+
+  it('shows a pushed title at once and keeps it over a read that left before it', async () => {
+    vi.useFakeTimers();
+    serve(settled);
+    const { result } = renderHook(() => useAgentJob(settled.id));
+    await act(async () => {});
+    expect(result.current.job?.title).toBe('Fix it');
+
+    // The read the push prompts answers with the row as it was (revision 3).
+    await act(async () => {
+      receiveThreadChange({
+        id: 'live-thread',
+        revision: 4,
+        title: 'Fix the flaky test',
+        title_source: 'generated',
+      });
+      await vi.advanceTimersByTimeAsync(PUSH_BATCH_MS);
+    });
+
+    expect(result.current.job?.title).toBe('Fix the flaky test');
+    // One read of the turn's row; the conversation and its events are not
+    // fetched again for a field that changed on it.
+    expect(getAgentJob).toHaveBeenCalledTimes(2);
+    expect(getAgentJobThread).toHaveBeenCalledTimes(1);
+    expect(listAllAgentThreadEvents).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows a pushed state and pull request link for its own turn', async () => {
+    vi.useFakeTimers();
+    serve({ ...settled, state: 'running', conversation_state: 'running' });
+    vi.mocked(streamAgentJob).mockReturnValue(new Promise(() => undefined));
+    const { result } = renderHook(() => useAgentJob(settled.id));
+    await act(async () => {});
+
+    await act(async () => {
+      receiveJobChange({
+        id: settled.id,
+        thread_id: 'live-thread',
+        revision: 5,
+        state: 'succeeded',
+        conversation_state: 'idle',
+        published_pr_url: 'https://example.test/pr/7',
+      });
+      await vi.advanceTimersByTimeAsync(PUSH_BATCH_MS);
+    });
+
+    expect(result.current.job?.conversationState).toBe('idle');
+    expect(result.current.job?.prUrl).toBe('https://example.test/pr/7');
+    expect(getAgentJob).toHaveBeenCalledTimes(2);
+  });
+
+  it('ignores what changed in other conversations', async () => {
+    vi.useFakeTimers();
+    serve(settled);
+    renderHook(() => useAgentJob(settled.id));
+    await act(async () => {});
+
+    await act(async () => {
+      receiveThreadChange({ id: 'other-thread', revision: 1, title: 'Elsewhere' });
+      receiveJobChange({
+        id: 'other-job',
+        thread_id: 'other-thread',
+        revision: 1,
+        state: 'running',
+      });
+      await vi.advanceTimersByTimeAsync(PUSH_BATCH_MS);
+    });
+
+    expect(getAgentJob).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads another turn's activity on the slow clock while pushes flow", async () => {
+    vi.useFakeTimers();
+    // The turn on screen has settled while a later one runs: it used to be
+    // read every five seconds to notice that turn ending.
+    serve({ ...settled, conversation_state: 'running' });
+    act(() => setAgentPushLive(true));
+    renderHook(() => useAgentJob(settled.id));
+    await act(async () => {});
+
+    await act(async () => vi.advanceTimersByTimeAsync(5_000));
+    expect(getAgentJob).toHaveBeenCalledTimes(1);
+
+    await act(async () => vi.advanceTimersByTimeAsync(PUSH_FALLBACK_POLL_MS));
+    expect(getAgentJob).toHaveBeenCalledTimes(2);
   });
 });

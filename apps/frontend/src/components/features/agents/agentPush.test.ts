@@ -1,0 +1,160 @@
+// @vitest-environment jsdom
+// What a tab holds from the owner's change stream. The cases that matter are
+// the ones where a wrong answer shows the owner something older than they were
+// already shown: a late or repeated push replacing a newer one, or an API read
+// that left before a change putting the old title back after its push.
+import { act, renderHook } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import type { AgentJobApi } from '@/lib/api/agents';
+import { streamAgentChanges, type StreamAgentChangesOptions } from '@/lib/api/agentChanges';
+
+import {
+  type AgentRecordsChange,
+  isAgentPushLive,
+  onAgentRecordsChanged,
+  overlayPushed,
+  PUSH_BATCH_MS,
+  receiveJobChange,
+  receiveSync,
+  receiveThreadChange,
+  resetAgentPush,
+  useAgentChangeStream,
+  useAgentPushLive,
+} from './agentPush';
+
+vi.mock('@/lib/api/agentChanges', () => ({ streamAgentChanges: vi.fn() }));
+
+const JOB = {
+  id: 'ajob_1',
+  thread_id: 'athr_1',
+  state: 'running',
+  conversation_state: 'running',
+  published_pr_url: null,
+  title: 'Old title',
+  title_source: 'fallback',
+  revision: 3,
+  thread_revision: 5,
+} as AgentJobApi;
+
+function collect(): AgentRecordsChange[] {
+  const seen: AgentRecordsChange[] = [];
+  onAgentRecordsChanged((change) => seen.push(change));
+  return seen;
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.useFakeTimers();
+  resetAgentPush();
+});
+
+afterEach(() => {
+  resetAgentPush();
+  vi.useRealTimers();
+});
+
+describe('pushed records', () => {
+  it('delivers changes that land together as one batch', () => {
+    const seen = collect();
+    receiveJobChange({ id: 'ajob_1', thread_id: 'athr_1', revision: 4, state: 'succeeded' });
+    receiveThreadChange({ id: 'athr_1', revision: 6, title: 'New title' });
+    receiveSync();
+    expect(seen).toEqual([]);
+
+    vi.advanceTimersByTime(PUSH_BATCH_MS);
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0].jobs.map((job) => job.id)).toEqual(['ajob_1']);
+    expect(seen[0].threads.map((thread) => thread.id)).toEqual(['athr_1']);
+    expect(seen[0].resync).toBe(true);
+  });
+
+  it('drops a push that is not newer than one already held', () => {
+    const seen = collect();
+    receiveJobChange({ id: 'ajob_1', revision: 4, state: 'succeeded' });
+    receiveJobChange({ id: 'ajob_1', revision: 4, state: 'succeeded' });
+    receiveJobChange({ id: 'ajob_1', revision: 2, state: 'running' });
+    vi.advanceTimersByTime(PUSH_BATCH_MS);
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0].jobs).toEqual([{ id: 'ajob_1', revision: 4, state: 'succeeded' }]);
+  });
+
+  it('keeps a removal over anything that arrives after it', () => {
+    const seen = collect();
+    receiveThreadChange({ id: 'athr_1', deleted: true });
+    receiveThreadChange({ id: 'athr_1', revision: 9, title: 'Too late' });
+    vi.advanceTimersByTime(PUSH_BATCH_MS);
+
+    expect(seen[0].threads).toEqual([{ id: 'athr_1', deleted: true }]);
+  });
+});
+
+describe('overlayPushed', () => {
+  it('keeps newer pushed values over an API read that left before them', () => {
+    receiveJobChange({
+      id: 'ajob_1',
+      thread_id: 'athr_1',
+      revision: 4,
+      state: 'succeeded',
+      conversation_state: 'idle',
+      published_pr_url: 'https://example.test/pr/1',
+    });
+    receiveThreadChange({
+      id: 'athr_1',
+      revision: 6,
+      title: 'New title',
+      title_source: 'generated',
+    });
+
+    expect(overlayPushed(JOB)).toMatchObject({
+      state: 'succeeded',
+      conversation_state: 'idle',
+      published_pr_url: 'https://example.test/pr/1',
+      revision: 4,
+      title: 'New title',
+      title_source: 'generated',
+      thread_revision: 6,
+    });
+  });
+
+  it('leaves a read alone when it is as new as what was pushed', () => {
+    receiveJobChange({ id: 'ajob_1', revision: 3, state: 'failed' });
+    receiveThreadChange({ id: 'athr_1', revision: 5, title: 'Pushed' });
+
+    expect(overlayPushed(JOB)).toBe(JOB);
+  });
+});
+
+describe('the tab stream', () => {
+  it('goes live with hello, stops when the connection drops, and ends with the page', () => {
+    let options!: StreamAgentChangesOptions;
+    vi.mocked(streamAgentChanges).mockImplementation((opts) => {
+      options = opts;
+      return new Promise(() => undefined);
+    });
+    const seen = collect();
+    const live = renderHook(() => useAgentPushLive());
+    const stream = renderHook(() => useAgentChangeStream('user-1'));
+    expect(live.result.current).toBe(false);
+
+    act(() => options.onSync(true));
+    expect(live.result.current).toBe(true);
+    act(() => vi.advanceTimersByTime(PUSH_BATCH_MS));
+    expect(seen.at(-1)?.resync).toBe(true);
+
+    act(() => options.onDisconnect());
+    expect(isAgentPushLive()).toBe(false);
+
+    act(() => options.onSync(true));
+    stream.unmount();
+    expect(options.signal.aborted).toBe(true);
+    expect(isAgentPushLive()).toBe(false);
+  });
+
+  it('holds nothing without a signed-in owner', () => {
+    renderHook(() => useAgentChangeStream(undefined));
+    expect(streamAgentChanges).not.toHaveBeenCalled();
+  });
+});

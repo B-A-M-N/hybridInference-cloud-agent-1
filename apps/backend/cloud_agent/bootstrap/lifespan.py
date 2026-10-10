@@ -20,6 +20,7 @@ from cloud_agent.logging_utils import get_logger
 from cloud_agent.workers.attempts import reap_expired_attempts
 from cloud_agent.workers.job_event_signal import JobEventSignal
 from cloud_agent.workers.notifications import listen
+from cloud_agent.workers.owner_change_signal import OwnerChangeSignal
 from cloud_agent.workers.snapshots import coordinate_shared_snapshots
 from cloud_agent.workers.work_signal import WorkSignal
 
@@ -236,12 +237,21 @@ async def lifespan(app: FastAPI, *, background: bool = True) -> AsyncIterator[No
         app.state.queue_monitor_task.add_done_callback(_BACKGROUND_TASKS.discard)
         # One connection to Postgres answers what waits on a change: idle hosts
         # parked on the worker wait endpoint (a job was queued, requeued or
-        # ended), and owners' event streams (their job stored an event or
-        # changed state).
+        # ended), owners' event streams (their job stored an event or changed
+        # state), and owners' change streams (one of their jobs or
+        # conversations changed).
         app.state.work_signal = WorkSignal()
         app.state.job_event_signal = JobEventSignal()
+        app.state.owner_change_signal = OwnerChangeSignal()
         app.state.notification_listener_task = asyncio.create_task(
-            listen(dsn, (app.state.work_signal, app.state.job_event_signal))
+            listen(
+                dsn,
+                (
+                    app.state.work_signal,
+                    app.state.job_event_signal,
+                    app.state.owner_change_signal,
+                ),
+            )
         )
         _BACKGROUND_TASKS.add(app.state.notification_listener_task)
         app.state.notification_listener_task.add_done_callback(_BACKGROUND_TASKS.discard)
@@ -261,6 +271,7 @@ async def lifespan(app: FastAPI, *, background: bool = True) -> AsyncIterator[No
         app.state.publish_task = None
         app.state.work_signal = None
         app.state.job_event_signal = None
+        app.state.owner_change_signal = None
         app.state.notification_listener_task = None
         logger.info("cloud agent relay listener started")
 
