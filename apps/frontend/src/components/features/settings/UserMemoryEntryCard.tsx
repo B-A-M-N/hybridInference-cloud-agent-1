@@ -36,12 +36,15 @@ export function UserMemoryEntryCard({
   pending: boolean;
   unavailable: boolean;
   onEditingChange: (editing: boolean) => void;
-  onSave: (content: string) => Promise<UserMemoryRequestResult>;
+  onSave: (content: string, scope: 'repo' | 'user') => Promise<UserMemoryRequestResult>;
   onRemove: () => Promise<UserMemoryRequestResult>;
   onRefresh: () => Promise<UserMemoryRequestResult>;
 }) {
   const { t, locale } = useLocale();
   const [editing, setEditing] = useState(false);
+  const [draftScope, setDraftScope] = useState<'repo' | 'user'>(
+    memory.scope ?? (memory.source_repo ? 'repo' : 'user'),
+  );
   const [draft, setDraft] = useState(memory.content);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [error, setError] = useState<EntryError | null>(null);
@@ -71,7 +74,7 @@ export function UserMemoryEntryCard({
   async function perform(action: 'save' | 'remove' | 'refresh') {
     if (unavailable && action !== 'refresh') return;
     const result = await (action === 'save'
-      ? onSave(draft)
+      ? onSave(draft, draftScope)
       : action === 'remove'
         ? onRemove()
         : onRefresh());
@@ -109,7 +112,15 @@ export function UserMemoryEntryCard({
         <span>
           {t(memory.kind === 'preference' ? 'settings.memory.preference' : 'settings.memory.task')}
         </span>
-        {memory.user_edited ? (
+        <span>
+          {t(
+            (memory.scope ?? (memory.source_repo ? 'repo' : 'user')) === 'repo'
+              ? 'settings.memory.repoScope'
+              : 'settings.memory.userScope',
+            { repo: memory.source_repo ?? '' },
+          )}
+        </span>
+        {memory.user_edited || memory.edited ? (
           <span className="rounded bg-accent-subtle px-2 py-0.5 text-accent">
             {t('settings.memory.edited')}
           </span>
@@ -171,7 +182,7 @@ export function UserMemoryEntryCard({
               setDraft(event.target.value);
               setError(null);
             }}
-            maxLength={500}
+            maxLength={240}
             rows={4}
             disabled={pending}
             readOnly={unavailable}
@@ -182,11 +193,29 @@ export function UserMemoryEntryCard({
           <p id={`${editorId}-limit`} className="mt-1 text-xs text-muted">
             {t('settings.memory.entryLimit', { count: draft.length })}
           </p>
+          <label
+            htmlFor={`${editorId}-scope`}
+            className="mt-2 block text-sm font-medium text-foreground"
+          >
+            {t('settings.memory.scope')}
+          </label>
+          <select
+            id={`${editorId}-scope`}
+            value={draftScope}
+            onChange={(event) => setDraftScope(event.target.value as 'repo' | 'user')}
+            disabled={pending || unavailable}
+            className="ui-input mt-2 w-full"
+          >
+            <option value="repo" disabled={!memory.source_repo}>
+              {t('settings.memory.repoScope', { repo: memory.source_repo ?? '' })}
+            </option>
+            <option value="user">{t('settings.memory.userScope')}</option>
+          </select>
           <div className="mt-3 flex flex-wrap gap-2">
             <button
               type="button"
               onClick={() => void perform('save')}
-              disabled={pending || unavailable || !draft.trim() || draft.length > 500}
+              disabled={pending || unavailable || !draft.trim() || draft.length > 240}
               className="ui-button ui-button-primary min-h-11"
             >
               {t('settings.memory.saveEntry')}
@@ -245,6 +274,7 @@ export function UserMemoryEntryCard({
             type="button"
             onClick={() => {
               setDraft(memory.content);
+              setDraftScope(memory.scope ?? (memory.source_repo ? 'repo' : 'user'));
               setEditing(true);
               onEditingChange(true);
               setError(null);

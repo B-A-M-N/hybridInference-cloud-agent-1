@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as client from './client';
 import {
   clearUserMemory,
+  consolidateUserMemory,
+  saveUserMemories,
   deleteUserMemoryEntry,
   editUserMemoryEntry,
   getUserMemory,
@@ -179,4 +181,24 @@ describe('user memory client', () => {
       });
     },
   );
+});
+
+it('sends bounded list corrections and consolidation with the examined revision', async () => {
+  const fetch = vi.spyOn(client, 'fetchWithAuth').mockImplementation(async () => response(view));
+  const signal = new AbortController().signal;
+  const edits = [{ id: 'preference-1', content: 'Use small changes.', scope: 'repo' as const }];
+  await saveUserMemories(1, edits, signal);
+  expect(fetch).toHaveBeenLastCalledWith(expect.any(String), '/v1/agent/user-memory', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ revision: 1, memories: edits }),
+    signal,
+  });
+  await consolidateUserMemory(2, signal);
+  expect(fetch).toHaveBeenLastCalledWith(expect.any(String), '/v1/agent/user-memory/consolidate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ revision: 2 }),
+    signal,
+  });
 });

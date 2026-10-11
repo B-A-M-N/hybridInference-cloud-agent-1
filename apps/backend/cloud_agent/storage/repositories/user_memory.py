@@ -9,10 +9,15 @@ from typing import TYPE_CHECKING, Any
 
 from cloud_agent.logging_utils import get_logger
 from cloud_agent.user_memory import (
+    MEMORY_TOTAL_LIMIT,
+    MemoryRevisionConflict,
+    UserMemory,
     UserMemoryConflict,
     UserMemoryNotFound,
+    bounded_memories,
     build_user_memory,
     normalize_memory_edit,
+    prune_memory_overrides,
     validate_memory_preference_edit,
 )
 
@@ -35,7 +40,22 @@ def _public_memory(row: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "enabled": bool(row["enabled"]),
         "portrait": _memory_json(row["portrait"]),
-        "memories": _memory_json(row["memories"]),
+        "memories": [
+            memory.model_dump(mode="json")
+            for memory in bounded_memories(
+                [
+                    UserMemory.model_validate(
+                        {
+                            **memory,
+                            "scope": memory.get(
+                                "scope", "repo" if memory.get("source_repo") else "user"
+                            ),
+                        }
+                    )
+                    for memory in _memory_json(row["memories"])
+                ]
+            )
+        ],
         "suggestions": _memory_json(row["suggestions"]),
         "revision": int(row["revision"]),
         "updated_at": row["updated_at"],
@@ -167,7 +187,8 @@ class PostgresUserMemoryRepository:
         # the builder or storing it in the profile document.
         for item in activity:
             item.pop("content_digest")
-        profile = build_user_memory(activity, _public_memory(current))
+        overrides = prune_memory_overrides(activity, _memory_json(current.get("overrides", [])))
+        profile = build_user_memory(activity, _public_memory(current), overrides)
         memory_ids = [memory["id"] for memory in profile["memories"]]
         if memory_ids:
             edits = await conn.fetch(
@@ -183,7 +204,7 @@ class PostgresUserMemoryRepository:
             """
             UPDATE agent_user_memories
             SET portrait = $2::jsonb, memories = $3::jsonb, suggestions = $4::jsonb,
-                activity_digest = $5, revision = revision + 1, updated_at = clock_timestamp()
+                activity_digest = $5, overrides = $6::jsonb, revision = revision + 1, updated_at = clock_timestamp()
             WHERE user_id = $1 RETURNING *
             """,
             user_id,
@@ -191,6 +212,7 @@ class PostgresUserMemoryRepository:
             json.dumps(profile["memories"]),
             json.dumps(profile["suggestions"]),
             digest,
+            json.dumps(overrides),
         )
         return _public_memory(updated)
 
@@ -244,7 +266,7 @@ class PostgresUserMemoryRepository:
                 """
                 UPDATE agent_user_memories
                 SET portrait = $2::jsonb, memories = $3::jsonb, suggestions = $4::jsonb,
-                    activity_digest = $5,
+                    overrides = '[]'::jsonb, activity_digest = $5,
                     cleared_message_id = (
                         SELECT COALESCE(max(m.id), 0)
                         FROM agent_thread_messages m
@@ -298,6 +320,17 @@ class PostgresUserMemoryRepository:
                     raise UserMemoryNotFound("Memory entry was not found.")
                 if entry["content"] == content and entry.get("user_edited") is True:
                     return profile
+            if (
+                content is not None
+                and sum(
+                    len(memory["content"])
+                    for memory in profile["memories"]
+                    if memory["id"] != memory_id
+                )
+                + len(content)
+                > MEMORY_TOTAL_LIMIT
+            ):
+                raise ValueError("Memory exceeds the total text limit")
             await conn.execute(
                 """
                 INSERT INTO agent_user_memory_edits (user_id, memory_id, source_job_id, content)
@@ -347,6 +380,57 @@ class PostgresUserMemoryRepository:
         return await self._change_user_memory_entry(
             user_id, memory_id, content=None, expected_revision=expected_revision
         )
+
+    async def replace_memories(
+        self, user_id: str, revision: int, memories: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Persist edits and tombstones under the same lock as refresh and clear."""
+        async with self._pool.acquire() as conn, conn.transaction():
+            await self._user_memory_lock(conn, user_id)
+            current = await self._ensure_user_memory(conn, user_id)
+            fresh = await self._refresh_user_memory_locked(conn, user_id, current)
+            if fresh["revision"] != revision:
+                raise MemoryRevisionConflict()
+            current = await self._ensure_user_memory(conn, user_id)
+            existing = _memory_json(current["overrides"])
+            # Bulk corrections supersede older single-entry corrections. Keep
+            # hidden removal markers so refresh cannot revive omitted entries.
+            await conn.execute(
+                "DELETE FROM agent_user_memory_edits WHERE user_id = $1 "
+                "AND memory_id = ANY($2::text[])",
+                user_id,
+                [memory["id"] for memory in fresh["memories"]],
+            )
+            original = fresh["memories"]
+            source_ids = {
+                source_id
+                for memory in original
+                for source_id in (memory.get("source_ids") or [memory["id"]])
+            }
+            overrides = [
+                item for item in existing if not source_ids.intersection(item["source_ids"])
+            ]
+            retained: set[str] = set()
+            for memory in memories:
+                ids = memory["source_ids"]
+                if not ids or not set(ids).issubset(source_ids):
+                    raise ValueError("Memory sources must belong to the current view")
+                retained.update(ids)
+                overrides.append({"source_ids": ids, "memory": memory})
+            for source_id in source_ids - retained:
+                overrides.append({"source_ids": [source_id], "memory": None})
+            row = await conn.fetchrow(
+                """
+                UPDATE agent_user_memories
+                SET memories = $2::jsonb, overrides = $3::jsonb,
+                    revision = revision + 1, updated_at = clock_timestamp()
+                WHERE user_id = $1 RETURNING *
+                """,
+                user_id,
+                json.dumps(memories),
+                json.dumps(overrides),
+            )
+        return _public_memory(row)
 
     async def refresh_active_users(self, limit: int = 100) -> int:
         """Visit enabled owners fairly, including profiles whose history was deleted."""

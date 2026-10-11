@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
@@ -85,7 +86,7 @@ class MemoryConnection:
         elif "DELETE FROM agent_user_memory_edits" in sql:
             for key, edit in list(self.pool.edits.items()):
                 if key[0] == user_id and (
-                    "NOT EXISTS" not in sql
+                    ("NOT EXISTS" not in sql and (len(params) == 1 or key[1] in params[1]))
                     or (
                         edit["content"] is not None
                         and (user_id, edit["source_job_id"]) in self.pool.deleted_sources
@@ -127,6 +128,7 @@ class MemoryConnection:
                 "cleared_message_id": 0,
                 "cleared_at": None,
                 "activity_digest": "",
+                "overrides": "[]",
             }
             return copy.deepcopy(self.pool.profiles[user_id])
         assert current is not None
@@ -134,6 +136,8 @@ class MemoryConnection:
             current["enabled"] = params[1]
         elif "SET memories" in sql:
             current["memories"] = params[1]
+            if len(params) == 3:
+                current["overrides"] = params[2]
         else:
             current.update(
                 portrait=params[1],
@@ -141,7 +145,10 @@ class MemoryConnection:
                 suggestions=params[3],
                 activity_digest=params[4],
             )
+            if len(params) == 6:
+                current["overrides"] = params[5]
             if "cleared_message_id =" in sql:
+                current["overrides"] = "[]"
                 current["cleared_message_id"] = max(
                     (row["id"] for row in self.pool.activity.get(user_id, [])), default=0
                 )
@@ -570,3 +577,72 @@ async def test_entry_edit_and_clear_share_the_owner_lock_and_cannot_restore_an_o
     await asyncio.gather(editing, clearing)
     assert (await repository.refresh("alice"))["memories"] == []
     assert not pool.edits
+
+
+@pytest.mark.asyncio
+async def test_edits_and_removals_survive_refresh_until_their_source_changes():
+    pool = MemoryPool()
+    pool.activity["alice"] = [activity()]
+    repository = PostgresUserMemoryRepository(pool)
+    current = await repository.refresh("alice")
+    preference = current["memories"][0]
+    edited = {**preference, "content": "Keep reviews concise.", "scope": "user", "edited": True}
+    saved = await repository.replace_memories("alice", current["revision"], [edited])
+    assert saved["memories"] == [edited]
+    assert saved == await repository.refresh("alice")
+    pool.activity["alice"].insert(0, activity(2, "Add backend tests."))
+    refreshed = await repository.refresh("alice")
+    assert edited in refreshed["memories"]
+    assert not any(
+        memory["kind"] == "task" and memory["source_job_id"] == "job-1"
+        for memory in refreshed["memories"]
+    )
+    assert len(json.loads(pool.profiles["alice"]["overrides"])) == 2
+    pool.activity["alice"] = [activity(2, "Add backend tests.")]
+    assert edited not in (await repository.refresh("alice"))["memories"]
+    await repository.clear("alice")
+    assert json.loads(pool.profiles["alice"]["overrides"]) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("control", ["clear", "disable", "edit", "activity"])
+async def test_stale_consolidation_cannot_overwrite_newer_changes(control):
+    from cloud_agent.user_memory import MemoryRevisionConflict
+
+    pool = MemoryPool()
+    pool.activity["alice"] = [activity()]
+    repository = PostgresUserMemoryRepository(pool)
+    current = await repository.refresh("alice")
+    if control == "clear":
+        await repository.clear("alice")
+    elif control == "disable":
+        await repository.set_enabled("alice", False)
+    elif control == "edit":
+        await repository.replace_memories("alice", current["revision"], [])
+    else:
+        pool.activity["alice"].insert(0, activity(2, "I prefer explicit checks."))
+    with pytest.raises(MemoryRevisionConflict):
+        await repository.replace_memories("alice", current["revision"], current["memories"])
+
+
+@pytest.mark.asyncio
+async def test_scope_correction_supersedes_native_entry_edit_after_refresh():
+    pool = MemoryPool()
+    pool.activity["alice"] = [activity()]
+    repository = PostgresUserMemoryRepository(pool)
+    current = await repository.refresh("alice")
+    entry = current["memories"][0]
+    native = await repository.update_entry(
+        "alice", entry["id"], content="Keep reviews short.", expected_revision=current["revision"]
+    )
+    edited = {
+        **native["memories"][0],
+        "content": "Explain changes clearly.",
+        "scope": "user",
+        "edited": True,
+    }
+    saved = await repository.replace_memories("alice", native["revision"], [edited])
+    pool.activity["alice"].insert(0, activity(2, "Add backend tests."))
+    refreshed = await repository.refresh("alice")
+    assert edited in saved["memories"] and edited in refreshed["memories"]
+    assert ("alice", entry["id"]) not in pool.edits

@@ -8,12 +8,21 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from cloud_agent.api._owner_auth import require_agent_owner
-from cloud_agent.api.deps import get_storage, require_store
+from cloud_agent.api.deps import get_gateway_client, get_grant_client, get_storage, require_store
+from cloud_agent.memory_consolidation import (
+    MemoryConsolidationError,
+    MemoryEdit,
+    consolidate_memory,
+    validate_memory_edits,
+)
 from cloud_agent.user_avatar import generate_user_avatar
 from cloud_agent.user_memory import (
+    MEMORY_CONTENT_LIMIT,
+    MEMORY_LIMIT,
+    MemoryRevisionConflict,
     UserMemoryConflict,
     UserMemoryNotFound,
     UserMemoryView,
@@ -61,7 +70,19 @@ class UpdateMemorySettings(BaseModel):
     """Enable or pause automatic memory creation and use."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
-    enabled: bool
+    enabled: bool | None = None
+    revision: int | None = Field(default=None, ge=0)
+    memories: list[MemoryEdit] | None = Field(default=None, max_length=MEMORY_LIMIT)
+
+    @model_validator(mode="after")
+    def valid_operation(self) -> UpdateMemorySettings:
+        """Require either a setting change or a revision-checked edit."""
+        if self.memories is not None:
+            if self.revision is None or self.enabled is not None:
+                raise ValueError("Memory edits require revision and cannot change enabled")
+        elif self.enabled is None or self.revision is not None:
+            raise ValueError("Supply enabled or revision and memories")
+        return self
 
 
 class MemoryEntryRevision(BaseModel):
@@ -74,7 +95,7 @@ class MemoryEntryRevision(BaseModel):
 class UpdateMemoryEntry(MemoryEntryRevision):
     """Edit content while retaining the entry's original kind and project."""
 
-    content: str = Field(min_length=1, max_length=500)
+    content: str = Field(min_length=1, max_length=MEMORY_CONTENT_LIMIT)
 
 
 def _view(values: dict[str, Any], user_id: str) -> UserMemoryView:
@@ -104,9 +125,24 @@ async def update_user_memory(
 ) -> UserMemoryView:
     """Pause generation and prompt personalization, or resume future updates."""
     response.headers["Cache-Control"] = "no-store"
-    values = await require_store(store).user_memory.set_enabled(
-        user_id=user["user_id"], enabled=body.enabled
-    )
+    repository = require_store(store).user_memory
+    if body.memories is None:
+        assert body.enabled is not None
+        values = await repository.set_enabled(user_id=user["user_id"], enabled=body.enabled)
+    else:
+        current = await repository.refresh(user_id=user["user_id"])
+        if current["revision"] != body.revision:
+            raise _conflict()
+        try:
+            memories = validate_memory_edits(body.memories, current["memories"])
+            assert body.revision is not None
+            values = await repository.replace_memories(
+                user_id=user["user_id"], revision=body.revision, memories=memories
+            )
+        except MemoryRevisionConflict:
+            raise _conflict() from None
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
     return _view(values, user["user_id"])
 
 
@@ -195,4 +231,46 @@ async def delete_user_memory_entry(
         ) from exc
     except UserMemoryNotFound as exc:
         raise HTTPException(status_code=404, detail="Memory entry not found.") from exc
+    return _view(values, user["user_id"])
+
+
+class ConsolidateMemoryRequest(BaseModel):
+    """Consolidate only the version the owner currently sees."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    revision: int = Field(ge=0)
+
+
+def _conflict() -> HTTPException:
+    return HTTPException(409, "Memory changed. Refresh and try again.")
+
+
+@router.post("/consolidate", response_model=UserMemoryView)
+async def consolidate_user_memory(
+    body: ConsolidateMemoryRequest,
+    response: Response,
+    user: dict[str, Any] = Depends(require_agent_owner),
+    store: _MemoryStorage | None = Depends(get_storage),
+    gateway: Any = Depends(get_gateway_client),
+    grants: Any = Depends(get_grant_client),
+) -> UserMemoryView:
+    """Merge and classify durable preferences using the owner's available model."""
+    response.headers["Cache-Control"] = "no-store"
+    repository = require_store(store).user_memory
+    current = await repository.refresh(user_id=user["user_id"])
+    if current["revision"] != body.revision:
+        raise _conflict()
+    if not current["memories"]:
+        return _view(current, user["user_id"])
+    try:
+        memories = await consolidate_memory(
+            current, user_id=user["user_id"], gateway=gateway, grants=grants
+        )
+        values = await repository.replace_memories(
+            user_id=user["user_id"], revision=body.revision, memories=memories
+        )
+    except MemoryRevisionConflict:
+        raise _conflict() from None
+    except MemoryConsolidationError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from None
     return _view(values, user["user_id"])

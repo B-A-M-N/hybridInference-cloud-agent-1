@@ -237,6 +237,15 @@ export const en = {
   // ── Settings ────────────────────────────────────────────────────────────
   'settings.title': 'Setting',
   'settings.description': 'Manage your connections, skills, memory, and notifications.',
+  'settings.memory.consolidate': 'Consolidate',
+  'settings.memory.consolidating': 'Consolidating…',
+  'settings.memory.scope': 'Applies to',
+  'settings.memory.repoScope': 'Repo: {repo}',
+  'settings.memory.userScope': 'User · all projects',
+  'settings.memory.bounds':
+    '{count}/12 memories · {characters}/2,400 characters · at most 3 user memories',
+  'settings.memory.consolidateDescription':
+    'Use your available model to merge duplicates and choose repo or user scope. Uses your model quota.',
   'settings.memory.title': 'Memory',
   'settings.memory.description':
     'Memory uses up to your 50 latest requests to suggest improvements. Explicit preferences can guide future tasks in the same project.',
@@ -279,7 +288,7 @@ export const en = {
   'settings.memory.lastSavedText': 'Last saved text',
   'settings.memory.editEntry': 'Edit memory',
   'settings.memory.editContent': 'Memory content',
-  'settings.memory.entryLimit': '{count}/500 characters',
+  'settings.memory.entryLimit': '{count}/240 characters',
   'settings.memory.saveEntry': 'Save memory',
   'settings.memory.removeEntry': 'Remove memory',
   'settings.memory.removeTitle': 'Remove this memory?',

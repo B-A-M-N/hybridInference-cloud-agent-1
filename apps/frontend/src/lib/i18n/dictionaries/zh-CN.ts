@@ -230,6 +230,14 @@ export const zhCN: Record<TranslationKey, string> = {
   // ── Settings ────────────────────────────────────────────────────────────
   'settings.title': '设置',
   'settings.description': '管理你的连接、技能、记忆和通知。',
+  'settings.memory.consolidate': '整合记忆',
+  'settings.memory.consolidating': '正在整合…',
+  'settings.memory.scope': '适用范围',
+  'settings.memory.repoScope': '仓库：{repo}',
+  'settings.memory.userScope': '用户 · 所有项目',
+  'settings.memory.bounds': '{count}/12 条记忆 · {characters}/2,400 个字符 · 最多 3 条用户记忆',
+  'settings.memory.consolidateDescription':
+    '使用你可用的模型合并重复记忆，并判断应归入仓库还是用户记忆。会使用模型配额。',
   'settings.memory.title': '记忆',
   'settings.memory.description':
     '记忆最多使用你的最近 50 个请求来提供改进建议。明确表达的偏好可用于指导同一项目中的未来任务。',
@@ -269,7 +277,7 @@ export const zhCN: Record<TranslationKey, string> = {
   'settings.memory.lastSavedText': '上次保存的内容',
   'settings.memory.editEntry': '编辑记忆',
   'settings.memory.editContent': '记忆内容',
-  'settings.memory.entryLimit': '{count}/500 个字符',
+  'settings.memory.entryLimit': '{count}/240 个字符',
   'settings.memory.saveEntry': '保存记忆',
   'settings.memory.removeEntry': '移除记忆',
   'settings.memory.removeTitle': '移除此条记忆？',
