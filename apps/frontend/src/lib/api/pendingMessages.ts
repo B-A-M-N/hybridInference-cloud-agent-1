@@ -187,11 +187,12 @@ export async function submitThreadMessage(
   body: ThreadMessageRequest,
 ): Promise<ThreadMessageResultApi> {
   const scope = `thread:${threadId}`;
+  const request = { ...body, prompt: body.prompt.trim() };
   const send = (key: string) =>
     fetchWithAuth(API_BASE, `${threadPath(threadId)}/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key },
-      body: JSON.stringify(body),
+      body: JSON.stringify(request),
     });
   let resp = await send(pendingKey(scope));
   if (resp.status === 409) {

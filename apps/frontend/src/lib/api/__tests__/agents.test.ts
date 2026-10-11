@@ -634,6 +634,28 @@ describe('agents api', () => {
     expect(second['Idempotency-Key']).not.toBe(first['Idempotency-Key']);
   });
 
+  it('trims surrounding whitespace from a task prompt before sending it', async () => {
+    fetchWithAuth.mockResolvedValue(jsonResponse({ id: 'ajob_new', state: 'queued' }, 201));
+
+    await createAgentJob({
+      repo: 'owner/name',
+      task_prompt: '\n  fix it\nthen test it  \n',
+      model: 'glm-5.1',
+    });
+
+    expect(fetchWithAuth).toHaveBeenCalledWith(
+      expect.any(String),
+      '/v1/agent/jobs',
+      expect.objectContaining({
+        body: JSON.stringify({
+          repo: 'owner/name',
+          task_prompt: 'fix it\nthen test it',
+          model: 'glm-5.1',
+        }),
+      }),
+    );
+  });
+
   it('delivers events and the terminal frame', async () => {
     fetchWithAuth.mockResolvedValue(
       sseResponse([frame(1, 'message', { text: 'a' }), frame(2, 'usage', { text: 'b' }), FINISHED]),
