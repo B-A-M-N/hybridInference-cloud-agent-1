@@ -1093,7 +1093,9 @@ class TestBuiltInWebSearch:
         assert tool["inputSchema"]["required"] == ["query"]
         assert tool["inputSchema"]["properties"]["num_results"]["maximum"] == 10
         assert tool["inputSchema"]["additionalProperties"] is False
-        assert "Serper.dev" in tool["description"] and "Brave Search" in tool["description"]
+        assert "Serper.dev" in tool["description"]
+        assert "Brave Search" in tool["description"]
+        assert "Parallel Search" in tool["description"]
 
     async def test_search_call_uses_the_platform_dispatch_not_a_user_connection(
         self,
@@ -1186,17 +1188,37 @@ class TestBuiltInWebSearch:
         assert store.search_acquired == []
         assert store.search_released == []
 
-    async def test_unsupported_brave_locale_consumes_no_shared_key_admission(
+    @pytest.mark.parametrize(
+        ("provider_name", "arguments"),
+        [
+            (
+                "brave",
+                {"query": "current package version", "language": "en-us"},
+            ),
+            (
+                "parallel",
+                {"query": "current package version", "language": "en"},
+            ),
+            (
+                "parallel",
+                {"query": "current package version", "country": "sg"},
+            ),
+            ("parallel", {"query": "x" * 201}),
+        ],
+    )
+    async def test_unsupported_provider_options_consume_no_shared_key_admission(
         self,
         client: AsyncClient,
         store: FakeStore,
         monkeypatch: pytest.MonkeyPatch,
+        provider_name: str,
+        arguments: dict[str, Any],
     ) -> None:
         monkeypatch.setattr(agent_mcp_router.web_search, "configured", lambda: True)
         monkeypatch.setattr(
             agent_mcp_router.web_search,
             "selected_provider",
-            lambda: "brave",
+            lambda: provider_name,
         )
 
         response = await client.post(
@@ -1204,7 +1226,7 @@ class TestBuiltInWebSearch:
             json=_rpc(
                 "tools/call",
                 name="web_search",
-                arguments={"query": "current package version", "language": "en-us"},
+                arguments=arguments,
             ),
             headers=_auth(),
         )

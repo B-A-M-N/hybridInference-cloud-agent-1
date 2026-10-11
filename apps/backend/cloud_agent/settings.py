@@ -365,10 +365,10 @@ SETTINGS: tuple[Setting, ...] = (
         "Web search",
         "auto",
         env="WEB_SEARCH_PROVIDER",
-        choices=("auto", "serper", "brave"),
+        choices=("auto", "serper", "brave", "parallel"),
         description=(
             "Selects the provider behind the built-in web_search tool. Auto prefers Serper "
-            "when both provider keys are configured."
+            "then Brave, then Parallel when multiple provider keys are configured."
         ),
     ),
     Setting(
@@ -394,6 +394,19 @@ SETTINGS: tuple[Setting, ...] = (
             "Enables Brave Search for the built-in web_search tool. Review Brave's result "
             "retention and end-user terms before enabling it. Queries go only to Brave, and "
             "the key never enters an agent sandbox."
+        ),
+    ),
+    Setting(
+        "parallel_api_key",
+        "Parallel API key",
+        "Web search",
+        "",
+        env="PARALLEL_API_KEY",
+        secret=True,
+        description=(
+            "Enables Parallel Search for the built-in web_search tool. Review Parallel's "
+            "data-use, retention, and end-user terms before enabling it. Queries go only "
+            "to Parallel, and the key never enters an agent sandbox."
         ),
     ),
     Setting(

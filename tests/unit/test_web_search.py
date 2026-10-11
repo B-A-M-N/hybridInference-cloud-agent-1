@@ -1,9 +1,10 @@
-"""Web Search validates, routes, and bounds Serper and Brave provider calls."""
+"""Web Search validates, routes, and bounds every supported provider call."""
 
 from __future__ import annotations
 
 import asyncio
 import json
+from datetime import date
 from typing import Any
 
 import httpx
@@ -18,11 +19,13 @@ def _configure(
     provider: str = "auto",
     serper_key: str = "",
     brave_key: str = "",
+    parallel_key: str = "",
 ) -> None:
     values = {
         web_search.PROVIDER_SETTING: provider,
         web_search.SERPER_API_KEY_SETTING: serper_key,
         web_search.BRAVE_API_KEY_SETTING: brave_key,
+        web_search.PARALLEL_API_KEY_SETTING: parallel_key,
     }
     monkeypatch.setattr(
         web_search,
@@ -31,7 +34,7 @@ def _configure(
     )
 
 
-def test_validated_options_translate_to_both_provider_contracts() -> None:
+def test_validated_options_translate_to_serper_and_brave_contracts() -> None:
     request = web_search.validate(
         {
             "query": "  current Python release  ",
@@ -65,6 +68,35 @@ def test_validated_options_translate_to_both_provider_contracts() -> None:
     }
 
 
+def test_parallel_request_is_bounded_and_translates_location_and_freshness() -> None:
+    request = web_search.validate(
+        {
+            "query": "current Python release",
+            "num_results": 4,
+            "country": "US",
+            "freshness": "week",
+        },
+        provider="parallel",
+    )
+
+    assert web_search.request_body(
+        request,
+        "parallel",
+        today=date(2026, 10, 11),
+    ) == {
+        "objective": "current Python release",
+        "search_queries": ["current Python release"],
+        "mode": "fast",
+        "max_chars_total": 4800,
+        "advanced_settings": {
+            "max_results": 4,
+            "excerpt_settings": {"max_chars_per_result": 1200},
+            "location": "us",
+            "source_policy": {"after_date": "2026-10-04"},
+        },
+    }
+
+
 def test_multipart_language_codes_are_preserved_for_brave() -> None:
     request = web_search.validate(
         {"query": "current news", "language": "ZH-HANS"},
@@ -86,6 +118,19 @@ def test_multipart_language_codes_are_preserved_for_brave() -> None:
 def test_brave_rejects_unsupported_country_and_language_before_request(arguments) -> None:
     with pytest.raises(web_search.WebSearchInputError, match="not supported by Brave Search"):
         web_search.validate(arguments, provider="brave")
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"query": "x" * 201},
+        {"query": "current news", "country": "SG"},
+        {"query": "current news", "language": "en"},
+    ],
+)
+def test_parallel_rejects_unsupported_arguments_before_request(arguments) -> None:
+    with pytest.raises(web_search.WebSearchInputError, match="Parallel Search"):
+        web_search.validate(arguments, provider="parallel")
 
 
 def test_serper_keeps_its_own_country_contract() -> None:
@@ -119,16 +164,21 @@ def test_validate_rejects_invalid_or_unbounded_arguments(arguments) -> None:
 
 
 @pytest.mark.parametrize(
-    ("provider", "serper_key", "brave_key", "expected"),
+    ("provider", "serper_key", "brave_key", "parallel_key", "expected"),
     [
-        ("auto", "", "", None),
-        ("auto", "serper-secret", "", "serper"),
-        ("auto", "", "brave-secret", "brave"),
-        ("auto", "serper-secret", "brave-secret", "serper"),
-        ("serper", "serper-secret", "brave-secret", "serper"),
-        ("brave", "serper-secret", "brave-secret", "brave"),
-        ("serper", "", "brave-secret", None),
-        ("brave", "serper-secret", "", None),
+        ("auto", "", "", "", None),
+        ("auto", "serper-secret", "", "", "serper"),
+        ("auto", "", "brave-secret", "", "brave"),
+        ("auto", "", "", "parallel-secret", "parallel"),
+        ("auto", "serper-secret", "brave-secret", "parallel-secret", "serper"),
+        ("auto", "", "brave-secret", "parallel-secret", "brave"),
+        ("serper", "serper-secret", "brave-secret", "parallel-secret", "serper"),
+        ("brave", "serper-secret", "brave-secret", "parallel-secret", "brave"),
+        ("parallel", "serper-secret", "brave-secret", "parallel-secret", "parallel"),
+        ("serper", "", "brave-secret", "parallel-secret", None),
+        ("brave", "serper-secret", "", "parallel-secret", None),
+        ("parallel", "serper-secret", "brave-secret", "", None),
+        ("unknown", "serper-secret", "brave-secret", "parallel-secret", None),
     ],
 )
 def test_provider_selection_is_deterministic_and_fails_closed(
@@ -136,6 +186,7 @@ def test_provider_selection_is_deterministic_and_fails_closed(
     provider: str,
     serper_key: str,
     brave_key: str,
+    parallel_key: str,
     expected: str | None,
 ) -> None:
     _configure(
@@ -143,6 +194,7 @@ def test_provider_selection_is_deterministic_and_fails_closed(
         provider=provider,
         serper_key=serper_key,
         brave_key=brave_key,
+        parallel_key=parallel_key,
     )
 
     assert web_search.selected_provider() == expected
@@ -335,14 +387,112 @@ async def test_brave_uses_only_its_header_and_normalizes_results(
     assert secret not in json.dumps(result)
 
 
+async def test_parallel_uses_only_its_header_and_normalizes_bounded_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "parallel-test-secret"
+    _configure(
+        monkeypatch,
+        provider="parallel",
+        serper_key="unused-serper",
+        brave_key="unused-brave",
+        parallel_key=secret,
+    )
+    seen: dict[str, Any] = {}
+    long_excerpt = "x" * 1300
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["method"] = request.method
+        seen["api_key"] = request.headers.get("x-api-key")
+        seen["brave_key"] = request.headers.get("x-subscription-token")
+        seen["api_version"] = request.headers.get("api-version")
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "search_id": "ignored",
+                "session_id": "ignored",
+                "results": [
+                    {
+                        "title": "Parallel result",
+                        "url": "https://example.com/parallel",
+                        "publish_date": "2026-10-10",
+                        "excerpts": ["first excerpt", long_excerpt, None],
+                        "providerOnly": secret,
+                    },
+                    {
+                        "title": "Unsafe URL is dropped",
+                        "url": "https://user:password@example.com/private",
+                        "excerpts": ["must not survive"],
+                    },
+                    "malformed",
+                    {
+                        "title": None,
+                        "url": "https://example.com/second",
+                        "publish_date": None,
+                        "excerpts": [None, "second excerpt"],
+                    },
+                ],
+                "warnings": [{"message": secret}],
+                "usage": [{"name": secret, "count": 1}],
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await web_search.search(
+            {"query": "parallel search", "num_results": 4, "country": "gb"},
+            client=client,
+        )
+
+    assert seen == {
+        "url": web_search.PARALLEL_API_URL,
+        "method": "POST",
+        "api_key": secret,
+        "brave_key": None,
+        "api_version": None,
+        "body": {
+            "objective": "parallel search",
+            "search_queries": ["parallel search"],
+            "mode": "fast",
+            "max_chars_total": 4800,
+            "advanced_settings": {
+                "max_results": 4,
+                "excerpt_settings": {"max_chars_per_result": 1200},
+                "location": "gb",
+            },
+        },
+    }
+    assert result == {
+        "provider": "parallel",
+        "query": "parallel search",
+        "organic": [
+            {
+                "title": "Parallel result",
+                "link": "https://example.com/parallel",
+                "snippet": ("first excerpt\n\n" + long_excerpt)[:1200],
+                "date": "2026-10-10",
+                "position": 1,
+            },
+            {
+                "link": "https://example.com/second",
+                "snippet": "second excerpt",
+                "position": 4,
+            },
+        ],
+    }
+    assert secret not in json.dumps(result)
+
+
 async def test_selected_provider_failure_never_falls_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _configure(
         monkeypatch,
-        provider="brave",
+        provider="parallel",
         serper_key="serper-must-not-be-used",
-        brave_key="brave-selected",
+        brave_key="brave-must-not-be-used",
+        parallel_key="parallel-selected",
     )
     seen: list[str] = []
 
@@ -355,7 +505,7 @@ async def test_selected_provider_failure_never_falls_back(
             await web_search.search({"query": "anything"}, client=client)
 
     assert caught.value.kind == "provider_unavailable"
-    assert seen == [web_search.BRAVE_API_URL]
+    assert seen == [web_search.PARALLEL_API_URL]
 
 
 @pytest.mark.parametrize(
@@ -367,6 +517,12 @@ async def test_selected_provider_failure_never_falls_back(
             "brave-redirect-secret",
             web_search.BRAVE_API_URL,
             "x-subscription-token",
+        ),
+        (
+            "parallel",
+            "parallel-redirect-secret",
+            web_search.PARALLEL_API_URL,
+            "x-api-key",
         ),
     ],
 )
@@ -382,6 +538,7 @@ async def test_search_never_follows_redirects(
         provider=provider,
         serper_key=secret if provider == "serper" else "",
         brave_key=secret if provider == "brave" else "",
+        parallel_key=secret if provider == "parallel" else "",
     )
     seen: list[tuple[str, str | None]] = []
 
@@ -438,6 +595,34 @@ async def test_search_rejects_a_key_reflected_in_an_allowed_provider_field(
                         }
                     ]
                 }
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(web_search.WebSearchError) as caught:
+            await web_search.search({"query": "anything"}, client=client)
+
+    assert caught.value.kind == "unsafe_response"
+    assert secret not in str(caught.value)
+
+
+async def test_parallel_rejects_a_key_reflected_in_an_excerpt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "parallel-reflected-secret"
+    _configure(monkeypatch, provider="parallel", parallel_key=secret)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "title": "Result",
+                        "url": "https://example.com",
+                        "excerpts": [f"echoed {secret}"],
+                    }
+                ]
             },
         )
 
@@ -507,20 +692,58 @@ async def test_provider_failures_are_safe(
     assert secret not in str(caught.value)
 
 
+@pytest.mark.parametrize(
+    ("status", "kind"),
+    [
+        (401, "credential_rejected"),
+        (403, "credential_rejected"),
+        (402, "quota_exhausted"),
+        (408, "timeout"),
+        (422, "request_rejected"),
+        (429, "rate_limited"),
+        (503, "provider_unavailable"),
+    ],
+)
+async def test_parallel_provider_failures_are_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    kind: str,
+) -> None:
+    secret = "parallel-must-never-appear"
+    _configure(monkeypatch, provider="parallel", parallel_key=secret)
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(status, text=f"provider echoed {secret}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(web_search.WebSearchError) as caught:
+            await web_search.search({"query": "anything"}, client=client)
+
+    assert caught.value.kind == kind
+    assert secret not in str(caught.value)
+    assert seen == [web_search.PARALLEL_API_URL]
+
+
 def test_admin_registry_and_tool_schema_are_safe() -> None:
     provider = settings.SETTINGS_BY_KEY[web_search.PROVIDER_SETTING]
     serper = settings.SETTINGS_BY_KEY[web_search.SERPER_API_KEY_SETTING]
     brave = settings.SETTINGS_BY_KEY[web_search.BRAVE_API_KEY_SETTING]
+    parallel = settings.SETTINGS_BY_KEY[web_search.PARALLEL_API_KEY_SETTING]
     definition = web_search.TOOL_DEFINITION
 
-    assert provider.choices == ("auto", "serper", "brave")
+    assert provider.choices == ("auto", "serper", "brave", "parallel")
     with pytest.raises(ValueError, match="Invalid value"):
         provider.validate("another-provider")
     assert serper.secret is True
     assert serper.env == "SERPER_API_KEY"
     assert brave.secret is True
     assert brave.env == "BRAVE_SEARCH_API_KEY"
+    assert parallel.secret is True
+    assert parallel.env == "PARALLEL_API_KEY"
     assert definition["name"] == "web_search"
+    assert "Parallel Search" in definition["description"]
     assert definition["inputSchema"]["properties"]["query"]["maxLength"] == 600
     assert definition["inputSchema"]["properties"]["num_results"]["maximum"] == 10
     assert definition["inputSchema"]["properties"]["freshness"]["enum"] == [

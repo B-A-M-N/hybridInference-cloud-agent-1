@@ -6978,11 +6978,12 @@ async def test_the_claim_hands_over_the_mcp_credential_too(client: AsyncClient):
 
 @pytest.mark.parametrize("runtime", ["codex", "kilo", "claude-code", "opencode", "pi"])
 @pytest.mark.parametrize(
-    ("selection", "serper_key", "brave_key"),
+    ("selection", "serper_key", "brave_key", "parallel_key"),
     [
-        ("serper", "serper-claim-secret", ""),
-        ("brave", "", "brave-claim-secret"),
-        ("auto", "serper-both-secret", "brave-both-secret"),
+        ("serper", "serper-claim-secret", "", ""),
+        ("brave", "", "brave-claim-secret", ""),
+        ("parallel", "", "", "parallel-claim-secret"),
+        ("auto", "serper-all-secret", "brave-all-secret", "parallel-all-secret"),
     ],
 )
 async def test_web_search_provider_enables_mcp_without_exposing_keys(
@@ -6992,11 +6993,13 @@ async def test_web_search_provider_enables_mcp_without_exposing_keys(
     selection: str,
     serper_key: str,
     brave_key: str,
+    parallel_key: str,
 ) -> None:
     values = {
         worker.web_search.PROVIDER_SETTING: selection,
         worker.web_search.SERPER_API_KEY_SETTING: serper_key,
         worker.web_search.BRAVE_API_KEY_SETTING: brave_key,
+        worker.web_search.PARALLEL_API_KEY_SETTING: parallel_key,
     }
     monkeypatch.setattr(
         worker.web_search,
@@ -7010,7 +7013,9 @@ async def test_web_search_provider_enables_mcp_without_exposing_keys(
 
     assert body["mcp_bindings"] == [worker.web_search.RUNTIME_SERVER_ID]
     assert body["mcp_token"]
-    assert all(secret not in json.dumps(body) for secret in (serper_key, brave_key) if secret)
+    assert all(
+        secret not in json.dumps(body) for secret in (serper_key, brave_key, parallel_key) if secret
+    )
 
 
 async def test_the_claim_names_no_mcp_relay_address(client: AsyncClient, monkeypatch):
