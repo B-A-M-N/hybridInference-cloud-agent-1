@@ -496,6 +496,28 @@ def test_edge_allows_the_largest_supported_attachment_json(file, prefix, upstrea
     assert config.count("client_max_body_size") == 1, "other routes retain the default"
 
 
+@pytest.mark.parametrize(
+    "file",
+    ["deploy/control-plane/edge.nginx.conf", "deploy/reverse-proxy/agents-under-gateway.conf"],
+)
+def test_shipped_proxies_overwrite_the_forwarded_address(file):
+    """The audit trail must not record an address the caller wrote.
+
+    With ``AGENT_TRUST_PROXY_HEADERS`` on, ``get_client_ip`` takes the first
+    ``X-Forwarded-For`` entry. ``$proxy_add_x_forwarded_for`` appends to the
+    header the caller sent, so that first entry would be the caller's choice.
+    Each shipped proxy replaces it with the one peer address nginx knows.
+    """
+    config = (REPO_ROOT / file).read_text()
+    live = [line.split("#", 1)[0] for line in config.splitlines()]
+    assert not any("$proxy_add_x_forwarded_for" in line for line in live)
+    forwarded = [
+        line.strip() for line in live if re.search(r"proxy_set_header\s+X-Forwarded-For", line)
+    ]
+    assert forwarded, f"{file} forwards no client address at all"
+    assert set(forwarded) == {"proxy_set_header X-Forwarded-For $remote_addr;"}, forwarded
+
+
 def test_control_and_runner_install_locked_production_dependencies():
     """Both images consume uv.lock without an unlocked pip project install."""
     for file in ("deploy/control-plane/Dockerfile", "deploy/host/Dockerfile.agent-runner"):
