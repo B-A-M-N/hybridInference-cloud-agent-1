@@ -710,6 +710,11 @@ async def create_connection(
         # column means "which preset this came from", and a value that names
         # nothing makes the provenance unreadable.
         raise _bad_request(f"unknown template: {template!r}")
+    if body.connector_id is not None:
+        # The same ownership read the bind route makes. Without it the column
+        # could name another user's machine, and that user's revocation would
+        # then reach into this connection.
+        await _require_connector(job_store, connector_id=body.connector_id, user_id=user["user_id"])
 
     if body.connector_id is not None:
         if location is not ExecutionLocation.USER_CONNECTOR:

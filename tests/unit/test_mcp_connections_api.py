@@ -2734,6 +2734,38 @@ class TestConnectors:
                 == 404
             )
 
+    def test_a_new_connection_cannot_name_another_users_connector(self) -> None:
+        """Creation reads the connector under the caller's ownership, as binding does."""
+        store = FakeStore()
+        store.connectors[9] = {
+            "id": 9,
+            "user_id": _OTHER,
+            "name": "Theirs",
+            "status": "pending",
+            "mounts": [],
+            "created_at": None,
+            "last_seen_at": None,
+            "revoked_at": None,
+        }
+        launch = {"command": "uvx", "args": ["server==1.0"]}
+        body = {
+            "label": "Local",
+            "transport": "stdio",
+            "location": "user-connector",
+            "launch": launch,
+        }
+        with _client(store) as client:
+            refused = client.post("/v1/agent/mcp/connections", json={**body, "connector_id": 9})
+            assert refused.status_code == 404
+            assert store.connections == {}
+            own = client.post("/v1/agent/mcp/connectors", json={"name": "Mine"}).json()
+            created = client.post(
+                "/v1/agent/mcp/connections",
+                json={**body, "connector_id": own["connector"]["id"]},
+            )
+        assert created.status_code == 201, created.text
+        assert created.json()["connector_id"] == own["connector"]["id"]
+
     def test_unbinding_a_connection_that_is_not_routed_here_is_not_found(self) -> None:
         """Silence would let a caller believe it had stopped something."""
         store = FakeStore()
