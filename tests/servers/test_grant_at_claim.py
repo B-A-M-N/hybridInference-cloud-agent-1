@@ -40,6 +40,7 @@ from tests.support.storage import AllCapabilities, EmptyAttachments
 from cloud_agent.api import routes as agent_jobs_router, worker as agent_worker
 from cloud_agent.api.deps import (
     get_agent_app_credentials,
+    get_gateway_client,
     get_grant_client,
     get_storage,
 )
@@ -173,12 +174,42 @@ class _Grants:
         return True
 
 
-def _app(store: _ClaimStore, grants: _Grants) -> FastAPI:
+class _Gateway:
+    """The Gateway's Agent access decision, as the claim re-reads it.
+
+    Allowed unless told otherwise. ``decision`` replaces the answer; ``error``
+    makes the lookup itself fail, which is how both a withdrawn account
+    (``subject_unavailable``) and an unreachable Gateway arrive.
+    """
+
+    def __init__(
+        self,
+        *,
+        decision: dict[str, Any] | None = None,
+        error: GatewayError | None = None,
+    ) -> None:
+        self.decision = decision
+        self.error = error
+        self.asked: list[str] = []
+
+    async def agent_access(self, user_id: str) -> dict[str, Any]:
+        self.asked.append(user_id)
+        if self.error is not None:
+            raise self.error
+        if self.decision is not None:
+            return {"user_id": user_id, **self.decision}
+        return {"user_id": user_id, "allowed": True, "permissions": ["agent.use"]}
+
+
+def _app(store: _ClaimStore, grants: _Grants, gateway: _Gateway | None = None) -> FastAPI:
     app = FastAPI()
     app.include_router(agent_jobs_router.router)
     app.dependency_overrides[get_storage] = lambda: store
     app.dependency_overrides[get_agent_app_credentials] = lambda: None
     app.dependency_overrides[get_grant_client] = lambda: grants
+    # Every claim asks the Gateway again whether the owner may use Agent.
+    resolved_gateway = gateway if gateway is not None else _Gateway()
+    app.dependency_overrides[get_gateway_client] = lambda: resolved_gateway
     app.dependency_overrides[agent_worker.verify_claiming_host] = lambda: {
         "host": "runner-test",
         "credential_hash": "test-credential-hash",
@@ -198,8 +229,8 @@ def _env(monkeypatch):
 async def claim():
     """Return a helper that drives one claim against a fresh app."""
 
-    async def _drive(store: _ClaimStore, grants: _Grants):
-        transport = ASGITransport(app=_app(store, grants))
+    async def _drive(store: _ClaimStore, grants: _Grants, gateway: _Gateway | None = None):
+        transport = ASGITransport(app=_app(store, grants, gateway))
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             return await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})
 
@@ -415,6 +446,62 @@ async def test_an_unavailable_repository_lookup_delays_the_claim(claim, monkeypa
     assert store.retry_delays == [30]
 
 
+@pytest.mark.parametrize(
+    "gateway",
+    [
+        _Gateway(decision={"allowed": False, "permissions": []}),
+        _Gateway(
+            error=GatewayError(
+                "gateway answered 403", status_code=403, error_type="subject_unavailable"
+            )
+        ),
+    ],
+    ids=["denied", "subject_unavailable"],
+)
+async def test_an_owner_whose_agent_access_was_withdrawn_is_not_run(claim, gateway):
+    """Queued work does not outlive its owner's access.
+
+    A goal's round or a waiting message is written with no request to admit
+    it, and any job can wait in the queue past a withdrawal. The grant mint
+    alone would not notice — the Gateway refuses it only for an unknown or
+    inactive account — so the claim asks, and a "no" ends the job with the
+    reason rather than handing it back to be refused again at every claim.
+    """
+    store, grants = _ClaimStore(), _Grants()
+
+    response = await claim(store, grants, gateway)
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["error"]["type"] == "agent_access_denied"
+    assert gateway.asked == ["user-owner"]
+    assert grants.calls == []
+    assert store.failed == [_JOB]
+    assert store.released == []
+
+
+@pytest.mark.parametrize(
+    "gateway",
+    [
+        _Gateway(error=GatewayError("gateway unreachable")),
+        _Gateway(error=GatewayError("gateway answered 503", status_code=503)),
+        _Gateway(decision={"allowed": True, "permissions": []}),
+    ],
+    ids=["unreachable", "unavailable", "malformed"],
+)
+async def test_an_unconfirmed_agent_access_hands_the_job_back(claim, gateway):
+    """No answer is not permission, and not a verdict on the owner either."""
+    store, grants = _ClaimStore(), _Grants()
+
+    response = await claim(store, grants, gateway)
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["error"]["type"] == "agent_access_unavailable"
+    assert grants.calls == []
+    assert store.failed == []
+    assert store.released == [(_JOB, _ATTEMPT)]
+    assert store.retry_delays == [30]
+
+
 @pytest.mark.parametrize("refusal", ["not_allowed", "unavailable"])
 async def test_a_repository_refusal_is_decided_before_any_grant_is_minted(
     claim, monkeypatch, refusal
@@ -479,6 +566,7 @@ async def test_title_generation_is_scheduled_after_successful_claim(monkeypatch,
         store=store,
         app_credentials=None,
         grants=grants,
+        gateway=_Gateway(),
     )
     assert response.job_id == _JOB
     generate.assert_not_awaited()

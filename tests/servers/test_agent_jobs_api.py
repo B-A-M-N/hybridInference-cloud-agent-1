@@ -2707,6 +2707,40 @@ async def test_a_message_sent_during_a_turn_waits_then_follows_it_in_native_cont
     assert "context_checkpoint" not in child_claim
 
 
+async def test_a_waiting_message_is_held_when_its_owners_agent_access_was_withdrawn(
+    client: AsyncClient, store: FakeStorage, monkeypatch: pytest.MonkeyPatch
+):
+    """The turn in front ending is not the owner asking again.
+
+    A waiting message is sent by the settlement, with no request of its
+    owner's behind it, so only the settlement can notice that the Gateway no
+    longer admits them. It holds the message with the reason instead of
+    turning it into a turn that would run anyway.
+    """
+    parent_id = await _create_job(client)
+    sent = await _send(client, store, parent_id, {"prompt": "now add a regression test"})
+    assert sent.status_code == 201
+    waiting = sent.json()["pending"]
+    claim = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+    assert claim["job_id"] == parent_id
+
+    async def withdrawn(self: Any, user_id: str) -> dict[str, Any]:
+        return {"user_id": user_id, "allowed": False, "permissions": []}
+
+    monkeypatch.setattr(_FakeGateway, "agent_access", withdrawn)
+    finished = await client.post(
+        f"/v1/agent/worker/jobs/{parent_id}/finish",
+        json={"state": "succeeded"},
+        headers={"Authorization": f"Bearer {claim['worker_token']}"},
+    )
+    assert finished.status_code == 200
+
+    held = store.pending[waiting["id"]]
+    assert held["state"] == "held"
+    assert held["last_error"] == "Agent access has not been granted for this account."
+    assert [job["id"] for job in store.jobs.values()] == [parent_id]
+
+
 async def test_cancelled_middle_turn_does_not_release_a_later_queued_turn(
     client: AsyncClient, store: FakeStorage
 ):

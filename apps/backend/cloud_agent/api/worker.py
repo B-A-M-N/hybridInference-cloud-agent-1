@@ -63,6 +63,11 @@ from cloud_agent.mcp.models import ConnectionStatus
 from cloud_agent.mcp.registry import resolve_for_thread
 from cloud_agent.measurement_ingest import Owner
 from cloud_agent.measurement_persistence import persist_measurement
+from cloud_agent.owner_access import (
+    AGENT_ACCESS_WITHDRAWN,
+    AgentAccessUnavailable,
+    owner_may_use_agent,
+)
 from cloud_agent.schemas import (
     HostResidencyEstablishResponse,
     WorkerAckResponse,
@@ -486,6 +491,77 @@ async def _worker_workspace_broker(
     return broker
 
 
+async def _require_owner_agent_access(
+    job_store: _WorkerStorage,
+    gateway: Any,
+    claim: dict[str, Any],
+) -> None:
+    """Ask the Gateway again whether this job's owner may still use Agent.
+
+    Admission was decided when the job was written, and a job can sit in the
+    queue long after that — or be written by a goal or a waiting message with
+    no request behind it at all. The grant mint does not catch a withdrawal:
+    the Gateway refuses it only for an account that is unknown or inactive, so
+    an active account without ``agent.use`` would still get a working grant.
+
+    **A denial ends the job rather than handing it back.** Released, it would be
+    eligible again at the next claim and refused again, every time; failed, it
+    carries a reason the owner can read, and the owner's goal and waiting
+    messages pause on it the way they do for any failed turn.
+
+    **No answer hands it back**, with the same delay as the other transient
+    claim failures: an unreachable Gateway is not a verdict on the owner, and a
+    released claim spends no attempt.
+
+    Raises:
+        HTTPException: 403 after ending the job when access was withdrawn, or
+            503 after releasing the claim when it could not be confirmed.
+    """
+    try:
+        permitted = await owner_may_use_agent(gateway, user_id=str(claim["user_id"]))
+    except AgentAccessUnavailable as exc:
+        await job_store.attempt_commands.release_claim(
+            job_id=claim["id"],
+            attempt_id=claim["attempt_id"],
+            lease_generation=claim["lease_generation"],
+            retry_after_seconds=30,
+        )
+        logger.warning(
+            "agent_job_owner_access_unavailable",
+            extra={"event": "agent_job_owner_access_unavailable", "job_id": claim["id"]},
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "type": "agent_access_unavailable",
+                    "message": (
+                        "Could not confirm the owner's Agent access; the job has been "
+                        "returned to the queue and no attempt was spent."
+                    ),
+                }
+            },
+        ) from exc
+    if permitted:
+        return
+    await job_store.attempt_commands.transition(
+        job_id=claim["id"],
+        attempt_id=claim["attempt_id"],
+        lease_generation=claim["lease_generation"],
+        from_states=(RUNNING,),
+        to_state=FAILED,
+        detail=AGENT_ACCESS_WITHDRAWN,
+    )
+    logger.warning(
+        "agent_job_owner_access_withdrawn",
+        extra={"event": "agent_job_owner_access_withdrawn", "job_id": claim["id"]},
+    )
+    raise HTTPException(
+        status_code=403,
+        detail={"error": {"type": "agent_access_denied", "message": AGENT_ACCESS_WITHDRAWN}},
+    )
+
+
 async def _mint_sandbox_grant(
     job_store: _WorkerStorage,
     grants: Any,
@@ -691,6 +767,7 @@ async def worker_claim(
     store: _WorkerStorage | None = Depends(get_storage),
     app_credentials: Any | None = Depends(get_agent_app_credentials),
     grants: Any = Depends(get_grant_client),
+    gateway: Any = Depends(get_gateway_client),
 ) -> WorkerClaimResponse | None:
     """Claim the next queued job and mint this attempt's capability token.
 
@@ -738,6 +815,9 @@ async def worker_claim(
         "attempt_id": claim["attempt_id"],
         "lease_generation": claim["lease_generation"],
     }
+    # Whether the owner may still use Agent at all comes first: it is the one
+    # check every turn passes here, including the ones no request admitted.
+    await _require_owner_agent_access(job_store, gateway, claim)
     # Re-checked at claim time, not just at create time. A row written before
     # this check existed — or while the allowlist was wider — must not be able
     # to produce a credential now.
