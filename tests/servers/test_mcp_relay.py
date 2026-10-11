@@ -31,6 +31,7 @@ from tests.support.storage import OneFake
 from cloud_agent.api import mcp_relay as agent_mcp_router
 from cloud_agent.api.deps import get_storage
 from cloud_agent.mcp.registry import mcp_cipher
+from cloud_agent.mcp_proxy import canonical_request
 from cloud_agent.tokens import SCOPE_FULL, SCOPE_MCP, SCOPE_MODEL, mint_worker_token
 
 pytestmark = pytest.mark.asyncio
@@ -687,6 +688,99 @@ async def test_an_allowed_tool_is_forwarded(client, upstream):
     )
     assert response.status_code == 200
     assert len(upstream.requests) == 1
+
+
+# -- the body is decided once, and the decided body is what travels ----
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # A byte that is not UTF-8, inside a string. This relay cannot decode
+        # it; a decoder that substitutes U+FFFD reads a call to create_issue.
+        b'{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+        b'"params":{"name":"create_issue","arguments":{"title":"\xff"}}}',
+        # No ``method`` here, but a case-insensitive decoder reads one.
+        b'{"jsonrpc":"2.0","id":1,"Method":"tools/call","params":{"name":"create_issue"}}',
+        # Here ``name`` is get_issue; a case-insensitive, last-wins decoder
+        # keeps create_issue.
+        b'{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+        b'"params":{"name":"get_issue","Name":"create_issue"}}',
+        # Python keeps the last of two members; a decoder that keeps the first
+        # runs the other tool.
+        b'{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+        b'"params":{"name":"create_issue","name":"get_issue"}}',
+        b"",
+    ],
+    ids=["invalid-utf8", "method-case", "name-case", "repeated-name", "empty"],
+)
+async def test_a_body_the_relay_cannot_decide_is_never_forwarded(
+    monkeypatch, store, upstream, body
+):
+    """An unparseable body is a call nothing decided, so it never leaves.
+
+    It used to be forwarded as it came, on the theory that a body this relay
+    cannot parse cannot be a ``tools/call``. That holds only if the upstream
+    parses the same way, and Node and Go do not: each of these reaches a
+    denied tool on an upstream that decodes it more leniently.
+    """
+    store.snapshot = _snapshot("get_issue", "create_issue")
+    store.bindings = [
+        _binding(
+            rules={
+                "get_issue": {"policy": "allow", "fingerprint": ""},
+                "create_issue": {"policy": "deny", "fingerprint": ""},
+            }
+        )
+    ]
+    async with _relay(monkeypatch, store, upstream) as api:
+        response = await api.post(
+            f"/v1/agent/mcp/{_ALIAS}",
+            content=body,
+            headers={**_auth(), "content-type": "application/json"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] in (-32700, -32600)
+    assert response.json()["id"] is None
+    assert upstream.requests == []
+    assert store.created_invocations == []
+
+
+async def test_the_upstream_receives_the_request_as_it_was_decided(client, upstream):
+    """What travels is this relay's encoding of the parsed call, not the bytes.
+
+    The two mean the same thing to a strict decoder. Sending the decided form
+    means they also mean the same thing to every other decoder.
+    """
+    raw = (
+        b'{ "jsonrpc" : "2.0", "id" : 1, "method" : "tools/call", "params" : '
+        b'{ "name" : "get_issue", "arguments" : { "title" : "caf\xc3\xa9", "n" : 1E2 } } }'
+    )
+    response = await client.post(
+        f"/v1/agent/mcp/{_ALIAS}",
+        content=raw,
+        headers={**_auth(), "content-type": "application/json; charset=utf-16"},
+    )
+
+    assert response.status_code == 200, response.text
+    sent = upstream.requests[0]
+    assert sent.content == canonical_request(json.loads(raw))
+    assert sent.content.isascii()
+    assert json.loads(sent.content)["params"]["arguments"] == {"title": "café", "n": 100.0}
+    assert sent.headers["content-type"] == "application/json"
+
+
+async def test_notifications_and_batches_still_travel(client, upstream):
+    """A batch is decided message by message and forwarded whole."""
+    batch = [
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "get_issue"}},
+    ]
+    response = await client.post(f"/v1/agent/mcp/{_ALIAS}", json=batch, headers=_auth())
+
+    assert response.status_code == 200, response.text
+    assert json.loads(upstream.requests[0].content) == batch
 
 
 async def test_a_denied_tool_is_never_advertised(monkeypatch, store, upstream):

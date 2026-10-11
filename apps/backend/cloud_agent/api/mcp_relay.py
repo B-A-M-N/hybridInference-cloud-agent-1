@@ -79,7 +79,10 @@ from cloud_agent.mcp_proxy import (
     MAX_BUFFERED_RESPONSE_BYTES,
     METHOD_NOT_FOUND,
     SseFilter,
+    UnreadableRequest,
+    canonical_request,
     filter_json_body,
+    parse_request,
     plan_request,
 )
 from cloud_agent.settings import number_setting
@@ -789,11 +792,15 @@ async def _capability_decision(
     the platform would be proxying a capability it cannot reason about, with a
     credential it is responsible for. Notifications are the exception, because
     they ask for nothing and carry no reply.
+
+    A body that does not parse is refused for the same reason. "No method this
+    relay can see" is not "no call": an upstream that decodes the bytes more
+    leniently could find a ``tools/call`` in them that nothing here decided.
     """
     try:
-        document = json.loads(body or b"{}")
-    except (json.JSONDecodeError, ValueError):
-        return None
+        document = parse_request(body)
+    except UnreadableRequest as exc:
+        return exc.reply()
     payloads = document if isinstance(document, list) else [document]
     for payload in payloads:
         if not isinstance(payload, dict):
@@ -952,6 +959,10 @@ async def _proxy(
         ) from exc
     assert server.url is not None
     headers = _upstream_headers(request, server)
+    if body:
+        # The body is this relay's own encoding of what it decided, so its type
+        # is too; a charset the sandbox named would describe other bytes.
+        headers["content-type"] = "application/json"
     client = build_upstream_client(server.request_timeout_s)
     upstream_request = client.build_request(
         method,
@@ -1915,7 +1926,15 @@ async def mcp_post(
         request_id = payload.get("id") if isinstance(payload, dict) else None
         return JSONResponse(_error_reply(request_id, str(exc.detail)))
     assert store is not None
-    body = await request.body()
+    try:
+        document = parse_request(await request.body())
+    except UnreadableRequest as exc:
+        # The merged endpoint's answer to the same body. Nothing below may see
+        # bytes other than the ones decided, so nothing below sees these.
+        return JSONResponse(exc.reply(), status_code=400)
+    # From here on the request *is* the parsed document: the decision, the
+    # allowlist and the upstream all read this one encoding of it.
+    body = canonical_request(document)
 
     held = await _capability_decision(
         authorized,

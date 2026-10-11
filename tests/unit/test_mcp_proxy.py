@@ -23,8 +23,17 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from cloud_agent.mcp.models import McpServer, Transport
-from cloud_agent.mcp_proxy import SseFilter, filter_json_body, plan_request
+from cloud_agent.mcp_proxy import (
+    SseFilter,
+    UnreadableRequest,
+    canonical_request,
+    filter_json_body,
+    parse_request,
+    plan_request,
+)
 
 _GATEWAY = "https://gateway.example.com"
 _TOKEN = "ajt.job.attempt.signature"
@@ -91,9 +100,91 @@ def test_a_batch_with_one_blocked_tool_is_refused_whole():
     assert [entry["id"] for entry in plan.rejection] == [2]
 
 
-def test_a_malformed_body_is_passed_through_rather_than_guessed_at():
-    """The upstream owns the protocol and answers a bad request better."""
-    assert not plan_request(b"{not json", _server()).rejected
+def test_a_malformed_body_is_refused_rather_than_forwarded():
+    """A body the proxy cannot parse is a ``tools/call`` it cannot see.
+
+    This used to be passed through for the upstream to answer. An upstream that
+    parses more leniently can find a call in it, and that call would have
+    skipped the allowlist entirely.
+    """
+    plan = plan_request(b"{not json", _server())
+    assert plan.rejected
+    assert plan.rejection == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32700, "message": plan.rejection["error"]["message"]},
+    }
+
+
+@pytest.mark.parametrize(
+    ("body", "code"),
+    [
+        (b'{"method":"tools/call","params":{"name":"get_issue\xff"}}', -32700),
+        (b'{"method":"tools/call","method":"tools/list"}', -32700),
+        (b'{"method":"tools/call","params":{"arguments":{"a":1,"a":2}}}', -32700),
+        (b'{"id":1,"n":NaN}', -32700),
+        (b'{"id":1,"n":-Infinity}', -32700),
+        (b'{"id":1,"n":1e400}', -32700),
+        (b"[" * 100_000 + b"]" * 100_000, -32700),
+        (b"\xef\xbb\xbf{}", -32700),
+        (b'{"Method":"tools/call"}', -32600),
+        (b'{"method":"tools/call","PARAMS":{"name":"x"}}', -32600),
+        # Go's case folding also matches U+017F, the long s, to "s".
+        (b'{"method":"tools/call","param\xc5\xbf":{}}', -32600),
+        (b'{"method":"tools/call","params":{"name":"x","Name":"y"}}', -32600),
+        (b'[{"method":"ping"},{"method":"tools/call","params":{"URI":"x"}}]', -32600),
+    ],
+    ids=[
+        "invalid-utf8",
+        "repeated-method",
+        "repeated-argument",
+        "nan",
+        "infinity",
+        "overflow",
+        "too-deep",
+        "byte-order-mark",
+        "method-case",
+        "params-case",
+        "long-s",
+        "name-case",
+        "batch-member-case",
+    ],
+)
+def test_an_ambiguous_body_is_refused_by_both_decisions(body: bytes, code: int):
+    """Every body two decoders could read differently is refused, not guessed at."""
+    with pytest.raises(UnreadableRequest) as caught:
+        parse_request(body)
+    assert caught.value.code == code
+    assert plan_request(body, _server()).rejection["error"]["code"] == code
+
+
+def test_a_member_this_relay_does_not_read_keeps_its_own_spelling():
+    """Only the members a decision reads are pinned; arguments are the tool's."""
+    document = parse_request(
+        b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_issue",'
+        b'"arguments":{"Name":"a","name":"b"},"_meta":{"progressToken":1}}}'
+    )
+    assert document["params"]["arguments"] == {"Name": "a", "name": "b"}
+
+
+def test_the_canonical_form_reads_back_as_what_was_decided():
+    """Re-encoding loses nothing a decision read, and stays ASCII for every decoder."""
+    body = json.dumps(
+        [
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {
+                "jsonrpc": "2.0",
+                "id": "a",
+                "method": "tools/call",
+                "params": {"name": "get_issue", "arguments": {"t": "café 😀", "n": 2**70}},
+            },
+        ]
+    ).encode()
+    document = parse_request(body)
+    canonical = canonical_request(document)
+    assert canonical.isascii()
+    assert parse_request(canonical) == document == json.loads(body)
+    assert not plan_request(canonical, _server()).rejected
 
 
 def test_an_empty_reachable_set_is_nothing_not_everything():
