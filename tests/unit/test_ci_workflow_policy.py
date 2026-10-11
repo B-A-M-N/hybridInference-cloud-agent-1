@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import shlex
 import subprocess
 from pathlib import Path
@@ -19,10 +20,15 @@ import pytest
 import yaml
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
+CACHE_WORKFLOW = WORKFLOW.with_name("pr-caches.yml")
 
 
 def _document() -> dict:
     return yaml.safe_load(WORKFLOW.read_text())
+
+
+def _cache_document() -> dict:
+    return yaml.safe_load(CACHE_WORKFLOW.read_text())
 
 
 def _expression(
@@ -105,8 +111,8 @@ def _self_hosted_labels(name: str, cell: dict) -> list[str]:
     )
 
 
-# The optional, hosted-only job that fills what pull requests restore. It is
-# the one exception to the routing below, and is pinned on its own further down.
+# The hosted-only cache warmer has its own workflow, so its completion cannot
+# delay the CI workflow's verdict used by publication.
 CACHE_WARMER = "pr-caches"
 
 
@@ -114,8 +120,8 @@ CACHE_WARMER = "pr-caches"
 def test_pull_requests_run_every_check_on_disposable_native_hosted_runners(fork: bool) -> None:
     """Forks, collaborators and same-repository PRs all take the hosted path."""
     for name, job in _document()["jobs"].items():
-        if name in {"kata", CACHE_WARMER}:
-            continue  # Neither is reachable from a pull request; both are checked below.
+        if name == "kata":
+            continue  # Its explicit PR exclusion is checked below.
         for cell in _cells(job):
             expected = "ubuntu-24.04-arm" if cell.get("arch") == "arm64" else "ubuntu-24.04"
             assert _runner_labels(job, "pull_request", cell, fork=fork) == [expected], (
@@ -127,8 +133,6 @@ def test_pull_requests_run_every_check_on_disposable_native_hosted_runners(fork:
 @pytest.mark.parametrize("event", ["push", "workflow_dispatch"])
 def test_trusted_events_keep_the_existing_self_hosted_pools(event: str) -> None:
     for name, job in _document()["jobs"].items():
-        if name == CACHE_WARMER:
-            continue
         for cell in _cells(job):
             expected = _self_hosted_labels(name, cell)
             assert _runner_labels(job, event, cell) == expected, (name, cell)
@@ -138,13 +142,18 @@ def test_only_an_optional_cache_warmer_runs_a_trusted_event_on_a_hosted_vm() -> 
     """Trusted CI and publication must never wait for a hosted VM.
 
     `pr-caches` runs dev's reviewed code on a hosted VM so that a pull request's
-    caches match its own VM. That is only acceptable while nothing depends on it:
-    no job needs it, the gate does not wait for it, and its failure cannot turn
-    the run red. GitHub refuses hosted jobs outright when billing lapses, and a
-    trusted pipeline that waited on one would silently stop publishing.
+    caches match its own VM. Its separate workflow prevents a queued or slow
+    hosted job from delaying the CI workflow's completion, which Publish waits
+    for even after CI Gate has passed.
     """
     jobs = _document()["jobs"]
-    warmer = jobs[CACHE_WARMER]
+    document = _cache_document()
+    triggers = document.get("on") or document[True]
+    assert triggers == {"push": {"branches": ["dev"]}}
+    assert document["permissions"] == {"contents": "read"}
+    assert set(document["jobs"]) == {CACHE_WARMER}
+    assert CACHE_WARMER not in jobs
+    warmer = document["jobs"][CACHE_WARMER]
     assert warmer["if"] == "github.event_name == 'push' && github.ref == 'refs/heads/dev'"
     assert warmer["runs-on"] == ["ubuntu-24.04"]
     assert warmer["continue-on-error"] is True
@@ -152,12 +161,30 @@ def test_only_an_optional_cache_warmer_runs_a_trusted_event_on_a_hosted_vm() -> 
     for name, job in jobs.items():
         needs = job.get("needs", [])
         assert CACHE_WARMER not in ([needs] if isinstance(needs, str) else needs), name
-    assert "secrets." not in json.dumps(warmer)
+    assert warmer.get("permissions", document["permissions"]) == {"contents": "read"}
+    assert "secrets." not in json.dumps(document)
     build = next(
         step for step in warmer["steps"] if "docker/build-push-action" in step.get("uses", "")
     )
     assert build["with"]["push"] is False
     assert build["with"]["outputs"] == "type=cacheonly", "the warmer exports layers, never an image"
+
+
+def test_publication_waits_only_for_the_ci_workflow() -> None:
+    """An optional job in CI still delays its workflow-level publication signal."""
+    document = _document()
+    assert CACHE_WARMER not in document["jobs"]
+    assert _cache_document()["name"] != document["name"]
+    publish = yaml.safe_load(WORKFLOW.with_name("publish.yml").read_text())
+    triggers = publish.get("on") or publish[True]
+    assert triggers["workflow_run"]["workflows"] == [document["name"]]
+    assert triggers["workflow_run"]["types"] == ["completed"]
+    scripts = "\n".join(
+        step.get("with", {}).get("script", "")
+        for job in publish["jobs"].values()
+        for step in job.get("steps", [])
+    )
+    assert set(re.findall(r"workflow_id:\s*'([^']+)'", scripts)) == {WORKFLOW.name}
 
 
 SANDBOX_CACHE = "type=gha,scope=sandbox-amd64"
@@ -197,7 +224,7 @@ def test_only_a_hosted_pull_request_imports_the_sandbox_layers(
                 assert imported == expected, (name, cell["name"])
     warmer = next(
         step
-        for step in jobs[CACHE_WARMER]["steps"]
+        for step in _cache_document()["jobs"][CACHE_WARMER]["steps"]
         if "docker/build-push-action" in step.get("uses", "")
     )
     assert warmer["with"]["file"] == "deploy/sandbox/Dockerfile.agent-sandbox"
@@ -205,11 +232,11 @@ def test_only_a_hosted_pull_request_imports_the_sandbox_layers(
     assert warmer["with"]["cache-to"] == f"{SANDBOX_CACHE},mode=max"
 
 
-def test_the_gate_waits_for_every_job_but_the_cache_warmer() -> None:
+def test_the_gate_waits_for_every_ci_job() -> None:
     """A job the gate does not wait for is a check that cannot fail a commit."""
     jobs = _document()["jobs"]
     gate = jobs["ci-gate"]
-    assert set(gate["needs"]) == set(jobs) - {"ci-gate", CACHE_WARMER}
+    assert set(gate["needs"]) == set(jobs) - {"ci-gate"}
     report = next(
         step
         for step in gate["steps"]
@@ -222,7 +249,8 @@ def test_the_gate_waits_for_every_job_but_the_cache_warmer() -> None:
 def test_warmed_dependency_caches_use_the_paths_pull_requests_restore() -> None:
     """The cache service keys an entry by its path; a different path never hits."""
     jobs = _document()["jobs"]
-    warmer = "\n".join(step.get("run", "") for step in jobs[CACHE_WARMER]["steps"])
+    warmer_job = _cache_document()["jobs"][CACHE_WARMER]
+    warmer = "\n".join(step.get("run", "") for step in warmer_job["steps"])
     for name in ("lint", "test", "test-db", "artifacts", "mcp", "compose"):
         assert any(
             'echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache"' in step.get("run", "")
@@ -235,7 +263,7 @@ def test_warmed_dependency_caches_use_the_paths_pull_requests_restore() -> None:
         ), name
     assert 'echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache"' in warmer
     assert 'echo "npm_config_cache=${RUNNER_TEMP}/npm-cache"' in warmer
-    node = next(step for step in jobs[CACHE_WARMER]["steps"] if step.get("name") == "Set up Node")
+    node = next(step for step in warmer_job["steps"] if step.get("name") == "Set up Node")
     assert node["with"] == next(
         step["with"] for step in jobs["check"]["steps"] if step.get("name") == "Set up Node"
     )
@@ -257,10 +285,11 @@ def test_pr_workflow_has_only_read_permissions_and_no_privileged_event_trigger()
 
 
 def test_checkouts_leave_no_token_in_the_unreviewed_repository() -> None:
-    for name, job in _document()["jobs"].items():
-        for step in job["steps"]:
-            if str(step.get("uses", "")).startswith("actions/checkout@"):
-                assert step.get("with", {}).get("persist-credentials") is False, name
+    for document in (_document(), _cache_document()):
+        for name, job in document["jobs"].items():
+            for step in job["steps"]:
+                if str(step.get("uses", "")).startswith("actions/checkout@"):
+                    assert step.get("with", {}).get("persist-credentials") is False, name
 
 
 @pytest.mark.parametrize("event", ["pull_request", "push"])

@@ -57,10 +57,6 @@ def test_ci_runner_routing_keeps_local_pools_and_isolates_every_pull_request() -
         if name == "kata":
             assert job["runs-on"] == expected, f"{name} left its pool"
             continue
-        if name == "pr-caches":
-            # Push-to-dev only and optional; `test_ci_workflow_policy.py` pins it.
-            assert job["runs-on"] == ["ubuntu-24.04"], name
-            continue
         routing = job["runs-on"]
         assert "github.event_name == 'pull_request'" in routing, name
         assert "head.repo" not in routing, f"{name} trusts a pull request by where it came from"

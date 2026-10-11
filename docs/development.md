@@ -180,11 +180,12 @@ Kata host qualification remains excluded from every PR and runs only on trusted
 `dev` events.
 
 Pull requests only read the Actions cache. After each push to `dev`, the
-optional `pr-caches` job fills the uv and npm caches and exports the sandbox
-image's build layers from a hosted VM, under the `dev` scope that every pull
-request into `dev` may restore. CI Gate does not wait for it, and its failure
-leaves the run green. Of the 15 real-CLI MCP cases, a pull request runs Kilo's
-three as `MCP conformance (kilo, …)` jobs, one case each, and the other twelve in
+optional `pr-caches.yml` workflow fills the uv and npm caches and exports the
+sandbox image's build layers from a hosted VM, under the `dev` scope that every pull
+request into `dev` may restore. It runs separately from CI, so publication
+does not wait for it and its failure does not affect CI's conclusion. Of the
+15 real-CLI MCP cases, a pull request runs Kilo's three as `MCP conformance
+(kilo, …)` jobs, one case each, and the other twelve in
 the sandbox image job; trusted events run all 15 in the sandbox image job.
 
 GitHub issue [#464](https://github.com/HarvardMadSys/hybridInference-cloud-agent/issues/464)

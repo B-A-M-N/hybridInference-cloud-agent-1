@@ -1638,87 +1638,6 @@ jobs:
           docker --host=unix:///var/run/docker.sock pull "${AGENT_COMMAND_TEST_IMAGE}"
           uv run --frozen pytest -q -m external tests/external/test_retained_command_limits.py
 
-  # -------------------------------------------------------------- pr caches
-  # What pull requests restore. A pull request runs on a fresh hosted VM, and
-  # the caches trusted runs leave behind cannot serve it: those are arm64, or
-  # sit under a runner's own temp path, and the cache service keys an entry by
-  # both. Every pull request therefore saved its own copy of the same npm and
-  # uv caches — 7.4GB of the repository's 10GB, evicting whatever else was
-  # there. This job fills them once per dev push, on the VM image and paths a
-  # pull request uses, under the dev scope every pull request into dev may
-  # restore; a pull request that finds an exact entry saves nothing.
-  #
-  # It also exports the sandbox layers that `artifacts` and `mcp` import on
-  # hosted runners. Exported from here rather than from the persistent pool,
-  # whose upload took more than 15 minutes under load (see `artifacts`). Built
-  # with SOURCE_COMMIT like the cells, though it no longer reaches a layer.
-  #
-  # The one trusted-event job on a hosted VM, and optional by construction:
-  # nothing needs it, CI Gate does not wait for it, and its failure leaves the
-  # run green, so CI and publication never depend on a hosted VM being
-  # available. It holds no secret, and nothing it writes reaches a release —
-  # publication builds on the persistent pools from their own builders.
-  pr-caches:
-    name: Warm pull-request caches
-    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
-    runs-on: [ubuntu-24.04]
-    continue-on-error: true
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      # The paths the pull-request jobs set: they are part of each entry's key.
-      - name: Use the pull-request cache paths
-        run: |
-          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache" >> "${GITHUB_ENV}"
-          echo "npm_config_cache=${RUNNER_TEMP}/npm-cache" >> "${GITHUB_ENV}"
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
-        with:
-          version: ${{ env.UV_VERSION }}
-          enable-cache: true
-          prune-cache: false
-
-      - name: Fill the uv cache
-        run: |
-          uv python install ${{ env.PYTHON_VERSION }}
-          uv sync
-
-      - name: Set up Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-          cache-dependency-path: apps/frontend/package-lock.json
-
-      - name: Fill the npm cache
-        working-directory: ./apps/frontend
-        run: npm ci --ignore-scripts
-
-      - name: Make a builder
-        run: |
-          docker buildx create --name pr-caches --driver docker-container --use >/dev/null
-          docker buildx inspect pr-caches --bootstrap >/dev/null
-
-      # `cacheonly`: the layers are the product, and nothing loads or pushes an
-      # image. `mode=max` keeps the intermediate stages, so a cell skips the
-      # Kilo and guest-observer builds as well as the final stage.
-      - name: Export the sandbox layers pull requests import
-        uses: docker/build-push-action@v6
-        with:
-          builder: pr-caches
-          context: .
-          file: deploy/sandbox/Dockerfile.agent-sandbox
-          push: false
-          outputs: type=cacheonly
-          cache-from: type=gha,scope=sandbox-amd64
-          cache-to: type=gha,scope=sandbox-amd64,mode=max
-          build-args: |
-            SOURCE_COMMIT=${{ github.sha }}
-
   # -------------------------------------------------------------------- gate
   kata:
     name: Candidate on real Kata
@@ -1767,8 +1686,6 @@ jobs:
     # dev and a consumable release.
     if: always()
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted","Linux","ci-general"]') }}
-    # Not `pr-caches`: it is optional, and a gate that waited for it would
-    # make trusted CI depend on a hosted VM after all.
     needs:
       - changes
       - lint
