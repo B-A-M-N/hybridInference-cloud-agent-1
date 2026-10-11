@@ -827,6 +827,56 @@ async def test_an_oversized_body_is_refused_before_it_is_decided(monkeypatch, st
     assert upstream.requests == []
 
 
+@pytest.mark.parametrize("policy", ["allow", "confirm"])
+async def test_a_body_that_outgrows_the_bound_when_encoded_is_refused(
+    monkeypatch, store, upstream, policy
+):
+    """A small UTF-8 body cannot become an oversized forwarded or held call."""
+    store.bindings = [_binding(rules={"get_issue": {"policy": policy, "fingerprint": ""}})]
+    document = _rpc("tools/call", name="get_issue", arguments={"pad": "é" * 50})
+    raw = json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode()
+    limit = len(raw) + 1
+    assert len(raw) < limit < len(canonical_request(document))
+    monkeypatch.setattr(agent_mcp_router, "MAX_RELAY_BODY_BYTES", limit)
+
+    async with _relay(monkeypatch, store, upstream) as api:
+        response = await api.post(
+            f"/v1/agent/mcp/{_ALIAS}",
+            content=raw,
+            headers={**_auth(), "content-type": "application/json"},
+        )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == -32600
+    assert response.json()["id"] is None
+    assert (
+        response.json()["error"]["message"] == f"An MCP request body is limited to {limit} bytes."
+    )
+    assert upstream.requests == []
+    assert store.created_invocations == []
+    assert store.looked_up == []
+
+
+async def test_a_canonical_body_exactly_at_the_bound_is_forwarded(monkeypatch, store, upstream):
+    """The canonical byte bound includes its ceiling, even when escaping grows it."""
+    document = _rpc("tools/call", name="get_issue", arguments={"pad": "é" * 50})
+    raw = json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode()
+    canonical = canonical_request(document)
+    assert len(raw) < len(canonical)
+    monkeypatch.setattr(agent_mcp_router, "MAX_RELAY_BODY_BYTES", len(canonical))
+
+    async with _relay(monkeypatch, store, upstream) as api:
+        response = await api.post(
+            f"/v1/agent/mcp/{_ALIAS}",
+            content=raw,
+            headers={**_auth(), "content-type": "application/json"},
+        )
+
+    assert response.status_code == 200
+    assert upstream.requests[0].content == canonical
+    assert store.created_invocations == []
+
+
 async def test_a_batch_over_the_cap_is_never_forwarded(client, upstream, store):
     """An oversized batch is refused whole rather than decided message by message."""
     batch = [

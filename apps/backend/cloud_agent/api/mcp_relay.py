@@ -165,11 +165,11 @@ _SSE_HEADERS = {
     "X-Accel-Buffering": "no",
 }
 
-#: The largest request body either POST route reads: the bound every JSON-RPC
-#: frame in this service already has. It is enforced while the bytes arrive,
-#: not after: the relay is one process every tenant's sandboxes share, and a
-#: body read whole before it is measured has already cost what the bound was
-#: there to save.
+#: The largest request body either POST route reads or the per-connection route
+#: forwards: the bound every JSON-RPC frame in this service already has. It is
+#: enforced while bytes arrive, and again after canonical encoding, whose ASCII
+#: escapes can grow a UTF-8 body. The relay is one process every tenant shares;
+#: a body read whole before measurement has already cost what the bound saves.
 MAX_RELAY_BODY_BYTES = MAX_MESSAGE_BYTES
 
 #: The most messages one JSON-RPC batch may carry. Current MCP revisions do not
@@ -272,6 +272,12 @@ class _BodyRefused(Exception):
         )
 
 
+def _require_body_size(size: int) -> None:
+    """Apply the same bound to the received and canonical request encodings."""
+    if size > MAX_RELAY_BODY_BYTES:
+        raise _BodyRefused(413, f"An MCP request body is limited to {MAX_RELAY_BODY_BYTES} bytes.")
+
+
 async def _read_body(request: Request) -> bytes:
     """Read a POST body under :data:`MAX_RELAY_BODY_BYTES`, or refuse it.
 
@@ -279,16 +285,14 @@ async def _read_body(request: Request) -> bytes:
     bound is applied again to the bytes as they stream in, because
     ``Content-Length`` is only the sender's claim and a chunked body makes none.
     """
-    too_large = f"An MCP request body is limited to {MAX_RELAY_BODY_BYTES} bytes."
     declared = request.headers.get("content-length", "")
-    if declared.isdigit() and int(declared) > MAX_RELAY_BODY_BYTES:
-        raise _BodyRefused(413, too_large)
+    if declared.isdigit():
+        _require_body_size(int(declared))
     chunks: list[bytes] = []
     size = 0
     async for chunk in request.stream():
         size += len(chunk)
-        if size > MAX_RELAY_BODY_BYTES:
-            raise _BodyRefused(413, too_large)
+        _require_body_size(size)
         chunks.append(chunk)
     return b"".join(chunks)
 
@@ -2020,6 +2024,10 @@ async def mcp_post(
     assert store is not None
     try:
         document = _bounded_batch(parse_request(await _read_body(request)))
+        body = canonical_request(document)
+        # ASCII escapes can expand a body that fit as UTF-8. Refuse that before
+        # deciding any call, so it cannot be held or forwarded over the bound.
+        _require_body_size(len(body))
     except _BodyRefused as exc:
         return exc.response
     except UnreadableRequest as exc:
@@ -2028,7 +2036,6 @@ async def mcp_post(
         return JSONResponse(exc.reply(), status_code=400)
     # From here on the request *is* the parsed document: the decision, the
     # allowlist and the upstream all read this one encoding of it.
-    body = canonical_request(document)
 
     held = await _capability_decision(
         authorized,
