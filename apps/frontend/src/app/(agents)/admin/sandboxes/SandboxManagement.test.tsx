@@ -123,6 +123,14 @@ describe('sandbox member visibility and control', () => {
     expect(screen.getByRole('button', { name: 'Stop idle sandbox' })).toBeEnabled();
   });
 
+  it('offers stopping when a fresh host heartbeat backs a missing terminal count stamp', async () => {
+    vi.mocked(getAdminSandbox).mockResolvedValue(
+      detail({ terminal_count: 0, terminal_count_observed_at: null }),
+    );
+    mount();
+    expect(await screen.findByRole('button', { name: 'Stop idle sandbox' })).toBeEnabled();
+  });
+
   it.each([
     [{ active_attempt_count: 1 }, 'Wait for all active turns'],
     [{ active_operation_count: 1 }, 'Wait for active workspace operations'],
@@ -131,6 +139,10 @@ describe('sandbox member visibility and control', () => {
     [{ snapshot_state: 'importing' }, 'Wait for the workspace snapshot'],
     [{ terminal_count: 1 }, 'Close all open terminals'],
     [{ terminal_count: null }, 'Wait for the host to report'],
+    [
+      { terminal_count: null, host_last_heartbeat_at: '2026-10-10T09:00:00Z' },
+      'not reporting open-terminal',
+    ],
     [{ terminal_count_observed_at: '2026-10-10T09:57:00Z' }, 'Wait for a fresh terminal report'],
     [{ generation: undefined }, 'container identity is unavailable'],
   ] as const)(

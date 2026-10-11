@@ -71,7 +71,15 @@ export function SandboxManagement({
   const serverNow = detail
     ? Date.parse(detail.observed_at) + Math.max(0, nowMs - observedAtMs)
     : NaN;
-  const terminalObserved = Date.parse(sandbox?.terminal_count_observed_at ?? '');
+  const hostHeartbeat = Date.parse(sandbox?.host_last_heartbeat_at ?? '');
+  const hostFresh = Number.isFinite(hostHeartbeat);
+  const hostStale =
+    hostFresh && Number.isFinite(serverNow) && serverNow - hostHeartbeat > TERMINAL_FRESHNESS_MS;
+  // A fresh host heartbeat stands in for terminal freshness when the host has
+  // not separately stamped its own count, matching the sibling detail view.
+  const terminalObserved = Date.parse(
+    sandbox?.terminal_count_observed_at ?? sandbox?.host_last_heartbeat_at ?? '',
+  );
   const blocked = !sandbox
     ? 'Load the current sandbox details before stopping it.'
     : sandbox.state !== 'running'
@@ -82,11 +90,14 @@ export function SandboxManagement({
           ? 'Wait for active workspace operations to finish.'
           : ['pending', 'snapshotting', 'importing'].includes(sandbox.snapshot_state ?? '')
             ? 'Wait for the workspace snapshot to finish.'
-            : sandbox.terminal_count == null || !Number.isFinite(terminalObserved)
-              ? 'Wait for the host to report its open terminals.'
+            : sandbox.terminal_count == null
+              ? hostFresh && !hostStale
+                ? 'Wait for the host to report its open terminals.'
+                : 'The host is not reporting open-terminal activity. Refresh to recheck the host.'
               : sandbox.terminal_count > 0
                 ? 'Close all open terminals before stopping the sandbox.'
                 : !Number.isFinite(serverNow) ||
+                    !Number.isFinite(terminalObserved) ||
                     serverNow - terminalObserved > TERMINAL_FRESHNESS_MS
                   ? 'Wait for a fresh terminal report from the host.'
                   : sandbox.generation == null || !sandbox.container_id
