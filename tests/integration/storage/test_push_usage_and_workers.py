@@ -546,7 +546,7 @@ async def test_a_failed_base_import_waits_out_its_retry(store, pool):
     commit_sha = "b" * 40
     assert await store.snapshot.record_snapshot_publish(
         snapshot_id=capture["snapshot_id"],
-        expected_publish_retry_count=publication["publish_retry_count"],
+        expected_publish_attempt_count=publication["publish_attempt_count"],
         pr_url="https://example.test/pull/1",
         commit_sha=commit_sha,
     )

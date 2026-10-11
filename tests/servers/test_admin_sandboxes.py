@@ -170,6 +170,7 @@ def terminal_probe(setup, monkeypatch):
     commands = SimpleNamespace(
         record_terminal_observation=AsyncMock(return_value=True),
         request_admin_stop=AsyncMock(return_value="accepted"),
+        request_admin_delete=AsyncMock(return_value="accepted"),
     )
     host_pool = SimpleNamespace(get_host=AsyncMock(return_value={"host": "runner-one"}))
     broker = SimpleNamespace(
@@ -182,11 +183,30 @@ def terminal_probe(setup, monkeypatch):
                     "generation": 1,
                     "running": True,
                     "shared_live": True,
+                    "docker_status": "running",
                     "terminal_count": 0,
                     "group_busy": False,
+                    "operation_count": 0,
+                    "snapshotting": False,
                 }
             ]
-        )
+        ),
+        shared_chat_sandbox_status=AsyncMock(
+            return_value={
+                "thread_id": "athr_other",
+                "origin_thread_id": "athr_other",
+                "sandbox_id": "asbx_other",
+                "container_id": "container-one",
+                "generation": 1,
+                "running": True,
+                "docker_status": "running",
+                "busy": False,
+                "group_busy": False,
+                "terminal_count": 0,
+                "operation_count": 0,
+                "snapshotting": False,
+            }
+        ),
     )
     broker_factory = Mock(return_value=broker)
     monkeypatch.setattr(admin_sandboxes, "broker_for_host", broker_factory)
@@ -989,6 +1009,7 @@ async def test_reviewed_delete_queues_authenticated_atomic_request(setup, result
         last_activity_at=END,
         actor_id="admin-token",
         admin_ip="127.0.0.1",
+        broker_confirmed_stopped=False,
     )
     if result == "accepted":
         assert response.headers["cache-control"] == "no-store"
@@ -997,7 +1018,181 @@ async def test_reviewed_delete_queues_authenticated_atomic_request(setup, result
         queries.detail.assert_not_awaited()
 
 
-async def test_delete_without_archive_configuration_does_not_fence_sandbox(setup):
+async def test_force_delete_repairs_only_an_exact_host_confirmed_stopped_container(
+    terminal_probe,
+):
+    app, queries, commands, host_pool, broker, broker_factory = terminal_probe
+    broker.shared_chat_sandbox_status.return_value.update(
+        {
+            "running": False,
+            "docker_status": "stopped",
+            "group_busy": False,
+            "terminal_count": 0,
+            "operation_count": 0,
+            "snapshotting": False,
+        }
+    )
+    queries.detail.side_effect = [
+        sandbox_detail(),
+        sandbox_detail(state="stopped", deletion_state="pending"),
+    ]
+    app.dependency_overrides[admin_sandboxes.admin_sandbox_deletion_available] = lambda: True
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"{PREFIX}/asbx_other/delete?force=true",
+            headers=ADMIN,
+            json={
+                "generation": 1,
+                "container_id": "container-one",
+                "last_activity_at": END.isoformat(),
+            },
+        )
+
+    assert response.status_code == 202
+    assert response.json()["sandbox"]["state"] == "stopped"
+    host_pool.get_host.assert_awaited_once_with(host="runner-one")
+    broker_factory.assert_called_once_with(host_pool.get_host.return_value)
+    broker.shared_chat_sandbox_status.assert_awaited_once_with("athr_other", timeout=5)
+    broker.list_sandboxes.assert_not_awaited()
+    commands.request_admin_delete.assert_awaited_once_with(
+        sandbox_id="asbx_other",
+        generation=1,
+        container_id="container-one",
+        last_activity_at=END,
+        actor_id="admin-token",
+        admin_ip="127.0.0.1",
+        broker_confirmed_stopped=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"sandbox_id": "asbx_replaced"},
+        {"thread_id": "athr_replaced"},
+        {"container_id": "replacement"},
+        {"generation": 2},
+        {"origin_thread_id": "athr_replaced"},
+        {"running": True, "docker_status": "running"},
+        {"docker_status": "created"},
+        {"busy": True},
+        {"group_busy": True},
+        {"terminal_count": 1},
+        {"terminal_count": True},
+        {"operation_count": 1},
+        {"operation_count": None},
+        {"snapshotting": True},
+    ],
+)
+async def test_force_delete_rejects_changed_running_or_non_quiescent_host_proof(
+    terminal_probe, changes
+):
+    app, queries, commands, _, broker, _ = terminal_probe
+    broker.shared_chat_sandbox_status.return_value.update(
+        {
+            "running": False,
+            "docker_status": "stopped",
+            "group_busy": False,
+            "terminal_count": 0,
+            "operation_count": 0,
+            "snapshotting": False,
+        }
+        | changes
+    )
+    queries.detail.return_value = sandbox_detail()
+    app.dependency_overrides[admin_sandboxes.admin_sandbox_deletion_available] = lambda: True
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"{PREFIX}/asbx_other/delete?force=true",
+            headers=ADMIN,
+            json={
+                "generation": 1,
+                "container_id": "container-one",
+                "last_activity_at": END.isoformat(),
+            },
+        )
+
+    assert response.status_code == 409
+    commands.request_admin_delete.assert_not_awaited()
+
+
+@pytest.mark.parametrize("failure", ["missing_host", "refused_url", "broker_error", "missing_row"])
+async def test_force_delete_fails_closed_when_host_proof_is_unavailable(terminal_probe, failure):
+    app, queries, commands, host_pool, broker, broker_factory = terminal_probe
+    queries.detail.return_value = sandbox_detail()
+    if failure == "missing_host":
+        host_pool.get_host.return_value = None
+    elif failure == "refused_url":
+        broker_factory.side_effect = BrokerUrlRefused("not allowed")
+    elif failure == "broker_error":
+        broker.shared_chat_sandbox_status.side_effect = WorkspaceBrokerError(
+            503, "PRIVATE diagnostic"
+        )
+    else:
+        broker.shared_chat_sandbox_status.side_effect = WorkspaceBrokerError(410, "PRIVATE lost")
+    app.dependency_overrides[admin_sandboxes.admin_sandbox_deletion_available] = lambda: True
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"{PREFIX}/asbx_other/delete?force=true",
+            headers=ADMIN,
+            json={
+                "generation": 1,
+                "container_id": "container-one",
+                "last_activity_at": END.isoformat(),
+            },
+        )
+
+    assert response.status_code == (503 if failure != "missing_row" else 409)
+    assert "PRIVATE" not in response.text
+    commands.request_admin_delete.assert_not_awaited()
+
+
+async def test_force_delete_rejects_a_stale_review_before_contacting_host(terminal_probe):
+    app, queries, commands, host_pool, broker, _ = terminal_probe
+    queries.detail.return_value = sandbox_detail()
+    app.dependency_overrides[admin_sandboxes.admin_sandbox_deletion_available] = lambda: True
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"{PREFIX}/asbx_other/delete?force=true",
+            headers=ADMIN,
+            json={
+                "generation": 2,
+                "container_id": "container-one",
+                "last_activity_at": END.isoformat(),
+            },
+        )
+
+    assert response.status_code == 409
+    host_pool.get_host.assert_not_awaited()
+    broker.shared_chat_sandbox_status.assert_not_awaited()
+    commands.request_admin_delete.assert_not_awaited()
+
+
+async def test_delete_body_cannot_claim_host_confirmation(setup):
+    app, queries, _ = setup
+    commands = SimpleNamespace(request_admin_delete=AsyncMock())
+    app.dependency_overrides[get_storage] = lambda: SimpleNamespace(
+        sandbox=commands, admin_sandboxes=queries
+    )
+    app.dependency_overrides[admin_sandboxes.admin_sandbox_deletion_available] = lambda: True
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"{PREFIX}/asbx_other/delete",
+            headers=ADMIN,
+            json={
+                "generation": 1,
+                "container_id": "container-one",
+                "last_activity_at": END.isoformat(),
+                "force": True,
+            },
+        )
+
+    assert response.status_code == 422
+    commands.request_admin_delete.assert_not_awaited()
+
+
+@pytest.mark.parametrize("force", [False, True])
+async def test_delete_without_archive_configuration_does_not_fence_sandbox(setup, force):
     app, queries, _ = setup
     commands = SimpleNamespace(request_admin_delete=AsyncMock())
     app.dependency_overrides[get_storage] = lambda: SimpleNamespace(
@@ -1006,7 +1201,7 @@ async def test_delete_without_archive_configuration_does_not_fence_sandbox(setup
     app.dependency_overrides[admin_sandboxes.admin_sandbox_deletion_available] = lambda: False
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post(
-            f"{PREFIX}/asbx_other/delete",
+            f"{PREFIX}/asbx_other/delete{'?force=true' if force else ''}",
             headers=ADMIN,
             json={
                 "generation": 1,

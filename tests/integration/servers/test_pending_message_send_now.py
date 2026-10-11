@@ -76,8 +76,8 @@ class _ResponseLossBroker:
         return {"accepted": True, "reason": None}
 
 
-def _route_input_to(monkeypatch, broker: _Broker | None) -> None:
-    async def resolve(_host_pool: Any, _attempt_id: int) -> _Broker | None:
+def _route_input_to(monkeypatch, broker: Any | None) -> None:
+    async def resolve(_host_pool: Any, _attempt_id: int) -> Any | None:
         return broker
 
     monkeypatch.setattr(send_now_delivery, "broker_for_attempt", resolve)
@@ -165,6 +165,14 @@ async def test_the_turn_takes_it_before_its_next_tool_call_and_it_is_not_sent_ag
     assert broker.calls == [
         (thread_id, f"attempt:{running['attempt_id']}", waiting["id"], "also check the docs")
     ]
+    async with api.pool.acquire() as conn:
+        marker, handed_off = await conn.fetchrow(
+            "SELECT send_now_requested_at, send_now_handed_off "
+            "FROM agent_pending_messages WHERE id = $1",
+            waiting["id"],
+        )
+    assert marker is not None
+    assert handed_off is True
     assert [row["state"] for row in (await api.queue(thread_id))["messages"]] == ["sending"]
     assert await _mid_turn_rows(api, job["id"]) == (
         [],
@@ -331,11 +339,13 @@ async def test_restart_recovers_a_handoff_committed_before_the_target_was_claime
         (thread_id, f"attempt:{running['attempt_id']}", waiting["id"], "and mind the tests")
     ]
     async with api.pool.acquire() as conn:
-        request_marker = await conn.fetchval(
-            "SELECT send_now_requested_at FROM agent_pending_messages WHERE id = $1",
+        request_marker, handed_off = await conn.fetchrow(
+            "SELECT send_now_requested_at, send_now_handed_off "
+            "FROM agent_pending_messages WHERE id = $1",
             waiting["id"],
         )
-    assert request_marker is None
+    assert request_marker is not None
+    assert handed_off is True
     assert await send_now_delivery.recover_handoffs(api.store) == {
         "claimed": 0,
         "accepted": 0,
@@ -416,7 +426,7 @@ async def test_response_loss_replays_the_host_receipt_without_a_second_native_st
 ):
     await _steerable(api)
     broker = _ResponseLossBroker()
-    _route_input_to(monkeypatch, broker)  # type: ignore[arg-type]
+    _route_input_to(monkeypatch, broker)
     _job, thread_id, _running, waiting = await _waiting_behind_a_running_turn(api)
 
     sent = await _send_now(api, thread_id, waiting)
@@ -439,11 +449,13 @@ async def test_response_loss_replays_the_host_receipt_without_a_second_native_st
     assert broker.calls == [waiting["id"], waiting["id"]]
     assert len(broker.native_steers) == 1
     async with api.pool.acquire() as conn:
-        request_marker = await conn.fetchval(
-            "SELECT send_now_requested_at FROM agent_pending_messages WHERE id = $1",
+        request_marker, handed_off = await conn.fetchrow(
+            "SELECT send_now_requested_at, send_now_handed_off "
+            "FROM agent_pending_messages WHERE id = $1",
             waiting["id"],
         )
-    assert request_marker is None
+    assert request_marker is not None
+    assert handed_off is True
 
 
 async def test_recovery_requeues_a_target_that_never_acquired_a_host_with_status(api):
@@ -592,11 +604,13 @@ async def test_send_now_authority_rechecks_expiry_after_a_plain_attempt_row_lock
     assert current["state"] == "sending"
     assert current["revision"] == revision
     async with api.pool.acquire() as conn:
-        request_marker = await conn.fetchval(
-            "SELECT send_now_requested_at FROM agent_pending_messages WHERE id = $1",
+        request_marker, handed_off = await conn.fetchrow(
+            "SELECT send_now_requested_at, send_now_handed_off "
+            "FROM agent_pending_messages WHERE id = $1",
             waiting["id"],
         )
     assert request_marker is not None
+    assert handed_off is False
 
 
 async def test_attempt_expiry_during_broker_io_leaves_recovery_the_receipt(api, monkeypatch):

@@ -31,6 +31,10 @@ HOST_COLUMN_NAMES = (
     "runner_version",
     "broker_url",
     "last_heartbeat_at",
+    "drain_fence_token",
+    "drain_fence_status_before",
+    "drain_fence_active",
+    "drain_fence_epoch",
     "sandbox_runtime",
     "sandbox_image_digest",
     "runtime_versions",
@@ -124,6 +128,9 @@ async def revoke_host_credentials(conn: Any, hosts: list[str]) -> None:
     credential transition shared by Host Remove and committed resource release.
     """
     await conn.execute(
-        "UPDATE agent_runner_hosts SET status='disabled',credential_hash=NULL WHERE host=ANY($1::text[])",
+        "UPDATE agent_runner_hosts "
+        "SET status='disabled',credential_hash=NULL,drain_fence_token=NULL,"
+        "drain_fence_status_before=NULL,drain_fence_active=FALSE "
+        "WHERE host=ANY($1::text[])",
         hosts,
     )

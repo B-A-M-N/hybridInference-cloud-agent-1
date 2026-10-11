@@ -107,9 +107,9 @@ def test_the_chain_is_connected_with_one_intentional_merge() -> None:
 
     merges = {revision: parents for revision, parents in pairs.items() if len(parents) > 1}
     assert merges == {
-        "0049_admin_sandbox_trajectory": (
+        "0056_admin_sandbox_trajectory": (
             "0046_admin_sandbox_trajectory",
-            "0048_sandbox_plugins",
+            "0055_send_now_handed_off",
         )
     }
     children: dict[str, list[str]] = {}

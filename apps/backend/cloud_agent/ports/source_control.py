@@ -53,7 +53,11 @@ class GitHubAccountSession(Protocol):
         refresh_token_ciphertext: str | None,
         refresh_expires_at: Any,
     ) -> bool:
-        """Write a refreshed token pair while the live lease is still ours."""
+        """Write only if this generation's lease is still live, then release it.
+
+        Expiry makes the claim eligible for takeover and invalidates even a
+        same-generation result that returns late.
+        """
         ...
 
     async def clear_github_tokens(self, *, user_id: str, access_token_ciphertext: str) -> bool:
@@ -112,7 +116,10 @@ class GitLabAccountSession(Protocol):
         refresh_token_ciphertext: str,
         expires_at: Any,
     ) -> bool:
-        """Rotate tokens while the live claimed generation is still ours."""
+        """Rotate only while this claimed generation's lease is still live.
+
+        Expiry invalidates a late result even before another caller takes over.
+        """
         ...
 
     async def delete_gitlab_connection(
@@ -186,7 +193,7 @@ class SourceControlRepository(Protocol):
         refresh_token_ciphertext: str | None,
         refresh_expires_at: Any,
     ) -> bool:
-        """Write a refreshed token pair while the lease is still ours, and release it."""
+        """Write only if this generation's lease is still live, then release it."""
         ...
 
     async def clear_github_tokens(self, *, user_id: str, access_token_ciphertext: str) -> bool:
@@ -259,7 +266,7 @@ class SourceControlRepository(Protocol):
         refresh_token_ciphertext: str,
         expires_at: Any,
     ) -> bool:
-        """Rotate tokens only while this owner still holds the claimed generation."""
+        """Rotate only while this owner holds the generation and its live lease."""
         ...
 
     async def delete_gitlab_connection(

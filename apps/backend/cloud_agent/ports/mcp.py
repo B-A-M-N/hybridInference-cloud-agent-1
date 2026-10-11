@@ -5,11 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
-
-class McpConnectionCreateConflict(Exception):
-    """A connection draft became invalid before its atomic insert."""
+    from collections.abc import Mapping, Sequence
 
 
 class McpConnectionRepository(Protocol):
@@ -44,6 +40,8 @@ class McpConnectionRepository(Protocol):
         request_timeout_s: float | None = None,
         reuse_pending: bool = False,
         access_token_ciphertext: str | None = None,
+        auth_config_patch: Mapping[str, Any] | None = None,
+        sealed_launch_spec: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Insert a connection and return it, at revision one.
 
@@ -56,22 +54,20 @@ class McpConnectionRepository(Protocol):
         instead of inserting another row. Existing credentials, settings, and
         approvals are never changed; authenticated accounts remain independent.
 
-        ``access_token_ciphertext`` is inserted with the row. Callers must
-        encrypt and validate it before entering this persistence operation, so
-        a failed request cannot leave a visible connection without its
-        credential.
+        ``access_token_ciphertext`` and ``sealed_launch_spec`` are written in
+        the same transaction as the insert. A rejected write raises
+        ``McpCredentialWriteRejected`` and leaves no row.
         """
         ...
 
     async def create_mcp_connections(
-        self, *, connections: list[dict[str, Any]]
+        self, *, connections: Sequence[Mapping[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Create every supplied connection in one transaction.
+        """Insert every draft, with its credentials, in one transaction.
 
-        This is the save boundary for configuration imports: either every row,
-        including its already-encrypted credential material, becomes visible or
-        none does. The dictionaries accept the same fields as
-        :meth:`create_mcp_connection`.
+        One rejected credential write or a later insert failure rolls the whole
+        batch back. Callers encrypt before this call, so a missing key never
+        reaches it.
         """
         ...
 
@@ -332,12 +328,13 @@ class McpConnectionRepository(Protocol):
         registration_endpoint: str | None,
         expires_at: Any,
     ) -> int | None:
-        """Record one started authorization.
+        """Record one started authorization and return its generation.
 
-        The configuration, authorization, and OAuth versions are write fences.
-        A matching connection allocates and returns the next OAuth generation
-        in the same transaction as the flow row; a stale start returns ``None``
-        without deleting the newer pending flow.
+        The new generation is allocated in the same statement that fences the
+        connection on the config revision, authorization epoch, and OAuth
+        generation the caller read. The flow row stores that returned value.
+        A stale start matches nothing: it does not move the generation and it
+        does not delete a newer pending flow. ``None`` means the fence missed.
         """
         ...
 
@@ -568,7 +565,7 @@ class McpConnectionRepository(Protocol):
         ...
 
     async def set_mcp_connector_status(self, *, connector_id: int, status: str) -> bool:
-        """Record a non-terminal heartbeat status; revocation uses the atomic path."""
+        """Record a heartbeat or a status change for one connector."""
         ...
 
     async def update_mcp_connector(
@@ -599,19 +596,23 @@ class McpConnectionRepository(Protocol):
         change of target as editing the command. Both revisions move, which
         invalidates every session binding approved against the previous answer,
         and the connector's authorized set is written in the same transaction so
-        the two cannot disagree about what it may serve.
+        the two cannot disagree about what it may serve. Every previous
+        authorization row for the connection is removed in that transaction
+        before the new pair is inserted.
         """
         ...
 
     async def unbind_mcp_connection_connector(
         self, *, connection_id: int, user_id: str, connector_id: int
     ) -> dict[str, Any] | None:
-        """Stop routing one connection through its connector.
+        """Stop routing one connection through the connector the caller named.
 
-        The same version movement as binding, for the same reason: a connection
-        that has moved back to "nowhere to run" is not the one a session was
-        approved against. ``connector_id`` is the caller's write fence: a stale
-        request for the connector the connection moved away from changes nothing.
+        ``connector_id`` is matched in the same statement that clears the
+        route. A request that names connector A must not detach a connection
+        currently bound to B, and only that pair's authorization row is removed.
+        The same version movement as binding applies when the pair matches: a
+        connection that has moved back to "nowhere to run" is not the one a
+        session was approved against.
         """
         ...
 

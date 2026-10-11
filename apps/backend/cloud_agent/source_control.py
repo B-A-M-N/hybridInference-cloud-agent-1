@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import math
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -28,9 +29,15 @@ if TYPE_CHECKING:
 GITLAB_ORIGIN = "https://gitlab.com"
 OAUTH_STATE_TTL = timedelta(minutes=10)
 _TOKEN_REFRESH_MARGIN = timedelta(minutes=5)
-_GITLAB_REFRESH_LEASE_SECONDS = 30
+_REFRESH_LEASE_DB_MARGIN_SECONDS = 30
 _GITLAB_REFRESH_WAIT_ATTEMPTS = 10
 _GITLAB_REFRESH_WAIT_INTERVAL_S = 0.3
+
+
+def _refresh_lease_seconds(request_timeout_s: float) -> int:
+    """Keep a refresh lease live through provider I/O and its fenced write."""
+    return max(1, math.ceil(request_timeout_s + _REFRESH_LEASE_DB_MARGIN_SECONDS))
+
 
 #: Wraps stored provider credentials. Its own secret, not the gateway's — the
 #: source derived this key from ``API_KEY_SECRET``, which meant the gateway
@@ -241,14 +248,24 @@ class GitLabOAuthClient:
         )
         return f"{GITLAB_ORIGIN}/oauth/authorize?{urlencode({'client_id': self.config.client_id, 'redirect_uri': self.config.redirect_uri, 'response_type': 'code', 'state': state, 'scope': 'read_user read_api', 'code_challenge': challenge.decode('ascii'), 'code_challenge_method': 'S256'})}"
 
-    def _client(self) -> httpx.AsyncClient:
+    def _client(self, *, timeout_s: float | None = None) -> httpx.AsyncClient:
         return httpx.AsyncClient(
-            timeout=self._timeout_override
-            if self._timeout_override is not None
-            else number_setting("gitlab_request_timeout_s", 20.0),
+            timeout=self.request_timeout_s if timeout_s is None else timeout_s,
             transport=self._transport,
             follow_redirects=False,
         )
+
+    @property
+    def request_timeout_s(self) -> float:
+        """Effective deadline used for the next provider request."""
+        if self._timeout_override is not None:
+            return self._timeout_override
+        return number_setting("gitlab_request_timeout_s", 20.0)
+
+    @property
+    def refresh_lease_seconds(self) -> int:
+        """Lease long enough for provider I/O plus the fenced database write."""
+        return _refresh_lease_seconds(self.request_timeout_s)
 
     @staticmethod
     def _require_success(response: httpx.Response, operation: str) -> dict[str, Any]:
@@ -286,9 +303,11 @@ class GitLabOAuthClient:
             raise SourceControlError("GitLab code exchange returned no usable token")
         return body
 
-    async def _refresh(self, refresh_token: str) -> dict[str, Any]:
+    async def _refresh(
+        self, refresh_token: str, *, timeout_s: float | None = None
+    ) -> dict[str, Any]:
         try:
-            async with self._client() as client:
+            async with self._client(timeout_s=timeout_s) as client:
                 response = await client.post(
                     f"{GITLAB_ORIGIN}/oauth/token",
                     data={
@@ -423,10 +442,14 @@ class GitLabOAuthClient:
         user_id = str(connection["user_id"])
         renewed = None
         async with store.serialize_gitlab_account(user_id=user_id) as account_store:
+            # Pin the request timeout to the value that sized this claim. A
+            # settings update between these awaits must affect the next
+            # request, not lengthen this single-use refresh past its lease.
+            refresh_timeout_s = self.request_timeout_s
             claim = await account_store.claim_gitlab_token_refresh(
                 connection_id=connection_id,
                 user_id=user_id,
-                lease_seconds=_GITLAB_REFRESH_LEASE_SECONDS,
+                lease_seconds=_refresh_lease_seconds(refresh_timeout_s),
                 margin_seconds=int(_TOKEN_REFRESH_MARGIN.total_seconds()),
             )
             if claim is not None:
@@ -434,7 +457,7 @@ class GitLabOAuthClient:
                 refresh_token = self.cipher.decrypt(claim["refresh_token_ciphertext"])
                 # The claim committed before provider I/O. A transient failure
                 # leaves its recoverable lease and releases this outer lock.
-                refreshed = await self._refresh(refresh_token)
+                refreshed = await self._refresh(refresh_token, timeout_s=refresh_timeout_s)
                 if await account_store.update_gitlab_tokens(
                     connection_id=connection_id,
                     user_id=user_id,

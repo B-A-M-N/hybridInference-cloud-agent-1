@@ -36,9 +36,9 @@ from cloud_agent.schemas import (
     HostHeartbeatResponse,
     HostRegisterRequest,
     HostRegisterResponse,
+    HostSandboxArchiveSettings,
     ResidencyBeat,
     RetainedSandboxStop,
-    SandboxArchiveSettingsResponse,
 )
 from cloud_agent.tokens import InvalidHostToken, mint_host_token, parse_host_token
 from cloud_agent_shared.host_settings import merge_admin_values, reported_values
@@ -212,7 +212,22 @@ async def register_host(
             labels=dict(body.labels),
         )
     except ValueError as exc:
-        if str(exc) != "resource_retiring":
+        error_type = str(exc)
+        if error_type == "host_drain_fenced":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": {
+                        "type": "host_drain_fenced",
+                        "message": (
+                            "This host is held by an automated deployment drain. "
+                            "The enrollment token was consumed; release the drain "
+                            "and issue a new token before retrying."
+                        ),
+                    }
+                },
+            ) from exc
+        if error_type != "resource_retiring":
             raise
         raise HTTPException(
             status_code=409,
@@ -399,7 +414,7 @@ async def heartbeat_host(
             await job_store.host_pool.host_settings(),
             updated.get("settings_desired"),
         ),
-        sandbox_archive_settings=SandboxArchiveSettingsResponse.model_validate(
+        sandbox_archive_settings=HostSandboxArchiveSettings.model_validate(
             await job_store.host_pool.sandbox_archive_settings()
         ),
         residencies_lost=lost,

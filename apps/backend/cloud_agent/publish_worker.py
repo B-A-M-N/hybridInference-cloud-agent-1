@@ -25,6 +25,11 @@ Order of operations is load-bearing:
 A rejected patch marks the snapshot/group dirty without rewriting successful
 Agent turns. Gate violations are human-review situations, and a retry loop
 would either spam the repository or bury the rejection.
+
+A transient credential, git, or PR failure does not. The branch name and the
+PR lookup are idempotent, so the snapshot returns to ``captured`` until its
+``retry_at``. Five such defers is the budget; the next one fails the snapshot
+so an outage cannot block the lineage forever.
 """
 
 from __future__ import annotations
@@ -40,7 +45,6 @@ from typing import TYPE_CHECKING, Any, Protocol
 import httpx
 
 from cloud_agent.entitlement import RepoAccessUnavailable, RepoNotAllowed, require_entitled_repo
-from cloud_agent.github_app import GitHubAppError
 from cloud_agent.logging_utils import get_logger
 from cloud_agent.pr_titles import generate_pr_title, is_generic_pr_summary
 from cloud_agent.publisher import (
@@ -87,11 +91,25 @@ POLL_INTERVAL_S = 15.0
 #: The longest an idle publisher that is told about new work sleeps. It wakes
 #: sooner for a notification or the earliest publication/base import retry.
 PUBLISH_IDLE_S = 30.0
+#: Refresh a live publication claim frequently enough that several sequential
+#: provider/git calls at their 300-second maximum cannot resemble a crashed
+#: publisher to the 900-second reaper.
+_PUBLISH_HEARTBEAT_INTERVAL_S = 60.0
 
 # Exactly what publishing does: push one branch, open one draft PR. Notably not
 # `workflows`, so a patch touching `.github/` cannot be pushed even if both
 # gates were bypassed — the credential itself would refuse.
 _PUBLISH_SCOPE = {"contents": "write", "pull_requests": "write"}
+
+_HTTP_STATUS_IN_DETAIL = re.compile(r"\((\d{3})\)|returned error:\s*(\d{3})\b")
+_GIT_DISCONNECT = re.compile(
+    r"timed out|unable to access|could not resolve host|failed to connect|"
+    r"connection (?:reset|refused|aborted)|network is unreachable|"
+    r"temporary failure in name resolution|remote end hung up|early eof|"
+    r"rpc failed|recv failure|send failure|could not read from remote|"
+    r"connection closed|broken pipe",
+    re.IGNORECASE,
+)
 
 # A PR base has to be a branch. `base_ref` is normally one (the composer offers
 # a branch picker), but the API accepts any ref it can resolve, and a caller
@@ -105,6 +123,7 @@ _LOOKS_LIKE_SHA = re.compile(r"^[0-9a-fA-F]{7,64}$")
 
 
 def _retryable_github_status(status: int | None) -> bool:
+    """Whether a provider refusal is conventionally safe to retry."""
     return status is not None and (status in {408, 429} or 500 <= status < 600)
 
 
@@ -511,6 +530,52 @@ async def publish_one(
     )
 
 
+def _http_status(exc: BaseException) -> int | None:
+    """The HTTP status on a credential or PR failure, if it has one."""
+    status = getattr(exc, "status", None)
+    if isinstance(status, int):
+        return status
+    response = getattr(exc, "response", None)
+    code = getattr(response, "status_code", None)
+    if isinstance(code, int):
+        return code
+    if isinstance(exc, PublishError):
+        match = _HTTP_STATUS_IN_DETAIL.search(str(exc))
+        if match:
+            return int(next(group for group in match.groups() if group))
+    return None
+
+
+def _is_retryable_publication_failure(exc: BaseException) -> bool:
+    """Whether this failure may be deferred instead of failing the snapshot.
+
+    Retryable: an explicitly uncertain remote effect; a credential mint that
+    did not connect, timed out, or got 408/429/5xx; a git disconnect; or the
+    same HTTP statuses from the remote. Patch, content, and other HTTP
+    rejections are permanent.
+    """
+    if isinstance(exc, TransientPublishError):
+        return True
+    status = _http_status(exc)
+    if _retryable_github_status(status):
+        return True
+    if status is not None:
+        return False
+    if isinstance(
+        exc,
+        (
+            httpx.ConnectError,
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+            TimeoutError,
+            ConnectionError,
+        ),
+    ):
+        return True
+    return isinstance(exc, PublishError) and _GIT_DISCONNECT.search(str(exc)) is not None
+
+
 async def _publish_due(
     store: PublishStorage,
     *,
@@ -521,8 +586,9 @@ async def _publish_due(
 ) -> None:
     """Publish every captured snapshot, past any that fails.
 
-    A refusal marks its snapshot failed; a preflight entitlement outage delays
-    its next claim. Snapshots behind either still go out in this pass.
+    A refusal marks its snapshot failed. A retryable failure, including an
+    entitlement outage, returns it to the queue until five defers are spent.
+    Snapshots behind either still go out in this pass.
     """
     while (job := await store.snapshot.claim_for_publish()) is not None:
         await _publish_claimed(
@@ -535,7 +601,99 @@ async def _publish_due(
         )
 
 
+async def _heartbeat_snapshot_publish(
+    store: PublishStorage,
+    *,
+    snapshot_id: int,
+    expected_publish_attempt_count: int,
+) -> None:
+    """Keep this exact claim live while remote publication is in progress."""
+    while True:
+        await asyncio.sleep(_PUBLISH_HEARTBEAT_INTERVAL_S)
+        try:
+            renewed = await store.snapshot.renew_snapshot_publish_claim(
+                snapshot_id=snapshot_id,
+                expected_publish_attempt_count=expected_publish_attempt_count,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A brief database interruption must not abandon a claim while its
+            # remote side effect is still running. The next one-minute beat
+            # retries well inside the stalled-publisher window.
+            logger.warning(
+                "agent_snapshot_publish_heartbeat_failed",
+                extra={
+                    "event": "agent_snapshot_publish_heartbeat_failed",
+                    "snapshot_id": snapshot_id,
+                    "publish_attempt_count": expected_publish_attempt_count,
+                },
+                exc_info=True,
+            )
+            continue
+        if not renewed:
+            logger.warning(
+                "agent_snapshot_publish_claim_lost",
+                extra={
+                    "event": "agent_snapshot_publish_claim_lost",
+                    "snapshot_id": snapshot_id,
+                    "publish_attempt_count": expected_publish_attempt_count,
+                },
+            )
+            return
+
+
 async def _publish_claimed(
+    store: PublishStorage,
+    job: dict[str, Any],
+    *,
+    credential: GitHubCredential | None,
+    app_credentials: Any | None,
+    grants: GrantClient | None = None,
+    base_branch: str,
+    allow_workflow_changes: bool = False,
+) -> str | None:
+    """Publish under a claim heartbeat spanning every local and remote phase."""
+    snapshot_id = int(job["snapshot_id"])
+    expected_publish_attempt_count = int(job["publish_attempt_count"])
+    if not await store.snapshot.renew_snapshot_publish_claim(
+        snapshot_id=snapshot_id,
+        expected_publish_attempt_count=expected_publish_attempt_count,
+    ):
+        logger.warning(
+            "agent_snapshot_publish_claim_lost",
+            extra={
+                "event": "agent_snapshot_publish_claim_lost",
+                "snapshot_id": snapshot_id,
+                "publish_attempt_count": expected_publish_attempt_count,
+            },
+        )
+        return None
+    heartbeat = asyncio.create_task(
+        _heartbeat_snapshot_publish(
+            store,
+            snapshot_id=snapshot_id,
+            expected_publish_attempt_count=expected_publish_attempt_count,
+        ),
+        name=f"snapshot-publish-heartbeat-{snapshot_id}",
+    )
+    try:
+        return await _publish_claimed_owned(
+            store,
+            job,
+            credential=credential,
+            app_credentials=app_credentials,
+            grants=grants,
+            base_branch=base_branch,
+            allow_workflow_changes=allow_workflow_changes,
+        )
+    finally:
+        heartbeat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat
+
+
+async def _publish_claimed_owned(
     store: PublishStorage,
     job: dict[str, Any],
     *,
@@ -549,19 +707,28 @@ async def _publish_claimed(
     job_id = job["job_id"]
     base_sha = job["base_sha"]
     pr_base = _pr_base_branch(job, base_branch)
-    expected_publish_retry_count = int(job["publish_retry_count"])
+    expected_publish_attempt_count = int(job["publish_attempt_count"])
 
     async def fail(detail: str) -> None:
         await store.snapshot.fail_snapshot_publish(
             snapshot_id=int(job["snapshot_id"]),
-            expected_publish_retry_count=expected_publish_retry_count,
+            expected_publish_attempt_count=expected_publish_attempt_count,
             detail=detail,
         )
 
     async def retry(detail: str) -> None:
+        """Let storage atomically defer or exhaust this exact claim."""
+        logger.warning(
+            "agent_job_publish_retrying",
+            extra={
+                "event": "agent_job_publish_retrying",
+                "job_id": job_id,
+                "publish_attempt_count": expected_publish_attempt_count,
+            },
+        )
         await store.snapshot.defer_snapshot_publish(
             snapshot_id=int(job["snapshot_id"]),
-            expected_publish_retry_count=expected_publish_retry_count,
+            expected_publish_attempt_count=expected_publish_attempt_count,
             detail=detail,
         )
 
@@ -600,17 +767,12 @@ async def _publish_claimed(
                     job["repo"], permissions=_PUBLISH_SCOPE, repository_scoped=True
                 )
             )
-        except (httpx.TransportError, SourceControlUnavailable) as exc:
-            await retry(f"could not obtain a GitHub credential; publication will retry: {exc}")
-            return None
-        except GitHubAppError as exc:
-            if _retryable_github_status(exc.status):
-                await retry(f"could not obtain a GitHub credential; publication will retry: {exc}")
-            else:
-                await fail(f"could not obtain a GitHub credential: {exc}")
-            return None
         except Exception as exc:
-            await fail(f"could not obtain a GitHub credential: {exc}")
+            detail = f"could not obtain a GitHub credential: {exc}"
+            if _is_retryable_publication_failure(exc):
+                await retry(detail)
+            else:
+                await fail(detail)
             return None
     if credential is None:
         await fail("no GitHub credential is configured for publishing")
@@ -642,35 +804,24 @@ async def _publish_claimed(
             body=_pr_body(job, result.changed_files),
             credential=credential,
         )
-    except TransientPublishError as exc:
-        logger.warning(
-            "agent_job_publish_deferred",
-            extra={"event": "agent_job_publish_deferred", "job_id": job_id},
-        )
-        await retry(f"transient publication failure; publication will retry: {exc}")
-        return None
-    except (httpx.TransportError, RepoAccessUnavailable, SourceControlUnavailable) as exc:
-        logger.warning(
-            "agent_job_publish_deferred",
-            extra={"event": "agent_job_publish_deferred", "job_id": job_id},
-        )
-        await retry(f"transient publication transport failure; publication will retry: {exc}")
-        return None
-    except PublishError as exc:
-        logger.warning(
-            "agent_job_publish_rejected",
-            extra={"event": "agent_job_publish_rejected", "job_id": job_id},
-        )
-        await fail(str(exc))
-        return None
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("agent job publish failed unexpectedly")
-        await fail(f"publish failed: {exc}")
+    except Exception as exc:
+        detail = str(exc) if isinstance(exc, PublishError) else f"publish failed: {exc}"
+        if _is_retryable_publication_failure(exc):
+            await retry(detail)
+            return None
+        if isinstance(exc, PublishError):
+            logger.warning(
+                "agent_job_publish_rejected",
+                extra={"event": "agent_job_publish_rejected", "job_id": job_id},
+            )
+        else:
+            logger.exception("agent job publish failed unexpectedly")
+        await fail(detail)
         return None
 
     recorded = await store.snapshot.record_snapshot_publish(
         snapshot_id=int(job["snapshot_id"]),
-        expected_publish_retry_count=expected_publish_retry_count,
+        expected_publish_attempt_count=expected_publish_attempt_count,
         pr_url=pr_url,
         commit_sha=result.commit_sha,
     )

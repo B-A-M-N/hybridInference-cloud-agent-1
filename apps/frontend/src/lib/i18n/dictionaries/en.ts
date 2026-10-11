@@ -237,29 +237,39 @@ export const en = {
   // ── Settings ────────────────────────────────────────────────────────────
   'settings.title': 'Setting',
   'settings.description': 'Manage your connections, skills, memory, and notifications.',
-  'settings.memory.title': 'Avatar & memory',
+  'settings.memory.consolidate': 'Consolidate',
+  'settings.memory.consolidating': 'Consolidating…',
+  'settings.memory.consolidationModel': 'Consolidation model',
+  'settings.memory.modelsLoading': 'Loading available models…',
+  'settings.memory.modelsError': 'Could not load models for consolidation. Please try again.',
+  'settings.memory.modelsRetry': 'Retry models',
+  'settings.memory.noModels': 'No models available for consolidation.',
+  'settings.memory.scope': 'Applies to',
+  'settings.memory.repoScope': 'Repo: {repo}',
+  'settings.memory.userScope': 'User · all projects',
+  'settings.memory.bounds':
+    '{count}/12 memories · {characters}/2,400 characters · at most 3 user memories',
+  'settings.memory.consolidateDescription':
+    'Choose a model to merge duplicates and choose repo or user scope. Uses your model quota. Existing memory is kept if the model returns no memories.',
+  'settings.memory.title': 'User memory',
   'settings.memory.description':
-    'Your illustrated avatar is generated automatically and evolves with recent work. Memory uses up to your 50 latest requests to suggest improvements. Explicit preferences can guide future tasks in the same project.',
-  'settings.memory.avatar': 'Your avatar',
-  'settings.memory.avatarAlt': 'Your automatically generated illustrated avatar',
-  'settings.memory.avatarDescription':
-    'Your base character stays the same while colors and details reflect your recent work.',
+    'Your avatar and recent-work profile reflect your activity across projects. User preferences apply to all projects: they come from requests without a project, or preferences explicitly marked “across all projects”. Project-specific context is saved separately below.',
   'settings.memory.automatic': 'Automatically build memory',
   'settings.memory.enabled':
-    'Your avatar’s theme, memory, and suggestions update automatically from your requests.',
+    'Your avatar’s theme, user memory, and suggestions update automatically from your requests. Project memory has its own settings.',
   'settings.memory.disabled':
-    'Avatar theme updates, memory updates, and personalization are paused.',
-  'settings.memory.loading': 'Loading your avatar and memory…',
+    'Avatar theme updates, memory updates, and user personalization are paused. Project memory keeps its own settings.',
+  'settings.memory.loading': 'Loading your memory…',
   'settings.memory.error': 'Could not load or update your memory. Please try again.',
   'settings.memory.retry': 'Retry',
-  'settings.memory.signIn': 'Sign in to see your avatar and memory.',
+  'settings.memory.signIn': 'Sign in to see your memory.',
   'settings.memory.updated': 'Memory updated {date}',
   'settings.memory.refresh': 'Refresh',
   'settings.memory.refreshing': 'Refreshing…',
   'settings.memory.clear': 'Clear memory',
-  'settings.memory.confirmTitle': 'Clear saved memory and suggestions?',
+  'settings.memory.confirmTitle': 'Clear user memory and suggestions?',
   'settings.memory.confirmDescription':
-    'Clearing resets your avatar’s work theme while keeping its base character. Old requests won’t be used again. Future requests can build new memory and update the avatar when enabled.',
+    'Clearing resets your avatar’s work theme while keeping its base character, and removes user memory and suggestions. Project memory is kept. Old requests won’t be used again for user memory. Future requests can build new memory and update the avatar when enabled.',
   'settings.memory.confirmClear': 'Confirm clear memory',
   'settings.memory.clearing': 'Clearing…',
   'settings.memory.cancel': 'Cancel',
@@ -270,7 +280,40 @@ export const en = {
   'settings.memory.model': 'Preferred model',
   'settings.memory.emptyPortrait':
     'Recent work will appear after you send requests with memory enabled.',
-  'settings.memory.memories': 'Saved memory',
+  'settings.memory.memories': 'Saved user memory',
+  'settings.memory.entriesDescription':
+    'Edit or remove saved memories. Your changes stay in place when memory refreshes.',
+  'settings.memory.entryLabel': 'Saved memory {number}',
+  'settings.memory.edited': 'Edited',
+  'settings.memory.entryProject': 'Project: {project}',
+  'settings.memory.noProject': 'No project',
+  'settings.memory.entryDate': 'Created {date}',
+  'settings.memory.noDate': 'Date unavailable',
+  'settings.memory.savedText': 'Currently saved text',
+  'settings.memory.lastSavedText': 'Last saved text',
+  'settings.memory.editEntry': 'Edit memory',
+  'settings.memory.editContent': 'Memory content',
+  'settings.memory.entryLimit': '{count}/240 characters',
+  'settings.memory.saveEntry': 'Save memory',
+  'settings.memory.removeEntry': 'Remove memory',
+  'settings.memory.removeTitle': 'Remove this memory?',
+  'settings.memory.removeDescription':
+    'This memory won’t return when memory refreshes. Its source task remains available.',
+  'settings.memory.confirmRemove': 'Confirm remove memory',
+  'settings.memory.refreshEntry': 'Refresh memory',
+  'settings.memory.entryConflict':
+    'Saved memory changed. Refresh to review the latest saved text, then save your draft again.',
+  'settings.memory.entryInvalid':
+    'Could not save this memory. Use nonempty text up to 500 characters and leave out credentials. Preferences must apply to future tasks.',
+  'settings.memory.entryMissing':
+    'This memory is no longer available. Refresh to review your saved memories.',
+  'settings.memory.entryUnavailable':
+    'This memory is no longer saved. Your draft is kept for copying. Cancel to close it.',
+  'settings.memory.entryError':
+    'Could not update this memory. Your draft is kept. Please try again.',
+  'settings.memory.removeConflict':
+    'Saved memory changed. Refresh to review the latest memory, then confirm removal again.',
+  'settings.memory.removeError': 'Could not remove this memory. Please try again.',
   'settings.memory.preference': 'Preference',
   'settings.memory.task': 'Task context',
   'settings.memory.source': 'View source task',
@@ -278,6 +321,41 @@ export const en = {
   'settings.memory.suggestions': 'Suggestions for future tasks',
   'settings.memory.emptySuggestions':
     'Suggestions will appear when your activity provides enough context.',
+  'settings.projectMemory.title': 'Project memory',
+  'settings.projectMemory.description':
+    'Each repository has its own preferences and task context, used only for that project. Project preferences take priority over user preferences when they conflict. Its memory controls are independent of user memory and other projects.',
+  'settings.projectMemory.signIn': 'Sign in to see your project memory.',
+  'settings.projectMemory.project': 'Repository (owner/repo)',
+  'settings.projectMemory.select': 'Select a repository',
+  'settings.projectMemory.refreshProjects': 'Refresh repositories',
+  'settings.projectMemory.loadingProjects': 'Loading your repositories…',
+  'settings.projectMemory.projectsError':
+    'Could not load your repositories. Refresh repositories to try again.',
+  'settings.projectMemory.noProjects':
+    'Project memory will appear after you send a request in a repository.',
+  'settings.projectMemory.loading': 'Loading project memory…',
+  'settings.projectMemory.error':
+    'Could not load or update this project’s memory. Please try again.',
+  'settings.projectMemory.automatic': 'Automatically build project memory',
+  'settings.projectMemory.enabled':
+    'Memory and suggestions update automatically for this repository.',
+  'settings.projectMemory.disabled':
+    'Memory updates and personalization are paused for this repository. User memory and other projects keep their own settings.',
+  'settings.projectMemory.refresh': 'Refresh project memory',
+  'settings.projectMemory.consolidate': 'Consolidate project memory',
+  'settings.projectMemory.bounds': '{count}/12 project memories · {characters}/2,400 characters',
+  'settings.projectMemory.clear': 'Clear project memory',
+  'settings.projectMemory.confirmTitle': 'Clear memory for {repo}?',
+  'settings.projectMemory.confirmDescription':
+    'This removes only the selected project’s memory and suggestions. Your user memory, avatar, and other projects are kept. Old requests won’t be reused for this project’s memory. Future requests can build new memory when enabled.',
+  'settings.projectMemory.confirmClear': 'Confirm clear project memory',
+  'settings.projectMemory.portrait': 'Project profile',
+  'settings.projectMemory.emptyPortrait':
+    'This project’s profile will appear after you send requests with project memory enabled.',
+  'settings.projectMemory.memories': 'Saved project memory',
+  'settings.projectMemory.emptyMemory': 'No saved memory for this project yet.',
+  'settings.projectMemory.emptySuggestions':
+    'Suggestions will appear when this project’s activity provides enough context.',
   'settings.notifications.title': 'Notifications',
   'settings.notifications.description':
     'Get browser notifications when an agent asks a question or finishes a turn. Keep the app open to receive them.',
@@ -436,6 +514,9 @@ export const en = {
   'archive.order': 'Recently archived first',
 
   // ── Composer ────────────────────────────────────────────────────────────
+  'composer.avatarAlt': 'Your automatically generated illustrated avatar',
+  'composer.avatarDescription':
+    'Your base character stays the same while colors and details reflect your recent work.',
   'composer.heading': 'What should the agent do?',
   'composer.subheading': 'Runs in an isolated sandbox.',
   'composer.subheadingFirstVisit':

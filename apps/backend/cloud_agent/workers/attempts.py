@@ -1,11 +1,11 @@
-"""The attempt reaper, and the maintenance passes that ride its loop.
+"""The attempt reaper, and the grant passes that ride its loop.
 
 One pass closes attempts whose lease expired, abandons the ones the gateway has
 definitively refused, renews the grants that are still live, reaps offline hosts
 and lapsed residencies, cleans up the residencies a stranded fork left behind,
-collects abandoned staged uploads, and reconciles the forks and snapshot
-publishes an expiry stranded. It ran from ``app.py`` before this module existed;
-it runs from the same place in the same process now, started and stopped by the
+reconciles the forks and snapshot publishes an expiry stranded, and purges
+abandoned staged uploads. It ran from ``app.py`` before this module existed; it
+runs from the same place in the same process now, started and stopped by the
 same lifespan.
 """
 
@@ -103,12 +103,9 @@ REAP_INTERVAL_S = RENEWAL_INTERVAL_S
 MAX_ATTEMPTS = 3
 
 
-#: Staged uploads have no durable owner other than the user who is still
-#: composing a request. After this many hours with neither a job nor a pending
-#: message holding them, the maintenance loop releases their quota and bytes.
-#: Administrators can change the live value through
-#: ``attachments.staged_retention_hours``.
-STAGED_ATTACHMENT_RETENTION_HOURS = 24
+#: Abandoned staged uploads count against staging quota until collected.
+#: Pending-message and job-claimed rows are kept by the repository predicate.
+STAGED_UPLOAD_RETENTION_HOURS = 24
 
 
 #: The gateway refusals that are a verdict on the grant itself.
@@ -604,27 +601,6 @@ async def _run_attempt_reaper(
             await _reap_lapsed_residencies(store.residency, grants)
         except Exception:
             logger.warning("Residency reaper pass failed", exc_info=True)
-        # Abandoned composer uploads have no request path that will release
-        # them later. Keep this in its own pass: attachment storage trouble
-        # must not stop attempt leases from being recovered. The repository's
-        # predicate excludes both job-claimed and pending-message uploads.
-        try:
-            purged_attachments = await store.attachments.purge_stale_staged(
-                older_than_hours=integer_setting(
-                    "attachments.staged_retention_hours",
-                    STAGED_ATTACHMENT_RETENTION_HOURS,
-                )
-            )
-            if purged_attachments:
-                logger.info(
-                    "agent_staged_attachments_purged",
-                    extra={
-                        "event": "agent_staged_attachments_purged",
-                        "count": purged_attachments,
-                    },
-                )
-        except Exception:
-            logger.warning("Staged attachment cleanup pass failed", exc_info=True)
         # Queued follow-ups after residencies, before the attempt pass: give
         # legacy turns a terminal answer if their native context is missing.
         # Normal ordering is enforced at claim time; this cleanup uses the
@@ -728,6 +704,18 @@ async def _run_attempt_reaper(
                 )
         except Exception:
             logger.warning("Agent attempt reaper pass failed", exc_info=True)
+        # Abandoned staged uploads count against staging quota until collected.
+        # Pending-message and job-claimed rows are kept by the repository
+        # predicate. Own try: a failure here must not skip later reaping.
+        try:
+            await store.attachments.purge_stale_staged(
+                older_than_hours=integer_setting(
+                    "attachments.staged_retention_hours",
+                    STAGED_UPLOAD_RETENTION_HOURS,
+                )
+            )
+        except Exception:
+            logger.warning("Staged upload purge failed", exc_info=True)
         # The owner's waiting messages after the attempt pass. A turn the
         # reaper just ended — failed or cancelled — reached no finish route, so
         # nothing else would act on it: this pauses its queue, and sends what a

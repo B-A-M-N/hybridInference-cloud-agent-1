@@ -1,6 +1,41 @@
 {
   "components": {
     "schemas": {
+      "AcquireHostDrainFenceRequest": {
+        "description": "Atomically replace the expected drain owner with a new opaque owner.",
+        "properties": {
+          "expected_fence_epoch": {
+            "description": "Canonical UUID copied from the latest host snapshot; the acquire is stale if drain-relevant host state changed afterward.",
+            "format": "uuid",
+            "title": "Expected Fence Epoch",
+            "type": "string"
+          },
+          "expected_fence_token": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Fence Token"
+          },
+          "fence_token": {
+            "format": "uuid",
+            "title": "Fence Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_fence_token",
+          "expected_fence_epoch",
+          "fence_token"
+        ],
+        "title": "AcquireHostDrainFenceRequest",
+        "type": "object"
+      },
       "AddComputeConnection": {
         "additionalProperties": false,
         "description": "Create a named, write-only credential in the control plane.",
@@ -5661,7 +5696,7 @@
         "type": "object"
       },
       "AgentRunnerHost": {
-        "description": "One machine in the agent runner pool.\n\nEverything below ``seconds_since_seen`` arrived with the dynamic pool\n(phase G) and every one of those fields has a default. A host that joined\nby polling — the only way in before enrollment existed — has none of them\nset, and it must still render on the admin page rather than 500 it.",
+        "description": "One machine in the agent runner pool.\n\nMost fields below ``seconds_since_seen`` arrived with the dynamic pool\n(phase G) and retain defaults for hosts that joined by polling. The drain\nfence epoch is different: its migration backfills every host and the API\nrequires it so an automation client never mistakes a partial fence\ncontract for a safe compare-and-swap base.",
         "properties": {
           "active": {
             "title": "Active",
@@ -5709,6 +5744,47 @@
             ],
             "description": "Generation of this host's capacity data; rotated by re-enrollment. A client uses it to drop a curve that belongs to the machine this one replaced.",
             "title": "Capacity Epoch"
+          },
+          "drain_fence_active": {
+            "default": false,
+            "description": "True only while the recorded deployment fence owns a draining host; false for an absent fence or released receipt.",
+            "title": "Drain Fence Active",
+            "type": "boolean"
+          },
+          "drain_fence_epoch": {
+            "description": "Opaque compare-and-swap generation for deployment drain state. It rotates whenever host lifecycle, credential, placement, or drain ownership changes.",
+            "format": "uuid",
+            "title": "Drain Fence Epoch",
+            "type": "string"
+          },
+          "drain_fence_status_before": {
+            "anyOf": [
+              {
+                "enum": [
+                  "online",
+                  "draining"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Host status immediately before the current drain-fence token was acquired.",
+            "title": "Drain Fence Status Before"
+          },
+          "drain_fence_token": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque owner of an automated deployment drain, retained after release as an idempotency receipt.",
+            "title": "Drain Fence Token"
           },
           "enrolled": {
             "default": false,
@@ -5951,7 +6027,8 @@
           "last_worker_id",
           "first_seen_at",
           "last_seen_at",
-          "seconds_since_seen"
+          "seconds_since_seen",
+          "drain_fence_epoch"
         ],
         "title": "AgentRunnerHost",
         "type": "object"
@@ -8021,6 +8098,12 @@
             "title": "Project",
             "type": "string"
           },
+          "ssh_public_key": {
+            "default": "",
+            "maxLength": 8192,
+            "title": "Ssh Public Key",
+            "type": "string"
+          },
           "ssh_username": {
             "default": "",
             "maxLength": 128,
@@ -8382,6 +8465,35 @@
           "status"
         ],
         "title": "ConnectorView",
+        "type": "object"
+      },
+      "ConsolidateMemoryRequest": {
+        "additionalProperties": false,
+        "description": "Consolidate only the version the owner currently sees.",
+        "properties": {
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "revision": {
+            "minimum": 0.0,
+            "title": "Revision",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision"
+        ],
+        "title": "ConsolidateMemoryRequest",
         "type": "object"
       },
       "ConversationUsage": {
@@ -10440,7 +10552,7 @@
             "type": "array"
           },
           "sandbox_archive_settings": {
-            "$ref": "#/components/schemas/SandboxArchiveSettingsResponse"
+            "$ref": "#/components/schemas/HostSandboxArchiveSettings"
           },
           "settings": {
             "additionalProperties": {
@@ -10640,6 +10752,83 @@
           "ttl_seconds"
         ],
         "title": "HostResidencyEstablishResponse",
+        "type": "object"
+      },
+      "HostSandboxArchiveSettings": {
+        "description": "Archive policy delivered to a broker. Empty access-key fields are omitted.",
+        "properties": {
+          "aws_access_key_id": {
+            "default": "",
+            "title": "Aws Access Key Id",
+            "type": "string"
+          },
+          "aws_secret_access_key": {
+            "default": "",
+            "description": "Included only when an access key is configured.",
+            "title": "Aws Secret Access Key",
+            "type": "string"
+          },
+          "enabled": {
+            "default": false,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "expected_bucket_owner": {
+            "default": "",
+            "title": "Expected Bucket Owner",
+            "type": "string"
+          },
+          "kms_key_arn": {
+            "default": "",
+            "title": "Kms Key Arn",
+            "type": "string"
+          },
+          "max_archive_bytes": {
+            "default": 2147483648,
+            "title": "Max Archive Bytes",
+            "type": "integer"
+          },
+          "multipart_part_bytes": {
+            "default": 8388608,
+            "title": "Multipart Part Bytes",
+            "type": "integer"
+          },
+          "multipart_threshold_bytes": {
+            "default": 8388608,
+            "title": "Multipart Threshold Bytes",
+            "type": "integer"
+          },
+          "region": {
+            "default": "",
+            "title": "Region",
+            "type": "string"
+          },
+          "revision": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "s3_uri": {
+            "const": "s3://freeinference/cloud-agent/sandbox",
+            "default": "s3://freeinference/cloud-agent/sandbox",
+            "title": "S3 Uri",
+            "type": "string"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "title": "HostSandboxArchiveSettings",
         "type": "object"
       },
       "HostSettingDefinition": {
@@ -11558,6 +11747,55 @@
         "title": "McpIntegrationResponse",
         "type": "object"
       },
+      "MemoryEdit": {
+        "additionalProperties": false,
+        "description": "A bounded owner edit; provenance remains server controlled.",
+        "properties": {
+          "content": {
+            "maxLength": 240,
+            "minLength": 1,
+            "title": "Content",
+            "type": "string"
+          },
+          "id": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "scope": {
+            "enum": [
+              "repo",
+              "user"
+            ],
+            "title": "Scope",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "content",
+          "scope"
+        ],
+        "title": "MemoryEdit",
+        "type": "object"
+      },
+      "MemoryEntryRevision": {
+        "additionalProperties": false,
+        "description": "Require the version the owner examined before changing an entry.",
+        "properties": {
+          "expected_revision": {
+            "minimum": 0.0,
+            "title": "Expected Revision",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_revision"
+        ],
+        "title": "MemoryEntryRevision",
+        "type": "object"
+      },
       "MessageRequestDetail": {
         "description": "A request matched by response identity inside one owner's execution.",
         "properties": {
@@ -11847,6 +12085,59 @@
         "title": "ProcessObservation",
         "type": "object"
       },
+      "ProjectMemoryView": {
+        "description": "An owner's independently controlled memory for one exact repository.",
+        "properties": {
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "memories": {
+            "items": {
+              "$ref": "#/components/schemas/UserMemory"
+            },
+            "title": "Memories",
+            "type": "array"
+          },
+          "portrait": {
+            "$ref": "#/components/schemas/UserPortrait"
+          },
+          "repo": {
+            "title": "Repo",
+            "type": "string"
+          },
+          "revision": {
+            "default": 0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "suggestions": {
+            "items": {
+              "$ref": "#/components/schemas/UserSuggestion"
+            },
+            "title": "Suggestions",
+            "type": "array"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "required": [
+          "repo"
+        ],
+        "title": "ProjectMemoryView",
+        "type": "object"
+      },
       "PromptRewriteAnswer": {
         "additionalProperties": false,
         "description": "One clarification and the user's optional answer.",
@@ -11999,6 +12290,21 @@
           "registration_secret"
         ],
         "title": "RegisterConnectorResponse",
+        "type": "object"
+      },
+      "ReleaseHostDrainFenceRequest": {
+        "description": "Release only the automated drain owned by this opaque token.",
+        "properties": {
+          "fence_token": {
+            "format": "uuid",
+            "title": "Fence Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "fence_token"
+        ],
+        "title": "ReleaseHostDrainFenceRequest",
         "type": "object"
       },
       "RenewalPolicy": {
@@ -12548,8 +12854,18 @@
         "type": "object"
       },
       "SandboxArchiveSettingsResponse": {
-        "description": "The revisioned archive policy stored for every sandbox host.",
+        "description": "The revisioned archive policy stored for every sandbox host.\n\nThe secret access key is write-only. ``aws_secret_access_key_configured``\ntells the editor whether a blank secret keeps the stored one.",
         "properties": {
+          "aws_access_key_id": {
+            "default": "",
+            "title": "Aws Access Key Id",
+            "type": "string"
+          },
+          "aws_secret_access_key_configured": {
+            "default": false,
+            "title": "Aws Secret Access Key Configured",
+            "type": "boolean"
+          },
           "enabled": {
             "default": false,
             "title": "Enabled",
@@ -13101,6 +13417,18 @@
         "additionalProperties": false,
         "description": "Replace the whole archive policy if the displayed revision is current.",
         "properties": {
+          "aws_access_key_id": {
+            "default": "",
+            "maxLength": 128,
+            "title": "Aws Access Key Id",
+            "type": "string"
+          },
+          "aws_secret_access_key": {
+            "default": "",
+            "maxLength": 256,
+            "title": "Aws Secret Access Key",
+            "type": "string"
+          },
           "enabled": {
             "title": "Enabled",
             "type": "boolean"
@@ -14479,18 +14807,72 @@
         "title": "UpdateConnectorRequest",
         "type": "object"
       },
+      "UpdateMemoryEntry": {
+        "additionalProperties": false,
+        "description": "Edit content while retaining the entry's original kind and project.",
+        "properties": {
+          "content": {
+            "maxLength": 240,
+            "minLength": 1,
+            "title": "Content",
+            "type": "string"
+          },
+          "expected_revision": {
+            "minimum": 0.0,
+            "title": "Expected Revision",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_revision",
+          "content"
+        ],
+        "title": "UpdateMemoryEntry",
+        "type": "object"
+      },
       "UpdateMemorySettings": {
         "additionalProperties": false,
         "description": "Enable or pause automatic memory creation and use.",
         "properties": {
           "enabled": {
-            "title": "Enabled",
-            "type": "boolean"
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "memories": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/MemoryEdit"
+                },
+                "maxItems": 12,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memories"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision"
           }
         },
-        "required": [
-          "enabled"
-        ],
         "title": "UpdateMemorySettings",
         "type": "object"
       },
@@ -14615,6 +14997,11 @@
             ],
             "title": "Created At"
           },
+          "edited": {
+            "default": false,
+            "title": "Edited",
+            "type": "boolean"
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -14626,6 +15013,22 @@
             ],
             "title": "Kind",
             "type": "string"
+          },
+          "scope": {
+            "default": "repo",
+            "enum": [
+              "repo",
+              "user"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "source_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Source Ids",
+            "type": "array"
           },
           "source_job_id": {
             "title": "Source Job Id",
@@ -14641,6 +15044,11 @@
               }
             ],
             "title": "Source Repo"
+          },
+          "user_edited": {
+            "default": false,
+            "title": "User Edited",
+            "type": "boolean"
           }
         },
         "required": [
@@ -15067,6 +15475,18 @@
           "execution_profile": {
             "$ref": "#/components/schemas/ExecutionProfile",
             "default": "trusted-v1"
+          },
+          "github_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Short-lived GitHub App token scoped to this repository with contents and pull_requests write permissions. Injected as GH_TOKEN in the owning sandbox member for pushing branches and creating pull requests. Null when no GitHub App installation covers the repository.",
+            "title": "Github Token"
           },
           "job_id": {
             "title": "Job Id",
@@ -20058,6 +20478,23 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/AcquireHostDrainFenceRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {
@@ -20298,6 +20735,18 @@
             }
           },
           {
+            "description": "Override an active deployment fence. A forced legacy transition clears its ownership and idempotency receipt.",
+            "in": "query",
+            "name": "force",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Override an active deployment fence. A forced legacy transition clears its ownership and idempotency receipt.",
+              "title": "Force",
+              "type": "boolean"
+            }
+          },
+          {
             "in": "header",
             "name": "authorization",
             "required": false,
@@ -20314,6 +20763,23 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ReleaseHostDrainFenceRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {
@@ -21153,7 +21619,7 @@
         "summary": "Get Sandbox Archive Settings"
       },
       "put": {
-        "description": "Atomically replace the archive policy; hosts apply it on their next beat.\n\nThe destination is fixed in server code and credentials are intentionally\nabsent. Brokers authenticate to AWS with their workload identity; this\nroute stores only the non-secret region, KMS key identity, owner fence and\nbounded transfer limits.",
+        "description": "Atomically replace the archive policy; hosts apply it on their next beat.\n\nThe destination is fixed in server code. A saved access key is encrypted\nat rest and is not returned. With no key, brokers authenticate with their\nworkload identity and still require the bucket owner and KMS key.",
         "operationId": "set_sandbox_archive_settings_admin_agent_sandbox_archive_settings_put",
         "parameters": [
           {
@@ -21438,7 +21904,7 @@
     },
     "/admin/agent/sandboxes/{sandbox_id}/delete": {
       "post": {
-        "description": "Queue archive-before-delete under the exact reviewed stopped-container fence.",
+        "description": "Queue verified deletion, with fail-closed recovery for stale running state.",
         "operationId": "delete_admin_sandbox_admin_agent_sandboxes__sandbox_id__delete_post",
         "parameters": [
           {
@@ -21448,6 +21914,16 @@
             "schema": {
               "title": "Sandbox Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "force",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Force",
+              "type": "boolean"
             }
           },
           {
@@ -26930,6 +27406,496 @@
         ]
       }
     },
+    "/v1/agent/project-memory": {
+      "delete": {
+        "description": "Forget only this project's past activity, preserving its enabled setting.",
+        "operationId": "clear_project_memory_v1_agent_project_memory_delete",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "repo",
+            "required": true,
+            "schema": {
+              "maxLength": 140,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Repo",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectMemoryView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clear Project Memory",
+        "tags": [
+          "project-memory"
+        ]
+      },
+      "get": {
+        "description": "Refresh memory from this owner's activity in the requested repository.",
+        "operationId": "read_project_memory_v1_agent_project_memory_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "repo",
+            "required": true,
+            "schema": {
+              "maxLength": 140,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Repo",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectMemoryView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Project Memory",
+        "tags": [
+          "project-memory"
+        ]
+      },
+      "patch": {
+        "description": "Change project settings or save revision-checked edits and scope changes.",
+        "operationId": "update_project_memory_v1_agent_project_memory_patch",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "repo",
+            "required": true,
+            "schema": {
+              "maxLength": 140,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Repo",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateMemorySettings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectMemoryView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Project Memory",
+        "tags": [
+          "project-memory"
+        ]
+      }
+    },
+    "/v1/agent/project-memory/consolidate": {
+      "post": {
+        "description": "Merge and classify durable preferences using the owner's available model.",
+        "operationId": "consolidate_project_memory_v1_agent_project_memory_consolidate_post",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "repo",
+            "required": true,
+            "schema": {
+              "maxLength": 140,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Repo",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConsolidateMemoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectMemoryView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Consolidate Project Memory",
+        "tags": [
+          "project-memory"
+        ]
+      }
+    },
+    "/v1/agent/project-memory/entries/{memory_id}": {
+      "delete": {
+        "description": "Forget an entry and suppress it during subsequent automatic refreshes.",
+        "operationId": "delete_project_memory_entry_v1_agent_project_memory_entries__memory_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "memory_id",
+            "required": true,
+            "schema": {
+              "title": "Memory Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "repo",
+            "required": true,
+            "schema": {
+              "maxLength": 140,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Repo",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryEntryRevision"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectMemoryView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "The owner has no such visible memory entry."
+          },
+          "409": {
+            "description": "Memory changed since the expected revision."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Project Memory Entry",
+        "tags": [
+          "project-memory"
+        ]
+      },
+      "patch": {
+        "description": "Save a durable correction to one of the owner's existing memories.",
+        "operationId": "edit_project_memory_entry_v1_agent_project_memory_entries__memory_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "memory_id",
+            "required": true,
+            "schema": {
+              "title": "Memory Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "repo",
+            "required": true,
+            "schema": {
+              "maxLength": 140,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Repo",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateMemoryEntry"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectMemoryView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "The owner has no such visible memory entry."
+          },
+          "409": {
+            "description": "Memory changed since the expected revision."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Edit Project Memory Entry",
+        "tags": [
+          "project-memory"
+        ]
+      }
+    },
+    "/v1/agent/project-memory/projects": {
+      "get": {
+        "description": "List only repositories with activity or memory owned by this user.",
+        "operationId": "list_memory_projects_v1_agent_project_memory_projects_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "title": "Response List Memory Projects V1 Agent Project Memory Projects Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Memory Projects",
+        "tags": [
+          "project-memory"
+        ]
+      }
+    },
     "/v1/agent/projects": {
       "get": {
         "description": "Summarize the caller's projects for the sidebar's task tree.",
@@ -29090,7 +30056,7 @@
         ]
       },
       "get": {
-        "description": "Automatically create the owner's avatar and refresh their recent memory.",
+        "description": "Create the owner's avatar and refresh their preferences across projects.",
         "operationId": "read_user_memory_v1_agent_user_memory_get",
         "parameters": [
           {
@@ -29191,6 +30157,214 @@
           }
         },
         "summary": "Update User Memory",
+        "tags": [
+          "user-memory"
+        ]
+      }
+    },
+    "/v1/agent/user-memory/consolidate": {
+      "post": {
+        "description": "Merge and classify durable preferences using the owner's available model.",
+        "operationId": "consolidate_user_memory_v1_agent_user_memory_consolidate_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConsolidateMemoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserMemoryView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Consolidate User Memory",
+        "tags": [
+          "user-memory"
+        ]
+      }
+    },
+    "/v1/agent/user-memory/entries/{memory_id}": {
+      "delete": {
+        "description": "Forget an entry and suppress it during subsequent automatic refreshes.",
+        "operationId": "delete_user_memory_entry_v1_agent_user_memory_entries__memory_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "memory_id",
+            "required": true,
+            "schema": {
+              "title": "Memory Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryEntryRevision"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserMemoryView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "The owner has no such visible memory entry."
+          },
+          "409": {
+            "description": "Memory changed since the expected revision."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete User Memory Entry",
+        "tags": [
+          "user-memory"
+        ]
+      },
+      "patch": {
+        "description": "Save a durable correction to one of the owner's existing memories.",
+        "operationId": "edit_user_memory_entry_v1_agent_user_memory_entries__memory_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "memory_id",
+            "required": true,
+            "schema": {
+              "title": "Memory Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateMemoryEntry"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserMemoryView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "The owner has no such visible memory entry."
+          },
+          "409": {
+            "description": "Memory changed since the expected revision."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Edit User Memory Entry",
         "tags": [
           "user-memory"
         ]

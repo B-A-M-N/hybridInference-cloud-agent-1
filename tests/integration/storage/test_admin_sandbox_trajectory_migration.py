@@ -17,11 +17,11 @@ from tests.support.migrations import REPO, apply_migrations, downgrade_to
 pytestmark = [pytest.mark.dbtest, pytest.mark.asyncio]
 
 _BRANCH_POINT = "0045_admin_sandbox_deletion"
-_BEFORE = "0048_sandbox_plugins"
-_THIS = "0049_admin_sandbox_trajectory"
+_BEFORE = "0055_send_now_handed_off"
+_THIS = "0056_admin_sandbox_trajectory"
 _COMMITTED_HEADS = (
     pytest.param("0046_admin_sandbox_trajectory", True, id="trajectory-head"),
-    pytest.param("0048_sandbox_plugins", False, id="mainline-head"),
+    pytest.param("0055_send_now_handed_off", False, id="mainline-head"),
 )
 
 
@@ -139,7 +139,7 @@ async def test_merge_downgrade_preserves_historical_branch_and_reupgrades(pool):
             }
         assert versions == {
             "0046_admin_sandbox_trajectory",
-            "0048_sandbox_plugins",
+            "0055_send_now_handed_off",
         }
         assert event_table is not None
         assert reject_function is not None

@@ -203,11 +203,11 @@ class PostgresGrantRepository:
         grant_id: str,
         binding_id: str | None = None,
     ) -> bool:
-        """Record the grant a residency runs on — only its own generation.
+        """Record the grant a residency runs on — only its own live generation.
 
-        A link that matched nothing means the residency expired or was taken
-        over between mint and link; the caller revokes the orphan grant rather
-        than handing out a credential nothing owns.
+        A link that matched nothing means the residency was taken over between
+        mint and link, or its lease has already expired. The caller revokes
+        the orphan grant rather than handing out a credential nothing owns.
         """
         async with self._pool.acquire() as conn, conn.transaction():
             locked = await conn.fetchval(

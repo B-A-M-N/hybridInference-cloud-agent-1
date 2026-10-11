@@ -5,11 +5,12 @@ streams the member Agent CLI's output through the workspace broker. Its shape
 follows from the adjudicated security model rather than convenience:
 
 - **Narrow credentials.** The enrolled host claims with its own identity. Only
-  a member-scoped inference grant and an attempt-fenced MCP token enter the
-  sandbox; worker-control and repository credentials stay in this process.
+  a member-scoped inference grant, an attempt-fenced MCP token, and a
+  short-lived repository-scoped GitHub App write token enter the sandbox.
+  Worker-control, account and service credentials stay outside.
 - **Snapshot-out, not push.** The runner never pushes. The trusted publisher
   captures and validates a quiescent shared-workspace snapshot, then pushes it.
-  That is why neither the runner nor the sandbox needs a git write credential.
+  The sandbox may also publish directly using its repository-scoped token.
 - **Heartbeats are how cancellation arrives.** A background thread renews the
   lease and watches the reply for ``cancel_requested``; the agent is killed on
   the next beat. Losing the lease (409) is fatal by design — a runner whose
@@ -322,10 +323,11 @@ class ClaimedJob:
     setup_script: str | None = None
     # Explicit CLI plugins installed in this chat's private member state.
     plugins: list[dict[str, str]] = field(default_factory=list)
-    # Read-only, single-repo, short-lived: what the runner clones with. Stays
-    # in the runner — it is never put in .git/config and never enters the
-    # sandbox environment. ``None`` for a public repository.
+    # Read-only, single-repo, short-lived: what the runner clones with. Never
+    # put in .git/config or the sandbox environment.
     clone_token: str | None = None
+    # A separate repository-scoped contents/PR write token for sandbox gh.
+    github_token: str | None = field(default=None, repr=False)
     parent_job_id: str | None = None
     turn_no: int = 1
     # MCP connection aliases this job was granted. Aliases only: the runner
@@ -381,6 +383,7 @@ class ClaimedJob:
             sandbox_token=body["sandbox_token"],
             mcp_token=body.get("mcp_token") or "",
             clone_token=body.get("clone_token") or None,
+            github_token=body.get("github_token") or None,
             mcp_bindings=list(body.get("mcp_bindings") or []),
             runtime_version=body.get("runtime_version") or None,
             thread_sandbox=(
@@ -984,10 +987,10 @@ def _auth_env(clone_token: str | None) -> dict[str, str]:
 def _assert_no_credential_on_disk(workdir: str, clone_token: str | None) -> None:
     """Fail rather than mount a worktree that carries the clone credential.
 
-    No repository credential may reach the sandbox, and this tree is about to
-    be streamed into it. Asserting the property beats assuming it: git writes
-    several files during a fetch, and a future authentication change could
-    quietly start recording the token in one of them.
+    No repository credential may be stored in the source tree, which is about
+    to be streamed into the sandbox. Asserting the property beats assuming it:
+    git writes several files during a fetch, and a future authentication change
+    could quietly start recording the token in one of them.
     """
     if not clone_token:
         return
@@ -2694,6 +2697,8 @@ def _run_shared_live_attempt(
             reasoning_effort=job.reasoning_effort,
             gateway_base_url=gateway_base_url,
             credential=None,
+            github_token=job.github_token,
+            github_repo=job.repo,
             plugins=tuple(job.plugins),
             mcp_server_ids=tuple(job.mcp_bindings),
             # The MCP relay token is attempt-fenced. It is process-fixed only

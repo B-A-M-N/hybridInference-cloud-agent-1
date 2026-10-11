@@ -176,12 +176,15 @@ class PostgresSandboxRepository:
         last_activity_at: datetime,
         actor_id: str,
         admin_ip: str,
+        broker_confirmed_stopped: bool = False,
     ) -> str:
         """Fence an idle stopped sandbox for verified S3 archival and deletion.
 
         A durable request closes admission before host export. No native state
         or ledger row is removed; only a verified host receipt may finalize
-        physical container deletion and mark its native context lost.
+        physical container deletion and mark its native context lost. A stale
+        RUNNING row may be repaired only after the API proves the exact host
+        container is stopped and idle.
         """
         async with self._pool.acquire() as conn, conn.transaction():
             await conn.execute("SET LOCAL statement_timeout = '5s'")
@@ -203,7 +206,8 @@ class PostgresSandboxRepository:
                 return "stale"
             if group["deletion_state"] in {"pending", "archived", "deleted"}:
                 return "accepted"
-            if group["state"] != "stopped":
+            forced_stopped_recovery = group["state"] == "running" and broker_confirmed_stopped
+            if group["state"] != "stopped" and not forced_stopped_recovery:
                 return "not_stopped"
             busy = await conn.fetchval(
                 """
@@ -230,6 +234,17 @@ class PostgresSandboxRepository:
                 or group["snapshot_state"] in {"pending", "snapshotting", "importing"}
             ):
                 return "busy"
+            if forced_stopped_recovery:
+                await conn.execute(
+                    """
+                    UPDATE agent_thread_sandbox_memberships
+                    SET resident_state = CASE
+                            WHEN native_state = 'lost' THEN 'lost' ELSE 'stopped' END,
+                        updated_at = NOW()
+                    WHERE sandbox_id = $1
+                    """,
+                    sandbox_id,
+                )
             request_id = str(uuid4())
             await self._record_trajectory_event(
                 conn,
@@ -244,7 +259,15 @@ class PostgresSandboxRepository:
             await conn.execute(
                 """
                 UPDATE agent_sandboxes
-                SET deletion_state = 'pending', deletion_request_id = $2,
+                SET state = CASE WHEN $3 THEN 'stopped' ELSE state END,
+                    idle_deadline = CASE WHEN $3 THEN NULL ELSE idle_deadline END,
+                    stop_requested_at = CASE WHEN $3 THEN NULL ELSE stop_requested_at END,
+                    resource_snapshot = CASE WHEN $3 THEN NULL ELSE resource_snapshot END,
+                    resource_sampled_at = CASE WHEN $3 THEN NULL ELSE resource_sampled_at END,
+                    resource_received_at = CASE WHEN $3 THEN NULL ELSE resource_received_at END,
+                    terminal_count = CASE WHEN $3 THEN NULL ELSE terminal_count END,
+                    terminal_count_observed_at = CASE WHEN $3 THEN NULL ELSE terminal_count_observed_at END,
+                    deletion_state = 'pending', deletion_request_id = $2,
                     deletion_requested_at = NOW(), deletion_retry_at = NOW(),
                     deletion_generation = generation, deletion_container_id = container_id,
                     deletion_last_activity_at = last_activity_at,
@@ -257,6 +280,7 @@ class PostgresSandboxRepository:
                 """,
                 sandbox_id,
                 request_id,
+                forced_stopped_recovery,
             )
             await self._audit_admin_deletion(
                 conn,
@@ -265,6 +289,7 @@ class PostgresSandboxRepository:
                 action="agent.sandbox.delete.requested",
                 actor_id=actor_id,
                 admin_ip=admin_ip,
+                broker_confirmed_stopped=forced_stopped_recovery,
             )
         return "accepted"
 
@@ -623,6 +648,7 @@ class PostgresSandboxRepository:
         sha256: str | None = None,
         size_bytes: int | None = None,
         archive_version_id: str | None = None,
+        broker_confirmed_stopped: bool = False,
     ) -> None:
         """Keep each deletion transition and content-free audit atomic."""
         await conn.execute(
@@ -645,6 +671,15 @@ class PostgresSandboxRepository:
                     "sha256": sha256,
                     "size_bytes": size_bytes,
                 }
+                | (
+                    {
+                        "force": True,
+                        "broker_confirmed_stopped": True,
+                        "docker_status": "stopped",
+                    }
+                    if broker_confirmed_stopped
+                    else {}
+                )
             ),
             action != "agent.sandbox.delete.failed",
         )

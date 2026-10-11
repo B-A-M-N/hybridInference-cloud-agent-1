@@ -767,7 +767,8 @@ async def test_concurrent_gitlab_refreshes_spend_one_rotating_token(store, monke
     release = asyncio.Event()
     refreshed_with: list[str] = []
 
-    async def refresh(refresh_token: str) -> dict:
+    async def refresh(refresh_token: str, *, timeout_s: float) -> dict:
+        assert timeout_s == client.request_timeout_s
         refreshed_with.append(refresh_token)
         started.set()
         await release.wait()
@@ -850,7 +851,8 @@ async def test_transient_gitlab_refresh_failure_releases_lock_but_keeps_committe
     connection = await store.get_gitlab_connection(user_id=_OWNER)
     assert connection is not None
 
-    async def fail(_refresh_token: str) -> dict:
+    async def fail(_refresh_token: str, *, timeout_s: float) -> dict:
+        assert timeout_s == client.request_timeout_s
         raise SourceControlError("temporary provider failure")
 
     monkeypatch.setattr(client, "_refresh", fail)
@@ -872,7 +874,8 @@ async def test_gitlab_refresh_first_then_disconnect_removes_the_refreshed_token(
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def refresh(_refresh_token: str) -> dict:
+    async def refresh(_refresh_token: str, *, timeout_s: float) -> dict:
+        assert timeout_s == client.request_timeout_s
         started.set()
         await release.wait()
         return {
@@ -964,12 +967,14 @@ async def test_rotating_tokens_cannot_cross_ownership(
 ) -> None:
     """The update is keyed by id *and* owner, so a guessed id is not enough."""
     connection_id = await _connect_gitlab(store, user_id=_OWNER)
+    connection = await store.get_gitlab_connection(user_id=_OWNER)
+    assert connection is not None
 
     assert (
         await store.update_gitlab_tokens(
             connection_id=connection_id,
             user_id=_OTHER,
-            refresh_generation=0,
+            refresh_generation=connection["refresh_generation"],
             access_token_ciphertext="stolen",
             refresh_token_ciphertext="stolen",
             expires_at=datetime.now(UTC) + timedelta(hours=1),
@@ -1037,3 +1042,165 @@ async def test_deleting_a_gitlab_connection_reports_and_is_scoped(
     deleted = await store.delete_gitlab_connection(user_id=_OWNER, connection_id=connection_id)
     assert deleted is not None and deleted["access_token_ciphertext"] == "at"
     assert await store.delete_gitlab_connection(user_id=_OWNER, connection_id=connection_id) is None
+
+
+async def _connect_due_gitlab(
+    store: PostgresSourceControlRepository,
+    *,
+    user_id: str = _OWNER,
+    external_user_id: int = 11,
+    username: str = "alice",
+    display_name: str = "Alice",
+    web_url: str = "https://gitlab.com/alice",
+    access_token_ciphertext: str = "cipher-a-access",
+    refresh_token_ciphertext: str = "cipher-a-refresh",
+    expires_in: timedelta = timedelta(minutes=2),
+) -> int:
+    """Store one GitLab identity whose access token is inside the refresh margin."""
+    return await store.upsert_gitlab_connection(
+        user_id=user_id,
+        external_user_id=external_user_id,
+        username=username,
+        display_name=display_name,
+        web_url=web_url,
+        access_token_ciphertext=access_token_ciphertext,
+        refresh_token_ciphertext=refresh_token_ciphertext,
+        expires_at=datetime.now(UTC) + expires_in,
+    )
+
+
+async def test_a_gitlab_token_that_does_not_need_refresh_is_not_claimed(
+    store: PostgresSourceControlRepository,
+) -> None:
+    connection_id = await _connect_gitlab(store, user_id=_OWNER)
+
+    assert (
+        await store.claim_gitlab_token_refresh(
+            connection_id=connection_id, user_id=_OWNER, lease_seconds=30, margin_seconds=300
+        )
+        is None
+    )
+
+
+async def test_one_gitlab_refresh_claim_wins_and_the_loser_cannot_write(
+    store: PostgresSourceControlRepository,
+) -> None:
+    """Two claims of one rotating token: only the holder persists."""
+    connection_id = await _connect_due_gitlab(store)
+    first, second = await asyncio.gather(
+        store.claim_gitlab_token_refresh(
+            connection_id=connection_id, user_id=_OWNER, lease_seconds=30, margin_seconds=300
+        ),
+        store.claim_gitlab_token_refresh(
+            connection_id=connection_id, user_id=_OWNER, lease_seconds=30, margin_seconds=300
+        ),
+    )
+
+    claims = [claim for claim in (first, second) if claim is not None]
+    assert len(claims) == 1
+    winner = claims[0]
+    assert winner["refresh_token_ciphertext"] == "cipher-a-refresh"
+    held = await store.get_gitlab_connection(user_id=_OWNER)
+    assert held is not None and held["refresh_lease_expires_at"] is not None
+
+    stale = await store.update_gitlab_tokens(
+        connection_id=connection_id,
+        user_id=_OWNER,
+        refresh_generation=winner["refresh_generation"] - 1,
+        access_token_ciphertext="cipher-loser-access",
+        refresh_token_ciphertext="cipher-loser-refresh",
+        expires_at=datetime.now(UTC) + timedelta(hours=2),
+    )
+    assert stale is False
+    unchanged = await store.get_gitlab_connection(user_id=_OWNER)
+    assert unchanged is not None
+    assert unchanged["access_token_ciphertext"] == "cipher-a-access"
+    assert unchanged["refresh_token_ciphertext"] == "cipher-a-refresh"
+    assert unchanged["refresh_lease_expires_at"] is not None
+
+    fresh = await store.update_gitlab_tokens(
+        connection_id=connection_id,
+        user_id=_OWNER,
+        refresh_generation=winner["refresh_generation"],
+        access_token_ciphertext="cipher-winner-access",
+        refresh_token_ciphertext="cipher-winner-refresh",
+        expires_at=datetime.now(UTC) + timedelta(hours=2),
+    )
+    assert fresh is True
+    connection = await store.get_gitlab_connection(user_id=_OWNER)
+    assert connection is not None
+    assert (connection["access_token_ciphertext"], connection["refresh_token_ciphertext"]) == (
+        "cipher-winner-access",
+        "cipher-winner-refresh",
+    )
+    assert connection["refresh_lease_expires_at"] is None
+
+
+async def test_reconnecting_gitlab_during_a_refresh_keeps_the_new_account(
+    store: PostgresSourceControlRepository,
+) -> None:
+    """Account A's in-flight refresh cannot pair B's identity with A's tokens."""
+    connection_id = await _connect_due_gitlab(store)
+    claim = await store.claim_gitlab_token_refresh(
+        connection_id=connection_id, user_id=_OWNER, lease_seconds=30, margin_seconds=300
+    )
+    assert claim is not None and claim["refresh_token_ciphertext"] == "cipher-a-refresh"
+
+    reconnected = await store.upsert_gitlab_connection(
+        user_id=_OWNER,
+        external_user_id=22,
+        username="bob",
+        display_name="Bob",
+        web_url="https://gitlab.com/bob",
+        access_token_ciphertext="cipher-b-access",
+        refresh_token_ciphertext="cipher-b-refresh",
+        expires_at=datetime.now(UTC) + timedelta(hours=2),
+    )
+    # Same row: the generation, not a new id, is what makes A's write miss.
+    assert reconnected == connection_id
+
+    wrote = await store.update_gitlab_tokens(
+        connection_id=connection_id,
+        user_id=_OWNER,
+        refresh_generation=claim["refresh_generation"],
+        access_token_ciphertext="cipher-a-refreshed-access",
+        refresh_token_ciphertext="cipher-a-refreshed-refresh",
+        expires_at=datetime.now(UTC) + timedelta(hours=2),
+    )
+    connection = await store.get_gitlab_connection(user_id=_OWNER)
+    assert wrote is False
+    assert connection is not None
+    assert connection["external_user_id"] == 22
+    assert connection["username"] == "bob"
+    assert connection["display_name"] == "Bob"
+    assert connection["web_url"] == "https://gitlab.com/bob"
+    assert connection["access_token_ciphertext"] == "cipher-b-access"
+    assert connection["refresh_token_ciphertext"] == "cipher-b-refresh"
+    assert connection["access_token_ciphertext"] != "cipher-a-refreshed-access"
+    assert connection["refresh_token_ciphertext"] != "cipher-a-refreshed-refresh"
+
+
+async def test_deleting_gitlab_during_a_refresh_makes_the_write_miss(
+    store: PostgresSourceControlRepository,
+) -> None:
+    """The row is gone, so the refresh that already claimed it cannot land."""
+    connection_id = await _connect_due_gitlab(store)
+    claim = await store.claim_gitlab_token_refresh(
+        connection_id=connection_id, user_id=_OWNER, lease_seconds=30, margin_seconds=300
+    )
+    assert claim is not None
+    assert (
+        await store.delete_gitlab_connection(user_id=_OWNER, connection_id=connection_id)
+        is not None
+    )
+
+    wrote = await store.update_gitlab_tokens(
+        connection_id=connection_id,
+        user_id=_OWNER,
+        refresh_generation=claim["refresh_generation"],
+        access_token_ciphertext="cipher-a-refreshed-access",
+        refresh_token_ciphertext="cipher-a-refreshed-refresh",
+        expires_at=datetime.now(UTC) + timedelta(hours=2),
+    )
+    assert wrote is False
+    assert await store.get_gitlab_connection(user_id=_OWNER) is None

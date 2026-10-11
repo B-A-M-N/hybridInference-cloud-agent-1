@@ -4209,6 +4209,20 @@ def test_unused_mcp_token_does_not_change_live_process_compatibility():
     )
 
 
+def test_github_token_rotation_or_removal_requires_a_new_resident_process():
+    launch = replace(
+        _launch("athr_source", native_session_id="native-source", slot=0),
+        github_token="first-token",
+        github_repo="owner/repo",
+    )
+    transport = ResidentTransport(launch=launch, session=SimpleNamespace())
+
+    assert transport.compatible_with(replace(launch, credential="renewed-grant"))
+    assert not transport.compatible_with(replace(launch, github_token="renewed-token"))
+    assert not transport.compatible_with(replace(launch, github_token=None))
+    assert not transport.compatible_with(replace(launch, github_repo="owner/other"))
+
+
 def test_missing_launch_locator_restores_the_known_member_instead_of_starting_fresh():
     factory = _TransportFactory()
     supervisor = SharedChatSessionSupervisor(_Manager(), transport_factory=factory)

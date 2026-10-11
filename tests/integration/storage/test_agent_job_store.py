@@ -655,7 +655,7 @@ async def test_shared_workspace_snapshot_publishes_without_rewriting_turn_state(
     commit_sha = "b" * 40
     assert await store.snapshot.record_snapshot_publish(
         snapshot_id=capture["snapshot_id"],
-        expected_publish_retry_count=publication["publish_retry_count"],
+        expected_publish_attempt_count=publication["publish_attempt_count"],
         pr_url="https://example.test/pull/1",
         commit_sha=commit_sha,
     )
@@ -765,7 +765,7 @@ async def test_snapshot_publication_uses_latest_current_attempt_replies_from_inc
         assert prior_publication is not None
         assert await store.snapshot.record_snapshot_publish(
             snapshot_id=prior_capture["snapshot_id"],
-            expected_publish_retry_count=prior_publication["publish_retry_count"],
+            expected_publish_attempt_count=prior_publication["publish_attempt_count"],
             pr_url="https://github.com/o/n/pull/7",
             commit_sha="b" * 40,
         )
@@ -890,7 +890,7 @@ async def test_snapshot_publication_uses_latest_current_attempt_replies_from_inc
         )
     assert await store.snapshot.record_snapshot_publish(
         snapshot_id=publication["snapshot_id"],
-        expected_publish_retry_count=publication["publish_retry_count"],
+        expected_publish_attempt_count=publication["publish_attempt_count"],
         pr_url="https://github.com/o/n/pull/8",
         commit_sha="c" * 40,
     )
@@ -1153,7 +1153,7 @@ async def test_shared_snapshot_failure_rearms_the_group_idle_deadline(
         if failure_mode == "publish_failed":
             await store.snapshot.fail_snapshot_publish(
                 snapshot_id=capture["snapshot_id"],
-                expected_publish_retry_count=publication["publish_retry_count"],
+                expected_publish_attempt_count=publication["publish_attempt_count"],
                 detail="publisher rejected the immutable patch",
             )
         else:
@@ -1294,7 +1294,7 @@ async def test_reaped_fork_does_not_poison_the_surviving_member_manifest(
         if next_action == "base_import":
             assert await store.snapshot.record_snapshot_publish(
                 snapshot_id=observed["snapshot_id"],
-                expected_publish_retry_count=observed["publish_retry_count"],
+                expected_publish_attempt_count=observed["publish_attempt_count"],
                 pr_url="https://example.invalid/pull/1",
                 commit_sha="b" * 40,
             )

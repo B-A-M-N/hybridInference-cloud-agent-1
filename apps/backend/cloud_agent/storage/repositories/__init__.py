@@ -41,6 +41,7 @@ from cloud_agent.storage.repositories.skills import PostgresSkillRepository
 from cloud_agent.storage.repositories.snapshot import PostgresSnapshotRepository
 from cloud_agent.storage.repositories.source_control import PostgresSourceControlRepository
 from cloud_agent.storage.repositories.user_memory import PostgresUserMemoryRepository
+from cloud_agent.storage.repositories.web_search import PostgresWebSearchRepository
 
 __all__ = [
     "PostgresAttachmentRepository",
@@ -72,4 +73,5 @@ __all__ = [
     "PostgresSnapshotRepository",
     "PostgresSourceControlRepository",
     "PostgresUserMemoryRepository",
+    "PostgresWebSearchRepository",
 ]

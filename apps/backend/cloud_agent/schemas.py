@@ -10,7 +10,13 @@ import binascii
 # model, so hiding this one behind TYPE_CHECKING leaves `AgentRunnerHost`
 # silently unbuilt and raises at the first request instead of at import.
 from datetime import datetime  # noqa: TC003
-from typing import Annotated, Any, Final, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Final, Literal
+from uuid import UUID
+
+if TYPE_CHECKING:
+    from pydantic import GetJsonSchemaHandler
+    from pydantic.json_schema import JsonSchemaValue
+    from pydantic_core import CoreSchema
 
 from pydantic import (
     BaseModel,
@@ -19,6 +25,7 @@ from pydantic import (
     StrictBool,
     StrictInt,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -1749,6 +1756,16 @@ class WorkerClaimResponse(BaseModel):
             "no GitHub App is configured, which is enough for a public repository."
         ),
     )
+    github_token: str | None = Field(
+        None,
+        repr=False,
+        description=(
+            "Short-lived GitHub App token scoped to this repository with contents and "
+            "pull_requests write permissions. Injected as GH_TOKEN in the owning sandbox "
+            "member for pushing branches and creating pull requests. Null when no GitHub "
+            "App installation covers the repository."
+        ),
+    )
     mcp_bindings: list[str] = Field(
         default_factory=list,
         description=(
@@ -2481,10 +2498,11 @@ class RepoBranchesResponse(BaseModel):
 class AgentRunnerHost(BaseModel):
     """One machine in the agent runner pool.
 
-    Everything below ``seconds_since_seen`` arrived with the dynamic pool
-    (phase G) and every one of those fields has a default. A host that joined
-    by polling — the only way in before enrollment existed — has none of them
-    set, and it must still render on the admin page rather than 500 it.
+    Most fields below ``seconds_since_seen`` arrived with the dynamic pool
+    (phase G) and retain defaults for hosts that joined by polling. The drain
+    fence epoch is different: its migration backfills every host and the API
+    requires it so an automation client never mistakes a partial fence
+    contract for a safe compare-and-swap base.
     """
 
     host: str
@@ -2548,6 +2566,32 @@ class AgentRunnerHost(BaseModel):
         description="Where this host's workspace broker listens, as the control plane reaches it.",
     )
     last_heartbeat_at: datetime | None = None
+    drain_fence_token: UUID | None = Field(
+        None,
+        repr=False,
+        description=(
+            "Opaque owner of an automated deployment drain, retained after release "
+            "as an idempotency receipt."
+        ),
+    )
+    drain_fence_status_before: Literal["online", "draining"] | None = Field(
+        None,
+        description="Host status immediately before the current drain-fence token was acquired.",
+    )
+    drain_fence_active: bool = Field(
+        False,
+        description=(
+            "True only while the recorded deployment fence owns a draining host; "
+            "false for an absent fence or released receipt."
+        ),
+    )
+    drain_fence_epoch: UUID = Field(
+        ...,
+        description=(
+            "Opaque compare-and-swap generation for deployment drain state. It rotates "
+            "whenever host lifecycle, credential, placement, or drain ownership changes."
+        ),
+    )
     sandbox_runtime: str | None = Field(
         None,
         description=(
@@ -2624,6 +2668,41 @@ class AgentRunnerHost(BaseModel):
             "the host predates database-backed archive settings or has not synchronized yet."
         ),
     )
+
+
+class AcquireHostDrainFenceRequest(BaseModel):
+    """Atomically replace the expected drain owner with a new opaque owner."""
+
+    expected_fence_token: UUID | None = Field(..., repr=False)
+    expected_fence_epoch: UUID = Field(
+        ...,
+        repr=False,
+        description=(
+            "Canonical UUID copied from the latest host snapshot; the acquire is stale if "
+            "drain-relevant host state changed afterward."
+        ),
+    )
+    fence_token: UUID = Field(..., repr=False)
+
+    @field_validator("expected_fence_epoch", mode="before")
+    @classmethod
+    def expected_epoch_is_canonical(cls, value: object) -> object:
+        """Reject alternate UUID spellings so persisted CAS intent is byte-stable."""
+        if isinstance(value, UUID) or not isinstance(value, str):
+            return value
+        try:
+            parsed = UUID(value)
+        except ValueError:
+            return value  # Let Pydantic produce its ordinary UUID error.
+        if str(parsed) != value:
+            raise ValueError("expected_fence_epoch must be a canonical UUID")
+        return parsed
+
+
+class ReleaseHostDrainFenceRequest(BaseModel):
+    """Release only the automated drain owned by this opaque token."""
+
+    fence_token: UUID = Field(..., repr=False)
 
 
 class HostSettingDefinition(BaseModel):
@@ -2813,18 +2892,66 @@ class SetHostSettingsRequest(BaseModel):
 
 
 class SandboxArchiveSettingsResponse(BaseModel):
-    """The revisioned archive policy stored for every sandbox host."""
+    """The revisioned archive policy stored for every sandbox host.
+
+    The secret access key is write-only. ``aws_secret_access_key_configured``
+    tells the editor whether a blank secret keeps the stored one.
+    """
 
     enabled: bool = False
     s3_uri: Literal["s3://freeinference/cloud-agent/sandbox"] = SANDBOX_ARCHIVE_S3_URI
     region: str = ""
     kms_key_arn: str = ""
     expected_bucket_owner: str = ""
+    aws_access_key_id: str = ""
+    aws_secret_access_key_configured: bool = False
     max_archive_bytes: int = DEFAULT_MAX_ARCHIVE_BYTES
     multipart_threshold_bytes: int = DEFAULT_MULTIPART_THRESHOLD_BYTES
     multipart_part_bytes: int = DEFAULT_MULTIPART_PART_BYTES
     revision: int = Field(0, ge=0)
     updated_at: datetime | None = None
+
+
+class HostSandboxArchiveSettings(SandboxArchiveSettingsResponse):
+    """Heartbeat copy. Includes the secret and omits empty credential fields.
+
+    Older brokers reject unknown policy keys. An unset access key must not
+    appear on the wire; a set key is delivered only to a broker that can
+    apply it. The admin configured flag is not part of this payload.
+    """
+
+    aws_secret_access_key: str = ""
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_credentials(self, handler: Any) -> dict[str, Any]:
+        data = handler(self)
+        if not data.get("aws_access_key_id"):
+            data.pop("aws_access_key_id", None)
+        if not data.get("aws_secret_access_key"):
+            data.pop("aws_secret_access_key", None)
+        data.pop("aws_secret_access_key_configured", None)
+        return data
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls, core_schema: CoreSchema, handler: GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        del core_schema, handler
+        schema = SandboxArchiveSettingsResponse.model_json_schema()
+        properties = dict(schema["properties"])
+        properties.pop("aws_secret_access_key_configured", None)
+        properties["aws_secret_access_key"] = {
+            "default": "",
+            "description": "Included only when an access key is configured.",
+            "title": "Aws Secret Access Key",
+            "type": "string",
+        }
+        return {
+            **schema,
+            "title": "HostSandboxArchiveSettings",
+            "description": "Archive policy delivered to a broker. Empty access-key fields are omitted.",
+            "properties": properties,
+        }
 
 
 class SetSandboxArchiveSettingsRequest(BaseModel):
@@ -2836,6 +2963,8 @@ class SetSandboxArchiveSettingsRequest(BaseModel):
     region: str = Field("", max_length=128)
     kms_key_arn: str = Field("", max_length=2048)
     expected_bucket_owner: str = Field("", max_length=12)
+    aws_access_key_id: str = Field("", max_length=128)
+    aws_secret_access_key: str = Field("", max_length=256)
     max_archive_bytes: StrictInt = Field(DEFAULT_MAX_ARCHIVE_BYTES, ge=1, le=MAX_ARCHIVE_BYTES)
     multipart_threshold_bytes: StrictInt = Field(
         DEFAULT_MULTIPART_THRESHOLD_BYTES, ge=1, le=MAX_SINGLE_UPLOAD_BYTES
@@ -2864,12 +2993,18 @@ class SetSandboxArchiveSettingsRequest(BaseModel):
 
     @model_validator(mode="after")
     def _safe_archive_policy(self) -> SetSandboxArchiveSettingsRequest:
+        # A blank secret can mean "keep the stored secret" when the access key
+        # id is unchanged. The route merges that secret and validates again.
+        if self.aws_access_key_id and not self.aws_secret_access_key:
+            return self
         try:
             SandboxArchivePolicy(
                 enabled=self.enabled,
                 region=self.region,
                 kms_key_arn=self.kms_key_arn,
                 expected_bucket_owner=self.expected_bucket_owner,
+                aws_access_key_id=self.aws_access_key_id,
+                aws_secret_access_key=self.aws_secret_access_key,
                 max_archive_bytes=self.max_archive_bytes,
                 multipart_threshold_bytes=self.multipart_threshold_bytes,
                 multipart_part_bytes=self.multipart_part_bytes,
@@ -3258,7 +3393,7 @@ class HostHeartbeatResponse(BaseModel):
             "override returns the next level's value, never a legacy environment value."
         ),
     )
-    sandbox_archive_settings: SandboxArchiveSettingsResponse
+    sandbox_archive_settings: HostSandboxArchiveSettings
     residencies_lost: list[ResidencyBeat] = Field(
         default_factory=list,
         description=(

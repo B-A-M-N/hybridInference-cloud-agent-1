@@ -281,7 +281,7 @@ class PostgresSourceControlRepository:
         refresh_token_ciphertext: str | None,
         refresh_expires_at: Any,
     ) -> bool:
-        """Write a refreshed token pair while the lease is still ours, and release it."""
+        """Write only while this generation's lease is live, then release it."""
         async with self._acquire() as conn, conn.transaction():
             locked = await conn.fetchval(
                 "SELECT 1 FROM agent_github_accounts WHERE user_id = $1 FOR UPDATE", user_id
@@ -428,6 +428,8 @@ class PostgresSourceControlRepository:
         expires_at: Any,
     ) -> int:
         """Store one GitLab.com identity per platform user."""
+        # Reconnecting replaces the account, and a refresh in flight for the
+        # previous one loses its lease: the generation moves.
         async with self._acquire() as conn, conn.transaction():
             connection_id = await conn.fetchval(
                 """
@@ -517,7 +519,7 @@ class PostgresSourceControlRepository:
         refresh_token_ciphertext: str,
         expires_at: Any,
     ) -> bool:
-        """Rotate tokens only while this owner still holds the claimed generation."""
+        """Rotate only while this owner holds the generation and its live lease."""
         async with self._acquire() as conn, conn.transaction():
             locked = await conn.fetchval(
                 "SELECT 1 FROM agent_gitlab_connections WHERE id = $1 AND user_id = $2 FOR UPDATE",

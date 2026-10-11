@@ -63,9 +63,11 @@ field is missing or an optional integration is only partly configured, the
 attention.
 
 For the first deployment of this release, run `alembic upgrade head` through
-`0048_sandbox_plugins`. Rebuild the sandbox image for explicit plugin loading.
-Then start the main control-plane listener with its
-existing complete environment. It imports registered environment settings once,
+`0051_host_drain_fence_epoch`. Existing hosts begin without a deployment drain
+owner or release receipt, and 0051 backfills each one with a non-null fence
+epoch. Rebuild the sandbox image for explicit plugin loading. Then start the
+main control-plane listener with its existing complete environment. It
+imports registered environment settings once,
 while the MCP-only listener waits for initialization and then reads the same
 settings. Newly migrated runtime identity, service keys, broker credentials,
 and policy fields are imported only when absent, under the same atomic
@@ -130,6 +132,13 @@ S3-compatible endpoint and object prefix. The matching
 `AGENT_SANDBOX_ARCHIVE_S3_*` environment variables import once when these fields
 are first introduced; later environment changes do not override saved settings.
 An empty bucket leaves deletion unavailable.
+
+The bucket field also accepts an S3 URI in the browser. Saving
+`s3://freeinference/cloud-agent/sandbox` sets the bucket to `freeinference` and
+the prefix to `cloud-agent/sandbox` in one update. A bucket-root URI clears the
+prefix; entering only a bucket name leaves the prefix unchanged. Direct API
+updates and initial environment imports require the bucket name and prefix in
+their separate settings.
 
 Provision the main control plane's AWS SDK credential chain, preferably with an
 IAM workload role. Its archive role needs `s3:PutObject` and `s3:GetObject` on the
@@ -535,7 +544,7 @@ control-plane and host releases. Apply `alembic upgrade head` before starting
 the updated API. Inventory removal additionally requires
 `0044_admin_sandbox_archive`, and S3-backed container deletion requires
 `0045_admin_sandbox_deletion` plus the matching workspace broker release.
-The append-only admin trajectory requires `0049_admin_sandbox_trajectory`.
+The append-only admin trajectory requires `0056_admin_sandbox_trajectory`.
 Resource persistence requires migration
 `0034_sandbox_resource_usage` and a host running the updated workspace broker.
 Older hosts still appear in the inventory with resource usage unavailable.
@@ -1068,16 +1077,40 @@ user with no installation looping through authorization.
 The same App also supplies the runner's clone credential, and the two are
 _not_ the same token. An installation token inherits every permission the App
 holds unless it asks for less, so the clone token is requested as
-`contents: read` on the single repository being worked on. Getting that wrong
-would put a push-capable credential on the host that executes untrusted
-repository code.
+`contents: read` on the single repository being worked on. Checkout does not
+inherit the publisher's broader authority.
+
+The claim separately mints a single-repository installation token with
+`contents: write` and `pull_requests: write`, injected as `GH_TOKEN` in the
+owning sandbox member's Agent CLI environment. `GH_REPO` selects the job's
+repository and `GH_HOST` selects `github.com`; `gh` authenticates as the App
+installation, rather than as the user's account. The token is not written to
+Git or GitHub CLI configuration, shared workspace files, or the image. Setup
+scripts and standalone terminal sessions do not receive it. Git uses the
+`gh auth git-credential` helper through invocation-only environment settings,
+so `git push` and `gh pr create` can authenticate without an interactive login.
+The host clone credential stays read-only; user account/refresh tokens and
+the App's private key remain outside the sandbox.
+
+Direct sandbox pushes bypass the trusted publisher's patch gate, including
+its workflow-file and secret checks. Repository branch protection and GitHub
+rules still apply. The App installation must grant Contents and Pull requests
+write access; token issuance failures return the claim to the queue.
+
+Each claim obtains a live token from the App's expiry-aware cache. When that
+token changes, the member resumes its native session in a replacement process
+so subsequent commands inherit the new credential. Installation tokens expire
+after about one hour; there is no in-turn renewal, so `gh` calls in a longer
+turn may require a new turn to obtain a fresh token.
 
 With no App configured the claim returns no clone token and the runner clones
 anonymously, which is enough for a public repository. A private repository
 needs the App.
 
-A static `AGENT_GITHUB_TOKEN` still works as a fallback, but it is a
-long-lived credential someone has to create and rotate; prefer the App.
+A static `AGENT_GITHUB_TOKEN` still works as a fallback for the trusted
+publisher, but it is a long-lived credential someone has to create and
+rotate; prefer the App. Sandbox GitHub authentication requires the App and
+never falls back to this static token.
 With neither, the publisher loop idles and says so — jobs still run and still
 produce patches, they just never become PRs.
 
@@ -1539,11 +1572,14 @@ Use the **Sandbox archives** card under **Admin → Settings → Sandbox** to st
 the deployment-wide archive policy in the Agent database. The destination is
 fixed at `s3://freeinference/cloud-agent/sandbox`; it is displayed read-only and
 is never accepted from the browser. An administrator atomically saves the
-enabled state, AWS region, customer-managed KMS key ARN, expected 12-digit
-bucket owner, maximum compressed archive size, multipart threshold, and part
-size. Updates use the revision returned by the last read, so two administrators
-cannot silently overwrite each other. Every change is recorded in the Audit
-log.
+enabled state, AWS region, maximum compressed archive size, multipart
+threshold, and part size. Authentication is either an AWS access key or the
+workload-identity pair: a customer-managed KMS key ARN and the expected
+12-digit bucket owner. An access key makes that pair optional; uploads then
+use SSE-S3 unless a KMS key is also set. The secret is write-only, encrypted
+at rest, and omitted from the audit row. Updates use the revision returned by
+the last read, so two administrators cannot silently overwrite each other.
+Every change is recorded in the Audit log.
 
 The dashboard uses admin-only `GET` and `PUT`
 `/admin/agent/sandbox-archive-settings`. To inspect the same policy and host
@@ -1562,13 +1598,19 @@ FROM agent_runner_hosts
 ORDER BY host;
 ```
 
-Do not put AWS access keys, archive policy, or the destination in `.env`. The
-workspace broker uses the host's AWS workload identity and the ordinary SDK
-credential chain. That identity needs the narrow S3 multipart/write and exact
-object-metadata permissions for the fixed prefix, plus encrypt access to the
-configured KMS key. The bucket must have versioning enabled. Configure lifecycle
-retention and access logging on the bucket itself; neither the runner nor a
-sandbox receives AWS credentials.
+Do not put archive policy, the destination, or an AWS access key in `.env`.
+Enter an access key on the Sandbox archives card when the broker has no
+workload identity. The control plane encrypts the secret before storing it
+and sends it to the broker on the authenticated heartbeat channel. The broker
+keeps it in memory for S3. Sandbox markers do not contain it, so it does not
+enter the container. A broker that predates access-key support rejects that
+heartbeat payload and does not confirm the revision; upgrade those brokers
+before relying on the key. With no access key, the workspace broker uses the
+host's AWS workload identity and the ordinary SDK credential chain. That
+identity needs the narrow S3 multipart/write and exact object-metadata
+permissions for the fixed prefix, plus encrypt access to the configured KMS
+key. The bucket must have versioning enabled. Configure lifecycle retention
+and access logging on the bucket itself.
 
 Concretely, grant the broker role `s3:GetBucketVersioning` on
 `arn:aws:s3:::freeinference`; `s3:ListBucket` on that bucket constrained to the
@@ -1577,7 +1619,8 @@ missing immutable initial object from an authorization failure); and
 `s3:GetObject`, `s3:PutObject`, and `s3:AbortMultipartUpload` on
 `arn:aws:s3:::freeinference/cloud-agent/sandbox/*`. The configured KMS key
 policy must permit `kms:GenerateDataKey` and `kms:Decrypt` for SSE-KMS
-multipart uploads. Add an `AbortIncompleteMultipartUpload` bucket lifecycle
+multipart uploads. An access key needs those same S3 actions; SSE-S3 uploads
+do not call KMS. Add an `AbortIncompleteMultipartUpload` bucket lifecycle
 rule as defense in depth for a host that disappears before its bounded abort
 request completes.
 
@@ -1817,6 +1860,79 @@ For downstream Actions triggered by `workflow_run`, the workflow definition
 comes from that repository's default branch. Synchronize orchestrator changes
 there before relying on a new rollback fence, and do not dispatch an older
 default-branch workflow against an environment during that rollout window.
+
+Migration `0049_host_drain_fence` introduced durable drain ownership and its V1
+recipe marker. Additive migration `0051_host_drain_fence_epoch` establishes the
+current permanent compatibility floor. Before activating the V2 control plane,
+the deployment orchestrator must reject every candidate whose control-plane
+recipe lacks `AGENT_DEPLOY_DRAIN_FENCE_V2`; after activation, do not downgrade
+the application or schema below that release. The recipe retains
+`AGENT_DEPLOY_DRAIN_FENCE_V1` only so an older orchestrator can perform the
+bridge upgrade. V1 alone is not a valid rollback target once V2 has run.
+
+Every host now has a non-null `drain_fence_epoch`. The API returns its canonical
+UUID spelling and requires the same value, together with the expected owner
+token, when acquiring or transferring a fence. A successful state change
+rotates the epoch. An exact requested-token retry is checked first, so a lost
+success response remains idempotent even though that success changed the epoch;
+a different token carrying the old epoch is stale.
+
+The database enforces the generation outside the API as well. Its `BEFORE
+UPDATE` trigger rotates the epoch when `status`, `credential_hash`,
+`drain_fence_token`, `drain_fence_status_before`, `drain_fence_active`, or
+`compute_node_id` changes, and ignores an attempt to assign the epoch directly.
+Its `BEFORE DELETE` guard rejects deletion while a drain fence is active. This
+means an operator, reaper, old writer, or placement change invalidates every
+previous snapshot rather than recreating a token-only ABA state. An older V1
+control plane does not compare the epoch and is therefore not operationally
+compatible, even though its writes still cause rotation.
+
+Inspect fence state before rollback or recovery:
+
+```sql
+SELECT host, status, slots_used, drain_fence_token,
+       drain_fence_status_before, drain_fence_active, drain_fence_epoch
+FROM agent_runner_hosts
+WHERE drain_fence_token IS NOT NULL;
+```
+
+The compatibility floor remains even when this query is empty: the current
+control plane may create a receipt on its next automated deployment. If an
+active fence is abandoned, redeploy the V2 fence-capable release and use its
+token-conditional release (or the audited force override). If that is
+impossible, stop the control plane and every deployment workflow, begin a
+transaction, lock exactly one host row, and verify the expected token, epoch,
+and `slots_used = 0`. Only then may an operator clear that one active fence:
+
+```sql
+BEGIN;
+SELECT host, status, slots_used, drain_fence_token, drain_fence_active,
+       drain_fence_epoch
+FROM agent_runner_hosts
+WHERE host = '<exact-host>'
+FOR UPDATE;
+
+UPDATE agent_runner_hosts
+SET status = 'online',
+    drain_fence_token = NULL,
+    drain_fence_status_before = NULL,
+    drain_fence_active = FALSE
+WHERE host = '<exact-host>'
+  AND status = 'draining'
+  AND slots_used = 0
+  AND drain_fence_token = '<expected-token>'::uuid
+  AND drain_fence_epoch = '<expected-epoch>'::uuid
+  AND drain_fence_active
+RETURNING host, drain_fence_epoch;
+COMMIT;
+```
+
+Require exactly one returned row. The returned epoch is the newly rotated
+value; do not try to assign it yourself. To clear only an inactive receipt, use
+the same exact host, token, and epoch predicates with `NOT drain_fence_active`;
+change status only when the separately verified recovery requires it. Never
+bulk-clear fence fields. If the owner, token, or epoch is uncertain, leave the
+host draining and restore the V2 fence-capable control plane.
 
 #### Cold starts and failed deployments
 
@@ -2093,7 +2209,7 @@ actual source and target versions before choosing a rolling deploy.
   `0011_mcp_rolling_compat` restores inert compatibility columns on databases
   upgraded by the original `0008`, which dropped/renamed them. Apply through
   head before starting the updated control plane and MCP relay.
-- `0052_mcp_connector_invariant` repairs the singular connector route for MCP
+- `0057_mcp_connector_invariant` repairs the singular connector route for MCP
   connections and adds a unique constraint on each connection's authorization
   mapping. Treat this revision as a stopped-writer boundary. Older binaries can
   recreate a missing mapping, leave a stale mapping after disconnect, or retain
@@ -2102,8 +2218,8 @@ actual source and target versions before choosing a rolling deploy.
   revision. Instead:
 
   1. stop every control-plane, MCP relay and web-tier database writer;
-  2. run `alembic upgrade 0052_mcp_connector_invariant` (or upgrade through
-     `0052` to the intended later revision);
+  2. run `alembic upgrade 0057_mcp_connector_invariant` (or upgrade through
+     `0057` to the intended later revision);
   3. deploy the invariant-aware control-plane, MCP relay and web-tier release;
      and
   4. resume writers only after every old binary has been replaced.

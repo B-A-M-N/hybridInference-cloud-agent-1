@@ -38,14 +38,22 @@ across restarts. The inventory below records built-in defaults and the
 environment names used for an initial import. Once a setting is registered, the
 service no longer reads it continuously from `.env`.
 
-Run `alembic upgrade head` (through `0048_sandbox_plugins`) before starting
-this release. The updated worker claim query requires
+Run `alembic upgrade head` (through `0051_host_drain_fence_epoch`) before
+starting this release. The updated worker claim query requires
 `agent_jobs.claim_retry_at`, and chat plugin selections require
 `agent_threads.plugins`; existing queued jobs remain immediately eligible and
-existing chats default to no plugins after the migrations. Rebuild the sandbox
-image to load selected plugins with the updated CLI wrappers. The main
-control-plane listener then initializes the settings document once from its
-existing environment. The MCP-only listener
+existing chats default to no plugins after the migrations. Migration 0049
+starts every existing host without a deployment drain owner or release receipt;
+0051 backfills a non-null drain-fence epoch for every host. The database rotates
+that epoch whenever drain-relevant lifecycle, credential, placement, or
+ownership state changes. Once the V2 control plane is activated, 0051 and
+`AGENT_DEPLOY_DRAIN_FENCE_V2` are the application and schema rollback floor.
+The V1 marker remains only so an older orchestrator can perform the bridge
+upgrade; it is not a post-activation rollback target. Rebuild the sandbox image
+to load selected plugins with the updated CLI wrappers. The main control-plane
+listener then initializes the settings document once from its existing
+environment. The
+MCP-only listener
 waits for that document and uses the same saved values.
 
 After the initial import, edit values in **Admin → Settings**. Later
@@ -74,12 +82,14 @@ never reactivates an old environment value.
 Configure sandbox archives only in **Admin → Settings → Sandbox**. Cloud
 Agent stores them as one revisioned policy in the Agent database. There is no
 `AGENT_SANDBOX_ARCHIVE_*` environment surface. The destination is fixed at
-`s3://freeinference/cloud-agent/sandbox`; the saved policy contains enablement,
-region, KMS key ARN, expected bucket owner, and bounded upload sizes, but no AWS
-credential. Workspace brokers authenticate with their deployment workload
-identity through the standard AWS SDK credential chain. See
-[Sandbox archives](docs/operations.md#sandbox-archives) for IAM, bucket
-versioning, rollout, and lifecycle semantics.
+`s3://freeinference/cloud-agent/sandbox`. The saved policy contains enablement,
+region, bounded upload sizes, and either an AWS access key or the workload
+identity fields (customer-managed KMS key ARN and expected bucket owner). The
+secret access key is encrypted with the settings encryption key and is not
+returned by the admin API. With no access key, workspace brokers authenticate
+with their deployment workload identity through the standard AWS SDK credential
+chain. See [Sandbox archives](docs/operations.md#sandbox-archives) for IAM,
+bucket versioning, rollout, and lifecycle semantics.
 
 The database also stores the control-plane runtime identity, signing/encryption
 keys, broker credentials, cookie/proxy policy, MCP target policy, and default
@@ -290,6 +300,7 @@ relay reachability and connection target policy.
 | `AGENT_CONTROL_PLANE_TUNNEL_*` | **NEW** | Runner-only SSH tunnel to the main API. Required suffixes: `SSH_DESTINATION`, `SSH_KEY`, `SSH_KNOWN_HOSTS`. Defaults for `SSH_PORT` / `REMOTE_HOST` / `REMOTE_PORT` / `LISTEN_PORT`: `22` / `127.0.0.1` / `8000` / `8000`. It joins only the runner network and is unreachable from sandboxes. Use a key distinct from the MCP and inference keys. |
 | `AGENT_CONTROL_PLANE_HOSTNAME` | **NEW** | That tunnel's alias, on the runner network only. Defaults to `agent-control-plane`. |
 | `AGENT_MCP_PUBLIC_BASE_URL` | optional override | The public API base URL used to register and receive MCP OAuth callbacks, including the API prefix — for example `https://example.com/agents/api`. The callback is `<base>/v1/agent/mcp/oauth/callback/<connection-id>`. After processing it, the service returns the browser to `<AGENT_WEB_BASE_URL>/integrations`; the web and API bases may differ. When unset, reuse `AGENT_SESSION_REDIRECT_URI` with its exact `/v1/session/callback` suffix removed, preserving the public API origin and proxy prefix. This works with the existing required sign-in configuration; use the override only if MCP callbacks have a separate public address. Never derived from request headers. If neither setting supplies a callback address, browser authorization is unavailable; static credentials still work. |
+| `AGENT_MCP_GITHUB_CLIENT_ID` / `AGENT_MCP_GITHUB_CLIENT_SECRET` | optional legacy import | Configure GitHub MCP browser sign-in in Admin Settings → MCP. Register a service-owned GitHub OAuth App or GitHub App with callback `<public API base>/v1/agent/mcp/oauth/callback/github` (including the API proxy prefix). Both client values and a public callback base are required. The preset then defaults to browser sign-in; each user authorizes their own account without registering an app or pasting a token. The client secret stays in encrypted settings and pending OAuth flows, while user tokens remain in separate MCP connections. Prefer a GitHub App limited to the required repositories and permissions, including Contents and Pull requests read and write access when agents publish changes; OAuth Apps request `repo` and `read:org` scopes (GitHub's `repo` scope permits writes). A personal access token remains available for narrower repository access. |
 | `AGENT_MCP_ALLOW_PRIVATE_TARGETS` | **NEW** | Whether a user-added MCP connection may dial private and loopback addresses. Off by default: a remote connection that reaches loopback reaches **this** service, and a user who needs a private network should run a connector instead. Turning it on still refuses the ranges this platform never dials, so it cannot be used to reach the cloud metadata service. |
 | `AGENT_MCP_ALLOW_PLAIN_HTTP` | **NEW** | Whether a user-added MCP connection may use `http://` as well as `https://`. Off by default because the credential would travel in the clear. A deployment whose connector bridge is genuinely HTTP inside a private network turns it on deliberately; it is a separate variable from the private-target one because it is a separate risk. |
 | `AGENT_MCP_SERVERS` | **NEW** | **Not operator-set — listed so nobody provisions it.** The name the runner publishes the relay endpoints under for the image-shipped wrappers, as one JSON object of `{alias: url}`. The wrappers merge it into the CLI config they already write, under whichever key their CLI spells MCP with, and add the token reference in that CLI's own syntax — which is not portable between them. A value put here by hand would point a sandbox at servers nobody connected. |

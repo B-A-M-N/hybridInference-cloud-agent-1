@@ -16,14 +16,14 @@ from cloud_agent.storage.assembly import Storage
 
 pytestmark = pytest.mark.dbtest
 
-_BEFORE = "0051_snapshot_publish_retries"
-_THIS = "0052_mcp_connector_invariant"
+_BEFORE = "0056_admin_sandbox_trajectory"
+_THIS = "0057_mcp_connector_invariant"
 _OWNER = "user-owner"
 _OTHER = "user-other"
 _PRESERVED_AUTHORIZED_AT = datetime(2001, 2, 3, 4, 5, 6, tzinfo=timezone.utc)
 
 
-def test_mcp_connector_invariant_revision_follows_snapshot_retries() -> None:
+def test_mcp_connector_invariant_revision_follows_trajectory_merge() -> None:
     """The repair extends the one post-merge migration line."""
     config = Config(str(REPO / "alembic.ini"))
     config.set_main_option("script_location", str(REPO / "migrations"))
@@ -69,7 +69,7 @@ async def _remote_connection(store: Storage, *, label: str) -> dict:
 
 @pytest.mark.asyncio
 async def test_migration_repairs_routes_and_preserves_only_the_canonical_pair(pool) -> None:
-    """0052 backfills valid authority and removes every stale alternative."""
+    """0057 backfills valid authority and removes every stale alternative."""
     config = _db_config()
     downgrade_to(config, _BEFORE)
     store = Storage(pool)

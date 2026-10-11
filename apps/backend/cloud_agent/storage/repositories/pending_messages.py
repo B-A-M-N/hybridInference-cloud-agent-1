@@ -600,7 +600,8 @@ class PostgresPendingMessageRepository:
                 """
                 UPDATE agent_pending_messages
                 SET state = $2, send_now_job_id = $3, send_now_requested_at = NOW(),
-                    last_error = NULL, revision = revision + 1, updated_at = NOW()
+                    send_now_handed_off = FALSE, last_error = NULL,
+                    revision = revision + 1, updated_at = NOW()
                 WHERE id = $1
                 """,
                 message_id,
@@ -659,6 +660,7 @@ class PostgresPendingMessageRepository:
                 FROM agent_pending_messages
                 WHERE id = $1 AND state = $2 AND revision = $3
                   AND send_now_requested_at IS NOT NULL
+                  AND send_now_handed_off = FALSE
                 FOR UPDATE
                 """,
                 message_id,
@@ -740,6 +742,7 @@ class PostgresPendingMessageRepository:
                 JOIN agent_jobs j ON j.id = p.send_now_job_id
                 JOIN agent_attempts a ON a.id = j.current_attempt_id
                 WHERE p.state = $1 AND p.send_now_requested_at IS NOT NULL
+                  AND p.send_now_handed_off = FALSE
                   AND j.state = $2 AND NOT j.cancel_requested
                   AND a.status = 'running'
                   AND a.lease_expires_at > clock_timestamp()
@@ -819,10 +822,10 @@ class PostgresPendingMessageRepository:
             changed = await conn.fetchval(
                 """
                 UPDATE agent_pending_messages
-                SET send_now_requested_at = NULL, revision = revision + 1,
-                    updated_at = clock_timestamp()
+                SET send_now_handed_off = TRUE, updated_at = clock_timestamp()
                 WHERE id = $1 AND state = $2 AND revision = $3
                   AND send_now_requested_at IS NOT NULL
+                  AND send_now_handed_off = FALSE
                 RETURNING TRUE
                 """,
                 message_id,
@@ -863,6 +866,7 @@ class PostgresPendingMessageRepository:
                 LEFT JOIN agent_jobs j ON j.id = p.send_now_job_id
                 LEFT JOIN agent_attempts a ON a.id = j.current_attempt_id
                 WHERE p.state = $1 AND p.send_now_requested_at IS NOT NULL
+                  AND p.send_now_handed_off = FALSE
                   AND (
                       p.updated_at <= p.send_now_requested_at
                       OR p.updated_at < clock_timestamp()
@@ -981,9 +985,11 @@ class PostgresPendingMessageRepository:
                     """
                     UPDATE agent_pending_messages
                     SET state = $3, send_now_job_id = NULL, send_now_requested_at = NULL,
-                        last_error = $5, revision = revision + 1,
+                        send_now_handed_off = FALSE, last_error = $5,
+                        revision = revision + 1,
                         updated_at = clock_timestamp()
                     WHERE id = $1 AND state = $2 AND revision = $4
+                      AND send_now_handed_off = FALSE
                     """,
                     message_id,
                     PENDING_SENDING,
@@ -1037,7 +1043,8 @@ class PostgresPendingMessageRepository:
                 """
                 UPDATE agent_pending_messages
                 SET state = 'queued', send_now_job_id = NULL, send_now_requested_at = NULL,
-                    last_error = $3, revision = revision + 1, updated_at = NOW()
+                    send_now_handed_off = FALSE, last_error = $3,
+                    revision = revision + 1, updated_at = NOW()
                 WHERE thread_id = $1 AND state = $2
                 """,
                 thread_id,

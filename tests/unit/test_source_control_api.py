@@ -151,7 +151,7 @@ async def test_integrations_gitlab_uses_source_control_repository(
         assert claim == {
             "connection_id": 7,
             "user_id": _OWNER,
-            "lease_seconds": 30,
+            "lease_seconds": 50,
             "margin_seconds": 300,
         }
         update = store.source_control.update_gitlab_tokens.await_args.kwargs
@@ -161,6 +161,7 @@ async def test_integrations_gitlab_uses_source_control_repository(
         assert gitlab.cipher.decrypt(update["access_token_ciphertext"]) == "access-two"
         assert gitlab.cipher.decrypt(update["refresh_token_ciphertext"]) == "refresh-two"
     else:
+        store.source_control.claim_gitlab_token_refresh.assert_not_awaited()
         store.source_control.update_gitlab_tokens.assert_not_awaited()
 
 

@@ -106,6 +106,76 @@ def _terminal_activity_needs_refresh(detail: AdminSandboxDetail) -> bool:
     )
 
 
+async def _confirm_force_delete_stopped(
+    detail: AdminSandboxDetail, storage: _AdminSandboxesStorage
+) -> None:
+    """Require fresh host proof that the exact retained container is stopped and idle."""
+    sandbox = detail.sandbox
+    host = await storage.host_pool.get_host(host=sandbox.host)
+    try:
+        broker = None if host is None else broker_for_host(host)
+    except BrokerUrlRefused:
+        broker = None
+    if broker is None:
+        raise HTTPException(
+            status_code=503,
+            detail="The owning host's workspace broker is unavailable. Restore its connection and try again.",
+        )
+    try:
+        row = await broker.shared_chat_sandbox_status(sandbox.origin_thread_id, timeout=5)
+    except WorkspaceBrokerError as exc:
+        if exc.status_code in {404, 410}:
+            raise HTTPException(
+                status_code=409,
+                detail="The host's container changed or is missing. Refresh details before force deleting it.",
+            ) from None
+        raise HTTPException(
+            status_code=503,
+            detail="The owning host's workspace broker is unavailable. Restore its connection and try again.",
+        ) from None
+    if (
+        row.get("thread_id") != sandbox.origin_thread_id
+        or row.get("origin_thread_id") != sandbox.origin_thread_id
+        or row.get("sandbox_id") != sandbox.id
+        or row.get("container_id") != sandbox.container_id
+        or row.get("generation") != sandbox.generation
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="The host's container changed. Refresh details before force deleting it.",
+        )
+    if row.get("running") is True:
+        raise HTTPException(
+            status_code=409,
+            detail="The host still reports this sandbox as running. Stop it before deleting it.",
+        )
+    if row.get("running") is not False or row.get("docker_status") != "stopped":
+        raise HTTPException(
+            status_code=409,
+            detail="The host cannot prove that this container is cleanly stopped.",
+        )
+    terminal_count = row.get("terminal_count")
+    operation_count = row.get("operation_count")
+    counts_valid = (
+        not isinstance(terminal_count, bool)
+        and isinstance(terminal_count, int)
+        and not isinstance(operation_count, bool)
+        and isinstance(operation_count, int)
+    )
+    if (
+        not counts_valid
+        or terminal_count != 0
+        or operation_count != 0
+        or row.get("busy") is not False
+        or row.get("group_busy") is not False
+        or row.get("snapshotting") is not False
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="The host reports active or unknown sandbox work. Wait until it is idle.",
+        )
+
+
 def get_admin_sandbox_queries(
     store: _AdminSandboxesStorage | None = Depends(get_storage),
 ) -> AdminSandboxQueries:
@@ -331,17 +401,42 @@ async def delete_admin_sandbox(
     sandbox_id: str,
     payload: AdminSandboxStopRequest,
     request: Request,
+    force: bool = Query(False),
     admin: str = Depends(verify_admin_access),
     archive_available: bool = Depends(admin_sandbox_deletion_available),
     store: _AdminSandboxesStorage | None = Depends(get_storage),
 ) -> AdminSandboxDetail:
-    """Queue archive-before-delete under the exact reviewed stopped-container fence."""
+    """Queue verified deletion, with fail-closed recovery for stale running state."""
     if not archive_available:
         raise HTTPException(
             status_code=503,
             detail="Configure a sandbox archive S3 bucket in Admin Settings before deleting sandboxes.",
         )
     storage = require_store(store)
+    broker_confirmed_stopped = False
+    if force:
+        current = await storage.admin_sandboxes.detail(sandbox_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="Sandbox not found.")
+        reviewed = AdminSandboxDetail.model_validate(current)
+        sandbox = reviewed.sandbox
+        if (
+            sandbox.generation != payload.generation
+            or sandbox.container_id != payload.container_id
+            or sandbox.last_activity_at != payload.last_activity_at
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Sandbox activity or container changed. Refresh before deleting it.",
+            )
+        if sandbox.state == "running":
+            await _confirm_force_delete_stopped(reviewed, storage)
+            broker_confirmed_stopped = True
+        elif sandbox.state != "stopped":
+            raise HTTPException(
+                status_code=409,
+                detail="Force deletion can only recover a sandbox still recorded as running.",
+            )
     result = await storage.sandbox.request_admin_delete(
         sandbox_id=sandbox_id,
         generation=payload.generation,
@@ -349,6 +444,7 @@ async def delete_admin_sandbox(
         last_activity_at=payload.last_activity_at,
         actor_id=admin,
         admin_ip=get_client_ip(request),
+        broker_confirmed_stopped=broker_confirmed_stopped,
     )
     errors = {
         "not_found": (404, "Sandbox not found."),

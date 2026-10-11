@@ -25,9 +25,10 @@ if TYPE_CHECKING:
 CAPTURE_RETRY_S = 5.0
 #: How long a published base whose import failed waits before it is retried.
 BASE_IMPORT_RETRY_S = 15.0
-#: A transient publication failure waits before its deterministic replay.
+#: A publication whose entitlement preflight failed waits before retrying.
 PUBLISH_RETRY_S = 30.0
-#: Remote publication attempts before the artifact becomes manual-review work.
+#: How many transient failures may return a publication to the durable queue.
+#: The next failure exhausts it and preserves the lineage block for review.
 PUBLISH_MAX_ATTEMPTS = 5
 
 
@@ -380,7 +381,7 @@ class PostgresSnapshotRepository:
             snapshot = await conn.fetchrow(
                 """
                 SELECT s.id AS snapshot_id, s.sandbox_id, s.workspace_epoch,
-                       s.publish_retry_count,
+                       s.publish_attempt_count,
                        s.anchor_job_id AS id, s.base_sha, s.patch_content AS patch,
                        (
                            SELECT COALESCE(
@@ -523,7 +524,7 @@ class PostgresSnapshotRepository:
                 return {
                     "publication_kind": "shared_snapshot",
                     "snapshot_id": int(snapshot["snapshot_id"]),
-                    "publish_retry_count": int(snapshot["publish_retry_count"]),
+                    "publish_attempt_count": int(snapshot["publish_attempt_count"]),
                     "sandbox_id": snapshot["sandbox_id"],
                     "workspace_epoch": int(snapshot["workspace_epoch"]),
                     "included_job_ids": load_json(snapshot["included_job_ids"]) or [],
@@ -557,15 +558,48 @@ class PostgresSnapshotRepository:
                 }
             return None
 
+    async def renew_snapshot_publish_claim(
+        self, *, snapshot_id: int, expected_publish_attempt_count: int
+    ) -> bool:
+        """Heartbeat this exact publishing claim using database wall time."""
+        async with self._pool.acquire() as conn:
+            renewed = await conn.fetchval(
+                """
+                UPDATE agent_sandbox_snapshots
+                SET updated_at = clock_timestamp()
+                WHERE id = $1 AND state = 'publishing'
+                  AND publish_attempt_count = $2
+                RETURNING id
+                """,
+                snapshot_id,
+                expected_publish_attempt_count,
+            )
+        return renewed is not None
+
     async def defer_snapshot_publish(
-        self, *, snapshot_id: int, expected_publish_retry_count: int, detail: str
+        self, *, snapshot_id: int, expected_publish_attempt_count: int, detail: str
+    ) -> bool:
+        return await self._defer_snapshot_publish(
+            snapshot_id=snapshot_id,
+            expected_publish_attempt_count=expected_publish_attempt_count,
+            detail=detail,
+            stall_seconds=None,
+        )
+
+    async def _defer_snapshot_publish(
+        self,
+        *,
+        snapshot_id: int,
+        expected_publish_attempt_count: int,
+        detail: str,
+        stall_seconds: float | None,
     ) -> bool:
         """Retry a transient publication, or stop after the durable budget.
 
         Deterministic branch and PR reconciliation makes replay safe even when
         the process died after a remote effect. The counter survives restarts;
         exhaustion marks the artifact and group dirty for manual review rather
-        than skipping it and publishing a later, out-of-order workspace epoch.
+        than skipping it and publishing a later workspace epoch out of order.
         The expected counter rejects a publisher whose stalled claim was
         reclaimed. Returns ``False`` unless this exact claim is still
         ``publishing``.
@@ -580,29 +614,37 @@ class PostgresSnapshotRepository:
                 """
                 UPDATE agent_sandbox_snapshots
                 SET state = CASE
-                        WHEN publish_retry_count + 1 >= $5 THEN 'failed'
+                        WHEN publish_attempt_count >= $5 THEN 'failed'
                         ELSE 'captured'
                     END,
-                    publish_retry_count = publish_retry_count + 1,
+                    publish_attempt_count = CASE
+                        WHEN publish_attempt_count >= $5 THEN publish_attempt_count
+                        ELSE publish_attempt_count + 1
+                    END,
                     last_error = CASE
-                        WHEN publish_retry_count + 1 >= $5 THEN $6
+                        WHEN publish_attempt_count >= $5 THEN $6
                         ELSE $3
                     END,
                     retry_at = CASE
-                        WHEN publish_retry_count + 1 >= $5 THEN NULL
+                        WHEN publish_attempt_count >= $5 THEN NULL
                         ELSE clock_timestamp() + make_interval(secs => $4)
                     END,
                     updated_at = NOW()
                 WHERE id = $1 AND state = 'publishing'
-                  AND publish_retry_count = $2
+                  AND publish_attempt_count = $2
+                  AND (
+                      $7::double precision IS NULL
+                      OR updated_at < clock_timestamp() - make_interval(secs => $7)
+                  )
                 RETURNING id, sandbox_id, anchor_job_id, state, last_error
                 """,
                 snapshot_id,
-                expected_publish_retry_count,
+                expected_publish_attempt_count,
                 retry_detail,
                 PUBLISH_RETRY_S,
                 PUBLISH_MAX_ATTEMPTS,
                 exhausted_detail,
+                stall_seconds,
             )
             if row is None:
                 return False
@@ -649,7 +691,7 @@ class PostgresSnapshotRepository:
         self,
         *,
         snapshot_id: int,
-        expected_publish_retry_count: int,
+        expected_publish_attempt_count: int,
         pr_url: str,
         commit_sha: str,
     ) -> bool:
@@ -667,13 +709,13 @@ class PostgresSnapshotRepository:
                     published_commit_sha = $3, published_at = NOW(),
                     last_error = NULL, retry_at = NULL, updated_at = NOW()
                 WHERE id = $1 AND state = 'publishing'
-                  AND publish_retry_count = $4
+                  AND publish_attempt_count = $4
                 RETURNING sandbox_id, anchor_job_id
                 """,
                 snapshot_id,
                 pr_url,
                 commit_sha,
-                expected_publish_retry_count,
+                expected_publish_attempt_count,
             )
             if row is None:
                 return False
@@ -729,7 +771,7 @@ class PostgresSnapshotRepository:
         return True
 
     async def fail_snapshot_publish(
-        self, *, snapshot_id: int, expected_publish_retry_count: int, detail: str
+        self, *, snapshot_id: int, expected_publish_attempt_count: int, detail: str
     ) -> None:
         """Retain a rejected group artifact without failing included turns."""
         async with self._pool.acquire() as conn, conn.transaction():
@@ -739,12 +781,12 @@ class PostgresSnapshotRepository:
                 SET state = 'failed', last_error = $2, retry_at = NULL,
                     updated_at = NOW()
                 WHERE id = $1 AND state = 'publishing'
-                  AND publish_retry_count = $3
+                  AND publish_attempt_count = $3
                 RETURNING sandbox_id, anchor_job_id
                 """,
                 snapshot_id,
                 detail[:2000],
-                expected_publish_retry_count,
+                expected_publish_attempt_count,
             )
             if row is None:
                 return
@@ -958,10 +1000,10 @@ class PostgresSnapshotRepository:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, publish_retry_count FROM agent_sandbox_snapshots
+                SELECT id, publish_attempt_count FROM agent_sandbox_snapshots
                 WHERE state = 'publishing'
                   AND published_pr_url IS NULL
-                  AND updated_at < NOW() - make_interval(secs => $1)
+                  AND updated_at < clock_timestamp() - make_interval(secs => $1)
                 ORDER BY id
                 """,
                 stall_seconds,
@@ -969,10 +1011,11 @@ class PostgresSnapshotRepository:
         reclaimed: list[int] = []
         for row in rows:
             snapshot_id = int(row["id"])
-            if await self.defer_snapshot_publish(
+            if await self._defer_snapshot_publish(
                 snapshot_id=snapshot_id,
-                expected_publish_retry_count=int(row["publish_retry_count"]),
+                expected_publish_attempt_count=int(row["publish_attempt_count"]),
                 detail=detail,
+                stall_seconds=stall_seconds,
             ):
                 reclaimed.append(snapshot_id)
         return reclaimed

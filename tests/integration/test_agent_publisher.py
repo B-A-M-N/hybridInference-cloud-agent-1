@@ -720,6 +720,67 @@ def test_retry_rejects_matching_tree_hidden_in_a_merge_commit(origin, tmp_path):
     assert not isinstance(refused.value, TransientPublishError)
 
 
+def test_retry_fences_a_branch_advance_after_recovered_tip_validation(
+    origin, tmp_path, monkeypatch
+):
+    """The final ordinary push prevents recording an old reconciled tip."""
+    from cloud_agent import publisher as publisher_module
+
+    clone_url, base_sha = origin
+    first = publish_patch(
+        job_id="ajob_reconcile_race",
+        branch_id="athr_reconcile_race",
+        patch=_PATCH_APP,
+        clone_url=clone_url,
+        base_sha=base_sha,
+        commit_message="agent: first process",
+    )
+
+    human = tmp_path / "reconcile-racer"
+    _git(["clone", "--quiet", clone_url, str(human)], cwd=tmp_path)
+    _git(
+        ["checkout", "--quiet", "-b", "agent/athr_reconcile_race", first.commit_sha],
+        cwd=human,
+    )
+    (human / "HOTFIX.md").write_text("human edit\n", encoding="utf-8")
+    _git(["add", "--all"], cwd=human)
+    _git(["commit", "--quiet", "-m", "human: advance during reconciliation"], cwd=human)
+    human_tip = _git(["rev-parse", "HEAD"], cwd=human).strip()
+
+    real_run_git = publisher_module._run_git
+    advanced = False
+
+    def race_on_fence(args, **kwargs):
+        nonlocal advanced
+        expected_refspec = f"{first.commit_sha}:refs/heads/agent/athr_reconcile_race"
+        if args[0] == "push" and args[-1] == expected_refspec and not advanced:
+            advanced = True
+            _git(
+                ["push", "--quiet", "origin", f"{human_tip}:refs/heads/agent/athr_reconcile_race"],
+                cwd=human,
+            )
+        return real_run_git(args, **kwargs)
+
+    monkeypatch.setattr(publisher_module, "_run_git", race_on_fence)
+    with pytest.raises(TransientPublishError, match="git push failed"):
+        publish_patch(
+            job_id="ajob_reconcile_race",
+            branch_id="athr_reconcile_race",
+            patch=_PATCH_APP,
+            clone_url=clone_url,
+            base_sha=base_sha,
+            commit_message="agent: retry after lost result",
+        )
+
+    assert advanced
+    assert (
+        _git(
+            ["rev-parse", "refs/heads/agent/athr_reconcile_race"], cwd=tmp_path / "origin.git"
+        ).strip()
+        == human_tip
+    )
+
+
 def _prerequisites(bundle: bytes) -> list[str]:
     """The commits a bundle requires the receiving repository to hold."""
     header = bundle.split(b"\n\n", 1)[0].decode()
@@ -764,6 +825,41 @@ def test_base_bundle_carries_only_what_the_published_commit_adds(origin, tmp_pat
         _git(["bundle", "unbundle", str(bundle)], cwd=workspace)
     _git(["cat-file", "-e", f"{result.commit_sha}^{{commit}}"], cwd=workspace)
     assert _git(["rev-parse", "HEAD"], cwd=workspace).strip() == base_sha
+
+
+def test_republishing_the_same_patch_reuses_the_commit_already_pushed(origin):
+    """A retry after the push, and before the PR is recorded, must not refuse.
+
+    The second commit object differs because its timestamps do, but it is the
+    same change on the same base. The branch already has that change, and the
+    platform does not force-push, so the retry keeps the existing tip.
+    """
+    clone_url, base_sha = origin
+    kwargs = {
+        "job_id": "ajob_retry",
+        "branch_id": "athr_retry",
+        "patch": _PATCH_APP,
+        "clone_url": clone_url,
+        "base_sha": base_sha,
+        "commit_message": "agent: turn 1",
+        "include_base_bundle": True,
+    }
+    first = publish_patch(**kwargs)
+    second = publish_patch(**kwargs)
+
+    assert second.commit_sha == first.commit_sha
+    assert second.branch == first.branch
+    assert second.changed_files == first.changed_files
+    assert second.base_bundle is not None
+    tip = subprocess.run(
+        ["git", "rev-parse", "refs/heads/agent/athr_retry"],
+        cwd=clone_url,
+        env=_GIT_ENV,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert tip == first.commit_sha
 
 
 def test_branch_moved_by_someone_else_is_refused_with_the_reason(origin, tmp_path):
