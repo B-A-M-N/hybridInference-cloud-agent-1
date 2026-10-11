@@ -6,11 +6,11 @@ from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, ConnectError, ReadTimeout, Request
 from tests.servers.test_admin_runs import ADMIN, setup as run_setup  # noqa: F401
 from tests.unit.test_ledger_snapshots import END, START
 
-from cloud_agent import identity
+from cloud_agent import broker_routing, identity
 from cloud_agent.admin_observability import encode_cursor
 from cloud_agent.admin_sandboxes import (
     SANDBOX_CURSOR_SCOPE,
@@ -1145,6 +1145,137 @@ async def test_force_delete_fails_closed_when_host_proof_is_unavailable(terminal
     assert response.status_code == (503 if failure != "missing_row" else 409)
     assert "PRIVATE" not in response.text
     commands.request_admin_delete.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("failure", "cause_keywords"),
+    [
+        ("missing_host", ("host", "register")),
+        ("blank_url", ("advertis", "broker")),
+        ("missing_token", ("credential", "control plane")),
+        ("malformed_url", ("url", "invalid")),
+        ("refused_url", ("url", "allowlist")),
+    ],
+)
+async def test_force_delete_explains_configuration_failure_without_contacting_broker(
+    terminal_probe, monkeypatch, caplog, failure, cause_keywords
+):
+    app, _, commands, host_pool, broker, _ = terminal_probe
+    host = {"host": "runner-one", "broker_url": "http://broker-one:8092"}
+    settings = {broker_routing.ENV_BROKER_TOKEN: "PRIVATE broker token"}
+    if failure == "missing_host":
+        host_pool.get_host.return_value = None
+    else:
+        if failure == "blank_url":
+            host["broker_url"] = "   "
+        elif failure == "missing_token":
+            settings[broker_routing.ENV_BROKER_TOKEN] = "   "
+        elif failure == "malformed_url":
+            host["broker_url"] = "http://[PRIVATE-internal"
+        elif failure == "refused_url":
+            host["broker_url"] = "http://PRIVATE-denied.internal:8092"
+            settings[broker_routing.ENV_BROKER_HOSTS] = "broker-one"
+        host_pool.get_host.return_value = host
+    monkeypatch.setattr(
+        broker_routing, "setting_env", lambda name, default=None: settings.get(name, default)
+    )
+    monkeypatch.setattr(admin_sandboxes, "broker_for_host", broker_routing.broker_for_host)
+    app.dependency_overrides[admin_sandboxes.admin_sandbox_deletion_available] = lambda: True
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"{PREFIX}/asbx_other/delete?force=true",
+            headers=ADMIN,
+            json={
+                "generation": 1,
+                "container_id": "container-one",
+                "last_activity_at": END.isoformat(),
+            },
+        )
+
+    assert response.status_code == 503
+    detail = response.json()["detail"].lower()
+    assert all(keyword in detail for keyword in cause_keywords)
+    assert any(action in detail for action in ("configure", "settings", "register", "check"))
+    assert "PRIVATE" not in response.text
+    assert "http://" not in response.text
+    broker.shared_chat_sandbox_status.assert_not_awaited()
+    commands.request_admin_delete.assert_not_awaited()
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "agent_sandbox_delete_verification_failed"
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.sandbox_id == "asbx_other"
+    assert record.host == "runner-one"
+    assert record.broker_status == 503
+    assert record.failure_type == "configuration"
+    assert record.exc_info is None
+    assert "PRIVATE" not in str(record.__dict__)
+    assert "http://" not in str(record.__dict__)
+
+
+@pytest.mark.parametrize(
+    ("failure", "cause_keywords"),
+    [
+        ("unauthorized", ("credential",)),
+        ("forbidden", ("credential",)),
+        ("timeout", ("time",)),
+        ("unreachable", ("connect",)),
+        ("broker_response", ("broker", "status")),
+    ],
+)
+async def test_force_delete_distinguishes_broker_failures_without_exposing_private_diagnostics(
+    terminal_probe, caplog, failure, cause_keywords
+):
+    app, _, commands, _, broker, _ = terminal_probe
+    status_code = {"unauthorized": 401, "forbidden": 403}.get(failure, 503)
+    error = WorkspaceBrokerError(status_code, "PRIVATE diagnostic http://PRIVATE-internal:8092")
+    request = Request("GET", "http://PRIVATE-internal:8092/shared-sandboxes/athr_other")
+    if failure == "timeout":
+        error.__cause__ = ReadTimeout("PRIVATE timeout", request=request)
+    elif failure == "unreachable":
+        error.__cause__ = ConnectError("PRIVATE connection diagnostic", request=request)
+    broker.shared_chat_sandbox_status.side_effect = error
+    app.dependency_overrides[admin_sandboxes.admin_sandbox_deletion_available] = lambda: True
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"{PREFIX}/asbx_other/delete?force=true",
+            headers=ADMIN,
+            json={
+                "generation": 1,
+                "container_id": "container-one",
+                "last_activity_at": END.isoformat(),
+            },
+        )
+
+    assert response.status_code == 503
+    detail = response.json()["detail"].lower()
+    assert all(keyword in detail for keyword in cause_keywords)
+    assert any(action in detail for action in ("configure", "check", "refresh", "retry", "match"))
+    if failure == "broker_response":
+        assert "restore its connection" not in detail
+    assert "PRIVATE" not in response.text
+    assert "http://" not in response.text
+    broker.shared_chat_sandbox_status.assert_awaited_once_with("athr_other", timeout=5)
+    commands.request_admin_delete.assert_not_awaited()
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "agent_sandbox_delete_verification_failed"
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.sandbox_id == "asbx_other"
+    assert record.host == "runner-one"
+    assert record.broker_status == status_code
+    assert record.failure_type == type(error.__cause__ or error).__name__
+    assert record.exc_info is None
+    assert "PRIVATE" not in str(record.__dict__)
+    assert "http://" not in str(record.__dict__)
 
 
 async def test_force_delete_rejects_a_stale_review_before_contacting_host(terminal_probe):

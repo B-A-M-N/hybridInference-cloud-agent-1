@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from cloud_agent.admin_observability import decode_cursor
@@ -25,13 +26,21 @@ from cloud_agent.api.deps import (
     require_store,
     verify_admin_access,
 )
-from cloud_agent.broker_routing import BrokerUrlRefused, broker_for_host
+from cloud_agent.broker_routing import (
+    BrokerUrlRefused,
+    broker_configuration_error,
+    broker_for_host,
+)
+from cloud_agent.logging_utils import get_logger
 from cloud_agent.sandbox_archive import S3SandboxArchiveStore
 from cloud_agent.workspace_broker_client import WorkspaceBrokerError
 
 if TYPE_CHECKING:
     from cloud_agent.ports import HostPoolRepository, SandboxRepository
     from cloud_agent.storage.admin_sandbox_queries import AdminSandboxQueries
+
+
+logger = get_logger(__name__)
 
 
 class _AdminSandboxesStorage(Protocol):
@@ -117,9 +126,20 @@ async def _confirm_force_delete_stopped(
     except BrokerUrlRefused:
         broker = None
     if broker is None:
+        logger.warning(
+            "Force deletion has no configured owning broker",
+            extra={
+                "event": "agent_sandbox_delete_verification_failed",
+                "sandbox_id": sandbox.id,
+                "host": sandbox.host,
+                "broker_status": 503,
+                "failure_type": "configuration",
+            },
+        )
         raise HTTPException(
             status_code=503,
-            detail="The owning host's workspace broker is unavailable. Restore its connection and try again.",
+            detail=broker_configuration_error(host)
+            or "The owning host's workspace broker is unavailable. Check its configuration and retry deletion.",
         )
     try:
         row = await broker.shared_chat_sandbox_status(sandbox.origin_thread_id, timeout=5)
@@ -129,9 +149,41 @@ async def _confirm_force_delete_stopped(
                 status_code=409,
                 detail="The host's container changed or is missing. Refresh details before force deleting it.",
             ) from None
+        if exc.status_code in {401, 403}:
+            message = (
+                "The owning host's workspace broker rejected the control plane's credential. "
+                "Match Workspace broker credential in Admin Settings with the host's broker token."
+            )
+        elif isinstance(exc.__cause__, httpx.TimeoutException):
+            message = (
+                "The owning host's workspace broker timed out while checking the sandbox. "
+                "Check the broker and Docker responsiveness, then refresh details and retry deletion."
+            )
+        elif isinstance(exc.__cause__, httpx.HTTPError):
+            message = (
+                "The control plane cannot connect to the owning host's workspace broker. "
+                "Check its advertised URL and reverse SSH tunnel, then retry deletion."
+            )
+        else:
+            message = (
+                "The owning host's workspace broker could not report the sandbox's stopped and idle "
+                "status. Check broker readiness and host logs, then refresh details and retry deletion."
+            )
+        logger.warning(
+            "Force deletion could not verify the owning sandbox",
+            extra={
+                "event": "agent_sandbox_delete_verification_failed",
+                "sandbox_id": sandbox.id,
+                "host": sandbox.host,
+                "broker_status": exc.status_code,
+                "failure_type": type(exc.__cause__).__name__
+                if exc.__cause__
+                else type(exc).__name__,
+            },
+        )
         raise HTTPException(
             status_code=503,
-            detail="The owning host's workspace broker is unavailable. Restore its connection and try again.",
+            detail=message,
         ) from None
     if (
         row.get("thread_id") != sandbox.origin_thread_id
