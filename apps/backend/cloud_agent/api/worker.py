@@ -145,6 +145,25 @@ MAX_TURN_RESOURCES_BODY_BYTES = 16 * 1024
 _USER_MEMORY_TIMEOUT_SECONDS = 2.0
 
 
+async def _refresh_claim_memory(
+    repository: UserMemoryRepository, user_id: str, *, repo: str | None = None
+) -> dict[str, Any] | None:
+    """Bound each scope independently so unavailable memory cannot block a claim."""
+    try:
+        async with asyncio.timeout(_USER_MEMORY_TIMEOUT_SECONDS):
+            if repo is None:
+                return await repository.refresh(user_id=user_id)
+            return await repository.refresh_project(user_id=user_id, repo=repo)
+    except Exception:
+        # Fixed log messages contain neither saved memory nor credentials.
+        logger.warning(
+            "agent_claim_user_memory_unavailable"
+            if repo is None
+            else "agent_claim_project_memory_unavailable"
+        )
+        return None
+
+
 class _BoundedTurnResourcesRoute(APIRoute):
     """Limit turn-resource reports before parsing, including chunked requests."""
 
@@ -254,9 +273,10 @@ def _require_store(store: _WorkerStorage | None) -> _WorkerStorage:
 # The clone credential is narrowed at the point it is minted, not merely by
 # convention: the App also holds `contents: write` for the publisher, and an
 # installation token inherits every permission the App has unless it is asked
-# for less. Without this the runner would be handed push rights it must not
-# have, on a host that runs untrusted repository code.
+# for less. Keep checkout authority separate from the token explicitly
+# delivered to the sandbox for branch and pull-request publication.
 _CLONE_SCOPE = {"contents": "read"}
+_SANDBOX_GITHUB_SCOPE = {"contents": "write", "pull_requests": "write"}
 
 
 #: Cheap structural check before touching the signing key: host credentials
@@ -790,14 +810,18 @@ async def worker_claim(
         ) from exc
 
     clone_token: str | None = None
+    github_token: str | None = None
     if app_credentials is not None:
         try:
             clone_token = await app_credentials.token_for(
                 claim["repo"], permissions=_CLONE_SCOPE, repository_scoped=True
             )
+            github_token = await app_credentials.token_for(
+                claim["repo"], permissions=_SANDBOX_GITHUB_SCOPE, repository_scoped=True
+            )
         except AppNotInstalled:
             # A settled answer: the App does not cover this repository. Hand
-            # the job over without a credential — a public repository clones
+            # the job over without credentials — a public repository clones
             # anonymously, and a private one fails with a message the owner can
             # act on ("install the App"), which retrying would not improve.
             logger.info(
@@ -863,14 +887,10 @@ async def worker_claim(
     thread_attachment_count = await job_store.attachments.count_thread_attachments(
         thread_id=str(claim["thread_id"])
     )
-    memory = None
-    try:
-        async with asyncio.timeout(_USER_MEMORY_TIMEOUT_SECONDS):
-            memory = await job_store.user_memory.refresh(user_id=claim["user_id"])
-    except Exception:
-        # A temporary personalization failure must not strand a claimed job.
-        # This fixed log message contains neither saved memory nor credentials.
-        logger.warning("agent_claim_user_memory_unavailable")
+    memory, project_memory = await asyncio.gather(
+        _refresh_claim_memory(job_store.user_memory, claim["user_id"]),
+        _refresh_claim_memory(job_store.user_memory, claim["user_id"], repo=claim["repo"]),
+    )
     response = WorkerClaimResponse(
         thread_attachment_count=thread_attachment_count,
         turn_attachment_count=len(claim.get("attachments") or []),
@@ -893,6 +913,7 @@ async def worker_claim(
                     prompt_with_attachments(claim["task_prompt"], claim.get("attachments")),
                     memory,
                     repo=claim["repo"],
+                    project_view=project_memory,
                 ),
                 claim.get("skills"),
             ),
@@ -914,6 +935,7 @@ async def worker_claim(
         sandbox_token=sandbox_token,
         mcp_token=mcp_token,
         clone_token=clone_token,
+        github_token=github_token,
         # Aliases, because that is what the runtime config addresses: the relay
         # path segment is the binding alias, and the runner learns nothing about
         # where the connection points.

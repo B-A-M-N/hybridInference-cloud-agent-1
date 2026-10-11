@@ -180,7 +180,12 @@ requirement, and rules 4 and 5 remain permanent service boundaries.
 - Long-lived account and service credentials never enter the sandbox. Each
   member receives its own scoped inference and MCP credentials; sibling
   members cannot read or reuse them. Spend remains governed by the gateway's
-  per-user quota.
+  per-user quota. The runner also injects a separate short-lived GitHub App
+  token as `GH_TOKEN` in the owning member's environment, restricted to
+  `contents: write` and `pull_requests: write` on the job's repository. Account
+  tokens, refresh tokens, and the App's private key remain outside. Direct
+  sandbox publication does not pass through the trusted publisher's patch
+  gate; repository branch protection and GitHub rules still apply.
 - Public multi-tenant use requires Kata isolation, non-root, dropped
   capabilities, seccomp, and resource limits — plain Docker containers are for
   trusted internal repositories only.

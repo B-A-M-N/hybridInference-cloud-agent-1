@@ -25,6 +25,11 @@ Order of operations is load-bearing:
 A rejected patch marks the snapshot/group dirty without rewriting successful
 Agent turns. Gate violations are human-review situations, and a retry loop
 would either spam the repository or bury the rejection.
+
+A transient credential, git, or PR failure does not. The branch name and the
+PR lookup are idempotent, so the snapshot returns to ``captured`` until its
+``retry_at``. Five such defers is the budget; the next one fails the snapshot
+so an outage cannot block the lineage forever.
 """
 
 from __future__ import annotations
@@ -86,6 +91,20 @@ PUBLISH_IDLE_S = 30.0
 # `workflows`, so a patch touching `.github/` cannot be pushed even if both
 # gates were bypassed — the credential itself would refuse.
 _PUBLISH_SCOPE = {"contents": "write", "pull_requests": "write"}
+
+#: How many times a transient failure may return a snapshot to the queue.
+#: The next one fails it. The count is the number of defers already recorded.
+_MAX_PUBLISH_ATTEMPTS = 5
+_RETRYABLE_HTTP_STATUS = frozenset({502, 503, 504})
+_HTTP_STATUS_IN_DETAIL = re.compile(r"\((\d{3})\)|returned error:\s*(\d{3})\b")
+_GIT_DISCONNECT = re.compile(
+    r"timed out|unable to access|could not resolve host|failed to connect|"
+    r"connection (?:reset|refused|aborted)|network is unreachable|"
+    r"temporary failure in name resolution|remote end hung up|early eof|"
+    r"rpc failed|recv failure|send failure|could not read from remote|"
+    r"connection closed|broken pipe",
+    re.IGNORECASE,
+)
 
 # A PR base has to be a branch. `base_ref` is normally one (the composer offers
 # a branch picker), but the API accepts any ref it can resolve, and a caller
@@ -480,6 +499,50 @@ async def publish_one(
     )
 
 
+def _http_status(exc: BaseException) -> int | None:
+    """The HTTP status on a credential or PR failure, if it has one."""
+    status = getattr(exc, "status", None)
+    if isinstance(status, int):
+        return status
+    response = getattr(exc, "response", None)
+    code = getattr(response, "status_code", None)
+    if isinstance(code, int):
+        return code
+    if isinstance(exc, PublishError):
+        match = _HTTP_STATUS_IN_DETAIL.search(str(exc))
+        if match:
+            return int(next(group for group in match.groups() if group))
+    return None
+
+
+def _is_retryable_publication_failure(exc: BaseException) -> bool:
+    """Whether this failure may be deferred instead of failing the snapshot.
+
+    Retryable: a credential mint that did not connect, timed out, or got
+    502/503/504; a git disconnect or the same HTTP statuses from the remote;
+    a PR call that got 502/503/504 or ``ConnectError``. A patch, content, or
+    other HTTP rejection is permanent.
+    """
+    status = _http_status(exc)
+    if status in _RETRYABLE_HTTP_STATUS:
+        return True
+    if status is not None:
+        return False
+    if isinstance(
+        exc,
+        (
+            httpx.ConnectError,
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+            TimeoutError,
+            ConnectionError,
+        ),
+    ):
+        return True
+    return isinstance(exc, PublishError) and _GIT_DISCONNECT.search(str(exc)) is not None
+
+
 async def _publish_due(
     store: PublishStorage,
     *,
@@ -490,8 +553,9 @@ async def _publish_due(
 ) -> None:
     """Publish every captured snapshot, past any that fails.
 
-    A refusal marks its snapshot failed; a preflight entitlement outage delays
-    its next claim. Snapshots behind either still go out in this pass.
+    A refusal marks its snapshot failed. A retryable failure, including an
+    entitlement outage, returns it to the queue until five defers are spent.
+    Snapshots behind either still go out in this pass.
     """
     while (job := await store.snapshot.claim_for_publish()) is not None:
         await _publish_claimed(
@@ -525,6 +589,29 @@ async def _publish_claimed(
             detail=detail,
         )
 
+    async def retry(detail: str) -> None:
+        """Defer one transient failure, or fail it once five defers are spent."""
+        attempts = int(job.get("publish_attempt_count") or 0)
+        if attempts >= _MAX_PUBLISH_ATTEMPTS:
+            logger.warning(
+                "agent_job_publish_retries_exhausted",
+                extra={"event": "agent_job_publish_retries_exhausted", "job_id": job_id},
+            )
+            await fail(detail)
+            return
+        logger.warning(
+            "agent_job_publish_retrying",
+            extra={
+                "event": "agent_job_publish_retrying",
+                "job_id": job_id,
+                "publish_attempt_count": attempts,
+            },
+        )
+        await store.snapshot.defer_snapshot_publish(
+            snapshot_id=int(job["snapshot_id"]),
+            detail=detail,
+        )
+
     # Re-checked here, before any credential is minted. Publishing happens well
     # after the job ran, and it is the step that asks for *write* authority —
     # so an entitlement withdrawn in between (a revoked connection, a narrowed
@@ -539,13 +626,7 @@ async def _publish_claimed(
             app_credentials=app_credentials,
         )
     except RepoAccessUnavailable as exc:
-        # No write credential, git push, or PR request has happened yet. Only
-        # this preflight failure can safely return the immutable artifact to
-        # the queue; later failures may have changed the remote repository.
-        await store.snapshot.defer_snapshot_publish(
-            snapshot_id=int(job["snapshot_id"]),
-            detail=f"repository access check unavailable; publication will retry: {exc}",
-        )
+        await retry(f"repository access check unavailable; publication will retry: {exc}")
         return None
     except RepoNotAllowed as exc:
         await fail(f"no longer entitled to publish to {job['repo']}: {exc}")
@@ -567,7 +648,11 @@ async def _publish_claimed(
                 )
             )
         except Exception as exc:
-            await fail(f"could not obtain a GitHub credential: {exc}")
+            detail = f"could not obtain a GitHub credential: {exc}"
+            if _is_retryable_publication_failure(exc):
+                await retry(detail)
+            else:
+                await fail(detail)
             return None
     if credential is None:
         await fail("no GitHub credential is configured for publishing")
@@ -599,16 +684,19 @@ async def _publish_claimed(
             body=_pr_body(job, result.changed_files),
             credential=credential,
         )
-    except PublishError as exc:
-        logger.warning(
-            "agent_job_publish_rejected",
-            extra={"event": "agent_job_publish_rejected", "job_id": job_id},
-        )
-        await fail(str(exc))
-        return None
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("agent job publish failed unexpectedly")
-        await fail(f"publish failed: {exc}")
+    except Exception as exc:
+        detail = str(exc) if isinstance(exc, PublishError) else f"publish failed: {exc}"
+        if _is_retryable_publication_failure(exc):
+            await retry(detail)
+            return None
+        if isinstance(exc, PublishError):
+            logger.warning(
+                "agent_job_publish_rejected",
+                extra={"event": "agent_job_publish_rejected", "job_id": job_id},
+            )
+        else:
+            logger.exception("agent job publish failed unexpectedly")
+        await fail(detail)
         return None
 
     recorded = await store.snapshot.record_snapshot_publish(

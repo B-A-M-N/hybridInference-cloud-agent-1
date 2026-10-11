@@ -409,9 +409,11 @@ class WorkspaceBrokerClient:
         params = {"base_sha": base_sha} if base_sha else None
         return await self._request("GET", workspace_id, "git", params=params, timeout=70)
 
-    async def shared_chat_sandbox_status(self, thread_id: str) -> dict[str, Any]:
+    async def shared_chat_sandbox_status(
+        self, thread_id: str, *, timeout: float = 60
+    ) -> dict[str, Any]:
         """Inspect one membership in its shared retained container."""
-        return await self._shared_sandbox_request("GET", thread_id)
+        return await self._shared_sandbox_request("GET", thread_id, timeout=timeout)
 
     async def prepare_sandbox_deletion(
         self, thread_id: str, payload: dict[str, Any]

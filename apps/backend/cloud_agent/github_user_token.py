@@ -11,7 +11,9 @@ refresh token, and GitHub would refuse the second: the connection both were
 keeping would be gone. So a renewal is taken under a lease on the account row,
 the way the MCP credential refresh is, and a caller that loses the race reads
 the row again — finding either the new token or the old one, still good for a
-few minutes, since renewal starts before expiry.
+few minutes, since renewal starts before expiry. A refresh whose write the
+generation fence rejects is the same loss: reconnect or disconnect moved the
+row, and the token just obtained was not stored, so it is not returned.
 """
 
 from __future__ import annotations
@@ -68,7 +70,8 @@ async def user_access_token(
     """A token that speaks as this user now, or ``None`` if they must reconnect.
 
     ``None`` is settled: there is no stored token (a connection made before
-    tokens were kept) or GitHub refused to renew it. A renewal lost to another
+    tokens were kept), GitHub refused to renew it, or the account was
+    disconnected while this refresh was in flight. A renewal lost to another
     caller that has not finished yet raises :class:`UserTokenUnavailable`.
     """
     account = await store.get_github_account(user_id=user_id)
@@ -104,7 +107,7 @@ async def user_access_token(
     # A failure for a passing reason leaves the lease to lapse, and the next
     # caller to try again; the current token is still good until it expires.
     ciphertext = cipher.encrypt(tokens.access_token)
-    await store.store_github_tokens(
+    stored = await store.store_github_tokens(
         user_id=user_id,
         refresh_generation=claim["refresh_generation"],
         access_token_ciphertext=ciphertext,
@@ -114,6 +117,11 @@ async def user_access_token(
         ),
         refresh_expires_at=tokens.refresh_expires_at,
     )
+    if not stored:
+        # Reconnect or disconnect moved the generation while GitHub was
+        # answering. This token was not stored, so it does not speak for the
+        # account the row holds now.
+        return await _await_renewal(user_id, store=store, cipher=cipher)
     return LiveUserToken(tokens.access_token, ciphertext)
 
 

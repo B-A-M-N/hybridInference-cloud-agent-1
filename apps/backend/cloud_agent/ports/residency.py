@@ -47,11 +47,14 @@ class ResidencyRepository(Protocol):
     ) -> str | None:
         """Extend a residency's lease — only the generation that holds it.
 
-        Returns ``None`` when nothing was extended (lost/taken over), else the
-        residency's grant id — ``""`` when it runs without one — so the caller
-        can renew the credential in the same pass. ``host`` narrows the write
-        to the machine the row names: a beat is a holder's statement, and a
-        guessed (thread, generation) from anywhere else must extend nothing.
+        Returns ``None`` when nothing was extended (lost, taken over, or
+        already expired), else the residency's grant id — ``""`` when it runs
+        without one — so the caller can renew the credential in the same pass.
+        ``host`` narrows the write to the machine the row names: a beat is a
+        holder's statement, and a guessed (thread, generation) from anywhere
+        else must extend nothing. The lease clock is the same fence
+        ``resident_host`` uses: a hot row whose lease has lapsed is already
+        lost, and a late beat must not revive it before the reaper runs.
         """
         ...
 

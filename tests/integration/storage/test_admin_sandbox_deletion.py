@@ -131,6 +131,102 @@ async def test_delete_rejects_changed_review(db, store, changed):
     assert await request_delete(store, "asbx_stale", **changed) == "stale"
 
 
+async def test_broker_confirmed_force_delete_atomically_repairs_stale_running_state(db, store):
+    origin = await seed(db, store, "asbx_force", state="running")
+    await member(db, "asbx_force", origin, 0)
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE agent_sandboxes
+            SET idle_deadline=NULL, terminal_count=0, terminal_count_observed_at=NOW(),
+                resource_snapshot='{}'::jsonb, resource_sampled_at=NOW(),
+                resource_received_at=NOW()
+            WHERE id='asbx_force'
+            """
+        )
+
+    assert await request_delete(store, "asbx_force", broker_confirmed_stopped=True) == "accepted"
+    async with db.acquire() as conn:
+        group = await conn.fetchrow(
+            """
+            SELECT state, deletion_state, idle_deadline, stop_requested_at,
+                   resource_snapshot, resource_sampled_at, resource_received_at,
+                   terminal_count, terminal_count_observed_at
+            FROM agent_sandboxes WHERE id='asbx_force'
+            """
+        )
+        resident_state = await conn.fetchval(
+            "SELECT resident_state FROM agent_thread_sandbox_memberships "
+            "WHERE sandbox_id='asbx_force'"
+        )
+        audit_proof = await conn.fetchrow(
+            "SELECT details->>'force' AS force, "
+            "details->>'broker_confirmed_stopped' AS broker_confirmed_stopped, "
+            "details->>'docker_status' AS docker_status FROM agent_admin_audit_log "
+            "WHERE action='agent.sandbox.delete.requested'"
+        )
+    assert group["state"] == "stopped" and group["deletion_state"] == "pending"
+    for field in (
+        "idle_deadline",
+        "stop_requested_at",
+        "resource_snapshot",
+        "resource_sampled_at",
+        "resource_received_at",
+        "terminal_count",
+        "terminal_count_observed_at",
+    ):
+        assert group[field] is None
+    assert resident_state == "stopped"
+    assert dict(audit_proof) == {
+        "force": "true",
+        "broker_confirmed_stopped": "true",
+        "docker_status": "stopped",
+    }
+    claim = await store.sandbox.claim_due_admin_sandbox_deletion(ttl_seconds=3600)
+    assert claim is not None and claim["id"] == "asbx_force"
+
+
+async def test_broker_confirmed_force_delete_keeps_all_busy_fences(db, store):
+    await seed(db, store, "asbx_force_busy", state="running")
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_sandboxes SET active_operation_count=1 WHERE id='asbx_force_busy'"
+        )
+    assert await request_delete(store, "asbx_force_busy", broker_confirmed_stopped=True) == "busy"
+    detail = await store.admin_sandboxes.detail("asbx_force_busy")
+    assert detail is not None
+    assert detail.sandbox.state == "running" and detail.sandbox.deletion_state == "none"
+
+
+async def test_force_delete_audit_failure_rolls_back_repair_and_deletion_fence(db, store):
+    origin = await seed(db, store, "asbx_force_audit", state="running")
+    await member(db, "asbx_force_audit", origin, 0)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "ALTER TABLE agent_admin_audit_log ADD CONSTRAINT reject_force_delete_audit "
+            "CHECK (action <> 'agent.sandbox.delete.requested')"
+        )
+    try:
+        with pytest.raises(asyncpg.CheckViolationError):
+            await request_delete(store, "asbx_force_audit", broker_confirmed_stopped=True)
+        detail = await store.admin_sandboxes.detail("asbx_force_audit")
+        assert detail is not None
+        assert detail.sandbox.state == "running" and detail.sandbox.deletion_state == "none"
+        async with db.acquire() as conn:
+            assert (
+                await conn.fetchval(
+                    "SELECT resident_state FROM agent_thread_sandbox_memberships "
+                    "WHERE sandbox_id='asbx_force_audit'"
+                )
+                == "starting"
+            )
+    finally:
+        async with db.acquire() as conn:
+            await conn.execute(
+                "ALTER TABLE agent_admin_audit_log DROP CONSTRAINT reject_force_delete_audit"
+            )
+
+
 async def test_delete_claim_excludes_other_workers_and_expired_worker_receipts(db, store):
     await seed(db, store, "asbx_lease", state="stopped")
     assert await request_delete(store, "asbx_lease") == "accepted"

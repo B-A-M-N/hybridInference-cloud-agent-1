@@ -60,6 +60,10 @@ class _Store:
         #: Stands in for another caller's renewal landing while this one waits.
         self.on_reread: Any = None
         self.reads = 0
+        #: The generation moved under this refresh; the write must not land.
+        self.reject_write = False
+        #: What the row is once that other caller has moved it.
+        self.on_rejected_write: Any = None
 
     async def get_github_account(self, *, user_id: str) -> dict[str, Any] | None:
         assert user_id == _USER
@@ -83,7 +87,11 @@ class _Store:
 
     async def store_github_tokens(self, **written: Any) -> bool:
         self.written.append(written)
-        return True
+        if not self.reject_write:
+            return True
+        if self.on_rejected_write is not None:
+            self.on_rejected_write(self)
+        return False
 
     async def clear_github_tokens(self, *, user_id: str, access_token_ciphertext: str) -> bool:
         self.cleared.append(access_token_ciphertext)
@@ -125,6 +133,40 @@ async def test_an_expiring_token_is_renewed_under_the_lease_and_written_back():
     assert app.cipher.decrypt(written["access_token_ciphertext"]) == "ghu_new"
     assert app.cipher.decrypt(written["refresh_token_ciphertext"]) == "ghr_new"
     assert token.ciphertext == written["access_token_ciphertext"]
+
+
+@pytest.mark.parametrize("outcome", ["reconnect", "no-ciphertext", "no-row"])
+async def test_a_refresh_the_fence_rejects_is_not_returned(outcome: str):
+    """Reconnect or disconnect moved the generation. The minted token stays unused."""
+    app = _App()
+    store = _Store(app, expires_in=timedelta(minutes=2))
+    store.reject_write = True
+    current = app.cipher.encrypt("ghu_reconnected")
+
+    def moved(store: _Store) -> None:
+        if outcome == "no-row":
+            store.row = None
+            return
+        assert store.row is not None
+        if outcome == "no-ciphertext":
+            store.row["access_token_ciphertext"] = None
+            return
+        store.row["access_token_ciphertext"] = current
+        store.row["access_expires_at"] = datetime.now(timezone.utc) + timedelta(hours=8)
+
+    store.on_rejected_write = moved
+
+    token = await user_access_token(_USER, store=store, app_credentials=app)
+
+    rejected = app.cipher.decrypt(store.written[0]["access_token_ciphertext"])
+    assert rejected == "ghu_new"
+    assert app.refreshed_with == ["ghr_old"]
+    if outcome == "reconnect":
+        assert token is not None
+        assert token.value == "ghu_reconnected"
+        assert token.ciphertext == current
+    else:
+        assert token is None
 
 
 async def test_a_caller_without_the_lease_uses_the_old_token_while_it_still_works():

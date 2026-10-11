@@ -26,6 +26,12 @@ class MemoryStore:
     def __init__(self) -> None:
         self.states: dict[str, dict] = {}
         self.token_update: dict | None = None
+        self.row: dict | None = None
+        self.generation = 0
+        self.lease_held = False
+        self.reject_write = False
+        self.writes: list[dict] = []
+        self.after_rejected_write = None
 
     async def create_oauth_state(self, **row) -> None:
         self.states[row["state_hash"]] = {**row, "consumed": False}
@@ -43,8 +49,51 @@ class MemoryStore:
         row["consumed"] = True
         return {"code_verifier_ciphertext": row["code_verifier_ciphertext"]}
 
-    async def update_gitlab_tokens(self, **values) -> None:
+    async def claim_gitlab_token_refresh(
+        self, *, connection_id: int, user_id: str, lease_seconds: int, margin_seconds: int
+    ) -> dict | None:
+        assert (lease_seconds, margin_seconds) == (30, 300)
+        if (
+            self.row is None
+            or self.lease_held
+            or self.row.get("id") != connection_id
+            or self.row.get("user_id") != user_id
+        ):
+            return None
+        self.lease_held = True
+        self.generation += 1
+        return {
+            "refresh_generation": self.generation,
+            "refresh_token_ciphertext": self.row["refresh_token_ciphertext"],
+        }
+
+    async def update_gitlab_tokens(self, **values) -> bool:
+        self.writes.append(dict(values))
+        accepted = (
+            not self.reject_write
+            and self.row is not None
+            and values.get("refresh_generation") == self.generation
+            and values.get("user_id") == self.row.get("user_id")
+            and values.get("connection_id") == self.row.get("id")
+        )
+        if not accepted:
+            if self.after_rejected_write is not None:
+                self.after_rejected_write()
+            return False
         self.token_update = values
+        self.lease_held = False
+        self.row = {
+            **self.row,
+            "access_token_ciphertext": values["access_token_ciphertext"],
+            "refresh_token_ciphertext": values["refresh_token_ciphertext"],
+            "expires_at": values["expires_at"],
+        }
+        return True
+
+    async def get_gitlab_connection(self, *, user_id: str) -> dict | None:
+        if self.row is None or self.row.get("user_id") != user_id:
+            return None
+        return dict(self.row)
 
 
 @pytest.mark.asyncio
@@ -272,9 +321,11 @@ async def test_gitlab_pkce_exchange_identity_projects_refresh_and_revoke() -> No
         "refresh_token_ciphertext": cipher.encrypt("refresh-one"),
         "expires_at": datetime.now(timezone.utc) - timedelta(seconds=1),
     }
+    store.row = connection
     refreshed = await client.access_token_for_connection(store, connection)
     assert refreshed == "access-two"
     assert store.token_update is not None
+    assert store.token_update["refresh_generation"] == 1
     assert "access-two" not in store.token_update["access_token_ciphertext"]
     assert "refresh-two" not in store.token_update["refresh_token_ciphertext"]
     await client.revoke(refreshed)
@@ -296,3 +347,170 @@ async def test_gitlab_network_failures_are_safe_integration_errors() -> None:
 
     with pytest.raises(SourceControlError, match="GitLab API request failed"):
         await client.verify_user("secret-access-token")
+
+
+def _gitlab_client(handler) -> GitLabOAuthClient:
+    return GitLabOAuthClient(
+        GitLabOAuthConfig("client-id", "client-secret", "https://example.com/callback"),
+        cipher=SourceControlCipher("server-secret"),
+        transport=httpx.MockTransport(handler),
+    )
+
+
+def _connection(*, cipher: SourceControlCipher, access: str, refresh: str, expires_at: datetime):
+    return {
+        "id": 7,
+        "user_id": "user-a",
+        "access_token_ciphertext": cipher.encrypt(access),
+        "refresh_token_ciphertext": cipher.encrypt(refresh),
+        "expires_at": expires_at,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_gitlab_token_outside_the_refresh_window_is_not_refreshed() -> None:
+    cipher = SourceControlCipher("server-secret")
+    store = MemoryStore()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request: {request.url.path}")
+
+    connection = _connection(
+        cipher=cipher,
+        access="access-live",
+        refresh="refresh-live",
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+    token = await _gitlab_client(handler).access_token_for_connection(store, connection)
+    assert token == "access-live"
+    assert store.writes == []
+
+
+@pytest.mark.asyncio
+async def test_a_gitlab_refresh_without_the_lease_uses_the_stored_token() -> None:
+    """The loser does not spend the refresh token or return the one it read."""
+    cipher = SourceControlCipher("server-secret")
+    store = MemoryStore()
+    store.lease_held = True
+    store.row = _connection(
+        cipher=cipher,
+        access="access-current",
+        refresh="refresh-current",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=2),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"refresh must not run: {request.url.path}")
+
+    expired = _connection(
+        cipher=cipher,
+        access="access-stale",
+        refresh="refresh-stale",
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+    token = await _gitlab_client(handler).access_token_for_connection(store, expired)
+    assert token == "access-current"
+    assert store.writes == []
+
+
+@pytest.mark.asyncio
+async def test_a_lost_gitlab_refresh_returns_the_replacement_not_its_own_token() -> None:
+    """A reconnect that wins the generation keeps its token; the refresh is discarded."""
+    cipher = SourceControlCipher("server-secret")
+    store = MemoryStore()
+    store.reject_write = True
+    store.row = _connection(
+        cipher=cipher,
+        access="access-a",
+        refresh="refresh-a",
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+    replacement = _connection(
+        cipher=cipher,
+        access="access-b",
+        refresh="refresh-b",
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=2),
+    )
+
+    def reconnect() -> None:
+        store.row = replacement
+
+    store.after_rejected_write = reconnect
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/oauth/token"
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "access-from-a",
+                "refresh_token": "refresh-from-a",
+                "created_at": datetime.now(timezone.utc).timestamp(),
+                "expires_in": 7200,
+            },
+        )
+
+    expired = _connection(
+        cipher=cipher,
+        access="access-a",
+        refresh="refresh-a",
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+    token = await _gitlab_client(handler).access_token_for_connection(store, expired)
+    assert token == "access-b"
+    assert token != "access-from-a"
+    assert store.token_update is None
+    assert store.row is replacement
+    [attempted] = store.writes
+    assert cipher.decrypt(attempted["access_token_ciphertext"]) == "access-from-a"
+    assert "access-from-a" not in replacement["access_token_ciphertext"]
+
+
+@pytest.mark.asyncio
+async def test_a_lost_gitlab_refresh_is_unavailable_when_nothing_valid_is_stored() -> None:
+    cipher = SourceControlCipher("server-secret")
+    store = MemoryStore()
+    store.reject_write = True
+    connection = _connection(
+        cipher=cipher,
+        access="access-old",
+        refresh="refresh-old",
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+    store.row = connection
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "access-refreshed",
+                "refresh_token": "refresh-refreshed",
+                "created_at": datetime.now(timezone.utc).timestamp(),
+                "expires_in": 7200,
+            },
+        )
+
+    with pytest.raises(SourceControlError, match="GitLab token refresh is unavailable"):
+        await _gitlab_client(handler).access_token_for_connection(store, connection)
+    assert store.token_update is None
+    assert cipher.decrypt(store.row["access_token_ciphertext"]) == "access-old"
+
+
+@pytest.mark.asyncio
+async def test_a_gitlab_refresh_without_the_lease_is_unavailable_once_the_token_lapses() -> None:
+    cipher = SourceControlCipher("server-secret")
+    store = MemoryStore()
+    store.lease_held = True
+    connection = _connection(
+        cipher=cipher,
+        access="access-old",
+        refresh="refresh-old",
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+    store.row = connection
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"refresh must not run: {request.url.path}")
+
+    with pytest.raises(SourceControlError, match="GitLab token refresh is unavailable"):
+        await _gitlab_client(handler).access_token_for_connection(store, connection)
+    assert store.writes == []

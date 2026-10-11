@@ -3,8 +3,11 @@ import '@testing-library/jest-dom/vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LocaleProvider } from '@/components/providers/LocaleProvider';
+import { getAgentConfig, type AgentConfigApi } from '@/lib/api/agents';
 import {
   clearUserMemory,
+  consolidateUserMemory,
+  saveUserMemories,
   deleteUserMemoryEntry,
   editUserMemoryEntry,
   getUserMemory,
@@ -20,12 +23,23 @@ vi.mock('@/components/providers/AuthProvider', () => ({
   useAuth: () => ({ state: { user: auth.userId ? { id: auth.userId } : null } }),
 }));
 vi.mock('@/lib/api/userMemory', () => ({
+  consolidateUserMemory: vi.fn(),
+  saveUserMemories: vi.fn(),
   getUserMemory: vi.fn(),
   updateUserMemory: vi.fn(),
   clearUserMemory: vi.fn(),
   editUserMemoryEntry: vi.fn(),
   deleteUserMemoryEntry: vi.fn(),
 }));
+vi.mock('@/lib/api/agents', () => ({ getAgentConfig: vi.fn() }));
+
+const agentConfig: AgentConfigApi = {
+  repos: [],
+  runtimes: ['codex'],
+  models: ['model-a', 'model-b'],
+  github_connected: false,
+  github_install_url: null,
+};
 
 function illustratedAvatar(color: string): UserMemoryView['avatar'] {
   return {
@@ -113,6 +127,7 @@ beforeEach(() => {
   vi.resetAllMocks();
   localStorage.clear();
   auth.userId = 'alice';
+  vi.mocked(getAgentConfig).mockResolvedValue(agentConfig);
   vi.mocked(getUserMemory).mockResolvedValue(populated);
   vi.mocked(updateUserMemory).mockResolvedValue({ ...populated, enabled: false });
   vi.mocked(clearUserMemory).mockResolvedValue(empty);
@@ -120,21 +135,24 @@ beforeEach(() => {
 
 afterEach(cleanup);
 
-describe('avatar and memory settings', () => {
-  it('automatically loads an illustrated avatar, recent work, source-linked memory, and actionable suggestions', async () => {
+describe('memory settings', () => {
+  it('automatically loads recent work, source-linked memory, and actionable suggestions without an avatar', async () => {
     render(panel());
-    expect(screen.getByRole('status')).toHaveTextContent('Loading your avatar and memory');
-    const avatar = await screen.findByRole('img', {
-      name: 'Your automatically generated illustrated avatar',
-    });
-    expect(avatar).toHaveAttribute('src', populated.avatar.data_url);
+    expect(screen.getByRole('status')).toHaveTextContent('Loading your memory');
+    await screen.findByRole('switch');
+    expect(screen.queryByRole('img')).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'User memory' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Saved user memory' })).toBeInTheDocument();
+    expect(screen.getByText(/User preferences apply to all projects/)).toHaveTextContent(
+      'preferences explicitly marked “across all projects”',
+    );
     expect(screen.getByRole('switch', { name: 'Automatically build memory' })).toBeChecked();
     expect(getUserMemory).toHaveBeenCalledWith(expect.any(AbortSignal));
     expect(screen.getByText(populated.portrait.summary)).toBeInTheDocument();
     expect(screen.getByText('alice/toolbox')).toBeInTheDocument();
     expect(screen.getByText('Testing')).toBeInTheDocument();
     expect(screen.getByText('codex')).toBeInTheDocument();
-    expect(screen.getByText('model-a')).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Consolidation model' })).toHaveValue('model-a');
     expect(screen.getByText('Preference')).toBeInTheDocument();
     expect(screen.getByText('Task context')).toBeInTheDocument();
     expect(screen.getAllByRole('link', { name: 'View source task' })[0]).toHaveAttribute(
@@ -147,10 +165,10 @@ describe('avatar and memory settings', () => {
     expect(screen.getByText(/Memory updated/)).toBeInTheDocument();
   });
 
-  it('renders useful empty states while retaining the avatar', async () => {
+  it('renders useful empty states', async () => {
     vi.mocked(getUserMemory).mockResolvedValue(empty);
     render(panel());
-    await screen.findByRole('img');
+    await screen.findByRole('switch');
     expect(screen.getByText(/Recent work will appear/)).toBeInTheDocument();
     expect(screen.getByText('No saved memory yet.')).toBeInTheDocument();
     expect(screen.getByText(/Suggestions will appear/)).toBeInTheDocument();
@@ -180,53 +198,13 @@ describe('avatar and memory settings', () => {
     expect(getUserMemory).toHaveBeenCalledTimes(2);
   });
 
-  it('replaces the avatar with the refreshed work theme, preserves the paused response, and resets the theme after clearing', async () => {
-    const refreshed: UserMemoryView = {
-      ...populated,
-      revision: 2,
-      avatar: illustratedAvatar('#ac7db5'),
-    };
-    const refresh = deferred<UserMemoryView>();
-    const paused = { ...refreshed, enabled: false };
-    const cleared = { ...empty, enabled: false };
-    vi.mocked(updateUserMemory).mockResolvedValueOnce(paused);
-    vi.mocked(clearUserMemory).mockResolvedValueOnce(cleared);
+  it('requires explicit clear confirmation, supports cancellation, and displays the returned empty memory after clearing', async () => {
     render(panel());
-    const avatar = await screen.findByRole('img');
-    expect(avatar).toHaveAttribute('src', populated.avatar.data_url);
-
-    vi.mocked(getUserMemory).mockReturnValueOnce(refresh.promise);
-    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
-    expect(avatar).toHaveAttribute('src', populated.avatar.data_url);
-    await act(async () => refresh.resolve(refreshed));
-    expect(avatar).toHaveAttribute('src', refreshed.avatar.data_url);
-
-    fireEvent.click(screen.getByRole('switch', { name: 'Automatically build memory' }));
-    await waitFor(() => expect(screen.getByRole('switch')).not.toBeChecked());
-    expect(avatar).toHaveAttribute('src', paused.avatar.data_url);
-    expect(screen.getByText(/Avatar theme updates, memory updates/)).toBeInTheDocument();
-    vi.mocked(getUserMemory).mockResolvedValueOnce(paused);
-    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled());
-    expect(avatar).toHaveAttribute('src', paused.avatar.data_url);
-
-    fireEvent.click(screen.getByRole('button', { name: 'Clear memory' }));
-    expect(
-      screen.getByText(/resets your avatar’s work theme while keeping its base character/),
-    ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm clear memory' }));
-    await screen.findByText('No saved memory yet.');
-    expect(avatar).toHaveAttribute('src', cleared.avatar.data_url);
-    expect(avatar).not.toHaveAttribute('src', refreshed.avatar.data_url);
-    expect(screen.getByRole('switch')).not.toBeChecked();
-  });
-
-  it('requires explicit clear confirmation, supports cancellation, and displays the returned base avatar after clearing', async () => {
-    render(panel());
-    await screen.findByRole('img');
+    await screen.findByRole('switch');
     fireEvent.click(screen.getByRole('button', { name: 'Clear memory' }));
     expect(clearUserMemory).not.toHaveBeenCalled();
     expect(screen.getByText(/Old requests won’t be used again/)).toBeInTheDocument();
+    expect(screen.getByText(/Project memory is kept/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Confirm clear memory' })).toHaveFocus();
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(screen.getByRole('button', { name: 'Clear memory' })).toHaveFocus();
@@ -238,7 +216,7 @@ describe('avatar and memory settings', () => {
     expect(screen.queryByText(populated.memories[0].content)).not.toBeInTheDocument();
     expect(screen.queryByText(populated.suggestions[0].title)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Confirm clear memory' })).not.toBeInTheDocument();
-    expect(screen.getByRole('img')).toHaveAttribute('src', empty.avatar.data_url);
+    expect(screen.queryByText(populated.portrait.summary)).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Clear memory' })).toHaveFocus();
   });
 
@@ -295,8 +273,7 @@ describe('avatar and memory settings', () => {
     await act(async () => newRead.resolve(otherAccount));
     await act(async () => oldClear.resolve(populated));
     expect(screen.getByRole('switch')).not.toBeChecked();
-    expect(screen.getByRole('img')).toHaveAttribute('src', otherAccount.avatar.data_url);
-    expect(screen.getByRole('img')).not.toHaveAttribute('src', populated.avatar.data_url);
+    expect(screen.getByText('No saved memory yet.')).toBeInTheDocument();
     expect(screen.queryByText(populated.memories[0].content)).not.toBeInTheDocument();
   });
 
@@ -310,19 +287,21 @@ describe('avatar and memory settings', () => {
     await act(async () => read.resolve(populated));
     auth.userId = undefined;
     render(panel());
-    expect(screen.getByText('Sign in to see your avatar and memory.')).toBeInTheDocument();
+    expect(screen.getByText('Sign in to see your memory.')).toBeInTheDocument();
     expect(getUserMemory).toHaveBeenCalledTimes(1);
+    expect(getAgentConfig).toHaveBeenCalledTimes(1);
   });
 
-  it('translates the avatar, memory controls, and clear confirmation into Chinese', async () => {
+  it('translates memory controls and clear confirmation into Chinese', async () => {
     localStorage.setItem(LOCALE_STORAGE_KEY, 'zh-CN');
     render(panel());
-    expect(await screen.findByRole('img', { name: '为你自动生成的插画头像' })).toBeInTheDocument();
+    await screen.findByRole('switch', { name: '自动建立记忆' });
+    expect(screen.getByRole('combobox', { name: '整合模型' })).toHaveValue('model-a');
+    expect(screen.getByRole('heading', { name: '用户记忆' })).toBeInTheDocument();
+    expect(screen.getByText(/用户偏好适用于所有项目/)).toBeInTheDocument();
     expect(screen.getByRole('switch', { name: '自动建立记忆' })).toBeChecked();
     expect(screen.getByRole('heading', { name: '未来任务建议' })).toBeInTheDocument();
-    expect(
-      screen.getByText('头像的基础角色保持不变，配色与细节会随近期工作变化。'),
-    ).toBeInTheDocument();
+    expect(screen.queryByRole('img')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '清除记忆' }));
     expect(screen.getByRole('button', { name: '确认清除记忆' })).toBeInTheDocument();
     expect(screen.getByText(/清除记忆会重置头像的工作主题，保留基础角色/)).toBeInTheDocument();
@@ -361,10 +340,10 @@ describe('avatar and memory settings', () => {
     let editor = within(first).getByRole('textbox', { name: 'Memory content' });
     expect(editor).toHaveFocus();
     expect(editor).toHaveValue(populated.memories[0].content);
-    expect(editor).toHaveAttribute('maxlength', '500');
+    expect(editor).toHaveAttribute('maxlength', '240');
     fireEvent.change(editor, { target: { value: '   ' } });
     expect(within(first).getByRole('button', { name: 'Save memory' })).toBeDisabled();
-    fireEvent.change(editor, { target: { value: 'x'.repeat(501) } });
+    fireEvent.change(editor, { target: { value: 'x'.repeat(241) } });
     expect(within(first).getByRole('button', { name: 'Save memory' })).toBeDisabled();
     fireEvent.click(within(first).getByRole('button', { name: 'Cancel' }));
     expect(within(first).getByRole('button', { name: 'Edit memory' })).toHaveFocus();
@@ -504,7 +483,7 @@ describe('avatar and memory settings', () => {
       populated.revision,
       expect.any(AbortSignal),
     );
-    expect(screen.getByRole('heading', { name: 'Saved memory' })).toHaveFocus();
+    expect(screen.getByRole('heading', { name: 'Saved user memory' })).toHaveFocus();
     expect(screen.getByText(populated.memories[1].content)).toBeInTheDocument();
   });
 
@@ -587,7 +566,7 @@ describe('avatar and memory settings', () => {
       expect(editUserMemoryEntry).toHaveBeenCalledTimes(1);
       fireEvent.click(within(first).getByRole('button', { name: 'Cancel' }));
       expect(first).not.toBeInTheDocument();
-      expect(screen.getByRole('heading', { name: 'Saved memory' })).toHaveFocus();
+      expect(screen.getByRole('heading', { name: 'Saved user memory' })).toHaveFocus();
     },
   );
 
@@ -650,7 +629,7 @@ describe('avatar and memory settings', () => {
     expect(within(first).getByRole('textbox')).toBeEnabled();
     expect(within(first).getByRole('button', { name: '保存记忆' })).toBeDisabled();
     fireEvent.click(within(first).getByRole('button', { name: '取消' }));
-    expect(screen.getByRole('heading', { name: '已保存的记忆' })).toHaveFocus();
+    expect(screen.getByRole('heading', { name: '已保存的用户记忆' })).toHaveFocus();
   });
 
   it('aborts an entry edit and removes its draft immediately when the account changes', async () => {
@@ -696,5 +675,186 @@ describe('avatar and memory settings', () => {
     fireEvent.click(within(first).getByRole('button', { name: '移除记忆' }));
     expect(within(first).getByRole('button', { name: '确认移除记忆' })).toHaveFocus();
     expect(within(first).getByText(/刷新记忆后，此条记忆也不会恢复/)).toBeInTheDocument();
+  });
+});
+
+describe('bounded scoped memory', () => {
+  it('submits the chosen model and keeps the choice when memory is refreshed', async () => {
+    vi.mocked(consolidateUserMemory).mockResolvedValue(populated);
+    render(panel());
+    const selector = await screen.findByRole('combobox', { name: 'Consolidation model' });
+    expect(selector).toHaveValue('model-a');
+    expect(
+      within(selector)
+        .getAllByRole('option')
+        .map((option) => option.textContent),
+    ).toEqual(['model-a', 'model-b']);
+    fireEvent.change(selector, { target: { value: 'model-b' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Consolidate' }));
+    await waitFor(() =>
+      expect(consolidateUserMemory).toHaveBeenCalledWith(1, 'model-b', expect.any(AbortSignal)),
+    );
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled());
+    expect(screen.getByText(populated.memories[0].content)).toBeInTheDocument();
+    expect(screen.getByText(populated.memories[1].content)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled());
+    expect(selector).toHaveValue('model-b');
+  });
+
+  it('uses the preferred available model when the memory arrives after the catalog', async () => {
+    const read = deferred<UserMemoryView>();
+    vi.mocked(getUserMemory).mockReturnValueOnce(read.promise);
+    vi.mocked(getAgentConfig).mockResolvedValue({
+      ...agentConfig,
+      models: ['model-b', 'model-a'],
+    });
+    render(panel());
+    await act(async () => read.resolve(populated));
+    expect(screen.getByRole('combobox', { name: 'Consolidation model' })).toHaveValue('model-a');
+  });
+
+  it('defaults to the first available model when the preferred model is unavailable', async () => {
+    vi.mocked(getAgentConfig).mockResolvedValue({
+      ...agentConfig,
+      models: ['model-b', 'model-c'],
+    });
+    render(panel());
+    expect(await screen.findByRole('combobox', { name: 'Consolidation model' })).toHaveValue(
+      'model-b',
+    );
+  });
+
+  it('keeps other memory controls usable while models are loading and retries an empty catalog', async () => {
+    const catalog = deferred<AgentConfigApi>();
+    vi.mocked(getAgentConfig).mockReturnValueOnce(catalog.promise);
+    render(panel());
+    const selector = await screen.findByRole('combobox', { name: 'Consolidation model' });
+    expect(selector).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Consolidate' })).toBeDisabled();
+    expect(screen.getByRole('status')).toHaveTextContent('Loading available models');
+    expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled();
+    expect(screen.getByRole('switch')).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Clear memory' })).toBeEnabled();
+    await act(async () => catalog.resolve({ ...agentConfig, models: [] }));
+    expect(screen.getByRole('status')).toHaveTextContent('No models available for consolidation');
+    expect(selector).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Consolidate' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled();
+    expect(consolidateUserMemory).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry models' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Consolidate' })).toBeEnabled());
+    expect(selector).toHaveValue('model-a');
+    expect(selector).toBeEnabled();
+    expect(getAgentConfig).toHaveBeenCalledTimes(2);
+    expect(getUserMemory).toHaveBeenCalledTimes(1);
+  });
+
+  it('disables consolidation after a catalog error and can retry without reloading memory', async () => {
+    vi.mocked(getAgentConfig).mockRejectedValueOnce(new Error('Offline'));
+    render(panel());
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not load models');
+    expect(screen.getByRole('button', { name: 'Consolidate' })).toBeDisabled();
+    expect(screen.getByRole('switch')).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Clear memory' })).toBeEnabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry models' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Consolidate' })).toBeEnabled());
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(getUserMemory).toHaveBeenCalledTimes(1);
+    expect(getAgentConfig).toHaveBeenCalledTimes(2);
+  });
+
+  it('discards old catalog responses and resets model choices when the account changes', async () => {
+    const oldCatalog = deferred<AgentConfigApi>();
+    const newCatalog = deferred<AgentConfigApi>();
+    vi.mocked(getAgentConfig)
+      .mockReturnValueOnce(oldCatalog.promise)
+      .mockReturnValueOnce(newCatalog.promise);
+    const rendered = render(panel());
+    await screen.findByRole('combobox', { name: 'Consolidation model' });
+    auth.userId = 'bob';
+    rendered.rerender(panel());
+    await act(async () => newCatalog.resolve({ ...agentConfig, models: ['bob-model'] }));
+    const selector = screen.getByRole('combobox', { name: 'Consolidation model' });
+    expect(selector).toHaveValue('bob-model');
+    await act(async () => oldCatalog.resolve({ ...agentConfig, models: ['alice-model'] }));
+    expect(selector).toHaveValue('bob-model');
+    expect(screen.queryByRole('option', { name: 'alice-model' })).not.toBeInTheDocument();
+  });
+
+  it('resets a selected model and aborts consolidation when the account changes', async () => {
+    const consolidation = deferred<UserMemoryView>();
+    vi.mocked(consolidateUserMemory).mockReturnValueOnce(consolidation.promise);
+    const rendered = render(panel());
+    const selector = await screen.findByRole('combobox', { name: 'Consolidation model' });
+    fireEvent.change(selector, { target: { value: 'model-b' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Consolidate' }));
+    const oldSignal = vi.mocked(consolidateUserMemory).mock.calls[0][2]!;
+    auth.userId = 'bob';
+    vi.mocked(getUserMemory).mockResolvedValue({
+      ...populated,
+      portrait: { ...populated.portrait, preferred_model: 'bob-model' },
+    });
+    vi.mocked(getAgentConfig).mockResolvedValue({ ...agentConfig, models: ['bob-model'] });
+    rendered.rerender(panel());
+    expect(oldSignal.aborted).toBe(true);
+    expect(await screen.findByRole('combobox', { name: 'Consolidation model' })).toHaveValue(
+      'bob-model',
+    );
+    await act(async () => consolidation.resolve(empty));
+    expect(screen.getByText(populated.memories[0].content)).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Consolidation model' })).toHaveValue('bob-model');
+  });
+
+  it('consolidates the current revision and replaces entries with the returned scopes', async () => {
+    vi.mocked(getUserMemory).mockResolvedValue(populated);
+    vi.mocked(consolidateUserMemory).mockResolvedValue({
+      ...populated,
+      revision: 2,
+      memories: [{ ...populated.memories[0], content: 'Keep reviews concise.', scope: 'user' }],
+    });
+    render(
+      <LocaleProvider>
+        <UserMemorySettings />
+      </LocaleProvider>,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Consolidate' }));
+    await screen.findByText('Keep reviews concise.');
+    expect(consolidateUserMemory).toHaveBeenCalledWith(1, 'model-a', expect.any(AbortSignal));
+    expect(screen.queryByText('Fix the test runner.')).not.toBeInTheDocument();
+    expect(screen.getByText(/1\/12 memories/)).toBeInTheDocument();
+  });
+
+  it('saves a user scope correction and disables consolidation while editing', async () => {
+    vi.mocked(getUserMemory).mockResolvedValue(populated);
+    vi.mocked(saveUserMemories).mockResolvedValue({
+      ...populated,
+      revision: 2,
+      memories: [{ ...populated.memories[0], scope: 'user' }, populated.memories[1]],
+    });
+    render(
+      <LocaleProvider>
+        <UserMemorySettings />
+      </LocaleProvider>,
+    );
+    const entry = await screen.findByRole('listitem', { name: 'Saved memory 1' });
+    fireEvent.click(within(entry).getByRole('button', { name: 'Edit memory' }));
+    expect(screen.getByRole('button', { name: 'Consolidate' })).toBeDisabled();
+    fireEvent.change(within(entry).getByRole('combobox', { name: 'Applies to' }), {
+      target: { value: 'user' },
+    });
+    expect(within(entry).getByRole('textbox')).toHaveAttribute('maxlength', '240');
+    fireEvent.click(within(entry).getByRole('button', { name: 'Save memory' }));
+    await waitFor(() =>
+      expect(saveUserMemories).toHaveBeenCalledWith(
+        1,
+        [
+          { id: 'preference-1', content: 'Use small pull requests.', scope: 'user' },
+          { id: 'task-1', content: 'Fix the test runner.', scope: 'user' },
+        ],
+        expect.any(AbortSignal),
+      ),
+    );
   });
 });

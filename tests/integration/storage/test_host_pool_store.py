@@ -2242,8 +2242,13 @@ async def test_a_takeover_surfaces_the_predecessors_grant_for_revocation(store, 
     assert second["previous_grant_id"] == "agr-old"
 
 
-async def test_reaped_residencies_carry_their_grant_id(store, hosts):
-    """The reaper revokes what the lapse orphans — it needs the id to do it."""
+async def test_reaped_residencies_carry_their_grant_id(db, store, hosts):
+    """The reaper revokes what the lapse orphans — it needs the id to do it.
+
+    The grant is linked while the lease is live. Once that lease is in the
+    past, a further link is refused and cannot replace the id the reaper
+    returns.
+    """
     await _enrol(store, "runner-a", hosts=hosts)
     job, _claim, _sandbox = await _resident_chat(store, "runner-a", hosts=hosts)
     await store.residency.establish_residency(
@@ -2251,16 +2256,133 @@ async def test_reaped_residencies_carry_their_grant_id(store, hosts):
         host="runner-a",
         runtime_id="claude-code",
         runtime_version=None,
-        ttl_seconds=-1,
+        ttl_seconds=60,
     )
-    await store.grants.link_residency_grant(
-        thread_id=job["thread_id"], generation=1, grant_id="agr-lapsed"
+    assert (
+        await store.grants.link_residency_grant(
+            thread_id=job["thread_id"], generation=1, grant_id="agr-lapsed"
+        )
+        is True
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_thread_sandbox_memberships "
+            "SET residency_lease_expires_at = NOW() - INTERVAL '1 second' "
+            "WHERE thread_id = $1",
+            job["thread_id"],
+        )
+    assert (
+        await store.grants.link_residency_grant(
+            thread_id=job["thread_id"], generation=1, grant_id="agr-after-expiry"
+        )
+        is False
     )
 
     lapsed = await store.residency.reap_expired_residencies()
     assert [(row["thread_id"], row["grant_id"]) for row in lapsed] == [
         (job["thread_id"], "agr-lapsed")
     ]
+
+
+async def test_a_live_lease_heartbeats_and_links_and_an_expired_lease_does_not(db, store, hosts):
+    """The clock ends a generation's authority before the reaper runs.
+
+    A live lease still heartbeats and accepts its grant. The same generation,
+    once the lease is in the past and the row is still hot, cannot extend
+    itself or take another grant. Reaping and an explicit release of that
+    expired row stay available.
+    """
+    await _enrol(store, "runner-a", hosts=hosts)
+    job, _claim, _sandbox = await _resident_chat(store, "runner-a", hosts=hosts)
+    await store.residency.establish_residency(
+        thread_id=job["thread_id"],
+        host="runner-a",
+        runtime_id="claude-code",
+        runtime_version=None,
+        ttl_seconds=60,
+    )
+
+    assert (
+        await store.residency.heartbeat_residency(
+            thread_id=job["thread_id"], generation=1, ttl_seconds=60, host="runner-a"
+        )
+        == ""
+    )
+    assert (
+        await store.grants.link_residency_grant(
+            thread_id=job["thread_id"], generation=1, grant_id="agr-live"
+        )
+        is True
+    )
+    assert (
+        await store.residency.heartbeat_residency(
+            thread_id=job["thread_id"], generation=1, ttl_seconds=60, host="runner-a"
+        )
+        == "agr-live"
+    )
+    assert (await store.residency.resident_host(thread_id=job["thread_id"]))["generation"] == 1
+
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_thread_sandbox_memberships "
+            "SET residency_lease_expires_at = NOW() - INTERVAL '1 second' "
+            "WHERE thread_id = $1",
+            job["thread_id"],
+        )
+
+    assert await store.residency.resident_host(thread_id=job["thread_id"]) is None
+    assert (
+        await store.residency.heartbeat_residency(
+            thread_id=job["thread_id"], generation=1, ttl_seconds=60, host="runner-a"
+        )
+        is None
+    )
+    assert (
+        await store.grants.link_residency_grant(
+            thread_id=job["thread_id"], generation=1, grant_id="agr-late"
+        )
+        is False
+    )
+    # The late beat did not push the lease forward, so the reaper still owns it.
+    assert await store.residency.resident_host(thread_id=job["thread_id"]) is None
+    lapsed = await store.residency.reap_expired_residencies()
+    assert [(row["thread_id"], row["generation"], row["grant_id"]) for row in lapsed] == [
+        (job["thread_id"], 1, "agr-live")
+    ]
+
+    expired_job, _expired_claim, _expired_sandbox = await _resident_chat(
+        store, "runner-a", hosts=hosts
+    )
+    await store.residency.establish_residency(
+        thread_id=expired_job["thread_id"],
+        host="runner-a",
+        runtime_id="claude-code",
+        runtime_version=None,
+        ttl_seconds=-1,
+    )
+    assert await store.residency.resident_host(thread_id=expired_job["thread_id"]) is None
+    assert (
+        await store.residency.heartbeat_residency(
+            thread_id=expired_job["thread_id"],
+            generation=1,
+            ttl_seconds=60,
+            host="runner-a",
+        )
+        is None
+    )
+    assert (
+        await store.grants.link_residency_grant(
+            thread_id=expired_job["thread_id"], generation=1, grant_id="agr-born-expired"
+        )
+        is False
+    )
+    assert (
+        await store.residency.release_residency(
+            thread_id=expired_job["thread_id"], generation=1, host="runner-a"
+        )
+        == ""
+    )
+    assert await store.residency.reap_expired_residencies() == []
 
 
 async def test_a_new_chat_without_a_group_is_claimable_by_an_enrolled_host(store, hosts):

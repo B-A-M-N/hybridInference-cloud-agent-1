@@ -3,9 +3,10 @@
 One pass closes attempts whose lease expired, abandons the ones the gateway has
 definitively refused, renews the grants that are still live, reaps offline hosts
 and lapsed residencies, cleans up the residencies a stranded fork left behind,
-and reconciles the forks and snapshot publishes an expiry stranded. It ran from
-``app.py`` before this module existed; it runs from the same place in the same
-process now, started and stopped by the same lifespan.
+reconciles the forks and snapshot publishes an expiry stranded, and purges
+abandoned staged uploads. It ran from ``app.py`` before this module existed; it
+runs from the same place in the same process now, started and stopped by the
+same lifespan.
 """
 
 from __future__ import annotations
@@ -99,6 +100,11 @@ REAP_INTERVAL_S = RENEWAL_INTERVAL_S
 
 
 MAX_ATTEMPTS = 3
+
+
+#: Abandoned staged uploads count against staging quota until collected.
+#: Pending-message and job-claimed rows are kept by the repository predicate.
+STAGED_UPLOAD_RETENTION_HOURS = 24
 
 
 #: The gateway refusals that are a verdict on the grant itself.
@@ -697,6 +703,15 @@ async def reap_expired_attempts(
                 )
         except Exception:
             logger.warning("Agent attempt reaper pass failed", exc_info=True)
+        # Abandoned staged uploads count against staging quota until collected.
+        # Pending-message and job-claimed rows are kept by the repository
+        # predicate. Own try: a failure here must not skip later reaping.
+        try:
+            await store.attachments.purge_stale_staged(
+                older_than_hours=STAGED_UPLOAD_RETENTION_HOURS
+            )
+        except Exception:
+            logger.warning("Staged upload purge failed", exc_info=True)
         # The owner's waiting messages after the attempt pass. A turn the
         # reaper just ended — failed or cancelled — reached no finish route, so
         # nothing else would act on it: this pauses its queue, and sends what a

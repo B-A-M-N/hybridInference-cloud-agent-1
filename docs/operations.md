@@ -133,6 +133,13 @@ S3-compatible endpoint and object prefix. The matching
 are first introduced; later environment changes do not override saved settings.
 An empty bucket leaves deletion unavailable.
 
+The bucket field also accepts an S3 URI in the browser. Saving
+`s3://freeinference/cloud-agent/sandbox` sets the bucket to `freeinference` and
+the prefix to `cloud-agent/sandbox` in one update. A bucket-root URI clears the
+prefix; entering only a bucket name leaves the prefix unchanged. Direct API
+updates and initial environment imports require the bucket name and prefix in
+their separate settings.
+
 Provision the main control plane's AWS SDK credential chain, preferably with an
 IAM workload role. Its archive role needs `s3:PutObject` and `s3:GetObject` on the
 configured archive prefix; `HeadObject` uses `s3:GetObject`. If SSE-KMS is applied
@@ -1069,16 +1076,40 @@ user with no installation looping through authorization.
 The same App also supplies the runner's clone credential, and the two are
 _not_ the same token. An installation token inherits every permission the App
 holds unless it asks for less, so the clone token is requested as
-`contents: read` on the single repository being worked on. Getting that wrong
-would put a push-capable credential on the host that executes untrusted
-repository code.
+`contents: read` on the single repository being worked on. Checkout does not
+inherit the publisher's broader authority.
+
+The claim separately mints a single-repository installation token with
+`contents: write` and `pull_requests: write`, injected as `GH_TOKEN` in the
+owning sandbox member's Agent CLI environment. `GH_REPO` selects the job's
+repository and `GH_HOST` selects `github.com`; `gh` authenticates as the App
+installation, rather than as the user's account. The token is not written to
+Git or GitHub CLI configuration, shared workspace files, or the image. Setup
+scripts and standalone terminal sessions do not receive it. Git uses the
+`gh auth git-credential` helper through invocation-only environment settings,
+so `git push` and `gh pr create` can authenticate without an interactive login.
+The host clone credential stays read-only; user account/refresh tokens and
+the App's private key remain outside the sandbox.
+
+Direct sandbox pushes bypass the trusted publisher's patch gate, including
+its workflow-file and secret checks. Repository branch protection and GitHub
+rules still apply. The App installation must grant Contents and Pull requests
+write access; token issuance failures return the claim to the queue.
+
+Each claim obtains a live token from the App's expiry-aware cache. When that
+token changes, the member resumes its native session in a replacement process
+so subsequent commands inherit the new credential. Installation tokens expire
+after about one hour; there is no in-turn renewal, so `gh` calls in a longer
+turn may require a new turn to obtain a fresh token.
 
 With no App configured the claim returns no clone token and the runner clones
 anonymously, which is enough for a public repository. A private repository
 needs the App.
 
-A static `AGENT_GITHUB_TOKEN` still works as a fallback, but it is a
-long-lived credential someone has to create and rotate; prefer the App.
+A static `AGENT_GITHUB_TOKEN` still works as a fallback for the trusted
+publisher, but it is a long-lived credential someone has to create and
+rotate; prefer the App. Sandbox GitHub authentication requires the App and
+never falls back to this static token.
 With neither, the publisher loop idles and says so — jobs still run and still
 produce patches, they just never become PRs.
 
@@ -1540,11 +1571,14 @@ Use the **Sandbox archives** card under **Admin → Settings → Sandbox** to st
 the deployment-wide archive policy in the Agent database. The destination is
 fixed at `s3://freeinference/cloud-agent/sandbox`; it is displayed read-only and
 is never accepted from the browser. An administrator atomically saves the
-enabled state, AWS region, customer-managed KMS key ARN, expected 12-digit
-bucket owner, maximum compressed archive size, multipart threshold, and part
-size. Updates use the revision returned by the last read, so two administrators
-cannot silently overwrite each other. Every change is recorded in the Audit
-log.
+enabled state, AWS region, maximum compressed archive size, multipart
+threshold, and part size. Authentication is either an AWS access key or the
+workload-identity pair: a customer-managed KMS key ARN and the expected
+12-digit bucket owner. An access key makes that pair optional; uploads then
+use SSE-S3 unless a KMS key is also set. The secret is write-only, encrypted
+at rest, and omitted from the audit row. Updates use the revision returned by
+the last read, so two administrators cannot silently overwrite each other.
+Every change is recorded in the Audit log.
 
 The dashboard uses admin-only `GET` and `PUT`
 `/admin/agent/sandbox-archive-settings`. To inspect the same policy and host
@@ -1563,13 +1597,19 @@ FROM agent_runner_hosts
 ORDER BY host;
 ```
 
-Do not put AWS access keys, archive policy, or the destination in `.env`. The
-workspace broker uses the host's AWS workload identity and the ordinary SDK
-credential chain. That identity needs the narrow S3 multipart/write and exact
-object-metadata permissions for the fixed prefix, plus encrypt access to the
-configured KMS key. The bucket must have versioning enabled. Configure lifecycle
-retention and access logging on the bucket itself; neither the runner nor a
-sandbox receives AWS credentials.
+Do not put archive policy, the destination, or an AWS access key in `.env`.
+Enter an access key on the Sandbox archives card when the broker has no
+workload identity. The control plane encrypts the secret before storing it
+and sends it to the broker on the authenticated heartbeat channel. The broker
+keeps it in memory for S3. Sandbox markers do not contain it, so it does not
+enter the container. A broker that predates access-key support rejects that
+heartbeat payload and does not confirm the revision; upgrade those brokers
+before relying on the key. With no access key, the workspace broker uses the
+host's AWS workload identity and the ordinary SDK credential chain. That
+identity needs the narrow S3 multipart/write and exact object-metadata
+permissions for the fixed prefix, plus encrypt access to the configured KMS
+key. The bucket must have versioning enabled. Configure lifecycle retention
+and access logging on the bucket itself.
 
 Concretely, grant the broker role `s3:GetBucketVersioning` on
 `arn:aws:s3:::freeinference`; `s3:ListBucket` on that bucket constrained to the
@@ -1578,7 +1618,8 @@ missing immutable initial object from an authorization failure); and
 `s3:GetObject`, `s3:PutObject`, and `s3:AbortMultipartUpload` on
 `arn:aws:s3:::freeinference/cloud-agent/sandbox/*`. The configured KMS key
 policy must permit `kms:GenerateDataKey` and `kms:Decrypt` for SSE-KMS
-multipart uploads. Add an `AbortIncompleteMultipartUpload` bucket lifecycle
+multipart uploads. An access key needs those same S3 actions; SSE-S3 uploads
+do not call KMS. Add an `AbortIncompleteMultipartUpload` bucket lifecycle
 rule as defense in depth for a host that disappears before its bounded abort
 request completes.
 

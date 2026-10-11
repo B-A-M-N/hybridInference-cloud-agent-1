@@ -9,6 +9,7 @@ import {
   updateUserMemory,
   type UserMemoryView,
 } from '@/lib/api/userMemory';
+import { getMemoryProjects } from '@/lib/api/projectMemory';
 import { LOCALE_STORAGE_KEY } from '@/lib/i18n/locales';
 import { IntegrationsView } from './IntegrationsView';
 import type { AgentIntegrationProviderApi, AgentIntegrationsApi } from '@/lib/api/agents';
@@ -21,6 +22,7 @@ import { listSkills } from '@/lib/api/skills';
 vi.mock('@/lib/api/skills', () => ({ listSkills: vi.fn() }));
 
 vi.mock('@/lib/api/agents', () => ({
+  getAgentConfig: vi.fn(),
   getAgentIntegrations: vi.fn(),
   disconnectAgentIntegration: vi.fn(),
   disconnectGitHubAccount: vi.fn(),
@@ -32,6 +34,19 @@ vi.mock('@/lib/api/userMemory', () => ({
   clearUserMemory: vi.fn(),
   editUserMemoryEntry: vi.fn(),
   deleteUserMemoryEntry: vi.fn(),
+  saveUserMemories: vi.fn(),
+  consolidateUserMemory: vi.fn(),
+}));
+
+vi.mock('@/lib/api/projectMemory', () => ({
+  getMemoryProjects: vi.fn(),
+  getProjectMemory: vi.fn(),
+  updateProjectMemory: vi.fn(),
+  clearProjectMemory: vi.fn(),
+  editProjectMemoryEntry: vi.fn(),
+  deleteProjectMemoryEntry: vi.fn(),
+  saveProjectMemories: vi.fn(),
+  consolidateProjectMemory: vi.fn(),
 }));
 
 // The MCP section loads its own connections; mocked empty so this file stays
@@ -46,6 +61,7 @@ vi.mock('@/lib/api/mcp', () => ({
 import {
   disconnectAgentIntegration,
   disconnectGitHubAccount,
+  getAgentConfig,
   getAgentIntegrations,
 } from '@/lib/api/agents';
 import { listMcpConnections } from '@/lib/api/mcp';
@@ -140,9 +156,17 @@ function unloadedGithub(
 beforeEach(() => {
   localStorage.clear();
   document.documentElement.lang = 'en';
+  vi.mocked(getAgentConfig).mockResolvedValue({
+    models: ['model-a', 'model-b'],
+    repos: [],
+    runtimes: ['codex'],
+    github_connected: true,
+    github_install_url: null,
+  });
   vi.mocked(listSkills).mockResolvedValue([]);
   mockedListMcpConnections.mockResolvedValue({ connections: [], templates: [] });
   vi.mocked(getUserMemory).mockResolvedValue(memory);
+  vi.mocked(getMemoryProjects).mockResolvedValue([]);
   vi.mocked(updateUserMemory).mockResolvedValue({ ...memory, enabled: false });
   vi.mocked(clearUserMemory).mockResolvedValue({ ...emptyMemory, enabled: false });
 });
@@ -176,22 +200,26 @@ describe('IntegrationsView', () => {
     expect(screen.getByRole('region', { name: 'Notifications' })).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: 'Agent questions' })).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: 'Turn completions' })).toBeInTheDocument();
-    expect(screen.getByRole('region', { name: 'Avatar & memory' })).toBeInTheDocument();
-    expect(screen.getByRole('heading', { level: 2, name: 'Avatar & memory' })).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'User memory' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 2, name: 'User memory' })).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'Project memory' })).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Repository (owner/repo)' })).toBeInTheDocument();
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(screen.queryByRole('combobox', { name: 'Theme' })).not.toBeInTheDocument();
     expect(screen.queryByRole('combobox', { name: 'Display language' })).not.toBeInTheDocument();
   });
 
-  it('shows the avatar, source-linked memory, suggestions, and privacy controls on the Setting page', async () => {
+  it('keeps source-linked memory, suggestions, and privacy controls on the Setting page without an avatar', async () => {
     mockedGetIntegrations.mockResolvedValue(integrations);
     render(<IntegrationsView />);
 
-    const section = screen.getByRole('region', { name: 'Avatar & memory' });
-    const avatar = await within(section).findByRole('img', {
-      name: 'Your automatically generated illustrated avatar',
-    });
-    expect(avatar).toHaveAttribute('src', memory.avatar.data_url);
+    const section = screen.getByRole('region', { name: 'User memory' });
+    await within(section).findByRole('switch');
+    expect(within(section).getByRole('combobox', { name: 'Consolidation model' })).toHaveValue(
+      'model-a',
+    );
+    expect(within(section).getByRole('button', { name: 'Consolidate' })).toBeEnabled();
+    expect(within(section).queryByRole('img')).not.toBeInTheDocument();
     expect(within(section).getByText(memory.portrait.summary)).toBeInTheDocument();
     expect(within(section).getByRole('link', { name: 'View source task' })).toHaveAttribute(
       'href',
@@ -203,7 +231,6 @@ describe('IntegrationsView', () => {
     await waitFor(() => expect(toggle).not.toBeChecked());
     expect(updateUserMemory).toHaveBeenCalledWith(false, expect.any(AbortSignal));
     expect(within(section).getByText(memory.memories[0].content)).toBeInTheDocument();
-    expect(avatar).toHaveAttribute('src', memory.avatar.data_url);
 
     fireEvent.click(within(section).getByRole('button', { name: 'Clear memory' }));
     expect(clearUserMemory).not.toHaveBeenCalled();
@@ -212,11 +239,10 @@ describe('IntegrationsView', () => {
     expect(clearUserMemory).toHaveBeenCalledWith(expect.any(AbortSignal));
     expect(within(section).queryByText(memory.portrait.summary)).not.toBeInTheDocument();
     expect(within(section).queryByText(memory.suggestions[0].title)).not.toBeInTheDocument();
-    expect(avatar).toHaveAttribute('src', memory.avatar.data_url);
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 
-  it('translates the Setting page and its avatar and memory card into Chinese', async () => {
+  it('translates the Setting page and its memory card into Chinese', async () => {
     mockedGetIntegrations.mockResolvedValue(integrations);
     localStorage.setItem(LOCALE_STORAGE_KEY, 'zh-CN');
     render(
@@ -226,11 +252,11 @@ describe('IntegrationsView', () => {
     );
 
     expect(await screen.findByRole('heading', { level: 1, name: '设置' })).toBeInTheDocument();
-    const section = screen.getByRole('region', { name: '头像与记忆' });
-    expect(
-      await within(section).findByRole('img', { name: '为你自动生成的插画头像' }),
-    ).toBeInTheDocument();
+    const section = screen.getByRole('region', { name: '用户记忆' });
+    await within(section).findByRole('switch', { name: '自动建立记忆' });
+    expect(within(section).queryByRole('img')).not.toBeInTheDocument();
     expect(within(section).getByRole('switch', { name: '自动建立记忆' })).toBeChecked();
+    expect(screen.getByRole('region', { name: '项目记忆' })).toBeInTheDocument();
     expect(screen.getByText('管理你的连接、技能、记忆和通知。')).toBeInTheDocument();
   });
 

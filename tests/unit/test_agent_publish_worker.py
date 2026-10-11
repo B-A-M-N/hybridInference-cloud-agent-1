@@ -19,6 +19,7 @@ from tests.support.storage import AllCapabilities
 
 from cloud_agent import publish_worker
 from cloud_agent.entitlement import RepoAccessUnavailable
+from cloud_agent.github_app import AppNotInstalled, GitHubAppError
 from cloud_agent.publish_worker import (
     GitHubCredential,
     create_draft_pull_request,
@@ -511,6 +512,7 @@ async def test_pr_closed_during_update_creates_a_new_draft(monkeypatch):
         httpx.Response(404, json={"message": "Not Found"}),
         httpx.Response(502, text="bad gateway"),
         httpx.Response(503, text="unavailable"),
+        httpx.Response(504, text="gateway timeout"),
         httpx.Response(200, text="not json"),
         httpx.Response(200, json={"unexpected": "object"}),
         httpx.Response(200, json=["not", "a", "PR"]),
@@ -518,7 +520,11 @@ async def test_pr_closed_during_update_creates_a_new_draft(monkeypatch):
     ],
 )
 async def test_pr_api_failure_does_not_record_the_stale_url(monkeypatch, failure, response):
-    """Unknown PR state must neither create duplicates nor record a stale link."""
+    """Unknown PR state must neither create duplicates nor record a stale link.
+
+    A 502, 503, 504, or a dropped connection goes back on the queue. A refusal
+    or an unreadable body still fails the snapshot.
+    """
     requests = []
 
     def handle(request):
@@ -545,10 +551,113 @@ async def test_pr_api_failure_does_not_record_the_stale_url(monkeypatch, failure
     store = FakeStore({**_JOB, "parent_pr_url": "https://github.com/o/n/pull/7"})
     assert await publish_one(store, credential=GitHubCredential("t")) is None
     assert store.snapshot_recorded is None
-    assert store.snapshot_failed is not None
-    if isinstance(response, httpx.Response) and response.status_code >= 400:
-        assert str(response.status_code) in store.snapshot_failed[1]
+    retryable = isinstance(response, httpx.ConnectError) or (
+        isinstance(response, httpx.Response) and response.status_code in {502, 503, 504}
+    )
+    recorded = store.snapshot_deferred if retryable else store.snapshot_failed
+    assert recorded is not None
+    assert store.snapshot_failed is None if retryable else store.snapshot_deferred is None
+    if isinstance(response, httpx.ConnectError):
+        assert "unreachable" in recorded[1]
+    elif isinstance(response, httpx.Response) and response.status_code >= 400:
+        assert str(response.status_code) in recorded[1]
     assert requests == (["GET", "PATCH"] if failure == "update" else ["GET"])
+
+
+@pytest.mark.parametrize("attempts", [4, 5])
+async def test_transient_publication_stops_after_five_defers(monkeypatch, attempts):
+    """The sixth transient failure fails the snapshot; the fifth still defers."""
+    store = FakeStore({**_JOB, "publish_attempt_count": attempts})
+    _patch_publish(
+        monkeypatch, PublishResult(branch="agent/ajob_1", commit_sha="s", changed_files=["x"])
+    )
+    monkeypatch.setattr(
+        publish_worker,
+        "ensure_draft_pull_request",
+        AsyncMock(side_effect=PublishError("GitHub refused the PR lookup (503)")),
+    )
+
+    assert await publish_one(store, credential=GitHubCredential("t")) is None
+    assert store.snapshot_recorded is None
+    if attempts >= 5:
+        assert store.snapshot_deferred is None
+        assert store.snapshot_failed == (9, "GitHub refused the PR lookup (503)")
+    else:
+        assert store.snapshot_failed is None
+        assert store.snapshot_deferred == (9, "GitHub refused the PR lookup (503)")
+
+
+@pytest.mark.parametrize(
+    ("error", "retried"),
+    [
+        (httpx.ConnectError("connection reset"), True),
+        (httpx.ReadTimeout("timed out"), True),
+        (GitHubAppError("GitHub token mint failed (502)", status=502), True),
+        (GitHubAppError("GitHub token mint failed (503)", status=503), True),
+        (GitHubAppError("GitHub token mint failed (504)", status=504), True),
+        (GitHubAppError("GitHub token mint failed (401)", status=401), False),
+        (AppNotInstalled("no App installation covers o/n", status=404), False),
+        (GitHubAppError("could not sign the App JWT"), False),
+    ],
+)
+async def test_credential_mint_retries_only_transient_github_failures(monkeypatch, error, retried):
+    """A GitHub blip while minting must not fail the snapshot; a refusal must."""
+    store = FakeStore(dict(_JOB))
+
+    class App:
+        async def token_for(self, repo: str, **kwargs: Any) -> str:
+            raise error
+
+    def forbid_push(**kwargs):
+        raise AssertionError("a credential failure must not push")
+
+    monkeypatch.setattr(publish_worker, "publish_patch", forbid_push)
+    assert await publish_one(store, app_credentials=App()) is None
+    assert store.snapshot_recorded is None
+    recorded = store.snapshot_deferred if retried else store.snapshot_failed
+    assert recorded is not None and recorded[0] == 9
+    assert "could not obtain a GitHub credential" in recorded[1]
+    assert store.snapshot_failed is None if retried else store.snapshot_deferred is None
+
+
+@pytest.mark.parametrize(
+    ("detail", "retried"),
+    [
+        (
+            "git fetch failed: fatal: unable to access 'https://github.com/o/n.git/': "
+            "Recv failure: Connection reset by peer",
+            True,
+        ),
+        ("git fetch timed out after 120s", True),
+        (
+            "git push failed: fatal: unable to access 'https://github.com/o/n.git/': "
+            "The requested URL returned error: 503",
+            True,
+        ),
+        (
+            "git fetch failed: fatal: Authentication failed for 'https://github.com/o/n.git/'",
+            False,
+        ),
+        (
+            "branch agent/athr_1 has moved: its tip is abcdefabcdef "
+            "but this run built on 123456789abc",
+            False,
+        ),
+    ],
+)
+async def test_git_transport_failures_retry_and_rejections_do_not(monkeypatch, detail, retried):
+    """A disconnect while publishing is deferred; a real git refusal is not."""
+    store = FakeStore(dict(_JOB))
+    _patch_publish(monkeypatch, PublishError(detail))
+    pr_called = _patch_pr(monkeypatch)
+
+    assert await publish_one(store, credential=GitHubCredential("t")) is None
+    assert pr_called == {}
+    assert store.snapshot_recorded is None
+    recorded = store.snapshot_deferred if retried else store.snapshot_failed
+    assert recorded is not None and recorded[0] == 9
+    assert detail in recorded[1] or recorded[1] == detail
+    assert store.snapshot_failed is None if retried else store.snapshot_deferred is None
 
 
 async def test_gate_rejection_fails_the_job_and_never_pushes(monkeypatch):

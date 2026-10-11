@@ -122,6 +122,13 @@ export function SandboxManagement({
           ? 'Wait for the workspace snapshot to finish.'
           : null
     : null;
+  const forceDelete =
+    sandbox?.state === 'running' &&
+    reviewBlocked === null &&
+    deletionBusyReason === null &&
+    !deletionComplete &&
+    idleBlocked === null &&
+    Boolean(sandbox.container_id);
   const stopBlocked =
     reviewBlocked ??
     deletionBusyReason ??
@@ -147,7 +154,7 @@ export function SandboxManagement({
     reviewBlocked ??
     deletionBusyReason ??
     (deletionComplete ? 'This sandbox has already been deleted.' : null) ??
-    (sandbox?.state !== 'stopped'
+    (sandbox?.state !== 'stopped' && sandbox?.state !== 'running'
       ? 'Wait for the host to confirm a clean stop before deleting this sandbox.'
       : null) ??
     idleBlocked ??
@@ -167,15 +174,17 @@ export function SandboxManagement({
       )
     )
       return;
-    if (
-      kind === 'delete' &&
-      !window.confirm(
-        `Archive to S3 and permanently delete the stopped sandbox shared by ${sandbox.member_count} ${sandbox.member_count === 1 ? 'session' : 'sessions'}? ` +
-          'Workspace files and native session history will be uploaded to S3 and verified before the retained container is deleted for every member. ' +
-          'Live native resume will no longer be available. Chat history remains.',
-      )
-    )
-      return;
+    if (kind === 'delete') {
+      const confirmation =
+        sandbox.state === 'running'
+          ? `Verify the exact retained container shared by ${sandbox.member_count} ${sandbox.member_count === 1 ? 'session' : 'sessions'} is stopped and idle, then permanently delete it? ` +
+            'The server refuses if that exact container is still running or has activity; this action does not stop a running container. ' +
+            'Workspace files and native session history are still uploaded to S3 and verified before deletion. Live native resume will no longer be available. Chat history remains.'
+          : `Archive to S3 and permanently delete the stopped sandbox shared by ${sandbox.member_count} ${sandbox.member_count === 1 ? 'session' : 'sessions'}? ` +
+            'Workspace files and native session history will be uploaded to S3 and verified before the retained container is deleted for every member. ' +
+            'Live native resume will no longer be available. Chat history remains.';
+      if (!window.confirm(confirmation)) return;
+    }
     if (
       kind === 'archive' &&
       !window.confirm(
@@ -205,13 +214,18 @@ export function SandboxManagement({
         last_activity_at: sandbox.last_activity_at,
       };
       let next: AdminSandboxDetail;
-      if (kind === 'stop' || kind === 'delete') {
-        const updateContainer = kind === 'stop' ? stopAdminSandbox : deleteAdminSandbox;
-        next = await updateContainer(
+      if (kind === 'stop') {
+        next = await stopAdminSandbox(
           sandbox.id,
           { ...reviewed, container_id: sandbox.container_id! },
           controller.signal,
         );
+      } else if (kind === 'delete') {
+        const deleteRequest = { ...reviewed, container_id: sandbox.container_id! };
+        next =
+          sandbox.state === 'running'
+            ? await deleteAdminSandbox(sandbox.id, deleteRequest, controller.signal, true)
+            : await deleteAdminSandbox(sandbox.id, deleteRequest, controller.signal);
       } else {
         const updateInventory = kind === 'archive' ? archiveAdminSandbox : restoreAdminSandbox;
         next = await updateInventory(sandbox.id, reviewed, controller.signal);
@@ -410,12 +424,20 @@ export function SandboxManagement({
               disabled={busy || loading || deleteBlocked !== null}
               onClick={() => void applyAction('delete')}
             >
-              {pendingAction === 'delete' ? 'Requesting deletion…' : 'Archive to S3 and delete'}
+              {pendingAction === 'delete'
+                ? forceDelete
+                  ? 'Verifying stopped state…'
+                  : 'Requesting deletion…'
+                : forceDelete
+                  ? 'Verify stopped and force delete'
+                  : 'Archive to S3 and delete'}
             </button>
-            {!controlsBlocked && (
+            {!controlsBlocked && (forceDelete || deleteBlocked !== stopBlocked) && (
               <p className="text-xs text-gray-500 dark:text-gray-400">
                 {deleteBlocked ??
-                  'Uploads and verifies files and native session history in S3 before deleting the retained container. Live native resume will no longer be available.'}
+                  (forceDelete
+                    ? 'Asks the server to verify that this exact container is already stopped and idle. It will not stop a running container, and S3 archival is still required before deletion.'
+                    : 'Uploads and verifies files and native session history in S3 before deleting the retained container. Live native resume will no longer be available.')}
               </p>
             )}
           </div>
