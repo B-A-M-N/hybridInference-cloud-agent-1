@@ -1,13 +1,13 @@
 """Fence a GitLab token refresh against reconnect and a second refresher.
 
 Revision ID: 0053_gitlab_refresh_fence
-Revises: 0052_memory_overrides
+Revises: 0053_project_memory
 """
 
 from alembic import op
 
 revision = "0053_gitlab_refresh_fence"
-down_revision = "0052_memory_overrides"
+down_revision = "0053_project_memory"
 branch_labels = None
 depends_on = None
 
