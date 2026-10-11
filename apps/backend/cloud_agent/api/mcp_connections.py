@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -1469,19 +1469,19 @@ async def _resolve(host: str, port: int) -> list[str]:
     return [str(info[4][0]) for info in infos]
 
 
-async def _callback_session_user(
-    request: Request,
-    authorization: str | None = Header(None),
-) -> str | None:
+async def _callback_session_user(request: Request) -> str | None:
     """The Agent account the returning browser is signed in as, or ``None``.
 
     Read by the same verifier as every owner route, but answered rather than
     raised: the callback is a browser navigation, and a 401 body is a dead end
     where a redirect back to the app can say what to do. The session cookie is
     ``SameSite=Lax``, so it travels on this top-level GET from the provider.
+    Only the cookie is read: a provider's redirect cannot carry a bearer, and
+    declaring that header would add a parameter to the served contract that no
+    real callback could use.
     """
     try:
-        user = await get_current_user(request, authorization)
+        user = await get_current_user(request, authorization=None)
     except HTTPException:
         return None
     return str(user["user_id"])

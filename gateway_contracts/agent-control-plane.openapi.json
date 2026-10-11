@@ -27447,7 +27447,7 @@
     },
     "/v1/agent/mcp/oauth/callback/{provider}": {
       "get": {
-        "description": "Complete a browser authorization, fenced to the flow that started it.\n\nUnauthenticated by design: the browser arriving here carries a session\ncookie it may or may not still have, and the *state* is the credential that\nidentifies the flow. The user is taken from the flow row, which was written\nby an authenticated request, rather than from whatever this request claims.",
+        "description": "Complete a browser authorization, fenced to the flow that started it.\n\nThe *state* identifies the flow; the Agent session decides who may finish\nit. A flow is consumed only for the account that started it, before any\ncode is exchanged. Without that, a consent URL started by one user and\napproved in another person's browser would store that person's provider\ngrant on the first user's connection -- the authorization-code injection\nRFC 9700 describes, which PKCE does not stop because the platform holds\nthe verifier. The connection is still taken from the flow row, written by\nan authenticated request, rather than from anything this request claims.",
         "operationId": "oauth_callback_v1_agent_mcp_oauth_callback__provider__get",
         "parameters": [
           {
