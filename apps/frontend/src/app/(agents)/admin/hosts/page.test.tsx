@@ -538,9 +538,9 @@ describe('AdminHostsPage', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Remove from pool' }));
 
     expect(confirm).toHaveBeenCalledTimes(1);
-    // The consequence has to be in the prompt: force does not stop the
-    // attempts, it leaves them to their leases.
-    expect(confirm.mock.calls[0][0]).toMatch(/does not stop them/);
+    // The consequence has to be in the prompt: force ends the host's running
+    // attempts now, requeueing them or marking a chat lost.
+    expect(confirm.mock.calls[0][0]).toMatch(/Removing it ends them/);
     expect(mocked.remove).not.toHaveBeenCalled();
 
     confirm.mockReturnValue(true);
