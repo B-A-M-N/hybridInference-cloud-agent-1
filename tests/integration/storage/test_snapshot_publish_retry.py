@@ -18,7 +18,7 @@ from tests.integration.storage.test_agent_job_store import (
 from cloud_agent import publish_worker
 from cloud_agent.entitlement import RepoAccessUnavailable
 from cloud_agent.publish_worker import GitHubCredential
-from cloud_agent.publisher import PublishResult
+from cloud_agent.publisher import PublishError, PublishResult
 
 pytestmark = [pytest.mark.dbtest, pytest.mark.asyncio]
 
@@ -104,6 +104,27 @@ async def _capture_settled_workspace(store, key: str) -> tuple[dict, dict, str]:
         == "captured"
     )
     return job, capture, patch
+
+
+async def _allow_publication(monkeypatch) -> None:
+    """Skip the deployment allowlist; these tests are about the publish queue."""
+
+    async def entitled(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(publish_worker, "require_entitled_repo", entitled)
+
+
+def _push(**kwargs):
+    return PublishResult(
+        branch=f"agent/{kwargs['branch_id']}", commit_sha="b" * 40, changed_files=["answer"]
+    )
+
+
+async def _import_base(store, *, snapshot, commit_sha, bundle):
+    return await store.snapshot.complete_snapshot_base_import(
+        snapshot_id=snapshot["snapshot_id"], commit_sha=commit_sha
+    )
 
 
 async def test_entitlement_outage_preserves_snapshot_and_later_work_then_retries_once(
@@ -224,4 +245,157 @@ async def test_entitlement_outage_preserves_snapshot_and_later_work_then_retries
                 [first["id"], later["id"]],
             )
             == 2
+        )
+
+
+async def test_transient_pr_failure_is_claimable_again_after_retry_at(store, pool, monkeypatch):
+    """A 502 after the push returns the snapshot to the queue, then it publishes."""
+    _job, capture, patch = await _capture_settled_workspace(store, "transient")
+    await _allow_publication(monkeypatch)
+    calls = {"pr": 0}
+
+    async def pull_request(**_kwargs):
+        calls["pr"] += 1
+        if calls["pr"] == 1:
+            raise PublishError("GitHub refused the draft PR (502): bad gateway")
+        return "https://example.test/pull/1"
+
+    monkeypatch.setattr(publish_worker, "publish_patch", _push)
+    monkeypatch.setattr(publish_worker, "ensure_draft_pull_request", pull_request)
+    monkeypatch.setattr(publish_worker, "_import_snapshot_base", _import_base)
+
+    await publish_worker._publish_due(
+        store,
+        credential=GitHubCredential("local-test-token"),
+        app_credentials=None,
+        base_branch="dev",
+    )
+    assert calls["pr"] == 1
+    async with pool.acquire() as conn:
+        retained = await conn.fetchrow(
+            "SELECT state, publish_attempt_count, retry_at, patch_content, last_error "
+            "FROM agent_sandbox_snapshots WHERE id = $1",
+            capture["snapshot_id"],
+        )
+    assert retained["state"] == "captured"
+    assert retained["publish_attempt_count"] == 1
+    assert retained["patch_content"] == patch
+    assert "502" in retained["last_error"]
+    assert retained["retry_at"] is not None
+    assert 25 < (retained["retry_at"] - datetime.now(UTC)).total_seconds() <= 30
+    assert await store.snapshot.claim_for_publish() is None
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_sandbox_snapshots SET retry_at = NOW() WHERE id = $1",
+            capture["snapshot_id"],
+        )
+    claimed = await store.snapshot.claim_for_publish()
+    assert claimed is not None
+    assert claimed["snapshot_id"] == capture["snapshot_id"]
+    assert claimed["publish_attempt_count"] == 1
+
+    url = await publish_worker._publish_claimed(
+        store,
+        claimed,
+        credential=GitHubCredential("local-test-token"),
+        app_credentials=None,
+        base_branch="dev",
+    )
+    assert url == "https://example.test/pull/1"
+    assert calls["pr"] == 2
+    async with pool.acquire() as conn:
+        final = await conn.fetchrow(
+            "SELECT state, publish_attempt_count, retry_at, last_error "
+            "FROM agent_sandbox_snapshots WHERE id = $1",
+            capture["snapshot_id"],
+        )
+    assert dict(final) == {
+        "state": "published",
+        "publish_attempt_count": 1,
+        "retry_at": None,
+        "last_error": None,
+    }
+
+
+async def test_the_sixth_transient_failure_fails_instead_of_deferring(store, pool, monkeypatch):
+    """Five recorded defers is the budget; the next 503 fails the snapshot."""
+    _job, capture, _patch = await _capture_settled_workspace(store, "budget")
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_sandbox_snapshots SET publish_attempt_count = 5 WHERE id = $1",
+            capture["snapshot_id"],
+        )
+    await _allow_publication(monkeypatch)
+
+    async def pull_request(**_kwargs):
+        raise PublishError("GitHub refused the PR lookup (503)")
+
+    monkeypatch.setattr(publish_worker, "publish_patch", _push)
+    monkeypatch.setattr(publish_worker, "ensure_draft_pull_request", pull_request)
+    monkeypatch.setattr(publish_worker, "_import_snapshot_base", _import_base)
+
+    await publish_worker._publish_due(
+        store,
+        credential=GitHubCredential("local-test-token"),
+        app_credentials=None,
+        base_branch="dev",
+    )
+    async with pool.acquire() as conn:
+        failed = await conn.fetchrow(
+            "SELECT state, publish_attempt_count, retry_at, last_error "
+            "FROM agent_sandbox_snapshots WHERE id = $1",
+            capture["snapshot_id"],
+        )
+    assert failed["state"] == "failed"
+    assert failed["publish_attempt_count"] == 5
+    assert failed["retry_at"] is None
+    assert "503" in failed["last_error"]
+    assert await store.snapshot.claim_for_publish() is None
+
+
+async def test_a_failed_earlier_snapshot_still_blocks_the_lineage(store, pool):
+    """A terminal publication failure still holds every later snapshot back."""
+    job, capture, _patch = await _capture_settled_workspace(store, "lineage")
+    claimed = await store.snapshot.claim_for_publish()
+    assert claimed is not None and claimed["snapshot_id"] == capture["snapshot_id"]
+    await store.snapshot.fail_snapshot_publish(
+        snapshot_id=capture["snapshot_id"], detail="publisher rejected the immutable patch"
+    )
+    later_patch = "diff --git a/later.txt b/later.txt\nnew file mode 100644\n"
+    async with pool.acquire() as conn, conn.transaction():
+        later_id = await conn.fetchval(
+            """
+            INSERT INTO agent_sandbox_snapshots (
+                sandbox_id, workspace_epoch, anchor_job_id, base_sha,
+                patch_content, content_sha256, state
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, 'captured')
+            RETURNING id
+            """,
+            capture["sandbox_id"],
+            capture["workspace_epoch"] + 1,
+            job["id"],
+            job["base_sha"],
+            later_patch,
+            hashlib.sha256(later_patch.encode()).hexdigest(),
+        )
+        await conn.execute(
+            "INSERT INTO agent_snapshot_jobs (snapshot_id, job_id) VALUES ($1, $2)",
+            later_id,
+            job["id"],
+        )
+
+    assert await store.snapshot.claim_for_publish() is None
+    async with pool.acquire() as conn:
+        assert (
+            await conn.fetchval("SELECT state FROM agent_sandbox_snapshots WHERE id = $1", later_id)
+            == "captured"
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT state FROM agent_sandbox_snapshots WHERE id = $1",
+                capture["snapshot_id"],
+            )
+            == "failed"
         )
