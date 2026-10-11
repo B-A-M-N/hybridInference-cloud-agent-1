@@ -226,6 +226,39 @@ describe('toDisplayEvent', () => {
     expect(row).toEqual({ kind: 'lifecycle', text: 'attempt_superseded', sourceEventId: 1 });
   });
 
+  it('shows every provider retry with its reported delay and attempt', () => {
+    for (const [attempt, delay] of [
+      [1, 5000],
+      [2, 10000],
+    ]) {
+      const display = toDisplayEvent(
+        event(attempt, 'lifecycle', {
+          phase: 'api_retry',
+          error_status: 503,
+          attempt,
+          max_retries: 10,
+          retry_delay_ms: delay,
+        }),
+      );
+      const text = `Provider temporarily unavailable. Retrying in ${delay / 1000}s (retry ${attempt} of 10).`;
+      expect(display).toEqual({ kind: 'lifecycle', text, sourceEventId: attempt });
+      expect(lifecyclePhaseLabel(text).milestone).toBe(false);
+    }
+  });
+
+  it.each([
+    [{ retry_delay_ms: 0, attempt: 1 }, 'Retrying now (retry 1).'],
+    [{ retry_delay_ms: 4500 }, 'Retrying in 5s.'],
+    [{}, 'Retrying model request.'],
+    [{ retry_delay_ms: -1, attempt: '2', max_retries: Number.NaN }, 'Retrying model request.'],
+  ])('does not invent missing retry timing or counts: %j', (payload, text) => {
+    expect(toDisplayEvent(event(1, 'lifecycle', { phase: 'api_retry', ...payload }))).toEqual({
+      kind: 'lifecycle',
+      text,
+      sourceEventId: 1,
+    });
+  });
+
   it('keeps rate-limit warnings while hiding normal allowance events', () => {
     expect(
       toDisplayEvent(event(1, 'lifecycle', { phase: 'rate_limit', info: { status: 'allowed' } })),
@@ -1016,6 +1049,42 @@ describe('toDisplayJob', () => {
 
     expect(job.prUrl).toBe('https://github.com/o/n/pull/44');
     expect(job.prLabel).toBe('draft PR 44');
+  });
+
+  it('opens the latest session PR when an earlier turn has the closed PR URL', () => {
+    const previous = {
+      ...JOB,
+      thread_id: 'thread_1',
+      turn_no: 1,
+      published_pr_url: 'https://github.com/o/n/pull/44',
+    };
+    const current = {
+      ...previous,
+      id: 'ajob_2',
+      turn_no: 2,
+      published_pr_url: 'https://github.com/o/n/pull/45',
+    };
+    const job = toDisplayJob(previous, {
+      thread: { thread_id: 'thread_1', jobs: [previous, current], messages: [] },
+    });
+
+    expect(job.prUrl).toBe('https://github.com/o/n/pull/45');
+    expect(job.prLabel).toBe('draft PR 45');
+  });
+
+  it('keeps a fresh PR update while the thread read still has the earlier URL', () => {
+    const stale = {
+      ...JOB,
+      thread_id: 'thread_1',
+      turn_no: 2,
+      published_pr_url: 'https://github.com/o/n/pull/44',
+    };
+    const fresh = { ...stale, published_pr_url: 'https://github.com/o/n/pull/45' };
+    const job = toDisplayJob(fresh, {
+      thread: { thread_id: 'thread_1', jobs: [stale], messages: [] },
+    });
+
+    expect(job.prUrl).toBe('https://github.com/o/n/pull/45');
   });
 });
 

@@ -1532,6 +1532,12 @@
             "title": "Execution Profile",
             "type": "string"
           },
+          "generation": {
+            "default": 1,
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
           "host": {
             "title": "Host",
             "type": "string"
@@ -1623,10 +1629,30 @@
             "type": "string"
           },
           "state": {
-            "const": "running",
             "default": "running",
+            "enum": [
+              "provisioning",
+              "starting",
+              "running",
+              "stopping",
+              "stopped",
+              "stopped_dirty",
+              "lost"
+            ],
             "title": "State",
             "type": "string"
+          },
+          "stop_requested_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stop Requested At"
           },
           "terminal_count": {
             "anyOf": [
@@ -1693,6 +1719,34 @@
         "title": "AdminSandbox",
         "type": "object"
       },
+      "AdminSandboxDetail": {
+        "description": "A consistent sandbox inspection with at most 128 current members.",
+        "properties": {
+          "members": {
+            "items": {
+              "$ref": "#/components/schemas/AdminSandboxMember"
+            },
+            "maxItems": 128,
+            "title": "Members",
+            "type": "array"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "sandbox": {
+            "$ref": "#/components/schemas/AdminSandbox"
+          }
+        },
+        "required": [
+          "sandbox",
+          "members",
+          "observed_at"
+        ],
+        "title": "AdminSandboxDetail",
+        "type": "object"
+      },
       "AdminSandboxList": {
         "description": "A bounded page of the current inventory, ordered by sandbox identity.",
         "properties": {
@@ -1731,6 +1785,96 @@
           "observed_at"
         ],
         "title": "AdminSandboxList",
+        "type": "object"
+      },
+      "AdminSandboxMember": {
+        "description": "Bounded member identity and occupancy, without native session content.",
+        "properties": {
+          "active_attempt_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Attempt Id"
+          },
+          "context_status": {
+            "title": "Context Status",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "last_settled_job_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Settled Job Id"
+          },
+          "native_state": {
+            "title": "Native State",
+            "type": "string"
+          },
+          "resident_slot_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resident Slot Id"
+          },
+          "resident_state": {
+            "title": "Resident State",
+            "type": "string"
+          },
+          "thread_id": {
+            "title": "Thread Id",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id",
+          "user_id",
+          "resident_state",
+          "context_status",
+          "native_state",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "AdminSandboxMember",
         "type": "object"
       },
       "AdminSandboxResourceUsage": {
@@ -1923,6 +2067,35 @@
           "stale"
         ],
         "title": "AdminSandboxResourceUsage",
+        "type": "object"
+      },
+      "AdminSandboxStopRequest": {
+        "additionalProperties": false,
+        "description": "The exact container and activity the administrator reviewed.",
+        "properties": {
+          "container_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Container Id",
+            "type": "string"
+          },
+          "generation": {
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "last_activity_at": {
+            "format": "date-time",
+            "title": "Last Activity At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "generation",
+          "container_id",
+          "last_activity_at"
+        ],
+        "title": "AdminSandboxStopRequest",
         "type": "object"
       },
       "AdminStep": {
@@ -5243,7 +5416,7 @@
             "additionalProperties": {
               "type": "integer"
             },
-            "description": "Runtime settings set for this server on the admin page, by key (see host_setting_definitions). They win over the global values; a setting absent here uses the global value, or the host's own.",
+            "description": "Runtime settings set for this server on the admin page, by key (see host_setting_definitions). They win over the global values; a setting absent here uses the global value, or the deployment default.",
             "title": "Settings Desired",
             "type": "object"
           },
@@ -5266,7 +5439,7 @@
                 "type": "null"
               }
             ],
-            "description": "What this host's own environment gives each setting with no admin value: its .env, or the built-in default. Clearing an admin value returns the host to this.",
+            "description": "The host's original bootstrap environment values, for diagnostics and one-time migration. Clearing an admin value restores the global value or built-in default.",
             "title": "Settings Local"
           },
           "slots_desired": {
@@ -5623,6 +5796,28 @@
       "AgentTerminalSessionListResponse": {
         "description": "Interactive terminal sessions retained by one live workspace.",
         "properties": {
+          "max_input_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Input Bytes"
+          },
+          "max_sessions": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Sessions"
+          },
           "profiling": {
             "anyOf": [
               {
@@ -6615,12 +6810,10 @@
         "description": "Advertise the server's upload bounds to clients.",
         "properties": {
           "max_file_bytes": {
-            "default": 5242880,
             "title": "Max File Bytes",
             "type": "integer"
           },
           "max_files": {
-            "default": 50,
             "title": "Max Files",
             "type": "integer"
           },
@@ -6630,7 +6823,6 @@
             "type": "integer"
           },
           "max_total_bytes": {
-            "default": 20971520,
             "title": "Max Total Bytes",
             "type": "integer"
           }
@@ -7785,6 +7977,71 @@
         "title": "CreateConnectionRequest",
         "type": "object"
       },
+      "CreateGitHubRepositoryRequest": {
+        "additionalProperties": false,
+        "description": "Create a personal GitHub repository without starting a conversation.",
+        "properties": {
+          "description": {
+            "default": "",
+            "maxLength": 350,
+            "pattern": "^[^\\x00]*$",
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 100,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+            "title": "Name",
+            "type": "string"
+          },
+          "private": {
+            "default": true,
+            "title": "Private",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "CreateGitHubRepositoryRequest",
+        "type": "object"
+      },
+      "CreateGitHubRepositoryResponse": {
+        "description": "The created repository and its separately checked Agent access.",
+        "properties": {
+          "accessible": {
+            "title": "Accessible",
+            "type": "boolean"
+          },
+          "default_branch": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Default Branch",
+            "type": "string"
+          },
+          "repo": {
+            "maxLength": 140,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,38}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$",
+            "title": "Repo",
+            "type": "string"
+          },
+          "web_url": {
+            "maxLength": 2048,
+            "pattern": "^https?://[^/]+/",
+            "title": "Web Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo",
+          "web_url",
+          "default_branch",
+          "accessible"
+        ],
+        "title": "CreateGitHubRepositoryResponse",
+        "type": "object"
+      },
       "CreateSkill": {
         "additionalProperties": false,
         "description": "Create instructions directly or after reviewing an uploaded Markdown file.",
@@ -7859,6 +8116,36 @@
           "content_base64"
         ],
         "title": "CreateUpload",
+        "type": "object"
+      },
+      "DatabaseTools": {
+        "description": "Whether the configured pgAdmin is reachable, and where to open it.",
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          }
+        },
+        "required": [
+          "enabled",
+          "available"
+        ],
+        "title": "DatabaseTools",
         "type": "object"
       },
       "DecisionRequest": {
@@ -9217,7 +9504,7 @@
                 "type": "null"
               }
             ],
-            "description": "What this host's own environment gives each setting with no admin value. Null means not reported and keeps what is stored.",
+            "description": "The host's original bootstrap environment values, for diagnostics and one-time migration. Null means not reported and keeps what is stored.",
             "title": "Settings Local"
           },
           "slots_total": {
@@ -9281,7 +9568,7 @@
             "additionalProperties": {
               "type": "integer"
             },
-            "description": "The runtime settings an admin set for this host — its own values over the global ones. A setting absent here is the host's own: its .env, or the built-in default. Always the whole set, so a value cleared on the admin page is absent rather than unchanged.",
+            "description": "The complete runtime settings for this host: per-host overrides, then global admin values, then built-in defaults. Clearing an override returns the next level's value, never a legacy environment value.",
             "title": "Settings",
             "type": "object"
           },
@@ -9480,7 +9767,7 @@
         "description": "One runtime setting an admin may set, with its unit and bounds.",
         "properties": {
           "default": {
-            "description": "Built-in value when neither an admin nor .env sets it.",
+            "description": "Built-in value when no admin override is set.",
             "title": "Default",
             "type": "integer"
           },
@@ -9489,7 +9776,7 @@
             "type": "string"
           },
           "env": {
-            "description": "The host environment variable it overrides.",
+            "description": "The legacy host environment variable imported at enrollment.",
             "title": "Env",
             "type": "string"
           },
@@ -9523,6 +9810,7 @@
             "enum": [
               "seconds",
               "MiB",
+              "KiB",
               "count"
             ],
             "title": "Unit",
@@ -9730,6 +10018,27 @@
           },
           "arguments_digest": {
             "title": "Arguments Digest",
+            "type": "string"
+          },
+          "capability_annotations": {
+            "additionalProperties": true,
+            "title": "Capability Annotations",
+            "type": "object"
+          },
+          "capability_description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Capability Description"
+          },
+          "capability_kind": {
+            "default": "tool",
+            "title": "Capability Kind",
             "type": "string"
           },
           "capability_name": {
@@ -10075,7 +10384,7 @@
             "additionalProperties": {
               "type": "integer"
             },
-            "description": "Runtime settings set for every server. A value set for one server wins over these; a setting set nowhere uses each host's own.",
+            "description": "Runtime settings set for every server. A value set for one server wins over these; a setting set nowhere uses the deployment default.",
             "title": "Host Settings",
             "type": "object"
           },
@@ -10595,6 +10904,117 @@
         "title": "ProcessObservation",
         "type": "object"
       },
+      "PromptRewriteAnswer": {
+        "additionalProperties": false,
+        "description": "One clarification and the user's optional answer.",
+        "properties": {
+          "answer": {
+            "maxLength": 5000,
+            "title": "Answer",
+            "type": "string"
+          },
+          "question": {
+            "maxLength": 1000,
+            "minLength": 1,
+            "title": "Question",
+            "type": "string"
+          }
+        },
+        "required": [
+          "question",
+          "answer"
+        ],
+        "title": "PromptRewriteAnswer",
+        "type": "object"
+      },
+      "PromptRewritePrompt": {
+        "additionalProperties": false,
+        "description": "A complete prompt the owner can review before submitting a job.",
+        "properties": {
+          "kind": {
+            "const": "prompt",
+            "default": "prompt",
+            "title": "Kind",
+            "type": "string"
+          },
+          "prompt": {
+            "maxLength": 32000,
+            "minLength": 1,
+            "title": "Prompt",
+            "type": "string"
+          }
+        },
+        "required": [
+          "prompt"
+        ],
+        "title": "PromptRewritePrompt",
+        "type": "object"
+      },
+      "PromptRewriteQuestions": {
+        "additionalProperties": false,
+        "description": "Questions to answer before requesting the final rewrite.",
+        "properties": {
+          "kind": {
+            "const": "questions",
+            "default": "questions",
+            "title": "Kind",
+            "type": "string"
+          },
+          "questions": {
+            "items": {
+              "maxLength": 1000,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 4,
+            "minItems": 2,
+            "title": "Questions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "questions"
+        ],
+        "title": "PromptRewriteQuestions",
+        "type": "object"
+      },
+      "PromptRewriteRequest": {
+        "additionalProperties": false,
+        "description": "A bounded draft and optional clarifications, independent of any job.",
+        "properties": {
+          "answers": {
+            "items": {
+              "$ref": "#/components/schemas/PromptRewriteAnswer"
+            },
+            "maxItems": 4,
+            "title": "Answers",
+            "type": "array"
+          },
+          "clarify": {
+            "default": false,
+            "title": "Clarify",
+            "type": "boolean"
+          },
+          "model": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Model",
+            "type": "string"
+          },
+          "prompt": {
+            "maxLength": 32000,
+            "minLength": 1,
+            "title": "Prompt",
+            "type": "string"
+          }
+        },
+        "required": [
+          "prompt",
+          "model"
+        ],
+        "title": "PromptRewriteRequest",
+        "type": "object"
+      },
       "RegisterConnectorRequest": {
         "additionalProperties": false,
         "description": "Register one machine as this user's connector.",
@@ -10955,6 +11375,26 @@
             "minimum": 1.0,
             "title": "Generation",
             "type": "integer"
+          },
+          "member_activation_generations": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "minimum": 0.0,
+                  "type": "integer"
+                },
+                "maxProperties": 128,
+                "propertyNames": {
+                  "maxLength": 256,
+                  "minLength": 1
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Member Activation Generations"
           },
           "reason": {
             "default": "idle",
@@ -11554,7 +11994,7 @@
                 }
               ]
             },
-            "description": "The settings to change, by key (see host_setting_definitions), each a whole number inside that setting's bounds, or null to clear it so the next level applies: a server's value falls back to the global one, and a global value to each host's own .env or default. Settings not named keep their values. Hosts apply the result from their next heartbeat answer.",
+            "description": "The settings to change, by key (see host_setting_definitions), each a whole number inside that setting's bounds, or null to clear it so the next level applies: a server's value falls back to the global one, and a global value to the deployment's built-in default. Settings not named keep their values. Hosts apply the result from their next heartbeat answer.",
             "maxProperties": 32,
             "minProperties": 1,
             "title": "Settings",
@@ -11736,17 +12176,14 @@
             "type": "integer"
           },
           "max_selected": {
-            "default": 16,
             "title": "Max Selected",
             "type": "integer"
           },
           "max_selection_bytes": {
-            "default": 131072,
             "title": "Max Selection Bytes",
             "type": "integer"
           },
           "max_skill_bytes": {
-            "default": 65536,
             "title": "Max Skill Bytes",
             "type": "integer"
           }
@@ -12900,6 +13337,22 @@
           }
         },
         "title": "UpdateConnectorRequest",
+        "type": "object"
+      },
+      "UpdateSettingsRequest": {
+        "additionalProperties": false,
+        "description": "A partial settings update; omitted keys retain their existing values.",
+        "properties": {
+          "settings": {
+            "additionalProperties": true,
+            "title": "Settings",
+            "type": "object"
+          }
+        },
+        "required": [
+          "settings"
+        ],
+        "title": "UpdateSettingsRequest",
         "type": "object"
       },
       "UpdateSkill": {
@@ -16625,9 +17078,59 @@
         "summary": "Get Admin Conversation"
       }
     },
+    "/admin/agent/database-tools": {
+      "get": {
+        "description": "Show a launch link only while the private service answers its health ping.",
+        "operationId": "database_tools_admin_agent_database_tools_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatabaseTools"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Database Tools",
+        "tags": [
+          "admin-database"
+        ]
+      }
+    },
     "/admin/agent/host-settings": {
       "put": {
-        "description": "Set or clear runtime settings for every server, without a redeploy.\n\nEach host picks the values up from its next heartbeat answer, except where\na value set for that server wins. ``null`` clears a setting, and each host\ngoes back to its own ``.env`` or built-in default for it.\n\n**Saving is not applying.** Each host reports what it applied, and the page\nshows the hosts that have not caught up yet. Nothing running is\ninterrupted: a turn keeps the time limit it started with, an existing\nsandbox keeps its chat capacity, and the terminal limits apply from the\nbroker's next sweep.",
+        "description": "Set or clear runtime settings for every server, without a redeploy.\n\nEach host picks the values up from its next heartbeat answer, except where\na value set for that server wins. ``null`` clears a setting, and each host\ngoes back to the deployment's built-in default for it.\n\n**Saving is not applying.** Each host reports what it applied, and the page\nshows the hosts that have not caught up yet. Nothing running is\ninterrupted: a turn keeps the time limit it started with, an existing\nsandbox keeps its chat capacity, and the terminal limits apply from the\nbroker's next sweep.",
         "operationId": "set_agent_host_settings_admin_agent_host_settings_put",
         "parameters": [
           {
@@ -17791,7 +18294,7 @@
     },
     "/admin/agent/runner-hosts/{host}/settings": {
       "put": {
-        "description": "Set or clear runtime settings for one server, over the global values.\n\nA value set here wins over the one set for every server. ``null`` clears\nit, and the server goes back to the global value, or to its own when there\nis none. Applied from the host's next heartbeat, like the global values,\nand kept through heartbeats and re-enrollment.",
+        "description": "Set or clear runtime settings for one server, over the global values.\n\nA value set here wins over the one set for every server. ``null`` clears\nit, and the server goes back to the global value, or the built-in default when there\nis none. Applied from the host's next heartbeat, like the global values,\nand kept through heartbeats and re-enrollment.",
         "operationId": "set_agent_runner_host_settings_admin_agent_runner_hosts__host__settings_put",
         "parameters": [
           {
@@ -18746,7 +19249,7 @@
     },
     "/admin/agent/sandboxes": {
       "get": {
-        "description": "List running containers, including retained groups between active turns.",
+        "description": "List lifecycle metadata, defaulting to retained running containers.",
         "operationId": "list_admin_sandboxes_admin_agent_sandboxes_get",
         "parameters": [
           {
@@ -18776,6 +19279,26 @@
               "minimum": 1,
               "title": "Limit",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "default": "running",
+              "enum": [
+                "all",
+                "provisioning",
+                "starting",
+                "running",
+                "stopping",
+                "stopped",
+                "stopped_dirty",
+                "lost"
+              ],
+              "title": "State",
+              "type": "string"
             }
           },
           {
@@ -18818,6 +19341,128 @@
           }
         },
         "summary": "List Admin Sandboxes"
+      }
+    },
+    "/admin/agent/sandboxes/{sandbox_id}": {
+      "get": {
+        "description": "Inspect safe container metadata and its current member identities.",
+        "operationId": "get_admin_sandbox_admin_agent_sandboxes__sandbox_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "title": "Sandbox Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminSandboxDetail"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Admin Sandbox"
+      }
+    },
+    "/admin/agent/sandboxes/{sandbox_id}/stop": {
+      "post": {
+        "description": "Request a fenced idle stop; the owning host confirms it asynchronously.",
+        "operationId": "stop_admin_sandbox_admin_agent_sandboxes__sandbox_id__stop_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "title": "Sandbox Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdminSandboxStopRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminSandboxDetail"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stop Admin Sandbox"
       }
     },
     "/admin/agent/server-preflights": {
@@ -18983,6 +19628,112 @@
           }
         },
         "summary": "Add Server"
+      }
+    },
+    "/admin/agent/settings": {
+      "get": {
+        "description": "Return editable setting definitions and values without exposing secrets.",
+        "operationId": "read_settings_admin_agent_settings_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Read Settings Admin Agent Settings Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Settings"
+      },
+      "put": {
+        "description": "Validate and atomically persist the submitted settings, recording safe changes.",
+        "operationId": "update_settings_admin_agent_settings_put",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSettingsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Settings Admin Agent Settings Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Settings"
       }
     },
     "/admin/agent/steps": {
@@ -23952,6 +24703,135 @@
         "summary": "List Agent Projects"
       }
     },
+    "/v1/agent/prompts/rewrite": {
+      "post": {
+        "description": "Ask clarifications or rewrite a draft using the selected model.",
+        "operationId": "rewrite_agent_prompt_v1_agent_prompts_rewrite_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PromptRewriteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "discriminator": {
+                    "mapping": {
+                      "prompt": "#/components/schemas/PromptRewritePrompt",
+                      "questions": "#/components/schemas/PromptRewriteQuestions"
+                    },
+                    "propertyName": "kind"
+                  },
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/PromptRewriteQuestions"
+                    },
+                    {
+                      "$ref": "#/components/schemas/PromptRewritePrompt"
+                    }
+                  ],
+                  "title": "Response Rewrite Agent Prompt V1 Agent Prompts Rewrite Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rewrite Agent Prompt"
+      }
+    },
+    "/v1/agent/repositories": {
+      "post": {
+        "description": "Create an initialized personal repository and check existing Agent access.",
+        "operationId": "create_github_repository_v1_agent_repositories_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateGitHubRepositoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateGitHubRepositoryResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Github Repository"
+      }
+    },
     "/v1/agent/service/oncall/jobs": {
       "post": {
         "description": "Queue one on-call analysis job for the configured service account.\n\nThe body is the owner surface's own :class:`AgentJobCreate`, so the relay\nchooses the runtime, model, repository and prompt — and every one of those\nchoices passes the owner route's checks under the service account: the\nmodel must resolve for that user, the repository must be entitled (for a\nheadless account that means the deployment's ``AGENT_REPO_ALLOWLIST``), and\na ``base_ref`` is pinned to the commit it names right now. Skill selection\nhas the same semantics: omitted IDs use this service account's defaults;\nthe relay can send ``skill_ids=[]`` to opt out explicitly.",
@@ -24471,6 +25351,27 @@
           }
         },
         "summary": "Delete Agent Sessions"
+      }
+    },
+    "/v1/agent/site-config": {
+      "get": {
+        "description": "Return only the allowlisted site identity and display feature switch.",
+        "operationId": "site_config_v1_agent_site_config_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Site Config V1 Agent Site Config Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Site Config"
       }
     },
     "/v1/agent/skills": {

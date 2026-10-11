@@ -17,8 +17,19 @@ import pytest
 import yaml
 from deploy.release import build_recipe
 
+from cloud_agent_shared.shared_protocol import SHARED_SANDBOX_RUNTIME_PINS
+
 REPO = Path(__file__).resolve().parents[3]
 COMMIT = "a" * 40
+# Packaged images already carry their reviewed default pins. Test processes may
+# run under a launcher with its own CLI version; that is not host configuration.
+_RUNTIME_DEFAULT_VARIABLES = {
+    "CLAUDE_CODE_VERSION",
+    "CODEX_VERSION",
+    "PI_VERSION",
+    "OPENCODE_VERSION",
+    "KILO_VERSION",
+}
 
 
 def manifest() -> dict:
@@ -46,7 +57,12 @@ def manifest() -> dict:
         "source_commit": COMMIT,
         "deploy_protocol": "shared-live-exact-sha-v4",
         "artifacts": artifacts,
-        "runtime_catalog": {"codex": {"default": "0.145.0", "versions": ["0.145.0"]}},
+        "runtime_catalog": {
+            "codex": {
+                "default": SHARED_SANDBOX_RUNTIME_PINS["codex"],
+                "versions": [SHARED_SANDBOX_RUNTIME_PINS["codex"]],
+            }
+        },
         "recipe": {
             "url": "https://github.com/HarvardMadSys/hybridInference-cloud-agent/releases/download/test/recipe.tgz",
             "sha256": "b" * 64,
@@ -71,6 +87,7 @@ with log.open("a") as f:
                        "deployed_at": os.getenv("AGENT_WEB_DEPLOYED_AT"),
                        "sandbox": os.getenv("AGENT_SANDBOX_IMAGE"),
                        "edge": os.getenv("AGENT_EDGE_CONFIG_FILE"),
+                       "pgadmin_servers": os.getenv("AGENT_PGADMIN_SERVERS_FILE"),
                        "physical_host": os.getenv("AGENT_PHYSICAL_HOST"),
                        "runner_host": os.getenv("AGENT_RUNNER_HOST")}) + "\n")
 if "config" in a and "--environment" in a:
@@ -212,7 +229,14 @@ def deployment(tmp_path: Path, stack: str, *, real_compose: bool = False) -> tup
         k: v
         for k, v in os.environ.items()
         if not k.startswith(("AGENT_", "COMPOSE_", "TEST_"))
-        and k not in {"DEPLOY_SHA", "REPLICAS", "SIBLING_COMPOSE_PROJECTS", "ALLOW_STRAY_STACK"}
+        and k
+        not in {
+            "DEPLOY_SHA",
+            "REPLICAS",
+            "SIBLING_COMPOSE_PROJECTS",
+            "ALLOW_STRAY_STACK",
+            *_RUNTIME_DEFAULT_VARIABLES,
+        }
     }
     env.update(
         {
@@ -246,6 +270,25 @@ def run(script: Path, env: dict, *arguments: str) -> tuple[subprocess.CompletedP
     log = Path(env["TEST_COMMAND_LOG"])
     calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
     return result, calls
+
+
+@pytest.mark.parametrize("custom_definitions", [False, True])
+def test_pgadmin_definitions_resolve_from_recipe_or_operator_override(
+    tmp_path: Path, custom_definitions: bool
+):
+    """The generated Compose file runs outside the extracted recipe directory."""
+    script, env = deployment(tmp_path, "control-plane")
+    definitions = script.parent / "pgadmin-servers.json"
+    if custom_definitions:
+        definitions = tmp_path / "custom-servers.json"
+        definitions.write_text('{"Servers": {}}\n')
+        with (Path(env["DEPLOY_ROOT"]) / ".env").open("a") as config:
+            config.write(f"AGENT_PGADMIN_SERVERS_FILE={definitions}\n")
+    result, calls = run(script, env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    activation = next(call for call in calls if "--remove-orphans" in call["args"])
+    assert activation["pgadmin_servers"] == str(definitions)
+    assert definitions.is_file()
 
 
 @pytest.mark.parametrize("stack", ["control-plane", "host"])

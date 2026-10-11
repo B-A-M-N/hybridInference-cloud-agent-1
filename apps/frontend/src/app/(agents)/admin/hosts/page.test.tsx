@@ -1,6 +1,18 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 
+// Setup notices have their own tests; this page uses a configured deployment.
+vi.mock('@/lib/api/adminSettings', () => ({
+  getAgentAdminSettings: async () => ({
+    revision: 1,
+    definitions: [],
+    values: {},
+    secret_configured: {},
+    bootstrap: [],
+    setup: { required: false, groups: [], bootstrap_missing: [] },
+  }),
+}));
+
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -1605,7 +1617,7 @@ describe('runtime settings', () => {
     const sessions = within(panel)
       .getByRole('rowheader', { name: 'Terminals per server' })
       .closest('tr')!;
-    expect(within(sessions).getByText('server default')).toBeInTheDocument();
+    expect(within(sessions).getByText('deployment default')).toBeInTheDocument();
 
     const input = within(panel).getByLabelText('Terminals per server for runner-a');
     fireEvent.change(input, { target: { value: '8' } });
@@ -1619,6 +1631,23 @@ describe('runtime settings', () => {
     expect(
       await within(sessions).findByText('set for this server · applying 8'),
     ).toBeInTheDocument();
+  });
+
+  it('offers the deployment default after reset even when the host reports an old environment value', async () => {
+    mocked.list.mockResolvedValue(
+      settingsPool([settingsHost({ settings_local: { agent_timeout_s: 999 } })]),
+    );
+    renderPage();
+    await openPanel();
+    const panel = screen.getByRole('region', { name: 'Sandbox settings for runner-a' });
+    const input = within(panel).getByLabelText('Turn time limit for runner-a');
+    expect(input).toHaveAttribute('placeholder', '1');
+    expect(within(panel).getByLabelText('Turn time limit for runner-a unit')).toHaveValue('h');
+    const timeout = within(panel)
+      .getByRole('rowheader', { name: 'Turn time limit' })
+      .closest('tr')!;
+    expect(within(timeout).getByText('deployment default')).toBeInTheDocument();
+    expect(within(timeout).queryByText(/applying/)).not.toBeInTheDocument();
   });
 
   it('says a server that predates settings needs a redeploy, and offers it no input', async () => {

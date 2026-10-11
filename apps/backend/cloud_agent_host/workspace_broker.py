@@ -83,11 +83,16 @@ from cloud_agent_host.shared_session_supervisor import (
 from cloud_agent_host.source_archive import DEFAULT_MAX_BASE_BUNDLE_BYTES
 from cloud_agent_host.tool_windows import ToolWindowTracker, attribute, tool_time_ms
 from cloud_agent_host.workspace_browser import (
-    MAX_FILE_PREVIEW_BYTES,
     WorkspacePathError,
     normalize_workspace_path,
 )
-from cloud_agent_shared.host_settings import BROKER_SETTING_KEYS, admin_values, resolve
+from cloud_agent_shared.host_settings import (
+    BROKER_SETTING_KEYS,
+    HOST_SETTINGS_BY_KEY,
+    admin_values,
+    default_values,
+    resolve,
+)
 from cloud_agent_shared.operation_profiling import PROFILING_CONTEXT_HEADER
 
 logger = get_logger(__name__)
@@ -95,19 +100,22 @@ logger = get_logger(__name__)
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterator
 
-MAX_FILE_WRITE_BYTES = 2 * 1024 * 1024
-MAX_COMMAND_OUTPUT_BYTES = 2 * 1024 * 1024
-MAX_DIRECTORY_ENTRIES = 5000
-DEFAULT_COMMAND_TIMEOUT_S = 60.0
-MAX_TERMINAL_SESSIONS_PER_WORKSPACE = 4
-DEFAULT_MAX_TERMINAL_SESSIONS = 64
-MAX_TERMINAL_BUFFER_BYTES = 2 * 1024 * 1024
-MAX_TERMINAL_BUFFER_EVENTS = 4096
-MAX_TERMINAL_TOTAL_OUTPUT_BYTES = 32 * 1024 * 1024
-MAX_TERMINAL_INPUT_BYTES = 64 * 1024
-MAX_TERMINAL_STREAMS_PER_SESSION = 4
-DEFAULT_TERMINAL_IDLE_TTL_S = 30 * 60.0
-DEFAULT_TERMINAL_HARD_TTL_S = 8 * 60 * 60.0
+_DEFAULT_SETTINGS = default_values(BROKER_SETTING_KEYS)
+# Protocol validation keeps these upper bounds even when the runtime admin
+# value is lower. The shared registry is the single source for defaults.
+MAX_FILE_WRITE_BYTES = _DEFAULT_SETTINGS["workspace_file_write_max_mib"] * 1024 * 1024
+MAX_COMMAND_OUTPUT_BYTES = _DEFAULT_SETTINGS["workspace_command_output_max_mib"] * 1024 * 1024
+MAX_DIRECTORY_ENTRIES = _DEFAULT_SETTINGS["workspace_directory_max_entries"]
+DEFAULT_COMMAND_TIMEOUT_S = float(_DEFAULT_SETTINGS["workspace_command_timeout_s"])
+MAX_TERMINAL_SESSIONS_PER_WORKSPACE = _DEFAULT_SETTINGS["terminal_max_sessions_per_workspace"]
+DEFAULT_MAX_TERMINAL_SESSIONS = _DEFAULT_SETTINGS["terminal_max_sessions"]
+MAX_TERMINAL_BUFFER_BYTES = _DEFAULT_SETTINGS["terminal_buffer_max_mib"] * 1024 * 1024
+MAX_TERMINAL_BUFFER_EVENTS = _DEFAULT_SETTINGS["terminal_buffer_max_events"]
+MAX_TERMINAL_TOTAL_OUTPUT_BYTES = _DEFAULT_SETTINGS["terminal_output_max_mib"] * 1024 * 1024
+MAX_TERMINAL_INPUT_BYTES = _DEFAULT_SETTINGS["terminal_input_max_kib"] * 1024
+MAX_TERMINAL_STREAMS_PER_SESSION = _DEFAULT_SETTINGS["terminal_max_streams_per_session"]
+DEFAULT_TERMINAL_IDLE_TTL_S = float(_DEFAULT_SETTINGS["terminal_idle_ttl_s"])
+DEFAULT_TERMINAL_HARD_TTL_S = float(_DEFAULT_SETTINGS["terminal_hard_ttl_s"])
 TERMINAL_STREAM_WAIT_S = 15.0
 _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{7,64}$")
 
@@ -221,6 +229,10 @@ class SharedIdleStopRequest(BaseModel):
     # fence must still be able to name that exact container.
     activation_generation: int = Field(..., ge=0)
     reason: Literal["idle", "orphaned_attempt", "lost"] = "idle"
+    member_activation_generations: (
+        dict[Annotated[str, Field(min_length=1, max_length=256)], Annotated[int, Field(ge=0)]]
+        | None
+    ) = Field(None, max_length=128)
 
 
 class SharedSandboxMemberRequest(BaseModel):
@@ -419,6 +431,26 @@ class _TerminalEvent:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class _TerminalLimits:
+    """A consistent snapshot of terminal buffering and viewer limits."""
+
+    buffer_bytes: int = MAX_TERMINAL_BUFFER_BYTES
+    buffer_events: int = MAX_TERMINAL_BUFFER_EVENTS
+    output_bytes: int = MAX_TERMINAL_TOTAL_OUTPUT_BYTES
+    streams: int = MAX_TERMINAL_STREAMS_PER_SESSION
+
+    @classmethod
+    def from_settings(cls, settings: dict[str, float]) -> _TerminalLimits:
+        """Translate the shared admin values into terminal implementation units."""
+        return cls(
+            buffer_bytes=int(settings["terminal_buffer_max_mib"]) * 1024 * 1024,
+            buffer_events=int(settings["terminal_buffer_max_events"]),
+            output_bytes=int(settings["terminal_output_max_mib"]) * 1024 * 1024,
+            streams=int(settings["terminal_max_streams_per_session"]),
+        )
+
+
 class _TerminalSession:
     """Thread-safe state and output history for one terminal process."""
 
@@ -433,15 +465,17 @@ class _TerminalSession:
         now: float,
         idle_ttl_s: float | None = None,
         on_closed: Callable[[float], None] | None = None,
+        limits: _TerminalLimits | None = None,
     ) -> None:
         self.id = terminal_id
-        self.shell = "sh"
+        self.shell = getattr(process, "shell", "sh")
         self.cwd = "/workspace"
         self.rows = rows
         self.cols = cols
         self.created_at = now
         self.last_active_at = now
         self._idle_ttl_s = idle_ttl_s
+        self._limits = limits or _TerminalLimits()
         self.state = "running"
         self._process = process
         self._workdir = workdir
@@ -484,6 +518,23 @@ class _TerminalSession:
     def is_closed(self) -> bool:
         with self._condition:
             return self._closed
+
+    @property
+    def holds_process(self) -> bool:
+        """Whether this session still owns a process, and with it a terminal slot.
+
+        An exited shell keeps its output for replay until it is closed or
+        reaped, but runs nothing, so it never refuses a new terminal: the
+        oldest exited shells are unlisted to make room instead.
+        """
+        with self._condition:
+            return not self._closed and self.state != "exited"
+
+    @property
+    def has_exited(self) -> bool:
+        """Whether the shell ended on its own and the session is still listed."""
+        with self._condition:
+            return not self._closed and self.state == "exited"
 
     def expired(self, *, now: float, idle_ttl_s: float, hard_ttl_s: float) -> bool:
         """Whether idle or absolute lifetime requires this session to close."""
@@ -637,9 +688,17 @@ class _TerminalSession:
     def open_stream(self) -> None:
         """Bound duplicate viewers of one PTY before starting an SSE response."""
         with self._condition:
-            if self._active_streams >= MAX_TERMINAL_STREAMS_PER_SESSION:
+            if self._active_streams >= self._limits.streams:
                 raise HTTPException(status_code=429, detail="terminal stream limit reached")
             self._active_streams += 1
+
+    def configure_limits(self, limits: _TerminalLimits) -> None:
+        """Apply new output limits and trim existing history immediately."""
+        with self._condition:
+            self._limits = limits
+            self._trim_events_locked()
+            self._condition.notify_all()
+            self._wake_async_waiters_locked()
 
     def close_stream(self) -> None:
         """Release one SSE viewer slot."""
@@ -663,10 +722,10 @@ class _TerminalSession:
     def _append_output(self, data: bytes) -> None:
         if not data:
             return
-        chunk_truncated = len(data) > MAX_TERMINAL_BUFFER_BYTES
-        if chunk_truncated:
-            data = data[-MAX_TERMINAL_BUFFER_BYTES:]
         with self._condition:
+            chunk_truncated = len(data) > self._limits.buffer_bytes
+            if chunk_truncated:
+                data = data[-self._limits.buffer_bytes :]
             if chunk_truncated:
                 # The retained tail is not a complete output event. Give the
                 # reset its own cursor so reconnecting after it resumes at the
@@ -706,8 +765,8 @@ class _TerminalSession:
         if self._events and self._events[0].kind == "reset":
             reset_seq = self._events.popleft().seq
         while self._events and (
-            self._buffer_bytes > MAX_TERMINAL_BUFFER_BYTES
-            or len(self._events) + (reset_seq is not None) > MAX_TERMINAL_BUFFER_EVENTS
+            self._buffer_bytes > self._limits.buffer_bytes
+            or len(self._events) + (reset_seq is not None) > self._limits.buffer_events
         ):
             oldest = self._events.popleft()
             self._buffer_bytes -= len(oldest.data)
@@ -719,8 +778,10 @@ class _TerminalSession:
         """Continuously drain the PTY and publish one terminal exit event."""
         try:
             for chunk in self._process.chunks():
-                self._total_output_bytes += len(chunk)
-                if self._total_output_bytes > MAX_TERMINAL_TOTAL_OUTPUT_BYTES:
+                with self._condition:
+                    self._total_output_bytes += len(chunk)
+                    output_exceeded = self._total_output_bytes > self._limits.output_bytes
+                if output_exceeded:
                     self._append_output(
                         b"\r\n\x1b[31m[terminal stopped: output limit exceeded]\x1b[0m\r\n"
                     )
@@ -762,10 +823,14 @@ class _TerminalManager:
         idle_ttl_s: float,
         hard_ttl_s: float,
         max_sessions: int,
+        max_sessions_per_workspace: int = MAX_TERMINAL_SESSIONS_PER_WORKSPACE,
+        limits: _TerminalLimits | None = None,
     ) -> None:
         self._idle_ttl_s = idle_ttl_s
         self._hard_ttl_s = hard_ttl_s
         self._max_sessions = max_sessions
+        self._max_sessions_per_workspace = max_sessions_per_workspace
+        self._limits = limits or _TerminalLimits()
         self._sessions: dict[str, dict[str, _TerminalSession]] = {}
         self._suspended_workspaces: set[str] = set()
         self._workspace_suspensions: dict[str, set[str]] = {}
@@ -774,7 +839,15 @@ class _TerminalManager:
         self._stop = threading.Event()
         self._reaper: threading.Thread | None = None
 
-    def configure(self, *, idle_ttl_s: float, hard_ttl_s: float, max_sessions: int) -> None:
+    def configure(
+        self,
+        *,
+        idle_ttl_s: float,
+        hard_ttl_s: float,
+        max_sessions: int,
+        max_sessions_per_workspace: int | None = None,
+        limits: _TerminalLimits | None = None,
+    ) -> None:
         """Change the limits at runtime, as the admin page asks.
 
         Open terminals are judged by the new lifetimes from the next sweep, so
@@ -785,10 +858,27 @@ class _TerminalManager:
             raise ValueError("terminal TTL values must be positive")
         if not 1 <= max_sessions <= 4096:
             raise ValueError("terminal global session limit must be between 1 and 4096")
+        if max_sessions_per_workspace is not None and not (
+            1 <= max_sessions_per_workspace <= MAX_TERMINAL_SESSIONS_PER_WORKSPACE
+        ):
+            raise ValueError("terminal workspace session limit must be between 1 and 4")
         with self._lock:
             self._idle_ttl_s = idle_ttl_s
             self._hard_ttl_s = hard_ttl_s
             self._max_sessions = max_sessions
+            if max_sessions_per_workspace is not None:
+                self._max_sessions_per_workspace = max_sessions_per_workspace
+            if limits is not None:
+                self._limits = limits
+                for group in self._sessions.values():
+                    for session in group.values():
+                        session.configure_limits(limits)
+
+    @property
+    def max_sessions_per_workspace(self) -> int:
+        """Advertise the current creation limit to workspace clients."""
+        with self._lock:
+            return self._max_sessions_per_workspace
 
     def start(self) -> None:
         """Start periodic TTL cleanup once the app lifespan begins."""
@@ -834,55 +924,111 @@ class _TerminalManager:
         self.reap()
         terminal_id = "term_" + secrets.token_urlsafe(18)
         now = time.monotonic()
-        with self._lock:
-            if workspace_id in self._suspended_workspaces:
-                raise HTTPException(status_code=409, detail="terminal workspace is not ready")
-            group = self._sessions.setdefault(workspace_id, {})
-            global_active = sum(
-                not session.is_closed
-                for sessions in self._sessions.values()
-                for session in sessions.values()
-            )
-            if global_active >= self._max_sessions:
-                if not group:
-                    self._sessions.pop(workspace_id, None)
-                raise HTTPException(status_code=503, detail="broker terminal limit reached")
-            active = sum(not session.is_closed for session in group.values())
-            if active >= MAX_TERMINAL_SESSIONS_PER_WORKSPACE:
-                raise HTTPException(status_code=409, detail="workspace terminal limit reached")
-            spec = SandboxSpec(
-                argv=["/bin/sh"],
-                workdir=str(workdir),
-                env={
-                    **backend.base_env(),
-                    "GIT_CONFIG_NOSYSTEM": "1",
-                    "TERM": "xterm-256color",
-                },
-            )
-            try:
-                process = backend.spawn_terminal(spec, rows=rows, cols=cols)
-            except TerminalNotSupportedError as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail=("Interactive terminals require the container or kata sandbox backend."),
-                ) from exc
-            except (OSError, SandboxError) as exc:
-                raise HTTPException(
-                    status_code=502, detail="terminal could not be started"
-                ) from exc
-            session = _TerminalSession(
-                terminal_id=terminal_id,
-                process=process,
-                workdir=workdir if isinstance(workdir, Path) else None,
-                rows=rows,
-                cols=cols,
-                now=now,
-                idle_ttl_s=idle_ttl_s,
-                on_closed=on_closed,
-            )
-            group[terminal_id] = session
+        evicted: list[_TerminalSession] = []
+        try:
+            with self._lock:
+                if workspace_id in self._suspended_workspaces:
+                    raise HTTPException(status_code=409, detail="terminal workspace is not ready")
+                group = self._sessions.setdefault(workspace_id, {})
+                global_active = sum(
+                    session.holds_process
+                    for sessions in self._sessions.values()
+                    for session in sessions.values()
+                )
+                if global_active >= self._max_sessions:
+                    if not group:
+                        self._sessions.pop(workspace_id, None)
+                    raise HTTPException(status_code=503, detail="broker terminal limit reached")
+                active = sum(session.holds_process for session in group.values())
+                if active >= self._max_sessions_per_workspace:
+                    raise HTTPException(status_code=409, detail="workspace terminal limit reached")
+                spec = SandboxSpec(
+                    argv=["/bin/sh"],
+                    workdir=str(workdir),
+                    env={
+                        **backend.base_env(),
+                        "GIT_CONFIG_NOSYSTEM": "1",
+                        "TERM": "xterm-256color",
+                    },
+                )
+                try:
+                    process = backend.spawn_terminal(spec, rows=rows, cols=cols)
+                except TerminalNotSupportedError as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Interactive terminals require the container or kata sandbox backend."
+                        ),
+                    ) from exc
+                except (OSError, SandboxError) as exc:
+                    raise HTTPException(
+                        status_code=502, detail="terminal could not be started"
+                    ) from exc
+                session = _TerminalSession(
+                    terminal_id=terminal_id,
+                    process=process,
+                    workdir=workdir if isinstance(workdir, Path) else None,
+                    rows=rows,
+                    cols=cols,
+                    now=now,
+                    idle_ttl_s=idle_ttl_s,
+                    on_closed=on_closed,
+                    limits=self._limits,
+                )
+                evicted.extend(self._unlist_exited_locked(workspace_id))
+                group[terminal_id] = session
+        finally:
+            for stale in evicted:
+                try:
+                    stale.close(mark_activity=False)
+                except (SandboxError, OSError):
+                    logger.exception("workspace_terminal_eviction_cleanup_failed")
         session.start()
         return session.descriptor()
+
+    def _unlist_exited_locked(self, workspace_id: str) -> list[_TerminalSession]:
+        """Unlist the oldest exited shells so one more terminal fits both limits.
+
+        An exited shell stays listed for its output and keeps up to a full
+        output buffer, so it still takes room under both limits, but only a
+        running shell can refuse a new terminal. The new terminal's workspace
+        gives up its own oldest exited shells while its list is full; then,
+        while the broker as a whole is full, the oldest anywhere go. The
+        caller closes the returned sessions once the lock is released.
+        """
+        group = self._sessions[workspace_id]
+        exited = sorted(
+            (
+                (owner, session)
+                for owner, sessions in self._sessions.items()
+                for session in sessions.values()
+                if session.has_exited
+            ),
+            key=lambda candidate: candidate[1].created_at,
+        )
+        unlisted: list[_TerminalSession] = []
+
+        def unlist(candidate: tuple[str, _TerminalSession]) -> None:
+            owner, session = candidate
+            sessions = self._sessions[owner]
+            unlisted.append(sessions.pop(session.id))
+            # The new terminal's own group is about to receive it.
+            if not sessions and owner != workspace_id:
+                self._sessions.pop(owner)
+
+        own = [candidate for candidate in exited if candidate[0] == workspace_id]
+        while own and len(group) >= self._max_sessions_per_workspace:
+            candidate = own.pop(0)
+            exited.remove(candidate)
+            unlist(candidate)
+        retained = sum(
+            not session.is_closed
+            for sessions in self._sessions.values()
+            for session in sessions.values()
+        )
+        for candidate in exited[: max(0, retained + 1 - self._max_sessions)]:
+            unlist(candidate)
+        return unlisted
 
     @staticmethod
     def _suspension_key(job_id: str | None) -> str:
@@ -1097,6 +1243,7 @@ def _run_sandbox(
     script: str,
     env: dict[str, str],
     timeout_s: float,
+    max_output_bytes: int = MAX_COMMAND_OUTPUT_BYTES,
 ) -> tuple[int, str, str]:
     """Run a bounded command and return status, stdout and stderr."""
     process = backend.spawn(
@@ -1130,21 +1277,28 @@ def _run_sandbox(
         if line is None:
             break
         size += len(line.encode("utf-8", errors="replace"))
-        if size > MAX_COMMAND_OUTPUT_BYTES:
+        if size > max_output_bytes:
             process.kill()
             raise HTTPException(status_code=413, detail="workspace command output is too large")
         chunks.append(line)
     exit_code = process.wait()
     stderr = process.stderr_text()
-    if len(stderr.encode("utf-8", errors="replace")) > MAX_COMMAND_OUTPUT_BYTES:
-        stderr = stderr[-MAX_COMMAND_OUTPUT_BYTES:]
+    if len(stderr.encode("utf-8", errors="replace")) > max_output_bytes:
+        stderr = stderr.encode("utf-8", errors="replace")[-max_output_bytes:].decode(
+            "utf-8", errors="replace"
+        )
     if isinstance(workdir, Path):
         os.utime(workdir, None)
     return exit_code, "".join(chunks), stderr
 
 
 def _run_terminal(
-    backend: SandboxBackend, workdir: Path | str, request: TerminalRequest
+    backend: SandboxBackend,
+    workdir: Path | str,
+    request: TerminalRequest,
+    *,
+    default_timeout_s: float = DEFAULT_COMMAND_TIMEOUT_S,
+    max_output_bytes: int = MAX_COMMAND_OUTPUT_BYTES,
 ) -> dict[str, Any]:
     marker = secrets.token_hex(16)
     script = (
@@ -1159,7 +1313,12 @@ def _run_terminal(
         workdir=workdir,
         script=script,
         env={"WORKSPACE_COMMAND": request.command, "WORKSPACE_CWD": request.cwd},
-        timeout_s=request.timeout_seconds,
+        timeout_s=(
+            request.timeout_seconds
+            if "timeout_seconds" in request.model_fields_set
+            else default_timeout_s
+        ),
+        max_output_bytes=max_output_bytes,
     )
     cwd_marker = f"\n__HYI_{marker}_CWD__"
     status_marker = f"\n__HYI_{marker}_STATUS__"
@@ -1180,7 +1339,12 @@ def _run_terminal(
 
 
 def _run_git(
-    backend: SandboxBackend, workdir: Path | str, base_sha: str | None = None
+    backend: SandboxBackend,
+    workdir: Path | str,
+    base_sha: str | None = None,
+    *,
+    timeout_s: float = DEFAULT_COMMAND_TIMEOUT_S,
+    max_output_bytes: int = MAX_COMMAND_OUTPUT_BYTES,
 ) -> dict[str, Any]:
     if base_sha and not _COMMIT_SHA.fullmatch(base_sha):
         raise HTTPException(status_code=400, detail="base SHA is not a commit hash")
@@ -1206,7 +1370,12 @@ def _run_git(
         f"printf '\n{status_tag}%s\n' \"$overall_status\""
     )
     process_status, stdout, stderr = _run_sandbox(
-        backend, workdir=workdir, script=script, env={}, timeout_s=60
+        backend,
+        workdir=workdir,
+        script=script,
+        env={},
+        timeout_s=timeout_s,
+        max_output_bytes=max_output_bytes,
     )
     status_text, separator, remainder = stdout.partition(f"\n{diff_tag}\n")
     if not separator:
@@ -1262,6 +1431,19 @@ def _terminal_sse_frame(event: _TerminalEvent) -> str:
         payload = {"seq": event.seq, "exit_code": event.exit_code}
     data = json.dumps(payload, separators=(",", ":"))
     return f"id: {event.seq}\nevent: {event.kind}\ndata: {data}\n\n"
+
+
+def _terminal_attached_frame(last_seq: int) -> str:
+    """Tell a new viewer where the terminal's history ends.
+
+    Events up to ``last_seq`` were produced before the viewer attached. A fresh
+    screen replaying them must not answer the terminal queries among them --
+    the program that asked is long past waiting, or gone -- or the answers
+    reach the shell as typed input. It is not a resumable event, so it has no
+    id; a client that does not know it ignores it.
+    """
+    data = json.dumps({"seq": last_seq}, separators=(",", ":"))
+    return f"event: attached\ndata: {data}\n\n"
 
 
 def create_app(
@@ -1432,41 +1614,71 @@ def create_app(
         """
         return broker_profiling_policy.apply_received_policy(body)
 
-    # This broker's own values for the settings an admin can also set: its
-    # environment, or the built-in defaults. Fixed for the process's life; an
-    # admin value is applied over them, and clearing it returns to them.
+    # Legacy environment values are bootstrap observations only. The first
+    # authenticated settings push replaces all of them with admin defaults.
     local_settings: dict[str, float] = {
+        **_DEFAULT_SETTINGS,
         "terminal_idle_ttl_s": idle_ttl_s,
         "terminal_hard_ttl_s": hard_ttl_s,
         "terminal_max_sessions": max_sessions,
         "chat_idle_timeout_s": chat_idle_timeout_s,
     }
+    for key in BROKER_SETTING_KEYS - {
+        "terminal_idle_ttl_s",
+        "terminal_hard_ttl_s",
+        "terminal_max_sessions",
+        "chat_idle_timeout_s",
+    }:
+        definition = HOST_SETTINGS_BY_KEY[key]
+        raw = os.environ.get(definition.env)
+        if raw is None:
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        if definition.accepts(value):
+            local_settings[key] = value
+    applied_settings = dict(local_settings)
+    terminals.configure(
+        idle_ttl_s=idle_ttl_s,
+        hard_ttl_s=hard_ttl_s,
+        max_sessions=max_sessions,
+        max_sessions_per_workspace=int(applied_settings["terminal_max_sessions_per_workspace"]),
+        limits=_TerminalLimits.from_settings(applied_settings),
+    )
 
     @app.post("/host-settings")
     def host_settings(
         body: dict[str, Any],
         _: None = Depends(authenticate),
     ) -> dict[str, Any]:
-        """Apply the runtime settings an admin set, over this broker's own.
+        """Apply the complete admin configuration, with defaults for missing keys.
 
         The runner sends them after every heartbeat, over the same
         shared-token channel the profiling policy uses: the broker holds no
         host credential and must not be given one. The whole set every time,
-        so a value an admin cleared arrives as an absence and this broker goes
-        back to its own. A value it cannot apply — unknown, or outside the
-        bounds this release accepts — is ignored the same way.
+        so a cleared or unsupported value uses the shared built-in default.
+        Legacy environment values cannot override a reset from the admin page.
 
         Answers with what it now applies and what its own would be, which the
         runner reports to the control plane as this host's confirmation.
         """
-        admin = admin_values(body.get("settings"), BROKER_SETTING_KEYS)
+        nonlocal applied_settings
+        admin = {
+            **_DEFAULT_SETTINGS,
+            **admin_values(body.get("settings"), BROKER_SETTING_KEYS),
+        }
         applied = resolve(admin, local_settings)
         terminals.configure(
             idle_ttl_s=float(applied["terminal_idle_ttl_s"]),
             hard_ttl_s=float(applied["terminal_hard_ttl_s"]),
             max_sessions=int(applied["terminal_max_sessions"]),
+            max_sessions_per_workspace=int(applied["terminal_max_sessions_per_workspace"]),
+            limits=_TerminalLimits.from_settings(applied),
         )
         shared_supervisor.set_idle_timeout_s(float(applied["chat_idle_timeout_s"]))
+        applied_settings = applied
         return {"applied": applied, "local": local_settings}
 
     @app.get("/health")
@@ -1974,6 +2186,7 @@ def create_app(
                 thread_id,
                 generation=body.generation,
                 reason=body.reason,
+                member_activation_generations=body.member_activation_generations,
             )
         except (SandboxError, ValueError) as exc:
             raise supervisor_error(exc) from exc
@@ -2034,7 +2247,15 @@ def create_app(
             result = await asyncio.to_thread(
                 owner.capture_snapshot,
                 thread_id,
-                capture=lambda backend: _run_git(backend, CHAT_WORKDIR, body.base_sha),
+                capture=lambda backend: _run_git(
+                    backend,
+                    CHAT_WORKDIR,
+                    body.base_sha,
+                    timeout_s=applied_settings["workspace_command_timeout_s"],
+                    max_output_bytes=int(applied_settings["workspace_command_output_max_mib"])
+                    * 1024
+                    * 1024,
+                ),
             )
         except (SandboxError, ValueError) as exc:
             raise supervisor_error(exc) from exc
@@ -2175,8 +2396,8 @@ def create_app(
             body = read_retained_file(
                 retained,
                 relative,
-                max_preview_bytes=MAX_FILE_PREVIEW_BYTES,
-                max_directory_entries=MAX_DIRECTORY_ENTRIES,
+                max_preview_bytes=int(applied_settings["workspace_file_preview_max_kib"]) * 1024,
+                max_directory_entries=int(applied_settings["workspace_directory_max_entries"]),
                 observer=active.recorder,
             )
             kind = str(body.get("kind") or "")
@@ -2202,9 +2423,9 @@ def create_app(
                 retained,
                 relative,
                 body.content,
-                max_write_bytes=MAX_FILE_WRITE_BYTES,
-                max_preview_bytes=MAX_FILE_PREVIEW_BYTES,
-                max_directory_entries=MAX_DIRECTORY_ENTRIES,
+                max_write_bytes=int(applied_settings["workspace_file_write_max_mib"]) * 1024 * 1024,
+                max_preview_bytes=int(applied_settings["workspace_file_preview_max_kib"]) * 1024,
+                max_directory_entries=int(applied_settings["workspace_directory_max_entries"]),
             ),
         )
 
@@ -2217,7 +2438,15 @@ def create_app(
         return await asyncio.to_thread(
             retained_operation,
             workspace_id,
-            lambda retained, _call: _run_terminal(retained, "/workspace", body),
+            lambda retained, _call: _run_terminal(
+                retained,
+                "/workspace",
+                body,
+                default_timeout_s=applied_settings["workspace_command_timeout_s"],
+                max_output_bytes=int(applied_settings["workspace_command_output_max_mib"])
+                * 1024
+                * 1024,
+            ),
         )
 
     @app.post("/workspaces/{workspace_id}/terminals")
@@ -2319,7 +2548,11 @@ def create_app(
         )
         scope = terminal_scope(workspace_id)
         with call.stage("list"):
-            body = {"terminals": await asyncio.to_thread(terminals.list, scope)}
+            body = {
+                "terminals": await asyncio.to_thread(terminals.list, scope),
+                "max_sessions": terminals.max_sessions_per_workspace,
+                "max_input_bytes": int(applied_settings["terminal_input_max_kib"]) * 1024,
+            }
         return call.answer(body)
 
     @app.get("/workspaces/{workspace_id}/terminals/{terminal_id}/stream")
@@ -2341,6 +2574,7 @@ def create_app(
         async def event_stream() -> AsyncIterator[str]:
             cursor = after
             try:
+                yield _terminal_attached_frame(session.descriptor()["last_seq"])
                 while True:
                     events = await session.events_after_async(
                         cursor,
@@ -2381,7 +2615,7 @@ def create_app(
             raise HTTPException(
                 status_code=400, detail="terminal input is not valid base64"
             ) from exc
-        if len(data) > MAX_TERMINAL_INPUT_BYTES:
+        if len(data) > int(applied_settings["terminal_input_max_kib"]) * 1024:
             raise HTTPException(status_code=413, detail="terminal input is too large")
         session = terminals.get_for_control(scope, terminal_id)
         return await asyncio.to_thread(session.write, data, now=time.monotonic())
@@ -2420,7 +2654,15 @@ def create_app(
         return await asyncio.to_thread(
             retained_operation,
             workspace_id,
-            lambda retained, _call: _run_git(retained, "/workspace", base_sha),
+            lambda retained, _call: _run_git(
+                retained,
+                "/workspace",
+                base_sha,
+                timeout_s=applied_settings["workspace_command_timeout_s"],
+                max_output_bytes=int(applied_settings["workspace_command_output_max_mib"])
+                * 1024
+                * 1024,
+            ),
         )
 
     return app

@@ -6,11 +6,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   createAgentJob,
+  createGitHubRepository,
   getAgentConfig,
   listAgentConversations,
   listRepoBranches,
 } from '@/lib/api/agents';
 import type { AgentConfigApi, AgentConversationApi, AgentJobApi } from '@/lib/api/agents';
+import { rewritePrompt, type RewritePromptResult } from '@/lib/api/promptRewrite';
+
+vi.mock('@/lib/api/promptRewrite', () => ({ rewritePrompt: vi.fn() }));
 
 import { FirstRunProvider } from './firstRun';
 import { requestGitHubAccess } from './githubReturn';
@@ -40,6 +44,7 @@ vi.mock('@/lib/api/attachments', () => ({
 
 vi.mock('@/lib/api/agents', () => ({
   createAgentJob: vi.fn(),
+  createGitHubRepository: vi.fn(),
   getAgentConfig: vi.fn(),
   listAgentConversations: vi.fn(),
   listRepoBranches: vi.fn(),
@@ -190,6 +195,7 @@ describe('TaskComposer source-control onboarding', () => {
     vi.mocked(deleteAttachment).mockResolvedValue(undefined);
     navigation.push.mockReset();
     vi.mocked(createAgentJob).mockReset();
+    vi.mocked(createGitHubRepository).mockReset();
     vi.mocked(getAgentConfig).mockReset();
     vi.mocked(listAgentConversations).mockReset();
     vi.mocked(listRepoBranches).mockReset();
@@ -197,6 +203,88 @@ describe('TaskComposer source-control onboarding', () => {
   });
 
   afterEach(() => cleanup());
+
+  it('rewrites the draft for review before creating a task', async () => {
+    vi.mocked(getAgentConfig).mockResolvedValue(config());
+    vi.mocked(createAgentJob).mockResolvedValue({ id: 'rewritten-task' } as never);
+    vi.mocked(rewritePrompt).mockResolvedValue({
+      kind: 'prompt',
+      prompt: 'Add CSV export with accessible controls and clear error feedback.',
+    });
+    render(<TaskComposer initialRepo="owner/repository" />);
+    const box = await screen.findByRole('textbox', { name: 'What should the agent do?' });
+    fireEvent.change(box, { target: { value: 'Add export' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Rewrite prompt' }));
+    await waitFor(() =>
+      expect(box).toHaveValue('Add CSV export with accessible controls and clear error feedback.'),
+    );
+    expect(createAgentJob).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: /^Run/ }));
+    await waitFor(() =>
+      expect(createAgentJob).toHaveBeenCalledWith(
+        expect.objectContaining({
+          task_prompt: 'Add CSV export with accessible controls and clear error feedback.',
+        }),
+      ),
+    );
+  });
+
+  it.each(['onboarding', 'repository picker'] as const)(
+    'waits for a pending rewrite before opening repository creation from %s',
+    async (entry) => {
+      vi.mocked(getAgentConfig).mockResolvedValue(
+        config({ repos: entry === 'onboarding' ? [] : ['owner/repository'] }),
+      );
+      let finish!: (result: RewritePromptResult) => void;
+      vi.mocked(rewritePrompt).mockReturnValue(
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+      );
+      render(<TaskComposer />);
+      const task = await screen.findByRole('textbox', { name: 'What should the agent do?' });
+      fireEvent.change(task, { target: { value: 'Build an app' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Rewrite prompt' }));
+      if (entry === 'repository picker') fireEvent.click(await repositoryButton());
+      const create = screen.getByRole('button', { name: 'Create repository' });
+      expect(create).toBeDisabled();
+      fireEvent.click(create);
+      expect(screen.queryByRole('dialog', { name: 'Create repository' })).not.toBeInTheDocument();
+      expect(createGitHubRepository).not.toHaveBeenCalled();
+      await act(async () => finish({ kind: 'prompt', prompt: 'Build an accessible app' }));
+      expect(task).toHaveValue('Build an accessible app');
+      if (entry === 'repository picker') fireEvent.click(await repositoryButton());
+      const available = screen.getByRole('button', { name: 'Create repository' });
+      expect(available).toBeEnabled();
+      fireEvent.click(available);
+      expect(screen.getByRole('dialog', { name: 'Create repository' })).toBeInTheDocument();
+      expect(screen.getByRole('textbox', { name: 'Repository name' })).toHaveFocus();
+      expect(createAgentJob).not.toHaveBeenCalled();
+    },
+  );
+
+  it('keeps Enter from starting a task while clarification is open', async () => {
+    vi.mocked(getAgentConfig).mockResolvedValue(config());
+    vi.mocked(rewritePrompt).mockResolvedValue({
+      kind: 'questions',
+      questions: ['Which export format?', 'Which records should be included?'],
+    });
+    render(<TaskComposer initialRepo="owner/repository" />);
+    const box = await screen.findByRole('textbox', { name: 'What should the agent do?' });
+    fireEvent.change(box, { target: { value: 'Add export' } });
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Ask clarification questions first' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Rewrite prompt' }));
+    await screen.findByText('Which export format?');
+    fireEvent.click(await repositoryButton());
+    expect(screen.getByRole('button', { name: 'Create repository' })).toBeDisabled();
+    fireEvent.keyDown(box, { key: 'Enter' });
+    expect(createAgentJob).not.toHaveBeenCalled();
+    expect(box).toHaveValue('Add export');
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: /^Run/ })).toBeEnabled());
+    fireEvent.click(await repositoryButton());
+    expect(screen.getByRole('button', { name: 'Create repository' })).toBeEnabled();
+  });
 
   // Someone arriving for the first time writes the task before they have
   // connected anything: the box takes it, the connect card is the next step,
@@ -384,6 +472,50 @@ describe('TaskComposer source-control onboarding', () => {
       task: 'Tidy the README',
     });
   });
+
+  it.each(['onboarding', 'repository picker'] as const)(
+    'creates a repository from %s while preserving the task draft',
+    async (entry) => {
+      vi.mocked(getAgentConfig)
+        .mockResolvedValueOnce(
+          config({ repos: entry === 'onboarding' ? [] : ['owner/repository'] }),
+        )
+        .mockResolvedValue(config({ repos: ['owner/repository', 'owner/new-repo'] }));
+      vi.mocked(createGitHubRepository).mockResolvedValue({
+        repo: 'owner/new-repo',
+        web_url: 'https://github.com/owner/new-repo',
+        default_branch: 'main',
+        accessible: true,
+      });
+      render(<TaskComposer />);
+      const task = await screen.findByRole('textbox');
+      fireEvent.change(task, { target: { value: 'Build a small app' } });
+      if (entry === 'repository picker') {
+        fireEvent.click(await repositoryButton());
+        const picker = await screen.findByRole('dialog', { name: 'Repository' });
+        fireEvent.click(within(picker).getByRole('button', { name: 'Create repository' }));
+      } else {
+        fireEvent.click(screen.getByRole('button', { name: 'Create repository' }));
+      }
+      const dialog = screen.getByRole('dialog', { name: 'Create repository' });
+      fireEvent.change(within(dialog).getByRole('textbox', { name: 'Repository name' }), {
+        target: { value: 'new-repo' },
+      });
+      fireEvent.submit(dialog.querySelector('form')!);
+      expect(
+        await screen.findByRole('button', { name: 'Repository: owner/new-repo' }),
+      ).toBeInTheDocument();
+      expect(task).toHaveValue('Build a small app');
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(createGitHubRepository).toHaveBeenCalledExactlyOnceWith({
+        name: 'new-repo',
+        private: true,
+      });
+      expect(getAgentConfig).toHaveBeenLastCalledWith({ fresh: true });
+      expect(createAgentJob).not.toHaveBeenCalled();
+      expect(navigation.push).not.toHaveBeenCalled();
+    },
+  );
 
   it('puts the draft back after the trip to GitHub, and only once', async () => {
     sessionStorage.setItem(

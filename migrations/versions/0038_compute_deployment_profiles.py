@@ -2,8 +2,8 @@
 
 from alembic import op
 
-revision = "0035_compute_deployment_profiles"
-down_revision = "0034_sandbox_resource_usage"
+revision = "0038_compute_deployment_profiles"
+down_revision = "0037_admin_sandbox_stop"
 branch_labels = None
 depends_on = None
 

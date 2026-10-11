@@ -1412,6 +1412,11 @@ class AgentTerminalSessionListResponse(BaseModel):
     """Interactive terminal sessions retained by one live workspace."""
 
     terminals: list[AgentTerminalSessionResponse] = Field(default_factory=list)
+    #: The owning broker's per-workspace terminal limit. Absent when the broker
+    #: predates advertising it; the browser then assumes its own default.
+    max_sessions: int | None = None
+    #: The most input bytes the owning broker accepts in one request.
+    max_input_bytes: int | None = None
     #: Present only on a measured list request; the instrumented handler adds
     #: it after serializing, so an unmeasured reply has no key at all.
     profiling: AgentOperationProfilingFragment | None = None
@@ -2289,6 +2294,25 @@ class GitHubConnectionResponse(BaseModel):
     install_url: str | None = None
 
 
+class CreateGitHubRepositoryRequest(BaseModel):
+    """Create a personal GitHub repository without starting a conversation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=100, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    description: str = Field("", max_length=350, pattern=r"^[^\x00]*$")
+    private: bool = Field(True, strict=True)
+
+
+class CreateGitHubRepositoryResponse(BaseModel):
+    """The created repository and its separately checked Agent access."""
+
+    repo: str = Field(..., pattern=REPO_PATTERN, max_length=140)
+    web_url: str = Field(..., pattern=r"^https?://[^/]+/", max_length=2048)
+    default_branch: str = Field(..., min_length=1, max_length=1024)
+    accessible: bool
+
+
 class SourceControlAccount(BaseModel):
     """Public identity metadata for a connected provider account."""
 
@@ -2501,7 +2525,7 @@ class AgentRunnerHost(BaseModel):
         description=(
             "Runtime settings set for this server on the admin page, by key "
             "(see host_setting_definitions). They win over the global values; "
-            "a setting absent here uses the global value, or the host's own."
+            "a setting absent here uses the global value, or the deployment default."
         ),
     )
     settings_applied: dict[str, int | float] | None = Field(
@@ -2516,9 +2540,9 @@ class AgentRunnerHost(BaseModel):
     settings_local: dict[str, int | float] | None = Field(
         None,
         description=(
-            "What this host's own environment gives each setting with no admin "
-            "value: its .env, or the built-in default. Clearing an admin value "
-            "returns the host to this."
+            "The host's original bootstrap environment values, for diagnostics "
+            "and one-time migration. Clearing an admin value restores the global "
+            "value or built-in default."
         ),
     )
 
@@ -2527,11 +2551,13 @@ class HostSettingDefinition(BaseModel):
     """One runtime setting an admin may set, with its unit and bounds."""
 
     key: str
-    env: str = Field(..., description="The host environment variable it overrides.")
+    env: str = Field(
+        ..., description="The legacy host environment variable imported at enrollment."
+    )
     label: str
     description: str
     unit: SettingUnit
-    default: int = Field(..., description="Built-in value when neither an admin nor .env sets it.")
+    default: int = Field(..., description="Built-in value when no admin override is set.")
     minimum: int
     maximum: int
     scope: SettingScope = Field(
@@ -2587,7 +2613,7 @@ class ListAgentRunnerHostsResponse(BaseModel):
         default_factory=dict,
         description=(
             "Runtime settings set for every server. A value set for one server "
-            "wins over these; a setting set nowhere uses each host's own."
+            "wins over these; a setting set nowhere uses the deployment default."
         ),
     )
     host_setting_definitions: list[HostSettingDefinition] = Field(
@@ -2695,7 +2721,7 @@ class SetHostSettingsRequest(BaseModel):
             "The settings to change, by key (see host_setting_definitions), each "
             "a whole number inside that setting's bounds, or null to clear it so "
             "the next level applies: a server's value falls back to the global "
-            "one, and a global value to each host's own .env or default. "
+            "one, and a global value to the deployment's built-in default. "
             "Settings not named keep their values. Hosts apply the result from "
             "their next heartbeat answer."
         ),
@@ -2899,6 +2925,10 @@ class RetainedSandboxStop(BaseModel):
     activation_generation: int = Field(..., ge=0)
     reason: Literal["idle", "orphaned_attempt", "lost"] = "idle"
     shared_live: Literal[True] = True
+    member_activation_generations: (
+        dict[Annotated[str, Field(min_length=1, max_length=256)], Annotated[int, Field(ge=0)]]
+        | None
+    ) = Field(None, max_length=128)
 
 
 class HostHeartbeatRequest(BaseModel):
@@ -3012,8 +3042,8 @@ class HostHeartbeatRequest(BaseModel):
         None,
         max_length=MAX_SETTINGS_KEYS,
         description=(
-            "What this host's own environment gives each setting with no admin "
-            "value. Null means not reported and keeps what is stored."
+            "The host's original bootstrap environment values, for diagnostics "
+            "and one-time migration. Null means not reported and keeps what is stored."
         ),
     )
 
@@ -3067,10 +3097,9 @@ class HostHeartbeatResponse(BaseModel):
     settings: dict[str, int] = Field(
         default_factory=dict,
         description=(
-            "The runtime settings an admin set for this host — its own values "
-            "over the global ones. A setting absent here is the host's own: "
-            "its .env, or the built-in default. Always the whole set, so a "
-            "value cleared on the admin page is absent rather than unchanged."
+            "The complete runtime settings for this host: per-host overrides, "
+            "then global admin values, then built-in defaults. Clearing an "
+            "override returns the next level's value, never a legacy environment value."
         ),
     )
     residencies_lost: list[ResidencyBeat] = Field(

@@ -22,6 +22,8 @@ Start with the task you need:
 | Prepare a host and its credentials | [Prerequisites](#before-a-job-can-run-for-real), [credentials](#2-credentials) |
 | Start or inspect the host service | [Running self-hosted](#running-self-hosted) |
 | Enable isolation for untrusted repositories | [Provisioning Kata](#provisioning-kata-on-a-runner-host) |
+| Change application behavior, integrations, or appearance | [Admin Settings](#admin-settings) |
+| Open PostgreSQL administration | [pgAdmin](#pgadmin) |
 | Change concurrency, sandbox settings, or placement | [How many runners](#how-many-runners), [which machine runs the jobs](#which-machine-runs-the-jobs) |
 | Add a host on another machine | [Tunnels and broker routing](#running-runners-on-another-machine) |
 | Deploy or roll back a release | [Rolling deployment order](#rolling-deployment-order), [deployment reliability](deployment-reliability.md) |
@@ -40,6 +42,126 @@ and queue alerts, use [deployment reliability](deployment-reliability.md).
 Historical measurements below describe the runs that were recorded; consult the
 deployment's own records for its current readiness. Replace `<...>` placeholders
 with deployment values before running commands.
+
+## Admin Settings
+
+Open **Admin → Settings** to manage application and integration configuration,
+publication, web appearance, operational intervals, upload and skill limits,
+task-title generation, and sandbox/workspace limits. Application settings are
+persisted in the Agent database. The application API is
+`GET /admin/agent/settings` and `PUT /admin/agent/settings` with a partial body
+such as `{"settings": {"max_attempts": 3}}`; omitted keys retain their values.
+Writes use the existing administrator guard and record changes in the Audit
+log. Credential fields show only whether a value is configured. Enter and save
+a replacement to change one; **Reset** restores its built-in default. Missing
+required fields and partially configured optional integrations produce an
+**Administrator setup required** prompt with links to the fields to complete.
+
+For the first deployment of this release, run `alembic upgrade head` through
+`0037_admin_sandbox_stop`, then start the main control-plane listener with its
+existing complete environment. It imports registered environment settings once.
+The MCP-only listener waits for initialization and reads the same settings.
+Newly migrated runtime identity, service keys, broker credentials and policy
+fields are imported only when absent, under the same atomic preservation rule.
+Subsequent deployments preserve admin values, and resetting a field never
+restores an old `.env` value. Listeners synchronize saved changes every five
+seconds; web appearance uses the saved public fields on each request. Apply
+changes to subsequent operations according to the description beside each
+setting.
+
+For a new installation, provision the database, a stable
+`AGENT_SETTINGS_ENCRYPTION_KEY` of at least 32 bytes and a separate random
+`ADMIN_TOKEN`, plus the infrastructure/build fields in the minimal
+`deploy/control-plane/.env.example`. Bootstrap the setup UI before enrolling
+execution hosts or running the normal deployment readiness gate:
+
+```bash
+AGENT_DEPLOYMENT_SHA=$(git rev-parse HEAD) docker compose -p cloudagent \
+  --env-file .env -f deploy/control-plane/docker-compose.yml \
+  up -d --build control-plane mcp-relay web
+```
+
+Open `<web base path>/setup` and enter the recovery token. This route is outside
+the sign-in guard. It uses the ordinary administrator API and audit trail;
+unauthenticated visitors cannot read or change settings. Reloading or locking
+the page clears its in-memory token. Complete Gateway sign-in, execution and
+user credential fields, then enroll hosts and run the usual deployment command.
+Optional integrations need setup only when their configuration has been started.
+The shared-live deployment gate continues to require qualified host readiness.
+
+Existing installations can retain the environment `AGENT_SESSION_SECRET`
+fallback for the settings root. Before removing that legacy environment entry,
+set `AGENT_SETTINGS_ENCRYPTION_KEY` to the **same original value**. Both listeners must receive the
+same effective key. Back it up with the database. Before changing that key,
+re-encrypt stored settings from the old key to the new one and coordinate the
+listener rollout; replacing the environment value alone makes existing
+ciphertext unreadable. The saved session signing key can be changed separately
+from this stable root. The saved user/compute encryption keys continue to protect
+their separate credential stores; the API rejects replacing or resetting an
+existing encryption key without a separate credential re-encryption procedure.
+
+Database access, the settings encryption root, recovery authentication,
+host provisioning, networking/listeners, actual host isolation,
+build routing, mounted files, and trusted compute
+deployment profiles remain deployment configuration. These bootstrap names
+appear on the page with hidden values. See [the environment inventory](../ENVIRONMENT.md#settings-and-bootstrap-configuration).
+
+## pgAdmin
+
+Open **Admin → Database → Open pgAdmin** to manage PostgreSQL. The page checks
+the private service before offering the link. The existing same-origin API
+proxy carries pgAdmin pages, assets, forms, downloads, and SQL requests, so the
+gateway and standalone edge need no new public route or port. Every request
+requires current `agent.admin` permission. pgAdmin retains its own login and
+CSRF checks; Agent cookies and bearer credentials are never sent upstream.
+
+Enable the optional service in the control-plane deployment's `.env`:
+
+```dotenv
+COMPOSE_PROFILES=pgadmin
+AGENT_PGADMIN_EMAIL=database-admin@example.org
+AGENT_PGADMIN_PASSWORD_FILE=/srv/cloud-agent-secrets/pgadmin-password
+```
+
+Retain any existing profiles, for example `COMPOSE_PROFILES=edge,pgadmin`.
+Provision the password file privately outside the checkout and make it readable
+by pgAdmin's UID 5050; Compose mounts it as `/run/secrets/pgadmin-password`.
+Run the normal control-plane deployment workflow. An existing stack can start
+the service and apply its new control-plane environment with:
+
+```bash
+docker compose --env-file .env -f <selected-compose-file> up -d pgadmin control-plane
+```
+
+Use the release-generated Compose file for an artifact deployment. Its bundled
+server definitions are resolved from the selected recipe. In **Admin → Settings
+→ Database tools**, set **Private pgAdmin URL** to `http://pgadmin:5050` for the
+bundled service. The default public URL is the saved web base URL followed by
+`/api/admin/agent/pgadmin/`; set **Public pgAdmin proxy URL** if the API has a
+different public prefix. Existing `AGENT_PGADMIN_URL` and
+`AGENT_PGADMIN_PUBLIC_URL` values are imported once along with other runtime settings.
+
+Sign in with the configured pgAdmin email and password. The initial server
+definition points to `postgres:5432`, database/user `cloudagent`. Enter the
+deployment's PostgreSQL password when connecting. If the database name or user
+differs, supply a custom `AGENT_PGADMIN_SERVERS_FILE` before initialization, or
+edit the connection in pgAdmin. Database passwords are not preloaded or exposed
+in the dashboard. Saved accounts and connections persist in the separate
+`agent-pgadmin` volume; changing initial credentials does not reset an existing
+account. Manage that account in pgAdmin.
+
+For the HTTP-only local stack, use `AGENT_PGADMIN_COOKIE_SECURE=False` alongside
+the existing local Agent-cookie setting. Keep the default `True` for HTTPS.
+If the dashboard reports unavailable, inspect `docker compose logs pgadmin`
+and its health state. Missing account settings, an unreadable password file,
+or unavailable PostgreSQL prevent startup. Opening pgAdmin records
+`agent.database.pgadmin.open` in the Agent audit log; pgAdmin manages SQL
+activity itself. Resetting **Private pgAdmin URL** in Admin Settings disables
+access after the listeners synchronize; removing the profile and stopping
+pgAdmin preserves its volume.
+
+See [pgAdmin's container documentation](https://www.pgadmin.org/docs/pgadmin4/9.18/container_deployment.html)
+for account and server initialization behavior.
 
 ## What a job does
 
@@ -104,6 +226,25 @@ each retry rechecks title ownership and the attempt fence. Follow-ups keep a
 valid conversation name, and forks inherit it. Legacy automatic or inherited
 titles containing the warmup status can recover on their next claim. Other
 existing titles remain unchanged, and no title data migration is required.
+
+### Draft prompt rewriting
+
+`POST /v1/agent/prompts/rewrite` prepares a draft without creating a job or
+starting a sandbox. It requires an owner session and current `agent.use`
+permission. The request contains `prompt`, `model`, optional `clarify`, and
+optional `answers` (`question` / `answer` pairs). With `clarify: true` and no
+answers it returns two to four clarification questions; otherwise it returns a
+complete prompt for the owner to review before submission. Answer-bearing
+requests always produce a rewrite rather than another question round.
+
+Each call resolves the selected model against the owner's current catalog and
+uses a fresh 120-second grant scoped to that model. Its opaque operation ID
+starts with `prompt-rewrite-`, so inference remains subject to the owner's
+Gateway quota while staying separate from job usage. The grant is revoked
+after the request and never renewed. The call has a 90-second total deadline;
+drafts and rewritten prompts are limited to 32,000 characters, with up to four
+clarification answers. Invalid, truncated, or warmup model responses are
+reported as errors without replacing the draft.
 
 ### Conversation status and run history
 
@@ -189,12 +330,30 @@ deletes the account, encrypted token, and installation grants and asks GitHub
 to withdraw the authorization. Uninstalling the App on GitHub revokes the
 platform's installation access.
 
-## Running sandbox inventory and resource usage
+## Sandbox inventory, resource usage, and controls
 
-The admin console's **Sandboxes** tab lists every group recorded as running,
-including containers retained between turns. Fork members share one container
-row. The inventory refreshes every 30 seconds and follows every page of
-`GET /admin/agent/sandboxes`, which requires admin access.
+The admin console's **Sandboxes** tab initially lists every group recorded as
+running, including containers retained between turns. Use the state filter to
+include stopped, starting, stopping, or failed groups. Fork members share one
+container row. The inventory refreshes every 30 seconds and follows every page
+of `GET /admin/agent/sandboxes`, which requires admin access. The default API
+filter remains `state=running`; `state=all` includes every lifecycle state.
+
+Open a sandbox's details to inspect its member sessions, host, runtime,
+container identity, and lifecycle. Member details include session links and
+activity states, without exposing native session identifiers, credentials,
+prompts, or raw container diagnostics.
+
+**Stop idle sandbox** requests a stop of the shared container, preserving its
+workspace and native sessions for a later turn. It applies to every member of
+the group. The API checks the reviewed container, generation, and last activity
+before accepting the request, and refuses a busy group, pending snapshot or
+publication work, or a group with open terminals or stale terminal observations.
+The request is recorded in the admin audit log. The host performs its own idle
+check before stopping the container.
+The page shows the pending request until a host observation confirms the stop;
+an offline host cannot complete it. New turns wait while the stop is pending.
+This action does not delete the container or reclaim its retained disk space.
 
 CPU is measured in occupied cores over the interval between Docker samples;
 memory is current usage with inactive file cache removed. Network and block
@@ -211,10 +370,13 @@ their measured coverage. Counters Docker or Kata does not report remain
 unavailable. A current host heartbeat alone does not imply current resource
 measurements.
 
-Resource persistence requires migration `0034_sandbox_resource_usage` and a
-host running the updated workspace broker. Older hosts still appear in the
-inventory with resource usage unavailable. Only the latest observation is
-stored; this view does not provide resource history.
+Sandbox controls require migration `0037_admin_sandbox_stop` and matching
+control-plane and host releases. Apply `alembic upgrade head` before starting
+the updated API. Resource persistence requires migration
+`0034_sandbox_resource_usage` and a host running the updated workspace broker.
+Older hosts still appear in the inventory with resource usage unavailable.
+Only the latest observation is stored; this view does not provide resource
+history.
 
 ## Reading a task's recorded events
 
@@ -436,6 +598,24 @@ other.
 
 ### Runtime boundaries
 
+Claude Code retries transient inference failures within the native request,
+including HTTP 429 and 5xx responses. Both headless and resident launches set
+`CLAUDE_CODE_MAX_RETRIES=15` and `CLAUDE_CODE_RETRY_WATCHDOG=0`: up to fifteen
+retries after the initial request, with the pinned CLI's exponential delay
+starting at 500 ms, capped at 32 seconds, and adding up to 25% jitter. The CLI
+honors integer `Retry-After` values; its ordinary mode stops if the required
+delay exceeds 60 seconds. The runner's execution timeout remains the overall
+turn limit, and owner cancellation still interrupts the query during backoff.
+Retry notifications appear in the chat with the attempt and wait time.
+
+Retries reuse the pending inference request, preserving completed tool calls,
+the native session and the single platform prompt. Exhaustion remains a failed
+native turn with retained context; the runner does not send the prompt again.
+Ordinary permanent client errors such as HTTP 400 and 403 are not retried;
+HTTP 401 retains the CLI's native credential-refresh recovery. Deploy the
+updated runner to apply the launch settings; existing resident CLI processes
+pick them up when restarted or restored.
+
 An adapter declares MCP support only after both behaviors are checked against
 the pinned binary: it directs the CLI to the platform relay and prevents every
 other MCP configuration source from adding servers. Runtime family alone does
@@ -632,7 +812,8 @@ unavailable — see below. Put the file on the host, owned by the service user
 and `chmod 600`. The control-plane image does not carry the deployment's
 `config/`, `distributions/`, or `var/data/` directories.
 
-**Whether GitHub is configured is decided by `AGENT_GITHUB_APP_ID` alone.** The
+**Whether GitHub is configured is decided by the saved GitHub App ID**, imported
+from `AGENT_GITHUB_APP_ID` at the first settings initialization. The
 key path always has a default in this stack, and `/dev/null` is mounted there
 when no App exists, so the path says nothing. With the App ID set, a key that
 cannot be loaded — missing, empty, unreadable by the service user, or not a
@@ -649,17 +830,39 @@ valid key — does not stop the control plane (issue #47):
   `queue_not_starting` alert fires as well.
 - The service reads the key again every 30 seconds. Fixing the file in place —
   its owner, mode or content — recovers the same process within a minute and
-  logs `source_control_load_recovered`. Changing an environment variable, or
-  the host path the bind mount points at, still needs the container recreated.
+  logs `source_control_load_recovered`. Change the App ID and inline credentials
+  through Admin → Settings. Changing the host path of the key bind mount still
+  needs the container recreated.
 
-Alternatively `AGENT_GITHUB_APP_PRIVATE_KEY` takes the PEM inline (escaped
-`\n` are accepted and unescaped) and skips the mount — at the cost of putting
-the key in the process environment, where `docker inspect`, crash dumps and
-log shippers can read it. Prefer the file.
+Alternatively save an inline PEM in the Settings page; it is encrypted in the
+database and takes precedence over the mounted key. The legacy
+`AGENT_GITHUB_APP_PRIVATE_KEY` environment value is accepted for the one-time
+import in deployments that pass it through. The mounted file remains available
+when the saved inline key is empty.
 
-The App needs `contents: write` and `pull_requests: write` and nothing else —
-notably not `workflows`, so a patch touching `.github/` cannot be pushed even
-if the gate were bypassed. Revocation is uninstalling the App.
+For checkout and publication, the App needs `contents: write` and
+`pull_requests: write`. To enable **Create repository** in the workspace and
+new-task pickers, also configure the GitHub App's repository permission
+**Repository creation: write**. GitHub also accepts
+**Administration: Read and write**, but Repository creation grants only the
+creation operations this feature needs. See GitHub's
+[repository creation permissions](https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps#repository-permissions-for-repository-creation).
+Existing installations may need their owners to approve the updated
+permissions on GitHub. Without that permission,
+repository creation reports that the App cannot create repositories; existing
+tasks continue to use their existing permissions. The App does not need
+`workflows`, so a patch touching `.github/` cannot be pushed even if the gate
+were bypassed. Revocation is uninstalling the App.
+
+Creation calls GitHub's `POST /user/repos` with the connected user's encrypted,
+refreshable GitHub App user token, kept in the control plane. It creates only
+in that user's personal account, defaults to private, and initializes a README.
+No long-lived credential enters a sandbox. Creation does not add a local
+repository grant or bypass the deployment allowlist: if the App installation
+covers only selected repositories, the owner grants access to the new one
+through **Configure repository access** and refreshes the picker. A transient
+access-check failure after creation is handled as a created repository awaiting
+access, rather than another creation attempt.
 
 For the _connect_ flow (a user authorizing their own repositories) the App
 also needs its OAuth half, with the callback pointing at this deployment's
@@ -828,7 +1031,13 @@ disconnect.
 
 GitHub repositories retain the complete Agent lifecycle: checkout, branch
 discovery, push, and draft PR publishing use short-lived GitHub App installation
-tokens. GitLab is intentionally narrower in this release: it verifies the
+tokens. New draft PR titles use a short excerpt from the included turns' closing
+summaries, with Markdown removed, and fall back to the changed files when no
+usable closing summary exists. The original task remains in the PR body.
+A conversation keeps one draft PR across its turns while that PR is open; once
+someone closes or merges it, the next published snapshot opens a new draft PR
+from the same `agent/…` branch.
+GitLab is intentionally narrower in this release: it verifies the
 authenticated GitLab user and shows their accessible projects for discovery.
 GitLab projects do not appear in the Agent task composer, and the control plane does
 not claim to read their source or publish GitLab merge requests yet.
@@ -1108,16 +1317,24 @@ machine, and only _Host default_ returns it to the environment.
 
 #### Sandbox settings
 
-Use the admin settings pages for sandbox limits. The turn time limit,
-the repository size limit, the sandbox idle timeout, sessions per sandbox and
-the three terminal limits sit in the _Sandbox_ card on the _Settings_ page, once
+Use the admin settings pages for sandbox and workspace limits. The turn time
+limit, repository size limit, sandbox idle timeout, sessions per sandbox,
+workspace command/file limits and terminal resource limits sit in the
+_Sandbox_ card on the _Settings_ page, once
 for every server, and in the _Sandbox_ table of each server's details on the
 _Servers_ page for that server alone; the API is `PUT /admin/agent/host-settings` and
 `PUT /admin/agent/runner-hosts/<host>/settings` with
 `{"settings": {"<key>": N}}`, where `null` clears a key. A server's own value
-wins over the global one, and a setting set in neither place keeps the host's
-`.env` value or built-in default — `ENVIRONMENT.md` §_Sandbox settings from
-the admin pages_ lists the precedence and the variables. They ride the heartbeat
+wins over the global one, and a setting set in neither place uses its built-in
+default. Migration `0036_host_settings_import` imports existing valid nondefault
+`.env` observations as per-server settings without replacing an administrator's
+choices. Hosts without a complete report finish this import through their
+initial heartbeats. Admin edits and resets exclude only the changed keys from
+pending imports, so unrelated legacy customizations are preserved. Global
+exclusions also protect newly enrolled hosts. Subsequent `.env` edits have no
+effect, and clearing an override never restores them.
+`ENVIRONMENT.md` §_Sandbox settings from the admin pages_ lists the precedence
+and initial variables. They ride the heartbeat
 answer like the slot limit, so nothing is redeployed, and the same rule holds:
 saving is not applying. Each host reports what it applies, the runner's share
 as it hands each turn over and the workspace broker's as the broker confirms

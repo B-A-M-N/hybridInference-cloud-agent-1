@@ -33,7 +33,11 @@ from cloud_agent_host.shared_protocol import (
     SHARED_SANDBOX_RUNTIME_PINS,
     shared_deployment_capability,
 )
-from cloud_agent_shared.shared_protocol import FORK_HELPER, mid_turn_input_capability
+from cloud_agent_shared.shared_protocol import (
+    FORK_HELPER,
+    USER_MESSAGE_EVENT,
+    mid_turn_input_capability,
+)
 
 pytestmark = [pytest.mark.dbtest, pytest.mark.asyncio]
 
@@ -442,6 +446,7 @@ async def test_shared_workspace_snapshot_publishes_without_rewriting_turn_state(
     assert publication["branch_id"] == job["thread_id"]
     assert publication["patch"] == patch
     assert publication["metadata"] == {"_agent_base_ref": "release/x"}
+    assert publication["session_summaries"] == []
     # Publication is group bookkeeping, not another state of the model turn.
     assert (await store.conversation_queries.get_job(job["id"]))["state"] == "succeeded"
 
@@ -476,6 +481,212 @@ async def test_shared_workspace_snapshot_publishes_without_rewriting_turn_state(
     assert group["published_base_sha"] == commit_sha
     assert group["snapshot_state"] == "quiescent"
     assert await store.snapshot.pending_snapshot_base_import() is None
+
+
+@pytest.mark.parametrize("publish_parent", [False, True])
+async def test_snapshot_publication_uses_latest_current_attempt_replies_from_included_turns(
+    pool,
+    store: Storage,
+    publish_parent,
+):
+    """Publication summaries follow the captured turns, not the newest chat activity."""
+    from cloud_agent.storage._sql.events import insert_event
+
+    parent, parent_claim, sandbox = await _reserve_shared_chat(store)
+
+    async def settle(job, claim, reservation, replies):
+        fence = {
+            "thread_id": job["thread_id"],
+            "attempt_id": claim["attempt_id"],
+            "lease_generation": claim["lease_generation"],
+            "sandbox_generation": reservation["generation"],
+            "activation_generation": reservation["activation_generation"],
+        }
+        assert await store.sandbox.mark_thread_sandbox_running(
+            **fence,
+            container_id="container-summary-selection",
+            context_status="new" if job["parent_job_id"] is None else "live",
+        )
+        assert await store.sandbox.admit_thread_sandbox_turn(**fence, job_id=job["id"])
+        for reply in replies:
+            assert await store.attempt_commands.append_event(
+                attempt_id=claim["attempt_id"],
+                lease_generation=claim["lease_generation"],
+                event_type="message",
+                payload={"text": reply},
+            )
+            if reply == "Investigating retry behavior.":
+                assert await store.attempt_commands.append_event(
+                    attempt_id=claim["attempt_id"],
+                    lease_generation=claim["lease_generation"],
+                    event_type=USER_MESSAGE_EVENT,
+                    payload={"text": "Use exponential backoff."},
+                )
+        assert await store.sandbox.settle_thread_sandbox(
+            **fence,
+            job_id=job["id"],
+            context_status="live",
+            native_session_id="native-summary-selection",
+            idle_timeout_seconds=1800,
+            base_sha=job["base_sha"],
+        )
+        assert await store.attempt_commands.transition(
+            job_id=job["id"],
+            attempt_id=claim["attempt_id"],
+            lease_generation=claim["lease_generation"],
+            from_states=("running",),
+            to_state="succeeded",
+        )
+
+    parent_summary = "Fixed retry handling. " + "Result details. " * 400
+    await settle(parent, parent_claim, sandbox, ["Investigating retry behavior.", parent_summary])
+    if publish_parent:
+        prior_capture = await store.snapshot.claim_due_sandbox_snapshot()
+        assert prior_capture is not None
+        prior_patch = "diff --git a/retry.py b/retry.py\n"
+        assert await store.snapshot.record_sandbox_snapshot_capture(
+            snapshot_id=prior_capture["snapshot_id"],
+            sandbox_id=prior_capture["sandbox_id"],
+            sandbox_generation=prior_capture["generation"],
+            container_id=prior_capture["container_id"],
+            workspace_epoch=prior_capture["workspace_epoch"],
+            base_sha=prior_capture["base_sha"],
+            patch=prior_patch,
+            content_sha256=hashlib.sha256(prior_patch.encode()).hexdigest(),
+        )
+        assert await store.snapshot.claim_for_publish() is not None
+        assert await store.snapshot.record_snapshot_publish(
+            snapshot_id=prior_capture["snapshot_id"],
+            pr_url="https://github.com/o/n/pull/7",
+            commit_sha="b" * 40,
+        )
+        assert await store.snapshot.complete_snapshot_base_import(
+            snapshot_id=prior_capture["snapshot_id"],
+            commit_sha="b" * 40,
+        )
+    child = await store.conversation_commands.create_follow_up(
+        parent_job_id=parent["id"], user_id=parent["user_id"], prompt="also update the docs"
+    )
+    assert child is not None
+    child_claim = await _claim(
+        store,
+        worker_id="summary-child",
+        lease_ttl_seconds=60,
+        host="shared-runner",
+        host_credential_hash="test-credential-hash",
+    )
+    assert child_claim is not None and child_claim["id"] == child["id"]
+    child_sandbox = await store.sandbox.reserve_thread_sandbox(
+        thread_id=child["thread_id"],
+        attempt_id=child_claim["attempt_id"],
+        lease_generation=child_claim["lease_generation"],
+        host="shared-runner",
+        sandbox_id=sandbox["sandbox_id"],
+        container_name="freeinference-shared-test",
+        runtime_id="claude-code",
+        runtime_version=child_claim.get("runtime_version"),
+        sandbox_image_digest=child_claim.get("sandbox_image_digest"),
+        execution_profile=child["execution_profile"],
+    )
+    assert child_sandbox is not None
+    child_summary = "Documented the retry behavior."
+    await settle(child, child_claim, child_sandbox, ["Reading the docs.", child_summary])
+
+    capture = await store.snapshot.claim_due_sandbox_snapshot()
+    assert capture is not None
+    patch = "diff --git a/answer.txt b/answer.txt\nnew file mode 100644\n"
+    assert (
+        await store.snapshot.record_sandbox_snapshot_capture(
+            snapshot_id=capture["snapshot_id"],
+            sandbox_id=capture["sandbox_id"],
+            sandbox_generation=capture["generation"],
+            container_id=capture["container_id"],
+            workspace_epoch=capture["workspace_epoch"],
+            base_sha=capture["base_sha"],
+            patch=patch,
+            content_sha256=hashlib.sha256(patch.encode()).hexdigest(),
+        )
+        == "captured"
+    )
+
+    # A persisted response from a different attempt must not win just because
+    # its transcript id is newer than the settled attempt's final response.
+    async with pool.acquire() as conn:
+        other_attempt_id = await conn.fetchval(
+            """
+            INSERT INTO agent_attempts (
+                job_id, thread_id, attempt_no, lease_owner, lease_generation,
+                lease_expires_at, status, finished_at
+            )
+            VALUES ($1, $2, 2, 'superseded-summary', 2, NOW(), 'superseded', NOW())
+            RETURNING id
+            """,
+            parent["id"],
+            parent["thread_id"],
+        )
+        await insert_event(
+            conn,
+            job_id=parent["id"],
+            attempt_id=other_attempt_id,
+            event_type="message",
+            payload={"text": "A response from a noncurrent attempt."},
+        )
+
+    later = await store.conversation_commands.create_follow_up(
+        parent_job_id=child["id"], user_id=child["user_id"], prompt="start unrelated later work"
+    )
+    assert later is not None
+    later_claim = await _claim(
+        store,
+        worker_id="summary-later",
+        lease_ttl_seconds=60,
+        host="shared-runner",
+        host_credential_hash="test-credential-hash",
+    )
+    assert later_claim is not None and later_claim["id"] == later["id"]
+    assert await store.attempt_commands.append_event(
+        attempt_id=later_claim["attempt_id"],
+        lease_generation=later_claim["lease_generation"],
+        event_type="message",
+        payload={"text": "A newer response outside the captured snapshot."},
+    )
+
+    publication = await store.snapshot.claim_for_publish()
+    assert publication is not None
+    assert publication["included_job_ids"] == (
+        [child["id"]] if publish_parent else [parent["id"], child["id"]]
+    )
+    assert publication["session_summaries"] == (
+        [child_summary] if publish_parent else [parent_summary[:4000], child_summary]
+    )
+    assert [
+        (message["role"], message["content"]) for message in publication["session_messages"]
+    ] == [
+        ("user", parent["task_prompt"]),
+        ("assistant", "Investigating retry behavior."),
+        ("user", "Use exponential backoff."),
+        ("assistant", parent_summary),
+        ("user", "also update the docs"),
+        ("assistant", "Reading the docs."),
+        ("assistant", child_summary),
+    ]
+    assert publication["model"] == child["model"]
+    # A copied turn, or a later snapshot including an already-published turn,
+    # can carry a prior URL. The newest publication must replace that value.
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_jobs SET published_pr_url = $2 WHERE id = $1",
+            child["id"],
+            "https://github.com/o/n/pull/7",
+        )
+    assert await store.snapshot.record_snapshot_publish(
+        snapshot_id=publication["snapshot_id"],
+        pr_url="https://github.com/o/n/pull/8",
+        commit_sha="c" * 40,
+    )
+    published_child = await store.conversation_queries.get_job(child["id"])
+    assert published_child["published_pr_url"] == "https://github.com/o/n/pull/8"
+    assert published_child["published_commit_sha"] == "c" * 40
 
 
 async def test_idle_stopped_shared_workspace_snapshot_remains_claimable(

@@ -19,8 +19,10 @@ import { highestEffort, offeredEfforts } from './effort';
 import { useT } from '@/components/providers';
 import { Picker } from './Picker';
 import { RepositoryPicker } from './RepositoryPicker';
+import { CreateRepositoryDialog } from './CreateRepositoryDialog';
 import { ComposerPlusMenu } from './ComposerPlusMenu';
 import { ComposerCommandMenu } from './ComposerCommandMenu';
+import { PromptRewrite } from './PromptRewrite';
 import { composerCommandMatches } from './composerCommands';
 import { AttachmentStrip } from './attachments/AttachmentStrip';
 import { useAttachments } from './attachments/useAttachments';
@@ -75,6 +77,7 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
   // account cannot use. Said out loud rather than swapped for another one.
   const [unavailableRepo, setUnavailableRepo] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [createRepositoryOpen, setCreateRepositoryOpen] = useState(false);
   // Which trip to GitHub is starting: connecting, or adding repository access.
   const [leaving, setLeaving] = useState<'connect' | 'manage' | null>(null);
   // The owner tried to run a task written before connecting GitHub. The card
@@ -92,6 +95,7 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
   const [effort, setEffort] = useState('');
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [rewriting, setRewriting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const attachments = useAttachments(t, config?.attachment_limits);
   const mcp = useComposerMcp(t);
@@ -273,7 +277,7 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
   // Connected, and GitHub has given the App no repository yet: a step still to
   // take, not a connection to make again.
   const noRepositories = config?.github_connected === true && config.repos.length === 0;
-  const busy = submitting || goalCommand.busy;
+  const busy = submitting || goalCommand.busy || rewriting;
   const missingRepository = config?.github_connected === true && !repo;
   const canRun =
     config?.github_connected === true &&
@@ -522,6 +526,16 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
             onAction={() => void goToGitHub('manage')}
             pending={leaving === 'manage'}
           />
+          <button
+            type="button"
+            disabled={rewriting || submitting}
+            onClick={() => {
+              if (!rewriting && !submitting) setCreateRepositoryOpen(true);
+            }}
+            className="mt-3 rounded-lg px-3 py-2 text-sm font-medium text-crimson-dark hover:bg-crimson/5 disabled:cursor-not-allowed disabled:opacity-50 dark:text-rose-300 dark:hover:bg-white/5"
+          >
+            {t('repositoryCreate.title')}
+          </button>
         </div>
       ) : null}
 
@@ -605,6 +619,19 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
           />
         )}
 
+        {!disconnected && (
+          <PromptRewrite
+            value={task}
+            model={model}
+            disabled={submitting || goalCommand.busy || /^\s*\//.test(task)}
+            onActiveChange={setRewriting}
+            onApply={(prompt) => {
+              setTask(prompt);
+              taskBox.current?.focus();
+            }}
+          />
+        )}
+
         <div className="border-t border-gray-100 dark:border-white/5">
           <div className="flex flex-wrap items-center gap-1.5 px-3 py-2.5 sm:px-4">
             {disconnected ? (
@@ -664,6 +691,10 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
                   onConfigure={
                     config?.github_install_url ? () => void goToGitHub('manage') : undefined
                   }
+                  onCreate={() => {
+                    if (!rewriting && !submitting) setCreateRepositoryOpen(true);
+                  }}
+                  createDisabled={rewriting || submitting}
                   returnFocusTo={repoPickerFromTask ? taskBox : undefined}
                 />
                 <Picker
@@ -708,7 +739,7 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
                 canRun ? 'hover:bg-crimson-dark' : 'cursor-not-allowed opacity-60'
               }`}
             >
-              {busy ? t('composer.starting') : t('composer.run')}
+              {submitting || goalCommand.busy ? t('composer.starting') : t('composer.run')}
               <svg
                 aria-hidden="true"
                 className="h-3.5 w-3.5"
@@ -751,6 +782,15 @@ export function TaskComposer({ initialRepo }: { initialRepo?: string }) {
           }}
         />
       ) : null}
+      <CreateRepositoryDialog
+        open={createRepositoryOpen}
+        onClose={() => setCreateRepositoryOpen(false)}
+        onAvailable={(repo, config) => {
+          applyConfig(config);
+          chooseRepository(repo);
+          taskBox.current?.focus();
+        }}
+      />
 
       {skillLibrary.error ? (
         <div className="mt-3 text-center text-sm text-red-600 dark:text-red-400" role="alert">

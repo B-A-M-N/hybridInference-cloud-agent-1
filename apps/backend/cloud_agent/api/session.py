@@ -49,7 +49,6 @@ require operator action; temporary failures offer retry without signing in again
 
 from __future__ import annotations
 
-import os
 from typing import Any, Literal
 from urllib.parse import urlencode
 
@@ -66,6 +65,7 @@ from cloud_agent.api.errors import AgentConfigurationError
 from cloud_agent.gateway import GatewayClient, GatewayError
 from cloud_agent.logging_utils import get_logger
 from cloud_agent.schemas import SessionUserResponse
+from cloud_agent.settings import setting_env
 
 logger = get_logger(__name__)
 
@@ -100,13 +100,13 @@ OAUTH_CLIENT_ID = "cloud-agent"
 
 def _cookie_is_secure() -> bool:
     """Whether the session cookie carries ``Secure``."""
-    raw = (os.environ.get(ENV_COOKIE_SECURE) or "").strip().lower()
+    raw = (setting_env(ENV_COOKIE_SECURE) or "").strip().lower()
     return raw not in ("0", "false", "no")
 
 
 def _env(name: str) -> str:
-    """Return a trimmed environment value."""
-    return (os.environ.get(name) or "").strip()
+    """Return a trimmed deployment setting."""
+    return (setting_env(name) or "").strip()
 
 
 def safe_return_to(candidate: str | None) -> str:

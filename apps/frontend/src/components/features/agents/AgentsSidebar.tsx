@@ -228,7 +228,10 @@ export function AgentsSidebar({
   // clock below is the backstop for when it is not flowing.
   useEffect(
     () =>
-      onAgentRecordsChanged(() => {
+      onAgentRecordsChanged((change) => {
+        // Tool approvals, usage, queues and publication hints belong to detail
+        // panes. Only changed records or a stream gap can affect these lists.
+        if (!change.resync && change.jobs.length === 0 && change.threads.length === 0) return;
         reload();
         reloadProjects();
       }),
@@ -618,7 +621,7 @@ export function AgentsSidebar({
                   />
                 ))}
                 <ListStatus
-                  loading={pinnedList.loading}
+                  loading={pinnedList.showLoading}
                   error={pinnedList.error}
                   empty={false}
                   more={pinnedRows.length > visiblePinned.length || Boolean(pinnedList.cursor)}
@@ -772,7 +775,7 @@ export function AgentsSidebar({
                   ),
                 )}
               <ListStatus
-                loading={search.loading || debounced !== query.trim()}
+                loading={search.showLoading || debounced !== query.trim()}
                 error={search.error}
                 empty={!search.rows.length}
                 more={Boolean(search.cursor)}
@@ -793,7 +796,7 @@ export function AgentsSidebar({
                 />
               ))}
               <ListStatus
-                loading={list.loading}
+                loading={list.showLoading}
                 error={list.error}
                 empty={!flatRows.length}
                 more={Boolean(list.cursor)}
@@ -838,7 +841,7 @@ export function AgentsSidebar({
               ))}
               {!folders.length && (
                 <ListStatus
-                  loading={list.loading || projectsLoading}
+                  loading={list.showLoading || projectsLoading}
                   error={list.error}
                   empty
                   more={false}

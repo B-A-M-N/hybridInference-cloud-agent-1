@@ -10,9 +10,18 @@ import { getAgentRunnerHosts, setAgentHostSettings, setAgentRuntimeVersion } fro
 import { APIError, getErrorMessage } from '@/lib/utils/errors';
 
 import AgentVersions, { agentName } from './AgentVersions';
+import ApplicationSettings from './ApplicationSettings';
 import { AdminNavigation } from '../AdminNavigation';
 import { GlobalSettingsCard, type NamedHost } from '../hosts/HostSettings';
 import { runtimeMenu, serverInventory } from '../hosts/format';
+
+const SETTINGS_TABS = [
+  { id: 'application', label: 'Application' },
+  { id: 'versions', label: 'Agent versions' },
+  { id: 'sandbox', label: 'Sandbox' },
+] as const;
+
+type SettingsTab = (typeof SETTINGS_TABS)[number]['id'];
 
 export default function AdminSettingsPage() {
   const { state } = useAuth();
@@ -36,6 +45,8 @@ function AccessDenied() {
 }
 
 function SettingsView() {
+  const [selectedTab, setSelectedTab] = useState<SettingsTab>('application');
+  const tabButtons = useRef<(HTMLButtonElement | null)[]>([]);
   const [pool, setPool] = useState<AgentRunnerHostPool | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -47,6 +58,11 @@ function SettingsView() {
   const revoked = useRef(false);
   const request = useRef<AbortController | null>(null);
   const sequence = useRef(0);
+
+  useEffect(() => {
+    const index = SETTINGS_TABS.findIndex(({ id }) => id === selectedTab);
+    tabButtons.current[index]?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
+  }, [selectedTab]);
 
   const fail = useCallback((cause: unknown) => {
     if (cause instanceof APIError && (cause.statusCode === 401 || cause.statusCode === 403)) {
@@ -133,7 +149,8 @@ function SettingsView() {
         <AdminNavigation current="settings" />
         <div className="max-w-4xl">
           <p className="mt-6 text-sm text-gray-500 dark:text-gray-400">
-            Default agent versions and sandbox settings for all servers. Set them for one server in{' '}
+            Application settings, default agent versions, and sandbox settings for all servers.
+            Override sandbox settings for one server in{' '}
             <Link
               href="/admin/hosts"
               className="underline hover:text-gray-700 dark:hover:text-gray-200"
@@ -142,7 +159,48 @@ function SettingsView() {
             </Link>
             .
           </p>
-          {error && (
+          <div
+            role="tablist"
+            aria-label="Settings sections"
+            className="mt-6 flex gap-1 overflow-x-auto rounded-lg bg-gray-100 p-1 dark:bg-white/5"
+          >
+            {SETTINGS_TABS.map(({ id, label }, index) => (
+              <button
+                key={id}
+                ref={(element) => {
+                  tabButtons.current[index] = element;
+                }}
+                type="button"
+                role="tab"
+                id={`admin-settings-tab-${id}`}
+                aria-controls={`admin-settings-panel-${id}`}
+                aria-selected={selectedTab === id}
+                tabIndex={selectedTab === id ? 0 : -1}
+                onClick={() => setSelectedTab(id)}
+                onKeyDown={(event) => {
+                  const nextTabs: Partial<Record<string, number>> = {
+                    ArrowRight: (index + 1) % SETTINGS_TABS.length,
+                    ArrowLeft: (index - 1 + SETTINGS_TABS.length) % SETTINGS_TABS.length,
+                    Home: 0,
+                    End: SETTINGS_TABS.length - 1,
+                  };
+                  const nextIndex = nextTabs[event.key];
+                  if (nextIndex === undefined) return;
+                  event.preventDefault();
+                  setSelectedTab(SETTINGS_TABS[nextIndex].id);
+                  tabButtons.current[nextIndex]?.focus();
+                }}
+                className={`shrink-0 rounded-md px-4 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-crimson dark:focus-visible:ring-crimson-light ${
+                  selectedTab === id
+                    ? 'bg-white text-gray-900 shadow-sm dark:bg-gray-800 dark:text-gray-50'
+                    : 'text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {selectedTab !== 'application' && error && (
             <div
               role="alert"
               className="mt-6 flex items-center justify-between gap-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-500/25 dark:bg-red-500/10 dark:text-red-400"
@@ -158,18 +216,34 @@ function SettingsView() {
               </button>
             </div>
           )}
-          {notice && (
+          {selectedTab !== 'application' && notice && (
             <p role="status" className="mt-6 text-sm text-gray-600 dark:text-gray-300">
               {notice}
             </p>
           )}
-          {loading && (
+          {selectedTab !== 'application' && loading && (
             <p role="status" className="mt-8 text-sm text-gray-500 dark:text-gray-400">
               Loading settings…
             </p>
           )}
-          {pool && (
-            <>
+          {/* Keep inactive panels mounted so switching tabs preserves unsaved edits. */}
+          <div
+            role="tabpanel"
+            id="admin-settings-panel-application"
+            aria-labelledby="admin-settings-tab-application"
+            hidden={selectedTab !== 'application'}
+            tabIndex={0}
+          >
+            <ApplicationSettings onAccessDenied={fail} />
+          </div>
+          <div
+            role="tabpanel"
+            id="admin-settings-panel-versions"
+            aria-labelledby="admin-settings-tab-versions"
+            hidden={selectedTab !== 'versions'}
+            tabIndex={0}
+          >
+            {pool && (
               <AgentVersions
                 menu={runtimeMenu(servers.map(({ host }) => host))}
                 servers={servers}
@@ -184,11 +258,17 @@ function SettingsView() {
                   )
                 }
               />
-              {/* One card, named and ordered like each server's own Sandbox
-                  table: seven rows whose labels already say what they limit
-                  need no sub-headings, and a setting this page has never
-                  heard of still lands in the list. */}
-              {definitions.length > 0 && (
+            )}
+          </div>
+          <div
+            role="tabpanel"
+            id="admin-settings-panel-sandbox"
+            aria-labelledby="admin-settings-tab-sandbox"
+            hidden={selectedTab !== 'sandbox'}
+            tabIndex={0}
+          >
+            {pool &&
+              (definitions.length > 0 ? (
                 <GlobalSettingsCard
                   title="Sandbox"
                   definitions={definitions}
@@ -201,9 +281,12 @@ function SettingsView() {
                     void save(() => setAgentHostSettings({ [key]: value }), null)
                   }
                 />
-              )}
-            </>
-          )}
+              ) : (
+                <p className="mt-8 text-sm text-gray-500 dark:text-gray-400">
+                  No sandbox settings are available.
+                </p>
+              ))}
+          </div>
         </div>
       </section>
     </div>

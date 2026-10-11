@@ -43,6 +43,7 @@ import { PaneResizer } from './PaneResizer';
 import { Picker } from './Picker';
 import { ComposerPlusMenu } from './ComposerPlusMenu';
 import { ComposerCommandMenu } from './ComposerCommandMenu';
+import { PromptRewrite } from './PromptRewrite';
 import { composerCommandMatches } from './composerCommands';
 import { GoalBar } from './goal/GoalBar';
 import { isGoalRevisionConflict, writeGoal } from './goal/goalApi';
@@ -90,6 +91,7 @@ import {
 import { hasLostContext, latestJob, ownerRunNote } from './conversationJob';
 import { useFirstRun } from './firstRun';
 import { SideChat } from './SideChat';
+import { codeReviewPrompt } from './codeReview';
 import { WorkspaceTabBar } from './WorkspaceTabBar';
 import { useWorkspaceTabs, type WorkspaceTab } from './useWorkspaceTabs';
 import {
@@ -171,13 +173,30 @@ function RunGuidance({ job }: { job: AgentJob }) {
   return null;
 }
 
+function ReviewButton({ onReview }: { onReview?: () => void }) {
+  const t = useT();
+  return (
+    <button
+      type="button"
+      onClick={onReview}
+      disabled={!onReview}
+      title={t(onReview ? 'review.start' : 'review.unavailable')}
+      className="rounded-md bg-white dark:bg-gray-900 px-3 py-1.5 text-[13px] font-medium text-gray-700 dark:text-gray-300 shadow-sm ring-1 ring-inset ring-gray-200 dark:ring-white/10 hover:bg-gray-50 dark:hover:bg-white/5 disabled:opacity-40"
+    >
+      {t('review.tab')}
+    </button>
+  );
+}
+
 function RunActions({
   job,
   onOpenDiff,
+  onReview,
   showChanges = job.diffFiles.length > 0,
 }: {
   job: AgentJob;
   onOpenDiff: () => void;
+  onReview?: () => void;
   showChanges?: boolean;
 }) {
   return (
@@ -192,14 +211,17 @@ function RunActions({
         </button>
       ) : null}
       {job.prUrl ? (
-        <a
-          href={job.prUrl}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="rounded-md bg-gray-900 dark:bg-gray-100 px-3 py-1.5 text-[13px] font-medium text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-white"
-        >
-          Open draft PR
-        </a>
+        <>
+          <a
+            href={job.prUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="rounded-md bg-gray-900 dark:bg-gray-100 px-3 py-1.5 text-[13px] font-medium text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-white"
+          >
+            Open draft PR
+          </a>
+          <ReviewButton onReview={onReview} />
+        </>
       ) : null}
     </>
   );
@@ -225,7 +247,15 @@ function RunNotices({ job }: { job: AgentJob }) {
  * The first draft PR someone gets: where it is, that merging is theirs, and
  * that the conversation goes on. Said once; later turns get the plain actions.
  */
-function FirstRunOutcome({ job, onOpenDiff }: { job: AgentJob; onOpenDiff: () => void }) {
+function FirstRunOutcome({
+  job,
+  onOpenDiff,
+  onReview,
+}: {
+  job: AgentJob;
+  onOpenDiff: () => void;
+  onReview?: () => void;
+}) {
   const t = useT();
   return (
     <div className="mt-6 flex gap-3 rounded-xl border border-gray-200 dark:border-white/10 bg-gray-50 dark:bg-gray-950 px-4 py-3.5">
@@ -251,7 +281,7 @@ function FirstRunOutcome({ job, onOpenDiff }: { job: AgentJob; onOpenDiff: () =>
           {t('firstRun.doneBody')}
         </p>
         <div className="mt-3 flex flex-wrap items-center gap-3">
-          <RunActions job={job} onOpenDiff={onOpenDiff} />
+          <RunActions job={job} onOpenDiff={onOpenDiff} onReview={onReview} />
         </div>
       </div>
     </div>
@@ -297,10 +327,12 @@ function SiteMisconfiguredAlert({
 function OutcomeCard({
   job,
   onOpenDiff,
+  onReview,
   firstRun = false,
 }: {
   job: AgentJob;
   onOpenDiff: () => void;
+  onReview?: () => void;
   firstRun?: boolean;
 }) {
   if (job.state === 'running' || job.state === 'queued') return null;
@@ -308,12 +340,13 @@ function OutcomeCard({
   if (successful) {
     const hasActions = job.diffFiles.length > 0 || Boolean(job.prUrl);
     if (!hasActions && !hasLostContext(job)) return null;
-    if (firstRun && job.prUrl) return <FirstRunOutcome job={job} onOpenDiff={onOpenDiff} />;
+    if (firstRun && job.prUrl)
+      return <FirstRunOutcome job={job} onOpenDiff={onOpenDiff} onReview={onReview} />;
     return (
       <div className="mt-6">
         {hasActions ? (
           <div className="flex flex-wrap items-center gap-3">
-            <RunActions job={job} onOpenDiff={onOpenDiff} />
+            <RunActions job={job} onOpenDiff={onOpenDiff} onReview={onReview} />
           </div>
         ) : null}
         <RunGuidance job={job} />
@@ -346,7 +379,15 @@ function OutcomeCard({
 
 type GitView = 'diff' | 'review' | 'commits';
 
-function GitPanel({ job, active }: { job: AgentJob; active: boolean }) {
+function GitPanel({
+  job,
+  active,
+  onReview,
+}: {
+  job: AgentJob;
+  active: boolean;
+  onReview?: () => void;
+}) {
   const [view, setView] = useState<GitView>('diff');
   const [live, setLive] = useState<AgentGitWorkspaceApi | null>(null);
   const [loading, setLoading] = useState(true);
@@ -538,14 +579,17 @@ function GitPanel({ job, active }: { job: AgentJob; active: boolean }) {
             </ul>
           ) : null}
           {job.prUrl ? (
-            <a
-              href={job.prUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex rounded-md bg-gray-900 dark:bg-gray-100 px-3 py-1.5 text-xs font-medium text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-white"
-            >
-              Open pull request
-            </a>
+            <div className="flex flex-wrap items-center gap-3">
+              <a
+                href={job.prUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex rounded-md bg-gray-900 dark:bg-gray-100 px-3 py-1.5 text-xs font-medium text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-white"
+              >
+                Open pull request
+              </a>
+              <ReviewButton onReview={onReview} />
+            </div>
           ) : (
             <p className="text-xs text-gray-400 dark:text-gray-500">
               Pull request not published yet.
@@ -626,8 +670,7 @@ export function JobDetail({
   const activityToggleRef = useRef<HTMLButtonElement>(null);
   const workspaceTabs = useWorkspaceTabs(userId, job, threadJobs);
   const workspaceTab = workspaceTabs.selected;
-  // The right region holds either the workspace or one selected step, never
-  // both: two panels would hide the trajectory that explains either of them.
+  // The workspace and the step inspector take turns in the same right region.
   const [inspector, setInspector] = useState<InspectorSelection | null>(null);
   const [trajectoryQuery, setTrajectoryQuery] = useState('');
   const [focusJobId, setFocusJobId] = useState<string | null>(null);
@@ -684,6 +727,7 @@ export function JobDetail({
   const [model, setModel] = useState(job.model);
   const [effort, setEffort] = useState(job.reasoningEffort ?? '');
   const [submitting, setSubmitting] = useState(false);
+  const [rewriting, setRewriting] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [forking, setForking] = useState(false);
   const [restoring, setRestoring] = useState(false);
@@ -725,12 +769,7 @@ export function JobDetail({
     maxViewportFraction: 0.6,
     siblingMinWidth: TRAJECTORY_MIN_WIDTH,
   });
-  // Both panes size themselves against the region that holds them: only that
-  // element knows how much is left once the sidebar has taken its share. The
-  // workspace and the inspector never open together, but they share the
-  // container, so both refs are attached to it. Without the inspector's, its
-  // floor for the list has nothing to measure against, and a drag can squeeze
-  // the list past the width it needs to stay readable.
+  // Measure every pane against the space remaining after the task sidebar.
   const { containerRef: workspaceContainerRef } = workspacePane;
   const { containerRef: inspectorContainerRef } = inspectorPane;
   const layoutContainerRef = useCallback(
@@ -1076,6 +1115,7 @@ export function JobDetail({
   async function sendDraft(): Promise<ThreadMessageResultApi | null> {
     if (
       submitting ||
+      rewriting ||
       contextLost ||
       isArchived ||
       attachments.uploading ||
@@ -1191,6 +1231,13 @@ export function JobDetail({
     job.sandboxId && job.workspaceShared && !isActive && !isArchived,
   );
   const canForkCurrent = Boolean(canForkWorkspace && job.nativeForkAvailable);
+  const canReview = Boolean(userId && canForkCurrent && !contextLost);
+  function openReview() {
+    if (!canReview) return;
+    workspaceTabs.review(codeReviewPrompt(job, threadJobs));
+    setWorkspaceOpen(true);
+    setInspector(null);
+  }
   const selectedAttemptIsCurrent = attemptNo === 0 || attemptNo === liveAttempt;
   const usageFooter = selectedAttemptIsCurrent ? (
     <LedgerUsage job={job} usage={usage} />
@@ -1752,6 +1799,7 @@ export function JobDetail({
                       job={job}
                       firstRun={firstRun}
                       onOpenDiff={() => openWorkspace('git')}
+                      onReview={canReview ? openReview : undefined}
                     />
                     {selectedAttemptIsCurrent ? <RunNotices job={job} /> : null}
                     {usageFooter && lastVisibleMessageIndex < 0 && currentReplyId === undefined ? (
@@ -1933,6 +1981,19 @@ export function JobDetail({
                         onRemove={attachments.remove}
                         disabled={contextLost || submitting}
                       />
+                      <PromptRewrite
+                        key={threadId}
+                        value={followUp}
+                        model={model}
+                        disabled={
+                          contextLost || submitting || goalCommand.busy || /^\s*\//.test(followUp)
+                        }
+                        onActiveChange={setRewriting}
+                        onApply={(prompt) => {
+                          setFollowUp(prompt);
+                          followUpBox.current?.focus();
+                        }}
+                      />
                       <div className="flex flex-wrap items-center gap-1.5 border-t border-gray-100/90 dark:border-white/5 px-3 py-2.5">
                         <ComposerPlusMenu
                           onFiles={attachments.add}
@@ -1999,6 +2060,7 @@ export function JobDetail({
                             contextLost ||
                             !followUp.trim() ||
                             submitting ||
+                            rewriting ||
                             attachments.uploading ||
                             readingFiles ||
                             mcp.saving ||
@@ -2162,7 +2224,11 @@ export function JobDetail({
             hidden={workspaceTab !== 'git'}
             className="min-h-0 flex-1 overflow-y-auto p-5"
           >
-            <GitPanel job={job} active={workspaceOpen && workspaceTab === 'git'} />
+            <GitPanel
+              job={job}
+              active={workspaceOpen && workspaceTab === 'git'}
+              onReview={canReview ? openReview : undefined}
+            />
           </div>
           <div
             id="workspace-panel-terminal"
@@ -2176,9 +2242,12 @@ export function JobDetail({
                 {t('sessionArchive.terminal')}
               </p>
             ) : (
+              // Keyed by the chat, not the turn: every turn shares the one
+              // workspace, and a new turn must not tear its terminals down.
               <TerminalWorkspace
-                key={job.id}
+                key={job.threadId ?? job.id}
                 jobId={job.id}
+                workspaceKey={job.threadId ?? job.id}
                 active={workspaceOpen && workspaceTab === 'terminal'}
                 ready={terminalWorkspaceReady}
               />
