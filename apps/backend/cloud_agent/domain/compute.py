@@ -77,6 +77,67 @@ def normalize_user_public_key(value: str) -> str:
     return f"{canonical} {comment}" if comment else canonical
 
 
+def autoscaling_acquire_can_cancel(
+    operation: dict[str, Any], allocation: dict[str, Any] | None
+) -> bool:
+    """Identify an autoscaled acquisition proven not to have reached its provider."""
+    internal = operation.get("result") or {}
+    return bool(
+        allocation
+        and allocation.get("autoscaling_owned")
+        and operation.get("kind") == "acquire"
+        and operation.get("state") in {"pending", "waiting", "blocked", "failed"}
+        and internal.get("external_pending") is False
+        and not internal.get("resource_ref")
+        and not internal.get("external_id")
+        and not internal.get("resolved_external_id")
+        and not allocation.get("external_id")
+        and not allocation.get("nodes")
+        and not allocation.get("scope_complete")
+        and not allocation.get("release_committed_at")
+        and not autoscaling_acquire_is_terminal(operation, allocation)
+    )
+
+
+def autoscaling_acquire_is_terminal(
+    operation: dict[str, Any], allocation: dict[str, Any] | None
+) -> bool:
+    """Identify an owned acquisition whose slot has already been recycled."""
+    return operation.get("kind") == "acquire" and autoscaling_operation_is_terminal(
+        operation, allocation
+    )
+
+
+def autoscaling_operation_is_terminal(
+    operation: dict[str, Any], allocation: dict[str, Any] | None
+) -> bool:
+    """Identify an owned lifecycle whose provider-terminal result is authoritative."""
+    if autoscaling_retirement_needs_settlement(operation, allocation):
+        return False
+    return bool(
+        allocation
+        and allocation.get("autoscaling_owned")
+        and operation.get("kind") in {"acquire", "retire", "discard"}
+        and (
+            allocation.get("autoscaling_member_state") == "released"
+            or allocation.get("observed_state") in {"terminated", "absent"}
+        )
+    )
+
+
+def autoscaling_retirement_needs_settlement(
+    operation: dict[str, Any], allocation: dict[str, Any] | None
+) -> bool:
+    """Keep terminal retirement retryable until its local credential fence commits."""
+    return bool(
+        allocation
+        and allocation.get("autoscaling_owned")
+        and operation.get("kind") in {"retire", "discard"}
+        and allocation.get("observed_state") in {"terminated", "absent"}
+        and not allocation.get("release_committed_at")
+    )
+
+
 def normalize_host_keys(keys: list[str]) -> list[str]:
     """Return a node's SSH host public keys as sorted, comment-free, parsed keys.
 

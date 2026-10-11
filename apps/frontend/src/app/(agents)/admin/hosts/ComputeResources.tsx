@@ -18,6 +18,7 @@ import {
 import { APIError, getErrorMessage } from '@/lib/utils/errors';
 
 import AddComputeServer from './AddComputeServer';
+import CloudLabAutoscaling from './CloudLabAutoscaling';
 import ComputeSetup from './ComputeSetup';
 import ServerAccess from './ServerAccess';
 import ServerActions from './ServerActions';
@@ -37,13 +38,14 @@ import {
 type OpenPanel =
   | { kind: 'add' }
   | { kind: 'setup' }
+  | { kind: 'autoscaling' }
   | { kind: 'operations' }
   | { kind: 'resource'; id: string }
   | { kind: 'host'; hosts: string[]; name: string }
   | { kind: 'operation'; id: string }
   | null;
 
-const FINISHED = new Set(['succeeded', 'cancelled', 'failed']);
+const IN_FLIGHT = new Set(['pending', 'running', 'waiting']);
 
 function withoutSupersededInspections(operations: ComputeOperation[]): ComputeOperation[] {
   const inspectedAllocations = new Set<string>();
@@ -148,9 +150,9 @@ export default function ComputeResources({
       if (
         ops.value.operations.some(
           (next) =>
-            FINISHED.has(next.state) &&
+            !IN_FLIGHT.has(next.state) &&
             previousOperations.current.some(
-              (before) => before.id === next.id && before.state !== next.state,
+              (before) => before.id === next.id && IN_FLIGHT.has(before.state),
             ),
         )
       ) {
@@ -263,7 +265,9 @@ export default function ComputeResources({
   // Keep the durable attempts in the API, but do not let recurring failures fill
   // either activity view with copies of the same current condition.
   const visibleOperations = withoutSupersededInspections(operations);
-  const pending = visibleOperations.filter((item) => !FINISHED.has(item.state));
+  const pending = visibleOperations.filter(
+    (item) => IN_FLIGHT.has(item.state) || item.allowed_actions.length > 0,
+  );
   const shownOperations = showAllOperations ? visibleOperations : pending;
 
   const resourceActions = [];
@@ -299,6 +303,17 @@ export default function ComputeResources({
             }}
           >
             Server setup
+          </button>
+          <button
+            className={buttonClass}
+            type="button"
+            onClick={() => {
+              addReturnFocus.current = null;
+              setAddSetupOpen(false);
+              setPanel({ kind: 'autoscaling' });
+            }}
+          >
+            Auto-scaling
           </button>
           <button
             className={buttonClass}
@@ -392,6 +407,16 @@ export default function ComputeResources({
               </li>
             ))}
           </ul>
+        </Panel>
+      )}
+
+      {panel?.kind === 'autoscaling' && catalog && (
+        <Panel title="CloudLab auto-scaling" onClose={() => setPanel(null)}>
+          <CloudLabAutoscaling
+            catalog={catalog}
+            connections={connections}
+            activeHost={selectedHost}
+          />
         </Panel>
       )}
 

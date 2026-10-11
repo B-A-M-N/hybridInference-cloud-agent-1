@@ -40,6 +40,10 @@ vi.mock('@/lib/api/compute', () => ({
   resolveComputeOperation: vi.fn(),
 }));
 
+vi.mock('./CloudLabAutoscaling', () => ({
+  default: () => <p>CloudLab auto-scaling controls</p>,
+}));
+
 const catalog: ComputeCatalog = {
   secret_store_configured: true,
   deployment_profiles: [{ id: 'secure-kata', label: 'Kata isolation' }],
@@ -1061,6 +1065,18 @@ describe('resource management', () => {
 });
 
 describe('resource dashboard', () => {
+  it('opens auto-scaling without replacing the manual allocation flow', async () => {
+    render(<ComputeResources onHostsChanged={vi.fn()} />);
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Add server' })).toBeEnabled());
+    fireEvent.click(screen.getByRole('button', { name: 'Auto-scaling' }));
+
+    const dialog = screen.getByRole('dialog', { name: 'CloudLab auto-scaling' });
+    expect(within(dialog).getByText('CloudLab auto-scaling controls')).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close panel' }));
+    expect(screen.getByRole('button', { name: 'Add server' })).toBeEnabled();
+  });
+
   it('shows only the newest periodic inspection for each server', async () => {
     vi.mocked(api.getComputeOperations).mockResolvedValue({
       operations: [
@@ -1083,11 +1099,8 @@ describe('resource dashboard', () => {
     });
 
     render(<ComputeResources onHostsChanged={vi.fn()} />);
-    fireEvent.click(await screen.findByRole('button', { name: /Activity.*1 active/ }));
-
-    expect(
-      screen.getAllByRole('button', { name: /inspect · CloudLab experiment · blocked/ }),
-    ).toHaveLength(1);
+    fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
+    expect(screen.getByText('No active operations.')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Show recent operations' }));
     expect(
       screen.getAllByRole('button', { name: /inspect · CloudLab experiment · blocked/ }),
@@ -1097,7 +1110,26 @@ describe('resource dashboard', () => {
     ).toBeInTheDocument();
   });
 
-  it('shows actual retained locations separately and recovers ongoing operations on page open', async () => {
+  it('keeps failed operations with recovery actions in the default Activity view', async () => {
+    vi.mocked(api.getComputeOperations).mockResolvedValue({
+      operations: [
+        operation({
+          state: 'failed',
+          message: 'CloudLab had no matching capacity',
+          allowed_actions: ['retry', 'cancel'],
+        }),
+      ],
+    });
+
+    render(<ComputeResources onHostsChanged={vi.fn()} />);
+    fireEvent.click(await screen.findByRole('button', { name: /Activity.*1 active/ }));
+
+    expect(
+      screen.getByRole('button', { name: /acquire · CloudLab experiment · failed/ }),
+    ).toBeInTheDocument();
+  });
+
+  it('keeps settled non-actionable operations in recent Activity only', async () => {
     vi.mocked(api.getComputeOperations).mockResolvedValue({
       operations: [
         operation({
@@ -1111,7 +1143,9 @@ describe('resource dashboard', () => {
     const oldServer = await screen.findByRole('listitem', { name: /old-host/ });
     expect(within(oldServer).getByText('3 sandboxes')).toBeInTheDocument();
     expect(within(oldServer).getByText('draining')).toBeInTheDocument();
-    fireEvent.click(await screen.findByRole('button', { name: /Activity.*1 active/ }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
+    expect(screen.getByText('No active operations.')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Show recent operations' }));
     fireEvent.click(
       await screen.findByRole('button', { name: /acquire · CloudLab experiment · unknown/ }),
     );
