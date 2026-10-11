@@ -232,18 +232,31 @@ control-plane container. Add its hostname/IP to
 `AGENT_BROKER_URL_ALLOWED_HOSTS` when that allowlist is enabled. Every
 simultaneously deployed Host needs a distinct reverse port.
 
-Verify node and tunnel-server host keys through a trusted source before adding
-them to their respective `known_hosts` files. `ssh-keyscan` collects a candidate
-key; it does not authenticate it. Transport uses strict host-key checking,
-isolated keys, no ambient SSH configuration or agent, and no trust-on-first-use.
-CloudLab VMs use the manifest's SSH port. Unknown keys block deployment until
-an administrator verifies and updates the selected SSH connection; retry uses
-the same resource.
+Verify existing-server and tunnel-server host keys through a trusted source
+before adding them to their respective `known_hosts` files. `ssh-keyscan`
+collects a candidate key; it does not authenticate it. Those transports use
+strict host-key checking, isolated keys, no ambient SSH configuration or agent,
+and no trust-on-first-use.
+
+CloudLab VMs use the manifest's SSH port and, by default, the control plane
+connects without verifying the VM host key. This permits automatic setup but is
+vulnerable to machine-in-the-middle impersonation of the CloudLab node. Select
+**SSH host-key checking → Registered by the node at first boot** when the
+Cloud Agent profile is available and host identity must be pinned.
+
+Unchecked intent is stored in a shape the immediately previous release can
+read, but that release deliberately fails closed when an SSH-dependent action
+encounters it. After an application rollback, existing resource observation,
+lease and provider operations remain readable; bootstrap, inventory or
+retirement that needs SSH must wait until this release is restored. Redeploy
+forward before retrying the operation rather than replacing the marker with
+unverified key material.
 
 ### CloudLab nodes that register their own host keys
 
-For automatic replacement, select **Node host keys → Registered by the node at
-first boot** in the CloudLab server's advanced options. This applies only to
+For automatic replacement, select **SSH host-key checking → Registered by the
+node at first boot** in the CloudLab server's advanced options. This applies
+only to
 experiments created by this control plane from the Cloud Agent profile:
 
 1. Publish [`deploy/cloudlab/cloud-agent-node.py`](../deploy/cloudlab/cloud-agent-node.py)
@@ -319,20 +332,22 @@ Use **Admin → CloudLab** to set the project, initial duration, template projec
 template name and SSH user that new CloudLab server forms start with. These are
 non-secret defaults only; an administrator can change them for one allocation.
 
-1. In **Admin → Servers → Connections**, add the management SSH private key and
-   verified node host keys. For CloudLab, separately add and validate the API
-   token. Credential responses expose metadata only.
-2. Choose **Add server** and existing SSH or CloudLab. SSH needs address, port and
-   user. CloudLab needs an exact experiment UUID to attach, or a profile and
-   explicitly selected project to provision. Select the SSH connection,
-   CloudLab SSH username and trusted deployment profile.
-3. Run preflight and submit. Follow the durable operation until ready. HTTP 202
-   confirms only that the operation was recorded; allocation, installation,
-   enrollment and readiness are separate steps.
-4. Select the ready Host as the **global sandbox location** if desired. Becoming
+1. In **Admin → Servers**, choose **Add server** and select existing SSH or
+   CloudLab.
+2. Create or select credentials inline. Existing SSH needs a private key and
+   verified node host keys. CloudLab needs an API token and a management SSH
+   private key; its advanced options can replace the default unchecked host with
+   first-boot host-key registration. Credential responses expose metadata only.
+3. Enter the resource details. Existing SSH needs an address, port and user.
+   CloudLab needs an exact experiment UUID to attach, or a profile and explicitly
+   selected project to provision, plus its SSH user.
+4. Submit and follow the durable operation until ready. HTTP 202 confirms only
+   that the operation was recorded; allocation, installation, enrollment and
+   readiness are separate steps.
+5. Select the ready Host as the **global sandbox location** if desired. Becoming
    ready does not change the saved location. New unassigned groups follow it;
    retained groups remain on their original Host.
-5. Review the allocation's complete scope before enabling renewal. Attached or
+6. Review the allocation's complete scope before enabling renewal. Attached or
    imported resources require explicit lifecycle adoption. Supply a real reason
    and ordered lead times. Confirm extensions from observed expiry and the last
    result; saving policy alone does not extend a lease.
@@ -350,7 +365,7 @@ creates a new command.
 
 | Result | Recovery |
 | --- | --- |
-| SSH key or identity refused | Verify the machine/key, update the selected connection and retry the same operation. Keep host-key checks enabled. |
+| SSH key or identity refused | Verify the machine/key, update the selected connection and retry the same operation. Existing-SSH and registered CloudLab connections keep host-key checks enabled. |
 | Cloud create outcome unknown, no UUID saved | Identify the actual experiment in the exact account/project and resolve explicitly. The worker never repeats POST or adopts an experiment by name. |
 | UUID saved, later observation failed | Repair access and resume the same resource. |
 | Installation or readiness failed | Inspect deployment checks, repair prerequisites/profile and retry the same resource. Failure does not destroy it. |

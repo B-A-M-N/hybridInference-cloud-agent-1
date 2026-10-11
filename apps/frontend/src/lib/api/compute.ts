@@ -110,6 +110,7 @@ export interface ComputeAllocation {
   connection_id?: string | null;
   ssh_connection_id?: string | null;
   sandbox_storage_path?: string | null;
+  ssh_host_key_policy?: 'unchecked' | 'known_hosts' | 'registration' | null;
   name: string;
   provider_id: string;
   state: string;
@@ -261,7 +262,7 @@ export const saveComputeConnection = (
   body: {
     name: string;
     provider_id: string;
-    configuration: Record<string, unknown>;
+    configuration?: Record<string, unknown>;
     secret?: string;
     expected_revision?: number;
   },

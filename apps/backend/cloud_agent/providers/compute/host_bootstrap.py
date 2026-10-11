@@ -606,7 +606,7 @@ class SshHostBootstrap:
     def _connection(node: NodeObservation) -> SshConnection:
         if node.connection is None:
             raise ProviderError(
-                "ssh_configuration", "This node has no verified SSH connection configuration"
+                "ssh_configuration", "This node has no SSH connection configuration"
             )
         return node.connection
 

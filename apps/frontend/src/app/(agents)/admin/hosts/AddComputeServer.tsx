@@ -131,9 +131,21 @@ export default function AddComputeServer({
   const storageId = useId();
   const [account, setAccount] = useState(() => initialCredential(provider, connections));
   const sshProvider = catalog.providers.find((item) => item.id === 'existing_ssh');
+  const hostKeySourceField = provider?.fields.find((field) => field.key === 'host_key_source');
+  const supportsUncheckedCloudLabSsh =
+    provider?.id === 'cloudlab' &&
+    hostKeySourceField?.default === 'none' &&
+    hostKeySourceField.options?.some((option) => option.value === 'none') === true;
+  const deploymentSshProvider =
+    supportsUncheckedCloudLabSsh && sshProvider
+      ? { ...sshProvider, connection_fields: [] }
+      : sshProvider;
   const [ssh, setSsh] = useState(() => initialCredential(sshProvider, connections));
   const deploymentConfigured = catalog.deployment_profiles.length > 0;
   const [values, setValues] = useState(() => initialFields(provider?.fields ?? []));
+  const skipsCloudLabHostKeyCheck =
+    supportsUncheckedCloudLabSsh &&
+    (mode === 'attach' || values.host_key_source !== 'registration');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [accountError, setAccountError] = useState<string | null>(null);
@@ -214,7 +226,7 @@ export default function AddComputeServer({
       }
       const configuration = parseFields(fields, values);
       const storagePath = observeOnly ? undefined : parseSandboxStoragePath(sandboxStoragePath);
-      if (needsSshKey && !observeOnly && !sshProvider) {
+      if (needsSshKey && !observeOnly && !deploymentSshProvider) {
         throw new Error('SSH access is not configured.');
       }
       stage = 'account';
@@ -222,7 +234,7 @@ export default function AddComputeServer({
       let sshConnectionId: string | undefined;
       if (needsSshKey && !observeOnly) {
         stage = 'ssh';
-        sshConnectionId = await saveCredential(ssh, sshProvider!, setSsh);
+        sshConnectionId = await saveCredential(ssh, deploymentSshProvider!, setSsh);
       }
       const body: ServerRequest = {
         request_id: requestId,
@@ -437,12 +449,13 @@ export default function AddComputeServer({
                 errors={fieldErrors}
               />
             </div>
-            {needsSshKey && sshProvider ? (
+            {needsSshKey && deploymentSshProvider ? (
               <CredentialPicker
-                provider={sshProvider}
+                provider={deploymentSshProvider}
                 connections={availableConnections}
                 value={ssh}
                 onChange={setSsh}
+                suppressUnverified={supportsUncheckedCloudLabSsh}
                 serverName={name}
                 error={sshError}
               />
@@ -456,6 +469,11 @@ export default function AddComputeServer({
                 error={accountError}
               />
             ) : null}
+            {skipsCloudLabHostKeyCheck && (
+              <p className="text-sm text-amber-700 dark:text-amber-300">
+                CloudLab SSH host identity will not be verified.
+              </p>
+            )}
           </Section>
         )}
         {(advancedFields.length > 0 || canObserve) && (
