@@ -180,6 +180,7 @@ async def consolidate_memory(
     user_id: str,
     gateway: GatewayClient,
     grants: GrantClient,
+    requested_model: str | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> list[dict[str, Any]]:
     """Use one short-lived grant under the owner's model permissions and quota."""
@@ -193,9 +194,19 @@ async def consolidate_memory(
             models, aliases = await gateway.model_catalog_with_aliases(user_id)
             if not models:
                 raise MemoryConsolidationError("No model is available to your account.", 400)
-            preferred = view.get("portrait", {}).get("preferred_model")
+            preferred = (
+                requested_model
+                if requested_model is not None
+                else view.get("portrait", {}).get("preferred_model")
+            )
             model = preferred if preferred in models else aliases.get(preferred)
-            model = model if model in models else models[0]
+            if model not in models:
+                if requested_model is not None:
+                    raise MemoryConsolidationError(
+                        "The selected model is not available to your account. Choose another model.",
+                        400,
+                    )
+                model = models[0]
             grant = await grants.mint(
                 user_id=user_id,
                 job_id=f"memory-consolidate-{uuid4().hex}",

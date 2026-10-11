@@ -8327,6 +8327,19 @@
         "additionalProperties": false,
         "description": "Consolidate only the version the owner currently sees.",
         "properties": {
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "revision": {
             "minimum": 0.0,
             "title": "Revision",

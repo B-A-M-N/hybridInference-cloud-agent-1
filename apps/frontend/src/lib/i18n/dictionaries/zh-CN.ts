@@ -232,12 +232,17 @@ export const zhCN: Record<TranslationKey, string> = {
   'settings.description': '管理你的连接、技能、记忆和通知。',
   'settings.memory.consolidate': '整合记忆',
   'settings.memory.consolidating': '正在整合…',
+  'settings.memory.consolidationModel': '整合模型',
+  'settings.memory.modelsLoading': '正在加载可用模型…',
+  'settings.memory.modelsError': '无法加载用于整合记忆的模型，请重试。',
+  'settings.memory.modelsRetry': '重试加载模型',
+  'settings.memory.noModels': '没有可用于整合记忆的模型。',
   'settings.memory.scope': '适用范围',
   'settings.memory.repoScope': '仓库：{repo}',
   'settings.memory.userScope': '用户 · 所有项目',
   'settings.memory.bounds': '{count}/12 条记忆 · {characters}/2,400 个字符 · 最多 3 条用户记忆',
   'settings.memory.consolidateDescription':
-    '使用你可用的模型合并重复记忆，并判断应归入仓库还是用户记忆。会使用模型配额。',
+    '选择模型合并重复记忆，并判断应归入仓库还是用户记忆。会使用模型配额。如果模型未返回任何记忆，将保留现有记忆。',
   'settings.memory.title': '记忆',
   'settings.memory.description':
     '记忆最多使用你的最近 50 个请求来提供改进建议。明确表达的偏好可用于指导同一项目中的未来任务。',

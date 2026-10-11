@@ -239,13 +239,18 @@ export const en = {
   'settings.description': 'Manage your connections, skills, memory, and notifications.',
   'settings.memory.consolidate': 'Consolidate',
   'settings.memory.consolidating': 'Consolidating…',
+  'settings.memory.consolidationModel': 'Consolidation model',
+  'settings.memory.modelsLoading': 'Loading available models…',
+  'settings.memory.modelsError': 'Could not load models for consolidation. Please try again.',
+  'settings.memory.modelsRetry': 'Retry models',
+  'settings.memory.noModels': 'No models available for consolidation.',
   'settings.memory.scope': 'Applies to',
   'settings.memory.repoScope': 'Repo: {repo}',
   'settings.memory.userScope': 'User · all projects',
   'settings.memory.bounds':
     '{count}/12 memories · {characters}/2,400 characters · at most 3 user memories',
   'settings.memory.consolidateDescription':
-    'Use your available model to merge duplicates and choose repo or user scope. Uses your model quota.',
+    'Choose a model to merge duplicates and choose repo or user scope. Uses your model quota. Existing memory is kept if the model returns no memories.',
   'settings.memory.title': 'Memory',
   'settings.memory.description':
     'Memory uses up to your 50 latest requests to suggest improvements. Explicit preferences can guide future tasks in the same project.',
