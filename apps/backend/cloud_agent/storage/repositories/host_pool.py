@@ -403,9 +403,11 @@ class PostgresHostPoolRepository:
         taking work", and letting it re-promote itself would make drain a
         suggestion.
 
-        Returns ``None`` for an unknown host. Every field is optional and only
-        overwrites when supplied, so a heartbeat that carries nothing but
-        liveness does not blank out what enrollment declared.
+        Returns ``None`` for an unknown host, and for one whose credential is
+        no longer the one this request authenticated with. Every field is
+        optional and only overwrites when supplied, so a heartbeat that
+        carries nothing but liveness does not blank out what enrollment
+        declared.
 
         **The capacity block is written by a second statement, deliberately.**
         Its acceptance conditions are not the heartbeat's: the credential must
@@ -427,8 +429,9 @@ class PostgresHostPoolRepository:
         Args:
             host: The authenticated host name.
             credential_hash: Digest the request authenticated with. The
-                archive revision, capacity write, and legacy settings import
-                are refused unless the row still holds it.
+                whole beat — liveness, archive revision, capacity write and
+                legacy settings import — is refused unless the row still
+                holds it.
             capacity: The validated, normalized capacity block to store.
             capacity_sample_age_ms: How old the observation was when sent.
             physical_host: Admin grouping label; never an identity.
@@ -449,7 +452,8 @@ class PostgresHostPoolRepository:
                 per-host overrides. Either ``None`` leaves the report in place.
 
         Returns:
-            The updated host row, or ``None`` when the host no longer exists.
+            The updated host row, or ``None`` when the host no longer exists
+            or no longer holds ``credential_hash``.
         """
         async with self._pool.acquire() as conn, conn.transaction():
             # Match the admin writer's lock order: policy before host. Once
@@ -490,7 +494,10 @@ class PostgresHostPoolRepository:
                         WHEN $15 AND ($16::text IS NULL OR credential_hash = $16) THEN $14
                         ELSE sandbox_archive_settings_applied_revision
                     END
-                WHERE host = $1
+                -- The credential the request authenticated with must still be
+                -- the row's: a beat delayed past a re-enrollment or a removal
+                -- must not mark the new machine online, or a removed one alive.
+                WHERE host = $1 AND ($16::text IS NULL OR credential_hash = $16)
                 RETURNING {HOST_COLUMNS}, settings_imported, settings_import_excluded
                 """,
                 host,

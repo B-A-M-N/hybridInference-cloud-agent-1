@@ -1440,18 +1440,19 @@ async def test_archive_revision_heartbeat_is_tristate_and_credential_fenced(
     reenrolled = await hosts.register_host(host="runner-a", credential_hash=new_hash)
     assert reenrolled["sandbox_archive_settings_applied_revision"] is None
 
+    # A beat from the replaced credential is refused whole: it neither
+    # confirms an archive revision nor counts as the new machine's liveness.
     stale = await hosts.record_host_heartbeat(
         host="runner-a",
         credential_hash=old_hash,
         sandbox_archive_settings_applied_revision=7,
         sandbox_archive_settings_revision_reported=True,
     )
-    assert stale is not None
-    assert stale["last_heartbeat_at"] is not None
-    assert stale["sandbox_archive_settings_applied_revision"] is None
-    assert (await hosts.get_host(host="runner-a"))[
-        "sandbox_archive_settings_applied_revision"
-    ] is None
+    assert stale is None
+    row = await hosts.get_host(host="runner-a")
+    assert row["sandbox_archive_settings_applied_revision"] is None
+    assert row["last_heartbeat_at"] is None
+    assert row["status"] == HOST_ENROLLING
     current = await hosts.record_host_heartbeat(
         host="runner-a",
         credential_hash=new_hash,
@@ -1460,6 +1461,38 @@ async def test_archive_revision_heartbeat_is_tristate_and_credential_fenced(
     )
     assert current is not None
     assert current["sandbox_archive_settings_applied_revision"] == 7
+
+
+async def test_a_beat_that_authenticated_before_a_removal_changes_nothing(
+    hosts: PostgresHostPoolRepository,
+):
+    """Authentication and the write are two statements; the write re-checks.
+
+    The beat below authenticated while the credential was live and reached
+    the store after the removal committed. It must not stamp the removed row
+    with liveness, a broker address or capabilities.
+    """
+    digest = hash_secret("cred-runner-a")
+    await hosts.register_host(
+        host="runner-a", credential_hash=digest, broker_url="http://runner-a:8787"
+    )
+    assert await hosts.record_host_heartbeat(host="runner-a", credential_hash=digest) is not None
+    before = await hosts.get_host(host="runner-a")
+    assert await hosts.remove_host(host="runner-a") == "ok"
+
+    late = await hosts.record_host_heartbeat(
+        host="runner-a",
+        credential_hash=digest,
+        broker_url="http://elsewhere:8787",
+        capabilities=["shared-sandbox-v1"],
+    )
+
+    assert late is None
+    after = await hosts.get_host(host="runner-a")
+    assert after["status"] == HOST_DISABLED
+    assert after["broker_url"] == "http://runner-a:8787"
+    assert after["last_heartbeat_at"] == before["last_heartbeat_at"]
+    assert after["capabilities"] == before["capabilities"]
 
 
 async def test_server_settings_are_kept_apart_from_what_the_host_reports(
