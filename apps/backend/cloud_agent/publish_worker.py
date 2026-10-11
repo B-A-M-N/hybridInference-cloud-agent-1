@@ -18,7 +18,9 @@ Order of operations is load-bearing:
 3. Push the group snapshot onto its stable ``agent/<origin-thread-id>`` branch
    with a pinned refspec.
 4. Open a **draft** PR against the branch the job was started from, so a human
-   reviews before anything can merge and the diff is the agent's own work.
+   reviews before anything can merge and the diff is the agent's own work. A
+   later snapshot refreshes the branch's open PR and opens a new draft once
+   someone has closed or merged it.
 
 A rejected patch marks the snapshot/group dirty without rewriting successful
 Agent turns. Gate violations are human-review situations, and a retry loop
@@ -30,7 +32,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
-from dataclasses import dataclass
+import unicodedata
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -38,13 +41,17 @@ import httpx
 
 from cloud_agent.entitlement import RepoNotAllowed, require_entitled_repo
 from cloud_agent.logging_utils import get_logger
+from cloud_agent.pr_titles import generate_pr_title
 from cloud_agent.publisher import PublishError, fetch_base_bundle, publish_patch
 from cloud_agent.schemas import BASE_REF_METADATA_KEY
+from cloud_agent.settings import number_setting, setting_env
 from cloud_agent.source_control_runtime import SourceControlUnavailable
+from cloud_agent.task_titles import is_warmup_title
 from cloud_agent.workers.background_wake import PUBLISH
 from cloud_agent_shared.git.patch_gate import branch_name_for
 
 if TYPE_CHECKING:
+    from cloud_agent.grants import GrantClient
     from cloud_agent.ports import (
         HostPoolRepository,
         SnapshotRepository,
@@ -126,7 +133,7 @@ class GitHubCredential:
     """
 
     token: str
-    api_base: str = GITHUB_API
+    api_base: str = field(default_factory=lambda: setting_env("AGENT_GITHUB_API") or GITHUB_API)
 
     def clone_url(self, repo: str) -> str:
         """Return an authenticated clone URL for ``owner/name``."""
@@ -141,21 +148,19 @@ async def create_draft_pull_request(
     title: str,
     body: str,
     credential: GitHubCredential,
-    timeout_s: float = 30.0,
+    timeout_s: float | None = None,
 ) -> str:
     """Open a draft PR and return its URL.
 
     Draft is not a nicety: the whole safety story assumes a human reads the
     change before it can merge, so this must never open a ready-for-review PR.
     """
-    async with httpx.AsyncClient(timeout=timeout_s) as client:
+    async with httpx.AsyncClient(
+        timeout=timeout_s if timeout_s is not None else number_setting("publish_pr_timeout_s", 30.0)
+    ) as client:
         response = await client.post(
             f"{credential.api_base}/repos/{repo}/pulls",
-            headers={
-                "Authorization": f"Bearer {credential.token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
+            headers=_github_headers(credential),
             json={
                 "title": title,
                 "head": head_branch,
@@ -181,6 +186,76 @@ async def create_draft_pull_request(
     return url
 
 
+async def ensure_draft_pull_request(
+    *,
+    repo: str,
+    head_branch: str,
+    base_branch: str,
+    title: str,
+    body: str,
+    credential: GitHubCredential,
+) -> str:
+    """Refresh an open branch PR, or create a new draft after closure/merge.
+
+    Look up the branch even on the first publication: a previous create may
+    have reached GitHub before its URL could be recorded locally. Never infer
+    that a saved URL still denotes an open PR.
+    """
+    headers = _github_headers(credential)
+    endpoint = f"{credential.api_base}/repos/{repo}/pulls"
+    async with httpx.AsyncClient(timeout=number_setting("publish_pr_timeout_s", 30.0)) as client:
+        response = await client.get(
+            endpoint,
+            headers=headers,
+            params={
+                "state": "open",
+                "head": f"{repo.split('/')[0]}:{head_branch}",
+                "base": base_branch,
+            },
+        )
+        if response.status_code >= 400:
+            raise PublishError(f"GitHub refused the PR lookup ({response.status_code})")
+        pulls = response.json()
+        if not isinstance(pulls, list):
+            raise PublishError("GitHub returned an invalid PR list")
+        for pull in pulls:
+            if not isinstance(pull, dict):
+                raise PublishError("GitHub returned an invalid PR list entry")
+            if pull.get("state") != "open":
+                continue
+            number, url = pull.get("number"), pull.get("html_url")
+            if not isinstance(number, int) or not isinstance(url, str) or not url.strip():
+                raise PublishError("GitHub returned an open PR without its number or URL")
+            updated = await client.patch(
+                f"{endpoint}/{number}", headers=headers, json={"title": title, "body": body}
+            )
+            if updated.status_code >= 400:
+                raise PublishError(f"GitHub refused the PR update ({updated.status_code})")
+            payload = updated.json()
+            if not isinstance(payload, dict) or payload.get("state") not in {"open", "closed"}:
+                raise PublishError("GitHub returned an invalid PR update")
+            if payload["state"] == "closed":
+                # The owner can close/merge while publication is updating it.
+                break
+            return url
+    return await create_draft_pull_request(
+        repo=repo,
+        head_branch=head_branch,
+        base_branch=base_branch,
+        title=title,
+        body=body,
+        credential=credential,
+    )
+
+
+def _github_headers(credential: GitHubCredential) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {credential.token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
 def _pr_body(job: dict[str, Any], changed_files: list[str]) -> str:
     """Compose a PR body that tells the reviewer what they are reviewing."""
     files = "\n".join(f"- `{path}`" for path in changed_files[:50])
@@ -204,6 +279,67 @@ def _pr_body(job: dict[str, Any], changed_files: list[str]) -> str:
         "limits) before pushing. It is a draft on purpose — please review "
         "before merging."
     )
+
+
+def _summary_line(value: Any) -> str | None:
+    """Read the opening prose of a closing message, without Markdown scaffolding."""
+    if not isinstance(value, str) or is_warmup_title(value):
+        return None
+    in_code = False
+    for line in value[:4000].splitlines():
+        line = line.strip()
+        if line.startswith(("```", "~~~")):
+            in_code = not in_code
+            continue
+        if in_code or line.startswith("<"):
+            continue
+        if any(unicodedata.category(char).startswith("C") and char != "\t" for char in line):
+            continue
+        line = re.sub(r"^(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+|>\s+)", "", line)
+        line = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", line)
+        line = line.replace("**", "").replace("__", "").replace("`", "")
+        line = " ".join(line.split()).strip(" *#")
+        if (
+            not any(char.isalnum() for char in line)
+            or line.endswith(":")
+            or line.casefold().rstrip(".!")
+            in {"summary", "changes", "what changed", "done", "completed"}
+            or line == "(the agent finished without a closing message)"
+        ):
+            continue
+        return line
+    return None
+
+
+def _pr_title(job: dict[str, Any], changed_files: list[str]) -> str:
+    """Name completed snapshot work from its included turns' closing summaries.
+
+    The task prompt describes requested work; a closing message describes what
+    the agent actually did. Shared snapshots can include several chats, so keep
+    a summary from each rather than naming only the anchor chat's instruction.
+    """
+    summaries = job.get("session_summaries")
+    lines = (
+        dict.fromkeys(line for summary in summaries if (line := _summary_line(summary)) is not None)
+        if isinstance(summaries, list)
+        else {}
+    )
+    # Share the title budget across summaries when several chats settle together.
+    fragments = list(lines)
+    if len(fragments) > 5:
+        fragments = [*fragments[:4], f"+{len(fragments) - 4} more"]
+    budget = (70 - 2 * (len(fragments) - 1)) // max(1, len(fragments))
+    summary = "; ".join(
+        line if len(line) <= budget else line[: budget - 1].rstrip() + "…" for line in fragments
+    )
+    if not summary:
+        summary = (
+            f"Update {', '.join(changed_files)}" if changed_files else "Update shared workspace"
+        )
+        summary = " ".join(summary.split())
+    if len(summary) > 70:
+        summary = summary[:69].rstrip() + "…"
+    return f"[agent] {summary}"
 
 
 async def _import_snapshot_base(
@@ -317,7 +453,8 @@ async def publish_one(
     *,
     credential: GitHubCredential | None = None,
     app_credentials: Any | None = None,
-    base_branch: str = "dev",
+    grants: GrantClient | None = None,
+    base_branch: str | None = None,
     allow_workflow_changes: bool = False,
 ) -> str | None:
     """Publish at most one pending job. Returns the PR URL, or ``None``.
@@ -336,7 +473,10 @@ async def publish_one(
         job,
         credential=credential,
         app_credentials=app_credentials,
-        base_branch=base_branch,
+        grants=grants,
+        base_branch=base_branch
+        if base_branch is not None
+        else setting_env("AGENT_PUBLISH_BASE_BRANCH") or "dev",
         allow_workflow_changes=allow_workflow_changes,
     )
 
@@ -346,6 +486,7 @@ async def _publish_due(
     *,
     credential: GitHubCredential | None,
     app_credentials: Any | None,
+    grants: GrantClient | None = None,
     base_branch: str,
 ) -> None:
     """Publish every captured snapshot, past any that fails.
@@ -359,6 +500,7 @@ async def _publish_due(
             job,
             credential=credential,
             app_credentials=app_credentials,
+            grants=grants,
             base_branch=base_branch,
         )
 
@@ -369,6 +511,7 @@ async def _publish_claimed(
     *,
     credential: GitHubCredential | None,
     app_credentials: Any | None,
+    grants: GrantClient | None = None,
     base_branch: str,
     allow_workflow_changes: bool = False,
 ) -> str | None:
@@ -439,16 +582,15 @@ async def _publish_claimed(
             allow_workflow_changes=allow_workflow_changes,
             include_base_bundle=True,
         )
-        pr_url = job.get("parent_pr_url")
-        if not pr_url:
-            pr_url = await create_draft_pull_request(
-                repo=job["repo"],
-                head_branch=result.branch,
-                base_branch=pr_base,
-                title=f"[agent] {job['task_prompt'][:70]}".strip(),
-                body=_pr_body(job, result.changed_files),
-                credential=credential,
-            )
+        title = await generate_pr_title(job, result.changed_files, grants=grants)
+        pr_url = await ensure_draft_pull_request(
+            repo=job["repo"],
+            head_branch=result.branch,
+            base_branch=pr_base,
+            title=title or _pr_title(job, result.changed_files),
+            body=_pr_body(job, result.changed_files),
+            credential=credential,
+        )
     except PublishError as exc:
         logger.warning(
             "agent_job_publish_rejected",
@@ -500,8 +642,9 @@ async def publish_loop(
     *,
     credential_provider: Any = None,
     github_app: GitHubAppSource | None = None,
-    base_branch: str = "dev",
-    interval_seconds: float = POLL_INTERVAL_S,
+    grants: GrantClient | None = None,
+    base_branch: str | None = None,
+    interval_seconds: float | None = None,
     wake: BackgroundWake | None = None,
 ) -> None:
     """Drain the publish queue forever.
@@ -522,10 +665,15 @@ async def publish_loop(
     """
     without_source = False
     while True:
+        poll_seconds = (
+            interval_seconds
+            if interval_seconds is not None
+            else number_setting("publish_poll_seconds", POLL_INTERVAL_S)
+        )
         if wake is None:
-            await asyncio.sleep(interval_seconds)
+            await asyncio.sleep(poll_seconds)
         elif without_source or not wake.listening:
-            await wake.wait(PUBLISH, interval_seconds)
+            await wake.wait(PUBLISH, poll_seconds)
         else:
             await wake.wait(PUBLISH, await _next_look_s(store))
         without_source = False
@@ -557,7 +705,10 @@ async def publish_loop(
                 store,
                 credential=credential,
                 app_credentials=app_credentials,
-                base_branch=base_branch,
+                grants=grants,
+                base_branch=base_branch
+                if base_branch is not None
+                else setting_env("AGENT_PUBLISH_BASE_BRANCH") or "dev",
             )
         except asyncio.CancelledError:
             raise
@@ -567,7 +718,7 @@ async def publish_loop(
 
 async def _next_look_s(store: PublishStorage) -> float:
     """How long the publisher may sleep before it looks for work again."""
-    idle_s = PUBLISH_IDLE_S
+    idle_s = number_setting("publish_idle_seconds", PUBLISH_IDLE_S)
     with contextlib.suppress(Exception):
         due = await store.snapshot.next_base_import_retry_due()
         if due is not None:

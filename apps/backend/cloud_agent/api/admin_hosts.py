@@ -93,7 +93,12 @@ def _no_store(response: Response) -> None:
     response.headers["Cache-Control"] = "no-store"
 
 
-router = APIRouter(prefix="/admin", dependencies=[Depends(_no_store)])
+# The guard is on the router, not only on each route: a route added to this
+# surface inherits it, so the next pool action cannot ship without one by
+# omission. Mutating routes keep their per-route ``_admin_id`` parameter for
+# the audit trail — FastAPI runs a shared dependency once per request, so the
+# two do not double-ask the gateway.
+router = APIRouter(prefix="/admin", dependencies=[Depends(_no_store), Depends(verify_admin_access)])
 
 _Result = TypeVar("_Result")
 
@@ -289,7 +294,7 @@ async def set_agent_host_settings(
 
     Each host picks the values up from its next heartbeat answer, except where
     a value set for that server wins. ``null`` clears a setting, and each host
-    goes back to its own ``.env`` or built-in default for it.
+    goes back to the deployment's built-in default for it.
 
     **Saving is not applying.** Each host reports what it applied, and the page
     shows the hosts that have not caught up yet. Nothing running is
@@ -325,7 +330,7 @@ async def set_agent_runner_host_settings(
     """Set or clear runtime settings for one server, over the global values.
 
     A value set here wins over the one set for every server. ``null`` clears
-    it, and the server goes back to the global value, or to its own when there
+    it, and the server goes back to the global value, or the built-in default when there
     is none. Applied from the host's next heartbeat, like the global values,
     and kept through heartbeats and re-enrollment.
     """

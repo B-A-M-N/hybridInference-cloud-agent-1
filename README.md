@@ -10,6 +10,13 @@ Model access and account identity come from a
 FreeInference is a hosted deployment of that gateway. Cloud Agent is a separate
 service with its own database and credentials.
 
+Use **Rewrite prompt** below a new task or follow-up to expand a draft with the
+selected model. Check **Ask clarification questions first** to answer a few
+questions before generating the comprehensive prompt. The result stays in the
+editor for review and can be edited before sending. Cancel or an unsuccessful
+rewrite preserves the original draft. Rewriting uses the account's normal model
+permissions and inference quota.
+
 ## Getting started
 
 Choose a path based on what you want to do:
@@ -65,6 +72,17 @@ lifecycle; it does not measure model quality or qualify production isolation.
 startup. Read the [local guide](deploy/local/README.md) for prerequisites,
 configuration, logs, and running multiple stacks.
 
+Administrators manage application behavior, integrations and credentials, web
+appearance, and sandbox/workspace limits in **Admin → Settings**. Saved values
+survive restarts; existing environment values are imported once, and Reset
+restores built-in defaults. Database access, identity, encryption, security and
+deployment infrastructure remain bootstrap configuration. See the
+[Settings runbook](docs/operations.md#admin-settings) for migration and key setup.
+
+**Admin → Database** opens the optional pgAdmin website for PostgreSQL
+administration. Enable the private service and its separate login using the
+[pgAdmin runbook](docs/operations.md#pgadmin).
+
 ## Architecture
 
 ```mermaid
@@ -99,6 +117,13 @@ replacement, the CLI resumes its native session in the same container.
 Fork creates another chat and native session in the same group. Parent and child
 share the workspace and can run concurrently, with separate member UIDs,
 credentials, and process control.
+
+For a completed chat with a draft PR, **Review** beside **Open draft PR** starts
+an independent code-review subagent in a workspace tab. It reviews all changes
+from the conversation's original base, including current workspace changes,
+and is instructed to return findings without editing files. Clicking Review
+again reopens that chat's review. Review requires an available native Fork;
+archived chats and chats with lost context cannot start one.
 
 | Context status | Meaning |
 |---|---|

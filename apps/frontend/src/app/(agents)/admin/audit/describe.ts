@@ -125,7 +125,7 @@ const SENTENCES: Record<string, Sentence> = {
   'agent.host_settings.set': (details, _host, definitions) => {
     const lines = settingChanges(details, definitions, {
       where: 'for all servers',
-      inherited: "each server's default",
+      inherited: 'the deployment default',
     });
     return lines.length > 0 ? lines.join('; ') : 'Changed sandbox settings for all servers';
   },
@@ -164,6 +164,8 @@ const SENTENCES: Record<string, Sentence> = {
   'agent.runner_host.forget': (_details, host) => `Forgot ${host}`,
   'agent.runner_host.enroll_token_issued': (_details, host) =>
     `Issued an enrollment token for ${host}`,
+  'agent.sandbox.stop': (details, host) =>
+    `Requested stopping sandbox ${text(details.sandbox_id) ?? '(unknown)'} on ${host}`,
   'agent.profiling.start': (details) => measurementChange('on', details),
   'agent.profiling.stop': (details) => measurementChange('off', details),
   'agent.run.event_content.read': (details) => {

@@ -42,10 +42,12 @@ from cloud_agent_host.workspace_broker import (
     TerminalRequest,
     _run_terminal,
     _terminal_sse_frame,
+    _TerminalLimits,
     _TerminalManager,
     _TerminalSession,
     create_app,
 )
+from cloud_agent_shared.host_settings import BROKER_SETTING_KEYS, default_values
 
 
 class _TerminalProcess(TerminalProcess):
@@ -104,7 +106,9 @@ class _WorkspaceBackend(RetainedChatBackend):
     def spawn_terminal(self, spec, *, rows, cols):
         assert rows > 0 and cols > 0
         self.spawned.append(spec)
-        process = _TerminalProcess()
+        # A shell stays open until it is killed; one that exits at once gives
+        # its slot back, which is not what the capacity tests are about.
+        process = _RunningTerminalProcess()
         self.processes.append(process)
         return process
 
@@ -1037,7 +1041,7 @@ def test_shared_one_shot_terminal_uses_group_writable_umask():
 
 @pytest.mark.asyncio
 async def test_the_runner_sets_the_brokers_runtime_settings_over_its_own():
-    """Applied at runtime, answered with what is applied, and cleared back to its own."""
+    """Apply runtime overrides and reset the complete configuration to defaults."""
     supervisor = _SharedSupervisor()
     app = create_app(
         backend=ProcessBackend(acknowledged_unsafe=True),
@@ -1050,6 +1054,7 @@ async def test_the_runner_sets_the_brokers_runtime_settings_over_its_own():
     )
     headers = {"X-Agent-Workspace-Token": "broker-secret"}
     own = {
+        **default_values(BROKER_SETTING_KEYS),
         "terminal_idle_ttl_s": 1800,
         "terminal_hard_ttl_s": 28800,
         "terminal_max_sessions": 64,
@@ -1085,7 +1090,201 @@ async def test_the_runner_sets_the_brokers_runtime_settings_over_its_own():
     assert supervisor.idle_timeout_s == 1800
 
 
-class _RunningTerminalProcess(_TerminalProcess):
+@pytest.mark.asyncio
+async def test_reset_uses_defaults_after_the_broker_bootstrapped_from_environment(monkeypatch):
+    monkeypatch.setenv("AGENT_TERMINAL_MAX_SESSIONS", "99")
+    monkeypatch.setenv("AGENT_CHAT_IDLE_TIMEOUT_S", "600")
+    monkeypatch.setenv("AGENT_TERMINAL_INPUT_MAX_KIB", "2")
+    supervisor = _SharedSupervisor()
+    app = _app(supervisor)
+    headers = {"X-Agent-Workspace-Token": "broker-secret"}
+    assert app.state.terminal_manager._max_sessions == 99
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://broker") as client:
+        reset = await client.post("/host-settings", headers=headers, json={"settings": {}})
+
+    assert reset.status_code == 200
+    assert reset.json()["applied"] == default_values(BROKER_SETTING_KEYS)
+    assert reset.json()["local"]["terminal_max_sessions"] == 99
+    assert reset.json()["local"]["chat_idle_timeout_s"] == 600
+    assert reset.json()["local"]["terminal_input_max_kib"] == 2
+    assert app.state.terminal_manager._max_sessions == 64
+    assert supervisor.idle_timeout_s == 1800
+
+
+@pytest.mark.asyncio
+async def test_admin_workspace_terminal_limits_are_advertised_and_enforced(monkeypatch):
+    supervisor = _SharedSupervisor()
+    process = _RunningTerminalProcess()
+    monkeypatch.setattr(supervisor.workspace_backend, "spawn_terminal", lambda *_a, **_k: process)
+    app = _app(supervisor)
+    headers = {"X-Agent-Workspace-Token": "broker-secret"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://broker") as client:
+        configured = await client.post(
+            "/host-settings",
+            headers=headers,
+            json={
+                "settings": {"terminal_max_sessions_per_workspace": 1, "terminal_input_max_kib": 1}
+            },
+        )
+        first = await client.post(
+            "/workspaces/athr_source/terminals", headers=headers, json={"rows": 24, "cols": 80}
+        )
+        second = await client.post(
+            "/workspaces/athr_child/terminals", headers=headers, json={"rows": 24, "cols": 80}
+        )
+        listed = await client.get("/workspaces/athr_child/terminals", headers=headers)
+        terminal_id = first.json()["id"]
+        rejected = await client.post(
+            f"/workspaces/athr_source/terminals/{terminal_id}/input",
+            headers=headers,
+            json={"data": base64.b64encode(b"x" * 1025).decode()},
+        )
+        accepted = await client.post(
+            f"/workspaces/athr_source/terminals/{terminal_id}/input",
+            headers=headers,
+            json={"data": base64.b64encode(b"x" * 1024).decode()},
+        )
+        await client.delete(f"/workspaces/athr_source/terminals/{terminal_id}", headers=headers)
+
+    assert configured.status_code == first.status_code == accepted.status_code == 200
+    assert second.status_code == 409
+    assert rejected.status_code == 413
+    assert listed.json()["max_sessions"] == 1
+    assert listed.json()["max_input_bytes"] == 1024
+    assert [row["id"] for row in listed.json()["terminals"]] == [terminal_id]
+
+
+@pytest.mark.asyncio
+async def test_admin_file_limits_reach_the_retained_workspace_reader_and_writer(monkeypatch):
+    seen: list[dict] = []
+
+    def read(_backend, relative, **kwargs):
+        kwargs.pop("observer", None)
+        seen.append(kwargs)
+        return {"path": relative, "kind": "directory", "entries": []}
+
+    def write(_backend, relative, _content, **kwargs):
+        kwargs.pop("observer", None)
+        seen.append(kwargs)
+        return {"path": relative, "kind": "file", "content": "saved"}
+
+    monkeypatch.setattr("cloud_agent_host.workspace_broker.read_retained_file", read)
+    monkeypatch.setattr("cloud_agent_host.workspace_broker.write_retained_file", write)
+    app = _app(_SharedSupervisor())
+    headers = {"X-Agent-Workspace-Token": "broker-secret"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://broker") as client:
+        configured = await client.post(
+            "/host-settings",
+            headers=headers,
+            json={
+                "settings": {
+                    "workspace_file_write_max_mib": 1,
+                    "workspace_file_preview_max_kib": 64,
+                    "workspace_directory_max_entries": 20,
+                }
+            },
+        )
+        listed = await client.get("/workspaces/athr_source/files", headers=headers)
+        saved = await client.put(
+            "/workspaces/athr_source/files?path=a.txt", headers=headers, json={"content": "saved"}
+        )
+
+    assert configured.status_code == listed.status_code == saved.status_code == 200
+    assert seen == [
+        {"max_preview_bytes": 64 * 1024, "max_directory_entries": 20},
+        {
+            "max_write_bytes": 1024 * 1024,
+            "max_preview_bytes": 64 * 1024,
+            "max_directory_entries": 20,
+        },
+    ]
+
+
+def test_lower_terminal_output_limits_apply_to_existing_terminals():
+    manager = _TerminalManager(idle_ttl_s=1800, hard_ttl_s=28800, max_sessions=8)
+    session = _TerminalSession(
+        terminal_id="term_live", process=_TerminalProcess(), workdir=None, rows=24, cols=80, now=0
+    )
+    manager._sessions["asbx_shared"] = {session.id: session}
+    session._append_output(b"a" * 100)
+    session._append_output(b"b" * 100)
+    session.open_stream()
+
+    manager.configure(
+        idle_ttl_s=1800,
+        hard_ttl_s=28800,
+        max_sessions=8,
+        limits=_TerminalLimits(buffer_bytes=100, buffer_events=2, output_bytes=150, streams=1),
+    )
+
+    assert [(event.kind, event.data) for event in session.events_after(0, wait_s=0)] == [
+        ("reset", b""),
+        ("output", b"b" * 100),
+    ]
+    with pytest.raises(HTTPException) as refused:
+        session.open_stream()
+    assert refused.value.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_lower_command_output_limit_stops_an_oversized_command(monkeypatch):
+    supervisor = _SharedSupervisor()
+    killed: list[bool] = []
+
+    def spawn(_spec):
+        return SimpleNamespace(
+            lines=lambda: iter(["x" * (1024 * 1024 + 1)]),
+            kill=lambda: killed.append(True),
+            wait=lambda: 0,
+            stderr_text=lambda: "",
+        )
+
+    monkeypatch.setattr(supervisor.workspace_backend, "spawn", spawn)
+    app = _app(supervisor)
+    headers = {"X-Agent-Workspace-Token": "broker-secret"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://broker") as client:
+        configured = await client.post(
+            "/host-settings",
+            headers=headers,
+            json={"settings": {"workspace_command_output_max_mib": 1}},
+        )
+        command = await client.post(
+            "/workspaces/athr_source/terminal",
+            headers=headers,
+            json={"command": "print_many_bytes"},
+        )
+
+    assert configured.status_code == 200
+    assert command.status_code == 413
+    assert killed == [True]
+
+
+def test_lower_terminal_total_output_limit_stops_the_process():
+    class LoudTerminal(_TerminalProcess):
+        def chunks(self):
+            yield b"x" * 1025
+
+    process = LoudTerminal()
+    session = _TerminalSession(
+        terminal_id="term_loud",
+        process=process,
+        workdir=None,
+        rows=24,
+        cols=80,
+        now=0,
+        limits=_TerminalLimits(output_bytes=1024),
+    )
+
+    session._pump()
+
+    assert process.killed
+    events = session.events_after(0, wait_s=0)
+    assert any(b"output limit exceeded" in event.data for event in events)
+    assert events[-1].kind == "exit"
+
+
+class _RunningTerminalProcess(_SuspendableTerminalProcess):
     """A shell that stays open, silent, until it is killed."""
 
     def __init__(self) -> None:
@@ -1248,6 +1447,180 @@ def test_terminal_idle_guard_cannot_outlive_the_chat_clock(tmp_path):
     )
     assert session.expired(now=109, idle_ttl_s=30, hard_ttl_s=60) is False
     assert session.expired(now=110, idle_ttl_s=30, hard_ttl_s=60) is True
+
+
+class _Spawner:
+    """Hands ``_TerminalManager.create`` the next prepared process."""
+
+    def __init__(self, *processes: TerminalProcess) -> None:
+        self.processes = list(processes)
+
+    @staticmethod
+    def base_env() -> dict[str, str]:
+        return {}
+
+    def spawn_terminal(self, _spec, *, rows: int, cols: int) -> TerminalProcess:
+        return self.processes.pop(0)
+
+
+def _wait_for(predicate, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "the condition never held"
+        time.sleep(0.01)
+
+
+def _state(
+    terminals: _TerminalManager, terminal_id: str, workspace_id: str = "athr_source"
+) -> str | None:
+    return next(
+        (row["state"] for row in terminals.list(workspace_id) if row["id"] == terminal_id), None
+    )
+
+
+def test_an_exited_shell_gives_back_its_terminal_slot():
+    """`exit` must not leave the workspace stuck at its terminal limit."""
+    terminals = _TerminalManager(
+        idle_ttl_s=1800, hard_ttl_s=28800, max_sessions=8, max_sessions_per_workspace=2
+    )
+    running, exited, replacement = (
+        _RunningTerminalProcess(),
+        _TerminalProcess(),  # its output ends at once: the owner typed `exit`
+        _RunningTerminalProcess(),
+    )
+    spawner = _Spawner(running, exited, replacement, _RunningTerminalProcess())
+
+    def create() -> dict:
+        return terminals.create("athr_source", "/workspace", rows=24, cols=80, backend=spawner)
+
+    first = create()
+    gone = create()
+    _wait_for(lambda: _state(terminals, gone["id"]) == "exited")
+    assert [row["id"] for row in terminals.list("athr_source")] == [first["id"], gone["id"]]
+
+    third = create()
+
+    # The exited shell made room and was dropped to stay within the bound.
+    assert [row["id"] for row in terminals.list("athr_source")] == [first["id"], third["id"]]
+    with pytest.raises(HTTPException) as refused:
+        create()
+    assert refused.value.status_code == 409
+    terminals.close()
+
+
+def test_an_exited_shell_stays_listed_while_there_is_room():
+    terminals = _TerminalManager(
+        idle_ttl_s=1800, hard_ttl_s=28800, max_sessions=8, max_sessions_per_workspace=4
+    )
+    spawner = _Spawner(_TerminalProcess(), _RunningTerminalProcess())
+    gone = terminals.create("athr_source", "/workspace", rows=24, cols=80, backend=spawner)
+    _wait_for(lambda: _state(terminals, gone["id"]) == "exited")
+
+    live = terminals.create("athr_source", "/workspace", rows=24, cols=80, backend=spawner)
+
+    assert {row["id"]: row["state"] for row in terminals.list("athr_source")} == {
+        gone["id"]: "exited",
+        live["id"]: "running",
+    }
+    terminals.close()
+
+
+def test_exited_shells_across_workspaces_stay_within_the_broker_limit():
+    """Exited shells keep their output, so the broker-wide bound still holds them."""
+    terminals = _TerminalManager(
+        idle_ttl_s=1800, hard_ttl_s=28800, max_sessions=2, max_sessions_per_workspace=2
+    )
+    oldest = _TerminalProcess()
+    spawner = _Spawner(
+        oldest,
+        _TerminalProcess(),
+        _RunningTerminalProcess(),
+        _RunningTerminalProcess(),
+        _RunningTerminalProcess(),
+    )
+
+    def create(workspace_id: str) -> dict:
+        return terminals.create(workspace_id, "/workspace", rows=24, cols=80, backend=spawner)
+
+    def listed() -> dict[str, list[str]]:
+        return {
+            workspace_id: [row["id"] for row in terminals.list(workspace_id)]
+            for workspace_id in ("athr_one", "athr_two", "athr_three")
+        }
+
+    first = create("athr_one")
+    second = create("athr_two")
+    _wait_for(lambda: _state(terminals, first["id"], "athr_one") == "exited")
+    _wait_for(lambda: _state(terminals, second["id"], "athr_two") == "exited")
+
+    # Neither exited shell refuses a third terminal, but together they would
+    # exceed the broker's bound: the oldest of them, in another chat, goes.
+    live = create("athr_three")
+    assert listed() == {"athr_one": [], "athr_two": [second["id"]], "athr_three": [live["id"]]}
+    assert oldest.killed
+    assert "athr_one" not in terminals._sessions
+
+    another = create("athr_three")
+    assert listed() == {"athr_one": [], "athr_two": [], "athr_three": [live["id"], another["id"]]}
+
+    # Running shells still refuse one past the limit.
+    with pytest.raises(HTTPException) as refused:
+        create("athr_one")
+    assert refused.value.status_code == 503
+    terminals.close()
+
+
+def test_the_descriptor_names_the_shell_the_process_runs():
+    class Bash(_RunningTerminalProcess):
+        shell = "bash"
+
+    terminals = _TerminalManager(idle_ttl_s=1800, hard_ttl_s=28800, max_sessions=8)
+    spawner = _Spawner(Bash(), _RunningTerminalProcess())
+
+    bash = terminals.create("athr_source", "/workspace", rows=24, cols=80, backend=spawner)
+    plain = terminals.create("athr_source", "/workspace", rows=24, cols=80, backend=spawner)
+
+    assert (bash["shell"], plain["shell"]) == ("bash", "sh")
+    terminals.close()
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_stream_first_says_where_its_history_ends(monkeypatch):
+    """A new viewer must know which bytes were produced before it attached."""
+
+    class Finished(_TerminalProcess):
+        def chunks(self):
+            yield b"\x1b[6n"  # a cursor-position query, long since answered
+
+    supervisor = _SharedSupervisor()
+    monkeypatch.setattr(
+        supervisor.workspace_backend, "spawn_terminal", lambda *_a, **_k: Finished()
+    )
+    app = _app(supervisor)
+    headers = {"X-Agent-Workspace-Token": "broker-secret"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://broker") as client:
+        created = await client.post(
+            "/workspaces/athr_source/terminals", headers=headers, json={"rows": 24, "cols": 80}
+        )
+        terminal_id = created.json()["id"]
+        terminals = app.state.terminal_manager
+        _wait_for(lambda: _state(terminals, terminal_id) == "exited")
+        replay = await client.get(
+            f"/workspaces/athr_source/terminals/{terminal_id}/stream", headers=headers
+        )
+        resumed = await client.get(
+            f"/workspaces/athr_source/terminals/{terminal_id}/stream?after=1", headers=headers
+        )
+
+    output = base64.b64encode(b"\x1b[6n").decode()
+    assert replay.text == (
+        'event: attached\ndata: {"seq":2}\n\n'
+        f'id: 1\nevent: output\ndata: {{"seq":1,"data":"{output}"}}\n\n'
+        'id: 2\nevent: exit\ndata: {"seq":2,"exit_code":0}\n\n'
+    )
+    assert resumed.text == (
+        'event: attached\ndata: {"seq":2}\n\nid: 2\nevent: exit\ndata: {"seq":2,"exit_code":0}\n\n'
+    )
 
 
 @pytest.mark.asyncio

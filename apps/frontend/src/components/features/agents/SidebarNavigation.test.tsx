@@ -15,6 +15,7 @@ const api = vi.hoisted(() => ({
   sessions: vi.fn(),
   setArchived: vi.fn(),
   pin: vi.fn(),
+  replace: vi.fn(),
   pathname: '/',
   params: '',
   user: 'alice',
@@ -22,7 +23,7 @@ const api = vi.hoisted(() => ({
 vi.mock('next/navigation', () => ({
   usePathname: () => api.pathname,
   useSearchParams: () => new URLSearchParams(api.params),
-  useRouter: () => ({ replace: vi.fn() }),
+  useRouter: () => ({ replace: api.replace }),
 }));
 vi.mock('@/components/providers', async () => {
   const { translate } = await import('@/lib/i18n/translate');
@@ -55,6 +56,14 @@ import { AgentsSidebar } from './AgentsSidebar';
 import { ArchivedTasksView } from './ArchivedTasksView';
 import { announceConversationRestored } from './conversationEvents';
 import { DEFAULT_PREFERENCES, sidebarPreferencesKey } from './sidebarPreferences';
+import {
+  PUSH_BATCH_MS,
+  receiveHint,
+  receiveJobChange,
+  receiveSync,
+  receiveThreadChange,
+  resetAgentPush,
+} from './agentPush';
 function conversation(id: string, repo = 'owner/repo'): AgentConversationApi {
   return {
     job: {
@@ -73,6 +82,7 @@ function conversation(id: string, repo = 'owner/repo'): AgentConversationApi {
 }
 const base = [conversation('a'), conversation('b')];
 beforeEach(() => {
+  resetAgentPush();
   localStorage.clear();
   api.pathname = '/';
   api.params = '';
@@ -92,9 +102,127 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
+  resetAgentPush();
+  vi.useRealTimers();
   vi.resetAllMocks();
 });
 describe('sidebar navigation interactions', () => {
+  it.each(['project', 'flat'] as const)(
+    'keeps the %s sidebar steady while archiving, navigating and receiving the archive push',
+    async (group) => {
+      localStorage.setItem(
+        sidebarPreferencesKey('alice'),
+        JSON.stringify({ ...DEFAULT_PREFERENCES, group }),
+      );
+      api.pathname = '/a';
+      let archived = false;
+      const pinned = conversation('pinned');
+      pinned.job.pinned_at = '2026-09-10T00:00:00Z';
+      const refreshes: (() => void)[] = [];
+      api.list.mockImplementation(
+        ({ pinned: pins }: { pinned?: boolean }) =>
+          new Promise((resolve) => {
+            const complete = () =>
+              resolve({
+                conversations: pins ? [pinned] : archived ? [base[1]] : base,
+                next_cursor: null,
+              });
+            if (archived) refreshes.push(complete);
+            else complete();
+          }),
+      );
+      api.get.mockResolvedValue(base[0].job);
+      api.thread.mockImplementation(async () => ({
+        jobs: [base[0].job],
+        title: base[0].title,
+        archived_at: archived ? '2026-09-10T00:00:00Z' : null,
+      }));
+      api.archive.mockImplementation(async () => {
+        archived = true;
+        announceAgentSessionsChanged({ threadIds: ['thread-a'], archived: true });
+        return { thread_id: 'thread-a', archived: true };
+      });
+      const view = render(<AgentsSidebar />);
+      const remaining = await screen.findByRole('link', {
+        name: group === 'flat' ? 'Task b · owner/repo' : 'Task b',
+      });
+      const pin = await screen.findByRole('link', { name: 'Task pinned · owner/repo' });
+      await waitFor(() => expect(screen.queryAllByText('Loading…')).toHaveLength(0));
+      const expectSteady = () => {
+        expect(remaining).toBeInTheDocument();
+        expect(pin).toBeInTheDocument();
+        expect(screen.queryByText('Task a')).not.toBeInTheDocument();
+        expect(screen.queryAllByText('Loading…')).toHaveLength(0);
+      };
+
+      fireEvent.click(screen.getByRole('button', { name: 'Archive Task a' }));
+      await waitFor(() => expect(api.replace).toHaveBeenCalledWith('/'));
+      expect(refreshes.length).toBeGreaterThan(0);
+      expectSteady();
+
+      api.pathname = '/';
+      view.rerender(<AgentsSidebar />);
+      expectSteady();
+      await act(async () => refreshes.splice(0).forEach((complete) => complete()));
+      expectSteady();
+
+      vi.useFakeTimers();
+      act(() => {
+        receiveThreadChange({ id: 'thread-a', revision: 1, archived_at: '2026-09-10T00:00:00Z' });
+        vi.advanceTimersByTime(PUSH_BATCH_MS);
+      });
+      expect(refreshes.length).toBeGreaterThan(0);
+      expectSteady();
+      await act(async () => refreshes.splice(0).forEach((complete) => complete()));
+      expectSteady();
+    },
+  );
+
+  it('keeps project and conversation lists steady during tool and usage updates', async () => {
+    render(<AgentsSidebar />);
+    await screen.findByText('Task a');
+    api.list.mockClear();
+    api.projects.mockClear();
+    vi.useFakeTimers();
+
+    for (const kind of ['usage', 'mcp', 'queue', 'publication'] as const) {
+      act(() => {
+        receiveHint(kind, kind === 'queue' || kind === 'publication' ? 'thread-a' : 'a');
+        vi.advanceTimersByTime(PUSH_BATCH_MS);
+      });
+      expect(api.list).not.toHaveBeenCalled();
+      expect(api.projects).not.toHaveBeenCalled();
+      expect(screen.getByText('Task a')).toBeInTheDocument();
+      expect(screen.queryByText('Loading…')).not.toBeInTheDocument();
+    }
+  });
+
+  it.each(['job', 'thread', 'resync'] as const)(
+    'refreshes project and conversation lists for a %s change alongside tool activity',
+    async (kind) => {
+      render(<AgentsSidebar />);
+      await screen.findByText('Task a');
+      api.list.mockClear();
+      api.projects.mockClear();
+      vi.useFakeTimers();
+
+      await act(async () => {
+        receiveHint('usage', 'a');
+        receiveHint('mcp', 'a');
+        if (kind === 'job')
+          receiveJobChange({ id: 'a', thread_id: 'thread-a', revision: 1, state: 'running' });
+        else if (kind === 'thread')
+          receiveThreadChange({ id: 'thread-a', revision: 1, title: 'Updated task' });
+        else receiveSync();
+        vi.advanceTimersByTime(PUSH_BATCH_MS);
+      });
+
+      expect(api.projects).toHaveBeenCalledOnce();
+      expect(api.list).toHaveBeenCalledWith(expect.objectContaining({ repo: 'owner/repo' }));
+      expect(api.list).toHaveBeenCalledWith(expect.objectContaining({ pinned: true }));
+    },
+  );
+
   it('refreshes a delayed automatic title after the conversation is idle', async () => {
     localStorage.setItem(
       sidebarPreferencesKey('alice'),
