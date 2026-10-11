@@ -184,7 +184,7 @@ class HostInventory(ComputeValue):
 
 
 class SshTransport(Protocol):
-    """Execute trusted scripts through a host-key-verified SSH connection."""
+    """Execute trusted scripts using the connection's explicit host-key policy."""
 
     async def run(
         self,

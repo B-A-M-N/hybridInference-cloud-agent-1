@@ -69,6 +69,19 @@ const catalog: ComputeCatalog = {
           modes: ['attach'],
           required: true,
         },
+        {
+          key: 'host_key_source',
+          label: 'SSH host-key checking',
+          type: 'select',
+          default: 'none',
+          advanced: true,
+          deployment_only: true,
+          modes: ['provision'],
+          options: [
+            { value: 'none', label: 'Do not verify the CloudLab host' },
+            { value: 'registration', label: 'Registered by the node at first boot' },
+          ],
+        },
       ],
       connection_fields: [],
       secret_label: 'Portal API token',
@@ -97,6 +110,15 @@ const connections: ComputeConnection[] = [
     blocked_reasons: [],
   },
 ];
+const cloudLabSshKey: ComputeConnection = {
+  ...connections[0],
+  configuration: {},
+  status: 'unverified',
+  blocked_reasons: [
+    { code: 'connection_unverified', message: 'Validate this connection before deployment.' },
+  ],
+};
+
 function operation(over: Partial<ComputeOperation> = {}): ComputeOperation {
   return {
     id: 'op-a',
@@ -242,11 +264,58 @@ describe('server acquisition UI', () => {
           mode: 'provision',
           connection_id: 'cloudlab-account',
           ssh_connection_id: 'ssh-account',
-          configuration: { project: 'FAST25-AE', profile: 'small-lan' },
+          configuration: { project: 'FAST25-AE', profile: 'small-lan', host_key_source: 'none' },
           sandbox_storage_path: '/mnt/cloudlab-data',
         }),
       ),
     );
+  });
+
+  it('keeps verified host keys when an older catalog does not advertise unchecked CloudLab SSH', () => {
+    const providers = catalog.providers.map((provider) => {
+      if (provider.id !== 'cloudlab') return provider;
+      return {
+        ...provider,
+        fields: provider.fields.map((field) => {
+          if (field.key !== 'host_key_source') return field;
+          return {
+            ...field,
+            default: 'known_hosts',
+            options: [
+              { value: 'known_hosts', label: 'Verified list on the SSH connection' },
+              {
+                value: 'registration',
+                label: 'Registered by the node at first boot',
+              },
+            ],
+          };
+        }),
+      };
+    });
+    const oldCatalog: ComputeCatalog = { ...catalog, providers };
+    renderAdd(vi.fn(), oldCatalog, []);
+    fireEvent.click(screen.getByRole('radio', { name: /CloudLab/ }));
+    expect(screen.getByLabelText('Verified host keys')).toBeInTheDocument();
+    expect(
+      screen.queryByText('CloudLab SSH host identity will not be verified.'),
+    ).not.toBeInTheDocument();
+  });
+
+  it('warns when connect-existing ignores a previously selected registration policy', () => {
+    renderAdd();
+    fireEvent.click(screen.getByRole('radio', { name: /CloudLab/ }));
+    fireEvent.change(screen.getByLabelText('SSH host-key checking'), {
+      target: { value: 'registration' },
+    });
+    expect(
+      screen.queryByText('CloudLab SSH host identity will not be verified.'),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Connect existing' }));
+
+    expect(
+      screen.getByText('CloudLab SSH host identity will not be verified.'),
+    ).toBeInTheDocument();
   });
 
   it('prefills CloudLab fields from the provider catalog defaults', async () => {
@@ -278,7 +347,7 @@ describe('server acquisition UI', () => {
     await waitFor(() =>
       expect(api.createComputeServer).toHaveBeenCalledWith(
         expect.objectContaining({
-          configuration: { project: 'FAST25-AE', profile: 'small-lan' },
+          configuration: { project: 'FAST25-AE', profile: 'small-lan', host_key_source: 'none' },
         }),
       ),
     );
@@ -395,6 +464,7 @@ describe('server acquisition UI', () => {
             profile: 'small-lan',
             group: 'research',
             bindings: {},
+            host_key_source: 'none',
           },
         }),
       ),
@@ -631,7 +701,7 @@ describe('server acquisition UI', () => {
     vi.mocked(api.saveComputeConnection)
       .mockResolvedValueOnce({ connection: connections[1] })
       .mockRejectedValueOnce(new Error('SSH key rejected'))
-      .mockResolvedValueOnce({ connection: connections[0] });
+      .mockResolvedValueOnce({ connection: cloudLabSshKey });
     vi.mocked(api.createComputeServer).mockResolvedValue({ operation: operation() });
     render(
       <AddComputeServer
@@ -642,6 +712,7 @@ describe('server acquisition UI', () => {
       />,
     );
     fireEvent.click(screen.getByRole('radio', { name: /CloudLab/ }));
+    expect(screen.queryByLabelText('Verified host keys')).not.toBeInTheDocument();
     fireEvent.change(screen.getByLabelText('Server name'), { target: { value: 'Research' } });
     fireEvent.change(screen.getByLabelText('Project'), { target: { value: 'FAST25' } });
     fireEvent.change(screen.getByLabelText('Profile'), { target: { value: 'small' } });
@@ -654,6 +725,20 @@ describe('server acquisition UI', () => {
     fireEvent.change(screen.getByLabelText('SSH private key'), { target: { value: 'ssh-key' } });
     fireEvent.click(screen.getByRole('button', { name: 'Create server' }));
     await screen.findByText('SSH key rejected');
+    expect(
+      screen.getByText('CloudLab SSH host identity will not be verified.'),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText('Validate this connection before deployment.'),
+    ).not.toBeInTheDocument();
+    expect(api.saveComputeConnection).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        provider_id: 'existing_ssh',
+        configuration: {},
+        secret: 'ssh-key',
+      }),
+    );
     expect(api.createComputeServer).not.toHaveBeenCalled();
     expect(api.getComputeOperations).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: 'Change CloudLab account' })).toBeInTheDocument();
@@ -695,6 +780,7 @@ describe('connection credentials', () => {
     const local = vi.spyOn(Storage.prototype, 'setItem');
     render(<ComputeConnectionForm catalog={catalog} connection={connections[0]} onSaved={saved} />);
     fireEvent.change(screen.getByLabelText('Key name'), { target: { value: 'Lab key' } });
+    expect(screen.getByLabelText('Verified host keys')).toHaveValue('verified-public-key');
     fireEvent.change(screen.getByLabelText('SSH private key'), {
       target: { value: 'sensitive-private-key' },
     });
@@ -1377,6 +1463,74 @@ describe('resource dashboard', () => {
     expect(within(dialog).queryByLabelText('Portal API token')).not.toBeInTheDocument();
     expect(screen.getAllByRole('dialog')).toHaveLength(1);
     expect(api.createComputeServer).not.toHaveBeenCalled();
+  });
+
+  it('treats a key-only SSH credential as valid only in its CloudLab server context', async () => {
+    vi.mocked(api.getComputeConnections).mockResolvedValue({
+      connections: [cloudLabSshKey, connections[1]],
+    });
+    vi.mocked(api.getComputeServers).mockResolvedValue({
+      allocations: [allocation({ ssh_host_key_policy: 'unchecked' })],
+      hosts: [],
+      active_host: null,
+      observed_at: '2026-10-04T08:00:00Z',
+    });
+    vi.mocked(api.saveComputeConnection).mockResolvedValue({
+      connection: { ...cloudLabSshKey, name: 'Rotated key', revision: 2 },
+    });
+    render(<ComputeResources onHostsChanged={vi.fn()} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Manage CloudLab experiment' }));
+    const dialog = screen.getByRole('dialog', { name: 'CloudLab experiment' });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Access settings' }));
+
+    expect(
+      within(dialog).getByText('SSH host-key checking is disabled for this CloudLab server.'),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).queryByText('Validate this connection before deployment.'),
+    ).not.toBeInTheDocument();
+    expect(within(dialog).getAllByRole('button', { name: 'Check' })).toHaveLength(1);
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Edit SSH key' }));
+    expect(within(dialog).getByLabelText('SSH private key')).toHaveValue('');
+    expect(within(dialog).queryByLabelText('Verified host keys')).not.toBeInTheDocument();
+    fireEvent.change(within(dialog).getByLabelText('Key name'), {
+      target: { value: 'Rotated key' },
+    });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save changes' }));
+    await within(dialog).findByText('Access settings saved.');
+
+    expect(api.saveComputeConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'Rotated key',
+        expected_revision: 1,
+      }),
+      'ssh-account',
+    );
+    expect(vi.mocked(api.saveComputeConnection).mock.calls[0][0]).not.toHaveProperty(
+      'configuration',
+    );
+    expect(api.validateComputeConnection).not.toHaveBeenCalled();
+  });
+
+  it('keeps a key-only SSH credential strict when the allocation policy is unavailable', async () => {
+    vi.mocked(api.getComputeConnections).mockResolvedValue({
+      connections: [cloudLabSshKey, connections[1]],
+    });
+
+    render(<ComputeResources onHostsChanged={vi.fn()} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Manage CloudLab experiment' }));
+    const dialog = screen.getByRole('dialog', { name: 'CloudLab experiment' });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Access settings' }));
+
+    expect(
+      within(dialog).getByText('Validate this connection before deployment.'),
+    ).toBeInTheDocument();
+    expect(within(dialog).getAllByRole('button', { name: 'Check' })).toHaveLength(2);
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Edit SSH key' }));
+
+    expect(within(dialog).getByLabelText('Verified host keys')).toHaveValue('');
   });
 
   it('keeps old Host management independent when resource management is not configured', async () => {

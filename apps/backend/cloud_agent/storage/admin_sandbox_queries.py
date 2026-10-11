@@ -38,7 +38,12 @@ class AdminSandboxQueries:
         return await self.list_sandboxes(cursor=cursor, limit=limit, state="running")
 
     async def list_sandboxes(
-        self, *, cursor: SandboxCursor | None, limit: int, state: SandboxStateFilter
+        self,
+        *,
+        cursor: SandboxCursor | None,
+        limit: int,
+        state: SandboxStateFilter,
+        include_archived: bool = False,
     ) -> AdminSandboxList:
         """Read a bounded lifecycle-filtered page with a matching count."""
         async with (
@@ -49,15 +54,17 @@ class AdminSandboxQueries:
             observed_at = await conn.fetchval("SELECT NOW()")
             total_count = await conn.fetchval(
                 "SELECT COUNT(*) FROM agent_sandboxes "
-                "WHERE deleted_at IS NULL AND ($1 = 'all' OR state = $1)",
+                "WHERE ($1 = 'all' OR state = $1) AND ($2 OR archived_at IS NULL)",
                 state,
+                include_archived,
             )
             rows = await conn.fetch(
                 """
                 WITH page AS (
-                    SELECT g.id, g.generation, g.stop_requested_at,
-                           g.delete_requested_at, g.delete_requested_by,
-                           g.deleted_at,
+                    SELECT g.id, g.generation, g.stop_requested_at, g.archived_at,
+                           g.deletion_state, g.deletion_request_id, g.deletion_requested_at,
+                           g.deletion_archive_key, g.deletion_archive_version_id,
+                           g.deletion_sha256, g.deletion_size_bytes, g.deletion_error, g.deleted_at,
                            g.origin_thread_id, g.user_id, g.host,
                            g.container_id, g.container_name,
                            g.runtime_id, g.runtime_version, g.execution_profile,
@@ -67,14 +74,15 @@ class AdminSandboxQueries:
                            g.resource_snapshot, g.resource_sampled_at, g.resource_received_at,
                            g.created_at, g.last_activity_at, g.idle_deadline, g.updated_at
                     FROM agent_sandboxes g
-                    WHERE g.deleted_at IS NULL
-                      AND ($3 = 'all' OR g.state = $3)
+                    WHERE ($3 = 'all' OR g.state = $3)
+                      AND ($4 OR g.archived_at IS NULL)
                       AND ($1::text IS NULL OR g.id > $1)
                     ORDER BY g.id LIMIT $2
                 )
-                SELECT g.id, g.generation, g.stop_requested_at,
-                       g.delete_requested_at, g.delete_requested_by, g.deleted_at,
-                       g.origin_thread_id,
+                SELECT g.id, g.generation, g.stop_requested_at, g.archived_at, g.origin_thread_id,
+                       g.deletion_state, g.deletion_request_id, g.deletion_requested_at,
+                       g.deletion_archive_key, g.deletion_archive_version_id,
+                       g.deletion_sha256, g.deletion_size_bytes, g.deletion_error, g.deleted_at,
                        CASE WHEN t.title_source IN ('generated', 'manual')
                             THEN LEFT(t.title, 160) END AS title,
                        LEFT(t.repo, 256) AS repo, LEFT(g.user_id, 256) AS user_id,
@@ -101,6 +109,7 @@ class AdminSandboxQueries:
                 cursor.after_id if cursor else None,
                 limit + 1,
                 state,
+                include_archived,
             )
         sandboxes = []
         for row in rows[:limit]:
@@ -115,7 +124,9 @@ class AdminSandboxQueries:
         next_cursor = None
         if len(rows) > limit:
             next_cursor = encode_cursor(
-                SandboxCursor(scope=sandbox_cursor_scope(state), after_id=sandboxes[-1].id)
+                SandboxCursor(
+                    scope=sandbox_cursor_scope(state, include_archived), after_id=sandboxes[-1].id
+                )
             )
         return AdminSandboxList(
             sandboxes=sandboxes,
@@ -134,9 +145,10 @@ class AdminSandboxQueries:
             observed_at = await conn.fetchval("SELECT NOW()")
             row = await conn.fetchrow(
                 """
-                SELECT g.id, g.generation, g.stop_requested_at,
-                       g.delete_requested_at, g.delete_requested_by, g.deleted_at,
-                       g.origin_thread_id,
+                SELECT g.id, g.generation, g.stop_requested_at, g.archived_at, g.origin_thread_id,
+                       g.deletion_state, g.deletion_request_id, g.deletion_requested_at,
+                       g.deletion_archive_key, g.deletion_archive_version_id,
+                       g.deletion_sha256, g.deletion_size_bytes, g.deletion_error, g.deleted_at,
                        CASE WHEN t.title_source IN ('generated', 'manual')
                             THEN LEFT(t.title, 160) END AS title,
                        LEFT(t.repo, 256) AS repo, LEFT(g.user_id, 256) AS user_id,
@@ -206,9 +218,10 @@ class AdminSandboxQueries:
             observed_at = await conn.fetchval("SELECT NOW()")
             row = await conn.fetchrow(
                 """
-                SELECT g.id, g.generation, g.stop_requested_at,
-                       g.delete_requested_at, g.delete_requested_by, g.deleted_at,
-                       g.origin_thread_id,
+                SELECT g.id, g.generation, g.stop_requested_at, g.archived_at, g.origin_thread_id,
+                       g.deletion_state, g.deletion_request_id, g.deletion_requested_at,
+                       g.deletion_archive_key, g.deletion_archive_version_id,
+                       g.deletion_sha256, g.deletion_size_bytes, g.deletion_error, g.deleted_at,
                        CASE WHEN t.title_source IN ('generated', 'manual')
                             THEN LEFT(t.title, 160) END AS title,
                        LEFT(t.repo, 256) AS repo, LEFT(g.user_id, 256) AS user_id,

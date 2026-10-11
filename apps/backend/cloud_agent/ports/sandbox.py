@@ -13,11 +13,110 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from datetime import datetime
-    from uuid import UUID
 
 
 class SandboxRepository(Protocol):
     """Port: retained sandbox groups and the members that live in them."""
+
+    async def request_admin_delete(
+        self,
+        *,
+        sandbox_id: str,
+        generation: int,
+        container_id: str,
+        last_activity_at: datetime,
+        actor_id: str,
+        admin_ip: str,
+    ) -> str:
+        """Fence an idle stopped sandbox for verified S3 archival and deletion.
+
+        A durable request closes admission before host export. No native state
+        or ledger row is removed; only a verified host receipt may finalize
+        physical container deletion and mark its native context lost.
+        """
+        ...
+
+    async def claim_due_admin_sandbox_deletion(
+        self, *, ttl_seconds: float
+    ) -> dict[str, Any] | None:
+        """Lease one pending or archive-verified deletion without duplicate workers."""
+        ...
+
+    async def record_admin_sandbox_archive(
+        self,
+        *,
+        sandbox_id: str,
+        request_id: str,
+        claim_token: str,
+        generation: int,
+        container_id: str,
+        archive_key: str,
+        sha256: str,
+        size_bytes: int,
+        archive_version_id: str | None = None,
+    ) -> bool:
+        """Checkpoint an independently verified S3 receipt under the live worker lease."""
+        ...
+
+    async def complete_admin_sandbox_deletion(
+        self,
+        *,
+        sandbox_id: str,
+        request_id: str,
+        claim_token: str,
+        generation: int,
+        container_id: str,
+    ) -> bool:
+        """Retain the archive and ledger after an exact host deletion acknowledgement."""
+        ...
+
+    async def fail_admin_sandbox_deletion(
+        self,
+        *,
+        sandbox_id: str,
+        request_id: str,
+        claim_token: str,
+        generation: int,
+        container_id: str,
+        error: str,
+        retain_pending: bool = False,
+    ) -> bool:
+        """Release safe pre-archive failures but keep ambiguous deletion fenced."""
+        ...
+
+    async def renew_admin_sandbox_deletion_claim(
+        self,
+        *,
+        sandbox_id: str,
+        request_id: str,
+        claim_token: str,
+        generation: int,
+        container_id: str,
+        ttl_seconds: float = 300,
+        for_cleanup: bool = False,
+        cleanup_archive_key: str | None = None,
+    ) -> bool:
+        """Extend an unexpired exact worker claim before bounded host cleanup."""
+        ...
+
+    async def set_admin_archived(
+        self,
+        *,
+        sandbox_id: str,
+        generation: int,
+        container_id: str | None,
+        last_activity_at: datetime,
+        archived: bool,
+        actor_id: str,
+        admin_ip: str,
+    ) -> str:
+        """Audit a reviewed inventory removal or restore without deleting state.
+
+        Only stopped, quiescent groups may be hidden. A new turn or running
+        host observation makes a removed group visible again automatically.
+        Native sessions, container writable layers and ledger rows survive.
+        """
+        ...
 
     async def record_terminal_observation(
         self,
@@ -47,52 +146,6 @@ class SandboxRepository(Protocol):
         The database marker survives observations and excludes new admission
         until Docker confirms the stop. No container or workspace is deleted.
         """
-        ...
-
-    async def request_admin_delete(
-        self,
-        *,
-        sandbox_id: str,
-        generation: int,
-        container_id: str,
-        last_activity_at: datetime,
-        actor_id: str,
-        admin_ip: str,
-    ) -> str:
-        """Queue physical deletion of a reviewed, stopped, quiescent sandbox.
-
-        The durable marker closes new admission and survives until the owning
-        host reports deletion of the exact fenced container. The sandbox row
-        remains as a tombstone for its membership and trajectory history.
-        """
-        ...
-
-    async def due_admin_sandbox_deletions(
-        self,
-        *,
-        host: str,
-        authenticated_host_capacity_epoch: UUID,
-        limit: int = 100,
-    ) -> list[dict[str, Any]]:
-        """Return reviewed physical-delete commands still awaiting host receipt.
-
-        Delivery is host-scoped but deliberately independent of inventory:
-        absence from a heartbeat never proves that Docker removed anything.
-        """
-        ...
-
-    async def confirm_admin_sandbox_deleted(
-        self,
-        *,
-        sandbox_id: str,
-        generation: int,
-        container_id: str,
-        host: str,
-        host_capacity_epoch: UUID,
-        authenticated_host_capacity_epoch: UUID,
-        outcome: str,
-    ) -> str:
-        """Tombstone only after the owning host acknowledges the exact container."""
         ...
 
     async def thread_workspace_ready(self, *, thread_id: str) -> bool:
@@ -228,7 +281,6 @@ class SandboxRepository(Protocol):
         *,
         thread_id: str,
         host: str,
-        authenticated_host_capacity_epoch: UUID,
         sandbox_id: str,
         container_id: str,
         sandbox_generation: int,

@@ -1001,8 +1001,7 @@ async def insert_follow_up(
     )
     sandbox = await conn.fetchrow(
         """
-        SELECT g.state, g.delete_requested_at, g.deleted_at,
-               m.context_status, TRUE AS shared_live
+        SELECT g.state, m.context_status, TRUE AS shared_live
         FROM agent_thread_sandbox_memberships m
         JOIN agent_sandboxes g ON g.id = m.sandbox_id
         WHERE m.thread_id = $1
@@ -1011,10 +1010,7 @@ async def insert_follow_up(
         thread_id,
     )
     if sandbox is not None and (
-        sandbox["context_status"] == "lost"
-        or sandbox["state"] in {"stopped_dirty", "lost"}
-        or sandbox["delete_requested_at"] is not None
-        or sandbox["deleted_at"] is not None
+        sandbox["context_status"] == "lost" or sandbox["state"] in {"stopped_dirty", "lost"}
     ):
         return {"error": "sandbox_context_lost"}
     if sandbox is None and parent["state"] == SUCCEEDED:

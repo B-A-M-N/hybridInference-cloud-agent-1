@@ -65,13 +65,21 @@ function sandbox(overrides: Partial<AdminSandbox> = {}): AdminSandbox {
     state: 'stopped',
     generation: 4,
     stop_requested_at: observedAt,
-    delete_requested_at: null,
+    archived_at: null,
+    deletion_state: 'none',
+    deletion_requested_at: null,
+    deletion_request_id: null,
+    deletion_archive_key: null,
+    deletion_sha256: null,
+    deletion_size_bytes: null,
     deleted_at: null,
-    delete_requested_by: null,
+    deletion_error: null,
     memory_limit: '4g',
     cpu_limit: '2',
     member_count: 1,
     active_attempt_count: 0,
+    active_operation_count: 0,
+    snapshot_state: 'none',
     created_at: '2026-10-10T09:00:00Z',
     last_activity_at: '2026-10-10T09:59:00Z',
     idle_deadline: null,
@@ -141,8 +149,8 @@ function trajectory(overrides: Partial<AdminSandboxTrajectory> = {}): AdminSandb
 function pendingDetail(): AdminSandboxDetail {
   return {
     sandbox: sandbox({
-      delete_requested_at: '2026-10-10T10:01:00Z',
-      delete_requested_by: 'admin-one',
+      deletion_state: 'pending',
+      deletion_requested_at: '2026-10-10T10:01:00Z',
     }),
     members: trajectory().members,
     observed_at: '2026-10-10T10:01:00Z',
@@ -227,9 +235,13 @@ describe('admin sandbox trajectory', () => {
     vi.mocked(getAdminSandboxTrajectory).mockResolvedValue(
       trajectory({
         sandbox: sandbox({
+          state: 'lost',
           container_id: null,
-          delete_requested_at: '2026-10-10T10:01:00Z',
-          delete_requested_by: 'admin-one',
+          deletion_state: 'deleted',
+          deletion_requested_at: '2026-10-10T10:01:00Z',
+          deletion_archive_key: 's3://sandbox-archives/sandbox-one.tar.gz',
+          deletion_sha256: 'a'.repeat(64),
+          deletion_size_bytes: 12_345,
           deleted_at: '2026-10-10T10:02:00Z',
         }),
         events: [
@@ -243,7 +255,14 @@ describe('admin sandbox trajectory', () => {
     );
     render(<AdminSandboxTrajectoryPage />);
 
-    expect(await screen.findByText(/Deleted Oct 10, 2026, 10:02:00 AM UTC/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/Sandbox deleted Oct 10, 2026, 10:02:00 AM UTC/),
+    ).toBeInTheDocument();
+    expect(screen.getByText('s3://sandbox-archives/sandbox-one.tar.gz')).toHaveProperty(
+      'tagName',
+      'CODE',
+    );
+    expect(screen.getByText(/Archive size: 12,345 bytes/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Sandbox deleted' })).toBeDisabled();
     const timeline = screen.getByRole('list', { name: 'Sandbox trajectory' });
     expect(within(timeline).getByText('Deleted')).toBeInTheDocument();
@@ -293,8 +312,8 @@ describe('admin sandbox trajectory', () => {
     });
     const pending = trajectory({
       sandbox: sandbox({
-        delete_requested_at: '2026-10-10T10:01:00Z',
-        delete_requested_by: 'admin-one',
+        deletion_state: 'pending',
+        deletion_requested_at: '2026-10-10T10:01:00Z',
       }),
       next_cursor: 'older-events',
     });
@@ -304,9 +323,11 @@ describe('admin sandbox trajectory', () => {
       .mockResolvedValueOnce(
         trajectory({
           sandbox: sandbox({
+            state: 'lost',
             container_id: null,
-            delete_requested_at: '2026-10-10T10:01:00Z',
-            delete_requested_by: 'admin-one',
+            deletion_state: 'deleted',
+            deletion_requested_at: '2026-10-10T10:01:00Z',
+            deletion_archive_key: 's3://sandbox-archives/sandbox-one.tar.gz',
             deleted_at: '2026-10-10T10:02:00Z',
           }),
           events: [
@@ -323,7 +344,9 @@ describe('admin sandbox trajectory', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Load more events' }));
     await waitFor(() => expect(getAdminSandboxTrajectory).toHaveBeenCalledTimes(2));
     await act(async () => vi.advanceTimersByTimeAsync(3_000));
-    expect(await screen.findByText(/Deleted Oct 10, 2026, 10:02:00 AM UTC/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/Sandbox deleted Oct 10, 2026, 10:02:00 AM UTC/),
+    ).toBeInTheDocument();
 
     await act(async () => {
       resolveOlder(
@@ -337,8 +360,8 @@ describe('admin sandbox trajectory', () => {
       await olderPage;
     });
 
-    expect(screen.getByText(/Deleted Oct 10, 2026, 10:02:00 AM UTC/)).toBeInTheDocument();
-    expect(screen.queryByText(/Waiting for the host/)).not.toBeInTheDocument();
+    expect(screen.getByText(/Sandbox deleted Oct 10, 2026, 10:02:00 AM UTC/)).toBeInTheDocument();
+    expect(screen.queryByText(/Archiving to S3/)).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Sandbox deleted' })).toBeDisabled();
   });
 
@@ -349,8 +372,13 @@ describe('admin sandbox trajectory', () => {
       .mockResolvedValueOnce(
         trajectory({
           sandbox: sandbox({
-            delete_requested_at: '2026-10-10T10:01:00Z',
-            delete_requested_by: 'admin-one',
+            state: 'lost',
+            container_id: null,
+            deletion_state: 'deleted',
+            deletion_requested_at: '2026-10-10T10:01:00Z',
+            deletion_archive_key: 's3://sandbox-archives/sandbox-one.tar.gz',
+            deletion_sha256: 'b'.repeat(64),
+            deletion_size_bytes: 4_096,
             deleted_at: '2026-10-10T10:02:00Z',
           }),
           events: [
@@ -364,7 +392,10 @@ describe('admin sandbox trajectory', () => {
       );
     render(<AdminSandboxTrajectoryPage />);
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Delete sandbox' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Archive to S3 and delete' }));
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('uploaded to S3'));
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('verified'));
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringMatching(/native resume/i));
     expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('cannot be undone'));
     expect(deleteAdminSandbox).toHaveBeenCalledWith(
       'sandbox/one',
@@ -372,20 +403,91 @@ describe('admin sandbox trajectory', () => {
         generation: 4,
         container_id: 'container-one',
         last_activity_at: '2026-10-10T09:59:00Z',
-        confirm: true,
       },
       expect.any(AbortSignal),
     );
     expect(
-      await screen.findByText(/Deletion requested .*Waiting for the host/),
-    ).toBeInTheDocument();
+      await screen.findByText(/The retained container will be deleted only/),
+    ).toHaveTextContent(/deleted only after the upload is verified/i);
     await act(async () => vi.advanceTimersByTimeAsync(3_000));
-    expect(await screen.findByText(/Deleted Oct 10, 2026, 10:02:00 AM UTC/)).toBeInTheDocument();
-    expect(screen.getByText(/Lifecycle history remains available/)).toBeInTheDocument();
-    expect(screen.getByText('Requested by admin-one.')).toBeInTheDocument();
+    expect(
+      await screen.findByText(/Sandbox deleted Oct 10, 2026, 10:02:00 AM UTC/),
+    ).toHaveTextContent(/archived and verified in S3/i);
+    expect(screen.getByText(/Chat history and lifecycle history remain/)).toBeInTheDocument();
+    expect(screen.getByText('s3://sandbox-archives/sandbox-one.tar.gz')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Sandbox deleted' })).toBeDisabled();
     const timeline = screen.getByRole('list', { name: 'Sandbox trajectory' });
     expect(within(timeline).getByText('Deleted')).toBeInTheDocument();
+  });
+
+  it('keeps the sandbox unchanged when archive-before-delete confirmation is cancelled', async () => {
+    vi.mocked(window.confirm).mockReturnValue(false);
+    render(<AdminSandboxTrajectoryPage />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Archive to S3 and delete' }));
+
+    expect(window.confirm).toHaveBeenCalledOnce();
+    expect(deleteAdminSandbox).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Archiving to S3/)).not.toBeInTheDocument();
+  });
+
+  it('shows a verified archive receipt while container deletion waits to retry', async () => {
+    const archiveKey = 's3://sandbox-archives/sandbox-one.tar.gz';
+    vi.mocked(getAdminSandboxTrajectory).mockResolvedValue(
+      trajectory({
+        sandbox: sandbox({
+          deletion_state: 'archived',
+          deletion_requested_at: '2026-10-10T10:01:00Z',
+          deletion_archive_key: archiveKey,
+          deletion_sha256: 'c'.repeat(64),
+          deletion_size_bytes: 98_765,
+          deletion_error: 'The host could not remove the retained container.',
+        }),
+      }),
+    );
+    render(<AdminSandboxTrajectoryPage />);
+
+    expect(await screen.findByText(/Archive verified in S3/)).toHaveTextContent(
+      /Waiting for the host to delete the retained container/,
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Deletion is waiting to retry: The host could not remove the retained container.',
+    );
+    expect(screen.getByText(archiveKey)).toHaveProperty('tagName', 'CODE');
+    expect(screen.getByText(/Archive size: 98,765 bytes/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Deleting archived sandbox…' })).toBeDisabled();
+    expect(deleteAdminSandbox).not.toHaveBeenCalled();
+  });
+
+  it('allows a safely failed archive request to be confirmed and retried', async () => {
+    vi.mocked(getAdminSandboxTrajectory).mockResolvedValue(
+      trajectory({
+        sandbox: sandbox({
+          deletion_state: 'failed',
+          deletion_requested_at: '2026-10-10T10:01:00Z',
+          deletion_error: 'S3 upload failed.',
+        }),
+      }),
+    );
+    render(<AdminSandboxTrajectoryPage />);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Deletion failed: S3 upload failed.',
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Retry archive and delete' }));
+    expect(deleteAdminSandbox).toHaveBeenCalledWith(
+      'sandbox/one',
+      {
+        generation: 4,
+        container_id: 'container-one',
+        last_activity_at: '2026-10-10T09:59:00Z',
+      },
+      expect.any(AbortSignal),
+    );
+    expect(
+      await screen.findByText(/The retained container will be deleted only/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Deletion failed:/)).not.toBeInTheDocument();
   });
 
   it('does not offer deletion while the sandbox is running', async () => {
@@ -393,8 +495,27 @@ describe('admin sandbox trajectory', () => {
       trajectory({ sandbox: sandbox({ state: 'running' }) }),
     );
     render(<AdminSandboxTrajectoryPage />);
-    expect(await screen.findByRole('button', { name: 'Delete sandbox' })).toBeDisabled();
-    expect(screen.getByText('Stop the sandbox before deleting it.')).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Archive to S3 and delete' })).toBeDisabled();
+    expect(
+      screen.getByText('Wait for the host to confirm a clean stop before deleting this sandbox.'),
+    ).toBeInTheDocument();
+    expect(deleteAdminSandbox).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ active_attempt_count: 1 }, 'Wait for all active turns to finish.'],
+    [{ active_operation_count: 1 }, 'Wait for active workspace operations to finish.'],
+    [{ snapshot_state: 'snapshotting' }, 'Wait for the workspace snapshot to finish.'],
+    [{ generation: undefined }, 'The retained container identity is unavailable.'],
+    [{ container_id: null }, 'The retained container identity is unavailable.'],
+  ] as const)('blocks deletion for unsafe stopped state %j', async (overrides, reason) => {
+    vi.mocked(getAdminSandboxTrajectory).mockResolvedValue(
+      trajectory({ sandbox: sandbox(overrides) }),
+    );
+    render(<AdminSandboxTrajectoryPage />);
+
+    expect(await screen.findByRole('button', { name: 'Archive to S3 and delete' })).toBeDisabled();
+    expect(screen.getByText(reason)).toBeInTheDocument();
     expect(deleteAdminSandbox).not.toHaveBeenCalled();
   });
 

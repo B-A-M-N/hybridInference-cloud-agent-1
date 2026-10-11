@@ -1336,7 +1336,6 @@ async def test_native_fork_finalizes_two_concurrent_members_in_one_sandbox(
         await store.sandbox.reconcile_thread_sandbox_observation(
             thread_id=job["thread_id"],
             host="shared-runner",
-            authenticated_host_capacity_epoch=sandbox["host_capacity_epoch"],
             sandbox_id=sandbox["sandbox_id"],
             container_id="container-shared-one",
             sandbox_generation=sandbox["generation"],
@@ -1508,7 +1507,6 @@ async def test_native_fork_finalizes_two_concurrent_members_in_one_sandbox(
         await store.sandbox.reconcile_thread_sandbox_observation(
             thread_id=job["thread_id"],
             host="shared-runner",
-            authenticated_host_capacity_epoch=sandbox["host_capacity_epoch"],
             sandbox_id=sandbox["sandbox_id"],
             container_id="container-shared-one",
             sandbox_generation=sandbox["generation"],
@@ -2790,7 +2788,6 @@ async def test_settlement_and_host_reconciliation_use_one_lock_order(pool, store
             store.sandbox.reconcile_thread_sandbox_observation(
                 thread_id=parent["thread_id"],
                 host="shared-runner",
-                authenticated_host_capacity_epoch=sandbox["host_capacity_epoch"],
                 sandbox_id=sandbox["sandbox_id"],
                 container_id="container-reconcile-lock-order",
                 sandbox_generation=sandbox["generation"],
@@ -2883,7 +2880,6 @@ async def test_stopped_reconciliation_locks_even_unreported_members_first(
             store.sandbox.reconcile_thread_sandbox_observation(
                 thread_id=parent["thread_id"],
                 host="shared-runner",
-                authenticated_host_capacity_epoch=sandbox["host_capacity_epoch"],
                 sandbox_id=sandbox["sandbox_id"],
                 container_id="container-stopped-lock-order",
                 sandbox_generation=sandbox["generation"],
@@ -3183,7 +3179,6 @@ async def test_retained_admission_settlement_and_job_finish_share_one_boundary(
     observation = {
         "thread_id": job["thread_id"],
         "host": "runner-a",
-        "authenticated_host_capacity_epoch": sandbox["host_capacity_epoch"],
         "sandbox_id": "asbx_test",
         "container_id": "container-retained-one",
         "sandbox_generation": sandbox["generation"],
@@ -3616,7 +3611,6 @@ async def test_failed_preadmission_late_container_observation_is_stopped(
     recovered = await store.sandbox.reconcile_thread_sandbox_observation(
         thread_id=job["thread_id"],
         host="runner-a",
-        authenticated_host_capacity_epoch=sandbox["host_capacity_epoch"],
         sandbox_id="asbx_test",
         container_id="container-created-before-response-loss",
         sandbox_generation=sandbox["generation"],
@@ -3748,7 +3742,6 @@ async def test_expired_shared_admission_loses_only_that_member_and_residency(
     await store.sandbox.reconcile_thread_sandbox_observation(
         thread_id=job["thread_id"],
         host="shared-runner",
-        authenticated_host_capacity_epoch=sandbox["host_capacity_epoch"],
         sandbox_id=sandbox["sandbox_id"],
         container_id="container-shared-one",
         sandbox_generation=sandbox["generation"],

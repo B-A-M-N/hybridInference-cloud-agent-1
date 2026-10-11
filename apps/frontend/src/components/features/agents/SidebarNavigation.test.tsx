@@ -127,6 +127,18 @@ afterEach(() => {
   vi.resetAllMocks();
 });
 describe('sidebar navigation interactions', () => {
+  it('does not resolve the approval inbox route as a conversation job', async () => {
+    api.pathname = '/approvals';
+    render(
+      <AgentReadProvider userId={api.user}>
+        <AgentsSidebar />
+      </AgentReadProvider>,
+    );
+    await screen.findByText('Task a');
+    expect(api.get).not.toHaveBeenCalled();
+    expect(api.thread).not.toHaveBeenCalled();
+  });
+
   it('keeps a late previous-owner response out of the sidebar and detail', async () => {
     api.pathname = '/a';
     let resolveOldJob!: (job: AgentJobApi) => void;

@@ -10,6 +10,16 @@
  * Placeholders are `{name}` and are substituted by `translate()`.
  */
 export const en = {
+  'approvals.title': 'Approvals',
+  'approvals.navCount': 'Approvals ({count} pending)',
+  'approvals.description':
+    'Review tool requests waiting for your decision across your conversations.',
+  'approvals.refresh': 'Refresh',
+  'approvals.refreshing': 'Refreshing…',
+  'approvals.loading': 'Loading tool approvals…',
+  'approvals.empty': 'No tool requests are waiting for your approval.',
+  'approvals.openConversation': 'Open conversation',
+  'approvals.loadMore': 'Load more approvals',
   'rewrite.button': 'Rewrite prompt',
   'rewrite.clarify': 'Ask clarification questions first',
   'rewrite.questionsTitle': 'Add a few details',
@@ -22,6 +32,18 @@ export const en = {
   'rewrite.invalidResponse': 'The rewrite response was incomplete. Please try again.',
   'rewrite.applied': 'Prompt rewritten. Review it before sending.',
   'workspaceFiles.download': 'Download file',
+  'workspaceFiles.pathLabel': 'Repository-relative file or folder path',
+  'workspaceFiles.pathPlaceholder': 'Open file or folder by path…',
+  'workspaceFiles.openPath': 'Open',
+  'workspaceFiles.root': 'Workspace root',
+  'workspaceFiles.retry': 'Try again',
+  'workspaceFiles.retryFolder': 'Retry loading folder {path}',
+  'workspaceFiles.retryFile': 'Retry loading file',
+  'workspaceFiles.copyPath': 'Copy path',
+  'workspaceFiles.copyContents': 'Copy contents',
+  'workspaceFiles.pathCopied': 'Path copied',
+  'workspaceFiles.contentsCopied': 'File contents copied',
+  'workspaceFiles.copyFailed': 'Could not copy. Select the text and copy it manually.',
   'workspaceFiles.previewAlt': 'Preview of {name}',
   'workspaceFiles.imageFailed': 'This image could not be decoded. You can still download the file.',
   'workspaceFiles.tooLarge':

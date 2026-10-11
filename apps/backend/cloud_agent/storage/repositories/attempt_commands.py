@@ -184,7 +184,6 @@ class PostgresAttemptCommands:
             host_row = await conn.fetchrow(
                 "SELECT status, capabilities, slots_total, slots_used, slots_desired, "
                 "sandbox_archive_settings_applied_revision, "
-                "capacity_epoch, "
                 "(credential_hash IS NOT NULL AND credential_hash = $2) "
                 "AS credential_matches "
                 "FROM agent_runner_hosts WHERE host = $1",
@@ -283,15 +282,17 @@ class PostgresAttemptCommands:
                         OR (
                             s.host = $2
                             AND $6::boolean
-                            AND s.host_capacity_epoch = $7
+                            AND NOT EXISTS (
+                                SELECT 1 FROM agent_sandboxes deleting
+                                WHERE deleting.id = s.sandbox_id
+                                  AND deleting.deletion_state IN ('pending', 'archived', 'deleted')
+                            )
                             AND s.fork_operation_id IS NULL
                             AND s.context_status <> 'lost'
                             AND s.native_state <> 'lost'
                             AND s.state IN (
                                 'provisioning', 'starting', 'running', 'stopped'
                             )
-                            AND s.delete_requested_at IS NULL
-                            AND s.deleted_at IS NULL
                             AND s.shared_live
                         )
                   )
@@ -305,7 +306,6 @@ class PostgresAttemptCommands:
                 shared_attestation,
                 pin_allows_new_sandbox,
                 followup_attestation,
-                host_row["capacity_epoch"],
             )
             if job_row is None:
                 return None
@@ -317,8 +317,9 @@ class PostgresAttemptCommands:
                 # a stop committed first leaves this job queued.
                 claimable = await conn.fetchval(
                     "SELECT state IN ('provisioning', 'starting', 'running', 'stopped') "
-                    "AND stop_requested_at IS NULL AND delete_requested_at IS NULL "
-                    "AND deleted_at IS NULL FROM agent_sandboxes "
+                    "AND stop_requested_at IS NULL "
+                    "AND deletion_state NOT IN ('pending', 'archived', 'deleted') "
+                    "FROM agent_sandboxes "
                     "WHERE id = $1 FOR SHARE",
                     thread_sandbox["sandbox_id"],
                 )
@@ -327,7 +328,7 @@ class PostgresAttemptCommands:
             # The atomic half of the slot claim. Under READ COMMITTED two
             # claims hitting the same host row serialize and the loser
             # re-evaluates capacity against the winner's committed value.
-            took_slot = await conn.fetchrow(
+            took_slot = await conn.fetchval(
                 f"""
                 UPDATE agent_runner_hosts
                 SET slots_used = slots_used + 1
@@ -343,7 +344,7 @@ class PostgresAttemptCommands:
                             AND capabilities @> $5::jsonb
                         )
                   )
-                RETURNING slots_used, capacity_epoch
+                RETURNING slots_used
                 """,
                 host,
                 host_credential_hash,
@@ -396,11 +397,10 @@ class PostgresAttemptCommands:
                 INSERT INTO agent_attempts
                     (job_id, thread_id, attempt_no, lease_owner, lease_generation,
                      lease_expires_at, base_sha, host_id,
-                     host_capacity_epoch,
                      sandbox_runtime, sandbox_image_digest, runtime_version,
                      host_kernel, guest_kernel)
                 VALUES ($1, $13, $2, $3, $4, NOW() + make_interval(secs => $5), $6, $7,
-                        $14, $8, $9, $10, $11, $12)
+                        $8, $9, $10, $11, $12)
                 RETURNING id, attempt_no, lease_generation,
                           sandbox_runtime, sandbox_image_digest, runtime_version
                 """,
@@ -417,7 +417,6 @@ class PostgresAttemptCommands:
                 host_kernel,
                 guest_kernel,
                 job_row["thread_id"],
-                took_slot["capacity_epoch"],
             )
             await conn.execute(
                 "UPDATE agent_jobs SET state = 'running', current_attempt_id = $2, "

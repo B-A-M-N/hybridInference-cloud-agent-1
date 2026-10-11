@@ -70,8 +70,6 @@ class PostgresResidencyRepository:
                 JOIN agent_sandboxes g ON g.id = m.sandbox_id
                 WHERE m.thread_id = $1 AND g.host = $2
                   AND ($3::text IS NULL OR m.sandbox_id = $3)
-                  AND g.delete_requested_at IS NULL
-                  AND g.deleted_at IS NULL
                 FOR UPDATE OF m
                 """,
                 thread_id,
@@ -136,8 +134,6 @@ class PostgresResidencyRepository:
                 WHERE m.thread_id = $1 AND m.residency_generation = $2
                   AND m.residency_status = 'hot'
                   AND g.id = m.sandbox_id AND ($4::text IS NULL OR g.host = $4)
-                  AND g.delete_requested_at IS NULL
-                  AND g.deleted_at IS NULL
                 RETURNING COALESCE(m.residency_grant_id, '')
                 """,
                 thread_id,
@@ -233,8 +229,6 @@ class PostgresResidencyRepository:
                 JOIN agent_sandboxes g ON g.id = m.sandbox_id
                 WHERE m.thread_id = $1 AND m.residency_status = 'hot'
                   AND m.residency_lease_expires_at > NOW()
-                  AND g.delete_requested_at IS NULL
-                  AND g.deleted_at IS NULL
                 """,
                 thread_id,
             )

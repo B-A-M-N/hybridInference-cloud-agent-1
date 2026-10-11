@@ -21,7 +21,10 @@ from cloud_agent.compute_config import ComputeConfiguration
 from cloud_agent.compute_registry import ComputeProviderRegistration, ComputeProviderRegistry
 from cloud_agent.compute_secrets import ComputeSecretStore
 from cloud_agent.domain.compute import ComputeRefusal
-from cloud_agent.ports.external.compute_provider import ProviderCapabilities
+from cloud_agent.ports.external.compute_provider import (
+    UNCHECKED_CLOUDLAB_HOST_KEY_REF,
+    ProviderCapabilities,
+)
 from cloud_agent.ports.external.host_bootstrap import DeploymentProfile
 from cloud_agent.schemas_compute import AutomaticDeploymentSetup, RenewalPolicy
 from cloud_agent_shared.egress import network_from_env
@@ -615,7 +618,11 @@ async def test_server_access_projection_links_credentials_without_transport_secr
             "instance_identity": "private-identity-canary",
         }
     ]
-    row["configuration"]["extra"] = "private-config-canary"
+    row["configuration"].update(
+        extra="private-config-canary",
+        host_key_source="known_hosts",
+        ssh_known_hosts_ref=UNCHECKED_CLOUDLAB_HOST_KEY_REF,
+    )
     row["hosts"] = [
         {"host": "host-a", "compute_node_id": "node-a", "credential_hash": "private-hash-canary"}
     ]
@@ -624,6 +631,7 @@ async def test_server_access_projection_links_credentials_without_transport_secr
     public = response.json()["allocations"][0]
     assert public["connection_id"] == body["connection_id"]
     assert public["ssh_connection_id"] == "ssh-access-id"
+    assert public["ssh_host_key_policy"] == "unchecked"
     assert public["nodes"] == [
         {
             "id": "node-a",
@@ -635,8 +643,33 @@ async def test_server_access_projection_links_credentials_without_transport_secr
         }
     ]
     assert "canary" not in response.text
+    assert UNCHECKED_CLOUDLAB_HOST_KEY_REF not in response.text
     assert "configuration" not in public
     assert response.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configuration", "expected"),
+    [
+        ({}, "known_hosts"),
+        ({"host_key_source": "known_hosts"}, "known_hosts"),
+        ({"host_key_source": "registration"}, "registration"),
+    ],
+)
+async def test_inventory_projects_only_the_effective_cloudlab_host_key_policy(
+    compute_api, configuration, expected
+):
+    client, repo, _ = compute_api
+    _, operation = await allocation(client)
+    repo.allocations[operation["allocation_id"]]["configuration"] = configuration
+
+    response = await client.get("/admin/agent/servers", headers=ADMIN)
+
+    assert response.status_code == 200
+    public = response.json()["allocations"][0]
+    assert public["ssh_host_key_policy"] == expected
+    assert "configuration" not in public
 
 
 @pytest.mark.asyncio

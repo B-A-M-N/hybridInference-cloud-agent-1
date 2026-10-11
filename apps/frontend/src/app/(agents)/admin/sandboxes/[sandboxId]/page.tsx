@@ -10,6 +10,7 @@ import { conversationHref } from '@/lib/api/adminConversations';
 import {
   deleteAdminSandbox,
   getAdminSandboxTrajectory,
+  type AdminSandbox,
   type AdminSandboxMember,
   type AdminSandboxTrajectory,
   type AdminSandboxTrajectoryEvent,
@@ -142,9 +143,9 @@ function SandboxTrajectory({ sandboxId }: { sandboxId: string }) {
     [],
   );
 
-  const deletionPending = Boolean(
-    trajectory?.sandbox.delete_requested_at && !trajectory.sandbox.deleted_at,
-  );
+  const deletionState = trajectory?.sandbox.deletion_state ?? 'none';
+  const deletionPending = deletionState === 'pending' || deletionState === 'archived';
+  const deletionComplete = deletionState === 'deleted';
 
   useEffect(() => {
     if (!deletionPending || denied) return;
@@ -223,27 +224,36 @@ function SandboxTrajectory({ sandboxId }: { sandboxId: string }) {
   const sandbox = trajectory?.sandbox;
   const memberCount =
     trajectory?.member_history_count ?? trajectory?.members.length ?? sandbox?.member_count ?? 0;
+  const idleBlocked = sandbox
+    ? sandbox.active_attempt_count > 0
+      ? 'Wait for all active turns to finish.'
+      : (sandbox.active_operation_count ?? 0) > 0
+        ? 'Wait for active workspace operations to finish.'
+        : ['pending', 'snapshotting', 'importing'].includes(sandbox.snapshot_state ?? '')
+          ? 'Wait for the workspace snapshot to finish.'
+          : null
+    : null;
   const deleteBlocked = !sandbox
     ? 'Load the current sandbox before deleting it.'
-    : sandbox.deleted_at
-      ? 'This sandbox has been deleted.'
-      : sandbox.delete_requested_at
-        ? 'Deletion is already in progress.'
+    : deletionPending
+      ? 'Wait for the S3 archive and container deletion to finish.'
+      : deletionComplete
+        ? 'This sandbox has already been deleted.'
         : sandbox.state !== 'stopped'
-          ? 'Stop the sandbox before deleting it.'
-          : sandbox.generation == null || !sandbox.container_id
-            ? 'The current container identity is unavailable.'
-            : null;
+          ? 'Wait for the host to confirm a clean stop before deleting this sandbox.'
+          : (idleBlocked ??
+            (sandbox.generation == null || !sandbox.container_id
+              ? 'The retained container identity is unavailable.'
+              : null));
 
   async function requestDeletion() {
     if (!sandbox || deleteBlocked || actionRequest.current) return;
     if (
       !window.confirm(
-        `Delete sandbox ${
-          sandbox.id
-        }? This permanently removes its retained container, workspace files, native agent sessions, and data shared by ${
-          memberCount
-        } ${memberCount === 1 ? 'session' : 'sessions'}. This cannot be undone.`,
+        `Archive to S3 and permanently delete sandbox ${sandbox.id}, shared by ${memberCount} ${
+          memberCount === 1 ? 'session' : 'sessions'
+        }? Workspace files and native session history will be uploaded to S3 and verified before the retained container is deleted. ` +
+          'Live native resume will no longer be available. Chat history and the lifecycle audit remain. Container deletion cannot be undone.',
       )
     )
       return;
@@ -262,7 +272,6 @@ function SandboxTrajectory({ sandboxId }: { sandboxId: string }) {
           generation: sandbox.generation!,
           container_id: sandbox.container_id!,
           last_activity_at: sandbox.last_activity_at,
-          confirm: true,
         },
         controller.signal,
       );
@@ -272,11 +281,10 @@ function SandboxTrajectory({ sandboxId }: { sandboxId: string }) {
         return {
           ...current,
           sandbox: next.sandbox,
-          members: next.members,
           observed_at: next.observed_at,
         };
       });
-      if (next.sandbox.deleted_at) setRevision((value) => value + 1);
+      if (next.sandbox.deletion_state === 'deleted') setRevision((value) => value + 1);
     } catch (cause) {
       if (controller.signal.aborted) return;
       if (accessDenied(cause)) {
@@ -337,45 +345,60 @@ function SandboxTrajectory({ sandboxId }: { sandboxId: string }) {
                 {sandbox.title ?? sandbox.id}
               </h2>
               <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-700 dark:bg-white/10 dark:text-gray-200">
-                {sandbox.deleted_at ? 'deleted' : stateLabel(sandbox.state)}
+                {deletionComplete ? 'deleted' : stateLabel(sandbox.state)}
               </span>
             </div>
             <p className="mt-2 break-all font-mono text-xs text-gray-500 dark:text-gray-400">
               {sandbox.id}
             </p>
 
-            {sandbox.deleted_at && (
+            {deletionComplete && (
               <div
                 role="status"
                 className="mt-5 rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-sm text-gray-700 dark:border-white/10 dark:bg-white/5 dark:text-gray-200"
               >
-                Deleted {dateTime(sandbox.deleted_at)}. The retained container and workspace were
-                removed.
+                Sandbox deleted{sandbox.deleted_at ? ` ${dateTime(sandbox.deleted_at)}` : ''}. Its
+                workspace files and native session history were archived and verified in S3 before
+                the retained container was removed. Live native resume is no longer available.
                 <span className="mt-1 block text-xs text-gray-500 dark:text-gray-400">
-                  Lifecycle history remains available here for administrative audit.
+                  Chat history and lifecycle history remain available for administrative audit.
                 </span>
-                {sandbox.delete_requested_by && (
-                  <span className="mt-1 block text-xs text-gray-500 dark:text-gray-400">
-                    Requested by {sandbox.delete_requested_by}.
-                  </span>
-                )}
               </div>
             )}
 
-            {!sandbox.deleted_at && deletionPending && (
+            {deletionState === 'pending' && (
               <div
                 role="status"
                 className="mt-5 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-500/25 dark:bg-amber-500/10 dark:text-amber-300"
               >
-                Deletion requested {dateTime(sandbox.delete_requested_at)}. Waiting for the host to
-                remove the retained container and workspace.
-                {sandbox.delete_requested_by && (
-                  <span className="mt-1 block text-xs">
-                    Requested by {sandbox.delete_requested_by}.
-                  </span>
+                {sandbox.deletion_requested_at && (
+                  <>Deletion requested {dateTime(sandbox.deletion_requested_at)}. </>
                 )}
+                Archiving to S3. The retained container will be deleted only after the upload is
+                verified.
               </div>
             )}
+
+            {deletionState === 'archived' && (
+              <div
+                role="status"
+                className="mt-5 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-500/25 dark:bg-amber-500/10 dark:text-amber-300"
+              >
+                Archive verified in S3. Waiting for the host to delete the retained container.
+              </div>
+            )}
+
+            {deletionState === 'failed' && (
+              <ErrorNotice>
+                Deletion failed:{' '}
+                {sandbox.deletion_error ??
+                  'The archive could not be verified. Confirm again to retry.'}
+              </ErrorNotice>
+            )}
+            {deletionPending && sandbox.deletion_error && (
+              <ErrorNotice>Deletion is waiting to retry: {sandbox.deletion_error}</ErrorNotice>
+            )}
+            {sandbox.deletion_archive_key && <DeletionReceipt sandbox={sandbox} />}
 
             <dl className={`${CARD} mt-5 grid grid-cols-2 gap-5 p-5 text-sm lg:grid-cols-4`}>
               {[
@@ -407,11 +430,12 @@ function SandboxTrajectory({ sandboxId }: { sandboxId: string }) {
                     id="sandbox-delete-heading"
                     className="text-sm font-semibold text-gray-900 dark:text-gray-100"
                   >
-                    Delete sandbox
+                    Archive and delete sandbox
                   </h3>
                   <p className="mt-1 text-xs leading-relaxed text-gray-500 dark:text-gray-400">
-                    Permanently removes the retained container, workspace files, native sessions,
-                    and member-private agent state. Only a fully stopped sandbox can be deleted.
+                    Uploads and verifies workspace files and native session history in S3 before
+                    deleting the retained container. Live native resume will no longer be available.
+                    Only a fully stopped, idle sandbox can be deleted.
                   </p>
                 </div>
                 <button
@@ -422,11 +446,15 @@ function SandboxTrajectory({ sandboxId }: { sandboxId: string }) {
                 >
                   {deleting
                     ? 'Requesting deletion…'
-                    : sandbox.deleted_at
+                    : deletionComplete
                       ? 'Sandbox deleted'
-                      : deletionPending
-                        ? 'Deletion requested'
-                        : 'Delete sandbox'}
+                      : deletionState === 'pending'
+                        ? 'Archiving to S3…'
+                        : deletionState === 'archived'
+                          ? 'Deleting archived sandbox…'
+                          : deletionState === 'failed'
+                            ? 'Retry archive and delete'
+                            : 'Archive to S3 and delete'}
                 </button>
               </div>
               {deleteBlocked && (
@@ -487,6 +515,24 @@ function SandboxTrajectory({ sandboxId }: { sandboxId: string }) {
           </>
         )}
       </section>
+    </div>
+  );
+}
+
+function DeletionReceipt({ sandbox }: { sandbox: AdminSandbox }) {
+  return (
+    <div className={`${CARD} mt-3 break-all p-4 text-xs text-gray-500 dark:text-gray-400`}>
+      <p>
+        S3 archive: <code>{sandbox.deletion_archive_key}</code>
+      </p>
+      {sandbox.deletion_sha256 && (
+        <p className="mt-1">
+          SHA-256: <code>{sandbox.deletion_sha256}</code>
+        </p>
+      )}
+      {sandbox.deletion_size_bytes != null && (
+        <p className="mt-1">Archive size: {sandbox.deletion_size_bytes.toLocaleString()} bytes</p>
+      )}
     </div>
   );
 }

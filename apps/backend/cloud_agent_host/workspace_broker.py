@@ -68,6 +68,11 @@ from cloud_agent_host.sandbox import (
     TerminalProcess,
     build_backend_from_env,
 )
+from cloud_agent_host.sandbox_archive import (
+    MAX_ARCHIVE_BYTES,
+    ArchiveIdentity,
+    SandboxArchiveService as SandboxDeletionArchiveService,
+)
 from cloud_agent_host.sandbox_archive_runtime import SandboxArchiveController
 from cloud_agent_host.sandbox_archive_s3 import SandboxArchiveConfigError
 from cloud_agent_host.sandbox_resources import SandboxResourceCollector
@@ -291,21 +296,30 @@ class SharedIdleStopRequest(BaseModel):
     ) = Field(None, max_length=128)
 
 
-class SharedSandboxDeleteRequest(BaseModel):
-    """Full immutable identity for one reviewed stopped-container deletion."""
+class SandboxArchivePrepareRequest(BaseModel):
+    """Exact stopped identity and immutable S3 object for one admin deletion."""
 
-    sandbox_id: str = Field(..., min_length=1, max_length=256)
+    request_id: str = Field(..., min_length=1, max_length=128)
     generation: int = Field(..., ge=1)
-    container_id: str = Field(..., min_length=12, max_length=256)
-    origin_thread_id: str = Field(..., min_length=1, max_length=256)
-    runtime_id: str = Field(..., min_length=1, max_length=128)
-    runtime_version: str | None = Field(None, max_length=128)
-    sandbox_image_digest: str | None = Field(None, max_length=512)
-    resident_slot_capacity: int = Field(8, ge=2, le=128)
-    memory_limit: str = Field("4g", min_length=1, max_length=32)
-    cpu_limit: str = Field("2", min_length=1, max_length=32)
-    stop_timeout_s: int = Field(10, ge=1, le=300)
-    shared_live: Literal[True] = True
+    expected_container_id: str = Field(..., min_length=1, max_length=256)
+    archive_key: str = Field(..., min_length=1, max_length=1024)
+
+
+class SandboxArchiveCommitRequest(SandboxArchivePrepareRequest):
+    """Prepared receipt independently verified by the trusted control plane."""
+
+    sha256: str = Field(..., pattern="^[0-9a-f]{64}$")
+    size_bytes: int = Field(..., gt=0, le=MAX_ARCHIVE_BYTES)
+
+
+class SandboxArchiveUploadRequest(SandboxArchiveCommitRequest):
+    """Checksum-bound single-object upload with no S3 credential on the host."""
+
+    upload_url: str = Field(..., min_length=1, max_length=16384)
+    upload_headers: dict[
+        Annotated[str, Field(min_length=1, max_length=128)],
+        Annotated[str, Field(max_length=2048)],
+    ] = Field(..., min_length=4, max_length=4)
 
 
 class SharedSandboxMemberRequest(BaseModel):
@@ -1757,6 +1771,7 @@ def create_app(
     app.state.shared_session_supervisor = shared_supervisor
     app.state.sandbox_archive_service = archive_boundary
     app.state.sandbox_archive_controller = archive_controller
+    app.state.sandbox_deletion_archive_service = SandboxDeletionArchiveService(shared_supervisor)
     app.state.sandbox_resource_collector = None
 
     async def runtime_refused(_request: Request, exc: Exception) -> JSONResponse:
@@ -2530,37 +2545,82 @@ def create_app(
             raise supervisor_error(exc) from exc
         return asdict(descriptor)
 
-    @app.post("/shared-sandboxes/{thread_id}/delete-stopped")
-    async def delete_stopped_shared_chat_sandbox(
-        thread_id: str,
-        body: SharedSandboxDeleteRequest,
-        _: None = Depends(authenticate),
-    ) -> dict[str, str]:
-        owner = require_shared_supervisor()
-        if thread_id != body.origin_thread_id:
-            raise HTTPException(status_code=409, detail="shared sandbox origin is stale")
-        spec = ChatSandboxSpec(
-            thread_id=body.origin_thread_id,
-            sandbox_id=body.sandbox_id,
+    def sandbox_archive_identity(
+        thread_id: str, body: SandboxArchivePrepareRequest
+    ) -> ArchiveIdentity:
+        return ArchiveIdentity(
+            thread_id=thread_id,
+            request_id=body.request_id,
             generation=body.generation,
-            runtime_id=body.runtime_id,
-            runtime_version=body.runtime_version,
-            sandbox_image_digest=body.sandbox_image_digest,
-            memory_limit=body.memory_limit,
-            cpu_limit=body.cpu_limit,
-            stop_timeout_s=body.stop_timeout_s,
-            shared_live=True,
-            resident_slot_capacity=body.resident_slot_capacity,
+            expected_container_id=body.expected_container_id,
+            archive_key=body.archive_key,
         )
+
+    @app.post("/shared-sandboxes/{thread_id}/admin-delete/prepare")
+    async def prepare_sandbox_archive(
+        thread_id: str,
+        body: SandboxArchivePrepareRequest,
+        _: None = Depends(authenticate),
+    ) -> dict[str, Any]:
+        require_shared_supervisor()
         try:
-            outcome = await asyncio.to_thread(
-                owner.delete_stopped,
-                spec,
-                container_id=body.container_id,
+            return await endpoint_calls.run(
+                app.state.sandbox_deletion_archive_service.prepare,
+                sandbox_archive_identity(thread_id, body),
             )
         except (SandboxError, ValueError) as exc:
             raise supervisor_error(exc) from exc
-        return {"outcome": outcome}
+
+    @app.post("/shared-sandboxes/{thread_id}/admin-delete/upload")
+    async def upload_sandbox_archive(
+        thread_id: str,
+        body: SandboxArchiveUploadRequest,
+        _: None = Depends(authenticate),
+    ) -> dict[str, Any]:
+        require_shared_supervisor()
+        try:
+            return await endpoint_calls.run(
+                app.state.sandbox_deletion_archive_service.upload,
+                sandbox_archive_identity(thread_id, body),
+                sha256=body.sha256,
+                size_bytes=body.size_bytes,
+                upload_url=body.upload_url,
+                upload_headers=body.upload_headers,
+            )
+        except (SandboxError, ValueError) as exc:
+            raise supervisor_error(exc) from exc
+
+    @app.post("/shared-sandboxes/{thread_id}/admin-delete/commit")
+    async def commit_sandbox_archive_deletion(
+        thread_id: str,
+        body: SandboxArchiveCommitRequest,
+        _: None = Depends(authenticate),
+    ) -> dict[str, Any]:
+        require_shared_supervisor()
+        try:
+            return await endpoint_calls.run(
+                app.state.sandbox_deletion_archive_service.commit,
+                sandbox_archive_identity(thread_id, body),
+                sha256=body.sha256,
+                size_bytes=body.size_bytes,
+            )
+        except (SandboxError, ValueError) as exc:
+            raise supervisor_error(exc) from exc
+
+    @app.post("/shared-sandboxes/{thread_id}/admin-delete/abort")
+    async def abort_sandbox_archive(
+        thread_id: str,
+        body: SandboxArchivePrepareRequest,
+        _: None = Depends(authenticate),
+    ) -> dict[str, Any]:
+        require_shared_supervisor()
+        try:
+            return await endpoint_calls.run(
+                app.state.sandbox_deletion_archive_service.abort,
+                sandbox_archive_identity(thread_id, body),
+            )
+        except (SandboxError, ValueError) as exc:
+            raise supervisor_error(exc) from exc
 
     @app.post("/shared-sandboxes/{thread_id}/fork")
     async def fork_shared_chat_session(

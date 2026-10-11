@@ -167,10 +167,6 @@ _WORK_WAIT_GRACE_S = 10.0
 #: One upload is capped at 5 MB by the control plane, but the connection can be
 #: slow; the default 30 s client timeout is too tight for a file transfer.
 _ATTACHMENT_TIMEOUT_S = 120.0
-#: Admin sandbox deletion is dispatched from the sole host heartbeat thread.
-#: Bound one broker operation comfortably below the control plane 90-second
-#: online window; commands not attempted on this beat remain durably due.
-_ADMIN_SANDBOX_DELETE_TIMEOUT_S = 30.0
 DEFAULT_AGENT_TIMEOUT_S = float(HOST_SETTINGS_BY_KEY["agent_timeout_s"].default)
 # How often the control checks run while the agent is silent.
 _POLL_INTERVAL_S = 0.5
@@ -1641,72 +1637,6 @@ def _stop_retained_sandboxes(commands: list[dict[str, Any]]) -> None:
     finally:
         if client is not None:
             client.close()
-
-
-def _delete_retained_sandboxes(commands: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Physically delete exact stopped containers and return explicit receipts."""
-    receipts: list[dict[str, Any]] = []
-    client: SessionSupervisorClient | None = None
-    try:
-        client = _session_supervisor_from_env()
-        # This callback runs on the sole heartbeat thread. Process at most one
-        # durable command per beat so a slow broker cannot make a healthy host
-        # appear offline; the control plane redelivers every command without a
-        # receipt on the next beat.
-        for command in commands[:1]:
-            try:
-                runtime_version = command.get("runtime_version")
-                image_digest = command.get("sandbox_image_digest")
-                spec = ChatSandboxSpec(
-                    thread_id=str(command["thread_id"]),
-                    sandbox_id=str(command["sandbox_id"]),
-                    generation=int(command["generation"]),
-                    runtime_id=str(command["runtime_id"]),
-                    runtime_version=(None if runtime_version is None else str(runtime_version)),
-                    sandbox_image_digest=(None if image_digest is None else str(image_digest)),
-                    memory_limit=str(command["memory_limit"]),
-                    cpu_limit=str(command["cpu_limit"]),
-                    stop_timeout_s=int(command["stop_timeout_seconds"]),
-                    shared_live=True,
-                    resident_slot_capacity=int(command["resident_slot_capacity"]),
-                )
-                container_id = str(command["container_id"])
-                host_capacity_epoch = str(command["host_capacity_epoch"])
-                answer = client.delete_shared_stopped(
-                    spec,
-                    container_id=container_id,
-                    timeout=_ADMIN_SANDBOX_DELETE_TIMEOUT_S,
-                )
-                outcome = answer.get("outcome")
-                if outcome not in {"deleted", "already_absent"}:
-                    raise ValueError("workspace broker returned an invalid deletion outcome")
-                receipts.append(
-                    {
-                        "sandbox_id": spec.sandbox_id,
-                        "generation": spec.generation,
-                        "container_id": container_id,
-                        "host_capacity_epoch": host_capacity_epoch,
-                        "outcome": outcome,
-                    }
-                )
-            except (KeyError, TypeError, ValueError, SessionSupervisorError) as exc:
-                # No receipt means no tombstone. The durable command remains
-                # due and retries after transient Docker or broker failures.
-                print(
-                    f"agent runner: retained sandbox deletion was not applied: {exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-    except (SandboxError, SessionSupervisorError) as exc:
-        print(
-            f"agent runner: retained sandbox deletion unavailable: {exc}",
-            file=sys.stderr,
-            flush=True,
-        )
-    finally:
-        if client is not None:
-            client.close()
-    return receipts
 
 
 def _handle_host_residencies_lost(lost: list[dict[str, Any]]) -> None:
@@ -4023,7 +3953,6 @@ def run_forever(
         on_sandbox_archive_settings=apply_archive_settings,
         on_residencies_lost=_handle_host_residencies_lost,
         on_retained_sandboxes_stop=retained_stop_worker.submit,
-        on_admin_sandbox_deletions=_delete_retained_sandboxes,
     )
     if policy_sync is not None:
         # Its own loop as well as the beat's answer: the answer only arrives

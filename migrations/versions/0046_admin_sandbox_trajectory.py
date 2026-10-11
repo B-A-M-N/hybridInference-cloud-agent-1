@@ -1,57 +1,19 @@
-"""Record retained-sandbox history and reviewed deletion intent.
+"""Record the complete retained-sandbox lifecycle as an append-only trajectory.
 
-Revision ID: 0044_admin_sandbox_trajectory
-Revises: 0043_automatic_compute_setup
+Revision ID: 0046_admin_sandbox_trajectory
+Revises: 0045_admin_sandbox_deletion
 """
 
 from alembic import op
 
-revision = "0044_admin_sandbox_trajectory"
-down_revision = "0043_automatic_compute_setup"
+revision = "0046_admin_sandbox_trajectory"
+down_revision = "0045_admin_sandbox_deletion"
 branch_labels = None
 depends_on = None
 
 
 def upgrade() -> None:
-    """Add durable delete intent and an append-only lifecycle ledger."""
-    op.execute(
-        """
-        ALTER TABLE agent_attempts
-            ADD COLUMN host_capacity_epoch UUID
-        """
-    )
-    op.execute(
-        """
-        ALTER TABLE agent_sandboxes
-            ADD COLUMN host_capacity_epoch UUID,
-            ADD COLUMN delete_requested_at TIMESTAMPTZ,
-            ADD COLUMN delete_requested_by TEXT,
-            ADD COLUMN delete_requested_host_capacity_epoch UUID,
-            ADD COLUMN deleted_at TIMESTAMPTZ,
-            ADD CONSTRAINT ck_agent_sandboxes_delete_request_actor
-                CHECK ((delete_requested_at IS NULL) = (delete_requested_by IS NULL)),
-            ADD CONSTRAINT ck_agent_sandboxes_delete_request_epoch
-                CHECK (
-                    (
-                        delete_requested_at IS NULL
-                        AND delete_requested_host_capacity_epoch IS NULL
-                    ) OR (
-                        delete_requested_at IS NOT NULL
-                        AND host_capacity_epoch IS NOT NULL
-                        AND delete_requested_host_capacity_epoch = host_capacity_epoch
-                    )
-                ),
-            ADD CONSTRAINT ck_agent_sandboxes_deleted_after_request
-                CHECK (deleted_at IS NULL OR delete_requested_at IS NOT NULL)
-        """
-    )
-    op.execute(
-        """
-        CREATE INDEX idx_agent_sandboxes_admin_delete_due
-        ON agent_sandboxes (host, delete_requested_at, id)
-        WHERE delete_requested_at IS NOT NULL AND deleted_at IS NULL
-        """
-    )
+    """Add an append-only lifecycle ledger after archive/delete bookkeeping."""
     op.execute(
         """
         CREATE TABLE agent_sandbox_events (
@@ -89,7 +51,9 @@ def upgrade() -> None:
                     NEW.id, NEW.generation, 'created', NEW.state, 'system',
                     jsonb_build_object(
                         'snapshot_state', NEW.snapshot_state,
-                        'container_present', NEW.container_id IS NOT NULL
+                        'container_present', NEW.container_id IS NOT NULL,
+                        'inventory_archived', NEW.archived_at IS NOT NULL,
+                        'deletion_state', NEW.deletion_state
                     ),
                     NEW.created_at
                 );
@@ -122,6 +86,30 @@ def upgrade() -> None:
                     )
                 );
             END IF;
+            IF OLD.archived_at IS DISTINCT FROM NEW.archived_at THEN
+                INSERT INTO agent_sandbox_events (
+                    sandbox_id, generation, event_type, from_state, to_state, source
+                ) VALUES (
+                    NEW.id,
+                    NEW.generation,
+                    'inventory_visibility_changed',
+                    CASE WHEN OLD.archived_at IS NULL THEN 'visible' ELSE 'archived' END,
+                    CASE WHEN NEW.archived_at IS NULL THEN 'visible' ELSE 'archived' END,
+                    'system'
+                );
+            END IF;
+            IF OLD.deletion_state IS DISTINCT FROM NEW.deletion_state THEN
+                INSERT INTO agent_sandbox_events (
+                    sandbox_id, generation, event_type, from_state, to_state, source
+                ) VALUES (
+                    NEW.id,
+                    NEW.generation,
+                    'deletion_state_changed',
+                    OLD.deletion_state,
+                    NEW.deletion_state,
+                    'system'
+                );
+            END IF;
             RETURN NEW;
         END;
         $$
@@ -130,7 +118,7 @@ def upgrade() -> None:
     op.execute(
         """
         CREATE TRIGGER trg_agent_sandbox_lifecycle_event
-        AFTER INSERT OR UPDATE OF state, snapshot_state, container_id
+        AFTER INSERT OR UPDATE OF state, snapshot_state, container_id, archived_at, deletion_state
         ON agent_sandboxes
         FOR EACH ROW EXECUTE FUNCTION agent_record_sandbox_lifecycle_event()
         """
@@ -162,39 +150,24 @@ def upgrade() -> None:
             sandbox_id, generation, event_type, to_state, source, details
         )
         SELECT id, generation, 'current_state_imported', state, 'migration',
-               jsonb_build_object(
+               jsonb_strip_nulls(jsonb_build_object(
                    'snapshot_state', snapshot_state,
                    'container_present', container_id IS NOT NULL,
+                   'inventory_archived', archived_at IS NOT NULL,
+                   'archived_at', archived_at,
+                   'deletion_state', deletion_state,
+                   'deletion_requested_at', deletion_requested_at,
+                   'deleted_at', deleted_at,
                    'original_created_at', created_at
-               )
+               ))
         FROM agent_sandboxes
         """
     )
 
 
 def downgrade() -> None:
-    """Remove lifecycle history and deletion intent."""
+    """Remove lifecycle history without changing sandbox archive/delete state."""
     op.execute("DROP TRIGGER IF EXISTS trg_agent_sandbox_lifecycle_event ON agent_sandboxes")
     op.execute("DROP FUNCTION IF EXISTS agent_record_sandbox_lifecycle_event()")
     op.execute("DROP TABLE IF EXISTS agent_sandbox_events")
     op.execute("DROP FUNCTION IF EXISTS agent_reject_sandbox_event_mutation()")
-    op.execute("DROP INDEX IF EXISTS idx_agent_sandboxes_admin_delete_due")
-    op.execute(
-        """
-        ALTER TABLE agent_sandboxes
-            DROP CONSTRAINT IF EXISTS ck_agent_sandboxes_deleted_after_request,
-            DROP CONSTRAINT IF EXISTS ck_agent_sandboxes_delete_request_epoch,
-            DROP CONSTRAINT IF EXISTS ck_agent_sandboxes_delete_request_actor,
-            DROP COLUMN IF EXISTS deleted_at,
-            DROP COLUMN IF EXISTS delete_requested_host_capacity_epoch,
-            DROP COLUMN IF EXISTS delete_requested_by,
-            DROP COLUMN IF EXISTS delete_requested_at,
-            DROP COLUMN IF EXISTS host_capacity_epoch
-        """
-    )
-    op.execute(
-        """
-        ALTER TABLE agent_attempts
-            DROP COLUMN IF EXISTS host_capacity_epoch
-        """
-    )

@@ -62,7 +62,6 @@ class _Manager:
         self.events: list[object] = []
         self.starts: list[str] = []
         self.stop_count = 0
-        self.delete_count = 0
         # The host-rule check: how many of the next checks fail, and how many ran.
         self.host_rule_failures = 0
         self.host_rule_checks = 0
@@ -207,17 +206,6 @@ class _Manager:
         current = replace(current, networks=())
         self.items[spec.container_name] = current
         return current
-
-    def delete_stopped(self, spec: ChatSandboxSpec, *, container_id: str) -> str:
-        self.delete_count += 1
-        current = self.items.get(spec.container_name)
-        if current is None:
-            return "already_absent"
-        assert current.container_id == container_id
-        if current.running:
-            raise SandboxError("shared sandbox must be stopped before deletion")
-        self.items.pop(spec.container_name)
-        return "deleted"
 
     def prune_orphan_networks(self, specs: list[ChatSandboxSpec]) -> None:
         self.pruned_specs = specs
@@ -3756,50 +3744,6 @@ def test_external_stopped_group_with_missing_final_marker_keeps_its_bridge() -> 
     assert manager.stop_count == 0
     with pytest.raises(SessionBusy, match="native flush failure"):
         supervisor.operation_opened(spec.thread_id)
-
-
-def test_delete_stopped_removes_group_members_only_after_physical_success():
-    manager = _Manager()
-    spec = _spec()
-    manager.items[spec.container_name] = manager._inspection(spec, running=False)
-    supervisor = SharedChatSessionSupervisor(manager)
-    supervisor.register_manifest(
-        spec,
-        _members(),
-        expected_container_id="container-shared",
-    )
-
-    assert supervisor.delete_stopped(spec, container_id="container-shared") == "deleted"
-    assert manager.delete_count == 1
-    with pytest.raises(SandboxError, match="no shared sandbox membership"):
-        supervisor.status("athr_source")
-    with pytest.raises(SandboxError, match="no shared sandbox membership"):
-        supervisor.status("athr_peer")
-
-
-def test_delete_stopped_refuses_a_running_group_before_manager_deletion():
-    manager = _Manager()
-    spec = _spec()
-    manager.create(spec)
-    supervisor = SharedChatSessionSupervisor(manager)
-    supervisor.register_manifest(
-        spec,
-        _members(),
-        expected_container_id="container-shared",
-    )
-
-    with pytest.raises(SessionBusy, match="must be stopped"):
-        supervisor.delete_stopped(spec, container_id="container-shared")
-    assert manager.delete_count == 0
-    assert supervisor.status("athr_source").running is True
-
-
-def test_delete_stopped_retries_idempotently_after_broker_reconstruction():
-    manager = _Manager()
-    supervisor = SharedChatSessionSupervisor(manager)
-
-    assert supervisor.delete_stopped(_spec(), container_id="container-shared") == "already_absent"
-    assert manager.delete_count == 1
 
 
 @pytest.mark.parametrize("generations", [{"athr_source": 0}, {"athr_source": 1, "athr_peer": 0}])

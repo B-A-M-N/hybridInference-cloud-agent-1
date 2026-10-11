@@ -21,9 +21,12 @@ SandboxStateFilter = Literal[
 ]
 
 
-def sandbox_cursor_scope(state: SandboxStateFilter) -> str:
-    """Bind continuation tokens to the exact lifecycle filter."""
-    return cursor_scope(["sandboxes", state])
+def sandbox_cursor_scope(state: SandboxStateFilter, include_archived: bool = False) -> str:
+    """Bind continuation tokens to the lifecycle and inventory visibility."""
+    parts = ["sandboxes", state]
+    if include_archived:
+        parts.append("include_archived")
+    return cursor_scope(parts)
 
 
 def sandbox_trajectory_cursor_scope(sandbox_id: str) -> str:
@@ -99,8 +102,15 @@ class AdminSandbox(BaseModel):
     execution_profile: str
     state: SandboxState = "running"
     stop_requested_at: datetime | None = None
-    delete_requested_at: datetime | None = None
-    delete_requested_by: str | None = None
+    archived_at: datetime | None = None
+    deletion_state: Literal["none", "pending", "archived", "deleted", "failed"] = "none"
+    deletion_request_id: str | None = None
+    deletion_requested_at: datetime | None = None
+    deletion_archive_key: str | None = None
+    deletion_archive_version_id: str | None = None
+    deletion_sha256: str | None = None
+    deletion_size_bytes: int | None = Field(None, gt=0)
+    deletion_error: str | None = None
     deleted_at: datetime | None = None
     memory_limit: str
     cpu_limit: str
@@ -174,14 +184,13 @@ class AdminSandboxStopRequest(BaseModel):
     last_activity_at: datetime
 
 
-class AdminSandboxDeleteRequest(BaseModel):
-    """A confirmed deletion of the exact stopped container an admin reviewed."""
+class AdminSandboxArchiveRequest(BaseModel):
+    """The exact sandbox reviewed for reversible inventory removal or restore."""
 
     model_config = ConfigDict(extra="forbid")
 
-    confirm: Literal[True]
     generation: int = Field(ge=1)
-    container_id: str = Field(min_length=1, max_length=256)
+    container_id: str | None = Field(min_length=1, max_length=256)
     last_activity_at: datetime
 
 

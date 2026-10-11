@@ -23,33 +23,6 @@ if TYPE_CHECKING:
     import asyncpg
 
 
-async def _lock_fork_memberships(
-    conn: Any,
-    *,
-    sandbox_id: str,
-    source_thread_id: str,
-    target_thread_id: str,
-) -> dict[str, Any]:
-    """Lock both fork members in the group-wide lifecycle order.
-
-    Reconciliation and administrative lifecycle writers lock every group
-    membership by ``thread_id``. A fork must not take source and then target:
-    the generated target id can sort first, forming a source/target cycle.
-    """
-    rows = await conn.fetch(
-        """
-        SELECT *
-        FROM agent_thread_sandbox_memberships
-        WHERE sandbox_id = $1 AND thread_id = ANY($2::text[])
-        ORDER BY thread_id
-        FOR UPDATE
-        """,
-        sandbox_id,
-        [source_thread_id, target_thread_id],
-    )
-    return {str(row["thread_id"]): row for row in rows}
-
-
 class PostgresSessionForkRepository:
     """Forking a retained chat: prepare, materialize, finalize, reap."""
 
@@ -154,10 +127,8 @@ class PostgresSessionForkRepository:
                 SELECT m.*, g.generation AS sandbox_generation, g.host,
                        g.container_id, g.container_name, g.runtime_id,
                        g.runtime_version, g.sandbox_image_digest,
-                       g.execution_profile, g.state AS sandbox_state,
-                       g.delete_requested_at, g.deleted_at,
-                       g.resident_slot_capacity, g.memory_limit, g.cpu_limit,
-                       g.disk_limit_mib,
+                       g.execution_profile, g.state AS sandbox_state, g.deletion_state,
+                       g.resident_slot_capacity, g.memory_limit, g.cpu_limit, g.disk_limit_mib,
                        g.stop_timeout_seconds,
                        {NATIVE_FORK_CAPABLE} AS native_fork_capable
                 FROM agent_thread_sandbox_memberships m
@@ -169,6 +140,8 @@ class PostgresSessionForkRepository:
             )
             if row is None:
                 return {"error": "not_shared_live"}
+            if row["deletion_state"] in {"pending", "archived", "deleted"}:
+                return {"error": "sandbox_not_ready"}
             resource_new, _ = await host_compute_admission(conn, str(row["host"]))
             if not resource_new:
                 return {"error": "resource_admission_blocked"}
@@ -201,17 +174,12 @@ class PostgresSessionForkRepository:
                 return {"error": "sandbox_not_ready"}
             if row["fork_operation_id"] is not None:
                 return {"error": "fork_in_progress"}
-            if (
-                row["sandbox_state"]
-                in {
-                    "lost",
-                    "stopped_dirty",
-                    "provisioning",
-                    "stopping",
-                }
-                or row["delete_requested_at"] is not None
-                or row["deleted_at"] is not None
-            ):
+            if row["sandbox_state"] in {
+                "lost",
+                "stopped_dirty",
+                "provisioning",
+                "stopping",
+            }:
                 return {"error": "sandbox_not_ready"}
             if not row["container_id"]:
                 return {"error": "sandbox_not_ready"}
@@ -359,7 +327,8 @@ class PostgresSessionForkRepository:
                 """
                 UPDATE agent_sandboxes
                 SET active_operation_count = active_operation_count + 1,
-                    idle_deadline = NULL, last_activity_at = NOW(), updated_at = NOW()
+                    idle_deadline = NULL, archived_at = NULL,
+                    last_activity_at = NOW(), updated_at = NOW()
                 WHERE id = $1
                 """,
                 row["sandbox_id"],
@@ -410,14 +379,16 @@ class PostgresSessionForkRepository:
             )
             if sandbox_host is None:
                 return None
-            memberships = await _lock_fork_memberships(
-                conn,
-                sandbox_id=str(operation["sandbox_id"]),
-                source_thread_id=thread_ids["source"],
-                target_thread_id=thread_ids["target"],
-            )
             for role, thread_id in thread_ids.items():
-                current = memberships.get(thread_id)
+                current = await conn.fetchrow(
+                    """
+                    SELECT residency_grant_id FROM agent_thread_sandbox_memberships
+                    WHERE thread_id = $1 AND sandbox_id = $2
+                    FOR UPDATE
+                    """,
+                    thread_id,
+                    operation["sandbox_id"],
+                )
                 if current is None:
                     return None
                 # The grant token itself is deliberately never stored.  A
@@ -661,7 +632,8 @@ class PostgresSessionForkRepository:
             await conn.execute(
                 """
                 UPDATE agent_sandboxes
-                SET state = 'running', last_activity_at = NOW(), updated_at = NOW()
+                SET state = 'running', archived_at = NULL,
+                    last_activity_at = NOW(), updated_at = NOW()
                 WHERE id = $1 AND generation = $2 AND container_id = $3
                 """,
                 operation["sandbox_id"],
@@ -698,13 +670,13 @@ class PostgresSessionForkRepository:
                     f"{JOB_SELECT} WHERE j.id = $1 FOR UPDATE OF j",
                     operation["source_job_id"],
                 )
-                memberships = await _lock_fork_memberships(
-                    conn,
-                    sandbox_id=str(operation["sandbox_id"]),
-                    source_thread_id=str(operation["source_thread_id"]),
-                    target_thread_id=str(operation["target_thread_id"]),
+                membership = await conn.fetchrow(
+                    """
+                    SELECT * FROM agent_thread_sandbox_memberships
+                    WHERE thread_id = $1 FOR UPDATE
+                    """,
+                    operation["source_thread_id"],
                 )
-                membership = memberships.get(str(operation["source_thread_id"]))
                 if (
                     source is None
                     or membership is None
@@ -930,12 +902,6 @@ class PostgresSessionForkRepository:
                 )
                 if changed is None:
                     continue
-                await _lock_fork_memberships(
-                    conn,
-                    sandbox_id=str(operation["sandbox_id"]),
-                    source_thread_id=str(operation["source_thread_id"]),
-                    target_thread_id=str(operation["target_thread_id"]),
-                )
                 await conn.execute(
                     """
                     UPDATE agent_thread_sandbox_memberships

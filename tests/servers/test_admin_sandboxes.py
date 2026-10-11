@@ -16,6 +16,7 @@ from cloud_agent.admin_sandboxes import (
     SANDBOX_CURSOR_SCOPE,
     SandboxCursor,
     SandboxTrajectoryCursor,
+    sandbox_cursor_scope,
     sandbox_trajectory_cursor_scope,
 )
 from cloud_agent.api import admin_sandboxes
@@ -100,15 +101,21 @@ def setup(run_setup):  # noqa: F811 — imported pytest fixture
         ),
         trajectory=AsyncMock(
             return_value={
-                "sandbox": sandbox() | {"state": "stopped"},
+                "sandbox": sandbox()
+                | {
+                    "state": "lost",
+                    "archived_at": END,
+                    "deletion_state": "deleted",
+                    "deleted_at": END,
+                },
                 "members": [
                     {
                         "thread_id": "athr_other",
                         "user_id": "other-owner",
                         "resident_slot_id": None,
-                        "resident_state": "stopped",
-                        "context_status": "restored",
-                        "native_state": "ready",
+                        "resident_state": "lost",
+                        "context_status": "lost",
+                        "native_state": "lost",
                         "created_at": START,
                         "updated_at": END,
                         "native_session_id": "PRIVATE session",
@@ -120,9 +127,9 @@ def setup(run_setup):  # noqa: F811 — imported pytest fixture
                     {
                         "id": 2,
                         "generation": 1,
-                        "event_type": "state_changed",
-                        "from_state": "running",
-                        "to_state": "stopped",
+                        "event_type": "deletion_state_changed",
+                        "from_state": "archived",
+                        "to_state": "deleted",
                         "source": "system",
                         "details": {},
                         "created_at": END,
@@ -247,7 +254,7 @@ async def test_valid_cursor_and_page_limit_are_forwarded(setup):
     queries.list_running.assert_awaited_once_with(cursor=parsed, limit=200)
 
 
-async def test_trajectory_is_scoped_newest_first_and_content_free(setup):
+async def test_trajectory_is_scoped_paginated_content_free_and_retains_tombstone(setup):
     app, queries, _ = setup
     parsed = SandboxTrajectoryCursor(
         scope=sandbox_trajectory_cursor_scope("asbx_other"),
@@ -264,10 +271,13 @@ async def test_trajectory_is_scoped_newest_first_and_content_free(setup):
     assert response.headers["cache-control"] == "no-store"
     body = response.json()
     assert body["sandbox"]["id"] == "asbx_other"
+    assert body["sandbox"]["archived_at"] is not None
+    assert body["sandbox"]["deletion_state"] == "deleted"
+    assert body["sandbox"]["deleted_at"] is not None
     assert body["members"][0]["resident_slot_id"] is None
     assert body["member_history_count"] == 1
     assert body["member_history_truncated"] is False
-    assert body["events"][0]["event_type"] == "state_changed"
+    assert body["events"][0]["event_type"] == "deletion_state_changed"
     assert "PRIVATE" not in response.text
     queries.trajectory.assert_awaited_once_with("asbx_other", cursor=parsed, limit=25)
 
@@ -309,6 +319,26 @@ async def test_all_lifecycle_filter_and_cursor_are_scoped(setup):
     assert response.status_code == 200
     assert mismatch.status_code == invalid.status_code == 422
     queries.list_sandboxes.assert_awaited_once_with(cursor=None, limit=100, state="all")
+
+
+async def test_removed_inventory_flag_is_forwarded_and_cursor_scoped(setup):
+    app, queries, _ = setup
+    queries.list_sandboxes = AsyncMock(return_value=queries.list_running.return_value)
+    parsed = SandboxCursor(scope=sandbox_cursor_scope("all", True), after_id="one")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            PREFIX,
+            headers=ADMIN,
+            params={"state": "all", "include_archived": "true", "cursor": encode_cursor(parsed)},
+        )
+        mismatch = await client.get(
+            PREFIX, headers=ADMIN, params={"state": "all", "cursor": encode_cursor(parsed)}
+        )
+    assert response.status_code == 200
+    assert mismatch.status_code == 422
+    queries.list_sandboxes.assert_awaited_once_with(
+        cursor=parsed, limit=100, state="all", include_archived=True
+    )
 
 
 async def test_detail_sanitizes_members_and_preserves_stopped_state(setup):
@@ -540,7 +570,9 @@ async def test_detail_keeps_activity_unavailable_if_container_changes_before_rec
         ("GET", "/asbx_other"),
         ("GET", "/asbx_other/trajectory"),
         ("POST", "/asbx_other/stop"),
-        ("DELETE", "/asbx_other"),
+        ("POST", "/asbx_other/archive"),
+        ("POST", "/asbx_other/restore"),
+        ("POST", "/asbx_other/delete"),
     ],
 )
 async def test_detail_and_control_require_current_admin_access(setup, method, path):
@@ -552,7 +584,6 @@ async def test_detail_and_control_require_current_admin_access(setup, method, pa
             method,
             PREFIX + path,
             json={
-                "confirm": True,
                 "generation": 1,
                 "container_id": "container-one",
                 "last_activity_at": END.isoformat(),
@@ -847,29 +878,90 @@ async def test_stop_keeps_atomic_stale_refusal_when_review_fences_do_not_match(
     queries.detail.assert_awaited_once_with("asbx_other")
 
 
+@pytest.mark.parametrize("archived", [False, True])
 @pytest.mark.parametrize(
     ("result", "status"),
-    [
-        ("accepted", 202),
-        ("not_found", 404),
-        ("stale", 409),
-        ("already_deleted", 409),
-        ("not_stopped", 409),
-        ("busy", 409),
-    ],
+    [("accepted", 200), ("not_found", 404), ("stale", 409), ("busy", 409), ("not_stopped", 409)],
 )
-async def test_confirmed_delete_passes_authenticated_actor_to_atomic_command(setup, result, status):
+async def test_inventory_controls_pass_review_and_authenticated_actor(
+    setup, archived, result, status
+):
     from cloud_agent.admin_sandboxes import AdminSandboxDetail
 
     app, queries, _ = setup
     queries.detail = AsyncMock(
         return_value=AdminSandboxDetail(
             sandbox=sandbox()
-            | {
-                "state": "stopped",
-                "delete_requested_at": END,
-                "delete_requested_by": "admin-token",
-            },
+            | {"state": "stopped", "container_id": None, "archived_at": END if archived else None},
+            members=[],
+            observed_at=END,
+        )
+    )
+    commands = SimpleNamespace(set_admin_archived=AsyncMock(return_value=result))
+    app.dependency_overrides[get_storage] = lambda: SimpleNamespace(
+        sandbox=commands, admin_sandboxes=queries
+    )
+    action = "archive" if archived else "restore"
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"{PREFIX}/asbx_other/{action}",
+            headers=ADMIN,
+            json={"generation": 1, "container_id": None, "last_activity_at": END.isoformat()},
+        )
+    assert response.status_code == status
+    commands.set_admin_archived.assert_awaited_once_with(
+        sandbox_id="asbx_other",
+        generation=1,
+        container_id=None,
+        last_activity_at=END,
+        archived=archived,
+        actor_id="admin-token",
+        admin_ip="127.0.0.1",
+    )
+    if result == "accepted":
+        assert response.headers["cache-control"] == "no-store"
+        assert (response.json()["sandbox"]["archived_at"] is not None) == archived
+        assert "PRIVATE" not in response.text
+    else:
+        queries.detail.assert_not_awaited()
+
+
+@pytest.mark.parametrize("action", ["archive", "restore"])
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"generation": 0},
+        {"container_id": ""},
+        {"last_activity_at": "invalid"},
+        {"force": True},
+    ],
+)
+async def test_inventory_controls_reject_unreviewed_payloads(setup, action, changes):
+    app, queries, _ = setup
+    commands = SimpleNamespace(set_admin_archived=AsyncMock())
+    app.dependency_overrides[get_storage] = lambda: SimpleNamespace(
+        sandbox=commands, admin_sandboxes=queries
+    )
+    payload = {"generation": 1, "container_id": None, "last_activity_at": END.isoformat()}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"{PREFIX}/asbx_other/{action}", headers=ADMIN, json=payload | changes
+        )
+    assert response.status_code == 422
+    commands.set_admin_archived.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("result", "status"),
+    [("accepted", 202), ("not_found", 404), ("stale", 409), ("busy", 409), ("not_stopped", 409)],
+)
+async def test_reviewed_delete_queues_authenticated_atomic_request(setup, result, status):
+    from cloud_agent.admin_sandboxes import AdminSandboxDetail
+
+    app, queries, _ = setup
+    queries.detail = AsyncMock(
+        return_value=AdminSandboxDetail(
+            sandbox=sandbox() | {"state": "stopped", "deletion_state": "pending"},
             members=[],
             observed_at=END,
         )
@@ -878,13 +970,12 @@ async def test_confirmed_delete_passes_authenticated_actor_to_atomic_command(set
     app.dependency_overrides[get_storage] = lambda: SimpleNamespace(
         sandbox=commands, admin_sandboxes=queries
     )
+    app.dependency_overrides[admin_sandboxes.admin_sandbox_deletion_available] = lambda: True
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.request(
-            "DELETE",
-            f"{PREFIX}/asbx_other",
+        response = await client.post(
+            f"{PREFIX}/asbx_other/delete",
             headers=ADMIN,
             json={
-                "confirm": True,
                 "generation": 1,
                 "container_id": "container-one",
                 "last_activity_at": END.isoformat(),
@@ -900,29 +991,31 @@ async def test_confirmed_delete_passes_authenticated_actor_to_atomic_command(set
         admin_ip="127.0.0.1",
     )
     if result == "accepted":
-        assert response.json()["sandbox"]["delete_requested_by"] == "admin-token"
+        assert response.headers["cache-control"] == "no-store"
+        assert response.json()["sandbox"]["deletion_state"] == "pending"
+    else:
+        queries.detail.assert_not_awaited()
 
 
-@pytest.mark.parametrize("body", [{}, {"confirm": False}])
-async def test_delete_requires_explicit_confirmation(setup, body):
+async def test_delete_without_archive_configuration_does_not_fence_sandbox(setup):
     app, queries, _ = setup
-    commands = SimpleNamespace(request_admin_delete=AsyncMock(return_value="accepted"))
+    commands = SimpleNamespace(request_admin_delete=AsyncMock())
     app.dependency_overrides[get_storage] = lambda: SimpleNamespace(
         sandbox=commands, admin_sandboxes=queries
     )
+    app.dependency_overrides[admin_sandboxes.admin_sandbox_deletion_available] = lambda: False
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.request(
-            "DELETE",
-            f"{PREFIX}/asbx_other",
+        response = await client.post(
+            f"{PREFIX}/asbx_other/delete",
             headers=ADMIN,
             json={
                 "generation": 1,
                 "container_id": "container-one",
                 "last_activity_at": END.isoformat(),
-            }
-            | body,
+            },
         )
-    assert response.status_code == 422
+    assert response.status_code == 503
+    assert "S3 bucket" in response.json()["detail"]
     commands.request_admin_delete.assert_not_awaited()
 
 
@@ -969,5 +1062,12 @@ def test_sandboxes_are_only_on_the_main_listener():
     assert PREFIX in create_app().openapi()["paths"]
     assert PREFIX not in create_mcp_app().openapi()["paths"]
     assert PREFIX + "/{sandbox_id}" not in create_mcp_app().openapi()["paths"]
+    assert PREFIX + "/{sandbox_id}/trajectory" in create_app().openapi()["paths"]
     assert PREFIX + "/{sandbox_id}/trajectory" not in create_mcp_app().openapi()["paths"]
     assert PREFIX + "/{sandbox_id}/stop" not in create_mcp_app().openapi()["paths"]
+    assert PREFIX + "/{sandbox_id}/archive" in create_app().openapi()["paths"]
+    assert PREFIX + "/{sandbox_id}/restore" in create_app().openapi()["paths"]
+    assert PREFIX + "/{sandbox_id}/archive" not in create_mcp_app().openapi()["paths"]
+    assert PREFIX + "/{sandbox_id}/restore" not in create_mcp_app().openapi()["paths"]
+    assert PREFIX + "/{sandbox_id}/delete" in create_app().openapi()["paths"]
+    assert PREFIX + "/{sandbox_id}/delete" not in create_mcp_app().openapi()["paths"]
