@@ -17,6 +17,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -106,24 +107,34 @@ def test_the_start_check_runs_the_image_this_job_built() -> None:
 
 
 def test_the_build_loads_the_image_it_is_about_to_start() -> None:
+    """The docker exporter puts the image on the daemon, uncompressed.
+
+    The daemon is its only consumer, and on a hosted VM the sandbox spent a
+    minute gzipping layers the daemon then unpacked. `load: true` is the same
+    exporter with its default compression, so it is not set beside this.
+    """
     for fragment in (
         "Build ${{ matrix.artifact.name }}",
         "Build ${{ matrix.artifact.name }} (retry)",
     ):
         build = step(fragment)
-        assert build["with"]["load"] is True, (
+        assert build["with"]["outputs"] == "type=docker,compression=uncompressed", (
             f"{fragment} must load the image onto this runner's daemon; the next step starts it "
             "from there, and a self-hosted runner shares no filesystem with the job that built it"
         )
+        assert "load" not in build["with"]
         assert build["with"]["push"] is False
 
 
-def test_the_build_does_not_export_an_unused_remote_cache() -> None:
+def test_no_cell_exports_a_cache_and_only_the_sandbox_imports_one() -> None:
     """The persistent per-runner builder is the cache used by later builds.
 
     A GHA exporter without an importer uploaded the sandbox's large runtime
     layers on every run but no build ever consumed them. The export alone took
-    minutes and occupied every x64 runner on their shared physical host.
+    minutes and occupied every x64 runner on their shared physical host. So no
+    cell exports; `pr-caches` does, from a hosted VM, and only the sandbox —
+    the one image whose cold build is long — imports it. Which events import
+    is pinned in `test_ci_workflow_policy.py`, where the expression is evaluated.
     """
     for fragment in (
         "Build ${{ matrix.artifact.name }}",
@@ -131,7 +142,9 @@ def test_the_build_does_not_export_an_unused_remote_cache() -> None:
     ):
         build = step(fragment)
         assert "cache-to" not in build["with"]
-        assert "cache-from" not in build["with"]
+        imported = str(build["with"]["cache-from"])
+        assert "matrix.artifact.name == 'sandbox'" in imported
+        assert "'type=gha,scope=sandbox-amd64'" in imported
 
 
 def test_the_build_tags_the_image_the_smoke_starts() -> None:
@@ -171,6 +184,104 @@ def test_mcp_interactions_run_in_isolated_parallel_workers() -> None:
     assert run.index("createdb") < run.index("uv run pytest")
 
 
+PARITY = "tests/external/test_resident_mcp_parity.py"
+
+# Copied verbatim from `artifacts` into `mcp`, so the cases a pull request runs
+# use the image the sandbox cell builds and starts, built and freed the same way.
+SHARED_MCP_STEPS = (
+    "Free unused SDKs on the hosted sandbox runner",
+    "Reuse this runner's builder, or make one",
+    "Build ${{ matrix.artifact.name }}",
+    "Build ${{ matrix.artifact.name }} (retry)",
+    "Free the hosted sandbox builder's unused cache",
+    "Isolate uv cache dir",
+    "Install uv",
+    "Drop this run's containers and image",
+    "Drop this pull request's builder",
+)
+
+
+def _mcp_case_step() -> dict[str, Any]:
+    return next(
+        candidate
+        for candidate in workflow()["jobs"]["mcp"]["steps"]
+        if "retains MCP through approval" in str(candidate.get("name", ""))
+    )
+
+
+def test_pull_requests_split_the_mcp_cases_and_trusted_events_run_them_whole() -> None:
+    """Every event runs all fifteen cases; only where they run differs.
+
+    Three parallel cases fill a four-vCPU hosted VM — the suite took 222s there
+    and 86s on the persistent pool — so a pull request spreads the runtimes
+    over five VMs. Trusted events keep the single persistent-pool step.
+    """
+    jobs = workflow()["jobs"]
+    assert step("All five CLIs retain MCP")["if"] == (
+        "matrix.artifact.name == 'sandbox' && github.event_name != 'pull_request'"
+    )
+    assert jobs["mcp"]["if"] == (
+        "github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'"
+    )
+    assert jobs["mcp"]["needs"] == "changes"
+    assert jobs["mcp"]["strategy"]["fail-fast"] is False
+    gate = jobs["ci-gate"]
+    assert "mcp" in gate["needs"]
+    assert "mcp=${{ needs.mcp.result }}" in str(step("Every job succeeded", job="ci-gate")["env"])
+
+
+def test_the_mcp_cells_partition_the_parity_suite() -> None:
+    """Five selections, three cases each, every case once.
+
+    Collected from the real test file, so a runtime added to its parametrization
+    and not to the matrix fails here rather than silently going untested. Each
+    selection ends in `]`, which only an item name can contain, so a substring
+    of the collected id is exactly what `-k` matches.
+    """
+    collected = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-m", "external", PARITY],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    cases = {line for line in collected.splitlines() if line.startswith(f"{PARITY}::")}
+    assert len(cases) == 15
+    template = _mcp_case_step()["env"]["MCP_TEST_SELECTION"]
+    assert template == "${{ matrix.runtime }}]"
+    selected: list[str] = []
+    for runtime in workflow()["jobs"]["mcp"]["strategy"]["matrix"]["runtime"]:
+        selection = template.replace("${{ matrix.runtime }}", runtime).lower()
+        mine = sorted(case for case in cases if selection in case.lower())
+        assert len(mine) == 3, (runtime, mine)
+        selected.extend(mine)
+    assert sorted(selected) == sorted(cases), "the cells overlap or leave a case out"
+
+
+def test_the_mcp_cells_build_and_clean_up_exactly_like_the_sandbox_cell() -> None:
+    jobs = workflow()["jobs"]
+    sandbox = next(cell for cell in cells() if cell["name"] == "sandbox")
+    assert jobs["mcp"]["strategy"]["matrix"]["artifact"] == [sandbox]
+    for name in SHARED_MCP_STEPS:
+        assert step(name, job="mcp") == step(name), f"{name} differs between artifacts and mcp"
+    ours, theirs = _mcp_case_step(), step("All five CLIs retain MCP")
+    assert ours["run"] == theirs["run"], "the cases must run the way the sandbox cell runs them"
+    assert ours["timeout-minutes"] == theirs["timeout-minutes"]
+    assert theirs["env"]["MCP_TEST_SELECTION"] == "", "trusted events must still run every case"
+    assert {**ours["env"], "MCP_TEST_SELECTION": ""} == theirs["env"]
+    assert '-k "${MCP_TEST_SELECTION}"' in ours["run"]
+
+
+def test_each_mcp_cell_removes_only_what_it_started() -> None:
+    """Five cells of one run share its id, so the label carries the runtime too."""
+    steps = workflow()["jobs"]["mcp"]["steps"]
+    naming = str(step("Name this cell", job="mcp")["run"])
+    assert "matrix.runtime" in naming and "GITHUB_RUN_ATTEMPT" in naming
+    assert 'echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-config" >> "${GITHUB_ENV}"' in naming
+    assert steps[-1]["name"] == "Drop this pull request's builder"
+    assert not any("secrets." in str(candidate) for candidate in steps)
+
+
 def test_cleanup_cannot_reach_another_cell() -> None:
     """Six cells of one run share a run id, an attempt — and often a Docker host.
 
@@ -191,6 +302,28 @@ def test_cleanup_cannot_reach_another_cell() -> None:
 def test_the_build_passes_the_commit_every_image_must_name() -> None:
     build = step("Build ${{ matrix.artifact.name }}")
     assert "SOURCE_COMMIT=${{ github.sha }}" in str(build["with"]["build-args"])
+
+
+@pytest.mark.parametrize("dockerfile", sorted({str(cell["dockerfile"]) for cell in cells()}))
+def test_the_commit_reaches_no_layer(dockerfile: str) -> None:
+    """A RUN after `ARG SOURCE_COMMIT` has the commit in its environment.
+
+    Every such layer then rebuilds on every commit, in every builder and every
+    layer cache. In the sandbox that was five layers below the label, rebuilt and
+    exported again on each run while nothing in them had changed.
+    """
+    text = re.sub(r"\\\n\s*", " ", (REPO_ROOT / dockerfile).read_text())
+    instructions = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    declared = [i for i, line in enumerate(instructions) if line.startswith("ARG SOURCE_COMMIT")]
+    assert declared, f"{dockerfile} never declares SOURCE_COMMIT"
+    after = instructions[declared[-1] :]
+    assert not [line for line in after if line.startswith("RUN ")], (
+        f"{dockerfile} runs a layer after ARG SOURCE_COMMIT; declare it after the last RUN"
+    )
 
 
 def _runs_the_image_jobs(path: str) -> bool:
