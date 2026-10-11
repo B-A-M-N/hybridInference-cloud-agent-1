@@ -1343,9 +1343,139 @@ def test_member_permission_normalization_prunes_platform_and_sibling_provider_ho
     assert script.count("-path /agent-state/codex-members") == 2
     assert script.count("-path /agent-state/opencode-members") == 2
     assert script.count("-path /agent-state/kilo-members") == 2
-    assert 'stat -c %u "$member"' in script
-    assert 'normalize_dirs "$member"' in script
+    # A member's provider home is never widened, not even by its owner: the
+    # pass no longer enters the collections at all.
+    assert "-members/" not in script
+    assert '"$member"' not in script
     assert calls[0][1]["user_uid"] == MEMBER_UID_BASE
+
+
+def _running(spec: ChatSandboxSpec) -> ChatSandboxInspection:
+    return ChatSandboxInspection(
+        container_id="sha256:container-one",
+        name=spec.container_name,
+        status=ChatSandboxStatus.RUNNING,
+        running=True,
+        image="img",
+        labels=spec.docker_labels(),
+        mounts=(),
+        networks=("agent-net",),
+    )
+
+
+def test_a_member_pipe_joins_two_member_execs_without_a_shared_file(monkeypatch, tmp_path):
+    """One UID's stdout reaches another UID's stdin through this host only."""
+    seen = tmp_path / "execs.jsonl"
+    docker = tmp_path / "docker"
+    docker.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        f"open({str(seen)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "args = sys.argv[2:]\n"
+        "while args[0].startswith('-'):\n"
+        "    if args.pop(0) in ('--user', '--workdir', '--env'):\n"
+        "        args.pop(0)\n"
+        "args.pop(0)\n"
+        "os.execvp(args[0], args)\n"
+    )
+    docker.chmod(0o755)
+    spec = replace(_spec(), shared_live=True, resident_slot_capacity=4)
+    manager = ChatSandboxManager(ContainerBackend(image="img", docker_binary=str(docker)))
+    monkeypatch.setattr(manager, "_require", lambda _spec: _running(spec))
+    received = tmp_path / "received"
+
+    source, target = manager.pipe_member_exec(
+        spec,
+        source_argv=["/bin/sh", "-c", "printf 'private state'; echo note >&2"],
+        source_uid=MEMBER_UID_BASE,
+        target_argv=["/bin/sh", "-c", 'cat > "$1"', "sh", str(received)],
+        target_uid=MEMBER_UID_BASE + 2,
+        user_gid=manager.backend.gid,
+        timeout_s=30,
+    )
+
+    assert (source.returncode, target.returncode) == (0, 0)
+    assert source.stderr == b"note\n"
+    assert received.read_text() == "private state"
+    source_exec, target_exec = (json.loads(line) for line in seen.read_text().splitlines())
+    assert source_exec[source_exec.index("--user") + 1] == f"{MEMBER_UID_BASE}:10001"
+    assert target_exec[target_exec.index("--user") + 1] == f"{MEMBER_UID_BASE + 2}:10001"
+    assert "--interactive" not in source_exec and "--interactive" in target_exec
+    assert source_exec[source_exec.index("--workdir") + 2] == "sha256:container-one"
+
+
+def test_a_failed_member_pipe_reports_each_side(monkeypatch, tmp_path):
+    docker = tmp_path / "docker"
+    docker.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "args = sys.argv[2:]\n"
+        "while args[0].startswith('-'):\n"
+        "    if args.pop(0) in ('--user', '--workdir', '--env'):\n"
+        "        args.pop(0)\n"
+        "args.pop(0)\n"
+        "os.execvp(args[0], args)\n"
+    )
+    docker.chmod(0o755)
+    spec = replace(_spec(), shared_live=True, resident_slot_capacity=4)
+    manager = ChatSandboxManager(ContainerBackend(image="img", docker_binary=str(docker)))
+    monkeypatch.setattr(manager, "_require", lambda _spec: _running(spec))
+
+    source, target = manager.pipe_member_exec(
+        spec,
+        source_argv=["/bin/sh", "-c", "yes"],
+        source_uid=MEMBER_UID_BASE,
+        target_argv=["/bin/sh", "-c", "echo refused >&2; exit 3"],
+        target_uid=MEMBER_UID_BASE + 1,
+        user_gid=manager.backend.gid,
+        timeout_s=30,
+    )
+
+    assert target.returncode == 3 and target.stderr == b"refused\n"
+    assert source.returncode != 0, "a closed pipe ends the source instead of hanging"
+
+
+def test_unsettled_reset_has_each_member_clear_its_private_homes_first(monkeypatch):
+    spec = replace(_spec(), shared_live=True, resident_slot_capacity=4)
+    manager = ChatSandboxManager(ContainerBackend(image="img"))
+    calls: list[tuple[list[str], dict]] = []
+    answers = iter(
+        [
+            SimpleNamespace(returncode=75, stdout=b"11001\n11003\n", stderr=b""),
+            SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+            SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+            SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+        ]
+    )
+
+    def fake_exec(_spec, argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        return next(answers)
+
+    monkeypatch.setattr(manager, "exec_capture", fake_exec)
+
+    manager.reset_unsettled_state(spec)
+
+    assert [kwargs.get("user_uid") for _argv, kwargs in calls] == [None, 11001, 11003, None]
+    assert calls[0][0] == calls[3][0], "the roots are cleared only once no member home is left"
+    assert "-members" in calls[1][0][2] and '-uid "$uid"' in calls[1][0][2]
+
+
+@pytest.mark.parametrize("owners", [b"0\n", b"10001\n", b"11005\n", b"not-a-uid\n"])
+def test_unsettled_reset_refuses_a_home_no_member_slot_owns(monkeypatch, owners):
+    spec = replace(_spec(), shared_live=True, resident_slot_capacity=4)
+    manager = ChatSandboxManager(ContainerBackend(image="img"))
+    calls: list[dict] = []
+
+    def fake_exec(_spec, _argv, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(returncode=75, stdout=owners, stderr=b"")
+
+    monkeypatch.setattr(manager, "exec_capture", fake_exec)
+
+    with pytest.raises(SandboxError, match="private member home"):
+        manager.reset_unsettled_state(spec)
+    assert len(calls) == 1
 
 
 def test_member_replacement_reaps_pidfile_group_and_every_same_uid_leftover(monkeypatch):

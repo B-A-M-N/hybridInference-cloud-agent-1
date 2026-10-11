@@ -143,6 +143,12 @@ ARCHIVE_IMPORT_TIMEOUT_PER_GIB_S = 120.0
 ARCHIVE_EXPORT_TIMEOUT_PER_GIB_S = ARCHIVE_IMPORT_TIMEOUT_PER_GIB_S
 CHAT_STATE_DIR = "/agent-state"
 CLAUDE_SHARED_PROJECTS_DIR = f"{CHAT_STATE_DIR}/claude/projects"
+#: Where Codex, OpenCode and Kilo keep one mode-0700 provider home per member
+#: (``resident_transport.PRIVATE_MEMBER_STATE_ROOTS``). Only a home's own
+#: member UID can open it.
+PRIVATE_MEMBER_HOME_COLLECTIONS = tuple(
+    f"{CHAT_STATE_DIR}/{runtime}-members" for runtime in ("codex", "opencode", "kilo")
+)
 ACTIVATION_TMPFS = "/run/agent-activation"
 MEMBER_TMPFS_ROOT = "/run/agent-members"
 #: Broker-owned durable receipt for the immutable pre-prompt archive.  It is
@@ -2920,13 +2926,15 @@ class ChatSandboxManager:
             raise ValueError("resident slot does not match its member uid")
         # Codex, OpenCode, and Kilo each need a member-private provider home:
         # Codex can make temp files owner-only, while the HTTP runtimes keep
-        # SQLite databases and per-project process locks. A sibling UID must
-        # never traverse those homes merely to normalize its own writes.
+        # SQLite databases and per-project process locks. Each home is mode
+        # 0700 to its member UID and is never widened, not even by its owner:
+        # its config and plugins run as that member, with that member's
+        # credentials, at every process start. Fork copies a child's home
+        # through a pipe between the two UIDs, so no sibling needs to read it.
         # Claude now loads settings and its sessions/ process registry from
         # /home/agent-member-N/.claude-members, outside this traversal. Only projects/
         # remains shared; never widen other legacy shared Claude files.
-        # Normalize shared roots while pruning every private-home collection,
-        # then enter only direct children owned by this member.
+        # Normalize shared roots while pruning every private-home collection.
         script = (
             "set -eu; uid=$1; "
             'normalize_dirs() { find "$@" -xdev -uid "$uid" -type d '
@@ -2950,15 +2958,7 @@ class ChatSandboxManager:
             '-uid "$uid" -type f -exec chmod g+rw -- {} +; '
             f"if test -d {CLAUDE_SHARED_PROJECTS_DIR}; then "
             f"normalize_dirs {CLAUDE_SHARED_PROJECTS_DIR}; "
-            f"normalize_files {CLAUDE_SHARED_PROJECTS_DIR}; fi; "
-            f"for collection in {CHAT_STATE_DIR}/codex-members "
-            f"{CHAT_STATE_DIR}/opencode-members {CHAT_STATE_DIR}/kilo-members; do "
-            'test -d "$collection" || continue; '
-            'for member in "$collection"/*; do '
-            'test -e "$member" || continue; '
-            'test "$(stat -c %u "$member" 2>/dev/null || :)" = "$uid" || continue; '
-            'normalize_dirs "$member"; normalize_files "$member"; '
-            "done; done"
+            f"normalize_files {CLAUDE_SHARED_PROJECTS_DIR}; fi"
         )
         result = self.exec_capture(
             spec,
@@ -3551,6 +3551,97 @@ class ChatSandboxManager:
                 )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise SandboxError(f"chat sandbox exec failed: {exc}") from exc
+
+    def pipe_member_exec(
+        self,
+        spec: ChatSandboxSpec,
+        *,
+        source_argv: builtins.list[str],
+        source_uid: int,
+        target_argv: builtins.list[str],
+        target_uid: int,
+        user_gid: int,
+        timeout_s: float,
+    ) -> tuple[subprocess.CompletedProcess[bytes], subprocess.CompletedProcess[bytes]]:
+        """Stream one member exec's stdout into another member exec's stdin.
+
+        The two commands meet only in a pipe on this host, so a file private to
+        one member UID can reach another member without being widened inside
+        the container or staged where a sibling could read it. Both run in the
+        one inspected container. Returns ``(source, target)`` results carrying
+        each command's bounded stderr tail; the target's stdout is discarded.
+        """
+        current = self._require(spec)
+        if not current.running:
+            raise SandboxError("chat sandbox must be started before exec")
+        commands = (
+            self.build_exec_command(
+                spec,
+                source_argv,
+                workdir="/",
+                user_uid=source_uid,
+                user_gid=user_gid,
+                container_id=current.container_id,
+            ),
+            self.build_exec_command(
+                spec,
+                target_argv,
+                workdir="/",
+                interactive=True,
+                user_uid=target_uid,
+                user_gid=user_gid,
+                container_id=current.container_id,
+            ),
+        )
+        deadline = time.monotonic() + timeout_s
+        processes: builtins.list[subprocess.Popen[bytes]] = []
+        with (
+            tempfile.TemporaryFile(prefix="freeinference-member-pipe-") as source_stderr,
+            tempfile.TemporaryFile(prefix="freeinference-member-pipe-") as target_stderr,
+        ):
+            try:
+                source = subprocess.Popen(
+                    commands[0],
+                    env=self.exec_client_env(),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=source_stderr,
+                )
+                processes.append(source)
+                assert source.stdout is not None
+                try:
+                    processes.append(
+                        subprocess.Popen(
+                            commands[1],
+                            env=self.exec_client_env(),
+                            stdin=source.stdout,
+                            stdout=subprocess.DEVNULL,
+                            stderr=target_stderr,
+                        )
+                    )
+                finally:
+                    # The target owns the read end now; a target that exits
+                    # early ends the source on a broken pipe.
+                    source.stdout.close()
+                codes = [
+                    process.wait(timeout=max(0.0, deadline - time.monotonic()))
+                    for process in reversed(processes)
+                ]
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise SandboxError(f"chat sandbox member pipe failed: {exc}") from exc
+            finally:
+                for process in processes:
+                    if process.poll() is None:
+                        process.kill()
+                        with contextlib.suppress(subprocess.TimeoutExpired):
+                            process.wait(timeout=5)
+            results = []
+            for command, code, stderr in zip(
+                commands, reversed(codes), (source_stderr, target_stderr), strict=True
+            ):
+                stderr.seek(max(0, stderr.seek(0, os.SEEK_END) - 4096))
+                results.append(subprocess.CompletedProcess(command, code, b"", stderr.read()))
+        return results[0], results[1]
 
     def _kata_privileged_exec(
         self,
@@ -4726,24 +4817,72 @@ finally:
         sandbox are cleared. A failed prompt admission is marked LOST and can
         never reach this method; it is only for checkout/setup failures before
         the Agent CLI saw the user's message.
+
+        A resident that started before the failure left a member-private
+        provider home that only its member UID can open. The reset names
+        those owners before it deletes anything, has each member remove its
+        own homes, and only then clears both roots.
         """
+        collections = " ".join(PRIVATE_MEMBER_HOME_COLLECTIONS)
         script = (
             "set -eu; "
+            f"owners=$(for collection in {collections}; do "
+            'test -d "$collection" || continue; '
+            'find "$collection" -mindepth 1 -maxdepth 1 ! -uid "$(id -u)" -printf "%U\\n"; '
+            "done | sort -u); "
+            'if test -n "$owners"; then printf "%s\\n" "$owners"; exit 75; fi; '
             f"for root in {CHAT_WORKDIR} {CHAT_STATE_DIR}; do "
             'find "$root" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; '
             "done"
         )
-        result = self.exec_capture(
-            spec,
-            ["/bin/sh", "-c", script],
-            workdir="/",
-            timeout_s=120,
-        )
+        for attempt in range(2):
+            result = self.exec_capture(
+                spec,
+                ["/bin/sh", "-c", script],
+                workdir="/",
+                timeout_s=120,
+            )
+            if result.returncode != 75 or attempt:
+                break
+            self._clear_private_member_homes(spec, result.stdout)
         if result.returncode != 0:
             raise SandboxError(
                 "chat sandbox unsettled-state reset failed: "
                 + result.stderr.decode("utf-8", "replace")[:300]
             )
+
+    def _clear_private_member_homes(self, spec: ChatSandboxSpec, owners: bytes) -> None:
+        """Have each named member UID remove the provider homes it owns."""
+        uids: set[int] = set()
+        for line in owners.decode("ascii", "replace").split():
+            if not line.isdigit():
+                raise SandboxError("private member home owners are malformed")
+            uid = int(line)
+            if not MEMBER_UID_BASE <= uid < MEMBER_UID_BASE + spec.resident_slot_capacity:
+                raise SandboxError(f"private member home is owned by unexpected uid {uid}")
+            uids.add(uid)
+        collections = " ".join(PRIVATE_MEMBER_HOME_COLLECTIONS)
+        script = (
+            "set -eu; uid=$(id -u); "
+            f"for collection in {collections}; do "
+            'test -d "$collection" || continue; '
+            'find "$collection" -mindepth 1 -maxdepth 1 -uid "$uid" -exec rm -rf -- {} +; '
+            "done"
+        )
+        for uid in sorted(uids):
+            result = self.exec_capture(
+                spec,
+                ["/bin/sh", "-c", script],
+                workdir="/",
+                timeout_s=120,
+                user_uid=uid,
+                user_gid=self.backend.gid,
+            )
+            if result.returncode != 0:
+                raise SandboxError(
+                    "private member home could not be cleared: "
+                    + result.stderr.decode("utf-8", "replace")[:300]
+                )
 
     def import_base_bundle(
         self,

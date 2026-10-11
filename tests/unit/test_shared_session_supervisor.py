@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import stat
 import subprocess
 import tarfile
 import threading
 import time
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -28,7 +31,7 @@ from cloud_agent_host.chat_sandbox import (
     RetainedChatLost,
     claude_member_config_dir,
 )
-from cloud_agent_host.drivers import InputOutcome
+from cloud_agent_host.drivers import DriverError, InputOutcome
 from cloud_agent_host.guest_observer import (
     GUEST_OBSERVER_SOURCE,
     GuestObservation,
@@ -1639,6 +1642,156 @@ def test_private_provider_members_get_deterministic_distinct_homes(
     assert source_home.startswith(f"/agent-state/{collection}/")
     assert child_home.startswith(f"/agent-state/{collection}/")
     assert source_home != child_home
+
+
+class _LocalMemberShell:
+    """Run the real member scripts on this host, with /agent-state under a temp root.
+
+    Every path a script touches arrives as an argument, so rebasing the
+    ``/agent-state`` arguments is enough to exercise the actual shell. The
+    member pipe is a real pipe between the two local processes.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.backend = SimpleNamespace(uid=os.getuid(), gid=os.getgid())
+        self.calls: list[tuple[object, ...]] = []
+
+    def local(self, path: str) -> Path:
+        return Path(f"{self.root}{path}")
+
+    def _rebase(self, argv: list[str]) -> list[str]:
+        return [str(self.local(item)) if item.startswith("/agent-state") else item for item in argv]
+
+    def exec_capture(self, _spec, argv, **kwargs):
+        self.calls.append(("exec", kwargs.get("user_uid")))
+        return subprocess.run(self._rebase(argv), capture_output=True, timeout=30, check=False)
+
+    def pipe_member_exec(
+        self, _spec, *, source_argv, source_uid, target_argv, target_uid, user_gid, timeout_s
+    ):
+        self.calls.append(("pipe", source_uid, target_uid))
+        source = subprocess.Popen(
+            self._rebase(source_argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        assert source.stdout is not None and source.stderr is not None
+        target = subprocess.run(
+            self._rebase(target_argv),
+            stdin=source.stdout,
+            capture_output=True,
+            timeout=timeout_s,
+            check=False,
+        )
+        source.stdout.close()
+        stderr = source.stderr.read()
+        return subprocess.CompletedProcess(source_argv, source.wait(), b"", stderr), target
+
+
+def _private_state_root(tmp_path: Path) -> Path:
+    """Mirror the image: a setgid, group-writable /agent-state."""
+    state = tmp_path / "agent-state"
+    state.mkdir()
+    state.chmod(0o2770)
+    (state / "config.toml").write_text("model = 'bootstrap'\n")
+    (state / "config.toml").chmod(0o664)
+    return state
+
+
+def _assert_private(home: Path) -> None:
+    assert stat.S_IMODE(home.stat().st_mode) == 0o700, oct(home.stat().st_mode)
+    for path in home.rglob("*"):
+        assert path.lstat().st_mode & 0o077 == 0, (path, oct(path.lstat().st_mode))
+
+
+@pytest.mark.parametrize("runtime_id", ["codex", "opencode", "kilo"])
+def test_a_member_provider_home_is_private_to_its_member(tmp_path: Path, runtime_id: str):
+    """A sibling UID shares the group, so group bits would hand it this home."""
+    _private_state_root(tmp_path)
+    manager = _LocalMemberShell(tmp_path)
+    factory = ResidentTransportFactory(manager)  # type: ignore[arg-type]
+    launch = replace(_launch("athr_member", native_session_id=None, slot=1), runtime_id=runtime_id)
+    home = factory._member_state_dir(launch)
+
+    factory._prepare_member_state(_spec(), launch, home)
+
+    _assert_private(manager.local(home))
+    collection = manager.local(home).parent
+    assert collection.stat().st_mode & 0o070 == 0o070, "every member can add its own home"
+    assert manager.calls == [("exec", MEMBER_UID_BASE + 1)]
+    if runtime_id == "codex":
+        assert (manager.local(home) / "config.toml").read_text() == "model = 'bootstrap'\n"
+
+
+def test_an_older_group_writable_member_home_is_narrowed_on_its_next_start(tmp_path: Path):
+    _private_state_root(tmp_path)
+    manager = _LocalMemberShell(tmp_path)
+    factory = ResidentTransportFactory(manager)  # type: ignore[arg-type]
+    launch = replace(_launch("athr_member", native_session_id=None, slot=1), runtime_id="opencode")
+    home = manager.local(factory._member_state_dir(launch))
+    (home / "opencode/config").mkdir(parents=True)
+    home.chmod(0o2770)
+    (home / ".freeinference-member-state-v1").write_text("")
+
+    factory._prepare_member_state(_spec(), launch, factory._member_state_dir(launch))
+
+    assert stat.S_IMODE(home.stat().st_mode) == 0o700
+
+
+def test_a_planted_member_home_is_refused_not_adopted(tmp_path: Path):
+    _private_state_root(tmp_path)
+    manager = _LocalMemberShell(tmp_path)
+    factory = ResidentTransportFactory(manager)  # type: ignore[arg-type]
+    launch = replace(_launch("athr_member", native_session_id=None, slot=1), runtime_id="codex")
+    home = manager.local(factory._member_state_dir(launch))
+    planted = tmp_path / "sibling-owned"
+    planted.mkdir()
+    planted.chmod(0o777)
+    home.parent.mkdir()
+    home.symlink_to(planted, target_is_directory=True)
+
+    with pytest.raises(DriverError, match="not owned by this member"):
+        factory._prepare_member_state(_spec(), launch, factory._member_state_dir(launch))
+
+    assert list(planted.iterdir()) == []
+
+
+@pytest.mark.parametrize("runtime_id", ["codex", "opencode"])
+def test_fork_copies_a_private_home_without_widening_either_side(tmp_path: Path, runtime_id: str):
+    _private_state_root(tmp_path)
+    manager = _LocalMemberShell(tmp_path)
+    factory = ResidentTransportFactory(manager)  # type: ignore[arg-type]
+    source_launch = replace(
+        _launch("athr_source", native_session_id="native-source", slot=0), runtime_id=runtime_id
+    )
+    target_launch = replace(
+        _launch("athr_child", native_session_id=None, slot=2), runtime_id=runtime_id
+    )
+    source_home = factory._member_state_dir(source_launch)
+    factory._prepare_member_state(_spec(), source_launch, source_home)
+    source = manager.local(source_home)
+    (source / "sessions").mkdir()
+    (source / "sessions/rollout.jsonl").write_text('{"id":"native-source"}\n')
+    (source / ".hidden").write_text("dotfile")
+    (source / "tmp").mkdir(exist_ok=True)
+    (source / "tmp/scratch").write_text("never copied")
+    (source / f"{runtime_id}/state/{runtime_id}/locks").mkdir(parents=True)
+    (source / f"{runtime_id}/state/{runtime_id}/locks/server.lock").write_text("pid")
+    manager.calls.clear()
+
+    factory._clone_private_member_state(_spec(), source_launch, target_launch)
+
+    child = manager.local(factory._member_state_dir(target_launch))
+    _assert_private(child)
+    # The CLI's own files keep its umask; the closed home is what protects them.
+    assert stat.S_IMODE(source.stat().st_mode) == 0o700
+    assert manager.calls == [("pipe", MEMBER_UID_BASE + 0, MEMBER_UID_BASE + 2)]
+    assert (child / "sessions/rollout.jsonl").read_text() == '{"id":"native-source"}\n'
+    assert (child / ".hidden").read_text() == "dotfile"
+    assert list((child / "tmp").iterdir()) == []
+    assert (child / ".freeinference-member-state-v1").exists()
+    locks = child / f"{runtime_id}/state/{runtime_id}/locks"
+    assert locks.exists() is (runtime_id == "codex")
+    assert (source / "tmp/scratch").exists(), "the source home is read, never changed"
 
 
 def test_codex_preparing_journal_recovers_one_persisted_child_without_refork(monkeypatch):
