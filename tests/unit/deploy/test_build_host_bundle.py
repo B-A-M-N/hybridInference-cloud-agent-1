@@ -7,7 +7,10 @@ import io
 import json
 import os
 import shlex
+import subprocess
+import sys
 import tarfile
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -149,6 +152,53 @@ def test_manual_build_with_unknown_revision_has_no_selectable_release(
     assert output.is_dir()
     assert not (output / "release.json").exists()
     assert not (output / "source.tar.gz").exists()
+
+
+def test_explicit_source_root_works_from_a_shallow_builder_path(
+    source_tree: Path, tmp_path: Path
+) -> None:
+    """The Docker build copies this script to /builder before invoking it."""
+    output = tmp_path / "release"
+    with tempfile.NamedTemporaryFile(
+        dir="/tmp", prefix="build-host-bundle-", suffix=".py"
+    ) as installed:
+        installed.write((REPO_ROOT / "deploy/release/build_host_bundle.py").read_bytes())
+        installed.flush()
+        completed = subprocess.run(
+            [
+                sys.executable,
+                installed.name,
+                "--root",
+                str(source_tree),
+                "--output",
+                str(output),
+                "--source-commit",
+                COMMIT,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads((output / "release.json").read_text())["source_commit"] == COMMIT
+
+
+def test_shallow_builder_path_requires_an_explicit_source_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(hb, "__file__", "/builder/build_host_bundle.py")
+    assert (
+        hb.main(
+            [
+                "--output",
+                str(tmp_path / "release"),
+                "--source-commit",
+                COMMIT,
+            ]
+        )
+        == 1
+    )
+    assert "pass --root" in capsys.readouterr().err
 
 
 def test_control_build_and_discovery_both_name_the_deployed_revision() -> None:

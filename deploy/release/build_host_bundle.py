@@ -20,7 +20,6 @@ import sys
 import tarfile
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 FORMAT_VERSION = 1
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
 PACKAGE_ROOTS = (
@@ -74,6 +73,14 @@ class HostBundleError(Exception):
     """The available source cannot be published as a reviewed Host bundle."""
 
 
+def _default_repo_root() -> Path:
+    """Find the source root when this script still has its repository path."""
+    try:
+        return Path(__file__).resolve().parents[2]
+    except IndexError as error:
+        raise HostBundleError("Host bundle source root cannot be inferred; pass --root") from error
+
+
 def _excluded(name: str) -> bool:
     return bool(_EXCLUDED_PART.fullmatch(name)) or Path(name).suffix.lower() in _SECRET_SUFFIXES
 
@@ -112,8 +119,9 @@ def source_files(root: Path) -> list[Path]:
     return [_checked_file(root, name) for name in sorted(names)]
 
 
-def build(root: Path = REPO_ROOT) -> bytes:
+def build(root: Path | None = None) -> bytes:
     """Produce deterministic gzip/tar bytes with no containing directory."""
+    root = _default_repo_root() if root is None else root
     output = io.BytesIO()
     total = 0
     with (
@@ -161,14 +169,15 @@ def write_release(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--root", type=Path, default=REPO_ROOT)
+    parser.add_argument("--root", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--allow-unknown", action="store_true")
     args = parser.parse_args(argv)
     try:
+        root = _default_repo_root() if args.root is None else args.root
         available = write_release(
-            args.root, args.output, args.source_commit, allow_unknown=args.allow_unknown
+            root, args.output, args.source_commit, allow_unknown=args.allow_unknown
         )
     except (HostBundleError, OSError) as error:
         print(f"refusing to publish Host bundle: {error}", file=sys.stderr)
