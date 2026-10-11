@@ -660,6 +660,93 @@ def test_create_start_stop_retains_the_same_container(monkeypatch):
     assert not any(argv[1:3] in (["rm", "--force"], ["container", "rm"]) for argv in calls)
 
 
+def test_delete_stopped_removes_only_the_exact_owned_container(monkeypatch):
+    spec = _spec()
+    manager = ChatSandboxManager(ContainerBackend(image="img", sandbox_namespace="this-stack"))
+    labels = {**spec.docker_labels(), CHAT_NAMESPACE_LABEL: "this-stack"}
+    exists = True
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **_kwargs):
+        nonlocal exists
+        calls.append(list(argv))
+        if argv[1:3] == ["container", "inspect"]:
+            if not exists:
+                return SimpleNamespace(returncode=1, stdout="", stderr="Error: No such container")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=_inspect_payload(
+                    spec,
+                    status="exited",
+                    running=False,
+                    labels=labels,
+                    networks=(),
+                ),
+                stderr="",
+            )
+        if argv[1:3] == ["container", "rm"]:
+            assert argv[3] == "sha256:container-one"
+            exists = False
+            return SimpleNamespace(returncode=0, stdout=argv[3], stderr="")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr("cloud_agent_host.chat_sandbox.subprocess.run", fake_run)
+
+    assert manager.delete_stopped(spec, container_id="sha256:container-one") == "deleted"
+    remove = next(argv for argv in calls if argv[1:3] == ["container", "rm"])
+    assert remove == ["docker", "container", "rm", "sha256:container-one"]
+
+
+def test_delete_stopped_is_idempotent_only_when_exact_id_is_absent(monkeypatch):
+    manager = ChatSandboxManager(ContainerBackend(image="img"))
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(list(argv))
+        return SimpleNamespace(returncode=1, stdout="", stderr="No such container")
+
+    monkeypatch.setattr("cloud_agent_host.chat_sandbox.subprocess.run", fake_run)
+
+    assert manager.delete_stopped(_spec(), container_id="sha256:container-one") == "already_absent"
+    assert not any(argv[1:3] == ["container", "rm"] for argv in calls)
+
+
+@pytest.mark.parametrize(
+    ("running", "namespace", "message"),
+    [
+        (True, "this-stack", "refusing to delete"),
+        (False, None, "namespace ownership"),
+        (False, "other-stack", "outside this chat"),
+    ],
+)
+def test_delete_stopped_refuses_running_or_unowned_containers(
+    monkeypatch, running, namespace, message
+):
+    spec = _spec()
+    manager = ChatSandboxManager(ContainerBackend(image="img", sandbox_namespace="this-stack"))
+    labels = spec.docker_labels()
+    if namespace is not None:
+        labels[CHAT_NAMESPACE_LABEL] = namespace
+    payload = _inspect_payload(
+        spec,
+        status="running" if running else "exited",
+        running=running,
+        labels=labels,
+        networks=(),
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(list(argv))
+        return SimpleNamespace(returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr("cloud_agent_host.chat_sandbox.subprocess.run", fake_run)
+
+    with pytest.raises(SandboxError, match=message):
+        manager.delete_stopped(spec, container_id="sha256:container-one")
+    assert not any(argv[1:3] == ["container", "rm"] for argv in calls)
+
+
 def test_an_existing_name_with_other_ownership_is_never_adopted(monkeypatch):
     spec = _spec()
     manager = ChatSandboxManager(ContainerBackend(image="img"))

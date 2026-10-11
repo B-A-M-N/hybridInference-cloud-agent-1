@@ -72,6 +72,9 @@ class FakeHostPoolStore(AllCapabilities):
         self.release_calls: list[tuple[str, int, str, int | None]] = []
         self.sandbox_observations: list[dict[str, Any]] = []
         self.sandbox_stop_due: dict[str, Any] | None = None
+        self.admin_sandbox_deletions: list[dict[str, Any]] = []
+        self.admin_sandbox_delete_confirm_result = "confirmed"
+        self.admin_sandbox_delete_confirm_calls: list[dict[str, Any]] = []
         #: History rows per host, as the capacity-history route would read
         #: them out of ``agent_host_capacity_history``.
         self.history: dict[str, list[dict[str, Any]]] = {}
@@ -185,7 +188,9 @@ class FakeHostPoolStore(AllCapabilities):
         settings_local: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         row = self.rows.get(host)
-        if row is None:
+        if row is None or (
+            credential_hash is not None and row["credential_hash"] != credential_hash
+        ):
             return None
         if row["status"] in (HOST_ENROLLING, HOST_OFFLINE):
             row["status"] = HOST_ONLINE
@@ -352,6 +357,21 @@ class FakeHostPoolStore(AllCapabilities):
 
     async def due_thread_sandbox_stop(self, **_kwargs: Any) -> dict[str, Any] | None:
         return self.sandbox_stop_due
+
+    async def due_admin_sandbox_deletions(
+        self,
+        *,
+        host: str,
+        authenticated_host_capacity_epoch: Any,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        assert host in self.rows
+        assert authenticated_host_capacity_epoch == self.rows[host]["capacity_epoch"]
+        return self.admin_sandbox_deletions[:limit]
+
+    async def confirm_admin_sandbox_deleted(self, **kwargs: Any) -> str:
+        self.admin_sandbox_delete_confirm_calls.append(dict(kwargs))
+        return self.admin_sandbox_delete_confirm_result
 
 
 class RecordingGrants:
@@ -1519,6 +1539,7 @@ async def test_the_beat_that_extends_a_residency_renews_its_grant(residency_clie
 async def test_host_heartbeat_reconciles_exact_retained_docker_observations(residency_client):
     client, store, _grants = residency_client
     credential = await _enroll(client, store)
+    epoch = store.rows["runner-a"]["capacity_epoch"]
 
     response = await client.post(
         "/v1/agent/host/heartbeat",
@@ -1546,6 +1567,7 @@ async def test_host_heartbeat_reconciles_exact_retained_docker_observations(resi
         {
             "thread_id": "athr_1",
             "host": "runner-a",
+            "authenticated_host_capacity_epoch": epoch,
             "sandbox_id": "asbx_1",
             "container_id": "0123456789abcdef",
             "sandbox_generation": 3,
@@ -1686,6 +1708,85 @@ async def test_host_heartbeat_accepts_a_generation_zero_fork_target_idle_stop(re
     assert response.json()["retained_sandboxes_stop"] == [
         {**store.sandbox_stop_due, "shared_live": True, "member_activation_generations": None}
     ]
+
+
+async def test_host_heartbeat_delivers_admin_delete_without_inventory(residency_client):
+    """Omission from Docker observations is never mistaken for completion."""
+    client, store, _grants = residency_client
+    credential = await _enroll(client, store)
+    epoch = str(store.rows["runner-a"]["capacity_epoch"])
+    command = {
+        "thread_id": "athr_deleted",
+        "sandbox_id": "asbx_deleted",
+        "generation": 4,
+        "container_id": "0123456789abcdef",
+        "host_capacity_epoch": epoch,
+        "runtime_id": "codex",
+        "runtime_version": "1.2.3",
+        "sandbox_image_digest": "sha256:image",
+        "memory_limit": "4g",
+        "cpu_limit": "2",
+        "stop_timeout_seconds": 10,
+        "resident_slot_capacity": 8,
+    }
+    store.admin_sandbox_deletions = [command]
+
+    response = await client.post(
+        "/v1/agent/host/heartbeat",
+        json={"retained_sandboxes": []},
+        headers={"Authorization": f"Bearer {credential}"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["admin_sandbox_deletions"] == [{**command, "shared_live": True}]
+    assert store.admin_sandbox_delete_confirm_calls == []
+
+
+async def test_authenticated_host_confirms_exact_admin_sandbox_deletion(residency_client):
+    client, store, _grants = residency_client
+    credential = await _enroll(client, store)
+    epoch = store.rows["runner-a"]["capacity_epoch"]
+
+    response = await client.post(
+        "/v1/agent/host/sandboxes/asbx_deleted/deleted",
+        json={
+            "generation": 4,
+            "container_id": "0123456789abcdef",
+            "host_capacity_epoch": str(epoch),
+            "outcome": "already_absent",
+        },
+        headers={"Authorization": f"Bearer {credential}"},
+    )
+
+    assert response.status_code == 204, response.text
+    assert store.admin_sandbox_delete_confirm_calls == [
+        {
+            "sandbox_id": "asbx_deleted",
+            "generation": 4,
+            "container_id": "0123456789abcdef",
+            "host": "runner-a",
+            "host_capacity_epoch": epoch,
+            "authenticated_host_capacity_epoch": epoch,
+            "outcome": "already_absent",
+        }
+    ]
+
+
+async def test_admin_sandbox_deletion_completion_requires_host_auth(residency_client):
+    client, store, _grants = residency_client
+
+    response = await client.post(
+        "/v1/agent/host/sandboxes/asbx_deleted/deleted",
+        json={
+            "generation": 4,
+            "container_id": "0123456789abcdef",
+            "host_capacity_epoch": "00000000-0000-4000-8000-000000000001",
+            "outcome": "deleted",
+        },
+    )
+
+    assert response.status_code == 401
+    assert store.admin_sandbox_delete_confirm_calls == []
 
 
 async def test_stopped_shared_group_releases_and_revokes_each_member_residency(residency_client):

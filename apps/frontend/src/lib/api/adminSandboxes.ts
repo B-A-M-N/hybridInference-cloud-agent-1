@@ -40,6 +40,9 @@ export interface AdminSandbox {
   state: AdminSandboxState;
   generation?: number;
   stop_requested_at?: string | null;
+  delete_requested_at?: string | null;
+  deleted_at?: string | null;
+  delete_requested_by?: string | null;
   memory_limit: string;
   cpu_limit: string;
   member_count: number;
@@ -92,6 +95,32 @@ export interface AdminSandboxStopRequest {
   last_activity_at: string;
 }
 
+export interface AdminSandboxDeleteRequest extends AdminSandboxStopRequest {
+  confirm: true;
+}
+
+export interface AdminSandboxTrajectoryEvent {
+  id: number;
+  generation: number;
+  event_type: string;
+  from_state: string | null;
+  to_state: string | null;
+  source: 'system' | 'admin' | 'host' | 'migration';
+  actor_id: string | null;
+  created_at: string;
+  details: Record<string, unknown>;
+}
+
+export interface AdminSandboxTrajectory {
+  sandbox: AdminSandbox;
+  members: AdminSandboxMember[];
+  member_history_count: number;
+  member_history_truncated: boolean;
+  events: AdminSandboxTrajectoryEvent[];
+  observed_at: string;
+  next_cursor: string | null;
+}
+
 export interface AdminSandboxesPage {
   sandboxes: AdminSandbox[];
   next_cursor: string | null;
@@ -124,6 +153,22 @@ export function getAdminSandbox(
   }).then(jsonOrThrow<AdminSandboxDetail>);
 }
 
+export function getAdminSandboxTrajectory(
+  sandboxId: string,
+  filters: { cursor?: string; limit?: number } = {},
+  signal?: AbortSignal,
+): Promise<AdminSandboxTrajectory> {
+  const params = new URLSearchParams();
+  if (filters.limit !== undefined) params.set('limit', String(filters.limit));
+  if (filters.cursor) params.set('cursor', filters.cursor);
+  const query = params.size ? `?${params}` : '';
+  return fetchWithAuth(
+    config.apiBase,
+    `/admin/agent/sandboxes/${encodeURIComponent(sandboxId)}/trajectory${query}`,
+    { signal, cache: 'no-store' },
+  ).then(jsonOrThrow<AdminSandboxTrajectory>);
+}
+
 export function stopAdminSandbox(
   sandboxId: string,
   reviewed: AdminSandboxStopRequest,
@@ -140,4 +185,18 @@ export function stopAdminSandbox(
       cache: 'no-store',
     },
   ).then(jsonOrThrow<AdminSandboxDetail>);
+}
+
+export function deleteAdminSandbox(
+  sandboxId: string,
+  reviewed: AdminSandboxDeleteRequest,
+  signal?: AbortSignal,
+): Promise<AdminSandboxDetail> {
+  return fetchWithAuth(config.apiBase, `/admin/agent/sandboxes/${encodeURIComponent(sandboxId)}`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(reviewed),
+    signal,
+    cache: 'no-store',
+  }).then(jsonOrThrow<AdminSandboxDetail>);
 }

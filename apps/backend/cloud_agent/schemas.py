@@ -11,6 +11,7 @@ import binascii
 # silently unbuilt and raises at the first request instead of at import.
 from datetime import datetime  # noqa: TC003
 from typing import Annotated, Any, Final, Literal
+from uuid import UUID  # noqa: TC003
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
@@ -2931,6 +2932,33 @@ class RetainedSandboxStop(BaseModel):
     ) = Field(None, max_length=128)
 
 
+class AdminSandboxDeleteCommand(BaseModel):
+    """Exact stopped-container identity an admin authorized a host to remove."""
+
+    thread_id: str = Field(..., min_length=1, max_length=256)
+    sandbox_id: str = Field(..., min_length=1, max_length=256)
+    generation: int = Field(..., ge=1)
+    container_id: str = Field(..., min_length=12, max_length=256)
+    host_capacity_epoch: UUID
+    runtime_id: str = Field(..., min_length=1, max_length=128)
+    runtime_version: str | None = Field(None, max_length=128)
+    sandbox_image_digest: str | None = Field(None, max_length=512)
+    memory_limit: str = Field(..., min_length=1, max_length=32)
+    cpu_limit: str = Field(..., min_length=1, max_length=32)
+    stop_timeout_seconds: int = Field(..., ge=1, le=300)
+    resident_slot_capacity: int = Field(..., ge=2, le=128)
+    shared_live: Literal[True] = True
+
+
+class AdminSandboxDeletedRequest(BaseModel):
+    """Authenticated host receipt for one exact physical container removal."""
+
+    generation: int = Field(..., ge=1)
+    container_id: str = Field(..., min_length=12, max_length=256)
+    host_capacity_epoch: UUID
+    outcome: Literal["deleted", "already_absent"]
+
+
 class HostHeartbeatRequest(BaseModel):
     """A host reporting that it is still there, and what it now looks like.
 
@@ -3117,6 +3145,14 @@ class HostHeartbeatResponse(BaseModel):
         description=(
             "Settled-idle or failed-attempt Docker stop commands fenced to the "
             "durable container and activation generations reported by this host."
+        ),
+    )
+    admin_sandbox_deletions: list[AdminSandboxDeleteCommand] = Field(
+        default_factory=list,
+        description=(
+            "Reviewed physical-delete commands for stopped containers on this host. "
+            "They are selected independently of the host's inventory report and remain "
+            "due until an explicit authenticated completion receipt is recorded."
         ),
     )
     broker_error: str | None = Field(

@@ -381,5 +381,34 @@ class SessionSupervisorClient:
             },
         )
 
+    def delete_shared_stopped(
+        self,
+        spec: ChatSandboxSpec,
+        *,
+        container_id: str,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Delete one exact stopped shared container through the owning broker."""
+        return self._shared_request(
+            "POST",
+            spec.thread_id,
+            "delete-stopped",
+            timeout=timeout,
+            payload={
+                "sandbox_id": spec.sandbox_id,
+                "generation": spec.generation,
+                "container_id": container_id,
+                "origin_thread_id": spec.thread_id,
+                "runtime_id": spec.runtime_id,
+                "runtime_version": spec.runtime_version,
+                "sandbox_image_digest": spec.sandbox_image_digest,
+                "resident_slot_capacity": spec.resident_slot_capacity,
+                "memory_limit": spec.memory_limit,
+                "cpu_limit": spec.cpu_limit,
+                "stop_timeout_s": spec.stop_timeout_s,
+                "shared_live": True,
+            },
+        )
+
 
 __all__ = ["SessionSupervisorClient", "SessionSupervisorError", "SharedTurnStream"]

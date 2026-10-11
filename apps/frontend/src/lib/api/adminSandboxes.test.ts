@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { getAdminSandbox, getAdminSandboxes, stopAdminSandbox } from './adminSandboxes';
+import {
+  deleteAdminSandbox,
+  getAdminSandbox,
+  getAdminSandboxes,
+  getAdminSandboxTrajectory,
+  stopAdminSandbox,
+} from './adminSandboxes';
 import * as client from './client';
 
 afterEach(() => vi.restoreAllMocks());
@@ -94,4 +100,63 @@ describe('admin sandbox inventory client', () => {
       await expect(getAdminSandboxes()).rejects.toMatchObject({ statusCode: status });
     },
   );
+  it('reads a paginated trajectory with an encoded sandbox identity', async () => {
+    const response = {
+      sandbox: { id: 'sandbox/one' },
+      members: [],
+      member_history_count: 0,
+      member_history_truncated: false,
+      events: [],
+      observed_at: '2026-10-10T10:00:00Z',
+      next_cursor: null,
+    };
+    const fetch = vi
+      .spyOn(client, 'fetchWithAuth')
+      .mockResolvedValue(new Response(JSON.stringify(response)));
+    const controller = new AbortController();
+
+    expect(
+      await getAdminSandboxTrajectory(
+        'sandbox/one',
+        { limit: 200, cursor: 'opaque+cursor&next' },
+        controller.signal,
+      ),
+    ).toEqual(response);
+
+    const url = new URL(fetch.mock.calls[0][1], 'https://agent.example');
+    expect(url.pathname).toBe('/admin/agent/sandboxes/sandbox%2Fone/trajectory');
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      limit: '200',
+      cursor: 'opaque+cursor&next',
+    });
+    expect(fetch.mock.calls[0][2]).toEqual({ signal: controller.signal, cache: 'no-store' });
+  });
+
+  it('deletes exactly the reviewed sandbox identity with explicit confirmation', async () => {
+    const response = {
+      sandbox: { id: 'sandbox/one', delete_requested_at: '2026-10-10T10:00:00Z' },
+      members: [],
+      observed_at: '2026-10-10T10:00:00Z',
+    };
+    const fetch = vi
+      .spyOn(client, 'fetchWithAuth')
+      .mockResolvedValue(new Response(JSON.stringify(response), { status: 202 }));
+    const reviewed = {
+      generation: 3,
+      container_id: 'container-one',
+      last_activity_at: '2026-10-10T09:59:00Z',
+      confirm: true as const,
+    };
+    const controller = new AbortController();
+
+    expect(await deleteAdminSandbox('sandbox/one', reviewed, controller.signal)).toEqual(response);
+    expect(fetch.mock.calls[0][1]).toBe('/admin/agent/sandboxes/sandbox%2Fone');
+    expect(fetch.mock.calls[0][2]).toEqual({
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(reviewed),
+      signal: controller.signal,
+      cache: 'no-store',
+    });
+  });
 });

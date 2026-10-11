@@ -8,12 +8,16 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from cloud_agent.admin_observability import decode_cursor
 from cloud_agent.admin_sandboxes import (
+    AdminSandboxDeleteRequest,
     AdminSandboxDetail,
     AdminSandboxList,
     AdminSandboxStopRequest,
+    AdminSandboxTrajectoryPage,
     SandboxCursor,
     SandboxStateFilter,
+    SandboxTrajectoryCursor,
     sandbox_cursor_scope,
+    sandbox_trajectory_cursor_scope,
 )
 from cloud_agent.api.deps import (
     get_client_ip,
@@ -69,6 +73,28 @@ async def list_admin_sandboxes(
     return await queries.list_sandboxes(cursor=parsed, limit=limit, state=state)
 
 
+@router.get("/{sandbox_id}/trajectory", response_model=AdminSandboxTrajectoryPage)
+async def get_admin_sandbox_trajectory(
+    sandbox_id: str,
+    cursor: str | None = Query(None, max_length=2048),
+    limit: int = Query(100, ge=1, le=200),
+    queries: AdminSandboxQueries = Depends(get_admin_sandbox_queries),
+) -> AdminSandboxTrajectoryPage:
+    """Read one sandbox's newest-first lifecycle without private session content."""
+    try:
+        parsed = decode_cursor(
+            cursor,
+            SandboxTrajectoryCursor,
+            sandbox_trajectory_cursor_scope(sandbox_id),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    trajectory = await queries.trajectory(sandbox_id, cursor=parsed, limit=limit)
+    if trajectory is None:
+        raise HTTPException(status_code=404, detail="Sandbox not found.")
+    return trajectory
+
+
 @router.get("/{sandbox_id}", response_model=AdminSandboxDetail)
 async def get_admin_sandbox(
     sandbox_id: str,
@@ -76,6 +102,52 @@ async def get_admin_sandbox(
 ) -> AdminSandboxDetail:
     """Inspect safe container metadata and its current member identities."""
     detail = await queries.detail(sandbox_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Sandbox not found.")
+    return detail
+
+
+@router.delete("/{sandbox_id}", response_model=AdminSandboxDetail, status_code=202)
+async def delete_admin_sandbox(
+    sandbox_id: str,
+    payload: AdminSandboxDeleteRequest,
+    request: Request,
+    admin: str = Depends(verify_admin_access),
+    store: _AdminSandboxesStorage | None = Depends(get_storage),
+) -> AdminSandboxDetail:
+    """Queue confirmed physical deletion of an exact, stopped sandbox."""
+    storage = require_store(store)
+    result = await storage.sandbox.request_admin_delete(
+        sandbox_id=sandbox_id,
+        generation=payload.generation,
+        container_id=payload.container_id,
+        last_activity_at=payload.last_activity_at,
+        actor_id=admin,
+        admin_ip=get_client_ip(request),
+    )
+    errors = {
+        "not_found": (404, "Sandbox not found."),
+        "stale": (
+            409,
+            "Sandbox activity or container changed. Refresh before deleting it.",
+        ),
+        "already_deleted": (409, "Sandbox has already been deleted."),
+        "not_stopped": (409, "Stop the sandbox before deleting it."),
+        "host_incarnation_unverified": (
+            409,
+            "The owning host has not positively reported this exact container under "
+            "its current enrollment. Wait for a heartbeat, then refresh.",
+        ),
+        "busy": (
+            409,
+            "Sandbox has an active residency, operation, fork, or snapshot. "
+            "Wait until it is quiescent.",
+        ),
+    }
+    if result != "accepted":
+        status, message = errors[result]
+        raise HTTPException(status_code=status, detail=message)
+    detail = await storage.admin_sandboxes.detail(sandbox_id)
     if detail is None:
         raise HTTPException(status_code=404, detail="Sandbox not found.")
     return detail

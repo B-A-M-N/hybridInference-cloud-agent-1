@@ -1984,6 +1984,50 @@ class ChatSandboxManager:
             )
         return self._release_sandbox_networks(spec, stopped)
 
+    def delete_stopped(
+        self,
+        spec: ChatSandboxSpec,
+        *,
+        container_id: str,
+    ) -> Literal["deleted", "already_absent"]:
+        """Remove only the exact, owned, stopped container named by a durable fence."""
+        if not container_id:
+            raise ValueError("expected retained container id must be non-empty")
+        # Inspect by durable ID, not the reusable Docker name. A renamed
+        # container is not absent, and a new occupant of the old name is not
+        # the object the admin reviewed.
+        current = self.inspect(container_id)
+        if current is None:
+            return "already_absent"
+        self._verify_identity(current, spec)
+        if current.labels.get(CHAT_NAMESPACE_LABEL) != self.backend.sandbox_namespace:
+            raise SandboxError("refusing to delete a container without exact namespace ownership")
+        if current.container_id != container_id:
+            raise RetainedChatLost("retained chat container id does not match the deletion fence")
+        if current.running or current.status not in {
+            ChatSandboxStatus.STOPPED,
+            ChatSandboxStatus.CREATED,
+        }:
+            raise SandboxError(f"refusing to delete chat sandbox in state {current.status.value!r}")
+        # Stopping normally releases the group bridge. Repeat that idempotent
+        # cleanup here so a retry after a broker crash cannot orphan networking.
+        current = self._release_sandbox_networks(spec, current)
+        if current.container_id != container_id:
+            raise RetainedChatLost("retained chat container changed during deletion")
+        result = self._run(
+            [self.backend.docker_binary, "container", "rm", current.container_id],
+            timeout=30,
+        )
+        if result.returncode != 0:
+            # Docker removal is synchronous, but the HTTP receipt can be lost.
+            # Treat only proven absence of the exact ID as idempotent success.
+            if self.inspect(container_id) is None:
+                return "already_absent"
+            raise SandboxError("chat sandbox could not be deleted: " + result.stderr.strip()[:300])
+        if self.inspect(container_id) is not None:
+            raise SandboxError("chat sandbox still exists after Docker reported deletion")
+        return "deleted"
+
     def require_network(
         self, spec: ChatSandboxSpec, *, observer: StageObserver | None = None
     ) -> None:

@@ -234,6 +234,8 @@ async def fail_discontinuous_follow_ups(
                           AND m.context_status <> 'lost'
                           AND m.native_state <> 'lost'
                           AND g.state NOT IN ('stopped_dirty', 'lost')
+                          AND g.delete_requested_at IS NULL
+                          AND g.deleted_at IS NULL
                   )
             )
             UPDATE agent_jobs pending

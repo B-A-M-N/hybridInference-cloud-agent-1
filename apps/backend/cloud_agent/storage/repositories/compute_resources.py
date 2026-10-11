@@ -402,7 +402,8 @@ class PostgresComputeResourceRepository:
                 for r in await conn.fetch(
                     """SELECT h.host,h.status,h.compute_node_id,
                 h.slots_used,h.last_heartbeat_at,h.broker_url,
-                (SELECT count(*) FROM agent_sandboxes g WHERE g.host=h.host) AS retained_groups
+                (SELECT count(*) FROM agent_sandboxes g
+                 WHERE g.host=h.host AND g.deleted_at IS NULL) AS retained_groups
                 FROM agent_runner_hosts h JOIN agent_compute_nodes n ON n.id=h.compute_node_id
                 WHERE n.allocation_id=$1 ORDER BY h.host""",
                     allocation_id,
@@ -452,7 +453,8 @@ class PostgresComputeResourceRepository:
                 for r in await conn.fetch("""SELECT h.host,h.status,h.compute_node_id,
                 n.allocation_id,h.slots_used,h.slots_total,h.slots_desired,h.last_heartbeat_at,
                 h.labels->>'physical_host' AS physical_host,h.broker_url,
-                (SELECT count(*) FROM agent_sandboxes g WHERE g.host=h.host) AS retained_groups
+                (SELECT count(*) FROM agent_sandboxes g
+                 WHERE g.host=h.host AND g.deleted_at IS NULL) AS retained_groups
                 FROM agent_runner_hosts h LEFT JOIN agent_compute_nodes n ON n.id=h.compute_node_id
                 ORDER BY h.host""")
             ]
@@ -1425,7 +1427,8 @@ class PostgresComputeResourceRepository:
         if active in hosts:
             reasons.append("placement_pinned")
         groups = await conn.fetch(
-            "SELECT id,host,state,active_operation_count FROM agent_sandboxes WHERE host=ANY($1::text[])",
+            "SELECT id,host,state,active_operation_count FROM agent_sandboxes "
+            "WHERE host=ANY($1::text[]) AND deleted_at IS NULL",
             hosts,
         )
         if groups:
@@ -1440,7 +1443,8 @@ class PostgresComputeResourceRepository:
             reasons.append("active_attempts_present")
         forks = await conn.fetchval(
             """SELECT count(*) FROM agent_session_forks f JOIN agent_sandboxes g ON g.id=f.sandbox_id
-            WHERE g.host=ANY($1::text[]) AND f.state IN ('preparing','materialized')""",
+            WHERE g.host=ANY($1::text[]) AND g.deleted_at IS NULL
+              AND f.state IN ('preparing','materialized')""",
             hosts,
         )
         if forks:

@@ -11,6 +11,7 @@ from cloud_agent.admin_observability import cursor_scope
 from cloud_agent_shared.sandbox_resources import parse_sandbox_resource_sample
 
 SANDBOX_CURSOR_SCOPE = cursor_scope(["sandboxes", "running"])
+SANDBOX_TRAJECTORY_MEMBER_LIMIT = 128
 RESOURCE_STALE_SECONDS = 90.0
 SandboxState = Literal[
     "provisioning", "starting", "running", "stopping", "stopped", "stopped_dirty", "lost"
@@ -23,6 +24,11 @@ SandboxStateFilter = Literal[
 def sandbox_cursor_scope(state: SandboxStateFilter) -> str:
     """Bind continuation tokens to the exact lifecycle filter."""
     return cursor_scope(["sandboxes", state])
+
+
+def sandbox_trajectory_cursor_scope(sandbox_id: str) -> str:
+    """Bind continuation tokens to one immutable sandbox identity."""
+    return cursor_scope(["sandbox-trajectory", sandbox_id])
 
 
 class AdminSandboxResourceUsage(BaseModel):
@@ -93,6 +99,9 @@ class AdminSandbox(BaseModel):
     execution_profile: str
     state: SandboxState = "running"
     stop_requested_at: datetime | None = None
+    delete_requested_at: datetime | None = None
+    delete_requested_by: str | None = None
+    deleted_at: datetime | None = None
     memory_limit: str
     cpu_limit: str
     member_count: int = Field(ge=0)
@@ -161,3 +170,51 @@ class AdminSandboxStopRequest(BaseModel):
     generation: int = Field(ge=1)
     container_id: str = Field(min_length=1, max_length=256)
     last_activity_at: datetime
+
+
+class AdminSandboxDeleteRequest(BaseModel):
+    """A confirmed deletion of the exact stopped container an admin reviewed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: Literal[True]
+    generation: int = Field(ge=1)
+    container_id: str = Field(min_length=1, max_length=256)
+    last_activity_at: datetime
+
+
+class SandboxTrajectoryCursor(BaseModel):
+    """Continue newest-first through one fixed event snapshot."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1] = 1
+    scope: str
+    snapshot_id: int = Field(ge=0, le=2**63 - 1)
+    before_id: int = Field(ge=1, le=2**63 - 1)
+
+
+class AdminSandboxTrajectoryEvent(BaseModel):
+    """One content-free retained-sandbox lifecycle observation."""
+
+    id: int
+    generation: int = Field(ge=1)
+    event_type: str
+    from_state: str | None = None
+    to_state: str | None = None
+    source: Literal["system", "admin", "host", "migration"]
+    actor_id: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class AdminSandboxTrajectoryPage(BaseModel):
+    """Current tombstone and bounded membership context beside a stable event page."""
+
+    sandbox: AdminSandbox
+    members: list[AdminSandboxMember] = Field(max_length=SANDBOX_TRAJECTORY_MEMBER_LIMIT)
+    member_history_count: int = Field(ge=0)
+    member_history_truncated: bool
+    events: list[AdminSandboxTrajectoryEvent]
+    observed_at: datetime
+    next_cursor: str | None = None

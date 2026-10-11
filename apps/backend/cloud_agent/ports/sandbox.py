@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from datetime import datetime
+    from uuid import UUID
 
 
 class SandboxRepository(Protocol):
@@ -34,6 +35,52 @@ class SandboxRepository(Protocol):
         The database marker survives observations and excludes new admission
         until Docker confirms the stop. No container or workspace is deleted.
         """
+        ...
+
+    async def request_admin_delete(
+        self,
+        *,
+        sandbox_id: str,
+        generation: int,
+        container_id: str,
+        last_activity_at: datetime,
+        actor_id: str,
+        admin_ip: str,
+    ) -> str:
+        """Queue physical deletion of a reviewed, stopped, quiescent sandbox.
+
+        The durable marker closes new admission and survives until the owning
+        host reports deletion of the exact fenced container. The sandbox row
+        remains as a tombstone for its membership and trajectory history.
+        """
+        ...
+
+    async def due_admin_sandbox_deletions(
+        self,
+        *,
+        host: str,
+        authenticated_host_capacity_epoch: UUID,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return reviewed physical-delete commands still awaiting host receipt.
+
+        Delivery is host-scoped but deliberately independent of inventory:
+        absence from a heartbeat never proves that Docker removed anything.
+        """
+        ...
+
+    async def confirm_admin_sandbox_deleted(
+        self,
+        *,
+        sandbox_id: str,
+        generation: int,
+        container_id: str,
+        host: str,
+        host_capacity_epoch: UUID,
+        authenticated_host_capacity_epoch: UUID,
+        outcome: str,
+    ) -> str:
+        """Tombstone only after the owning host acknowledges the exact container."""
         ...
 
     async def thread_workspace_ready(self, *, thread_id: str) -> bool:
@@ -168,6 +215,7 @@ class SandboxRepository(Protocol):
         *,
         thread_id: str,
         host: str,
+        authenticated_host_capacity_epoch: UUID,
         sandbox_id: str,
         container_id: str,
         sandbox_generation: int,

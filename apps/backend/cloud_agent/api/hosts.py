@@ -32,6 +32,8 @@ from cloud_agent.host_pool import (
     hash_secret,
 )
 from cloud_agent.schemas import (
+    AdminSandboxDeleteCommand,
+    AdminSandboxDeletedRequest,
     HostHeartbeatRequest,
     HostHeartbeatResponse,
     HostRegisterRequest,
@@ -274,9 +276,9 @@ async def heartbeat_host(
         settings_local=reported_values(body.settings_local),
     )
     if updated is None:
-        # The row vanished between authentication and the write — a forget
-        # landing mid-request. Refusing is right: this credential now names
-        # nothing.
+        # The row vanished or its credential was superseded between
+        # authentication and the write. Refusing keeps an old incarnation
+        # from refreshing or reporting inventory for its replacement.
         raise _unauthorized("This host credential is no longer valid.")
     # Residency beats ride the host heartbeat (design §7): one wire message
     # says "I am here" and "these sandboxes are still mine", generation-scoped
@@ -318,6 +320,7 @@ async def heartbeat_host(
         await job_store.sandbox.reconcile_thread_sandbox_observation(
             thread_id=retained.thread_id,
             host=updated["host"],
+            authenticated_host_capacity_epoch=updated["capacity_epoch"],
             sandbox_id=retained.sandbox_id,
             container_id=retained.container_id,
             sandbox_generation=retained.generation,
@@ -379,6 +382,18 @@ async def heartbeat_host(
             )
             if due is not None:
                 retained_stops.append(RetainedSandboxStop.model_validate(due))
+    # Delete intent is durable control-plane state, not an inference from what
+    # the host happened to include in this beat. Keep delivering it even when
+    # the broker inventory is empty or temporarily unavailable; only the
+    # authenticated completion endpoint below advances the tombstone.
+    admin_deletions = [
+        AdminSandboxDeleteCommand.model_validate(command)
+        for command in await job_store.sandbox.due_admin_sandbox_deletions(
+            host=updated["host"],
+            authenticated_host_capacity_epoch=updated["capacity_epoch"],
+            limit=100,
+        )
+    ]
     return HostHeartbeatResponse(
         host=updated["host"],
         status=updated["status"],
@@ -396,6 +411,7 @@ async def heartbeat_host(
         ),
         residencies_lost=lost,
         retained_sandboxes_stop=retained_stops,
+        admin_sandbox_deletions=admin_deletions,
         heartbeat_interval_seconds=HEARTBEAT_INTERVAL_S,
         # Rate-limited inside the probe. Heartbeats are this host's liveness
         # signal and must not come to depend on a second service answering, but
@@ -403,6 +419,42 @@ async def heartbeat_host(
         # already wrong when the host enrolled — which is how the first remote
         # host was misconfigured, and it stayed invisible for a day.
         broker_error=await _probed_broker_error(updated["host"], body.broker_url),
+    )
+
+
+@router.post("/sandboxes/{sandbox_id}/deleted", status_code=204)
+async def confirm_admin_sandbox_deleted(
+    sandbox_id: str,
+    body: AdminSandboxDeletedRequest,
+    host: dict[str, Any] = Depends(authenticate_host),
+    store: _HostsStorage | None = Depends(get_storage),
+) -> None:
+    """Record an explicit host receipt for one exact physical deletion."""
+    job_store = _require_store(store)
+    result = await job_store.sandbox.confirm_admin_sandbox_deleted(
+        sandbox_id=sandbox_id,
+        generation=body.generation,
+        container_id=body.container_id,
+        host=host["host"],
+        host_capacity_epoch=body.host_capacity_epoch,
+        authenticated_host_capacity_epoch=host["capacity_epoch"],
+        outcome=body.outcome,
+    )
+    if result in {"confirmed", "already_confirmed"}:
+        return
+    if result == "not_found":
+        raise HTTPException(
+            status_code=404,
+            detail={"error": {"type": "not_found", "message": "Sandbox not found."}},
+        )
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error": {
+                "type": result,
+                "message": "Sandbox deletion receipt no longer matches durable state.",
+            }
+        },
     )
 
 
