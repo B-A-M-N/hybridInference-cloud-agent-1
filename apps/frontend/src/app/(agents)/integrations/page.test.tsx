@@ -18,6 +18,7 @@ import { listSkills } from '@/lib/api/skills';
 vi.mock('@/lib/api/skills', () => ({ listSkills: vi.fn() }));
 
 vi.mock('@/lib/api/agents', () => ({
+  getAgentConfig: vi.fn(),
   getAgentIntegrations: vi.fn(),
   disconnectAgentIntegration: vi.fn(),
 }));
@@ -35,7 +36,7 @@ vi.mock('@/lib/api/mcp', () => ({
   authorizeMcpConnection: vi.fn(),
 }));
 
-import { getAgentIntegrations } from '@/lib/api/agents';
+import { getAgentConfig, getAgentIntegrations } from '@/lib/api/agents';
 import { listMcpConnections, testMcpConnection } from '@/lib/api/mcp';
 
 const connection: McpConnectionApi = {
@@ -72,6 +73,13 @@ const connection: McpConnectionApi = {
 beforeEach(() => {
   vi.mocked(listSkills).mockResolvedValue([]);
   navigation.search = '';
+  vi.mocked(getAgentConfig).mockResolvedValue({
+    models: ['model-a'],
+    repos: [],
+    runtimes: ['codex'],
+    github_connected: false,
+    github_install_url: null,
+  });
   vi.mocked(getAgentIntegrations).mockResolvedValue({ providers: [] });
   vi.mocked(listMcpConnections).mockResolvedValue({ connections: [connection], templates: [] });
   vi.mocked(getUserMemory).mockResolvedValue({

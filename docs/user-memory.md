@@ -36,12 +36,14 @@ Repository scope is the default for project conventions and technical choices.
 
 ## Controls
 
-- **Consolidate** uses an available model under your account's permissions and
-  quota to merge duplicates, shorten preferences, and decide their scope. It
-  favors repository memory and reserves user memory for general communication
-  and collaboration preferences. It drops temporary instructions and task
-  references. Saving is revision-checked so a slow model cannot overwrite
-  newer edits or a clear. Consolidation is disabled while an editor is open.
+- **Consolidate** uses the model you choose from your account's available models,
+  under your account's permissions and quota, to merge duplicates, shorten
+  preferences, and decide their scope. It favors repository memory and reserves
+  user memory for general communication and collaboration preferences. It drops
+  temporary instructions and task references. Saving is revision-checked so a
+  slow model cannot overwrite
+  newer edits or a clear. An empty model result leaves saved memory unchanged.
+  Consolidation is disabled while an editor is open or no model is available.
 - **Refresh** rebuilds memory and the avatar's usage theme from currently eligible
   requests.
 - Turning off **Automatically build memory** pauses automatic updates and
@@ -106,10 +108,15 @@ with `409`, and return `404` when the owner has no such visible entry. Entry
 kind and source information cannot be changed. Responses mark corrected
 entries with `user_edited`.
 
-`POST /v1/agent/user-memory/consolidate` accepts `{revision}` and returns the
-updated profile. Model output is checked for owned source references, duplicate
-references, cross-repository merges, credentials, temporary instructions, and
-all memory limits before saving. Stale output returns `409`.
+`POST /v1/agent/user-memory/consolidate` accepts `{revision, model}` and returns the
+updated profile. The optional `model` must be available to the authenticated
+account; unavailable choices return `400`. Omitting it preserves automatic model
+selection for existing clients. Model output is checked for owned source
+references, duplicate references, cross-repository merges, credentials,
+temporary instructions, and all memory limits before saving. Only nonempty
+results replace saved memory; empty results return the latest profile without
+recording removals. Stale output
+returns `409` when a replacement is attempted.
 
 ## Future improvements
 

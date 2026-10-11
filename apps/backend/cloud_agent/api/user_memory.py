@@ -239,6 +239,7 @@ class ConsolidateMemoryRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
     revision: int = Field(ge=0)
+    model: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 def _conflict() -> HTTPException:
@@ -264,8 +265,15 @@ async def consolidate_user_memory(
         return _view(current, user["user_id"])
     try:
         memories = await consolidate_memory(
-            current, user_id=user["user_id"], gateway=gateway, grants=grants
+            current,
+            user_id=user["user_id"],
+            gateway=gateway,
+            grants=grants,
+            requested_model=body.model,
         )
+        if not memories:
+            values = await repository.refresh(user_id=user["user_id"])
+            return _view(values, user["user_id"])
         values = await repository.replace_memories(
             user_id=user["user_id"], revision=body.revision, memories=memories
         )

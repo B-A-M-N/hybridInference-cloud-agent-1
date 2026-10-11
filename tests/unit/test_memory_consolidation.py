@@ -72,6 +72,10 @@ def test_consolidation_classifies_user_preferences_and_retains_repo_isolation():
     assert result[0]["source_ids"] == api["source_ids"]
 
 
+def test_empty_consolidation_is_a_valid_result():
+    assert parse_consolidation(completion([]), profile()["memories"]) == []
+
+
 @pytest.mark.parametrize(
     "bad",
     [
@@ -213,3 +217,67 @@ async def test_no_permitted_model_does_not_mint_a_grant(monkeypatch):
     with pytest.raises(MemoryConsolidationError):
         await consolidate_memory(profile(), user_id="alice", gateway=gateway, grants=grants)
     grants.mint.assert_not_awaited()
+
+
+@pytest.mark.parametrize("requested_model", ["chosen-model", "chosen-alias"])
+async def test_explicit_model_is_resolved_for_the_owned_grant_and_request(
+    monkeypatch, requested_model
+):
+    monkeypatch.setenv("GATEWAY_BASE_URL", "https://gateway.example")
+    view = profile()
+    gateway, grants = AsyncMock(), AsyncMock()
+    gateway.model_catalog_with_aliases.return_value = (
+        ["canonical-model", "chosen-model"],
+        {"model-alias": "canonical-model", "chosen-alias": "chosen-model"},
+    )
+    grants.mint.return_value = {
+        "grant_id": "grant-chosen",
+        "token": "private-grant",
+        "allowed_models": ["chosen-model"],
+    }
+    requests = []
+
+    async def handle(request):
+        requests.append(request)
+        assert json.loads(request.content)["model"] == "chosen-model"
+        return httpx.Response(200, json=completion([output(view["memories"][0])]))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        result = await consolidate_memory(
+            view,
+            user_id="alice",
+            gateway=gateway,
+            grants=grants,
+            requested_model=requested_model,
+            client=client,
+        )
+    assert result[0]["content"] == "Run API tests."
+    gateway.model_catalog_with_aliases.assert_awaited_once_with("alice")
+    assert grants.mint.await_args.kwargs["models"] == ["chosen-model"]
+    assert grants.mint.await_args.kwargs["user_id"] == "alice"
+    grants.revoke.assert_awaited_once_with("grant-chosen")
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("requested_model", ["unavailable-model", "unavailable-alias", ""])
+async def test_unavailable_requested_model_never_falls_back_or_mints_a_grant(
+    monkeypatch, requested_model
+):
+    monkeypatch.setenv("GATEWAY_BASE_URL", "https://gateway.example")
+    gateway, grants = AsyncMock(), AsyncMock()
+    gateway.model_catalog_with_aliases.return_value = (
+        ["canonical-model"],
+        {"model-alias": "canonical-model", "unavailable-alias": "unavailable-model"},
+    )
+    with pytest.raises(MemoryConsolidationError) as exc:
+        await consolidate_memory(
+            profile(),
+            user_id="alice",
+            gateway=gateway,
+            grants=grants,
+            requested_model=requested_model,
+        )
+    assert exc.value.status_code == 400
+    assert "selected model is not available" in str(exc.value)
+    grants.mint.assert_not_awaited()
+    grants.revoke.assert_not_awaited()

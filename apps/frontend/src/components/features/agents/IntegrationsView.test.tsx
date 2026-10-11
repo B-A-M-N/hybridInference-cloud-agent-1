@@ -21,6 +21,7 @@ import { listSkills } from '@/lib/api/skills';
 vi.mock('@/lib/api/skills', () => ({ listSkills: vi.fn() }));
 
 vi.mock('@/lib/api/agents', () => ({
+  getAgentConfig: vi.fn(),
   getAgentIntegrations: vi.fn(),
   disconnectAgentIntegration: vi.fn(),
   disconnectGitHubAccount: vi.fn(),
@@ -46,6 +47,7 @@ vi.mock('@/lib/api/mcp', () => ({
 import {
   disconnectAgentIntegration,
   disconnectGitHubAccount,
+  getAgentConfig,
   getAgentIntegrations,
 } from '@/lib/api/agents';
 import { listMcpConnections } from '@/lib/api/mcp';
@@ -140,6 +142,13 @@ function unloadedGithub(
 beforeEach(() => {
   localStorage.clear();
   document.documentElement.lang = 'en';
+  vi.mocked(getAgentConfig).mockResolvedValue({
+    models: ['model-a', 'model-b'],
+    repos: [],
+    runtimes: ['codex'],
+    github_connected: true,
+    github_install_url: null,
+  });
   vi.mocked(listSkills).mockResolvedValue([]);
   mockedListMcpConnections.mockResolvedValue({ connections: [], templates: [] });
   vi.mocked(getUserMemory).mockResolvedValue(memory);
@@ -189,6 +198,10 @@ describe('IntegrationsView', () => {
 
     const section = screen.getByRole('region', { name: 'Memory' });
     await within(section).findByRole('switch');
+    expect(within(section).getByRole('combobox', { name: 'Consolidation model' })).toHaveValue(
+      'model-a',
+    );
+    expect(within(section).getByRole('button', { name: 'Consolidate' })).toBeEnabled();
     expect(within(section).queryByRole('img')).not.toBeInTheDocument();
     expect(within(section).getByText(memory.portrait.summary)).toBeInTheDocument();
     expect(within(section).getByRole('link', { name: 'View source task' })).toHaveAttribute(

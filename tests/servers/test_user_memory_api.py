@@ -13,6 +13,7 @@ from cloud_agent import identity
 from cloud_agent.api import user_memory
 from cloud_agent.api.deps import get_gateway_client, get_storage
 from cloud_agent.app import create_app, create_mcp_app, install_admin_no_store
+from cloud_agent.memory_consolidation import MemoryConsolidationError
 from cloud_agent.user_avatar import generate_user_avatar
 from cloud_agent.user_memory import (
     MemoryRevisionConflict,
@@ -168,6 +169,7 @@ async def test_paused_avatar_uses_saved_activity_clear_resets_and_resume_updates
             {"content": "Prefer concise replies.", "expected_revision": 0},
         ),
         ("DELETE", PATH + "/entries/memory-1", {"expected_revision": 0}),
+        ("POST", PATH + "/consolidate", {"revision": 0, "model": "chosen-model"}),
     ],
 )
 @pytest.mark.parametrize("credential", [None, "ajt.worker-token", "agr.inference-token"])
@@ -495,8 +497,9 @@ async def test_invalid_edits_do_not_mutate_saved_memory(app, invalid):
 
 
 @pytest.mark.parametrize("conflict", [False, True])
+@pytest.mark.parametrize("model", [None, "chosen-model"])
 async def test_consolidation_runs_for_owner_and_fences_slow_model_results(
-    app, monkeypatch, conflict
+    app, monkeypatch, conflict, model
 ):
     current = activity_profile("I prefer concise replies.")
     app.state.repository.refresh.side_effect = None
@@ -510,14 +513,105 @@ async def test_consolidation_runs_for_owner_and_fences_slow_model_results(
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="https://agent.example"
     ) as client:
-        response = await client.post(
-            PATH + "/consolidate", headers=session_headers(), json={"revision": 0}
-        )
+        body = {"revision": 0}
+        if model is not None:
+            body["model"] = model
+        response = await client.post(PATH + "/consolidate", headers=session_headers(), json=body)
     assert response.status_code == (409 if conflict else 200)
     assert response.headers["Cache-Control"] == "no-store"
     assert consolidate.await_args.kwargs["user_id"] == "owner-1"
+    assert consolidate.await_args.kwargs["requested_model"] == model
     app.state.repository.replace_memories.assert_awaited_once_with(
         user_id="owner-1",
         revision=0,
         memories=current["memories"],
     )
+
+
+@pytest.mark.parametrize("cleared_during_inference", [False, True])
+async def test_empty_consolidation_preserves_saved_memory_and_returns_latest_snapshot(
+    app, monkeypatch, cleared_during_inference
+):
+    current = {**activity_profile("I prefer concise replies."), "revision": 7}
+    latest = {**build_user_memory([], None), "revision": 8} if cleared_during_inference else current
+    app.state.repository.refresh.side_effect = [current, latest]
+    consolidate = AsyncMock(return_value=[])
+    monkeypatch.setattr(user_memory, "consolidate_memory", consolidate)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://agent.example"
+    ) as client:
+        response = await client.post(
+            PATH + "/consolidate",
+            headers=session_headers(),
+            json={"revision": 7, "model": "chosen-model"},
+        )
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.json() == user_memory._view(latest, "owner-1").model_dump(mode="json")
+    assert consolidate.await_args.kwargs["requested_model"] == "chosen-model"
+    assert [call.kwargs for call in app.state.repository.refresh.await_args_list] == [
+        {"user_id": "owner-1"},
+        {"user_id": "owner-1"},
+    ]
+    app.state.repository.replace_memories.assert_not_awaited()
+
+
+@pytest.mark.parametrize("status", [400, 429, 502, 503])
+async def test_consolidation_failure_never_replaces_saved_memory(app, monkeypatch, status):
+    current = {**activity_profile("I prefer concise replies."), "revision": 7}
+    app.state.repository.refresh.side_effect = None
+    app.state.repository.refresh.return_value = current
+    consolidate = AsyncMock(side_effect=MemoryConsolidationError("Please try again.", status))
+    monkeypatch.setattr(user_memory, "consolidate_memory", consolidate)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://agent.example"
+    ) as client:
+        response = await client.post(
+            PATH + "/consolidate", headers=session_headers(), json={"revision": 7}
+        )
+    assert response.status_code == status
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.json() == {"detail": "Please try again."}
+    app.state.repository.replace_memories.assert_not_awaited()
+
+
+async def test_stale_consolidation_does_not_call_model_or_replace_memory(app, monkeypatch):
+    app.state.repository.refresh.side_effect = None
+    app.state.repository.refresh.return_value = {
+        **activity_profile("I prefer concise replies."),
+        "revision": 8,
+    }
+    consolidate = AsyncMock()
+    monkeypatch.setattr(user_memory, "consolidate_memory", consolidate)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://agent.example"
+    ) as client:
+        response = await client.post(
+            PATH + "/consolidate",
+            headers=session_headers(),
+            json={"revision": 7, "model": "chosen-model"},
+        )
+    assert response.status_code == 409
+    consolidate.assert_not_awaited()
+    app.state.repository.replace_memories.assert_not_awaited()
+
+
+@pytest.mark.parametrize("model", ["", "x" * 201, 123, False, ["chosen-model"]])
+async def test_invalid_consolidation_model_does_not_reach_inference_or_storage(
+    app, monkeypatch, model
+):
+    consolidate = AsyncMock()
+    monkeypatch.setattr(user_memory, "consolidate_memory", consolidate)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://agent.example"
+    ) as client:
+        response = await client.post(
+            PATH + "/consolidate",
+            headers=session_headers(),
+            json={"revision": 0, "model": model},
+        )
+    assert response.status_code == 422
+    assert response.headers["Cache-Control"] == "no-store"
+    consolidate.assert_not_awaited()
+    app.state.repository.refresh.assert_not_awaited()
+    app.state.repository.replace_memories.assert_not_awaited()

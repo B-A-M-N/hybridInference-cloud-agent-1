@@ -1,7 +1,8 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { useAuth, useLocale } from '@/components/providers';
+import { getAgentConfig } from '@/lib/api/agents';
 import {
   clearUserMemory,
   consolidateUserMemory,
@@ -41,6 +42,29 @@ function UserMemoryPanel({ userId }: { userId: string | undefined }) {
   const wasConfirming = useRef(false);
   const memoriesHeading = useRef<HTMLHeadingElement>(null);
   const [removedEntries, setRemovedEntries] = useState(0);
+  const [models, setModels] = useState<string[]>([]);
+  const [modelsStatus, setModelsStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [modelLoadAttempt, setModelLoadAttempt] = useState(0);
+  const [modelChoice, setModelChoice] = useState('');
+  const modelSelectId = useId();
+
+  useEffect(() => {
+    if (!userId) return;
+    let cancelled = false;
+    setModelsStatus('loading');
+    getAgentConfig()
+      .then((config) => {
+        if (cancelled) return;
+        setModels(config.models);
+        setModelsStatus('ready');
+      })
+      .catch(() => {
+        if (!cancelled) setModelsStatus('error');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [userId, modelLoadAttempt]);
 
   useEffect(() => {
     if (removedEntries) memoriesHeading.current?.focus();
@@ -127,6 +151,12 @@ function UserMemoryPanel({ userId }: { userId: string | undefined }) {
     ...(view?.memories ?? []),
     ...[...editingEntries.values()].filter((memory) => !savedIds.has(memory.id)),
   ];
+  const preferredModel = view?.portrait.preferred_model;
+  const consolidationModel = models.includes(modelChoice)
+    ? modelChoice
+    : preferredModel && models.includes(preferredModel)
+      ? preferredModel
+      : (models[0] ?? '');
 
   return (
     <section
@@ -197,7 +227,7 @@ function UserMemoryPanel({ userId }: { userId: string | undefined }) {
                     </p>
                   ) : null}
                 </div>
-                <div className="flex flex-wrap gap-2 lg:ml-auto">
+                <div className="flex flex-wrap items-end gap-2 lg:ml-auto">
                   <button
                     type="button"
                     onClick={() => void run('refresh', getUserMemory)}
@@ -210,22 +240,60 @@ function UserMemoryPanel({ userId }: { userId: string | undefined }) {
                         : 'settings.memory.refresh',
                     )}
                   </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      void run('consolidate', (signal) =>
-                        consolidateUserMemory(view.revision, signal),
-                      )
-                    }
-                    disabled={pending !== null || editingEntries.size > 0 || !view.memories.length}
-                    className="ui-button ui-button-secondary min-h-11"
-                  >
-                    {t(
-                      pending === 'consolidate'
-                        ? 'settings.memory.consolidating'
-                        : 'settings.memory.consolidate',
-                    )}
-                  </button>
+                  <div className="flex flex-wrap items-end gap-2">
+                    <div className="min-w-0">
+                      <label
+                        htmlFor={modelSelectId}
+                        className="text-xs font-medium text-foreground"
+                      >
+                        {t('settings.memory.consolidationModel')}
+                      </label>
+                      <select
+                        id={modelSelectId}
+                        value={consolidationModel}
+                        onChange={(event) => setModelChoice(event.target.value)}
+                        disabled={pending !== null || modelsStatus !== 'ready' || !models.length}
+                        className="ui-input mt-1 block min-h-11 max-w-full rounded-lg"
+                      >
+                        {!models.length ? (
+                          <option value="">
+                            {t(
+                              modelsStatus === 'loading'
+                                ? 'settings.memory.modelsLoading'
+                                : 'settings.memory.noModels',
+                            )}
+                          </option>
+                        ) : null}
+                        {models.map((model) => (
+                          <option key={model} value={model}>
+                            {model}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void run('consolidate', (signal) =>
+                          consolidateUserMemory(view.revision, consolidationModel, signal),
+                        )
+                      }
+                      disabled={
+                        pending !== null ||
+                        editingEntries.size > 0 ||
+                        !view.memories.length ||
+                        modelsStatus !== 'ready' ||
+                        !consolidationModel
+                      }
+                      className="ui-button ui-button-secondary min-h-11"
+                    >
+                      {t(
+                        pending === 'consolidate'
+                          ? 'settings.memory.consolidating'
+                          : 'settings.memory.consolidate',
+                      )}
+                    </button>
+                  </div>
                   <button
                     ref={clearButton}
                     type="button"
@@ -237,6 +305,36 @@ function UserMemoryPanel({ userId }: { userId: string | undefined }) {
                   </button>
                 </div>
               </div>
+
+              {modelsStatus === 'loading' ? (
+                <p role="status" className="mt-3 text-xs text-muted">
+                  {t('settings.memory.modelsLoading')}
+                </p>
+              ) : modelsStatus === 'error' ? (
+                <div role="alert" className="mt-3 text-sm text-status-error">
+                  <p>{t('settings.memory.modelsError')}</p>
+                  <button
+                    type="button"
+                    onClick={() => setModelLoadAttempt((attempt) => attempt + 1)}
+                    className="ui-button ui-button-secondary mt-2 min-h-11"
+                  >
+                    {t('settings.memory.modelsRetry')}
+                  </button>
+                </div>
+              ) : !models.length ? (
+                <div className="mt-3">
+                  <p role="status" className="text-xs text-muted">
+                    {t('settings.memory.noModels')}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => setModelLoadAttempt((attempt) => attempt + 1)}
+                    className="ui-button ui-button-secondary mt-2 min-h-11"
+                  >
+                    {t('settings.memory.modelsRetry')}
+                  </button>
+                </div>
+              ) : null}
 
               {confirmClear ? (
                 <div
