@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from cloud_agent_host.chat_sandbox import (
@@ -325,6 +325,7 @@ class _Group:
     initial_archive_preservation_pending: bool = False
     starting: bool = False
     stopping: bool = False
+    archive_request_id: str | None = None
     stop_archive_pending: bool = False
     stop_archive_blocked: bool = False
     stop_archive_members: tuple[SharedMemberManifest, ...] | None = None
@@ -1475,6 +1476,8 @@ class SharedChatSessionSupervisor:
                 raise SandboxError("shared sandbox immutable identity/configuration changed")
             if expected_container_id and group.inspection.container_id != expected_container_id:
                 raise RetainedChatLost("shared sandbox container identity changed")
+            if group.archive_request_id is not None:
+                raise SessionBusy("shared sandbox archive and deletion is in progress")
 
             wanted = {item.thread_id for item in members}
             for manifest, resident_slot_id in validated_members:
@@ -3786,6 +3789,92 @@ class SharedChatSessionSupervisor:
             self._condition.notify_all()
             return descriptor
 
+    def begin_archive(
+        self,
+        thread_id: str,
+        *,
+        request_id: str,
+        generation: int,
+        container_id: str,
+    ) -> tuple[ChatSandboxSpec, dict[str, Any]]:
+        """Hold a stopped group's admission barrier across S3 verification."""
+        with self._lock:
+            group, _ = self._member(thread_id)
+            if group.spec.generation != generation:
+                raise SessionLeaseLost("sandbox archive generation is stale")
+            if group.archive_request_id not in (None, request_id):
+                raise SessionBusy("another sandbox archive is in progress")
+            self._require_deletion_lifecycle_admission(group)
+            if group.archive_request_id is None:
+                self._require_mutation_admission(group)
+            if group.archive_request_id is None and not self._is_quiescent(group):
+                raise SessionBusy("sandbox archive requires an idle group")
+            current = self._manager.require_stopped_archive(group.spec, container_id=container_id)
+            group.inspection = current
+            if group.archive_request_id is None:
+                group.lifecycle_generation += 1
+            group.archive_request_id = request_id
+            group.stopping = True
+            group.idle_deadline = None
+            return group.spec, {
+                "spec": asdict(group.spec),
+                "inspection": asdict(current),
+                "members": [asdict(item) for item in self._descriptors(group)],
+            }
+
+    def abort_archive(self, spec: ChatSandboxSpec, *, request_id: str, container_id: str) -> None:
+        """Release only the caller's archival barrier after a failed operation."""
+        with self._lock:
+            group = self._groups.get(spec.sandbox_id)
+            if group is None:
+                return
+            if group.spec != spec or group.inspection.container_id != container_id:
+                raise SessionLeaseLost("sandbox archive identity changed")
+            if group.archive_request_id not in (None, request_id):
+                raise SessionLeaseLost("sandbox archive request is stale")
+            if group.archive_request_id == request_id:
+                group.archive_request_id = None
+                group.stopping = False
+                group.lifecycle_generation += 1
+                self._arm_idle_if_quiescent(group)
+                self._condition.notify_all()
+
+    def commit_archive(self, spec: ChatSandboxSpec, *, request_id: str, container_id: str) -> None:
+        """Remove an exact stopped group after durable archive authorization.
+
+        The caller persists its verified commit receipt before invoking this
+        method. That receipt permits replay after a crash between Docker rm
+        and the final acknowledgment. An absent original is complete only if
+        its stable name is also absent; a replacement is always rejected.
+        """
+        with self._lock:
+            group = self._groups.get(spec.sandbox_id)
+            if group is not None:
+                if group.spec != spec or group.inspection.container_id != container_id:
+                    raise SessionLeaseLost("sandbox archive identity changed")
+                if group.archive_request_id not in (None, request_id):
+                    raise SessionLeaseLost("sandbox archive request is stale")
+                self._require_deletion_lifecycle_admission(group)
+                if group.archive_request_id is None:
+                    self._require_mutation_admission(group)
+                if group.archive_request_id is None and not self._is_quiescent(group):
+                    raise SessionBusy("sandbox deletion requires an idle group")
+                group.archive_request_id = request_id
+                group.stopping = True
+                group.idle_deadline = None
+            current = self._manager.inspect(spec.container_name)
+            if current is not None:
+                self._manager.remove_stopped_archived(spec, container_id=container_id)
+            if self._manager.inspect(container_id) is not None:
+                raise RetainedChatLost("archived sandbox identity changed during deletion")
+            if group is not None:
+                for member in group.members.values():
+                    member.context_status = "lost"
+                    member.resident_state = "lost"
+                    self._members.pop(member.thread_id, None)
+                self._groups.pop(spec.sandbox_id, None)
+            self._condition.notify_all()
+
     def sweep(self) -> builtins.list[SharedSessionDescriptor]:
         """Stop groups whose single refreshed inactivity deadline elapsed."""
         now = self._clock()
@@ -3965,6 +4054,22 @@ class SharedChatSessionSupervisor:
                 for member in group.members.values()
             )
         )
+
+    @staticmethod
+    def _require_deletion_lifecycle_admission(group: _Group) -> None:
+        """Preserve native flush and lifecycle archive fences during deletion."""
+        if group.container_lost:
+            raise RetainedChatLost("shared sandbox container identity was lost")
+        if (
+            group.snapshotting
+            or group.starting
+            or group.initial_archive_preservation_pending
+            or group.stop_archive_pending
+            or group.stop_archive_blocked
+            or group.orphan_finalization_pending
+            or group.start_archive_completion_pending
+        ):
+            raise SessionBusy("sandbox lifecycle archive must finish before deletion")
 
     @staticmethod
     def _require_mutation_admission(group: _Group) -> None:

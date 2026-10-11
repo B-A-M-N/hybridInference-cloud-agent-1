@@ -68,6 +68,11 @@ from cloud_agent_host.sandbox import (
     TerminalProcess,
     build_backend_from_env,
 )
+from cloud_agent_host.sandbox_archive import (
+    MAX_ARCHIVE_BYTES,
+    ArchiveIdentity,
+    SandboxArchiveService as SandboxDeletionArchiveService,
+)
 from cloud_agent_host.sandbox_archive_runtime import SandboxArchiveController
 from cloud_agent_host.sandbox_archive_s3 import SandboxArchiveConfigError
 from cloud_agent_host.sandbox_resources import SandboxResourceCollector
@@ -289,6 +294,32 @@ class SharedIdleStopRequest(BaseModel):
         dict[Annotated[str, Field(min_length=1, max_length=256)], Annotated[int, Field(ge=0)]]
         | None
     ) = Field(None, max_length=128)
+
+
+class SandboxArchivePrepareRequest(BaseModel):
+    """Exact stopped identity and immutable S3 object for one admin deletion."""
+
+    request_id: str = Field(..., min_length=1, max_length=128)
+    generation: int = Field(..., ge=1)
+    expected_container_id: str = Field(..., min_length=1, max_length=256)
+    archive_key: str = Field(..., min_length=1, max_length=1024)
+
+
+class SandboxArchiveCommitRequest(SandboxArchivePrepareRequest):
+    """Prepared receipt independently verified by the trusted control plane."""
+
+    sha256: str = Field(..., pattern="^[0-9a-f]{64}$")
+    size_bytes: int = Field(..., gt=0, le=MAX_ARCHIVE_BYTES)
+
+
+class SandboxArchiveUploadRequest(SandboxArchiveCommitRequest):
+    """Checksum-bound single-object upload with no S3 credential on the host."""
+
+    upload_url: str = Field(..., min_length=1, max_length=16384)
+    upload_headers: dict[
+        Annotated[str, Field(min_length=1, max_length=128)],
+        Annotated[str, Field(max_length=2048)],
+    ] = Field(..., min_length=4, max_length=4)
 
 
 class SharedSandboxMemberRequest(BaseModel):
@@ -1740,6 +1771,7 @@ def create_app(
     app.state.shared_session_supervisor = shared_supervisor
     app.state.sandbox_archive_service = archive_boundary
     app.state.sandbox_archive_controller = archive_controller
+    app.state.sandbox_deletion_archive_service = SandboxDeletionArchiveService(shared_supervisor)
     app.state.sandbox_resource_collector = None
 
     async def runtime_refused(_request: Request, exc: Exception) -> JSONResponse:
@@ -2512,6 +2544,83 @@ def create_app(
         except (SandboxError, ValueError) as exc:
             raise supervisor_error(exc) from exc
         return asdict(descriptor)
+
+    def sandbox_archive_identity(
+        thread_id: str, body: SandboxArchivePrepareRequest
+    ) -> ArchiveIdentity:
+        return ArchiveIdentity(
+            thread_id=thread_id,
+            request_id=body.request_id,
+            generation=body.generation,
+            expected_container_id=body.expected_container_id,
+            archive_key=body.archive_key,
+        )
+
+    @app.post("/shared-sandboxes/{thread_id}/admin-delete/prepare")
+    async def prepare_sandbox_archive(
+        thread_id: str,
+        body: SandboxArchivePrepareRequest,
+        _: None = Depends(authenticate),
+    ) -> dict[str, Any]:
+        require_shared_supervisor()
+        try:
+            return await endpoint_calls.run(
+                app.state.sandbox_deletion_archive_service.prepare,
+                sandbox_archive_identity(thread_id, body),
+            )
+        except (SandboxError, ValueError) as exc:
+            raise supervisor_error(exc) from exc
+
+    @app.post("/shared-sandboxes/{thread_id}/admin-delete/upload")
+    async def upload_sandbox_archive(
+        thread_id: str,
+        body: SandboxArchiveUploadRequest,
+        _: None = Depends(authenticate),
+    ) -> dict[str, Any]:
+        require_shared_supervisor()
+        try:
+            return await endpoint_calls.run(
+                app.state.sandbox_deletion_archive_service.upload,
+                sandbox_archive_identity(thread_id, body),
+                sha256=body.sha256,
+                size_bytes=body.size_bytes,
+                upload_url=body.upload_url,
+                upload_headers=body.upload_headers,
+            )
+        except (SandboxError, ValueError) as exc:
+            raise supervisor_error(exc) from exc
+
+    @app.post("/shared-sandboxes/{thread_id}/admin-delete/commit")
+    async def commit_sandbox_archive_deletion(
+        thread_id: str,
+        body: SandboxArchiveCommitRequest,
+        _: None = Depends(authenticate),
+    ) -> dict[str, Any]:
+        require_shared_supervisor()
+        try:
+            return await endpoint_calls.run(
+                app.state.sandbox_deletion_archive_service.commit,
+                sandbox_archive_identity(thread_id, body),
+                sha256=body.sha256,
+                size_bytes=body.size_bytes,
+            )
+        except (SandboxError, ValueError) as exc:
+            raise supervisor_error(exc) from exc
+
+    @app.post("/shared-sandboxes/{thread_id}/admin-delete/abort")
+    async def abort_sandbox_archive(
+        thread_id: str,
+        body: SandboxArchivePrepareRequest,
+        _: None = Depends(authenticate),
+    ) -> dict[str, Any]:
+        require_shared_supervisor()
+        try:
+            return await endpoint_calls.run(
+                app.state.sandbox_deletion_archive_service.abort,
+                sandbox_archive_identity(thread_id, body),
+            )
+        except (SandboxError, ValueError) as exc:
+            raise supervisor_error(exc) from exc
 
     @app.post("/shared-sandboxes/{thread_id}/fork")
     async def fork_shared_chat_session(
