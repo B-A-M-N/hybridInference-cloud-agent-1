@@ -1,6 +1,34 @@
 {
   "components": {
     "schemas": {
+      "AcquireHostDrainFenceRequest": {
+        "description": "Atomically replace the expected drain owner with a new opaque owner.",
+        "properties": {
+          "expected_fence_token": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Fence Token"
+          },
+          "fence_token": {
+            "format": "uuid",
+            "title": "Fence Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_fence_token",
+          "fence_token"
+        ],
+        "title": "AcquireHostDrainFenceRequest",
+        "type": "object"
+      },
       "AddComputeConnection": {
         "additionalProperties": false,
         "description": "Create a named, write-only credential in the control plane.",
@@ -5571,6 +5599,41 @@
             ],
             "description": "Generation of this host's capacity data; rotated by re-enrollment. A client uses it to drop a curve that belongs to the machine this one replaced.",
             "title": "Capacity Epoch"
+          },
+          "drain_fence_active": {
+            "default": false,
+            "description": "True only while the recorded deployment fence owns a draining host; false for an absent fence or released receipt.",
+            "title": "Drain Fence Active",
+            "type": "boolean"
+          },
+          "drain_fence_status_before": {
+            "anyOf": [
+              {
+                "enum": [
+                  "online",
+                  "draining"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Host status immediately before the current drain-fence token was acquired.",
+            "title": "Drain Fence Status Before"
+          },
+          "drain_fence_token": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque owner of an automated deployment drain, retained after release as an idempotency receipt.",
+            "title": "Drain Fence Token"
           },
           "enrolled": {
             "default": false,
@@ -11861,6 +11924,21 @@
           "registration_secret"
         ],
         "title": "RegisterConnectorResponse",
+        "type": "object"
+      },
+      "ReleaseHostDrainFenceRequest": {
+        "description": "Release only the automated drain owned by this opaque token.",
+        "properties": {
+          "fence_token": {
+            "format": "uuid",
+            "title": "Fence Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "fence_token"
+        ],
+        "title": "ReleaseHostDrainFenceRequest",
         "type": "object"
       },
       "RenewalPolicy": {
@@ -19902,6 +19980,23 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/AcquireHostDrainFenceRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {
@@ -20142,6 +20237,18 @@
             }
           },
           {
+            "description": "Override an active deployment fence. A forced legacy transition clears its ownership and idempotency receipt.",
+            "in": "query",
+            "name": "force",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Override an active deployment fence. A forced legacy transition clears its ownership and idempotency receipt.",
+              "title": "Force",
+              "type": "boolean"
+            }
+          },
+          {
             "in": "header",
             "name": "authorization",
             "required": false,
@@ -20158,6 +20265,23 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ReleaseHostDrainFenceRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {

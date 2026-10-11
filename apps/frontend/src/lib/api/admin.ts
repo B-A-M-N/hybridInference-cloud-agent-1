@@ -179,6 +179,12 @@ export interface AgentRunnerHost {
    * host, not fail on it.
    */
   status: AgentHostStatus;
+  /** Opaque automated-drain owner or its released idempotency receipt. */
+  drain_fence_token?: string | null;
+  /** Host state immediately before the current automated owner acquired it. */
+  drain_fence_status_before?: 'online' | 'draining' | null;
+  /** True while the automated owner keeps this host draining. */
+  drain_fence_active?: boolean;
   /**
    * True when the host redeemed an enrollment token, which is the difference
    * between a name that is a scheduling label and a name that is an identity.

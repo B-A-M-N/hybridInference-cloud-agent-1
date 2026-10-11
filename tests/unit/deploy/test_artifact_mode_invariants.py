@@ -53,6 +53,11 @@ def test_artifact_mode_requires_a_manifest_and_names_its_variant() -> None:
     )
 
 
+def test_control_plane_recipe_advertises_fenced_deployment_drains() -> None:
+    """A downstream rollout rejects a candidate that could reintroduce stale undrain."""
+    assert "AGENT_DEPLOY_DRAIN_FENCE_V1" in CONTROL
+
+
 def test_only_release_owned_values_reach_the_command_line() -> None:
     """The resolved environment carries credentials; argv carries none of them.
 

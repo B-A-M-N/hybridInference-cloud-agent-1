@@ -38,14 +38,18 @@ across restarts. The inventory below records built-in defaults and the
 environment names used for an initial import. Once a setting is registered, the
 service no longer reads it continuously from `.env`.
 
-Run `alembic upgrade head` (through `0048_sandbox_plugins`) before starting
+Run `alembic upgrade head` (through `0049_host_drain_fence`) before starting
 this release. The updated worker claim query requires
 `agent_jobs.claim_retry_at`, and chat plugin selections require
 `agent_threads.plugins`; existing queued jobs remain immediately eligible and
-existing chats default to no plugins after the migrations. Rebuild the sandbox
-image to load selected plugins with the updated CLI wrappers. The main
-control-plane listener then initializes the settings document once from its
-existing environment. The MCP-only listener
+existing chats default to no plugins after the migrations. The new runner-host
+columns start every existing host without a deployment drain owner or release
+receipt. Once this release is activated, it is the application and schema
+rollback floor: every later candidate must retain
+`AGENT_DEPLOY_DRAIN_FENCE_V1`. Rebuild the sandbox image to load selected
+plugins with the updated CLI wrappers. The main control-plane listener then
+initializes the settings document once from its existing environment. The
+MCP-only listener
 waits for that document and uses the same saved values.
 
 After the initial import, edit values in **Admin → Settings**. Later

@@ -212,7 +212,22 @@ async def register_host(
             labels=dict(body.labels),
         )
     except ValueError as exc:
-        if str(exc) != "resource_retiring":
+        error_type = str(exc)
+        if error_type == "host_drain_fenced":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": {
+                        "type": "host_drain_fenced",
+                        "message": (
+                            "This host is held by an automated deployment drain. "
+                            "The enrollment token was consumed; release the drain "
+                            "and issue a new token before retrying."
+                        ),
+                    }
+                },
+            ) from exc
+        if error_type != "resource_retiring":
             raise
         raise HTTPException(
             status_code=409,
