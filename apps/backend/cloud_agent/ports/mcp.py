@@ -5,7 +5,16 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
+
+
+class McpCredentialWriteRejected(Exception):
+    """A credential write matched no row, so its connection must not remain.
+
+    Raised inside the creation transaction. The insert rolls back with it,
+    which is what keeps a rejected secret from leaving a credential-less
+    connection behind.
+    """
 
 
 class McpConnectionRepository(Protocol):
@@ -39,6 +48,9 @@ class McpConnectionRepository(Protocol):
         account_label: str | None = None,
         request_timeout_s: float | None = None,
         reuse_pending: bool = False,
+        access_token_ciphertext: str | None = None,
+        auth_config_patch: Mapping[str, Any] | None = None,
+        sealed_launch_spec: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Insert a connection and return it, at revision one.
 
@@ -50,6 +62,21 @@ class McpConnectionRepository(Protocol):
         ``reuse_pending`` resumes an identical remote setup without credentials
         instead of inserting another row. Existing credentials, settings, and
         approvals are never changed; authenticated accounts remain independent.
+
+        ``access_token_ciphertext`` and ``sealed_launch_spec`` are written in
+        the same transaction as the insert. A rejected write raises
+        :class:`McpCredentialWriteRejected` and leaves no row.
+        """
+        ...
+
+    async def create_mcp_connections(
+        self, *, connections: Sequence[Mapping[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Insert every draft, with its credentials, in one transaction.
+
+        One rejected credential write or a later insert failure rolls the whole
+        batch back. Callers encrypt before this call, so a missing key never
+        reaches it.
         """
         ...
 
@@ -294,7 +321,7 @@ class McpConnectionRepository(Protocol):
         connection_id: int,
         config_revision: int,
         authorization_epoch: int,
-        oauth_generation: int,
+        expected_oauth_generation: int,
         code_verifier_ciphertext: str,
         client_id: str,
         client_secret_ciphertext: str | None,
@@ -309,12 +336,14 @@ class McpConnectionRepository(Protocol):
         revocation_endpoint: str | None,
         registration_endpoint: str | None,
         expires_at: Any,
-    ) -> None:
-        """Record one started authorization.
+    ) -> int | None:
+        """Record one started authorization and return its generation.
 
-        Starting a flow also moves the OAuth generation, in the same
-        transaction, so any callback still in flight for an earlier attempt is
-        refused rather than being allowed to win a race against the newer one.
+        The new generation is allocated in the same statement that fences the
+        connection on the config revision, authorization epoch, and OAuth
+        generation the caller read. The flow row stores that returned value.
+        A stale start matches nothing: it does not move the generation and it
+        does not delete a newer pending flow. ``None`` means the fence missed.
         """
         ...
 
@@ -576,18 +605,23 @@ class McpConnectionRepository(Protocol):
         change of target as editing the command. Both revisions move, which
         invalidates every session binding approved against the previous answer,
         and the connector's authorized set is written in the same transaction so
-        the two cannot disagree about what it may serve.
+        the two cannot disagree about what it may serve. Every previous
+        authorization row for the connection is removed in that transaction
+        before the new pair is inserted.
         """
         ...
 
     async def unbind_mcp_connection_connector(
-        self, *, connection_id: int, user_id: str
+        self, *, connection_id: int, user_id: str, connector_id: int
     ) -> dict[str, Any] | None:
-        """Stop routing one connection through its connector.
+        """Stop routing one connection through the connector the caller named.
 
-        The same version movement as binding, for the same reason: a connection
-        that has moved back to "nowhere to run" is not the one a session was
-        approved against.
+        ``connector_id`` is matched in the same statement that clears the
+        route. A request that names connector A must not detach a connection
+        currently bound to B, and only that pair's authorization row is removed.
+        The same version movement as binding applies when the pair matches: a
+        connection that has moved back to "nowhere to run" is not the one a
+        session was approved against.
         """
         ...
 

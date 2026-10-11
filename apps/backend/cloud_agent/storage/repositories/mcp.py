@@ -5,13 +5,39 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
+from cloud_agent.ports.mcp import McpCredentialWriteRejected
 from cloud_agent.storage._sql.mcp import ensure_mcp_bindings, mcp_binding_row
 from cloud_agent.storage._sql.rows import load_json as _load_json
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
     import asyncpg
+
+_CREATE_REQUIRED = ("user_id", "label", "transport", "location", "auth_kind", "auth_config")
+_CREATE_OPTIONAL = (
+    "url",
+    "launch_spec",
+    "template",
+    "connector_id",
+    "account_label",
+    "request_timeout_s",
+    "reuse_pending",
+    "access_token_ciphertext",
+    "auth_config_patch",
+    "sealed_launch_spec",
+)
+
+
+def _create_kwargs(item: Mapping[str, Any]) -> dict[str, Any]:
+    """The insert arguments present on one batch draft."""
+    missing = [key for key in _CREATE_REQUIRED if key not in item]
+    if missing:
+        joined = ", ".join(missing)
+        raise TypeError(f"MCP connection draft is missing {joined}")
+    kwargs = {key: item[key] for key in _CREATE_REQUIRED}
+    kwargs.update({key: item[key] for key in _CREATE_OPTIONAL if key in item})
+    return kwargs
 
 
 def fence_params(
@@ -157,6 +183,9 @@ class PostgresMcpConnectionRepository:
         account_label: str | None = None,
         request_timeout_s: float | None = None,
         reuse_pending: bool = False,
+        access_token_ciphertext: str | None = None,
+        auth_config_patch: Mapping[str, Any] | None = None,
+        sealed_launch_spec: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Insert a connection and return it, at revision one.
 
@@ -168,71 +197,171 @@ class PostgresMcpConnectionRepository:
         ``reuse_pending`` resumes an identical remote setup without credentials
         instead of inserting another row. Existing credentials, settings, and
         approvals are never changed; authenticated accounts remain independent.
+
+        ``access_token_ciphertext`` and ``sealed_launch_spec`` are written in
+        the same transaction as the insert. A rejected write raises
+        :class:`~cloud_agent.ports.mcp.McpCredentialWriteRejected` and leaves
+        no row.
         """
         async with self._pool.acquire() as conn, conn.transaction():
-            if (
-                reuse_pending
-                and location == "remote"
-                and transport in {"streamable-http", "http-sse"}
-                and url is not None
-                and launch_spec is None
-                and auth_kind in {"none", "oauth"}
-                and not auth_config
-            ):
-                # Serialize setup retries across API workers, even before the
-                # first row exists. The owner scope also keeps tenants apart.
-                await conn.execute(
-                    "SELECT pg_advisory_xact_lock(hashtextextended('agent-mcp-setup:' || $1, 0))",
-                    user_id,
-                )
-                existing = await conn.fetchrow(
-                    f"""
-                    SELECT {self._MCP_CONNECTION_COLUMNS}
-                    FROM agent_mcp_connections
-                    WHERE user_id = $1 AND label = $2 AND transport = $3
-                      AND location = $4 AND url = $5 AND launch_spec IS NULL
-                      AND connector_id IS NOT DISTINCT FROM $6::bigint
-                      AND account_label IS NOT DISTINCT FROM $7::text
-                      AND request_timeout_s IS NOT DISTINCT FROM $8::double precision
-                      AND auth_kind IN ('none', 'oauth')
-                      AND access_token_ciphertext IS NULL AND refresh_token_ciphertext IS NULL
-                      AND deleted_at IS NULL AND status <> 'disabled'
-                    ORDER BY id LIMIT 1 FOR UPDATE
-                    """,
-                    user_id,
-                    label,
-                    transport,
-                    location,
-                    url,
-                    connector_id,
-                    account_label,
-                    request_timeout_s,
-                )
-                if existing is not None:
-                    return self._mcp_connection(existing)
-            row = await conn.fetchrow(
+            return await self._insert_mcp_connection(
+                conn,
+                user_id=user_id,
+                label=label,
+                transport=transport,
+                location=location,
+                url=url,
+                launch_spec=launch_spec,
+                auth_kind=auth_kind,
+                auth_config=auth_config,
+                template=template,
+                connector_id=connector_id,
+                account_label=account_label,
+                request_timeout_s=request_timeout_s,
+                reuse_pending=reuse_pending,
+                access_token_ciphertext=access_token_ciphertext,
+                auth_config_patch=auth_config_patch,
+                sealed_launch_spec=sealed_launch_spec,
+            )
+
+    async def create_mcp_connections(
+        self, *, connections: Sequence[Mapping[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Insert every draft, with its credentials, in one transaction.
+
+        One rejected credential write or a later insert failure rolls the whole
+        batch back. Callers encrypt before this call, so a missing key never
+        reaches it.
+        """
+        async with self._pool.acquire() as conn, conn.transaction():
+            return [
+                await self._insert_mcp_connection(conn, **_create_kwargs(item))
+                for item in connections
+            ]
+
+    async def _insert_mcp_connection(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        user_id: str,
+        label: str,
+        transport: str,
+        location: str,
+        url: str | None,
+        launch_spec: dict[str, Any] | None,
+        auth_kind: str,
+        auth_config: dict[str, Any],
+        template: str | None = None,
+        connector_id: int | None = None,
+        account_label: str | None = None,
+        request_timeout_s: float | None = None,
+        reuse_pending: bool = False,
+        access_token_ciphertext: str | None = None,
+        auth_config_patch: Mapping[str, Any] | None = None,
+        sealed_launch_spec: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Insert one connection on ``conn`` and store any credential with it."""
+        if (
+            reuse_pending
+            and location == "remote"
+            and transport in {"streamable-http", "http-sse"}
+            and url is not None
+            and launch_spec is None
+            and auth_kind in {"none", "oauth"}
+            and not auth_config
+            and access_token_ciphertext is None
+            and sealed_launch_spec is None
+        ):
+            # Serialize setup retries across API workers, even before the
+            # first row exists. The owner scope also keeps tenants apart.
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended('agent-mcp-setup:' || $1, 0))",
+                user_id,
+            )
+            existing = await conn.fetchrow(
                 f"""
-                INSERT INTO agent_mcp_connections
-                    (user_id, label, template, transport, location, url, launch_spec,
-                     auth_kind, auth_config, connector_id, account_label, status,
-                     request_timeout_s)
-                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9::jsonb, $10, $11, 'draft',
-                        $12)
-                RETURNING {self._MCP_CONNECTION_COLUMNS}
+                SELECT {self._MCP_CONNECTION_COLUMNS}
+                FROM agent_mcp_connections
+                WHERE user_id = $1 AND label = $2 AND transport = $3
+                  AND location = $4 AND url = $5 AND launch_spec IS NULL
+                  AND connector_id IS NOT DISTINCT FROM $6::bigint
+                  AND account_label IS NOT DISTINCT FROM $7::text
+                  AND request_timeout_s IS NOT DISTINCT FROM $8::double precision
+                  AND auth_kind IN ('none', 'oauth')
+                  AND access_token_ciphertext IS NULL AND refresh_token_ciphertext IS NULL
+                  AND deleted_at IS NULL AND status <> 'disabled'
+                ORDER BY id LIMIT 1 FOR UPDATE
                 """,
                 user_id,
                 label,
-                template,
                 transport,
                 location,
                 url,
-                json.dumps(launch_spec) if launch_spec is not None else None,
-                auth_kind,
-                json.dumps(auth_config),
                 connector_id,
                 account_label,
                 request_timeout_s,
             )
+            if existing is not None:
+                return self._mcp_connection(existing)
+        row = await conn.fetchrow(
+            f"""
+            INSERT INTO agent_mcp_connections
+                (user_id, label, template, transport, location, url, launch_spec,
+                 auth_kind, auth_config, connector_id, account_label, status,
+                 request_timeout_s)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9::jsonb, $10, $11, 'draft',
+                    $12)
+            RETURNING {self._MCP_CONNECTION_COLUMNS}
+            """,
+            user_id,
+            label,
+            template,
+            transport,
+            location,
+            url,
+            json.dumps(launch_spec) if launch_spec is not None else None,
+            auth_kind,
+            json.dumps(auth_config),
+            connector_id,
+            account_label,
+            request_timeout_s,
+        )
+        epoch = int(row["authorization_epoch"])
+        inserted_id = int(row["id"])
+        if access_token_ciphertext is not None:
+            updated = await conn.fetchrow(
+                f"""
+                UPDATE agent_mcp_connections SET
+                    access_token_ciphertext = $3,
+                    auth_config = auth_config || $4::jsonb,
+                    credential_version = credential_version + 1,
+                    updated_at = NOW()
+                WHERE id = $1 AND authorization_epoch = $2 AND deleted_at IS NULL
+                RETURNING {self._MCP_CONNECTION_COLUMNS}
+                """,
+                inserted_id,
+                epoch,
+                access_token_ciphertext,
+                json.dumps(dict(auth_config_patch or {})),
+            )
+            if updated is None:
+                raise McpCredentialWriteRejected()
+            row = updated
+        if sealed_launch_spec is not None:
+            updated = await conn.fetchrow(
+                f"""
+                UPDATE agent_mcp_connections SET
+                    launch_spec = $3::jsonb, updated_at = NOW()
+                WHERE id = $1 AND authorization_epoch = $2 AND deleted_at IS NULL
+                RETURNING {self._MCP_CONNECTION_COLUMNS}
+                """,
+                inserted_id,
+                epoch,
+                json.dumps(dict(sealed_launch_spec)),
+            )
+            if updated is None:
+                raise McpCredentialWriteRejected()
+            row = updated
         return self._mcp_connection(row)
 
     async def update_mcp_connection(
@@ -775,7 +904,7 @@ class PostgresMcpConnectionRepository:
         connection_id: int,
         config_revision: int,
         authorization_epoch: int,
-        oauth_generation: int,
+        expected_oauth_generation: int,
         code_verifier_ciphertext: str,
         client_id: str,
         client_secret_ciphertext: str | None,
@@ -790,23 +919,34 @@ class PostgresMcpConnectionRepository:
         revocation_endpoint: str | None,
         registration_endpoint: str | None,
         expires_at: Any,
-    ) -> None:
-        """Record one started authorization.
+    ) -> int | None:
+        """Record one started authorization and return its generation.
 
-        Starting a flow also moves the OAuth generation, in the same
-        transaction, so any callback still in flight for an earlier attempt is
-        refused rather than being allowed to win a race against the newer one.
+        The new generation is allocated in the same statement that fences the
+        connection on the config revision, authorization epoch, and OAuth
+        generation the caller read. The flow row stores that returned value.
+        A stale start matches nothing: it does not move the generation and it
+        does not delete a newer pending flow. ``None`` means the fence missed.
         """
         async with self._pool.acquire() as conn, conn.transaction():
-            await conn.execute(
+            generation = await conn.fetchval(
                 """
                 UPDATE agent_mcp_connections
                 SET oauth_generation = oauth_generation + 1, updated_at = NOW()
                 WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+                  AND config_revision = $3
+                  AND authorization_epoch = $4
+                  AND oauth_generation = $5
+                RETURNING oauth_generation
                 """,
                 connection_id,
                 user_id,
+                config_revision,
+                authorization_epoch,
+                expected_oauth_generation,
             )
+            if generation is None:
+                return None
             await conn.execute(
                 "DELETE FROM agent_mcp_oauth_flows WHERE connection_id = $1 AND consumed_at IS NULL",
                 connection_id,
@@ -827,7 +967,7 @@ class PostgresMcpConnectionRepository:
                 connection_id,
                 config_revision,
                 authorization_epoch,
-                oauth_generation,
+                int(generation),
                 code_verifier_ciphertext,
                 client_id,
                 client_secret_ciphertext,
@@ -843,6 +983,7 @@ class PostgresMcpConnectionRepository:
                 registration_endpoint,
                 expires_at,
             )
+        return int(generation)
 
     async def consume_mcp_oauth_flow(self, *, state_hash: str) -> dict[str, Any] | None:
         """Claim a flow exactly once, returning it, or ``None``.
@@ -1543,7 +1684,9 @@ class PostgresMcpConnectionRepository:
         change of target as editing the command. Both revisions move, which
         invalidates every session binding approved against the previous answer,
         and the connector's authorized set is written in the same transaction so
-        the two cannot disagree about what it may serve.
+        the two cannot disagree about what it may serve. Every previous
+        authorization row for the connection is removed in that transaction
+        before the new pair is inserted.
         """
         async with self._pool.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
@@ -1567,6 +1710,10 @@ class PostgresMcpConnectionRepository:
             if row is None:
                 return None
             await conn.execute(
+                "DELETE FROM agent_mcp_connector_connections WHERE connection_id = $1",
+                connection_id,
+            )
+            await conn.execute(
                 """
                 INSERT INTO agent_mcp_connector_connections (connector_id, connection_id)
                 VALUES ($1, $2) ON CONFLICT DO NOTHING
@@ -1577,13 +1724,16 @@ class PostgresMcpConnectionRepository:
         return self._mcp_connection(row)
 
     async def unbind_mcp_connection_connector(
-        self, *, connection_id: int, user_id: str
+        self, *, connection_id: int, user_id: str, connector_id: int
     ) -> dict[str, Any] | None:
-        """Stop routing one connection through its connector.
+        """Stop routing one connection through the connector the caller named.
 
-        The same version movement as binding, for the same reason: a connection
-        that has moved back to "nowhere to run" is not the one a session was
-        approved against.
+        ``connector_id`` is matched in the same statement that clears the
+        route. A request that names connector A must not detach a connection
+        currently bound to B, and only that pair's authorization row is removed.
+        The same version movement as binding applies when the pair matches: a
+        connection that has moved back to "nowhere to run" is not the one a
+        session was approved against.
         """
         async with self._pool.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
@@ -1593,16 +1743,21 @@ class PostgresMcpConnectionRepository:
                     config_revision = c.config_revision + 1,
                     authorization_epoch = c.authorization_epoch + 1,
                     updated_at = NOW()
-                WHERE c.id = $1 AND c.user_id = $2 AND c.connector_id IS NOT NULL
+                WHERE c.id = $1 AND c.user_id = $2 AND c.connector_id = $3
                 RETURNING {self._MCP_CONNECTION_COLUMNS}
                 """,
                 connection_id,
                 user_id,
+                connector_id,
             )
             if row is None:
                 return None
             await conn.execute(
-                "DELETE FROM agent_mcp_connector_connections WHERE connection_id = $1",
+                """
+                DELETE FROM agent_mcp_connector_connections
+                WHERE connector_id = $1 AND connection_id = $2
+                """,
+                connector_id,
                 connection_id,
             )
         return self._mcp_connection(row)
