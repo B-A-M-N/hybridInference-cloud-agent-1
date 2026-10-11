@@ -296,9 +296,13 @@ class FakeStore(AllCapabilities):
             row.update(status="draft", error_kind="none", error_detail=None, last_checked_at=None)
         return True
 
-    async def consume_mcp_oauth_flow(self, *, state_hash: str) -> dict[str, Any] | None:
-        """Hand back a flow once, for the state hash the caller presents."""
+    async def consume_mcp_oauth_flow(
+        self, *, state_hash: str, user_id: str
+    ) -> dict[str, Any] | None:
+        """Hand back a flow once, for its state hash and the account that started it."""
         if self.oauth_flow is None or state_hash != self.oauth_state_hash:
+            return None
+        if self.oauth_flow.get("user_id") != user_id:
             return None
         flow, self.oauth_flow = self.oauth_flow, None
         return flow
@@ -553,13 +557,19 @@ class FakeStore(AllCapabilities):
 
 
 def _client(store: FakeStore, *, user_id: str = _OWNER) -> TestClient:
-    """Build a client whose owner guard is satisfied by ``user_id``."""
+    """Build a client whose owner guard is satisfied by ``user_id``.
+
+    The OAuth callback reads the session itself rather than through the owner
+    guard, so it is answered as ``user_id`` too: the browser returning from a
+    provider is the one that started the flow.
+    """
     app = FastAPI()
     # Management alone, as ``create_app`` mounts it: the relay's tool routes
     # are served by the MCP-only listener and nowhere else.
     app.include_router(mcp_connections.router)
     app.dependency_overrides[get_storage] = lambda: OneFake(store)
     app.dependency_overrides[require_agent_owner] = lambda: {"user_id": user_id}
+    app.dependency_overrides[mcp_connections._callback_session_user] = lambda: user_id
     return TestClient(app)
 
 
@@ -1522,6 +1532,88 @@ class TestAuthorization:
         assert "client_secret" not in config
         assert "shh" not in json.dumps(config)
 
+    def test_only_the_account_that_started_a_flow_can_finish_it(self, monkeypatch) -> None:
+        """A consent approved in somebody else's browser stores nothing anywhere.
+
+        The callback reads the real session cookie here rather than an
+        override. A browser signed in as another account, and one with no
+        usable session, are both refused before the code is exchanged, and the
+        flow is left for the account that started it, which can still finish.
+        """
+        from cloud_agent import identity
+        from cloud_agent.mcp import oauth
+
+        monkeypatch.setenv(identity.ENV_SESSION_SECRET, "mcp-callback-session-secret-for-tests")
+        monkeypatch.setenv(identity.ENV_ISSUER, "https://gateway.example")
+        monkeypatch.setenv("AGENT_MCP_PUBLIC_BASE_URL", "https://example.com/agents/api")
+        monkeypatch.setenv("AGENT_WEB_BASE_URL", "https://example.com/agents")
+        metadata = oauth.AuthorizationServerMetadata(
+            issuer="https://auth.example.com",
+            authorization_endpoint="https://auth.example.com/authorize",
+            token_endpoint="https://auth.example.com/token",
+        )
+        monkeypatch.setattr(
+            oauth, "discover_authorization_server", AsyncMock(return_value=(None, metadata))
+        )
+        exchange = AsyncMock(return_value={"access_token": "owner-token"})
+        monkeypatch.setattr(mcp_connections, "_post_form", exchange)
+        store = FakeStore()
+        connection_id = _seed(
+            store, auth_kind="oauth", auth_config={"client_id": "registered-client"}
+        )
+
+        async def save_flow(**kwargs):
+            store.oauth_flow = kwargs
+            store.oauth_state_hash = kwargs["state_hash"]
+            store.connections[connection_id]["oauth_generation"] = kwargs["oauth_generation"]
+
+        monkeypatch.setattr(store, "create_mcp_oauth_flow", save_flow, raising=False)
+        with _client(store) as client:
+            # Started as the owner; finished by whatever session the browser has.
+            del client.app.dependency_overrides[mcp_connections._callback_session_user]
+            started = client.post(f"/v1/agent/mcp/connections/{connection_id}/authorize")
+            assert started.status_code == 200, started.text
+            state = parse_qs(urlsplit(started.json()["authorization_url"]).query)["state"][0]
+
+            def finish(session: str | None) -> httpx.Response:
+                client.cookies.clear()
+                if session is not None:
+                    client.cookies.set(identity.SESSION_COOKIE, session)
+                return client.get(
+                    f"/v1/agent/mcp/oauth/callback/{connection_id}",
+                    params={"state": state, "code": "consented-code"},
+                    follow_redirects=False,
+                )
+
+            for session, reason in (
+                (identity.mint_session(user_id=_OTHER), "started by another account"),
+                (None, "sign in to the account that started this authorization"),
+                ("not-a-session", "sign in to the account that started this authorization"),
+            ):
+                refused = finish(session)
+                assert refused.status_code == 302
+                assert refused.headers["location"].startswith(
+                    "https://example.com/agents/integrations?"
+                )
+                result = parse_qs(urlsplit(refused.headers["location"]).query)
+                assert result["mcp_authorized"] == ["0"]
+                assert result["mcp_connection"] == [str(connection_id)]
+                assert reason in result["mcp_message"][0]
+                exchange.assert_not_awaited()
+                assert store.credential_writes == []
+                assert store.oauth_flow is not None
+
+            completed = finish(identity.mint_session(user_id=_OWNER))
+        assert parse_qs(urlsplit(completed.headers["location"]).query)["mcp_authorized"] == ["1"]
+        exchange.assert_awaited_once()
+        assert store.oauth_flow is None
+        assert (
+            mcp_cipher(_ENCRYPTION_KEY).decrypt(
+                store.connections[connection_id]["access_token_ciphertext"]
+            )
+            == "owner-token"
+        )
+
 
 class TestTheDynamicClientIdentity:
     """What the callback does with the client the flow authorized as.
@@ -1564,6 +1656,7 @@ class TestTheDynamicClientIdentity:
         from cloud_agent.mcp.registry import oauth_cipher
 
         return {
+            "user_id": _OWNER,
             "connection_id": str(connection_id),
             "config_revision": 1,
             "authorization_epoch": 1,
@@ -1606,6 +1699,7 @@ class TestTheDynamicClientIdentity:
             code="the-code",
             error="",
             store=store,
+            session_user=_OWNER,
         )
         return str(response.headers["location"])
 

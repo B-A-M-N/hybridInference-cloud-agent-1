@@ -338,14 +338,19 @@ class McpConnectionRepository(Protocol):
         """
         ...
 
-    async def consume_mcp_oauth_flow(self, *, state_hash: str) -> dict[str, Any] | None:
-        """Claim a flow exactly once, returning it, or ``None``.
+    async def consume_mcp_oauth_flow(
+        self, *, state_hash: str, user_id: str
+    ) -> dict[str, Any] | None:
+        """Claim one of ``user_id``'s flows exactly once, returning it, or ``None``.
 
         The ``consumed_at IS NULL`` predicate is inside the ``UPDATE``, so two
         callbacks racing on the same state cannot both proceed: the second
         matches no row. Marking it consumed before the token exchange is
         deliberate -- a callback that fails after this point must be restarted
         by the user, which is preferable to a state value that can be replayed.
+
+        The owner is part of the match: a flow presented by a browser signed in
+        as another account matches nothing and is left for its owner.
         """
         ...
 

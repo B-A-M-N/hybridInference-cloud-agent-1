@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -40,7 +40,7 @@ from pydantic import BaseModel, ConfigDict, Field
 # reimplemented, and deliberately one-directional: this module depends on
 # ``_owner_auth`` and never the reverse, so there is no cycle to reason about.
 from cloud_agent.api._owner_auth import require_agent_owner
-from cloud_agent.api.deps import get_storage
+from cloud_agent.api.deps import get_current_user, get_storage
 from cloud_agent.logging_utils import get_logger
 from cloud_agent.mcp import config_import, github_oauth, launch, oauth
 from cloud_agent.mcp.authorization import binding_from_selection
@@ -1452,6 +1452,31 @@ async def _resolve(host: str, port: int) -> list[str]:
     return [str(info[4][0]) for info in infos]
 
 
+async def _callback_session_user(
+    request: Request,
+    authorization: str | None = Header(None),
+) -> str | None:
+    """The Agent account the returning browser is signed in as, or ``None``.
+
+    Read by the same verifier as every owner route, but answered rather than
+    raised: the callback is a browser navigation, and a 401 body is a dead end
+    where a redirect back to the app can say what to do. The session cookie is
+    ``SameSite=Lax``, so it travels on this top-level GET from the provider.
+    """
+    try:
+        user = await get_current_user(request, authorization)
+    except HTTPException:
+        return None
+    return str(user["user_id"])
+
+
+#: Why a callback without the starting account's session was refused. Fixed
+#: text: nothing about the flow, or about who started it, is disclosed.
+_CALLBACK_NEEDS_SESSION = (
+    "sign in to the account that started this authorization, then sign in to the server again"
+)
+
+
 @router.get("/oauth/callback/{provider}", response_model=None)
 async def oauth_callback(
     provider: str,
@@ -1460,13 +1485,18 @@ async def oauth_callback(
     code: str = Query(""),
     error: str = Query(""),
     store: _McpConnectionsStorage | None = Depends(get_storage),
+    session_user: str | None = Depends(_callback_session_user),
 ) -> Response:
     """Complete a browser authorization, fenced to the flow that started it.
 
-    Unauthenticated by design: the browser arriving here carries a session
-    cookie it may or may not still have, and the *state* is the credential that
-    identifies the flow. The user is taken from the flow row, which was written
-    by an authenticated request, rather than from whatever this request claims.
+    The *state* identifies the flow; the Agent session decides who may finish
+    it. A flow is consumed only for the account that started it, before any
+    code is exchanged. Without that, a consent URL started by one user and
+    approved in another person's browser would store that person's provider
+    grant on the first user's connection -- the authorization-code injection
+    RFC 9700 describes, which PKCE does not stop because the platform holds
+    the verifier. The connection is still taken from the flow row, written by
+    an authenticated request, rather than from anything this request claims.
     """
     job_store = _require_store(store)
     if error:
@@ -1478,11 +1508,21 @@ async def oauth_callback(
         return _callback_redirect(provider, ok=False, message=message)
     if not state or not code:
         return _callback_redirect(provider, ok=False, message="missing state or code")
+    if session_user is None:
+        return _callback_redirect(provider, ok=False, message=_CALLBACK_NEEDS_SESSION)
 
-    flow = await job_store.mcp.consume_mcp_oauth_flow(state_hash=oauth.state_hash(state))
+    flow = await job_store.mcp.consume_mcp_oauth_flow(
+        state_hash=oauth.state_hash(state), user_id=session_user
+    )
     if flow is None:
+        # Expired, already used, or started by another account: one answer,
+        # so a state value cannot be probed for whose flow it is.
         return _callback_redirect(
-            provider, ok=False, message="this authorization expired or was already used"
+            provider,
+            ok=False,
+            message=(
+                "this authorization expired, was already used, or was started by another account"
+            ),
         )
     uses_github_client = (
         flow["issuer"] == github_oauth.ISSUER
