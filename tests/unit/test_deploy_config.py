@@ -873,6 +873,38 @@ def test_the_reference_sshd_policy_is_what_automatic_setup_writes(compose: dict)
     assert "deploy/host/sshd-tunnels.conf.example" in (REPO_ROOT / "docs/operations.md").read_text()
 
 
+def test_no_shipped_doc_or_config_offers_gateway_ports_yes():
+    """`GatewayPorts yes` moves every remote forward to the wildcard address.
+
+    sshd overrides the requested bind and still reports success, so
+    `ExitOnForwardFailure` never fires and each host's broker is published on
+    every interface of the control-plane machine behind one shared token.
+    The broker route needs `clientspecified`, held to one address and port by
+    the account's PermitListen and the key's permitlisten.
+    """
+    offered = re.compile(r"GatewayPorts[\s=`'\"]+yes\b", re.IGNORECASE)
+    sources = [
+        *sorted((REPO_ROOT / "docs").rglob("*.md")),
+        *sorted(REPO_ROOT.glob("*.md")),
+        *sorted(p for p in (REPO_ROOT / "deploy").rglob("*") if p.is_file()),
+    ]
+    offenders = [
+        f"{path.relative_to(REPO_ROOT)}:{number}"
+        for path in sources
+        for number, line in enumerate(
+            path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1
+        )
+        if offered.search(line)
+    ]
+    assert not offenders, f"`GatewayPorts yes` is offered at {offenders}"
+
+    operations = (REPO_ROOT / "docs/operations.md").read_text()
+    assert "`GatewayPorts clientspecified`" in operations
+    assert "GatewayPorts clientspecified" in _SSHD_REFERENCE.read_text()
+    # The bind address alone does not keep the LAN out (weak host model).
+    assert re.search(r"iptables -I INPUT -p tcp --dport \d+ ! -i br-\S+ -j DROP", operations)
+
+
 def test_a_failed_tunnel_probe_is_not_reported_as_a_successful_start() -> None:
     """`up` must not print "done" after the probe said a sandbox cannot reach
     the gateway.

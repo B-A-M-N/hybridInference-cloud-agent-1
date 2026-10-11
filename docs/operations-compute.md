@@ -232,7 +232,11 @@ The Host control connection also reverse-forwards from the stable
 control-plane machine to `workspace-broker:8092`. Bind its listener to the
 actual control-plane Docker bridge gateway address, never loopback or
 `0.0.0.0`. Configure `GatewayPorts clientspecified`, restricting both the
-key's reverse listen address/port and forward destination. Set
+key's reverse listen address/port and forward destination; never `yes`, which
+binds every remote forward to the wildcard address. Firewall the reverse ports
+on that machine so they answer only on its Docker bridge interface
+([broker route](operations.md#the-way-back-the-control-plane-reaching-this-hosts-broker)).
+Set
 `AGENT_WORKSPACE_BROKER_ADVERTISE_URL` to the resulting URL reachable from the
 control-plane container. Add its hostname/IP to
 `AGENT_BROKER_URL_ALLOWED_HOSTS` when that allowlist is enabled. Every

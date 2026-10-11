@@ -2640,10 +2640,32 @@ already opens — a reverse forward on the control-plane tunnel:
 | `AGENT_BROKER_REVERSE_PORT` | A free port on that host |
 | `AGENT_WORKSPACE_BROKER_ADVERTISE_URL` | `http://<bind>:<port>` — what the runner reports, and what the control plane will dial |
 
-A non-loopback remote bind requires `GatewayPorts yes` or `clientspecified` in
-the **control plane host's** sshd. Without it the bind is refused and, because
-the tunnel runs with `ExitOnForwardFailure`, ssh exits and the container
-restarts rather than sitting there having bound nothing.
+The **control plane host's** sshd must apply `GatewayPorts clientspecified` to
+the control account, as its block in
+[`deploy/host/sshd-tunnels.conf.example`](../deploy/host/sshd-tunnels.conf.example)
+does, together with that account's `PermitListen` and the key's `permitlisten`
+naming this exact address and port. Never set it to `yes`: that binds every
+remote forward to the wildcard address whatever the client asked for, and
+reports success, so each host's broker is published on all of that machine's
+interfaces behind one shared token. With the default, `no`, sshd binds the
+forward to loopback instead, where the control plane's containers cannot reach
+it. A listener sshd refuses outright (a port in use, or one `PermitListen` does
+not allow) makes ssh exit under `ExitOnForwardFailure`, and the container
+restarts; the two wrong `GatewayPorts` values do not. Confirm on that machine
+with `ss -ltn` that the port listens on the bridge address and nowhere else.
+
+Also limit the reverse ports in that machine's firewall to its Docker bridge
+interface. The bind address alone does not: Linux accepts a packet for any
+local address on any interface, so a neighbour routing the bridge address
+through the machine's LAN interface would still reach the listener. Find the
+interface with `ip -o -4 addr show to <bind>`, then, for each reverse port (or
+the range you assign), for example:
+
+```bash
+iptables -I INPUT -p tcp --dport 18092 ! -i br-0123456789ab -j DROP
+```
+
+Persist the rule the way that machine persists its firewall.
 
 Set all three. The supported standalone host stack never publishes its broker
 and does not share a Compose network with the control plane, even when both
