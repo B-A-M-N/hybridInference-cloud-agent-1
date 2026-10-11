@@ -212,13 +212,15 @@ def _mcp_case_step() -> dict[str, Any]:
 SANDBOX_CELL_SELECTION = "${{ github.event_name == 'pull_request' && 'not kilo]' || '' }}"
 
 
-def test_pull_requests_give_kilo_its_own_vm_and_trusted_events_run_every_case_together() -> None:
+def test_pull_requests_give_kilo_its_own_vms_and_trusted_events_run_every_case_together() -> None:
     """Every event runs all fifteen cases; only where they run differs.
 
-    On a hosted VM Kilo's three cases took 198s together, while three cases of
-    any other runtime took 20-40s. A pull request therefore runs the other twelve
-    in the sandbox cell and Kilo's on a VM of its own. Trusted events keep all
-    fifteen in the persistent-pool step.
+    Each Kilo case needs most of the test's 180s turn timeout on a hosted VM by
+    itself, and beside another one it runs past it — the cause of most hosted
+    failures of this suite. Three cases of any other runtime take 20-40s
+    together. A pull request therefore runs the other twelve in the sandbox
+    cell and each Kilo case on a VM of its own. Trusted events keep all fifteen
+    in the persistent-pool step.
     """
     jobs = workflow()["jobs"]
     in_cell = step("All five CLIs retain MCP")
@@ -261,14 +263,19 @@ def test_the_mcp_cells_partition_the_parity_suite() -> None:
     ).stdout
     cases = {line for line in collected.splitlines() if line.startswith(f"{PARITY}::")}
     assert len(cases) == 15
-    selections = ["not kilo]", _mcp_case_step()["env"]["MCP_TEST_SELECTION"]]
+    template = _mcp_case_step()["env"]["MCP_TEST_SELECTION"]
+    assert template == "${{ matrix.case }}-kilo]"
+    selections = ["not kilo]"] + [
+        template.replace("${{ matrix.case }}", case)
+        for case in workflow()["jobs"]["mcp"]["strategy"]["matrix"]["case"]
+    ]
     selected: list[str] = []
     for selection in selections:
         mine = sorted(case for case in cases if _selects(selection, case))
         assert mine, f"{selection} selects nothing"
         selected.extend(mine)
     assert sorted(selected) == sorted(cases), "the cells overlap or leave a case out"
-    assert [len([c for c in cases if _selects(s, c)]) for s in selections] == [12, 3]
+    assert len([case for case in cases if _selects("not kilo]", case)]) == 12
 
 
 def test_the_mcp_cells_build_and_clean_up_exactly_like_the_sandbox_cell() -> None:
@@ -285,12 +292,11 @@ def test_the_mcp_cells_build_and_clean_up_exactly_like_the_sandbox_cell() -> Non
     assert '-k "${MCP_TEST_SELECTION}"' in ours["run"]
 
 
-def test_the_mcp_job_removes_only_what_it_started() -> None:
-    """It shares a run id with the sandbox cell, so its label must differ from that cell's."""
+def test_each_mcp_cell_removes_only_what_it_started() -> None:
+    """The cells of one run share its id, so the label carries the case too."""
     steps = workflow()["jobs"]["mcp"]["steps"]
     naming = str(step("Name this cell", job="mcp")["run"])
-    assert "GITHUB_RUN_ATTEMPT" in naming and naming != str(step("Name this cell")["run"])
-    assert 'suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-mcp-kilo"' in naming
+    assert "matrix.case" in naming and "GITHUB_RUN_ATTEMPT" in naming
     assert 'echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-config" >> "${GITHUB_ENV}"' in naming
     assert steps[-1]["name"] == "Drop this pull request's builder"
     assert not any("secrets." in str(candidate) for candidate in steps)

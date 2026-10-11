@@ -184,8 +184,8 @@ optional `pr-caches` job fills the uv and npm caches and exports the sandbox
 image's build layers from a hosted VM, under the `dev` scope that every pull
 request into `dev` may restore. CI Gate does not wait for it, and its failure
 leaves the run green. Of the 15 real-CLI MCP cases, a pull request runs Kilo's
-three in the `MCP conformance (kilo)` job and the other twelve in the sandbox
-image job; trusted events run all 15 in the sandbox image job.
+three as `MCP conformance (kilo, …)` jobs, one case each, and the other twelve in
+the sandbox image job; trusted events run all 15 in the sandbox image job.
 
 GitHub issue [#464](https://github.com/HarvardMadSys/hybridInference-cloud-agent/issues/464)
 tracks the remaining administrator work: the runner-group controls below,

@@ -1080,7 +1080,7 @@ jobs:
 
       # On the image this cell just built. Trusted events run all fifteen cases
       # here; a pull request runs the twelve that are not Kilo's, and `mcp`
-      # runs Kilo's three on a VM of their own.
+      # runs Kilo's three on VMs of their own.
       - name: All five CLIs retain MCP through approval, resume and fork
         if: matrix.artifact.name == 'sandbox'
         timeout-minutes: 20
@@ -1175,29 +1175,31 @@ jobs:
           fi
 
   # ------------------------------------------------------------------- mcp
-  # Kilo's three real-CLI cases, on a VM of their own, for pull requests. On a
-  # hosted VM the three took 198s together, against 20-40s for three cases of
-  # any other runtime, so beside the build they set the sandbox cell's pace.
-  # The sandbox cell keeps the other twelve; trusted events still run all
-  # fifteen there, which this job leaves untouched. One VM per Kilo case was
-  # measured too: 55s, 160s and 176s, so two more sandbox builds per run would
-  # buy about 20s.
+  # Kilo's three real-CLI cases, one per VM, for pull requests. Each spends
+  # most of the test's 180s turn timeout on a hosted VM even alone (55s, 160s
+  # and 176s for the whole case), against 20-40s for three cases of any other
+  # runtime. Beside one another they run past it: on 2026-10-11, 25 of 48
+  # hosted sandbox cells failed this suite, nearly all on a Kilo case's
+  # TimeoutError, and three Kilo cases on one VM did it again in #532. The
+  # sandbox cell keeps the other twelve; trusted events still run all fifteen
+  # there, on the persistent pool, which this job leaves untouched.
   #
-  # The job builds the sandbox itself, importing the layers `pr-caches`
+  # Each cell builds the sandbox itself, importing the layers `pr-caches`
   # exports. Everything from the SDK step to the builder removal is copied from
   # `artifacts` verbatim, comments aside — see there for why each step is the
   # way it is. `test_artifacts_workflow.py` fails if the copies diverge, so the
   # image these cases run is the image the sandbox cell builds and starts.
   mcp:
-    name: MCP conformance (kilo)
+    name: MCP conformance (kilo, ${{ matrix.case }})
     needs: changes
     if: github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || matrix.artifact.runner) }}
     strategy:
       fail-fast: false
       matrix:
-        # The sandbox cell, so that the steps copied from it read the same
-        # values here.
+        # Kilo's three policy cases. With the sandbox cell's selection these
+        # partition the parity suite; the policy test collects it to prove so.
+        case: [allow, confirm, confirm-normalized-name]
         artifact:
           - name: sandbox
             arch: amd64
@@ -1211,11 +1213,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # Not `-sandbox`: the sandbox cell of the same run and attempt uses that,
-      # and cleanup removes containers by this label.
+      # Per case as well as per run and attempt: the cells share a run id, and
+      # cleanup removes containers by this label.
       - name: Name this cell's artifacts
         run: |
-          suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-mcp-kilo"
+          suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-mcp-kilo-${{ matrix.case }}"
           echo "IMAGE_TAG=${{ matrix.artifact.name }}:ci-${suffix}" >> "${GITHUB_ENV}"
           echo "SUFFIX=${suffix}" >> "${GITHUB_ENV}"
           mkdir -p "${RUNNER_TEMP}/docker-config"
@@ -1328,7 +1330,7 @@ jobs:
           enable-cache: true
           prune-cache: false
 
-      - name: Kilo retains MCP through approval, resume and fork
+      - name: Kilo retains MCP through approval, resume and fork (${{ matrix.case }})
         timeout-minutes: 20
         env:
           MCP_TEST_SANDBOX_IMAGE: ${{ env.IMAGE_TAG }}
@@ -1338,8 +1340,8 @@ jobs:
           TEST_DB_USER: postgres
           TEST_DB_PASSWORD: mcp-conformance-only
           MCP_TEST_WORKERS: "3"
-          # Kilo's three cases: the ones the sandbox cell's `not kilo]` leaves.
-          MCP_TEST_SELECTION: "kilo]"
+          # The id `[<case>-kilo]`, which names exactly one case.
+          MCP_TEST_SELECTION: "${{ matrix.case }}-kilo]"
         run: |
           set -euo pipefail
           database="mcp-db-${SUFFIX}"
