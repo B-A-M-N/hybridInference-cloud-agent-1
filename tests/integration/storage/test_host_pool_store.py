@@ -1969,6 +1969,7 @@ async def test_a_forced_removal_ends_the_work_the_host_was_holding(
     fence = {"attempt_id": claim["attempt_id"], "lease_generation": claim["lease_generation"]}
     residency = await store.residency.establish_residency(
         thread_id=job["thread_id"],
+        **fence,
         host="runner-a",
         runtime_id="claude-code",
         runtime_version=None,
@@ -1991,6 +1992,7 @@ async def test_a_forced_removal_ends_the_work_the_host_was_holding(
     assert (
         await store.residency.establish_residency(
             thread_id=job["thread_id"],
+            **fence,
             host="runner-a",
             runtime_id="claude-code",
             runtime_version=None,
@@ -2029,6 +2031,7 @@ async def test_a_disabled_host_can_no_longer_extend_or_earn(
     assert (
         await store.residency.establish_residency(
             thread_id=job["thread_id"],
+            **fence,
             host="runner-a",
             runtime_id="claude-code",
             runtime_version=None,

@@ -1861,9 +1861,12 @@ async def test_native_fork_mints_no_residency_on_a_disabled_host(store: Storage)
     assert await store.sandbox.mark_thread_sandbox_running(
         **fence, container_id="container-shared-one", context_status="new"
     )
-    assert await store.sandbox.admit_thread_sandbox_turn(**fence, job_id=job["id"])
+    assert await store.sandbox.admit_thread_sandbox_turn(
+        **fence, residency_generation=sandbox["residency_generation"], job_id=job["id"]
+    )
     assert await store.sandbox.settle_thread_sandbox(
         **fence,
+        residency_generation=sandbox["residency_generation"],
         job_id=job["id"],
         context_status="live",
         native_session_id="native-source",
