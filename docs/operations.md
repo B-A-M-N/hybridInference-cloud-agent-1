@@ -516,6 +516,17 @@ deletion acknowledgements keep admission blocked and retry the same request.
 The broker stores its deletion receipts on its own persistent volume so an
 acknowledgement can survive a broker restart.
 
+**Verify stopped and force delete** recovers a sandbox still recorded as running
+only when the owning broker confirms that the exact reviewed container is
+stopped and idle. It does not stop a running container or bypass unavailable
+host proof. If verification fails, the error identifies missing host registration,
+an absent or refused advertised URL, a missing or rejected broker credential,
+a connection failure, a timeout, or unavailable sandbox status. Check the
+indicated configuration or broker readiness before retrying. For a connection
+failure, verify the [reverse broker route](#the-way-back-the-control-plane-reaching-this-hosts-broker).
+Control-plane logs record `agent_sandbox_delete_verification_failed` with the
+sandbox, owning host, status code, and failure type without raw broker errors.
+
 The details show progress, archive location, checksum, size, and any failure.
 Chat history, memberships, execution records, and audit receipts remain in the
 database. Deleted native sessions cannot resume; this operation does not add

@@ -73,7 +73,10 @@ def validate_broker_url(url: str | None) -> str | None:
     if url is None or not url.strip():
         return None
     candidate = url.strip()
-    parsed = urlparse(candidate)
+    try:
+        parsed = urlparse(candidate)
+    except ValueError:
+        raise BrokerUrlRefused("broker_url must be a valid http(s) URL") from None
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise BrokerUrlRefused(f"broker_url must be an http(s) URL, got {candidate!r}")
 
@@ -86,6 +89,34 @@ def validate_broker_url(url: str | None) -> str | None:
 
 
 ENV_BROKER_TOKEN = "AGENT_WORKSPACE_BROKER_TOKEN"
+
+
+def broker_configuration_error(host: dict[str, Any] | None) -> str | None:
+    """Describe an unusable broker configuration without exposing URLs or secrets."""
+    if host is None:
+        return (
+            "The owning host is no longer registered. Restore that host's registration "
+            "and workspace broker before retrying deletion."
+        )
+    try:
+        url = validate_broker_url(host.get("broker_url"))
+    except BrokerUrlRefused:
+        return (
+            "The owning host's workspace broker URL is invalid or refused by the host allowlist. "
+            "Check its advertised URL and the Workspace broker host allowlist in Admin Settings."
+        )
+    if not url:
+        return (
+            "The owning host has not advertised a workspace broker URL. Configure its "
+            "advertised URL and send a new host heartbeat before retrying deletion."
+        )
+    if not (setting_env(ENV_BROKER_TOKEN) or "").strip():
+        return (
+            "The control plane has no workspace broker credential. Configure Workspace broker "
+            "credential in Admin Settings to match the owning host's broker."
+        )
+    return None
+
 
 #: `{host: (url, pool)}` — one connection pool per enrolled host. A broker
 #: client is built per request — one per file read, one per terminal keystroke
