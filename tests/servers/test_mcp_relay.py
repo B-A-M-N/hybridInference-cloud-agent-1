@@ -871,6 +871,30 @@ async def test_a_confirmed_tool_is_advertised_but_held_for_its_owner(monkeypatch
     assert invocation["arguments_digest"]
 
 
+async def test_a_call_too_large_to_review_is_refused_rather_than_held(monkeypatch, store, upstream):
+    """A held call's arguments are stored for its owner, so they are bounded.
+
+    The body is well inside the relay's request bound, and still far more than
+    a person reviews before approving; storing it would only grow a table every
+    tenant shares.
+    """
+    store.snapshot = _snapshot("create_issue")
+    store.bindings = [_binding(rules={"create_issue": {"policy": "confirm", "fingerprint": ""}})]
+    arguments = {"body": "x" * agent_mcp_router.MAX_HELD_ARGUMENTS_BYTES}
+    async with _relay(monkeypatch, store, upstream) as api:
+        response = await api.post(
+            f"/v1/agent/mcp/{_ALIAS}",
+            json=_rpc("tools/call", name="create_issue", arguments=arguments),
+            headers=_auth(),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["error"]["code"] == -32602
+    assert "not held or sent" in response.json()["error"]["message"]
+    assert store.created_invocations == []
+    assert upstream.requests == []
+
+
 async def test_a_retry_matching_an_approval_is_dispatched(monkeypatch, store, upstream):
     """**The retry is the consumption.**
 

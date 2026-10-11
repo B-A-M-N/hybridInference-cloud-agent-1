@@ -167,6 +167,7 @@ async def _invocation(
     *,
     expires_in: timedelta = timedelta(minutes=10),
     policy_revision: int = 1,
+    arguments_ciphertext: str | None = None,
 ) -> dict[str, Any]:
     """One held call, pending and undecided."""
     return await store.mcp.create_mcp_invocation(
@@ -177,7 +178,7 @@ async def _invocation(
         connection_id=int(connection["id"]),
         capability_name="get_issue",
         arguments_digest="digest-1",
-        arguments_ciphertext=None,
+        arguments_ciphertext=arguments_ciphertext,
         config_revision=int(connection["config_revision"]),
         authorization_epoch=int(connection["authorization_epoch"]),
         capability_revision=int(connection["capability_revision"]),
@@ -1559,6 +1560,51 @@ async def test_expiring_held_calls_leaves_the_settled_ones_alone(
     still_open = await store.mcp.get_mcp_invocation(invocation_id=int(pending["id"]))
     assert still_open is not None
     assert still_open["status"] == "pending"
+
+
+async def test_an_expired_call_no_longer_keeps_its_arguments(store: Storage) -> None:
+    """Arguments are held for a decision; once none can be made, they are dropped.
+
+    Every expiry path shares one assignment, so this walks four of them: the
+    waiting client leaving, a late decision, the deadline sweep, and the owner
+    turning the connection off. A call that was decided keeps its arguments as
+    the record of what was refused.
+    """
+    job = await _create_job(store)
+    connection = await _connect(store, _OWNER)
+    paused = await _connect(store, _OWNER, label="Second GitHub")
+    abandoned = await _invocation(store, job, connection, arguments_ciphertext="sealed-1")
+    late = await _invocation(
+        store, job, connection, expires_in=timedelta(seconds=-1), arguments_ciphertext="sealed-2"
+    )
+    overdue = await _invocation(
+        store, job, connection, expires_in=timedelta(seconds=-1), arguments_ciphertext="sealed-3"
+    )
+    switched_off = await _invocation(store, job, paused, arguments_ciphertext="sealed-4")
+    denied = await _invocation(store, job, connection, arguments_ciphertext="sealed-5")
+    assert await store.mcp.decide_mcp_invocation(
+        invocation_id=denied["id"], approve=False, decided_by=_OWNER
+    )
+
+    assert await store.mcp.expire_mcp_invocation(invocation_id=abandoned["id"])
+    assert (
+        await store.mcp.decide_mcp_invocation(
+            invocation_id=late["id"], approve=True, decided_by=_OWNER
+        )
+        is None
+    )
+    assert await store.mcp.expire_mcp_invocations() == 1
+    assert await store.mcp.set_mcp_connection_enabled(
+        connection_id=int(paused["id"]), user_id=_OWNER, enabled=False
+    )
+
+    for invocation in (abandoned, late, overdue, switched_off):
+        stored = await store.mcp.get_mcp_invocation(invocation_id=int(invocation["id"]))
+        assert stored is not None
+        assert (stored["status"], stored["arguments_ciphertext"]) == ("expired", None)
+    kept = await store.mcp.get_mcp_invocation(invocation_id=int(denied["id"]))
+    assert kept is not None
+    assert (kept["status"], kept["arguments_ciphertext"]) == ("denied", "sealed-5")
 
 
 async def test_listing_calls_filters_by_job_and_state(store: Storage) -> None:

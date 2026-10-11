@@ -96,6 +96,13 @@ class PostgresMcpConnectionRepository:
         "created_at, updated_at, deleted_at"
     )
 
+    #: Every way a held call expires, in one assignment. Its arguments were kept
+    #: only so the owner could see what they were deciding; once nothing can be
+    #: decided, the ciphertext is dropped rather than left in a shared table
+    #: until the job is deleted. Settled calls keep theirs as the record of what
+    #: was sent or refused.
+    _EXPIRED = "status = 'expired', arguments_ciphertext = NULL"
+
     @staticmethod
     def _mcp_connection(row: Any) -> dict[str, Any]:
         """Decode one connection row into plain Python values."""
@@ -379,7 +386,7 @@ class PostgresMcpConnectionRepository:
             )
             if row is not None and not enabled:
                 await conn.execute(
-                    "UPDATE agent_mcp_invocations SET status = 'expired' "
+                    f"UPDATE agent_mcp_invocations SET {self._EXPIRED} "
                     "WHERE connection_id = $1 AND status IN ('pending', 'approved')",
                     connection_id,
                 )
@@ -964,7 +971,7 @@ class PostgresMcpConnectionRepository:
                 # Revocation is visible to both the waiting relay and the UI.
                 # A call already dispatching keeps its outcome; it is never replayed.
                 await conn.execute(
-                    "UPDATE agent_mcp_invocations SET status = 'expired' "
+                    f"UPDATE agent_mcp_invocations SET {self._EXPIRED} "
                     "WHERE thread_id = $1 AND connection_id = ANY($2::bigint[]) "
                     "AND status IN ('pending', 'approved')",
                     thread_id,
@@ -1153,7 +1160,7 @@ class PostgresMcpConnectionRepository:
                 # Distinguish "already decided" from "too late" for the caller,
                 # without changing either outcome.
                 await conn.execute(
-                    "UPDATE agent_mcp_invocations SET status = 'expired' "
+                    f"UPDATE agent_mcp_invocations SET {self._EXPIRED} "
                     "WHERE id = $1 AND status = 'pending' AND expires_at <= NOW()",
                     invocation_id,
                 )
@@ -1332,7 +1339,7 @@ class PostgresMcpConnectionRepository:
         """Expire every pending or approved call whose deadline has passed."""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "UPDATE agent_mcp_invocations SET status = 'expired' "
+                f"UPDATE agent_mcp_invocations SET {self._EXPIRED} "
                 "WHERE status IN ('pending', 'approved') AND expires_at <= NOW() RETURNING id"
             )
         return len(rows)
@@ -1341,7 +1348,7 @@ class PostgresMcpConnectionRepository:
         """Expire a superseded attempt's undecided calls."""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "UPDATE agent_mcp_invocations SET status = 'expired' "
+                f"UPDATE agent_mcp_invocations SET {self._EXPIRED} "
                 "WHERE attempt_id = $1 AND status IN ('pending', 'approved') RETURNING id",
                 attempt_id,
             )
@@ -1694,7 +1701,7 @@ class PostgresMcpConnectionRepository:
         """Expire one undispatched call when its waiting client or authorization is gone."""
         async with self._pool.acquire() as conn:
             updated = await conn.fetchval(
-                "UPDATE agent_mcp_invocations SET status = 'expired' "
+                f"UPDATE agent_mcp_invocations SET {self._EXPIRED} "
                 "WHERE id = $1 AND status IN ('pending', 'approved') RETURNING id",
                 invocation_id,
             )

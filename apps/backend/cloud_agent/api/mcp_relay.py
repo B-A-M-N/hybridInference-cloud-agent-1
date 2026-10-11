@@ -50,13 +50,19 @@ from cloud_agent.api.deps import get_mcp_decision_signal, get_storage
 from cloud_agent.logging_utils import get_logger
 from cloud_agent.mcp import protocol
 from cloud_agent.mcp.authorization import decide, visible_capabilities
-from cloud_agent.mcp.host import HostError, McpHost, SessionKey, arguments_digest
+from cloud_agent.mcp.host import (
+    HostError,
+    McpHost,
+    SessionKey,
+    arguments_digest,
+    encode_arguments,
+)
 from cloud_agent.mcp.http_body import (
     IDENTITY_ENCODING_HEADERS,
     iter_response_bytes,
     require_identity_encoding,
 )
-from cloud_agent.mcp.invocations import deadline_for
+from cloud_agent.mcp.invocations import MAX_HELD_ARGUMENTS_BYTES, deadline_for
 from cloud_agent.mcp.jsonrpc import (
     INTERNAL_ERROR,
     INVALID_PARAMS,
@@ -654,6 +660,23 @@ async def _decide_call(
             # retry storm cannot send a write twice.
             authorized.dispatches.append((int(claimed["id"]), int(claimed["dispatch_generation"])))
             return None
+    if not _held_arguments_fit(arguments):
+        logger.warning(
+            "agent_mcp_call_too_large_to_hold",
+            extra={
+                "event": "agent_mcp_call_too_large_to_hold",
+                "job_id": authorized.job_id,
+                "alias": authorized.alias,
+                "tool": name,
+            },
+        )
+        return _error_reply(
+            request_id,
+            f"This call needs its owner's approval, and its arguments are larger than the "
+            f"{MAX_HELD_ARGUMENTS_BYTES} bytes a held call can keep for review. "
+            "It was not held or sent.",
+            INVALID_PARAMS,
+        )
     invocation = await store.mcp.create_mcp_invocation(
         job_id=authorized.job_id,
         attempt_id=attempt_id,
@@ -911,6 +934,13 @@ async def _capability_decision(
         if held is not None:
             return held
     return None
+
+
+def _held_arguments_fit(arguments: Any) -> bool:
+    """Whether a held call's arguments fit under :data:`MAX_HELD_ARGUMENTS_BYTES` as stored."""
+    if not isinstance(arguments, dict):
+        return True
+    return len(encode_arguments(arguments)) <= MAX_HELD_ARGUMENTS_BYTES
 
 
 def _protect_arguments(arguments: Any) -> str | None:
