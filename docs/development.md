@@ -169,30 +169,37 @@ Set `CI_LOG_DIR` to choose an output directory. This local gate excludes externa
 regressions, rolling upgrades, Gitleaks, Docker release-image builds, and Kata
 qualification; those remain part of the wider hosted CI gate.
 
-While this repository remains private, pull requests from branches in this same
-repository temporarily run on the existing self-hosted pools. This explicitly
-trusts everyone who can push such a branch with persistent-runner access; it is
-a hosted-minute workaround, not an isolation boundary. Fork pull requests stay
-on disposable GitHub-hosted VMs: ARM64 artifacts use `ubuntu-24.04-arm`, and
-AMD64 artifacts use `ubuntu-24.04`. Pushes to `dev` and `main`, and authorized
-manual dispatches, keep the same self-hosted routing as before. Every PR still
-has only a read token, checkout does not persist it, image jobs use anonymous
-registry pulls, and the per-PR buildx directory and builder name remain isolated
-from the persistent builders used by trusted push and dispatch jobs. Real Kata
-host qualification remains excluded from every PR and runs only on trusted
+Every pull request, from a fork or from a branch of this repository, runs on
+disposable GitHub-hosted VMs: ARM64 artifacts use `ubuntu-24.04-arm`, and
+everything else uses `ubuntu-24.04`. The repository is public, so these runners
+consume no minute quota. Pushes to `dev` and `main`, and authorized manual
+dispatches, keep the self-hosted pools, which also run publication and
+synchronization. Every PR has only a read token, checkout does not persist it,
+image jobs use anonymous registry pulls, and no PR job receives a secret. Real
+Kata host qualification remains excluded from every PR and runs only on trusted
 `dev` events.
 
-This temporary policy must be removed before the repository is open-sourced.
-GitHub issue [#464](https://github.com/HarvardMadSys/hybridInference-cloud-agent/issues/464)
-tracks the release-blocking work: route every PR back to a disposable isolated
-runner, then validate the runner-group controls below against an untrusted fork.
-Repository visibility must not change until that issue is closed and its
-acceptance check has passed.
+Pull requests only read the Actions cache. After each push to `dev`, the
+optional `pr-caches.yml` workflow fills the uv and npm caches and exports the
+sandbox image's build layers from a hosted VM, under the `dev` scope that every pull
+request into `dev` may restore. It runs separately from CI, so publication
+does not wait for it and its failure does not affect CI's conclusion. Of the
+15 real-CLI MCP cases, a pull request runs Kilo's three as `MCP conformance
+(kilo, …)` jobs, one case each, and the other twelve in
+the sandbox image job; trusted events run all 15 in the sandbox image job.
 
-Before enabling public fork workflows, configure GitHub's runner groups to allow
-persistent pools only for the trusted workflow references on `refs/heads/dev`
-and `refs/heads/main`, including the publication and manual synchronization
-workflows. Deny PR merge/head refs and other workflow files. Verify those rules
+GitHub issue [#464](https://github.com/HarvardMadSys/hybridInference-cloud-agent/issues/464)
+tracks the remaining administrator work: the runner-group controls below,
+validated against an untrusted fork.
+
+Because the repository is public, a fork's pull request can run workflows.
+Configure GitHub's runner groups to allow persistent pools only for the trusted
+workflow references on `refs/heads/dev` and `refs/heads/main`, including the
+publication and manual synchronization workflows. The pools are registered on
+the repository today, where no such restriction applies, so they need to move
+into an organization runner group first. Deny PR merge/head refs and other
+workflow files. Until then, require approval for fork workflows from every
+external contributor, not only first-time ones. Verify those rules
 with an untrusted fork workflow edit that requests a persistent runner: it must
 remain ineligible. A fork can edit its workflow YAML, so the checked-in runner
 expressions cannot enforce this restriction themselves. If the organization

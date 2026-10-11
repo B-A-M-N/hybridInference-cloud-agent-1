@@ -26,13 +26,14 @@ on:
   pull_request:
     branches: [main, dev]
 
-# TEMPORARY PRIVATE-REPOSITORY POLICY (#464): same-repository pull requests are
-# trusted to the repository's existing persistent pools; fork pull requests
-# stay on disposable GitHub-hosted VMs. This saves hosted-runner minutes, but it
-# is not safe for public contribution. Before this repository is open-sourced,
-# #464 must restore disposable, isolated runners for every pull request and the
-# runner-group restrictions in docs/development.md must be verified. PRs keep a
-# read-only token, checkout never persists it, and no PR job receives secrets.
+# Pull requests execute unreviewed code: tests, package install hooks and
+# Dockerfiles. Every PR job, from a fork or from a branch of this repository,
+# runs on a disposable GitHub-hosted VM, which a public repository gets without
+# a minute quota. Persistent pools are reserved for pushes and manual
+# dispatches, which also publish and synchronise. PRs keep a read-only token,
+# checkout never persists it, and no PR job receives secrets. A fork can edit
+# this file, so these expressions are not the boundary: the runner-group
+# restrictions in docs/development.md (#464) are.
 permissions:
   contents: read
 
@@ -49,7 +50,7 @@ env:
 jobs:
   changes:
     name: Classify Changes
-    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && '["ubuntu-24.04"]' || '["self-hosted","Linux","ci-general"]') }}
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted","Linux","ci-general"]') }}
     outputs:
       backend: ${{ steps.classify.outputs.backend }}
       web: ${{ steps.classify.outputs.web }}
@@ -164,7 +165,7 @@ jobs:
     name: Lint
     needs: changes
     if: needs.changes.outputs.backend == 'true'
-    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && '["ubuntu-24.04"]' || '["self-hosted","Linux","ci-general"]') }}
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted","Linux","ci-general"]') }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -262,7 +263,7 @@ jobs:
     name: Tests
     needs: changes
     if: needs.changes.outputs.backend == 'true'
-    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && '["ubuntu-24.04"]' || '["self-hosted","Linux","ci-general"]') }}
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted","Linux","ci-general"]') }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -364,7 +365,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.backend == 'true'
     # This pool can start service containers; postgres:15 supports ARM64.
-    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && '["ubuntu-24.04"]' || '["self-hosted","Linux","ci-general"]') }}
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted","Linux","ci-general"]') }}
 
     services:
       postgres:
@@ -554,19 +555,22 @@ jobs:
               )
           PY
   # -------------------------------------------------------------------- web
-  # One job, six checks, for the reason spelled out over `lint` above — and
-  # more sharply here, because Node costs more to install than uv does. Measured
-  # over one run: 55s of setup across the five cells for 27s of actual checking,
-  # and four of the five spent longer installing than working (Prettier: 10s of
-  # setup, 1s of formatting check). The last two install nothing and reuse the
-  # checkout, but they do build: the guard builds the one that must fail, and
-  # the acceptance builds both web variants. That replaces a plain
-  # `npm run build` step rather than adding to it.
+  # Two jobs: the checks, and the builds. The checks stay together for the
+  # reason spelled out over `lint` above — and more sharply here, because Node
+  # costs more to install than uv does. Measured over one run: 55s of setup
+  # across five cells for 27s of actual checking, and four of the five spent
+  # longer installing than working (Prettier: 10s of setup, 1s of formatting
+  # check). The builds are a different size. On a hosted pull-request VM one
+  # job took 326s, 116s of it unit tests and 141s the two builds, so `web-build`
+  # runs them beside the checks and pays the ~25s of setup a second time rather
+  # than waiting for them. The guard builds the one that must fail, and the
+  # acceptance builds both web variants. That replaces a plain `npm run build`
+  # step rather than adding to it.
   check:
     name: Web
     needs: changes
     if: needs.changes.outputs.web == 'true'
-    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && '["ubuntu-24.04"]' || '["self-hosted","Linux","ci-general"]') }}
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted","Linux","ci-general"]') }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -625,6 +629,56 @@ jobs:
         working-directory: ./apps/frontend
         run: npm run test
 
+      - name: Every check passed
+        env:
+          RESULTS: >-
+            eslint=${{ steps.eslint.outcome }}
+            prettier=${{ steps.prettier.outcome }}
+            typescript=${{ steps.typescript.outcome }}
+            tests=${{ steps.tests.outcome }}
+        run: |
+          set -euo pipefail
+          failed=0
+          for entry in ${RESULTS}; do
+            name="${entry%%=*}"
+            result="${entry#*=}"
+            case "${result}" in
+              success) ;;
+              *) echo "::error title=Web::${name} is ${result}"; failed=1 ;;
+            esac
+          done
+          [ "${failed}" -eq 0 ] || exit 1
+          echo "Web: green"
+
+  web-build:
+    name: Web builds
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted","Linux","ci-general"]') }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Full fetch: shallow-clone packs with missing delta bases have been
+          # failing random checkouts on this pool.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Same directory, and so the same cache entry, as `check` above.
+      - name: Isolate the npm cache dir
+        run: |
+          echo "npm_config_cache=${RUNNER_TEMP}/npm-cache" >> "${GITHUB_ENV}"
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./apps/frontend
+        run: npm ci
+
       # A Client Component importing the server config reader must fail the
       # build, and that is enforced by the bundler rather than by the module,
       # so only a real build proves it. The build is expected to fail; the
@@ -650,10 +704,6 @@ jobs:
       - name: Every check passed
         env:
           RESULTS: >-
-            eslint=${{ steps.eslint.outcome }}
-            prettier=${{ steps.prettier.outcome }}
-            typescript=${{ steps.typescript.outcome }}
-            tests=${{ steps.tests.outcome }}
             server-only=${{ steps.server-only.outcome }}
             runtime-config=${{ steps.runtime-config.outcome }}
         run: |
@@ -664,15 +714,15 @@ jobs:
             result="${entry#*=}"
             case "${result}" in
               success) ;;
-              *) echo "::error title=Web::${name} is ${result}"; failed=1 ;;
+              *) echo "::error title=Web builds::${name} is ${result}"; failed=1 ;;
             esac
           done
           [ "${failed}" -eq 0 ] || exit 1
-          echo "Web: green"
+          echo "Web builds: green"
   # ------------------------------------------------------------------ secret
   gitleaks:
     name: Gitleaks
-    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && '["ubuntu-24.04"]' || '["self-hosted","Linux","ci-general"]') }}
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted","Linux","ci-general"]') }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -744,7 +794,7 @@ jobs:
     name: ${{ matrix.artifact.name }} (${{ matrix.artifact.arch }})
     needs: changes
     if: needs.changes.outputs.docker == 'true'
-    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && (matrix.artifact.arch == 'arm64' && '["ubuntu-24.04-arm"]' || '["ubuntu-24.04"]') || matrix.artifact.runner) }}
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && (matrix.artifact.arch == 'arm64' && '["ubuntu-24.04-arm"]' || '["ubuntu-24.04"]') || matrix.artifact.runner) }}
     # The builder lives in a config directory belonging to the *runner*, not to
     # this job, because its layer cache is the only thing between a cell and
     # re-downloading hundreds of megabytes. With a builder per job the cache
@@ -762,12 +812,18 @@ jobs:
     # mid-build deleted the builder out from under it — `target migrate:
     # failed to receive status`, `graceful_stop`.
     #
-    # The persistent builder is the cache; there is deliberately no GHA cache
-    # importer or exporter below. Importing one made a warm runner download
-    # 835MB it already held, while retaining only the exporter later spent 154s
-    # uploading the same sandbox layers for a cache no build consumed. Under
-    # three concurrent sandbox builds on this host, that write-only export took
-    # more than 15 minutes. A cold builder rebuilds once and then stays warm.
+    # On the persistent pools the builder is the cache, and nothing here
+    # imports or exports a GHA cache there. Importing one made a warm runner
+    # download 835MB it already held, while retaining only the exporter later
+    # spent 154s uploading the same sandbox layers for a cache no build
+    # consumed. Under three concurrent sandbox builds on this host, that
+    # write-only export took more than 15 minutes. A cold builder rebuilds once
+    # and then stays warm.
+    #
+    # A pull request's VM is always cold, so its sandbox build imports the
+    # layers `pr-caches` exports after each push to dev, from a hosted VM whose
+    # upload does not compete with these hosts. Pull requests only ever read
+    # that cache; nothing in a pull request can write what another one restores.
     strategy:
       fail-fast: false
       matrix:
@@ -868,14 +924,19 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # The sandbox build and runtime copies need more space than the hosted
-      # runner leaves free. These preinstalled SDKs are unused by this job;
-      # sandbox toolchains are installed inside the image.
+      # The sandbox build and its runtime copies need more space than a
+      # private repository's hosted runner leaves free. These preinstalled SDKs
+      # are unused by this job; sandbox toolchains are installed inside the
+      # image. Deleting them takes about 90s, and a public repository's runner
+      # starts with roughly 80GB free, so only a runner under 40GB pays for it.
       - name: Free unused SDKs on the hosted sandbox runner
         if: github.event_name == 'pull_request' && runner.environment == 'github-hosted' && matrix.artifact.name == 'sandbox'
         run: |
           set -euo pipefail
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          available_kib="$(df --output=avail -k / | tail -n 1 | tr -dc '0-9')"
+          if [ "${available_kib:-0}" -lt $((40 * 1024 * 1024)) ]; then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          fi
           df -h /
 
       # Reused across jobs, and self-healing: a builder whose buildkitd will not
@@ -938,8 +999,10 @@ jobs:
           echo "builder ${builder} ready in ${buildx_config}"
 
       # `push: false` still: nothing here publishes, and these images carry no
-      # credentials. `load: true` is what puts the image on this runner's
-      # daemon, which is where the smoke below starts it.
+      # credentials. The `docker` output is what puts the image on this
+      # runner's daemon, which is where the smoke below starts it. Uncompressed,
+      # because the daemon is the only consumer: on a hosted VM the sandbox spent
+      # 60s compressing layers that the daemon then decompressed again.
       #
       # `SOURCE_COMMIT` is passed to every artifact because each Dockerfile
       # writes it into `org.opencontainers.image.revision`, and a release whose
@@ -959,12 +1022,13 @@ jobs:
           context: .
           file: ${{ matrix.artifact.dockerfile }}
           push: false
-          load: true
+          outputs: type=docker,compression=uncompressed
           # The docker exporter needs a name to load the image under. Without
           # this the build succeeds and the smoke then finds nothing to start:
           # `docker inspect <tag>` is the first thing it does, and a build that
           # produced an anonymous image reads as a missing one.
           tags: ${{ env.IMAGE_TAG }}
+          cache-from: ${{ github.event_name == 'pull_request' && runner.environment == 'github-hosted' && matrix.artifact.name == 'sandbox' && 'type=gha,scope=sandbox-amd64' || '' }}
           build-args: |
             SOURCE_COMMIT=${{ github.sha }}
             ${{ matrix.artifact.build_args }}
@@ -979,24 +1043,29 @@ jobs:
           context: .
           file: ${{ matrix.artifact.dockerfile }}
           push: false
-          load: true
+          outputs: type=docker,compression=uncompressed
           # The docker exporter needs a name to load the image under. Without
           # this the build succeeds and the smoke then finds nothing to start:
           # `docker inspect <tag>` is the first thing it does, and a build that
           # produced an anonymous image reads as a missing one.
           tags: ${{ env.IMAGE_TAG }}
+          cache-from: ${{ github.event_name == 'pull_request' && runner.environment == 'github-hosted' && matrix.artifact.name == 'sandbox' && 'type=gha,scope=sandbox-amd64' || '' }}
           build-args: |
             SOURCE_COMMIT=${{ github.sha }}
             ${{ matrix.artifact.build_args }}
 
-      # The image is loaded into Docker now. Drop unused intermediate layers
-      # from this disposable builder before the retained-runtime tests make
-      # writable copies; persistent runner builders keep their warm caches.
+      # The image is loaded into Docker now. On a runner short of space, drop
+      # unused intermediate layers from this disposable builder before the
+      # retained-runtime tests make writable copies; persistent runner builders
+      # keep their warm caches. The threshold is the one the SDK step uses.
       - name: Free the hosted sandbox builder's unused cache
         if: github.event_name == 'pull_request' && runner.environment == 'github-hosted' && matrix.artifact.name == 'sandbox'
         run: |
           set -euo pipefail
-          docker buildx prune --builder "${BUILDER}" --all --force
+          available_kib="$(df --output=avail -k / | tail -n 1 | tr -dc '0-9')"
+          if [ "${available_kib:-0}" -lt $((40 * 1024 * 1024)) ]; then
+            docker buildx prune --builder "${BUILDER}" --all --force
+          fi
           df -h /
 
       - name: Isolate uv cache dir
@@ -1009,6 +1078,9 @@ jobs:
           enable-cache: true
           prune-cache: false
 
+      # On the image this cell just built. Trusted events run all fifteen cases
+      # here; a pull request runs the twelve that are not Kilo's, and `mcp`
+      # runs Kilo's three on VMs of their own.
       - name: All five CLIs retain MCP through approval, resume and fork
         if: matrix.artifact.name == 'sandbox'
         timeout-minutes: 20
@@ -1020,6 +1092,9 @@ jobs:
           TEST_DB_USER: postgres
           TEST_DB_PASSWORD: mcp-conformance-only
           MCP_TEST_WORKERS: "3"
+          # A pytest `-k` expression; empty selects every case. Test ids end
+          # `-<runtime>]`, which no other runtime's ids contain.
+          MCP_TEST_SELECTION: ${{ github.event_name == 'pull_request' && 'not kilo]' || '' }}
         run: |
           set -euo pipefail
           database="mcp-db-${SUFFIX}"
@@ -1056,7 +1131,7 @@ jobs:
           # or loadscope would keep them serial. Dynamic load balances the real
           # CLI processes while the worker databases isolate their storage.
           uv run pytest -q -n "${MCP_TEST_WORKERS}" --dist load \
-            -m external tests/external/test_resident_mcp_parity.py
+            -m external -k "${MCP_TEST_SELECTION}" tests/external/test_resident_mcp_parity.py
 
       # The smoke harness removes its image, so run it after the CLI matrix.
       - name: Start it, and assert what only starting shows
@@ -1069,13 +1144,13 @@ jobs:
             --revision "${GITHUB_SHA}"
 
       # The harness removes what it started; this is the backstop for the paths
-      # where it never got that far. Hosted runners are discarded, these are
-      # not: without it the machine accumulates a container and an image per
-      # attempt until the disk fills, and the symptom lands on whatever job
-      # happens to be running then. Containers first — an image with a
-      # container still referencing it is not removed even with `-f`.
+      # where it never got that far. Hosted runners are discarded, so it runs on
+      # the persistent ones only: without it the machine accumulates a container
+      # and an image per attempt until the disk fills, and the symptom lands on
+      # whatever job happens to be running then. Containers first — an image with
+      # a container still referencing it is not removed even with `-f`.
       - name: Drop this run's containers and image
-        if: always()
+        if: always() && runner.environment != 'github-hosted'
         run: |
           # Scoped by this cell's label, not by the name prefix: a shared
           # runner hosts several cells at once, so `--filter name=smoke-`
@@ -1090,9 +1165,238 @@ jobs:
           docker image rm "${IMAGE_TAG}" >/dev/null 2>&1 || true
 
       # Pull requests use job-local builders even on persistent runners. Remove
-      # the buildkit container as well as its temporary configuration.
+      # the buildkit container as well as its temporary configuration. A hosted
+      # VM is deleted with both, and removing them first took 20-30s.
       - name: Drop this pull request's builder
-        if: always() && github.event_name == 'pull_request'
+        if: always() && github.event_name == 'pull_request' && runner.environment != 'github-hosted'
+        run: |
+          if [ -n "${BUILDER:-}" ]; then
+            docker buildx rm "${BUILDER}" >/dev/null 2>&1 || true
+          fi
+
+  # ------------------------------------------------------------------- mcp
+  # Kilo's three real-CLI cases, one per VM, for pull requests. Each spends
+  # most of the test's 180s turn timeout on a hosted VM even alone (55s, 160s
+  # and 176s for the whole case), against 20-40s for three cases of any other
+  # runtime. Beside one another they run past it: on 2026-10-11, 25 of 48
+  # hosted sandbox cells failed this suite, nearly all on a Kilo case's
+  # TimeoutError, and three Kilo cases on one VM did it again in #532. The
+  # sandbox cell keeps the other twelve; trusted events still run all fifteen
+  # there, on the persistent pool, which this job leaves untouched.
+  #
+  # Each cell builds the sandbox itself, importing the layers `pr-caches`
+  # exports. Everything from the SDK step to the builder removal is copied from
+  # `artifacts` verbatim, comments aside — see there for why each step is the
+  # way it is. `test_artifacts_workflow.py` fails if the copies diverge, so the
+  # image these cases run is the image the sandbox cell builds and starts.
+  mcp:
+    name: MCP conformance (kilo, ${{ matrix.case }})
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || matrix.artifact.runner) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Kilo's three policy cases. With the sandbox cell's selection these
+        # partition the parity suite; the policy test collects it to prove so.
+        case: [allow, confirm, confirm-normalized-name]
+        artifact:
+          - name: sandbox
+            arch: amd64
+            smoke_args: --role sandbox
+            dockerfile: deploy/sandbox/Dockerfile.agent-sandbox
+            runner: '["self-hosted","Linux","X64","image-verify-x64"]'
+            build_args: ""
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Per case as well as per run and attempt: the cells share a run id, and
+      # cleanup removes containers by this label.
+      - name: Name this cell's artifacts
+        run: |
+          suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-mcp-kilo-${{ matrix.case }}"
+          echo "IMAGE_TAG=${{ matrix.artifact.name }}:ci-${suffix}" >> "${GITHUB_ENV}"
+          echo "SUFFIX=${suffix}" >> "${GITHUB_ENV}"
+          mkdir -p "${RUNNER_TEMP}/docker-config"
+          echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-config" >> "${GITHUB_ENV}"
+
+      - name: Free unused SDKs on the hosted sandbox runner
+        if: github.event_name == 'pull_request' && runner.environment == 'github-hosted' && matrix.artifact.name == 'sandbox'
+        run: |
+          set -euo pipefail
+          available_kib="$(df --output=avail -k / | tail -n 1 | tr -dc '0-9')"
+          if [ "${available_kib:-0}" -lt $((40 * 1024 * 1024)) ]; then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          fi
+          df -h /
+
+      - name: Reuse this runner's builder, or make one
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            builder_scope="$(
+              printf '%s-%s' "${GITHUB_REPOSITORY}" "${RUNNER_NAME}" \
+                | tr '[:upper:]' '[:lower:]' \
+                | tr -c '[:alnum:]_.-' '-'
+            )"
+            builder_prefix="ci-pr-${builder_scope}-"
+            buildx_config="${RUNNER_TEMP}/buildx"
+            builder="${builder_prefix}${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.artifact.name }}"
+          else
+            buildx_config="$(dirname "${RUNNER_WORKSPACE}")/buildx/${RUNNER_NAME}"
+            builder="ci-${RUNNER_NAME}"
+          fi
+          mkdir -p "${buildx_config}"
+          export BUILDX_CONFIG="${buildx_config}"
+          echo "BUILDX_CONFIG=${buildx_config}" >> "${GITHUB_ENV}"
+          echo "BUILDER=${builder}" >> "${GITHUB_ENV}"
+          # A cancelled PR cannot run its final cleanup. On the next job for this
+          # repository and runner, remove only that runner's orphaned builders.
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            stale_prefix="buildx_buildkit_${builder_prefix}"
+            while IFS= read -r container; do
+              [ -n "${container}" ] || continue
+              [ "${container}" = "buildx_buildkit_${builder}0" ] && continue
+              case "${container}" in
+                "${stale_prefix}"*)
+                  docker rm -fv "${container}" >/dev/null 2>&1 || true
+                  docker volume rm "${container}_state" >/dev/null 2>&1 || true
+                  ;;
+              esac
+            done < <(
+              docker ps -a --filter "name=${stale_prefix}" --format '{{.Names}}' \
+                2>/dev/null || true
+            )
+          fi
+          if ! docker buildx inspect "${builder}" --bootstrap >/dev/null 2>&1; then
+            docker buildx rm "${builder}" >/dev/null 2>&1 || true
+            docker buildx create --name "${builder}" --driver docker-container --use >/dev/null
+            docker buildx inspect "${builder}" --bootstrap >/dev/null
+          fi
+          docker buildx use "${builder}" >/dev/null
+          echo "builder ${builder} ready in ${buildx_config}"
+
+      - name: Build ${{ matrix.artifact.name }}
+        id: build
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          builder: ${{ env.BUILDER }}
+          context: .
+          file: ${{ matrix.artifact.dockerfile }}
+          push: false
+          outputs: type=docker,compression=uncompressed
+          tags: ${{ env.IMAGE_TAG }}
+          cache-from: ${{ github.event_name == 'pull_request' && runner.environment == 'github-hosted' && matrix.artifact.name == 'sandbox' && 'type=gha,scope=sandbox-amd64' || '' }}
+          build-args: |
+            SOURCE_COMMIT=${{ github.sha }}
+            ${{ matrix.artifact.build_args }}
+
+      - name: Build ${{ matrix.artifact.name }} (retry)
+        if: steps.build.outcome == 'failure'
+        uses: docker/build-push-action@v6
+        with:
+          builder: ${{ env.BUILDER }}
+          context: .
+          file: ${{ matrix.artifact.dockerfile }}
+          push: false
+          outputs: type=docker,compression=uncompressed
+          tags: ${{ env.IMAGE_TAG }}
+          cache-from: ${{ github.event_name == 'pull_request' && runner.environment == 'github-hosted' && matrix.artifact.name == 'sandbox' && 'type=gha,scope=sandbox-amd64' || '' }}
+          build-args: |
+            SOURCE_COMMIT=${{ github.sha }}
+            ${{ matrix.artifact.build_args }}
+
+      - name: Free the hosted sandbox builder's unused cache
+        if: github.event_name == 'pull_request' && runner.environment == 'github-hosted' && matrix.artifact.name == 'sandbox'
+        run: |
+          set -euo pipefail
+          available_kib="$(df --output=avail -k / | tail -n 1 | tr -dc '0-9')"
+          if [ "${available_kib:-0}" -lt $((40 * 1024 * 1024)) ]; then
+            docker buildx prune --builder "${BUILDER}" --all --force
+          fi
+          df -h /
+
+      - name: Isolate uv cache dir
+        run: |
+          echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache" >> "${GITHUB_ENV}"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+          prune-cache: false
+
+      - name: Kilo retains MCP through approval, resume and fork (${{ matrix.case }})
+        timeout-minutes: 20
+        env:
+          MCP_TEST_SANDBOX_IMAGE: ${{ env.IMAGE_TAG }}
+          MCP_TEST_RUN_LABEL: ${{ env.SUFFIX }}
+          TEST_DB_HOST: 127.0.0.1
+          TEST_DB_NAME: hybridinference_test_mcp
+          TEST_DB_USER: postgres
+          TEST_DB_PASSWORD: mcp-conformance-only
+          MCP_TEST_WORKERS: "3"
+          # The id `[<case>-kilo]`, which names exactly one case.
+          MCP_TEST_SELECTION: "${{ matrix.case }}-kilo]"
+        run: |
+          set -euo pipefail
+          database="mcp-db-${SUFFIX}"
+          trap 'docker rm -f "${database}" >/dev/null 2>&1 || true' EXIT
+          docker run -d --name "${database}" \
+            --label "io.hybridinference.smoke.run=${SUFFIX}" \
+            -e POSTGRES_DB="${TEST_DB_NAME}" -e POSTGRES_PASSWORD="${TEST_DB_PASSWORD}" \
+            -p 127.0.0.1::5432 postgres:16-alpine
+          # Probe TCP, not the socket. The image runs initdb against a
+          # temporary server started with `listen_addresses=''` — reachable on
+          # the unix socket and nowhere else — then stops it and starts the
+          # real one. A socket probe answers "accepting connections" for that
+          # temporary server, and the createdb below then lands in the shutdown
+          # between the two: `FATAL: the database system is shutting down`.
+          # TCP is also how the tests reach it, so it is the honest question.
+          for attempt in $(seq 1 30); do
+            if docker exec "${database}" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          docker exec "${database}" pg_isready -h 127.0.0.1 -U postgres
+          # The test config appends pytest-xdist's worker id to TEST_DB_NAME.
+          # Give each worker its own database so migrations and state cannot race;
+          # the Postgres container creates only the unsuffixed database.
+          for worker in $(seq 0 "$((MCP_TEST_WORKERS - 1))"); do
+            docker exec "${database}" createdb \
+              -U "${TEST_DB_USER}" "${TEST_DB_NAME}_gw${worker}"
+          done
+          TEST_DB_PORT=$(docker port "${database}" 5432/tcp | awk -F: '{print $NF}')
+          MCP_TEST_HOST=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')
+          export TEST_DB_PORT MCP_TEST_HOST
+          # All 15 cases are one parametrized function in one file, so loadfile
+          # or loadscope would keep them serial. Dynamic load balances the real
+          # CLI processes while the worker databases isolate their storage.
+          uv run pytest -q -n "${MCP_TEST_WORKERS}" --dist load \
+            -m external -k "${MCP_TEST_SELECTION}" tests/external/test_resident_mcp_parity.py
+
+      - name: Drop this run's containers and image
+        if: always() && runner.environment != 'github-hosted'
+        run: |
+          # Scoped by this cell's label, not by the name prefix: a shared
+          # runner hosts several cells at once, so `--filter name=smoke-`
+          # reaches into the others and kills their containers mid-check.
+          docker ps -aq --filter "label=io.hybridinference.smoke.run=${SUFFIX}" \
+            | xargs -r docker rm -f || true
+          # Not `-f`. Forced removal untags an image another cell or run may
+          # still be starting containers from; a plain `rm` refuses while any
+          # container references it, so the worst case is a leftover image
+          # rather than a tag pulled out from under somebody else. (It does not
+          # delete containers — the removals above are what did that.)
+          docker image rm "${IMAGE_TAG}" >/dev/null 2>&1 || true
+
+      - name: Drop this pull request's builder
+        if: always() && github.event_name == 'pull_request' && runner.environment != 'github-hosted'
         run: |
           if [ -n "${BUILDER:-}" ]; then
             docker buildx rm "${BUILDER}" >/dev/null 2>&1 || true
@@ -1105,8 +1409,8 @@ jobs:
     # The one docker job with no architecture to match: `docker compose config`
     # parses and interpolates, it does not build or start anything. Use the
     # ARM64 pool for trusted events so this does not queue behind x64 builds;
-    # fork pull requests can parse these files on a disposable x64 hosted VM.
-    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && '["ubuntu-24.04"]' || '["self-hosted","Linux","ARM64","image-verify-arm64"]') }}
+    # pull requests can parse these files on a disposable x64 hosted VM.
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted","Linux","ARM64","image-verify-arm64"]') }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -1381,15 +1685,17 @@ jobs:
     # on this workflow's conclusion, so this is what stands between a merge to
     # dev and a consumable release.
     if: always()
-    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && '["ubuntu-24.04"]' || '["self-hosted","Linux","ci-general"]') }}
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["self-hosted","Linux","ci-general"]') }}
     needs:
       - changes
       - lint
       - test
       - test-db
       - check
+      - web-build
       - gitleaks
       - artifacts
+      - mcp
       - compose
       - kata
     steps:
@@ -1406,8 +1712,10 @@ jobs:
             test=${{ needs.test.result }}
             test-db=${{ needs.test-db.result }}
             web=${{ needs.check.result }}
+            web-build=${{ needs.web-build.result }}
             gitleaks=${{ needs.gitleaks.result }}
             artifacts=${{ needs.artifacts.result }}
+            mcp=${{ needs.mcp.result }}
             compose=${{ needs.compose.result }}
             kata=${{ needs.kata.result }}
           CHANGES_RESULT: ${{ needs.changes.result }}

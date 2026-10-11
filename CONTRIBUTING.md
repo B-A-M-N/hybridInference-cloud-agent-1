@@ -83,16 +83,13 @@ CLI/session and MCP flows. After review, the real-Kata candidate check runs for
 relevant `dev` commits. Pull-request image jobs build and smoke-test without
 publishing.
 
-While this repository remains private, pull requests from branches in this
-repository temporarily run on persistent self-hosted pools. Fork pull requests
-run on disposable GitHub-hosted runners. This policy trusts everyone who can
-push a branch here, so it is not suitable for public contribution. Before the
-repository becomes public, issue
+Every pull request, from a fork or from a branch here, runs on disposable
+GitHub-hosted runners; pushes to `dev` and `main` run on the self-hosted pools.
+Checked-in runner routing is not a security boundary: a fork can edit it. Issue
 [#464](https://github.com/HarvardMadSys/hybridInference-cloud-agent/issues/464)
-must route every pull request back to a disposable runner and validate the
-runner-group restrictions. Checked-in runner routing is not a security boundary.
-The [developer guide](docs/development.md#run-the-relevant-checks) describes the
-required runner-group policy. Release publication has its own
+tracks the runner-group restrictions that are, and the
+[developer guide](docs/development.md#run-the-relevant-checks) describes them.
+Release publication has its own
 [workflow](.github/workflows/publish.yml) and [guide](deploy/release/README.md).
 
 ## Contracts

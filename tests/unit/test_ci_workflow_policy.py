@@ -1,9 +1,8 @@
-"""Temporary private-repository runner routing policy.
+"""Unreviewed PR code never shares a runner or credential with publication.
 
-Same-repository PRs use persistent pools; fork PRs select hosted runners. Exercise
-every cell rather than trusting an expression that merely mentions both. GitHub
-runner-group restrictions remain required because a fork can propose workflow
-edits.
+Exercise the workflow's runner expressions for every cell rather than accepting
+an expression merely because it contains a hosted runner somewhere. Runner-group
+restrictions are also required in GitHub: a fork can propose workflow edits.
 """
 
 from __future__ import annotations
@@ -11,6 +10,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import shlex
 import subprocess
 from pathlib import Path
@@ -20,10 +20,15 @@ import pytest
 import yaml
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
+CACHE_WORKFLOW = WORKFLOW.with_name("pr-caches.yml")
 
 
 def _document() -> dict:
     return yaml.safe_load(WORKFLOW.read_text())
+
+
+def _cache_document() -> dict:
+    return yaml.safe_load(CACHE_WORKFLOW.read_text())
 
 
 def _expression(
@@ -101,31 +106,25 @@ def _self_hosted_labels(name: str, cell: dict) -> list[str]:
     }
     return (
         json.loads(cell["runner"])
-        if name == "artifacts"
+        if name in {"artifacts", "mcp"}
         else special.get(name, ["self-hosted", "Linux", "ci-general"])
     )
 
 
-def test_fork_pull_requests_run_every_check_on_native_hosted_runners() -> None:
-    """The checked-in routing keeps ordinary fork jobs on hosted runners."""
+# The hosted-only cache warmer has its own workflow, so its completion cannot
+# delay the CI workflow's verdict used by publication.
+CACHE_WARMER = "pr-caches"
+
+
+@pytest.mark.parametrize("fork", [True, False], ids=["fork", "same-repository"])
+def test_pull_requests_run_every_check_on_disposable_native_hosted_runners(fork: bool) -> None:
+    """Forks, collaborators and same-repository PRs all take the hosted path."""
     for name, job in _document()["jobs"].items():
         if name == "kata":
             continue  # Its explicit PR exclusion is checked below.
         for cell in _cells(job):
             expected = "ubuntu-24.04-arm" if cell.get("arch") == "arm64" else "ubuntu-24.04"
-            assert _runner_labels(job, "pull_request", cell, fork=True) == [expected], (
-                name,
-                cell,
-            )
-
-
-def test_same_repository_pull_requests_use_the_existing_self_hosted_pools() -> None:
-    """Trusted repository branches conserve hosted minutes without changing pools."""
-    for name, job in _document()["jobs"].items():
-        if name == "kata":
-            continue  # It remains excluded from every pull request below.
-        for cell in _cells(job):
-            assert _runner_labels(job, "pull_request", cell) == _self_hosted_labels(name, cell), (
+            assert _runner_labels(job, "pull_request", cell, fork=fork) == [expected], (
                 name,
                 cell,
             )
@@ -137,6 +136,137 @@ def test_trusted_events_keep_the_existing_self_hosted_pools(event: str) -> None:
         for cell in _cells(job):
             expected = _self_hosted_labels(name, cell)
             assert _runner_labels(job, event, cell) == expected, (name, cell)
+
+
+def test_only_an_optional_cache_warmer_runs_a_trusted_event_on_a_hosted_vm() -> None:
+    """Trusted CI and publication must never wait for a hosted VM.
+
+    `pr-caches` runs dev's reviewed code on a hosted VM so that a pull request's
+    caches match its own VM. Its separate workflow prevents a queued or slow
+    hosted job from delaying the CI workflow's completion, which Publish waits
+    for even after CI Gate has passed.
+    """
+    jobs = _document()["jobs"]
+    document = _cache_document()
+    triggers = document.get("on") or document[True]
+    assert triggers == {"push": {"branches": ["dev"]}}
+    assert document["permissions"] == {"contents": "read"}
+    assert set(document["jobs"]) == {CACHE_WARMER}
+    assert CACHE_WARMER not in jobs
+    warmer = document["jobs"][CACHE_WARMER]
+    assert warmer["if"] == "github.event_name == 'push' && github.ref == 'refs/heads/dev'"
+    assert warmer["runs-on"] == ["ubuntu-24.04"]
+    assert warmer["continue-on-error"] is True
+    assert "needs" not in warmer
+    for name, job in jobs.items():
+        needs = job.get("needs", [])
+        assert CACHE_WARMER not in ([needs] if isinstance(needs, str) else needs), name
+    assert warmer.get("permissions", document["permissions"]) == {"contents": "read"}
+    assert "secrets." not in json.dumps(document)
+    build = next(
+        step for step in warmer["steps"] if "docker/build-push-action" in step.get("uses", "")
+    )
+    assert build["with"]["push"] is False
+    assert build["with"]["outputs"] == "type=cacheonly", "the warmer exports layers, never an image"
+
+
+def test_publication_waits_only_for_the_ci_workflow() -> None:
+    """An optional job in CI still delays its workflow-level publication signal."""
+    document = _document()
+    assert CACHE_WARMER not in document["jobs"]
+    assert _cache_document()["name"] != document["name"]
+    publish = yaml.safe_load(WORKFLOW.with_name("publish.yml").read_text())
+    triggers = publish.get("on") or publish[True]
+    assert triggers["workflow_run"]["workflows"] == [document["name"]]
+    assert triggers["workflow_run"]["types"] == ["completed"]
+    scripts = "\n".join(
+        step.get("with", {}).get("script", "")
+        for job in publish["jobs"].values()
+        for step in job.get("steps", [])
+    )
+    assert set(re.findall(r"workflow_id:\s*'([^']+)'", scripts)) == {WORKFLOW.name}
+
+
+SANDBOX_CACHE = "type=gha,scope=sandbox-amd64"
+
+
+@pytest.mark.parametrize("event", ["pull_request", "push", "workflow_dispatch"])
+@pytest.mark.parametrize("runner_environment", ["github-hosted", "self-hosted"])
+def test_only_a_hosted_pull_request_imports_the_sandbox_layers(
+    event: str, runner_environment: str
+) -> None:
+    """A cold hosted VM imports what dev exported; a warm persistent builder never does.
+
+    On a persistent builder the import downloads layers it already holds. No cell
+    exports, either: a pull request must not be able to write what another one
+    restores, and the persistent pools' uploads are too slow to carry it.
+    """
+    jobs = _document()["jobs"]
+    for name in ("artifacts", "mcp"):
+        builds = [s for s in jobs[name]["steps"] if "docker/build-push-action" in s.get("uses", "")]
+        assert len(builds) == 2, name  # the build and its retry
+        for build in builds:
+            assert "cache-to" not in build["with"], name
+            for cell in _cells(jobs[name]):
+                expected = (
+                    SANDBOX_CACHE
+                    if event == "pull_request"
+                    and runner_environment == "github-hosted"
+                    and cell["name"] == "sandbox"
+                    else ""
+                )
+                imported = _expression(
+                    build["with"]["cache-from"],
+                    event,
+                    cell,
+                    runner_environment=runner_environment,
+                )
+                assert imported == expected, (name, cell["name"])
+    warmer = next(
+        step
+        for step in _cache_document()["jobs"][CACHE_WARMER]["steps"]
+        if "docker/build-push-action" in step.get("uses", "")
+    )
+    assert warmer["with"]["file"] == "deploy/sandbox/Dockerfile.agent-sandbox"
+    assert warmer["with"]["cache-from"] == SANDBOX_CACHE
+    assert warmer["with"]["cache-to"] == f"{SANDBOX_CACHE},mode=max"
+
+
+def test_the_gate_waits_for_every_ci_job() -> None:
+    """A job the gate does not wait for is a check that cannot fail a commit."""
+    jobs = _document()["jobs"]
+    gate = jobs["ci-gate"]
+    assert set(gate["needs"]) == set(jobs) - {"ci-gate"}
+    report = next(
+        step
+        for step in gate["steps"]
+        if step.get("name") == "Every job succeeded or was deliberately skipped"
+    )
+    for need in gate["needs"]:
+        assert f"${{{{ needs.{need}.result }}}}" in report["env"]["RESULTS"], need
+
+
+def test_warmed_dependency_caches_use_the_paths_pull_requests_restore() -> None:
+    """The cache service keys an entry by its path; a different path never hits."""
+    jobs = _document()["jobs"]
+    warmer_job = _cache_document()["jobs"][CACHE_WARMER]
+    warmer = "\n".join(step.get("run", "") for step in warmer_job["steps"])
+    for name in ("lint", "test", "test-db", "artifacts", "mcp", "compose"):
+        assert any(
+            'echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache"' in step.get("run", "")
+            for step in jobs[name]["steps"]
+        ), name
+    for name in ("check", "web-build"):
+        assert any(
+            'echo "npm_config_cache=${RUNNER_TEMP}/npm-cache"' in step.get("run", "")
+            for step in jobs[name]["steps"]
+        ), name
+    assert 'echo "UV_CACHE_DIR=${RUNNER_TEMP}/uv-cache"' in warmer
+    assert 'echo "npm_config_cache=${RUNNER_TEMP}/npm-cache"' in warmer
+    node = next(step for step in warmer_job["steps"] if step.get("name") == "Set up Node")
+    assert node["with"] == next(
+        step["with"] for step in jobs["check"]["steps"] if step.get("name") == "Set up Node"
+    )
 
 
 def test_pr_workflow_has_only_read_permissions_and_no_privileged_event_trigger() -> None:
@@ -155,10 +285,11 @@ def test_pr_workflow_has_only_read_permissions_and_no_privileged_event_trigger()
 
 
 def test_checkouts_leave_no_token_in_the_unreviewed_repository() -> None:
-    for name, job in _document()["jobs"].items():
-        for step in job["steps"]:
-            if str(step.get("uses", "")).startswith("actions/checkout@"):
-                assert step.get("with", {}).get("persist-credentials") is False, name
+    for document in (_document(), _cache_document()):
+        for name, job in document["jobs"].items():
+            for step in job["steps"]:
+                if str(step.get("uses", "")).startswith("actions/checkout@"):
+                    assert step.get("with", {}).get("persist-credentials") is False, name
 
 
 @pytest.mark.parametrize("event", ["pull_request", "push"])
@@ -212,10 +343,13 @@ def test_builder_configuration_is_disposable_for_prs_and_persistent_for_pushes(
 
 
 def test_pull_request_builder_is_always_removed_after_the_artifact_job() -> None:
+    """Whatever happened, on any persistent runner. A hosted VM is deleted with it."""
     steps = _document()["jobs"]["artifacts"]["steps"]
     cleanup = [step for step in steps if 'docker buildx rm "${BUILDER}"' in step.get("run", "")]
     assert len(cleanup) == 1
-    assert cleanup[0]["if"] == "always() && github.event_name == 'pull_request'"
+    assert cleanup[0]["if"] == (
+        "always() && github.event_name == 'pull_request' && runner.environment != 'github-hosted'"
+    )
     assert steps[-1] is cleanup[0]
 
 
@@ -241,8 +375,43 @@ def test_sandbox_disk_cleanup_runs_only_for_hosted_pull_request_cells(
             )
 
 
-def test_sandbox_disk_cleanup_keeps_loaded_images_and_other_builder_caches(tmp_path: Path) -> None:
-    """Execute cleanup with command recorders instead of SDK files or a Docker daemon."""
+GIB_IN_KIB = 1024 * 1024
+FREED = [
+    "sudo",
+    "rm",
+    "-rf",
+    "/usr/local/lib/android",
+    "/usr/share/dotnet",
+    "/opt/ghc",
+    "/opt/hostedtoolcache/CodeQL",
+    "docker",
+    "buildx",
+    "prune",
+    "--builder",
+    "ci-pr-123-2-sandbox",
+    "--all",
+    "--force",
+]
+
+
+@pytest.mark.parametrize(
+    ("available_kib", "expected"),
+    [
+        (None, FREED),  # a df that says nothing is treated as a full disk
+        (39 * GIB_IN_KIB, FREED),  # a private repository's runner
+        (41 * GIB_IN_KIB, []),
+        (100 * GIB_IN_KIB, []),  # a public repository's runner after the build
+    ],
+    ids=["unreadable", "tight", "just-enough", "public"],
+)
+def test_sandbox_disk_cleanup_keeps_loaded_images_and_other_builder_caches(
+    tmp_path: Path, available_kib: int | None, expected: list[str]
+) -> None:
+    """Execute cleanup with command recorders instead of SDK files or a Docker daemon.
+
+    Only a runner short of space pays the 90s deletion. Whatever it frees, it
+    frees nothing else: no loaded image, no other builder's cache.
+    """
     steps = _document()["jobs"]["artifacts"]["steps"]
     sdks = next(
         step
@@ -273,8 +442,13 @@ def test_sandbox_disk_cleanup_keeps_loaded_images_and_other_builder_caches(tmp_p
             '#!/bin/sh\nprintf "%s\\n" "${0##*/}" "$@" >> "$CLEANUP_COMMAND_LOG"\n'
         )
         executable.chmod(0o755)
+    # `df --output=avail -k /` prints a header and the free KiB.
     df = bin_dir / "df"
-    df.write_text("#!/bin/sh\nexit 0\n")
+    df.write_text(
+        "#!/bin/sh\nexit 0\n"
+        if available_kib is None
+        else f'#!/bin/sh\nprintf "     Avail\\n %s\\n" {available_kib}\n'
+    )
     df.chmod(0o755)
     # Define recorders inside Bash so managed shell startup cannot reorder PATH
     # and expose the host's real sudo, Docker, or df commands.
@@ -297,22 +471,8 @@ def test_sandbox_disk_cleanup_keeps_loaded_images_and_other_builder_caches(tmp_p
             env=env,
             check=True,
         )
-    assert commands.read_text().splitlines() == [
-        "sudo",
-        "rm",
-        "-rf",
-        "/usr/local/lib/android",
-        "/usr/share/dotnet",
-        "/opt/ghc",
-        "/opt/hostedtoolcache/CodeQL",
-        "docker",
-        "buildx",
-        "prune",
-        "--builder",
-        env["BUILDER"],
-        "--all",
-        "--force",
-    ]
+    recorded = commands.read_text().splitlines() if commands.exists() else []
+    assert recorded == expected
 
 
 def test_real_kata_probe_is_unreachable_from_pull_requests_and_reported_as_skipped() -> None:

@@ -320,19 +320,6 @@ LABEL org.freeinference.runtime.claude-code.version="${CLAUDE_CODE_VERSION}" \
       org.freeinference.runtime.opencode.versions="${OPENCODE_VERSIONS}" \
       org.freeinference.runtime.kilo.versions="${KILO_VERSIONS}"
 
-# What this image is, in the two places a deployment looks: OCI's own labels,
-# and one of ours naming the artifact's role. A resolver reads both out of the
-# platform image it is about to run and compares them with the release
-# manifest — the revision against the manifest's source commit, the role
-# against the artifact it stands in for — so a build matrix that swaps two
-# digests is caught where the release is consumed rather than where it is
-# deployed. `SOURCE_COMMIT` is supplied by the publication build; an image
-# built by hand says `unknown`, and a resolver refuses it.
-ARG SOURCE_COMMIT=unknown
-LABEL org.opencontainers.image.source="https://github.com/HarvardMadSys/hybridInference-cloud-agent" \
-      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
-      io.hybridinference.artifact.role="sandbox"
-
 # pi, OpenCode, and Kilo all ignore OPENAI_BASE_URL; each one's supported
 # route to a custom gateway is a provider config file whose content (gateway
 # address, per-job credential, model) is only known at run time. These
@@ -486,6 +473,23 @@ RUN set -eu; \
     fd --version; \
     git lfs version; \
     gh --version
+
+# What this image is, in the two places a deployment looks: OCI's own labels,
+# and one of ours naming the artifact's role. A resolver reads both out of the
+# platform image it is about to run and compares them with the release
+# manifest — the revision against the manifest's source commit, the role
+# against the artifact it stands in for — so a build matrix that swaps two
+# digests is caught where the release is consumed rather than where it is
+# deployed. `SOURCE_COMMIT` is supplied by the publication build; an image
+# built by hand says `unknown`, and a resolver refuses it.
+#
+# Last, after every RUN: a RUN has each ARG declared above it in its
+# environment, so a commit-valued ARG declared earlier invalidated every layer
+# below it on every commit, in every builder and every layer cache.
+ARG SOURCE_COMMIT=unknown
+LABEL org.opencontainers.image.source="https://github.com/HarvardMadSys/hybridInference-cloud-agent" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      io.hybridinference.artifact.role="sandbox"
 
 # No ENTRYPOINT: the runner supplies the full argv from the runtime adapter,
 # so this image never decides what an agent run looks like.
