@@ -1397,9 +1397,15 @@ def test_a_member_pipe_joins_two_member_execs_without_a_shared_file(monkeypatch,
     assert (source.returncode, target.returncode) == (0, 0)
     assert source.stderr == b"note\n"
     assert received.read_text() == "private state"
-    source_exec, target_exec = (json.loads(line) for line in seen.read_text().splitlines())
-    assert source_exec[source_exec.index("--user") + 1] == f"{MEMBER_UID_BASE}:10001"
-    assert target_exec[target_exec.index("--user") + 1] == f"{MEMBER_UID_BASE + 2}:10001"
+    # Both execs start before either finishes, so the order they were logged
+    # in is not the order they were spawned in; tell them apart by user.
+    execs = {
+        argv[argv.index("--user") + 1]: argv
+        for argv in (json.loads(line) for line in seen.read_text().splitlines())
+    }
+    assert set(execs) == {f"{MEMBER_UID_BASE}:10001", f"{MEMBER_UID_BASE + 2}:10001"}
+    source_exec = execs[f"{MEMBER_UID_BASE}:10001"]
+    target_exec = execs[f"{MEMBER_UID_BASE + 2}:10001"]
     assert "--interactive" not in source_exec and "--interactive" in target_exec
     assert source_exec[source_exec.index("--workdir") + 2] == "sha256:container-one"
 
