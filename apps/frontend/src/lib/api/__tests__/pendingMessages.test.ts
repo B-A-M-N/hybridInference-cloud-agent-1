@@ -59,6 +59,20 @@ describe('pending messages api', () => {
     );
   });
 
+  it('trims surrounding whitespace from a prompt before sending it', async () => {
+    fetchWithAuth.mockResolvedValue(jsonResponse({ pending: waiting, job: null }, 201));
+
+    await submitThreadMessage('athr_1', { prompt: '\n  please add a test\nand docs  \n' });
+
+    expect(fetchWithAuth).toHaveBeenCalledWith(
+      expect.any(String),
+      '/v1/agent/threads/athr_1/messages',
+      expect.objectContaining({
+        body: JSON.stringify({ prompt: 'please add a test\nand docs' }),
+      }),
+    );
+  });
+
   it('keeps the idempotency key while the response is lost', async () => {
     fetchWithAuth
       .mockRejectedValueOnce(new TypeError('network error'))

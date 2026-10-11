@@ -1163,11 +1163,12 @@ export async function getAgentThreadStats(jobId: string): Promise<AgentThreadSta
 }
 
 export async function createAgentJob(body: CreateAgentJobRequest): Promise<AgentJobApi> {
+  const request = { ...body, task_prompt: body.task_prompt.trim() };
   return submitOnce('create', (requestId) =>
     fetchWithAuth(API_BASE, '/v1/agent/jobs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Idempotency-Key': requestId },
-      body: JSON.stringify(body),
+      body: JSON.stringify(request),
     }),
   );
 }
