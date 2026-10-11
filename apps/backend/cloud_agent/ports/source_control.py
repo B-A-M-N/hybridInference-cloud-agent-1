@@ -112,18 +112,30 @@ class SourceControlRepository(Protocol):
         """Return the owning user's connection, including encrypted tokens."""
         ...
 
+    async def claim_gitlab_token_refresh(
+        self,
+        *,
+        connection_id: int,
+        user_id: str,
+        lease_seconds: int,
+        margin_seconds: int,
+    ) -> dict[str, Any] | None:
+        """Take the lease to refresh an expiring token, or ``None`` if it is not ours."""
+        ...
+
     async def update_gitlab_tokens(
         self,
         *,
         connection_id: int,
         user_id: str,
+        refresh_generation: int,
         access_token_ciphertext: str,
         refresh_token_ciphertext: str,
         expires_at: Any,
     ) -> bool:
-        """Rotate encrypted OAuth tokens without crossing user ownership."""
+        """Write a refreshed token pair while this generation still owns the row."""
         ...
 
     async def delete_gitlab_connection(self, *, user_id: str, connection_id: int) -> bool:
-        """Delete only a connection owned by the authenticated user."""
+        """Delete only this user's row, so an in-flight refresh write misses."""
         ...

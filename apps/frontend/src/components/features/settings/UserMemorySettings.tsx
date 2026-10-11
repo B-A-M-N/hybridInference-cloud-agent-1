@@ -1,7 +1,8 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { useAuth, useLocale } from '@/components/providers';
+import { getAgentConfig } from '@/lib/api/agents';
 import {
   clearUserMemory,
   consolidateUserMemory,
@@ -14,6 +15,7 @@ import {
   type UserMemoryView,
 } from '@/lib/api/userMemory';
 import { APIError } from '@/lib/utils/errors';
+import { MemoryDetails } from './MemoryDetails';
 import { UserMemoryEntryCard, type UserMemoryRequestResult } from './UserMemoryEntryCard';
 
 type Operation = 'refresh' | 'toggle' | 'clear' | 'edit' | 'delete' | 'consolidate';
@@ -41,6 +43,29 @@ function UserMemoryPanel({ userId }: { userId: string | undefined }) {
   const wasConfirming = useRef(false);
   const memoriesHeading = useRef<HTMLHeadingElement>(null);
   const [removedEntries, setRemovedEntries] = useState(0);
+  const [models, setModels] = useState<string[]>([]);
+  const [modelsStatus, setModelsStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [modelLoadAttempt, setModelLoadAttempt] = useState(0);
+  const [modelChoice, setModelChoice] = useState('');
+  const modelSelectId = useId();
+
+  useEffect(() => {
+    if (!userId) return;
+    let cancelled = false;
+    setModelsStatus('loading');
+    getAgentConfig()
+      .then((config) => {
+        if (cancelled) return;
+        setModels(config.models);
+        setModelsStatus('ready');
+      })
+      .catch(() => {
+        if (!cancelled) setModelsStatus('error');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [userId, modelLoadAttempt]);
 
   useEffect(() => {
     if (removedEntries) memoriesHeading.current?.focus();
@@ -112,13 +137,6 @@ function UserMemoryPanel({ userId }: { userId: string | undefined }) {
     };
   }, [run]);
 
-  const hasPortrait =
-    view &&
-    (view.portrait.summary ||
-      view.portrait.projects.length ||
-      view.portrait.focus_areas.length ||
-      view.portrait.preferred_runtime ||
-      view.portrait.preferred_model);
   const updatedAt = view?.updated_at ? new Date(view.updated_at) : null;
   const savedIds = new Set(view?.memories.map((memory) => memory.id));
   // Keep keyed editor instances, and their local drafts, when a refresh removes
@@ -127,6 +145,12 @@ function UserMemoryPanel({ userId }: { userId: string | undefined }) {
     ...(view?.memories ?? []),
     ...[...editingEntries.values()].filter((memory) => !savedIds.has(memory.id)),
   ];
+  const preferredModel = view?.portrait.preferred_model;
+  const consolidationModel = models.includes(modelChoice)
+    ? modelChoice
+    : preferredModel && models.includes(preferredModel)
+      ? preferredModel
+      : (models[0] ?? '');
 
   return (
     <section
@@ -197,7 +221,7 @@ function UserMemoryPanel({ userId }: { userId: string | undefined }) {
                     </p>
                   ) : null}
                 </div>
-                <div className="flex flex-wrap gap-2 lg:ml-auto">
+                <div className="flex flex-wrap items-end gap-2 lg:ml-auto">
                   <button
                     type="button"
                     onClick={() => void run('refresh', getUserMemory)}
@@ -210,22 +234,60 @@ function UserMemoryPanel({ userId }: { userId: string | undefined }) {
                         : 'settings.memory.refresh',
                     )}
                   </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      void run('consolidate', (signal) =>
-                        consolidateUserMemory(view.revision, signal),
-                      )
-                    }
-                    disabled={pending !== null || editingEntries.size > 0 || !view.memories.length}
-                    className="ui-button ui-button-secondary min-h-11"
-                  >
-                    {t(
-                      pending === 'consolidate'
-                        ? 'settings.memory.consolidating'
-                        : 'settings.memory.consolidate',
-                    )}
-                  </button>
+                  <div className="flex flex-wrap items-end gap-2">
+                    <div className="min-w-0">
+                      <label
+                        htmlFor={modelSelectId}
+                        className="text-xs font-medium text-foreground"
+                      >
+                        {t('settings.memory.consolidationModel')}
+                      </label>
+                      <select
+                        id={modelSelectId}
+                        value={consolidationModel}
+                        onChange={(event) => setModelChoice(event.target.value)}
+                        disabled={pending !== null || modelsStatus !== 'ready' || !models.length}
+                        className="ui-input mt-1 block min-h-11 max-w-full rounded-lg"
+                      >
+                        {!models.length ? (
+                          <option value="">
+                            {t(
+                              modelsStatus === 'loading'
+                                ? 'settings.memory.modelsLoading'
+                                : 'settings.memory.noModels',
+                            )}
+                          </option>
+                        ) : null}
+                        {models.map((model) => (
+                          <option key={model} value={model}>
+                            {model}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void run('consolidate', (signal) =>
+                          consolidateUserMemory(view.revision, consolidationModel, signal),
+                        )
+                      }
+                      disabled={
+                        pending !== null ||
+                        editingEntries.size > 0 ||
+                        !view.memories.length ||
+                        modelsStatus !== 'ready' ||
+                        !consolidationModel
+                      }
+                      className="ui-button ui-button-secondary min-h-11"
+                    >
+                      {t(
+                        pending === 'consolidate'
+                          ? 'settings.memory.consolidating'
+                          : 'settings.memory.consolidate',
+                      )}
+                    </button>
+                  </div>
                   <button
                     ref={clearButton}
                     type="button"
@@ -237,6 +299,36 @@ function UserMemoryPanel({ userId }: { userId: string | undefined }) {
                   </button>
                 </div>
               </div>
+
+              {modelsStatus === 'loading' ? (
+                <p role="status" className="mt-3 text-xs text-muted">
+                  {t('settings.memory.modelsLoading')}
+                </p>
+              ) : modelsStatus === 'error' ? (
+                <div role="alert" className="mt-3 text-sm text-status-error">
+                  <p>{t('settings.memory.modelsError')}</p>
+                  <button
+                    type="button"
+                    onClick={() => setModelLoadAttempt((attempt) => attempt + 1)}
+                    className="ui-button ui-button-secondary mt-2 min-h-11"
+                  >
+                    {t('settings.memory.modelsRetry')}
+                  </button>
+                </div>
+              ) : !models.length ? (
+                <div className="mt-3">
+                  <p role="status" className="text-xs text-muted">
+                    {t('settings.memory.noModels')}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => setModelLoadAttempt((attempt) => attempt + 1)}
+                    className="ui-button ui-button-secondary mt-2 min-h-11"
+                  >
+                    {t('settings.memory.modelsRetry')}
+                  </button>
+                </div>
+              ) : null}
 
               {confirmClear ? (
                 <div
@@ -276,174 +368,90 @@ function UserMemoryPanel({ userId }: { userId: string | undefined }) {
                 </div>
               ) : null}
 
-              <div className="mt-5 grid gap-5 lg:grid-cols-3">
-                <div>
-                  <h3 className="text-sm font-semibold text-foreground">
-                    {t('settings.memory.portrait')}
-                  </h3>
-                  {hasPortrait ? (
-                    <>
-                      {view.portrait.summary ? (
-                        <p className="mt-2 whitespace-pre-wrap break-words text-sm leading-relaxed text-muted">
-                          {view.portrait.summary}
-                        </p>
-                      ) : null}
-                      <dl className="mt-2 space-y-2 text-sm">
-                        {view.portrait.projects.length ? (
-                          <div>
-                            <dt className="font-medium text-foreground">
-                              {t('settings.memory.projects')}
-                            </dt>
-                            <dd className="break-words text-muted">
-                              {view.portrait.projects.join(', ')}
-                            </dd>
-                          </div>
-                        ) : null}
-                        {view.portrait.focus_areas.length ? (
-                          <div>
-                            <dt className="font-medium text-foreground">
-                              {t('settings.memory.focusAreas')}
-                            </dt>
-                            <dd className="break-words text-muted">
-                              {view.portrait.focus_areas.join(', ')}
-                            </dd>
-                          </div>
-                        ) : null}
-                        {view.portrait.preferred_runtime ? (
-                          <div>
-                            <dt className="font-medium text-foreground">
-                              {t('settings.memory.runtime')}
-                            </dt>
-                            <dd className="break-words text-muted">
-                              {view.portrait.preferred_runtime}
-                            </dd>
-                          </div>
-                        ) : null}
-                        {view.portrait.preferred_model ? (
-                          <div>
-                            <dt className="font-medium text-foreground">
-                              {t('settings.memory.model')}
-                            </dt>
-                            <dd className="break-words text-muted">
-                              {view.portrait.preferred_model}
-                            </dd>
-                          </div>
-                        ) : null}
-                      </dl>
-                    </>
-                  ) : (
-                    <p className="mt-2 text-sm leading-relaxed text-muted">
-                      {t('settings.memory.emptyPortrait')}
+              <MemoryDetails
+                view={view}
+                scope="user"
+                memoriesContent={
+                  <div>
+                    <h3
+                      ref={memoriesHeading}
+                      tabIndex={-1}
+                      className="text-sm font-semibold text-foreground outline-none"
+                    >
+                      {t('settings.memory.memories')}
+                    </h3>
+                    <p className="mt-2 text-xs leading-relaxed text-muted">
+                      {t('settings.memory.entriesDescription')}{' '}
+                      {t('settings.memory.bounds', {
+                        count: view.memories.length,
+                        characters: view.memories.reduce(
+                          (total, memory) => total + memory.content.length,
+                          0,
+                        ),
+                      })}
                     </p>
-                  )}
-                </div>
-
-                <div>
-                  <h3
-                    ref={memoriesHeading}
-                    tabIndex={-1}
-                    className="text-sm font-semibold text-foreground outline-none"
-                  >
-                    {t('settings.memory.memories')}
-                  </h3>
-                  <p className="mt-2 text-xs leading-relaxed text-muted">
-                    {t('settings.memory.entriesDescription')}{' '}
-                    {t('settings.memory.bounds', {
-                      count: view.memories.length,
-                      characters: view.memories.reduce(
-                        (total, memory) => total + memory.content.length,
-                        0,
-                      ),
-                    })}
-                  </p>
-                  {shownMemories.length ? (
-                    <ul className="mt-2 max-h-96 space-y-2 overflow-y-auto">
-                      {shownMemories.map((memory, index) => (
-                        <UserMemoryEntryCard
-                          key={memory.id}
-                          memory={memory}
-                          number={index + 1}
-                          pending={pending !== null}
-                          unavailable={!savedIds.has(memory.id)}
-                          onEditingChange={(editing) => {
-                            setEditingEntries((current) => {
-                              const next = new Map(current);
-                              if (editing) next.set(memory.id, memory);
-                              else next.delete(memory.id);
-                              return next;
-                            });
-                            if (!editing && !savedIds.has(memory.id))
-                              setRemovedEntries((count) => count + 1);
-                          }}
-                          onSave={(content, scope) =>
-                            run(
-                              'edit',
-                              (signal) => {
-                                const savedScope =
-                                  memory.scope ?? (memory.source_repo ? 'repo' : 'user');
-                                if (scope === savedScope)
-                                  return editUserMemoryEntry(
-                                    memory.id,
-                                    content,
-                                    view.revision,
-                                    signal,
-                                  );
-                                const memories = view.memories.map((entry) => ({
-                                  id: entry.id,
-                                  content: entry.id === memory.id ? content : entry.content,
-                                  scope:
-                                    entry.id === memory.id
-                                      ? scope
-                                      : (entry.scope ?? (entry.source_repo ? 'repo' : 'user')),
-                                }));
-                                return saveUserMemories(view.revision, memories, signal);
-                              },
-                              false,
-                            )
-                          }
-                          onRemove={() =>
-                            run(
-                              'delete',
-                              (signal) => deleteUserMemoryEntry(memory.id, view.revision, signal),
-                              false,
-                            )
-                          }
-                          onRefresh={() => run('refresh', getUserMemory, false, memory.id)}
-                        />
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="mt-2 text-sm text-muted">{t('settings.memory.emptyMemory')}</p>
-                  )}
-                </div>
-
-                <div>
-                  <h3 className="text-sm font-semibold text-foreground">
-                    {t('settings.memory.suggestions')}
-                  </h3>
-                  {view.suggestions.length ? (
-                    <ul className="mt-2 space-y-2">
-                      {view.suggestions.map((suggestion) => (
-                        <li key={suggestion.id} className="rounded-lg bg-surface-muted p-3">
-                          <p className="break-words text-sm font-medium text-foreground">
-                            {suggestion.title}
-                          </p>
-                          <p className="mt-1 whitespace-pre-wrap break-words text-xs leading-relaxed text-muted">
-                            {suggestion.reason}
-                          </p>
-                          <p className="mt-2 whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground">
-                            {suggestion.action}
-                          </p>
-                        </li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="mt-2 text-sm leading-relaxed text-muted">
-                      {t('settings.memory.emptySuggestions')}
-                    </p>
-                  )}
-                </div>
-              </div>
+                    {shownMemories.length ? (
+                      <ul className="mt-2 max-h-96 space-y-2 overflow-y-auto">
+                        {shownMemories.map((memory, index) => (
+                          <UserMemoryEntryCard
+                            key={memory.id}
+                            memory={memory}
+                            number={index + 1}
+                            pending={pending !== null}
+                            unavailable={!savedIds.has(memory.id)}
+                            onEditingChange={(editing) => {
+                              setEditingEntries((current) => {
+                                const next = new Map(current);
+                                if (editing) next.set(memory.id, memory);
+                                else next.delete(memory.id);
+                                return next;
+                              });
+                              if (!editing && !savedIds.has(memory.id))
+                                setRemovedEntries((count) => count + 1);
+                            }}
+                            onSave={(content, scope) =>
+                              run(
+                                'edit',
+                                (signal) => {
+                                  const savedScope =
+                                    memory.scope ?? (memory.source_repo ? 'repo' : 'user');
+                                  if (scope === savedScope)
+                                    return editUserMemoryEntry(
+                                      memory.id,
+                                      content,
+                                      view.revision,
+                                      signal,
+                                    );
+                                  const memories = view.memories.map((entry) => ({
+                                    id: entry.id,
+                                    content: entry.id === memory.id ? content : entry.content,
+                                    scope:
+                                      entry.id === memory.id
+                                        ? scope
+                                        : (entry.scope ?? (entry.source_repo ? 'repo' : 'user')),
+                                  }));
+                                  return saveUserMemories(view.revision, memories, signal);
+                                },
+                                false,
+                              )
+                            }
+                            onRemove={() =>
+                              run(
+                                'delete',
+                                (signal) => deleteUserMemoryEntry(memory.id, view.revision, signal),
+                                false,
+                              )
+                            }
+                            onRefresh={() => run('refresh', getUserMemory, false, memory.id)}
+                          />
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="mt-2 text-sm text-muted">{t('settings.memory.emptyMemory')}</p>
+                    )}
+                  </div>
+                }
+              />
             </>
           ) : null}
         </>

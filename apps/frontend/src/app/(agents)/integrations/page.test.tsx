@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import IntegrationsPage from './page';
 import type { McpConnectionApi } from '@/lib/api/mcp';
 import { getUserMemory } from '@/lib/api/userMemory';
+import { getMemoryProjects } from '@/lib/api/projectMemory';
 
 vi.mock('@/components/providers/AuthProvider', () => ({
   useAuth: () => ({ state: { user: { id: 'settings-owner' } } }),
@@ -18,6 +19,7 @@ import { listSkills } from '@/lib/api/skills';
 vi.mock('@/lib/api/skills', () => ({ listSkills: vi.fn() }));
 
 vi.mock('@/lib/api/agents', () => ({
+  getAgentConfig: vi.fn(),
   getAgentIntegrations: vi.fn(),
   disconnectAgentIntegration: vi.fn(),
 }));
@@ -28,6 +30,16 @@ vi.mock('@/lib/api/userMemory', () => ({
   editUserMemoryEntry: vi.fn(),
   deleteUserMemoryEntry: vi.fn(),
 }));
+vi.mock('@/lib/api/projectMemory', () => ({
+  getMemoryProjects: vi.fn(),
+  getProjectMemory: vi.fn(),
+  updateProjectMemory: vi.fn(),
+  clearProjectMemory: vi.fn(),
+  editProjectMemoryEntry: vi.fn(),
+  deleteProjectMemoryEntry: vi.fn(),
+  saveProjectMemories: vi.fn(),
+  consolidateProjectMemory: vi.fn(),
+}));
 vi.mock('@/lib/api/mcp', () => ({
   listMcpConnections: vi.fn(),
   testMcpConnection: vi.fn(),
@@ -35,7 +47,7 @@ vi.mock('@/lib/api/mcp', () => ({
   authorizeMcpConnection: vi.fn(),
 }));
 
-import { getAgentIntegrations } from '@/lib/api/agents';
+import { getAgentConfig, getAgentIntegrations } from '@/lib/api/agents';
 import { listMcpConnections, testMcpConnection } from '@/lib/api/mcp';
 
 const connection: McpConnectionApi = {
@@ -70,8 +82,16 @@ const connection: McpConnectionApi = {
 };
 
 beforeEach(() => {
+  vi.mocked(getMemoryProjects).mockResolvedValue([]);
   vi.mocked(listSkills).mockResolvedValue([]);
   navigation.search = '';
+  vi.mocked(getAgentConfig).mockResolvedValue({
+    models: ['model-a'],
+    repos: [],
+    runtimes: ['codex'],
+    github_connected: false,
+    github_install_url: null,
+  });
   vi.mocked(getAgentIntegrations).mockResolvedValue({ providers: [] });
   vi.mocked(listMcpConnections).mockResolvedValue({ connections: [connection], templates: [] });
   vi.mocked(getUserMemory).mockResolvedValue({

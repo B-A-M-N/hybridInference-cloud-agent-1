@@ -27,6 +27,8 @@ if TYPE_CHECKING:
 GITLAB_ORIGIN = "https://gitlab.com"
 OAUTH_STATE_TTL = timedelta(minutes=10)
 _TOKEN_REFRESH_MARGIN = timedelta(minutes=5)
+#: A refresh that takes longer than this has died; the next caller may claim.
+_REFRESH_LEASE_SECONDS = 30
 
 #: Wraps stored provider credentials. Its own secret, not the gateway's — the
 #: source derived this key from ``API_KEY_SECRET``, which meant the gateway
@@ -384,6 +386,17 @@ class GitLabOAuthClient:
                 break
         return projects
 
+    async def _current_access_token(self, store: SourceControlRepository, *, user_id: str) -> str:
+        """Return a stored access token that is still valid, or raise if none is."""
+        current = await store.get_gitlab_connection(user_id=user_id)
+        if current is not None:
+            expires_at = current["expires_at"]
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at > datetime.now(timezone.utc):
+                return self.cipher.decrypt(current["access_token_ciphertext"])
+        raise SourceControlError("GitLab token refresh is unavailable")
+
     async def access_token_for_connection(
         self, store: SourceControlRepository, connection: dict[str, Any]
     ) -> str:
@@ -393,15 +406,28 @@ class GitLabOAuthClient:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         if expires_at > datetime.now(timezone.utc) + _TOKEN_REFRESH_MARGIN:
             return self.cipher.decrypt(connection["access_token_ciphertext"])
-        refresh_token = self.cipher.decrypt(connection["refresh_token_ciphertext"])
-        refreshed = await self._refresh(refresh_token)
-        await store.update_gitlab_tokens(
+        # One claim spends the rotating refresh token. A loser must not refresh
+        # the copy it read, or persist — or return — a token for an account the
+        # row no longer holds.
+        claim = await store.claim_gitlab_token_refresh(
             connection_id=connection["id"],
             user_id=connection["user_id"],
+            lease_seconds=_REFRESH_LEASE_SECONDS,
+            margin_seconds=int(_TOKEN_REFRESH_MARGIN.total_seconds()),
+        )
+        if claim is None:
+            return await self._current_access_token(store, user_id=connection["user_id"])
+        refreshed = await self._refresh(self.cipher.decrypt(claim["refresh_token_ciphertext"]))
+        wrote = await store.update_gitlab_tokens(
+            connection_id=connection["id"],
+            user_id=connection["user_id"],
+            refresh_generation=claim["refresh_generation"],
             access_token_ciphertext=self.cipher.encrypt(refreshed["access_token"]),
             refresh_token_ciphertext=self.cipher.encrypt(refreshed["refresh_token"]),
             expires_at=self.token_expiry(refreshed),
         )
+        if not wrote:
+            return await self._current_access_token(store, user_id=connection["user_id"])
         return refreshed["access_token"]
 
     async def projects_for_connection(

@@ -521,7 +521,7 @@ async def test_consuming_an_oauth_flow_has_exactly_one_winner(store: Storage) ->
         config_revision=row["config_revision"],
         authorization_epoch=row["authorization_epoch"],
         # Starting a flow moves the generation; the row records the new one.
-        oauth_generation=row["oauth_generation"] + 1,
+        expected_oauth_generation=row["oauth_generation"],
         code_verifier_ciphertext="ciphertext-verifier",
         client_id="client-1",
         client_secret_ciphertext=None,
@@ -552,6 +552,90 @@ async def test_consuming_an_oauth_flow_has_exactly_one_winner(store: Storage) ->
     assert (await store.mcp.get_mcp_connection(connection_id=row["id"]))["oauth_generation"] == row[
         "oauth_generation"
     ] + 1
+
+
+def _oauth_start(row: dict[str, Any], *, state_hash: str) -> dict[str, Any]:
+    """Arguments for one start, fenced to the generation the caller observed."""
+    return {
+        "state_hash": state_hash,
+        "user_id": _OWNER,
+        "connection_id": row["id"],
+        "config_revision": row["config_revision"],
+        "authorization_epoch": row["authorization_epoch"],
+        "expected_oauth_generation": row["oauth_generation"],
+        "code_verifier_ciphertext": "ciphertext-verifier",
+        "client_id": "client-1",
+        "client_secret_ciphertext": None,
+        "client_auth_method": "none",
+        "registration": "dcr",
+        "issuer": "https://issuer.example.com",
+        "resource": _URL,
+        "redirect_uri": "https://app.example.com/callback",
+        "scopes": ["read"],
+        "authorization_endpoint": "https://issuer.example.com/authorize",
+        "token_endpoint": "https://issuer.example.com/token",
+        "revocation_endpoint": None,
+        "registration_endpoint": None,
+        "expires_at": datetime.now(timezone.utc) + timedelta(minutes=10),
+    }
+
+
+async def _pending_flows(pool: asyncpg.Pool, connection_id: int) -> list[dict[str, Any]]:
+    """Unconsumed authorization flows for one connection."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT state_hash, oauth_generation
+            FROM agent_mcp_oauth_flows
+            WHERE connection_id = $1 AND consumed_at IS NULL
+            ORDER BY state_hash
+            """,
+            connection_id,
+        )
+    return [dict(row) for row in rows]
+
+
+async def test_concurrent_oauth_starts_leave_one_flow_at_the_allocated_generation(
+    store: Storage, pool
+) -> None:
+    """Two starts that both read generation X must not both insert a flow for X+1.
+
+    The survivor's generation is the value the connection update returned, so
+    the callback's generation check can still accept that URL. The loser does
+    not delete it.
+    """
+    row = await _connect(store, _OWNER, auth_kind="oauth", access_token=None)
+    observed = int(row["oauth_generation"])
+    first, second = await asyncio.gather(
+        store.mcp.create_mcp_oauth_flow(**_oauth_start(row, state_hash="state-a")),
+        store.mcp.create_mcp_oauth_flow(**_oauth_start(row, state_hash="state-b")),
+    )
+    allocated = [generation for generation in (first, second) if generation is not None]
+    assert allocated == [observed + 1]
+    current = await store.mcp.get_mcp_connection(connection_id=row["id"])
+    assert current is not None
+    assert int(current["oauth_generation"]) == observed + 1
+    flows = await _pending_flows(pool, row["id"])
+    assert len(flows) == 1
+    assert int(flows[0]["oauth_generation"]) == int(current["oauth_generation"])
+    consumed = await store.mcp.consume_mcp_oauth_flow(state_hash=str(flows[0]["state_hash"]))
+    assert consumed is not None
+    assert int(consumed["oauth_generation"]) == int(current["oauth_generation"])
+
+
+async def test_a_stale_oauth_start_cannot_delete_a_newer_flow(store: Storage, pool) -> None:
+    """A start that lost the generation fence must not remove the flow that won."""
+    row = await _connect(store, _OWNER, auth_kind="oauth", access_token=None)
+    allocated = await store.mcp.create_mcp_oauth_flow(**_oauth_start(row, state_hash="newer"))
+    assert allocated == int(row["oauth_generation"]) + 1
+    stale = dict(_oauth_start(row, state_hash="stale"))
+    assert await store.mcp.create_mcp_oauth_flow(**stale) is None
+    current = await store.mcp.get_mcp_connection(connection_id=row["id"])
+    assert current is not None
+    assert int(current["oauth_generation"]) == allocated
+    flows = await _pending_flows(pool, row["id"])
+    assert [str(item["state_hash"]) for item in flows] == ["newer"]
+    assert int(flows[0]["oauth_generation"]) == allocated
 
 
 async def test_claiming_an_approved_call_has_exactly_one_winner(store: Storage) -> None:
@@ -656,12 +740,129 @@ async def test_routing_a_connection_through_a_connector_moves_its_versions(
     ]
 
     unbound = await store.mcp.unbind_mcp_connection_connector(
-        connection_id=connection["id"], user_id=_OWNER
+        connection_id=connection["id"], user_id=_OWNER, connector_id=connector["id"]
     )
     assert unbound is not None
     assert unbound["connector_id"] is None
     assert unbound["config_revision"] == bound["config_revision"] + 1
     assert await store.mcp.list_mcp_connector_connections(connector_id=connector["id"]) == []
+
+
+async def _stdio_connection(store: Storage, *, label: str = "Local files") -> dict[str, Any]:
+    """One connection that runs on the user's own machine."""
+    return await store.mcp.create_mcp_connection(
+        user_id=_OWNER,
+        label=label,
+        transport="stdio",
+        location="user-connector",
+        url=None,
+        launch_spec={"command": "npx", "args": ["server@1.0.0"], "env": {}, "mounts": []},
+        auth_kind="none",
+        auth_config={},
+    )
+
+
+async def _mapping_pairs(pool: asyncpg.Pool, connection_id: int) -> list[tuple[int, int]]:
+    """Every connector authorization row for one connection."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT connector_id, connection_id
+            FROM agent_mcp_connector_connections
+            WHERE connection_id = $1
+            ORDER BY connector_id
+            """,
+            connection_id,
+        )
+    return [(int(row["connector_id"]), int(row["connection_id"])) for row in rows]
+
+
+async def test_unbinding_another_connector_leaves_the_binding(store: Storage, pool) -> None:
+    """DELETE names a connector, and the row update has to name the same one.
+
+    Checking that connector A exists and then clearing connection C is a stale
+    path detaching B. The mismatch matches no row, so C's route, versions, and
+    B's authorization row stay where they were.
+    """
+    left = await store.mcp.create_mcp_connector(
+        user_id=_OWNER, name="Laptop A", registration_hash="hash-unbind-a"
+    )
+    right = await store.mcp.create_mcp_connector(
+        user_id=_OWNER, name="Laptop B", registration_hash="hash-unbind-b"
+    )
+    connection = await _stdio_connection(store)
+    bound = await store.mcp.bind_mcp_connection_connector(
+        connection_id=connection["id"], user_id=_OWNER, connector_id=right["id"]
+    )
+    assert bound is not None
+
+    assert (
+        await store.mcp.unbind_mcp_connection_connector(
+            connection_id=connection["id"], user_id=_OWNER, connector_id=left["id"]
+        )
+        is None
+    )
+
+    current = await store.mcp.get_mcp_connection(connection_id=connection["id"])
+    assert current is not None
+    assert current["connector_id"] == right["id"]
+    assert current["config_revision"] == bound["config_revision"]
+    assert current["authorization_epoch"] == bound["authorization_epoch"]
+    assert await store.mcp.list_mcp_connector_connections(connector_id=left["id"]) == []
+    assert await store.mcp.list_mcp_connector_connections(connector_id=right["id"]) == [
+        connection["id"]
+    ]
+    assert await _mapping_pairs(pool, connection["id"]) == [(right["id"], connection["id"])]
+
+
+async def test_a_stale_unbind_cannot_clear_a_connector_the_connection_moved_to(
+    store: Storage, pool
+) -> None:
+    """Unbind and rebind serialize on the connection, and the loser does not win.
+
+    An unbind that still names A must not clear the route after a rebind to B
+    has committed, and it must not delete B's authorization row. Whichever
+    statement acquires the row first, B is the route that remains: the unbind
+    only matches while the connection still names A, so a successful rebind is
+    last only when it ran after that unbind.
+    """
+    left = await store.mcp.create_mcp_connector(
+        user_id=_OWNER, name="Laptop A", registration_hash="hash-unbind-race-a"
+    )
+    right = await store.mcp.create_mcp_connector(
+        user_id=_OWNER, name="Laptop B", registration_hash="hash-unbind-race-b"
+    )
+    connection = await _stdio_connection(store, label="Racing files")
+    assert (
+        await store.mcp.bind_mcp_connection_connector(
+            connection_id=connection["id"], user_id=_OWNER, connector_id=left["id"]
+        )
+        is not None
+    )
+
+    rebound, unbound = await asyncio.gather(
+        store.mcp.bind_mcp_connection_connector(
+            connection_id=connection["id"], user_id=_OWNER, connector_id=right["id"]
+        ),
+        store.mcp.unbind_mcp_connection_connector(
+            connection_id=connection["id"], user_id=_OWNER, connector_id=left["id"]
+        ),
+    )
+
+    current = await store.mcp.get_mcp_connection(connection_id=connection["id"])
+    assert current is not None
+    assert rebound is not None
+    assert current["connector_id"] == right["id"]
+    assert await store.mcp.list_mcp_connector_connections(connector_id=left["id"]) == []
+    assert await store.mcp.list_mcp_connector_connections(connector_id=right["id"]) == [
+        connection["id"]
+    ]
+    assert await _mapping_pairs(pool, connection["id"]) == [(right["id"], connection["id"])]
+    if unbound is not None:
+        # The unbind matched A, so the rebind ran after it and moved both versions
+        # one step further than that clear.
+        assert current["config_revision"] == unbound["config_revision"] + 1
+        assert current["authorization_epoch"] == unbound["authorization_epoch"] + 1
 
 
 async def test_revoking_a_connector_detaches_what_routed_through_it(
@@ -708,6 +909,103 @@ async def test_revoking_a_connector_detaches_what_routed_through_it(
         )
         is None
     )
+
+
+async def test_rebinding_drops_the_previous_connector_authorization(store: Storage, pool) -> None:
+    """Moving C from A to B leaves one route and one authorization row.
+
+    Updating ``connector_id`` and inserting the new pair without deleting the
+    old one leaves A authorized for a connection that no longer routes there.
+    The listing, the connection, and the mapping table have to name B only,
+    and both versions still move with the rebind.
+    """
+    left = await store.mcp.create_mcp_connector(
+        user_id=_OWNER, name="Laptop A", registration_hash="hash-rebind-a"
+    )
+    right = await store.mcp.create_mcp_connector(
+        user_id=_OWNER, name="Laptop B", registration_hash="hash-rebind-b"
+    )
+    connection = await _stdio_connection(store, label="Rebound files")
+    first = await store.mcp.bind_mcp_connection_connector(
+        connection_id=connection["id"], user_id=_OWNER, connector_id=left["id"]
+    )
+    assert first is not None
+    rebound = await store.mcp.bind_mcp_connection_connector(
+        connection_id=connection["id"], user_id=_OWNER, connector_id=right["id"]
+    )
+    assert rebound is not None
+    assert rebound["connector_id"] == right["id"]
+    assert rebound["config_revision"] == first["config_revision"] + 1
+    assert rebound["authorization_epoch"] == first["authorization_epoch"] + 1
+    assert await store.mcp.list_mcp_connector_connections(connector_id=left["id"]) == []
+    assert await store.mcp.list_mcp_connector_connections(connector_id=right["id"]) == [
+        connection["id"]
+    ]
+    assert await _mapping_pairs(pool, connection["id"]) == [(right["id"], connection["id"])]
+
+
+async def test_a_connection_and_its_credential_commit_together(store: Storage) -> None:
+    """The secret is not a second request that can fail after the row is visible."""
+    created = await store.mcp.create_mcp_connection(
+        user_id=_OWNER,
+        label="GitHub",
+        transport="streamable-http",
+        location="remote",
+        url=_URL,
+        launch_spec={
+            "command": "npx",
+            "args": ["server@1.0.0"],
+            "env": {"API_KEY": "secret://API_KEY"},
+        },
+        auth_kind="static",
+        auth_config={"header_name": "Authorization", "scheme": "Bearer"},
+        access_token_ciphertext="ciphertext-token",
+        auth_config_patch={"hint": "ci****en"},
+        sealed_launch_spec={
+            "command": "npx",
+            "args": ["server@1.0.0"],
+            "env": {"API_KEY": "secret://API_KEY"},
+            "env_secrets": {"API_KEY": "ciphertext-env"},
+        },
+    )
+    assert created["access_token_ciphertext"] == "ciphertext-token"
+    assert created["credential_version"] == 2
+    assert created["auth_config"]["hint"] == "ci****en"
+    assert created["auth_config"]["scheme"] == "Bearer"
+    assert created["launch_spec"]["env_secrets"]["API_KEY"] == "ciphertext-env"
+    assert [row["id"] for row in await store.mcp.list_mcp_connections(user_id=_OWNER)] == [
+        created["id"]
+    ]
+
+
+async def test_a_rejected_credential_batch_leaves_no_connection(store: Storage) -> None:
+    """A later draft's credential failure rolls back the drafts already inserted."""
+
+    class _Unsealable:
+        """A patch value ``json.dumps`` refuses after the insert has run."""
+
+    first = {
+        "user_id": _OWNER,
+        "label": "Wiki",
+        "transport": "streamable-http",
+        "location": "remote",
+        "url": _URL,
+        "launch_spec": None,
+        "auth_kind": "static",
+        "auth_config": {"header_name": "Authorization", "scheme": "Bearer"},
+        "access_token_ciphertext": "ciphertext-wiki",
+        "auth_config_patch": {"hint": "wi****ki"},
+    }
+    second = {
+        **first,
+        "label": "Tracker",
+        "url": "https://tracker.example.com/mcp",
+        "access_token_ciphertext": "ciphertext-tracker",
+        "auth_config_patch": {"hint": _Unsealable()},
+    }
+    with pytest.raises(TypeError):
+        await store.mcp.create_mcp_connections(connections=[first, second])
+    assert await store.mcp.list_mcp_connections(user_id=_OWNER) == []
 
 
 async def test_a_connector_cannot_be_bound_across_owners(store: Storage) -> None:
@@ -1128,7 +1426,7 @@ async def test_target_edit_invalidates_only_its_previous_discovery_and_flow(stor
         connection_id=row["id"],
         config_revision=row["config_revision"],
         authorization_epoch=row["authorization_epoch"],
-        oauth_generation=row["oauth_generation"] + 1,
+        expected_oauth_generation=row["oauth_generation"],
         code_verifier_ciphertext="ciphertext-verifier",
         client_id="client",
         client_secret_ciphertext=None,

@@ -46,7 +46,7 @@ export interface UserMemoryView {
   suggestions: UserMemorySuggestion[];
 }
 
-/** Reading refreshes the current user's profile from their recent activity. */
+/** Reading refreshes the current user's profile and cross-project preferences. */
 export async function getUserMemory(signal?: AbortSignal): Promise<UserMemoryView> {
   const response = await fetchWithAuth(config.apiBase, USER_MEMORY, {
     signal,
@@ -129,12 +129,13 @@ export async function saveUserMemories(
 
 export async function consolidateUserMemory(
   revision: number,
+  model?: string,
   signal?: AbortSignal,
 ): Promise<UserMemoryView> {
   const response = await fetchWithAuth(config.apiBase, `${USER_MEMORY}/consolidate`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ revision }),
+    body: JSON.stringify({ revision, model }),
     signal,
   });
   return jsonOrThrow<UserMemoryView>(response);

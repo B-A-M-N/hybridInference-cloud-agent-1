@@ -130,6 +130,12 @@ class Setting:
                 except (ValueError, ValidationError):
                     valid = False
         if not valid:
+            if self.key == "sandbox_archive.bucket":
+                raise ValueError(
+                    f"Invalid value for {self.label} ({self.key}). "
+                    "Use a bucket name such as freeinference; set cloud-agent/sandbox "
+                    "in Sandbox archive S3 prefix."
+                )
             raise ValueError(f"Invalid value for {self.label} ({self.key})")
         return value
 
@@ -612,6 +618,23 @@ SETTINGS: tuple[Setting, ...] = (
         url=True,
     ),
     Setting(
+        "mcp_github_client_id",
+        "GitHub MCP sign-in client ID",
+        "MCP",
+        "",
+        env="AGENT_MCP_GITHUB_CLIENT_ID",
+        description="Service-managed GitHub OAuth App or GitHub App used for MCP browser sign-in.",
+    ),
+    Setting(
+        "mcp_github_client_secret",
+        "GitHub MCP sign-in client secret",
+        "MCP",
+        "",
+        env="AGENT_MCP_GITHUB_CLIENT_SECRET",
+        secret=True,
+        description="Register <public API base>/v1/agent/mcp/oauth/callback/github on this app.",
+    ),
+    Setting(
         "alert_webhook_url",
         "Alert webhook URL",
         "Operations",
@@ -747,7 +770,7 @@ MIGRATED_SETTINGS: tuple[Setting, ...] = (
         "Sandbox archives",
         "",
         env="AGENT_SANDBOX_ARCHIVE_S3_BUCKET",
-        description="Required for sandbox deletion. The control plane verifies the completed archive before the host may remove its stopped container. Empty disables deletion.",
+        description="Enter a bucket name, or paste an S3 URI such as s3://freeinference/cloud-agent/sandbox to save the bucket and prefix together. Required for sandbox deletion; the completed archive is verified before removal. Empty disables deletion.",
     ),
     Setting(
         "sandbox_archive.region",
@@ -1170,6 +1193,12 @@ def setup_status(values: Mapping[str, SettingValue]) -> dict[str, Any]:
                 "gitlab_redirect_uri",
                 "source_control_encryption_key",
             ),
+        ),
+        (
+            "mcp_github",
+            "GitHub MCP browser sign-in",
+            False,
+            ("mcp_github_client_id", "mcp_github_client_secret", "source_control_encryption_key"),
         ),
         ("compute", "Compute credential storage", False, ("compute_encryption_key",)),
     ):

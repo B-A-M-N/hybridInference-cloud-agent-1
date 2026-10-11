@@ -118,11 +118,14 @@ class PostgresResidencyRepository:
     ) -> str | None:
         """Extend a residency's lease — only the generation that holds it.
 
-        Returns ``None`` when nothing was extended (lost/taken over), else the
-        residency's grant id — ``""`` when it runs without one — so the caller
-        can renew the credential in the same pass. ``host`` narrows the write
-        to the machine the row names: a beat is a holder's statement, and a
-        guessed (thread, generation) from anywhere else must extend nothing.
+        Returns ``None`` when nothing was extended (lost, taken over, or
+        already expired), else the residency's grant id — ``""`` when it runs
+        without one — so the caller can renew the credential in the same pass.
+        ``host`` narrows the write to the machine the row names: a beat is a
+        holder's statement, and a guessed (thread, generation) from anywhere
+        else must extend nothing. The lease clock is the same fence
+        ``resident_host`` uses: a hot row whose lease has lapsed is already
+        lost, and a late beat must not revive it before the reaper runs.
         """
         async with self._pool.acquire() as conn:
             return await conn.fetchval(
@@ -133,6 +136,7 @@ class PostgresResidencyRepository:
                 FROM agent_sandboxes g
                 WHERE m.thread_id = $1 AND m.residency_generation = $2
                   AND m.residency_status = 'hot'
+                  AND m.residency_lease_expires_at > NOW()
                   AND g.id = m.sandbox_id AND ($4::text IS NULL OR g.host = $4)
                 RETURNING COALESCE(m.residency_grant_id, '')
                 """,

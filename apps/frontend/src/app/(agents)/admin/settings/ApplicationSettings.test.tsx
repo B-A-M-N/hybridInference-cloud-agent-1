@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   getAgentAdminSettings,
   setAgentAdminSettings,
+  type AdminSettingDefinition,
   type AgentAdminSettings,
 } from '@/lib/api/adminSettings';
 import { APIError } from '@/lib/utils/errors';
@@ -105,6 +106,40 @@ function snapshot(over: Partial<AgentAdminSettings> = {}): AgentAdminSettings {
   };
 }
 
+function archiveSnapshot(over: Partial<AgentAdminSettings> = {}): AgentAdminSettings {
+  const current = snapshot();
+  return {
+    ...current,
+    definitions: [
+      ...current.definitions,
+      {
+        key: 'sandbox_archive.bucket',
+        label: 'Sandbox archive S3 bucket',
+        description: 'S3 bucket for sandbox deletion.',
+        category: 'Sandbox archives',
+        kind: 'string',
+        default: '',
+        secret: false,
+      },
+      {
+        key: 'sandbox_archive.prefix',
+        label: 'Sandbox archive S3 prefix',
+        description: 'Object key prefix for new deletion requests.',
+        category: 'Sandbox archives',
+        kind: 'string',
+        default: 'sandbox-archives',
+        secret: false,
+      },
+    ],
+    values: {
+      ...current.values,
+      'sandbox_archive.bucket': '',
+      'sandbox_archive.prefix': 'sandbox-archives',
+    },
+    ...over,
+  };
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason: unknown) => void;
@@ -118,6 +153,50 @@ function deferred<T>() {
 function selectCategory(category: string) {
   const navigation = screen.getByRole('navigation', { name: 'Application setting categories' });
   fireEvent.click(within(navigation).getByRole('button', { name: category }));
+}
+
+function organizedSnapshot(): AgentAdminSettings {
+  const fields: [
+    string,
+    string,
+    string,
+    'string' | 'boolean' | 'integer',
+    string | number | boolean,
+  ][] = [
+    ['site.app_name', 'Appearance', 'Application name', 'string', 'Cloud Agent'],
+    [
+      'gateway_authorize_url',
+      'Sign-in',
+      'Sign-in authorization URL',
+      'string',
+      'https://gateway.example/authorize',
+    ],
+    ['trust_proxy_headers', 'Security', 'Trust forwarded client addresses', 'boolean', false],
+    ['github_app_id', 'Source control', 'GitHub App ID', 'string', '123'],
+    ['publish_base_branch', 'Publication', 'Default pull request base branch', 'string', 'dev'],
+    ['publish_git_timeout_s', 'Publication', 'Publication Git timeout', 'integer', 120],
+  ];
+  const definitions: AdminSettingDefinition[] = fields.map(
+    ([key, category, label, kind, value]) => ({
+      key,
+      category,
+      label,
+      kind,
+      default: value,
+      description: '',
+      secret: false,
+    }),
+  );
+  return snapshot({
+    definitions,
+    values: Object.fromEntries(fields.map(([key, , , , value]) => [key, value])),
+    secret_configured: {},
+    bootstrap: [],
+  });
+}
+
+function toggleAdvanced(field: HTMLElement) {
+  fireEvent.click(field.closest('details')!.querySelector('summary')!);
 }
 
 beforeEach(() => {
@@ -134,6 +213,290 @@ afterEach(() => {
 });
 
 describe('application settings', () => {
+  it('merges related categories while keeping settings from each original category', async () => {
+    const categoryFields = [
+      ['gateway_authorize_url', 'Sign-in', 'Sign-in authorization URL'],
+      ['session_cookie_secure', 'Security', 'Require HTTPS session cookies'],
+      ['github_app_id', 'Source control', 'GitHub App ID'],
+      ['publish_base_branch', 'Publication', 'Default pull request base branch'],
+      ['attachments.max_files', 'Attachments', 'Maximum upload file count'],
+      ['skills.max_selected', 'Skills', 'Maximum selected skills'],
+      ['task_titles.max_chars', 'Task titles', 'Maximum task title length'],
+      ['alert_webhook_url', 'Operations', 'Alert webhook URL'],
+      ['goals.stalled_after_seconds', 'Goals', 'Goal stall timeout'],
+      ['pgadmin_url', 'Database tools', 'Private pgAdmin URL'],
+      ['compute.cloudlab_api_url', 'Compute', 'CloudLab API URL'],
+      ['default_execution_profile', 'Execution', 'New session isolation policy'],
+    ];
+    read.mockResolvedValue(
+      snapshot({
+        definitions: categoryFields.map(([key, category, label]) => ({
+          key,
+          category,
+          label,
+          description: '',
+          kind: 'string',
+          default: '',
+          secret: false,
+        })),
+        values: Object.fromEntries(categoryFields.map(([key]) => [key, ''])),
+        secret_configured: {},
+        bootstrap: [],
+      }),
+    );
+    render(<ApplicationSettings />);
+    const navigation = await screen.findByRole('navigation', {
+      name: 'Application setting categories',
+    });
+    expect(
+      within(navigation)
+        .getAllByRole('button')
+        .map((button) => button.textContent),
+    ).toEqual(['Identity & access2', 'Source control2', 'Content3', 'Operations3', 'Compute2']);
+    expect(screen.getByRole('heading', { name: 'Sign-in', level: 4 })).toBeVisible();
+    expect(screen.getByRole('heading', { name: 'Session security', level: 4 })).toBeVisible();
+    for (const [category, labels] of [
+      ['Identity & access', ['Sign-in authorization URL', 'Require HTTPS session cookies']],
+      ['Source control', ['GitHub App ID', 'Default pull request base branch']],
+      [
+        'Content',
+        ['Maximum upload file count', 'Maximum selected skills', 'Maximum task title length'],
+      ],
+      ['Operations', ['Alert webhook URL', 'Goal stall timeout']],
+      ['Compute', ['CloudLab API URL', 'New session isolation policy']],
+    ] as const) {
+      selectCategory(category);
+      for (const label of labels) expect(screen.getByLabelText(label)).toBeVisible();
+    }
+    expect(screen.getByLabelText('Private pgAdmin URL')).toBeInTheDocument();
+  });
+
+  it('keeps Important visible and preserves Advanced drafts when closed or switched to another category', async () => {
+    read.mockResolvedValue(organizedSnapshot());
+    render(<ApplicationSettings />);
+    await screen.findByLabelText('Application name');
+    selectCategory('Source control');
+    const appId = screen.getByLabelText('GitHub App ID');
+    const timeout = screen.getByLabelText('Publication Git timeout');
+    expect(appId).toBeVisible();
+    expect(screen.getByLabelText('Default pull request base branch')).toBeVisible();
+    expect(timeout).not.toBeVisible();
+    expect(timeout.closest('details')).not.toHaveAttribute('open');
+    fireEvent.change(appId, { target: { value: '456' } });
+    toggleAdvanced(timeout);
+    expect(timeout).toBeVisible();
+    fireEvent.change(timeout, { target: { value: '180' } });
+    toggleAdvanced(timeout);
+    expect(timeout).not.toBeVisible();
+    expect(appId).toHaveValue('456');
+    selectCategory('Appearance');
+    selectCategory('Source control');
+    toggleAdvanced(timeout);
+    expect(screen.getByLabelText('Publication Git timeout')).toBe(timeout);
+    expect(timeout).toHaveValue(180);
+    expect(appId).toHaveValue('456');
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it('opens Advanced and focuses an initial deep link from a merged original category', async () => {
+    read.mockResolvedValue(organizedSnapshot());
+    window.history.replaceState(null, '', '#application-setting-publish_git_timeout_s');
+    render(<ApplicationSettings />);
+    const input = await screen.findByRole('spinbutton', { name: 'Publication Git timeout' });
+    await waitFor(() => expect(input).toHaveFocus());
+    expect(input.closest('details')).toHaveAttribute('open');
+    expect(screen.getByRole('region', { name: 'Source control' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Source control' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    );
+  });
+
+  it('opens Advanced in the merged category when a missing setup field is selected', async () => {
+    read.mockResolvedValue({
+      ...organizedSnapshot(),
+      setup: {
+        required: true,
+        groups: [
+          {
+            key: 'security',
+            label: 'Session security',
+            required: true,
+            configured: false,
+            needs_setup: true,
+            missing: [{ key: 'trust_proxy_headers', label: 'Trust forwarded client addresses' }],
+          },
+        ],
+        bootstrap_missing: [],
+      },
+    });
+    render(<ApplicationSettings />);
+    const link = await screen.findByRole('link', { name: 'Trust forwarded client addresses' });
+    const input = screen.getByLabelText('Trust forwarded client addresses');
+    expect(input).not.toBeVisible();
+    fireEvent.click(link);
+    await waitFor(() => expect(input).toHaveFocus());
+    expect(input).toBeVisible();
+    expect(input.closest('details')).toHaveAttribute('open');
+    expect(screen.getByRole('region', { name: 'Identity & access' })).toBeVisible();
+    expect(screen.getByLabelText('Sign-in authorization URL')).toBeVisible();
+  });
+
+  it('saves an archive URI as an atomic bucket and prefix patch and resets both drafts', async () => {
+    const current = archiveSnapshot();
+    read.mockResolvedValue(current);
+    write.mockResolvedValue(
+      archiveSnapshot({
+        revision: 2,
+        values: {
+          ...current.values,
+          'sandbox_archive.bucket': 'freeinference',
+          'sandbox_archive.prefix': 'cloud-agent/sandbox',
+        },
+      }),
+    );
+    render(<ApplicationSettings />);
+    fireEvent.change(await screen.findByLabelText('Product name'), {
+      target: { value: 'Unsaved name' },
+    });
+    selectCategory('Sandbox archives');
+    expect(screen.getByText(/Saving an S3 URI replaces the prefix/)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('Sandbox archive S3 prefix'), {
+      target: { value: 'unsaved-prefix' },
+    });
+    fireEvent.change(screen.getByLabelText('Sandbox archive S3 bucket'), {
+      target: { value: 's3://freeinference/cloud-agent/sandbox' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Sandbox archive S3 bucket' }));
+    await screen.findByText('Sandbox archive S3 bucket saved. Prefix set to cloud-agent/sandbox.');
+    expect(write).toHaveBeenCalledExactlyOnceWith(
+      {
+        'sandbox_archive.bucket': 'freeinference',
+        'sandbox_archive.prefix': 'cloud-agent/sandbox',
+      },
+      expect.any(AbortSignal),
+    );
+    expect(screen.getByLabelText('Sandbox archive S3 bucket')).toHaveValue('freeinference');
+    expect(screen.getByLabelText('Sandbox archive S3 prefix')).toHaveValue('cloud-agent/sandbox');
+    expect(screen.getByRole('button', { name: 'Save Sandbox archive S3 bucket' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Save Sandbox archive S3 prefix' })).toBeDisabled();
+    selectCategory('Site');
+    expect(screen.getByLabelText('Product name')).toHaveValue('Unsaved name');
+  });
+
+  it('saves a bare archive bucket without changing a saved prefix or its unsaved draft', async () => {
+    const current = archiveSnapshot();
+    read.mockResolvedValue(current);
+    write.mockResolvedValue(
+      archiveSnapshot({
+        values: { ...current.values, 'sandbox_archive.bucket': 'freeinference' },
+      }),
+    );
+    render(<ApplicationSettings />);
+    await screen.findByLabelText('Product name');
+    selectCategory('Sandbox archives');
+    fireEvent.change(screen.getByLabelText('Sandbox archive S3 prefix'), {
+      target: { value: 'unsaved-prefix' },
+    });
+    fireEvent.change(screen.getByLabelText('Sandbox archive S3 bucket'), {
+      target: { value: 'freeinference' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Sandbox archive S3 bucket' }));
+    await screen.findByText('Sandbox archive S3 bucket saved.');
+    expect(write).toHaveBeenCalledExactlyOnceWith(
+      { 'sandbox_archive.bucket': 'freeinference' },
+      expect.any(AbortSignal),
+    );
+    expect(screen.getByLabelText('Sandbox archive S3 prefix')).toHaveValue('unsaved-prefix');
+    expect(screen.getByRole('button', { name: 'Save Sandbox archive S3 prefix' })).toBeEnabled();
+  });
+
+  it.each([
+    ['s3://freeinference/cloud-agent/sandbox/', 'cloud-agent/sandbox'],
+    ['s3://freeinference', ''],
+    ['s3://freeinference/', ''],
+    [`s3://freeinference/${'a'.repeat(512)}`, 'a'.repeat(512)],
+  ])('saves the canonical prefix for %s', async (uri, prefix) => {
+    const current = archiveSnapshot();
+    read.mockResolvedValue(current);
+    write.mockResolvedValue(
+      archiveSnapshot({
+        values: {
+          ...current.values,
+          'sandbox_archive.bucket': 'freeinference',
+          'sandbox_archive.prefix': prefix,
+        },
+      }),
+    );
+    render(<ApplicationSettings />);
+    await screen.findByLabelText('Product name');
+    selectCategory('Sandbox archives');
+    fireEvent.change(screen.getByLabelText('Sandbox archive S3 bucket'), {
+      target: { value: uri },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Sandbox archive S3 bucket' }));
+    await screen.findByText(
+      `Sandbox archive S3 bucket saved. Prefix set to ${prefix || '(empty)'}.`,
+    );
+    expect(write).toHaveBeenCalledExactlyOnceWith(
+      { 'sandbox_archive.bucket': 'freeinference', 'sandbox_archive.prefix': prefix },
+      expect.any(AbortSignal),
+    );
+    expect(screen.getByLabelText('Sandbox archive S3 bucket')).toHaveValue('freeinference');
+    expect(screen.getByLabelText('Sandbox archive S3 prefix')).toHaveValue(prefix);
+  });
+
+  it('rejects malformed archive buckets and URIs before making an API call', async () => {
+    read.mockResolvedValue(archiveSnapshot());
+    render(<ApplicationSettings />);
+    await screen.findByLabelText('Product name');
+    selectCategory('Sandbox archives');
+    const input = screen.getByLabelText('Sandbox archive S3 bucket');
+    for (const value of [
+      's3:/freeinference/cloud-agent/sandbox',
+      'S3://freeinference/cloud-agent/sandbox',
+      'https://freeinference/cloud-agent/sandbox',
+      's3:///cloud-agent/sandbox',
+      's3://user@freeinference/cloud-agent/sandbox',
+      's3://freeinference:443/cloud-agent/sandbox',
+      's3://FreeInference/cloud-agent/sandbox',
+      's3://freeinference/cloud agent/sandbox',
+      's3://freeinference/cloud-agent/sandbox?version=1',
+      's3://freeinference/cloud-agent/sandbox#fragment',
+      's3://freeinference//',
+      's3://freeinference/cloud-agent//sandbox',
+      's3://freeinference/cloud-agent/sandbox//',
+      's3://freeinference/cloud-agent/./sandbox',
+      's3://freeinference/cloud-agent/../sandbox',
+      's3://freeinference/cloud-agent/%2e%2e/sandbox',
+      's3://freeinference/cloud-agent%2fsandbox',
+      `s3://freeinference/${'a'.repeat(513)}`,
+      ' s3://freeinference/cloud-agent/sandbox',
+      'invalid..bucket',
+      'invalid.-bucket',
+      'invalid-.bucket',
+      '127.0.0.1',
+      'xn--bucket',
+      'sthree-bucket',
+      'amzn-s3-demo-bucket',
+      'bucket-s3alias',
+      'bucket--ol-s3',
+      'bucket.mrap',
+      'bucket--x-s3',
+      'bucket--table-s3',
+      'ab',
+      'a'.repeat(64),
+    ]) {
+      fireEvent.change(input, { target: { value } });
+      fireEvent.click(screen.getByRole('button', { name: 'Save Sandbox archive S3 bucket' }));
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        /Enter (a valid S3 bucket name|an S3 URI)/,
+      );
+      expect(input).toHaveAttribute('aria-invalid', 'true');
+      expect(write).not.toHaveBeenCalled();
+    }
+  });
+
   it('shows one category with accessible navigation and keeps other fields mounted', async () => {
     render(<ApplicationSettings />);
     const navigation = await screen.findByRole('navigation', {
@@ -440,7 +803,7 @@ describe('application settings', () => {
     expect(screen.getByLabelText('Registration')).toHaveValue('true');
     selectCategory('Limits');
     expect(screen.getByLabelText('Retry factor')).toHaveValue(1.5);
-    expect(screen.getByRole('heading', { name: 'Limits' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Limits', level: 3 })).toBeInTheDocument();
     selectCategory('Connections');
     expect(screen.getByLabelText('Service token')).toHaveValue('');
     expect(screen.getByText('Configured. Saved values are hidden.')).toBeInTheDocument();

@@ -600,6 +600,60 @@ async def test_health_and_sandbox_inventory_are_authenticated_and_shared_only():
 
 
 @pytest.mark.asyncio
+async def test_targeted_shared_status_serializes_force_delete_proof_fields():
+    supervisor = _SharedSupervisor()
+    supervisor.status = lambda thread_id: replace(
+        _descriptor(thread_id),
+        docker_status="stopped",
+        running=False,
+        group_busy=False,
+        busy=False,
+        terminal_count=0,
+        operation_count=0,
+        snapshotting=False,
+    )
+    app = _app(supervisor)
+    headers = {"X-Agent-Workspace-Token": "broker-secret"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://broker") as client:
+        denied = await client.get("/shared-sandboxes/athr_source")
+        response = await client.get("/shared-sandboxes/athr_source", headers=headers)
+
+    assert denied.status_code == 401
+    assert response.status_code == 200
+    payload = response.json()
+    assert {
+        key: payload[key]
+        for key in (
+            "thread_id",
+            "origin_thread_id",
+            "sandbox_id",
+            "generation",
+            "container_id",
+            "docker_status",
+            "running",
+            "group_busy",
+            "busy",
+            "terminal_count",
+            "operation_count",
+            "snapshotting",
+        )
+    } == {
+        "thread_id": "athr_source",
+        "origin_thread_id": "athr_source",
+        "sandbox_id": "asbx_shared",
+        "generation": 3,
+        "container_id": "container-shared",
+        "docker_status": "stopped",
+        "running": False,
+        "group_busy": False,
+        "busy": False,
+        "terminal_count": 0,
+        "operation_count": 0,
+        "snapshotting": False,
+    }
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("origin_count,child_count", [(0, 2), (1, 2), (2, 0), (0, 0)])
 async def test_sandbox_inventory_reports_terminals_across_all_shared_members(
     origin_count, child_count
