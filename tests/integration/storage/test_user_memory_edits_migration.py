@@ -18,6 +18,7 @@ pytestmark = [pytest.mark.dbtest, pytest.mark.asyncio]
 
 _BEFORE = "0049_host_drain_fence"
 _THIS = "0050_user_memory_edits"
+_TRAJECTORY_HEAD = "0046_admin_sandbox_trajectory"
 _PRESERVED_TABLES = {
     "agent_jobs": "id",
     "agent_threads": "id",
@@ -33,6 +34,11 @@ async def test_user_memory_edits_upgrade_constraints_and_round_trip_preserve_sou
     try:
         downgrade_to(config, _BEFORE)
         async with pool.acquire() as conn:
+            versions = await conn.fetch("SELECT version_num FROM alembic_version")
+            assert {row["version_num"] for row in versions} == {
+                _TRAJECTORY_HEAD,
+                _BEFORE,
+            }
             await conn.execute(
                 "INSERT INTO agent_user_memories "
                 "(user_id, portrait, memories, suggestions, activity_digest, revision) "
@@ -52,7 +58,11 @@ async def test_user_memory_edits_upgrade_constraints_and_round_trip_preserve_sou
         for _ in range(2):
             apply_migrations(config, _THIS)
             async with pool.acquire() as conn:
-                assert await conn.fetchval("SELECT version_num FROM alembic_version") == _THIS
+                versions = await conn.fetch("SELECT version_num FROM alembic_version")
+                assert {row["version_num"] for row in versions} == {
+                    _TRAJECTORY_HEAD,
+                    _THIS,
+                }
                 assert await conn.fetchval("SELECT COUNT(*) FROM agent_user_memory_edits") == 0
                 for table, key in _PRESERVED_TABLES.items():
                     assert [
@@ -144,6 +154,11 @@ async def test_user_memory_edits_upgrade_constraints_and_round_trip_preserve_sou
 
             downgrade_to(config, _BEFORE)
             async with pool.acquire() as conn:
+                versions = await conn.fetch("SELECT version_num FROM alembic_version")
+                assert {row["version_num"] for row in versions} == {
+                    _TRAJECTORY_HEAD,
+                    _BEFORE,
+                }
                 assert await conn.fetchval("SELECT to_regclass('agent_user_memory_edits')") is None
                 for table, key in _PRESERVED_TABLES.items():
                     assert [

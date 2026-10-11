@@ -119,7 +119,7 @@ CASE
         SELECT 1 FROM agent_attempts a
         JOIN agent_jobs busy_job ON busy_job.id = a.job_id
         WHERE busy_job.thread_id = t.session_id
-          AND a.status = 'running' AND a.lease_expires_at > NOW()
+          AND a.status = 'running' AND a.lease_expires_at > clock_timestamp()
     ) OR EXISTS (
         SELECT 1 FROM agent_thread_sandbox_memberships m
         WHERE m.thread_id = t.session_id

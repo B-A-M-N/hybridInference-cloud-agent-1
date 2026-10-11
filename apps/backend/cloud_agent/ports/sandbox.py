@@ -226,9 +226,10 @@ class SandboxRepository(Protocol):
         lease_generation: int,
         sandbox_generation: int,
         activation_generation: int,
+        residency_generation: int,
         process_generation: int,
     ) -> bool:
-        """Record the supervisor's diagnostic CLI process generation."""
+        """Record an equal or newer supervisor CLI process generation."""
         ...
 
     async def record_shared_thread_residency(
@@ -252,6 +253,7 @@ class SandboxRepository(Protocol):
         lease_generation: int,
         sandbox_generation: int,
         activation_generation: int,
+        residency_generation: int,
     ) -> bool:
         """Reserve one prompt delivery durably before Agent CLI stdin.
 
@@ -270,6 +272,7 @@ class SandboxRepository(Protocol):
         lease_generation: int,
         sandbox_generation: int,
         activation_generation: int,
+        residency_generation: int,
         job_id: str,
         context_status: str,
         native_session_id: str | None,

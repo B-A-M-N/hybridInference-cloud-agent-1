@@ -1,16 +1,18 @@
 """Postgres implementation of the pending-message port.
 
-Every write here takes the thread's row lock first — the same lock appending a
-turn, forking, cancelling and archiving take first — so the queue, the turns it
-becomes and the thread's pause reason can only be changed in one order. That
-order is also what makes settling safe to run from anywhere at once: a second
-settlement waits for the first, then sees the turn it created and does nothing.
+Writes without an attempt fence take the thread's row lock first — the same lock
+appending a turn, forking, cancelling and archiving take first — so the queue,
+the turns it becomes and the thread's pause reason can only be changed in one
+order. Send-now acknowledgements first lock the attempt whose authority they
+carry, then resume the thread-first order. That is also what makes settling safe
+to run from anywhere at once: a second settlement waits for the first, then sees
+the turn it created and does nothing.
 """
 
 from __future__ import annotations
 
-import inspect
 import json
+import math
 from typing import Any
 
 import asyncpg
@@ -51,6 +53,9 @@ _PAUSE_FOR_ENDING = {"failed": QUEUE_PAUSED_FAILED, "cancelled": QUEUE_PAUSED_ST
 _CONTEXT_LOST = (
     "This chat's retained sandbox has an indeterminate or lost context and cannot "
     "safely accept another message."
+)
+_SEND_NOW_TARGET_ENDED = (
+    "Send now was not delivered because the target turn ended before taking the message."
 )
 
 
@@ -165,25 +170,6 @@ async def _pin_attachments(
 def _json_or_null(value: list[int] | None) -> str | None:
     """A JSON array column's text, or NULL — this pool registers no JSONB codec."""
     return None if value is None else json.dumps(value)
-
-
-_SEND_NOW_LOCK_SQL = "SELECT pg_try_advisory_lock(hashtextextended('send-now:' || $1, 0))"
-
-
-async def _open_dedicated_connection(pool: asyncpg.Pool) -> Any:
-    """A connection the pool does not own, opened the same way the pool opens one.
-
-    The pool's reset runs ``pg_advisory_unlock_all`` when a connection is
-    returned, so a session lock cannot live on a pooled connection. This one
-    stays open until the caller closes it.
-    """
-    return await pool._connect(
-        *pool._connect_args,
-        loop=pool._loop,
-        connection_class=pool._connection_class,
-        record_class=pool._record_class,
-        **pool._connect_kwargs,
-    )
 
 
 class PostgresPendingMessageRepository:
@@ -614,7 +600,7 @@ class PostgresPendingMessageRepository:
                 """
                 UPDATE agent_pending_messages
                 SET state = $2, send_now_job_id = $3, send_now_requested_at = NOW(),
-                    send_now_handed_off = FALSE,
+                    send_now_handed_off = FALSE, last_error = NULL,
                     revision = revision + 1, updated_at = NOW()
                 WHERE id = $1
                 """,
@@ -629,120 +615,389 @@ class PostgresPendingMessageRepository:
                 "attempt_id": int(live["current_attempt_id"]) if running else None,
             }
 
-    async def return_to_queue(self, *, message_id: str, revision: int) -> dict[str, Any] | None:
+    async def claim_send_now_handoff(
+        self, *, message_id: str, revision: int, lease_seconds: float
+    ) -> dict[str, Any] | None:
+        """Lease a send-now handoff to this control-plane process.
+
+        The message revision is the ownership token. An unclaimed row has the
+        identical request/update timestamp written by begin_send_now; a claim
+        moves updated_at forward and can be reclaimed only after the lease.
+        """
+        if not math.isfinite(lease_seconds) or lease_seconds <= 0:
+            raise ValueError("lease_seconds must be finite and positive")
+        async with self._pool.acquire() as conn, conn.transaction():
+            candidate = await conn.fetchrow(
+                """
+                SELECT p.thread_id, p.send_now_job_id, j.current_attempt_id
+                FROM agent_pending_messages p
+                LEFT JOIN agent_jobs j ON j.id = p.send_now_job_id
+                WHERE p.id = $1
+                """,
+                message_id,
+            )
+            if (
+                candidate is None
+                or candidate["send_now_job_id"] is None
+                or candidate["current_attempt_id"] is None
+            ):
+                return None
+            attempt_id = int(candidate["current_attempt_id"])
+            if not await conn.fetchval(
+                "SELECT id FROM agent_attempts WHERE id = $1 FOR SHARE",
+                attempt_id,
+            ):
+                return None
+            thread_id = str(candidate["thread_id"])
+            if not await conn.fetchval(
+                "SELECT id FROM agent_threads WHERE id = $1 FOR UPDATE",
+                thread_id,
+            ):
+                return None
+            message = await conn.fetchrow(
+                f"""
+                SELECT {PENDING_MESSAGE_COLUMNS}
+                FROM agent_pending_messages
+                WHERE id = $1 AND state = $2 AND revision = $3
+                  AND send_now_requested_at IS NOT NULL
+                  AND send_now_handed_off = FALSE
+                FOR UPDATE
+                """,
+                message_id,
+                PENDING_SENDING,
+                revision,
+            )
+            if (
+                message is None
+                or message["thread_id"] != candidate["thread_id"]
+                or message["send_now_job_id"] != candidate["send_now_job_id"]
+            ):
+                return None
+            target = await conn.fetchrow(
+                """
+                SELECT j.state, j.cancel_requested, j.current_attempt_id
+                FROM agent_jobs j WHERE j.id = $1 AND j.thread_id = $2
+                FOR UPDATE
+                """,
+                message["send_now_job_id"],
+                thread_id,
+            )
+            if (
+                target is None
+                or target["state"] != RUNNING
+                or target["cancel_requested"]
+                or target["current_attempt_id"] != attempt_id
+                or not await conn.fetchval(
+                    """
+                    SELECT (
+                            p.updated_at <= p.send_now_requested_at
+                            OR p.updated_at < clock_timestamp()
+                                - make_interval(secs => $3::double precision)
+                        )
+                        AND a.status = 'running'
+                        AND a.lease_expires_at > clock_timestamp()
+                    FROM agent_pending_messages p, agent_attempts a
+                    WHERE p.id = $1 AND a.id = $2
+                    """,
+                    message_id,
+                    attempt_id,
+                    lease_seconds,
+                )
+            ):
+                return None
+            await conn.execute(
+                """
+                UPDATE agent_pending_messages
+                SET revision = revision + 1,
+                    updated_at = GREATEST(
+                        clock_timestamp(), send_now_requested_at + INTERVAL '1 microsecond'
+                    )
+                WHERE id = $1 AND revision = $2
+                """,
+                message_id,
+                revision,
+            )
+            claimed = await read_pending_message(conn, message_id)
+            if claimed is None:  # The thread lock makes this defensive only.
+                return None
+            return {
+                "message": claimed,
+                "job_id": str(message["send_now_job_id"]),
+                "attempt_id": attempt_id,
+            }
+
+    async def recoverable_send_now_handoffs(
+        self, *, lease_seconds: float, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Candidates a process may claim without holding a lock over broker I/O."""
+        if not math.isfinite(lease_seconds) or lease_seconds <= 0:
+            raise ValueError("lease_seconds must be finite and positive")
+        if limit <= 0:
+            return []
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT p.id, p.revision
+                FROM agent_pending_messages p
+                JOIN agent_jobs j ON j.id = p.send_now_job_id
+                JOIN agent_attempts a ON a.id = j.current_attempt_id
+                WHERE p.state = $1 AND p.send_now_requested_at IS NOT NULL
+                  AND p.send_now_handed_off = FALSE
+                  AND j.state = $2 AND NOT j.cancel_requested
+                  AND a.status = 'running'
+                  AND a.lease_expires_at > clock_timestamp()
+                  AND (
+                      p.updated_at <= p.send_now_requested_at
+                      OR p.updated_at < clock_timestamp()
+                          - make_interval(secs => $3::double precision)
+                  )
+                ORDER BY p.send_now_requested_at, p.id
+                LIMIT $4
+                """,
+                PENDING_SENDING,
+                RUNNING,
+                lease_seconds,
+                limit,
+            )
+        return [{"message_id": str(row["id"]), "revision": int(row["revision"])} for row in rows]
+
+    async def mark_send_now_handoff_accepted(
+        self, *, message_id: str, revision: int, attempt_id: int
+    ) -> bool:
+        """Fence retries after the exact current live attempt accepted a handoff."""
+        async with self._pool.acquire() as conn, conn.transaction():
+            candidate = await conn.fetchrow(
+                "SELECT thread_id, send_now_job_id FROM agent_pending_messages WHERE id = $1",
+                message_id,
+            )
+            if candidate is None or candidate["send_now_job_id"] is None:
+                return False
+            if not await conn.fetchval(
+                "SELECT id FROM agent_attempts WHERE id = $1 FOR SHARE",
+                attempt_id,
+            ):
+                return False
+            thread_id = str(candidate["thread_id"])
+            if not await conn.fetchval(
+                "SELECT id FROM agent_threads WHERE id = $1 FOR UPDATE",
+                thread_id,
+            ):
+                return False
+            message = await conn.fetchrow(
+                """
+                SELECT thread_id, send_now_job_id FROM agent_pending_messages
+                WHERE id = $1 AND state = $2 AND revision = $3
+                  AND send_now_requested_at IS NOT NULL
+                FOR UPDATE
+                """,
+                message_id,
+                PENDING_SENDING,
+                revision,
+            )
+            if (
+                message is None
+                or message["thread_id"] != candidate["thread_id"]
+                or message["send_now_job_id"] != candidate["send_now_job_id"]
+            ):
+                return False
+            if not await conn.fetchval(
+                "SELECT id FROM agent_jobs WHERE id = $1 AND thread_id = $2 FOR SHARE",
+                message["send_now_job_id"],
+                thread_id,
+            ):
+                return False
+            authorized = await conn.fetchval(
+                """
+                SELECT j.state = 'running' AND NOT j.cancel_requested
+                   AND j.current_attempt_id = a.id AND a.status = 'running'
+                   AND a.lease_expires_at > clock_timestamp()
+                FROM agent_jobs j, agent_attempts a
+                WHERE j.id = $1 AND a.id = $2
+                """,
+                message["send_now_job_id"],
+                attempt_id,
+            )
+            if not authorized:
+                return False
+            changed = await conn.fetchval(
+                """
+                UPDATE agent_pending_messages
+                SET send_now_handed_off = TRUE, updated_at = clock_timestamp()
+                WHERE id = $1 AND state = $2 AND revision = $3
+                  AND send_now_requested_at IS NOT NULL
+                  AND send_now_handed_off = FALSE
+                RETURNING TRUE
+                """,
+                message_id,
+                PENDING_SENDING,
+                revision,
+            )
+            return bool(changed)
+
+    async def expired_send_now_handoffs(
+        self, *, wait_seconds: float, lease_seconds: float, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Reclaimable handoffs whose turn ended or failed to acquire a host."""
+        if not math.isfinite(wait_seconds) or wait_seconds <= 0:
+            raise ValueError("wait_seconds must be finite and positive")
+        if not math.isfinite(lease_seconds) or lease_seconds <= 0:
+            raise ValueError("lease_seconds must be finite and positive")
+        if limit <= 0:
+            return []
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT p.id, p.revision,
+                       CASE
+                           WHEN j.id IS NULL
+                             OR j.state IN ('succeeded', 'failed', 'cancelled')
+                             OR j.cancel_requested
+                             OR (
+                                 j.state = $2
+                                 AND (
+                                     a.id IS NULL OR a.status <> 'running'
+                                     OR a.lease_expires_at <= clock_timestamp()
+                                 )
+                             )
+                           THEN 'target_ended'
+                           ELSE 'claim_timeout'
+                       END AS reason
+                FROM agent_pending_messages p
+                LEFT JOIN agent_jobs j ON j.id = p.send_now_job_id
+                LEFT JOIN agent_attempts a ON a.id = j.current_attempt_id
+                WHERE p.state = $1 AND p.send_now_requested_at IS NOT NULL
+                  AND p.send_now_handed_off = FALSE
+                  AND (
+                      p.updated_at <= p.send_now_requested_at
+                      OR p.updated_at < clock_timestamp()
+                          - make_interval(secs => $4::double precision)
+                  )
+                  AND (
+                      j.id IS NULL
+                      OR j.state IN ('succeeded', 'failed', 'cancelled')
+                      OR j.cancel_requested
+                      OR (
+                          j.state = $2
+                          AND (
+                              a.id IS NULL OR a.status <> 'running'
+                              OR a.lease_expires_at <= clock_timestamp()
+                          )
+                      )
+                      OR (
+                          j.state <> $2
+                          AND p.send_now_requested_at < clock_timestamp()
+                              - make_interval(secs => $3::double precision)
+                      )
+                  )
+                ORDER BY p.send_now_requested_at, p.id
+                LIMIT $5
+                """,
+                PENDING_SENDING,
+                RUNNING,
+                wait_seconds,
+                lease_seconds,
+                limit,
+            )
+        return [
+            {
+                "message_id": str(row["id"]),
+                "revision": int(row["revision"]),
+                "reason": str(row["reason"]),
+            }
+            for row in rows
+        ]
+
+    async def return_to_queue(
+        self,
+        *,
+        message_id: str,
+        revision: int,
+        last_error: str | None = None,
+        attempt_id: int | None = None,
+    ) -> dict[str, Any] | None:
         """Put a message its turn will not take back in line, as it was.
 
         ``revision`` is the one it took when it was chosen to send now; a
         message the queue has moved on from since — taken by the turn, or
-        already back in line — is left alone. Returns the message as it now
-        is, or ``None`` when it is gone.
+        already back in line — is left alone. ``last_error`` persists a
+        recovery status for a request whose original HTTP response is gone.
+        ``attempt_id`` additionally fences a live broker answer to the exact
+        live, unexpired attempt it addressed. If it expires during broker I/O,
+        the row stays leased for target-ended recovery. Returns the message as
+        it now is, or ``None`` when it is gone.
         """
         async with self._pool.acquire() as conn, conn.transaction():
-            thread_id = await conn.fetchval(
-                "SELECT thread_id FROM agent_pending_messages WHERE id = $1", message_id
+            candidate = await conn.fetchrow(
+                "SELECT thread_id, send_now_job_id FROM agent_pending_messages WHERE id = $1",
+                message_id,
             )
-            if thread_id is None:
+            if candidate is None:
                 return None
-            await conn.execute("SELECT id FROM agent_threads WHERE id = $1 FOR UPDATE", thread_id)
-            await conn.execute(
+            attempt_locked = attempt_id is None or bool(
+                await conn.fetchval(
+                    "SELECT id FROM agent_attempts WHERE id = $1 FOR SHARE",
+                    attempt_id,
+                )
+            )
+            thread_id = str(candidate["thread_id"])
+            if not await conn.fetchval(
+                "SELECT id FROM agent_threads WHERE id = $1 FOR UPDATE",
+                thread_id,
+            ):
+                return None
+            message = await conn.fetchrow(
                 """
-                UPDATE agent_pending_messages
-                SET state = $3, send_now_job_id = NULL, send_now_requested_at = NULL,
-                    send_now_handed_off = FALSE,
-                    revision = revision + 1, updated_at = NOW()
-                WHERE id = $1 AND state = $2 AND revision = $4
+                SELECT thread_id, send_now_job_id FROM agent_pending_messages
+                WHERE id = $1 FOR UPDATE
                 """,
                 message_id,
-                PENDING_SENDING,
-                PENDING_QUEUED,
-                revision,
             )
+            if message is None:
+                return None
+            authorized = attempt_id is None
+            if (
+                attempt_id is not None
+                and attempt_locked
+                and message["thread_id"] == candidate["thread_id"]
+                and message["send_now_job_id"] == candidate["send_now_job_id"]
+                and message["send_now_job_id"] is not None
+                and await conn.fetchval(
+                    "SELECT id FROM agent_jobs WHERE id = $1 AND thread_id = $2 FOR SHARE",
+                    message["send_now_job_id"],
+                    thread_id,
+                )
+            ):
+                authorized = bool(
+                    await conn.fetchval(
+                        """
+                        SELECT j.state = 'running' AND NOT j.cancel_requested
+                           AND j.current_attempt_id = a.id AND a.status = 'running'
+                           AND a.lease_expires_at > clock_timestamp()
+                        FROM agent_jobs j, agent_attempts a
+                        WHERE j.id = $1 AND a.id = $2
+                        """,
+                        message["send_now_job_id"],
+                        attempt_id,
+                    )
+                )
+            if authorized:
+                await conn.execute(
+                    """
+                    UPDATE agent_pending_messages
+                    SET state = $3, send_now_job_id = NULL, send_now_requested_at = NULL,
+                        send_now_handed_off = FALSE, last_error = $5,
+                        revision = revision + 1,
+                        updated_at = clock_timestamp()
+                    WHERE id = $1 AND state = $2 AND revision = $4
+                      AND send_now_handed_off = FALSE
+                    """,
+                    message_id,
+                    PENDING_SENDING,
+                    PENDING_QUEUED,
+                    revision,
+                    last_error[:MAX_PENDING_ERROR_CHARS] if last_error is not None else None,
+                )
             return await read_pending_message(conn, message_id)
-
-    async def list_sending_handoffs(self) -> list[dict[str, Any]]:
-        """Messages in ``sending`` tied to a turn, for a restarted control plane.
-
-        The wait that hands one to a host is not durable. The row is: ``sending``
-        with ``send_now_job_id`` set, and not yet accepted by the host. A row
-        marked handed off stays ``sending`` until the turn takes it, and a
-        restart must not inject it again.
-        """
-        acquired = self._pool.acquire()
-        # A stand-in pool's ``acquire`` is a coroutine, not a context manager.
-        # Closing it here is what keeps that failure from warning at shutdown.
-        if inspect.iscoroutine(acquired):
-            acquired.close()
-            raise RuntimeError("send-now handoff list needs a pool connection")
-        async with acquired as conn:
-            rows = await conn.fetch(
-                f"SELECT {PENDING_MESSAGE_COLUMNS} FROM agent_pending_messages "
-                "WHERE state = $1 AND send_now_job_id IS NOT NULL "
-                "AND send_now_handed_off = FALSE "
-                "ORDER BY send_now_requested_at, id",
-                PENDING_SENDING,
-            )
-        # ``fetch`` returns a list of rows. Anything else is not that result,
-        # and iterating it would invent handoffs.
-        if not isinstance(rows, list):
-            raise RuntimeError("send-now handoff query did not return rows")
-        return [pending_message_row(row) for row in rows]
-
-    async def send_now_handoff_pending(self, *, message_id: str, revision: int) -> bool:
-        """True when this revision is still ``sending`` and the host has not accepted it."""
-        async with self._pool.acquire() as conn:
-            pending = await conn.fetchval(
-                """
-                SELECT id FROM agent_pending_messages
-                WHERE id = $1 AND revision = $2 AND state = $3
-                  AND send_now_handed_off = FALSE
-                """,
-                message_id,
-                revision,
-                PENDING_SENDING,
-            )
-        return pending is not None
-
-    async def try_acquire_send_now_lock(self, message_id: str) -> Any | None:
-        """A dedicated connection holding this message's session lock, or ``None``.
-
-        ``pg_try_advisory_lock(hashtextextended('send-now:' || message_id, 0))``
-        is session-level: a commit does not release it, and a dropped connection
-        does. The connection is opened the way the pool opens one and is not
-        checked out of the pool, so it cannot be returned early with the lock
-        still on it or already gone. The caller holds it for the whole handoff
-        and closes it to release. ``None`` means another session has the lock.
-        """
-        conn = await _open_dedicated_connection(self._pool)
-        try:
-            locked = await conn.fetchval(_SEND_NOW_LOCK_SQL, message_id)
-        except Exception:
-            await conn.close()
-            raise
-        if not locked:
-            await conn.close()
-            return None
-        return conn
-
-    async def mark_send_now_handed(self, *, message_id: str, revision: int) -> bool:
-        """Remember that this revision was accepted, so a restart does not inject it again.
-
-        The row stays ``sending`` until the turn takes it. The session lock is
-        gone by then, and the host writes a duplicate if recovery hands the
-        same text over a second time.
-        """
-        async with self._pool.acquire() as conn:
-            marked = await conn.fetchval(
-                """
-                UPDATE agent_pending_messages
-                SET send_now_handed_off = TRUE, updated_at = NOW()
-                WHERE id = $1 AND revision = $2 AND state = $3
-                RETURNING id
-                """,
-                message_id,
-                revision,
-                PENDING_SENDING,
-            )
-        return marked is not None
 
     async def settle_queue(
         self, *, thread_id: str, prepared: PreparedHead | None = None
@@ -788,12 +1043,13 @@ class PostgresPendingMessageRepository:
                 """
                 UPDATE agent_pending_messages
                 SET state = 'queued', send_now_job_id = NULL, send_now_requested_at = NULL,
-                    send_now_handed_off = FALSE,
+                    send_now_handed_off = FALSE, last_error = $3,
                     revision = revision + 1, updated_at = NOW()
                 WHERE thread_id = $1 AND state = $2
                 """,
                 thread_id,
                 PENDING_SENDING,
+                _SEND_NOW_TARGET_ENDED,
             )
             if latest["id"] != thread["queue_settled_job_id"]:
                 # Each ending is acted on once. Continuing moves this marker

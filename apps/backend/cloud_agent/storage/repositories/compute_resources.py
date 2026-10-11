@@ -494,7 +494,8 @@ class PostgresComputeResourceRepository:
                 for r in await conn.fetch(
                     """SELECT h.host,h.status,h.compute_node_id,
                 h.slots_used,h.last_heartbeat_at,h.broker_url,h.drain_fence_active,
-                (SELECT count(*) FROM agent_sandboxes g WHERE g.host=h.host) AS retained_groups
+                (SELECT count(*) FROM agent_sandboxes g
+                 WHERE g.host=h.host AND g.deletion_state<>'deleted') AS retained_groups
                 FROM agent_runner_hosts h JOIN agent_compute_nodes n ON n.id=h.compute_node_id
                 WHERE n.allocation_id=$1 ORDER BY h.host""",
                     allocation_id,
@@ -544,7 +545,8 @@ class PostgresComputeResourceRepository:
                 for r in await conn.fetch("""SELECT h.host,h.status,h.compute_node_id,
                 n.allocation_id,h.slots_used,h.slots_total,h.slots_desired,h.last_heartbeat_at,
                 h.labels->>'physical_host' AS physical_host,h.broker_url,
-                (SELECT count(*) FROM agent_sandboxes g WHERE g.host=h.host) AS retained_groups
+                (SELECT count(*) FROM agent_sandboxes g
+                 WHERE g.host=h.host AND g.deletion_state<>'deleted') AS retained_groups
                 FROM agent_runner_hosts h LEFT JOIN agent_compute_nodes n ON n.id=h.compute_node_id
                 ORDER BY h.host""")
             ]
@@ -1206,7 +1208,8 @@ class PostgresComputeResourceRepository:
                 raise ValueError("autoscaling_member_not_idle")
             host_names = [host["host"] for host in hosts]
             if await conn.fetchval(
-                "SELECT 1 FROM agent_sandboxes WHERE host=ANY($1::text[]) LIMIT 1",
+                "SELECT 1 FROM agent_sandboxes "
+                "WHERE host=ANY($1::text[]) AND deletion_state<>'deleted' LIMIT 1",
                 host_names,
             ):
                 raise ValueError("autoscaling_member_not_idle")
@@ -1407,16 +1410,19 @@ class PostgresComputeResourceRepository:
     ) -> None:
         if operation_id is None:
             return
-        valid = await conn.fetchval(
+        locked = await conn.fetchval(
             """SELECT id FROM agent_compute_operations
             WHERE id=$1 AND generation=$2 AND worker_id=$3 AND state='running'
-              AND lease_expires_at>NOW() AND ($4::text IS NULL OR allocation_id=$4) FOR UPDATE""",
+              AND ($4::text IS NULL OR allocation_id=$4) FOR UPDATE""",
             operation_id,
             generation,
             worker_id,
             allocation_id,
         )
-        if valid is None:
+        if locked is None or not await conn.fetchval(
+            "SELECT lease_expires_at > clock_timestamp() FROM agent_compute_operations WHERE id=$1",
+            operation_id,
+        ):
             raise ValueError("operation_lease_lost")
 
     async def _release_terminal_autoscaling_reservation(
@@ -1657,7 +1663,7 @@ class PostgresComputeResourceRepository:
             row = await conn.fetchrow(
                 """INSERT INTO agent_compute_node_registrations
                 (id,allocation_id,operation_id,token_hash,expires_at)
-                VALUES ($1,$2,$3,$4,NOW()+make_interval(secs=>$5))
+                VALUES ($1,$2,$3,$4,clock_timestamp()+make_interval(secs=>$5))
                 RETURNING id,expires_at,created_at""",
                 str(uuid4()),
                 allocation_id,
@@ -1676,7 +1682,7 @@ class PostgresComputeResourceRepository:
         async with self._pool.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
                 """SELECT r.id,r.allocation_id,r.host_keys,r.registered_at,
-                    r.expires_at>NOW() AS live,a.desired_state,a.release_committed_at
+                    r.expires_at,a.desired_state,a.release_committed_at
                 FROM agent_compute_node_registrations r
                 JOIN agent_compute_allocations a ON a.id=r.allocation_id
                 WHERE r.token_hash=$1 FOR UPDATE OF r""",
@@ -1684,6 +1690,11 @@ class PostgresComputeResourceRepository:
             )
             if row is None:
                 return "invalid"
+            live = await conn.fetchval(
+                "SELECT expires_at > clock_timestamp() "
+                "FROM agent_compute_node_registrations WHERE id=$1",
+                row["id"],
+            )
             if row["registered_at"] is not None:
                 return "replayed" if load_json(row["host_keys"]) == host_keys else "conflict"
             newest = await conn.fetchval(
@@ -1692,7 +1703,7 @@ class PostgresComputeResourceRepository:
                 row["allocation_id"],
             )
             if (
-                not row["live"]
+                not live
                 or row["desired_state"] != "present"
                 or row["release_committed_at"] is not None
                 or newest != row["id"]
@@ -1711,7 +1722,7 @@ class PostgresComputeResourceRepository:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 """SELECT id,expires_at,host_keys,registered_at,created_at,
-                    expires_at<=NOW() AS expired
+                    expires_at<=clock_timestamp() AS expired
                 FROM agent_compute_node_registrations WHERE allocation_id=$1
                 ORDER BY created_at DESC,id DESC LIMIT 1""",
                 allocation_id,
@@ -1764,15 +1775,15 @@ class PostgresComputeResourceRepository:
             )
             row = await conn.fetchrow("""SELECT o.* FROM agent_compute_operations o
                 LEFT JOIN agent_compute_allocations a ON a.id=o.allocation_id
-                WHERE ((o.state IN ('pending','waiting') AND o.next_attempt_at<=NOW())
-                       OR (o.state='running' AND o.lease_expires_at<=NOW()))
+                WHERE ((o.state IN ('pending','waiting') AND o.next_attempt_at<=clock_timestamp())
+                       OR (o.state='running' AND o.lease_expires_at<=clock_timestamp()))
                   AND (a.release_committed_at IS NULL OR o.kind IN ('retire','inspect','discard'))
                   AND NOT EXISTS (SELECT 1 FROM agent_compute_operations busy
                     WHERE busy.allocation_id=o.allocation_id AND busy.id<>o.id
                       AND (busy.state='running' OR busy.state='unknown' OR (busy.state='waiting' AND busy.result->>'external_pending'='true'))
                       AND NOT (o.kind='rotate' AND busy.kind='extend'
                                AND busy.state='waiting')
-                      AND NOT (busy.state='running' AND busy.lease_expires_at<=NOW()
+                      AND NOT (busy.state='running' AND busy.lease_expires_at<=clock_timestamp()
                                AND o.state='running' AND o.created_at<busy.created_at))
                 ORDER BY (o.state='running') DESC,o.created_at LIMIT 1 FOR UPDATE OF o SKIP LOCKED""")
             if row is None:
@@ -1781,7 +1792,7 @@ class PostgresComputeResourceRepository:
                 await conn.fetchrow(
                     """UPDATE agent_compute_operations
                 SET state='running',worker_id=$2,generation=generation+1,
-                    lease_expires_at=NOW()+make_interval(secs=>$3),updated_at=NOW()
+                    lease_expires_at=clock_timestamp()+make_interval(secs=>$3),updated_at=NOW()
                 WHERE id=$1 RETURNING *""",
                     row["id"],
                     worker_id,
@@ -1793,13 +1804,17 @@ class PostgresComputeResourceRepository:
         self, *, operation_id: str, generation: int, worker_id: str, lease_seconds: float = 120
     ) -> bool:
         """Extend only the still-current worker lease."""
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            try:
+                await self._fence(conn, operation_id, generation, worker_id)
+            except ValueError:
+                return False
             return bool(
                 await conn.fetchval(
                     """UPDATE agent_compute_operations
-                SET lease_expires_at=NOW()+make_interval(secs=>$4),updated_at=NOW()
+                SET lease_expires_at=clock_timestamp()+make_interval(secs=>$4),updated_at=NOW()
                 WHERE id=$1 AND generation=$2 AND worker_id=$3 AND state='running'
-                  AND lease_expires_at>NOW() RETURNING id""",
+                  AND lease_expires_at>clock_timestamp() RETURNING id""",
                     operation_id,
                     generation,
                     worker_id,
@@ -1817,13 +1832,17 @@ class PostgresComputeResourceRepository:
         result: dict[str, Any] | None = None,
     ) -> bool:
         """Merge a durable step receipt without releasing the external-call lease."""
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            try:
+                await self._fence(conn, operation_id, generation, worker_id)
+            except ValueError:
+                return False
             return bool(
                 await conn.fetchval(
                     """UPDATE agent_compute_operations
                 SET step=$4,result=result || $5::jsonb,updated_at=NOW()
                 WHERE id=$1 AND generation=$2 AND worker_id=$3 AND state='running'
-                  AND lease_expires_at>NOW() RETURNING id""",
+                  AND lease_expires_at>clock_timestamp() RETURNING id""",
                     operation_id,
                     generation,
                     worker_id,
@@ -1849,13 +1868,17 @@ class PostgresComputeResourceRepository:
             raise ValueError("invalid_operation_state")
         async with self._pool.acquire() as conn, conn.transaction():
             await lock_compute_entry(conn, exclusive=True)
+            try:
+                await self._fence(conn, operation_id, generation, worker_id)
+            except ValueError:
+                return False
             row = await conn.fetchrow(
                 """UPDATE agent_compute_operations
                 SET state=$4,step=$5,message=$6,result=result || $7::jsonb,
-                    next_attempt_at=NOW()+make_interval(secs=>$8),lease_expires_at=NULL,worker_id=NULL,
+                    next_attempt_at=clock_timestamp()+make_interval(secs=>$8),lease_expires_at=NULL,worker_id=NULL,
                     updated_at=NOW(),completed_at=CASE WHEN $4 IN ('succeeded','failed') THEN NOW() ELSE NULL END
                 WHERE id=$1 AND generation=$2 AND worker_id=$3 AND state='running'
-                  AND lease_expires_at>NOW() RETURNING id,allocation_id,kind""",
+                  AND lease_expires_at>clock_timestamp() RETURNING id,allocation_id,kind""",
                 operation_id,
                 generation,
                 worker_id,
@@ -2512,7 +2535,8 @@ class PostgresComputeResourceRepository:
         if any(host["drain_fence_active"] for host in allocation["hosts"]):
             reasons.append("deployment_drain_active")
         groups = await conn.fetch(
-            "SELECT id,host,state,active_operation_count FROM agent_sandboxes WHERE host=ANY($1::text[])",
+            "SELECT id,host,state,active_operation_count FROM agent_sandboxes "
+            "WHERE host=ANY($1::text[]) AND deletion_state<>'deleted'",
             hosts,
         )
         if groups:
@@ -2527,7 +2551,8 @@ class PostgresComputeResourceRepository:
             reasons.append("active_attempts_present")
         forks = await conn.fetchval(
             """SELECT count(*) FROM agent_session_forks f JOIN agent_sandboxes g ON g.id=f.sandbox_id
-            WHERE g.host=ANY($1::text[]) AND f.state IN ('preparing','materialized')""",
+            WHERE g.host=ANY($1::text[]) AND g.deletion_state<>'deleted'
+              AND f.state IN ('preparing','materialized')""",
             hosts,
         )
         if forks:

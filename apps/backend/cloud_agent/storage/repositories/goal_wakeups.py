@@ -75,6 +75,24 @@ async def _insert(
     )
 
 
+async def _lock_live_wakeup(conn: Any, wakeup_id: str, lease_owner: str) -> bool:
+    """Lock first so expiry is evaluated after any row-lock wait."""
+    locked = await conn.fetchval(
+        "SELECT id FROM agent_goal_wakeups "
+        "WHERE id = $1 AND state = 'pending' AND lease_owner = $2 FOR UPDATE",
+        wakeup_id,
+        lease_owner,
+    )
+    if locked is None:
+        return False
+    return bool(
+        await conn.fetchval(
+            "SELECT lease_expires_at > clock_timestamp() FROM agent_goal_wakeups WHERE id = $1",
+            wakeup_id,
+        )
+    )
+
+
 class PostgresGoalWakeupRepository:
     """The pending-advance queue behind one conversation's goal."""
 
@@ -138,14 +156,14 @@ class PostgresGoalWakeupRepository:
             rows = await conn.fetch(
                 f"""
                 UPDATE agent_goal_wakeups
-                SET lease_owner = $1, lease_expires_at = NOW() + make_interval(secs => $2),
+                SET lease_owner = $1, lease_expires_at = clock_timestamp() + make_interval(secs => $2),
                     attempts = attempts + 1, updated_at = NOW()
                 WHERE id IN (
                     SELECT id FROM agent_goal_wakeups
                     WHERE state = 'pending'
                       AND waiting_job_id IS NULL
                       AND not_before <= NOW()
-                      AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
+                      AND (lease_expires_at IS NULL OR lease_expires_at < clock_timestamp())
                     ORDER BY created_at
                     LIMIT $3
                     FOR UPDATE SKIP LOCKED
@@ -190,7 +208,7 @@ class PostgresGoalWakeupRepository:
                 restore_attempt=restore_attempt,
             )
             return
-        async with self._pool.acquire() as acquired:
+        async with self._pool.acquire() as acquired, acquired.transaction():
             await _release_on(
                 acquired,
                 wakeup_id=wakeup_id,
@@ -228,9 +246,17 @@ class PostgresGoalWakeupRepository:
               ))
             """
         if conn is not None:
+            if lease_owner is not None and not await _lock_live_wakeup(
+                conn, wakeup_id, lease_owner
+            ):
+                return
             await conn.execute(sql, wakeup_id, processed, detail, lease_owner)
             return
-        async with self._pool.acquire() as acquired:
+        async with self._pool.acquire() as acquired, acquired.transaction():
+            if lease_owner is not None and not await _lock_live_wakeup(
+                acquired, wakeup_id, lease_owner
+            ):
+                return
             await acquired.execute(sql, wakeup_id, processed, detail, lease_owner)
 
     async def lock_wakeup(self, *, wakeup_id: str, lease_owner: str, conn: Any) -> bool:
@@ -242,16 +268,7 @@ class PostgresGoalWakeupRepository:
         Check the wall clock: NOW() stays fixed while a transaction waits for
         the conversation lock and can predate the lease's expiry.
         """
-        return bool(
-            await conn.fetchval(
-                """SELECT id FROM agent_goal_wakeups
-            WHERE id = $1 AND state = 'pending' AND lease_owner = $2
-              AND lease_expires_at > clock_timestamp()
-            FOR UPDATE""",
-                wakeup_id,
-                lease_owner,
-            )
-        )
+        return await _lock_live_wakeup(conn, wakeup_id, lease_owner)
 
     async def pending_wakeup(self, *, thread_id: str) -> dict[str, Any] | None:
         """The newest unprocessed wakeup of a conversation, if any."""
@@ -286,6 +303,8 @@ async def _release_on(
         if retry_in_seconds is not None
         else None
     )
+    if lease_owner is not None and not await _lock_live_wakeup(conn, wakeup_id, lease_owner):
+        return
     await conn.execute(
         """
         UPDATE agent_goal_wakeups
@@ -293,7 +312,7 @@ async def _release_on(
             waiting_job_id = COALESCE($2, waiting_job_id),
             detail = COALESCE($3, detail),
             not_before = CASE WHEN $4::double precision IS NULL THEN not_before
-                              ELSE NOW() + make_interval(secs => $4) END,
+                              ELSE clock_timestamp() + make_interval(secs => $4) END,
             attempts = GREATEST(attempts - CASE WHEN $6 THEN 1 ELSE 0 END, 0),
             updated_at = NOW()
         WHERE id = $1 AND state = 'pending'

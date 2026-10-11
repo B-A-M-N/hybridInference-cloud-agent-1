@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
+from tests.integration.storage.test_admin_sandbox_queries import member, seed
 from tests.integration.storage.test_host_pool_store import (
     _claim,
     _create_job,
@@ -93,6 +94,55 @@ async def operation(repo, allocation_id, kind="retire"):
 
 def fence(op):
     return {"operation_id": op["id"], "generation": op["generation"], "worker_id": "worker"}
+
+
+async def complete_admin_deletion(store, sandbox_id: str) -> None:
+    """Drive one stopped retained group through the durable deletion protocol."""
+    detail = await store.admin_sandboxes.detail(sandbox_id)
+    assert detail is not None
+    assert (
+        await store.sandbox.request_admin_delete(
+            sandbox_id=sandbox_id,
+            generation=detail.sandbox.generation,
+            container_id=detail.sandbox.container_id,
+            last_activity_at=detail.sandbox.last_activity_at,
+            actor_id="admin:scale-in-test",
+            admin_ip="127.0.0.1",
+        )
+        == "accepted"
+    )
+    claim = await store.sandbox.claim_due_admin_sandbox_deletion(ttl_seconds=3600)
+    assert claim is not None and claim["id"] == sandbox_id
+    worker_fence = {
+        "sandbox_id": sandbox_id,
+        "request_id": claim["deletion_request_id"],
+        "claim_token": claim["deletion_claim_token"],
+        "generation": claim["generation"],
+        "container_id": claim["container_id"],
+    }
+    assert await store.sandbox.record_admin_sandbox_archive(
+        **worker_fence,
+        archive_key=f"s3://sandbox-archive-bucket/{sandbox_id}.tar",
+        sha256="d" * 64,
+        size_bytes=4096,
+    )
+    assert await store.sandbox.complete_admin_sandbox_deletion(**worker_fence)
+
+
+async def retained_group_counts(store, *, allocation_id: str, host: str) -> tuple[int, int, int]:
+    """Read the three payloads that feed autoscaling and retirement decisions."""
+    observation = await store.host_pool.autoscaling_observation(expected_deployment_sha="")
+    observed_host = next(row for row in observation["hosts"] if row["host"] == host)
+    allocation = await store.compute_resources.get_allocation(allocation_id)
+    assert allocation is not None
+    allocation_host = next(row for row in allocation["hosts"] if row["host"] == host)
+    inventory = await store.compute_resources.server_inventory()
+    inventory_host = next(row for row in inventory["hosts"] if row["host"] == host)
+    return (
+        observed_host["retained_groups"],
+        allocation_host["retained_groups"],
+        inventory_host["retained_groups"],
+    )
 
 
 async def autoscale_acquisition(
@@ -751,6 +801,169 @@ async def test_stopped_retained_group_blocks_release_even_with_zero_slots(db, st
     assert await hosts.forget_runner_host(host="machine") == "retained_groups_present"
 
 
+async def test_completed_admin_deletion_makes_autoscaled_host_scale_down_eligible(db, store, hosts):
+    repo = store.compute_resources
+    first, _, _ = await resource(store, hosts, name="autoscale-retained-peer")
+    candidate, _, _ = await resource(store, hosts, name="autoscale-retained-candidate")
+    origin = await seed(
+        db,
+        store,
+        "autoscale-retained-group",
+        state="stopped",
+        host="autoscale-retained-candidate",
+    )
+    await member(db, "autoscale-retained-group", origin, None)
+    async with db.acquire() as conn:
+        await conn.execute(
+            """UPDATE agent_cloudlab_autoscaling_policy
+               SET enabled=TRUE,min_hosts=1,max_hosts=2,scale_down_enabled=TRUE,
+                   deployment_profiles=ARRAY['retained-peer','retained-candidate']"""
+        )
+        for allocation_id, profile in (
+            (first, "retained-peer"),
+            (candidate, "retained-candidate"),
+        ):
+            await conn.execute(
+                """INSERT INTO agent_cloudlab_autoscaling_members
+                   (allocation_id,deployment_profile,state) VALUES ($1,$2,'active')""",
+                allocation_id,
+                profile,
+            )
+            await conn.execute(
+                """INSERT INTO agent_cloudlab_autoscaling_profile_reservations
+                   (deployment_profile,profile_snapshot,allocation_id)
+                   VALUES ($1,jsonb_build_object('id',$1::text),$2)""",
+                profile,
+                allocation_id,
+            )
+
+    assert await retained_group_counts(
+        store, allocation_id=candidate, host="autoscale-retained-candidate"
+    ) == (1, 1, 1)
+    with pytest.raises(ValueError, match="autoscaling_member_not_idle"):
+        await repo.queue_autoscale_retire(
+            expected_revision=0,
+            expected_generation=0,
+            allocation_id=candidate,
+            request_id="retire-retained-live",
+            fingerprint="retire-retained-live",
+            parameters={"allocation_id": candidate},
+            requested_by="system:cloudlab-autoscaler",
+            decision={"action": "scale_down_idle", "allocation_id": candidate},
+            cooldown_seconds=60,
+        )
+
+    async with db.acquire() as conn:
+        await conn.execute(
+            """UPDATE agent_sandboxes
+               SET state='lost',deletion_state='failed'
+               WHERE id='autoscale-retained-group'"""
+        )
+    assert await retained_group_counts(
+        store, allocation_id=candidate, host="autoscale-retained-candidate"
+    ) == (1, 1, 1)
+    with pytest.raises(ValueError, match="autoscaling_member_not_idle"):
+        await repo.queue_autoscale_retire(
+            expected_revision=0,
+            expected_generation=0,
+            allocation_id=candidate,
+            request_id="retire-retained-lost-incomplete",
+            fingerprint="retire-retained-lost-incomplete",
+            parameters={"allocation_id": candidate},
+            requested_by="system:cloudlab-autoscaler",
+            decision={"action": "scale_down_idle", "allocation_id": candidate},
+            cooldown_seconds=60,
+        )
+
+    async with db.acquire() as conn:
+        await conn.execute(
+            """UPDATE agent_sandboxes
+               SET state='stopped',deletion_state='none'
+               WHERE id='autoscale-retained-group'"""
+        )
+    await complete_admin_deletion(store, "autoscale-retained-group")
+
+    assert await retained_group_counts(
+        store, allocation_id=candidate, host="autoscale-retained-candidate"
+    ) == (0, 0, 0)
+    # General host removal intentionally remains conservative: the audit row
+    # still owns durable history even though it no longer represents capacity.
+    assert (
+        await hosts.forget_runner_host(host="autoscale-retained-candidate")
+        == "retained_groups_present"
+    )
+    queued = await repo.queue_autoscale_retire(
+        expected_revision=0,
+        expected_generation=0,
+        allocation_id=candidate,
+        request_id="retire-after-admin-deletion",
+        fingerprint="retire-after-admin-deletion",
+        parameters={"allocation_id": candidate},
+        requested_by="system:cloudlab-autoscaler",
+        decision={"action": "scale_down_idle", "allocation_id": candidate},
+        cooldown_seconds=60,
+    )
+    assert queued["operation"]["kind"] == "retire"
+    assert queued["operation"]["allocation_id"] == candidate
+
+
+async def test_completed_admin_deletion_unblocks_resource_retirement(db, store, hosts):
+    repo = store.compute_resources
+    allocation_id, _, _ = await resource(store, hosts, name="retirement-after-deletion")
+    origin = await seed(
+        db,
+        store,
+        "retirement-retained-group",
+        state="stopped",
+        host="retirement-after-deletion",
+    )
+    await member(db, "retirement-retained-group", origin, None)
+    op = await operation(repo, allocation_id)
+
+    impact = await repo.begin_retirement(allocation_id=allocation_id, **fence(op))
+    assert impact["hosts"][0]["retained_groups"] == 1
+    assert [group["id"] for group in impact["retained_groups"]] == ["retirement-retained-group"]
+    assert "retained_groups_present" in impact["blocked_reasons"]
+
+    async with db.acquire() as conn:
+        await conn.execute(
+            """UPDATE agent_sandboxes
+               SET state='lost',deletion_state='failed'
+               WHERE id='retirement-retained-group'"""
+        )
+    lost = await repo.retirement_impact(allocation_id)
+    assert lost["hosts"][0]["retained_groups"] == 1
+    assert [group["id"] for group in lost["retained_groups"]] == ["retirement-retained-group"]
+    assert "retained_groups_present" in lost["blocked_reasons"]
+
+    async with db.acquire() as conn:
+        await conn.execute(
+            """UPDATE agent_sandboxes
+               SET state='stopped',deletion_state='none'
+               WHERE id='retirement-retained-group'"""
+        )
+    await complete_admin_deletion(store, "retirement-retained-group")
+
+    deleted = await repo.retirement_impact(allocation_id)
+    assert deleted["hosts"][0]["retained_groups"] == 0
+    assert deleted["retained_groups"] == []
+    assert "retained_groups_present" not in deleted["blocked_reasons"]
+    assert (
+        await hosts.forget_runner_host(host="retirement-after-deletion")
+        == "retained_groups_present"
+    )
+    assert await repo.record_inventory(
+        allocation_id=allocation_id,
+        hosts=["retirement-after-deletion"],
+        empty=True,
+        **fence(op),
+    )
+    committed = await repo.commit_release(allocation_id=allocation_id, **fence(op))
+    assert committed["release_committed"]
+    assert committed["retained_groups"] == []
+    assert committed["blocked_reasons"] == []
+
+
 async def test_terminal_provider_state_commits_release_and_revokes_host_despite_retention(
     db, store, hosts
 ):
@@ -1051,9 +1264,12 @@ async def test_retirement_freezes_fork_membership_at_source_group(store, hosts):
     assert await store.sandbox.mark_thread_sandbox_running(
         **attempt_fence, container_id="fork-container", context_status="new"
     )
-    assert await store.sandbox.admit_thread_sandbox_turn(**attempt_fence, job_id=job["id"])
+    assert await store.sandbox.admit_thread_sandbox_turn(
+        **attempt_fence, residency_generation=sandbox["residency_generation"], job_id=job["id"]
+    )
     assert await store.sandbox.settle_thread_sandbox(
         **attempt_fence,
+        residency_generation=sandbox["residency_generation"],
         job_id=job["id"],
         context_status="live",
         native_session_id="native-source",
@@ -1142,6 +1358,27 @@ async def test_unknown_expiry_observation_preserves_known_hard_deadline(db, stor
     assert row["expires_at"] == expired and not row["expiration_known"]
     async with db.acquire() as conn, conn.transaction():
         await lock_compute_entry(conn)
+        assert await host_compute_admission(conn, "machine") == (False, False)
+
+
+async def test_compute_admission_uses_wall_time_in_an_aged_transaction(db, store, hosts):
+    allocation_id, _, _ = await resource(store, hosts)
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE agent_compute_allocations
+            SET expires_at = clock_timestamp() + INTERVAL '400 milliseconds',
+                policy = '{"stop_new_groups_before_seconds": 0,
+                           "stop_claims_before_seconds": 0}'::jsonb
+            WHERE id = $1
+            """,
+            allocation_id,
+        )
+    async with db.acquire() as conn, conn.transaction():
+        started_at = await conn.fetchval("SELECT NOW()")
+        await asyncio.sleep(0.55)
+        await lock_compute_entry(conn)
+        assert await conn.fetchval("SELECT NOW() = $1", started_at)
         assert await host_compute_admission(conn, "machine") == (False, False)
 
 

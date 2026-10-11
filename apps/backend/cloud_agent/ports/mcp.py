@@ -627,12 +627,6 @@ class McpConnectionRepository(Protocol):
         """
         ...
 
-    async def authorize_mcp_connector_connection(
-        self, *, connector_id: int, connection_id: int
-    ) -> None:
-        """Record that a connector is allowed to serve one connection."""
-        ...
-
     async def list_mcp_connector_connections(self, *, connector_id: int) -> list[int]:
         """The connection ids one connector may serve."""
         ...

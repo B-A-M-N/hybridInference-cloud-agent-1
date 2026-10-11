@@ -590,6 +590,7 @@ class ControlPlane:
         *,
         sandbox_generation: int,
         activation_generation: int,
+        residency_generation: int,
         process_generation: int,
     ) -> None:
         """Record a CLI process rotation inside the same chat container."""
@@ -598,6 +599,7 @@ class ControlPlane:
             {
                 "sandbox_generation": sandbox_generation,
                 "activation_generation": activation_generation,
+                "residency_generation": residency_generation,
                 "process_generation": process_generation,
             },
         )
@@ -624,6 +626,7 @@ class ControlPlane:
         *,
         sandbox_generation: int,
         activation_generation: int,
+        residency_generation: int,
     ) -> None:
         """Reserve this job before its prompt may reach Agent CLI stdin."""
         self._post(
@@ -631,6 +634,7 @@ class ControlPlane:
             {
                 "sandbox_generation": sandbox_generation,
                 "activation_generation": activation_generation,
+                "residency_generation": residency_generation,
             },
             timeout=10.0,
         )
@@ -640,6 +644,7 @@ class ControlPlane:
         *,
         sandbox_generation: int,
         activation_generation: int,
+        residency_generation: int,
         context_status: str,
         native_session_id: str | None,
         idle_timeout_seconds: float,
@@ -651,6 +656,7 @@ class ControlPlane:
             {
                 "sandbox_generation": sandbox_generation,
                 "activation_generation": activation_generation,
+                "residency_generation": residency_generation,
                 "context_status": context_status,
                 "native_session_id": native_session_id,
                 "base_sha": base_sha,
@@ -2778,6 +2784,7 @@ def _run_shared_live_attempt(
         control.record_chat_process(
             sandbox_generation=spec.generation,
             activation_generation=activation_generation,
+            residency_generation=launch.residency_generation,
             process_generation=process_generation,
         )
         if context_status == "live":
@@ -2794,6 +2801,7 @@ def _run_shared_live_attempt(
             lambda: control.admit_chat_turn(
                 sandbox_generation=spec.generation,
                 activation_generation=activation_generation,
+                residency_generation=launch.residency_generation,
             ),
         )
         turn_admitted = True
@@ -2919,6 +2927,7 @@ def _run_shared_live_attempt(
             lambda: control.settle_chat_sandbox(
                 sandbox_generation=spec.generation,
                 activation_generation=activation_generation,
+                residency_generation=launch.residency_generation,
                 context_status=context_status,
                 native_session_id=settled_session_id,
                 base_sha=base_sha,

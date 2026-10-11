@@ -15,7 +15,9 @@ from cloud_agent.admin_observability import encode_cursor
 from cloud_agent.admin_sandboxes import (
     SANDBOX_CURSOR_SCOPE,
     SandboxCursor,
+    SandboxTrajectoryCursor,
     sandbox_cursor_scope,
+    sandbox_trajectory_cursor_scope,
 )
 from cloud_agent.api import admin_sandboxes
 from cloud_agent.api.deps import get_storage
@@ -96,7 +98,47 @@ def setup(run_setup):  # noqa: F811 — imported pytest fixture
                 "observed_at": END,
                 "total_count": 1,
             }
-        )
+        ),
+        trajectory=AsyncMock(
+            return_value={
+                "sandbox": sandbox()
+                | {
+                    "state": "lost",
+                    "archived_at": END,
+                    "deletion_state": "deleted",
+                    "deleted_at": END,
+                },
+                "members": [
+                    {
+                        "thread_id": "athr_other",
+                        "user_id": "other-owner",
+                        "resident_slot_id": None,
+                        "resident_state": "lost",
+                        "context_status": "lost",
+                        "native_state": "lost",
+                        "created_at": START,
+                        "updated_at": END,
+                        "native_session_id": "PRIVATE session",
+                    }
+                ],
+                "member_history_count": 1,
+                "member_history_truncated": False,
+                "events": [
+                    {
+                        "id": 2,
+                        "generation": 1,
+                        "event_type": "deletion_state_changed",
+                        "from_state": "archived",
+                        "to_state": "deleted",
+                        "source": "system",
+                        "details": {},
+                        "created_at": END,
+                    }
+                ],
+                "observed_at": END,
+                "next_cursor": None,
+            }
+        ),
     )
     app.include_router(admin_sandboxes.router)
     app.dependency_overrides[admin_sandboxes.get_admin_sandbox_queries] = lambda: queries
@@ -230,6 +272,54 @@ async def test_valid_cursor_and_page_limit_are_forwarded(setup):
         )
     assert response.status_code == 200
     queries.list_running.assert_awaited_once_with(cursor=parsed, limit=200)
+
+
+async def test_trajectory_is_scoped_paginated_content_free_and_retains_tombstone(setup):
+    app, queries, _ = setup
+    parsed = SandboxTrajectoryCursor(
+        scope=sandbox_trajectory_cursor_scope("asbx_other"),
+        snapshot_id=12,
+        before_id=9,
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            f"{PREFIX}/asbx_other/trajectory",
+            headers=ADMIN,
+            params={"cursor": encode_cursor(parsed), "limit": 25},
+        )
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    body = response.json()
+    assert body["sandbox"]["id"] == "asbx_other"
+    assert body["sandbox"]["archived_at"] is not None
+    assert body["sandbox"]["deletion_state"] == "deleted"
+    assert body["sandbox"]["deleted_at"] is not None
+    assert body["members"][0]["resident_slot_id"] is None
+    assert body["member_history_count"] == 1
+    assert body["member_history_truncated"] is False
+    assert body["events"][0]["event_type"] == "deletion_state_changed"
+    assert "PRIVATE" not in response.text
+    queries.trajectory.assert_awaited_once_with("asbx_other", cursor=parsed, limit=25)
+
+    queries.trajectory.return_value = None
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        missing = await client.get(f"{PREFIX}/missing/trajectory", headers=ADMIN)
+    assert missing.status_code == 404
+
+
+async def test_trajectory_rejects_a_cursor_for_another_sandbox(setup):
+    app, queries, _ = setup
+    parsed = SandboxTrajectoryCursor(
+        scope=sandbox_trajectory_cursor_scope("different"), snapshot_id=2, before_id=1
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            f"{PREFIX}/asbx_other/trajectory",
+            headers=ADMIN,
+            params={"cursor": encode_cursor(parsed)},
+        )
+    assert response.status_code == 422
+    queries.trajectory.assert_not_awaited()
 
 
 async def test_all_lifecycle_filter_and_cursor_are_scoped(setup):
@@ -495,22 +585,23 @@ async def test_detail_keeps_activity_unavailable_if_container_changes_before_rec
 
 
 @pytest.mark.parametrize(
-    "path",
+    ("method", "path"),
     [
-        "/asbx_other",
-        "/asbx_other/stop",
-        "/asbx_other/archive",
-        "/asbx_other/restore",
-        "/asbx_other/delete",
+        ("GET", "/asbx_other"),
+        ("GET", "/asbx_other/trajectory"),
+        ("POST", "/asbx_other/stop"),
+        ("POST", "/asbx_other/archive"),
+        ("POST", "/asbx_other/restore"),
+        ("POST", "/asbx_other/delete"),
     ],
 )
-async def test_detail_and_control_require_current_admin_access(setup, path):
+async def test_detail_and_control_require_current_admin_access(setup, method, path):
     app, _, gateway = setup
     gateway.permissions = ["agent.use"]
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         client.cookies.set(identity.SESSION_COOKIE, identity.mint_session(user_id="admin"))
         response = await client.request(
-            "GET" if path == "/asbx_other" else "POST",
+            method,
             PREFIX + path,
             json={
                 "generation": 1,
@@ -1166,6 +1257,8 @@ def test_sandboxes_are_only_on_the_main_listener():
     assert PREFIX in create_app().openapi()["paths"]
     assert PREFIX not in create_mcp_app().openapi()["paths"]
     assert PREFIX + "/{sandbox_id}" not in create_mcp_app().openapi()["paths"]
+    assert PREFIX + "/{sandbox_id}/trajectory" in create_app().openapi()["paths"]
+    assert PREFIX + "/{sandbox_id}/trajectory" not in create_mcp_app().openapi()["paths"]
     assert PREFIX + "/{sandbox_id}/stop" not in create_mcp_app().openapi()["paths"]
     assert PREFIX + "/{sandbox_id}/archive" in create_app().openapi()["paths"]
     assert PREFIX + "/{sandbox_id}/restore" in create_app().openapi()["paths"]

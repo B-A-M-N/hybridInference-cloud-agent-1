@@ -1326,6 +1326,8 @@ async def worker_establish_shared_sandbox_residency(
         raise _lease_lost()
     row = await job_store.residency.establish_residency(
         thread_id=thread_id,
+        attempt_id=claims["attempt_id"],
+        lease_generation=claims["lease_generation"],
         host=str(host["host"]),
         runtime_id=body.runtime_id,
         runtime_version=body.runtime_version,
@@ -1397,6 +1399,7 @@ async def worker_record_thread_sandbox_process(
         lease_generation=claims["lease_generation"],
         sandbox_generation=body.sandbox_generation,
         activation_generation=body.activation_generation,
+        residency_generation=body.residency_generation,
         process_generation=body.process_generation,
     )
     if not recorded:
@@ -1426,6 +1429,7 @@ async def worker_admit_thread_sandbox_turn(
         lease_generation=claims["lease_generation"],
         sandbox_generation=body.sandbox_generation,
         activation_generation=body.activation_generation,
+        residency_generation=body.residency_generation,
     )
     if not recorded:
         raise _lease_lost()
@@ -1453,6 +1457,7 @@ async def worker_settle_thread_sandbox(
         lease_generation=claims["lease_generation"],
         sandbox_generation=body.sandbox_generation,
         activation_generation=body.activation_generation,
+        residency_generation=body.residency_generation,
         job_id=job_id,
         context_status=body.context_status,
         native_session_id=body.native_session_id,

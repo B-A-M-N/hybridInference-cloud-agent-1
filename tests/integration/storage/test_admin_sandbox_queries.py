@@ -16,7 +16,14 @@ from tests.unit.test_ledger_snapshots import END, START
 from tests.unit.test_sandbox_resource_protocol import sample
 
 from cloud_agent.admin_observability import decode_cursor
-from cloud_agent.admin_sandboxes import SANDBOX_CURSOR_SCOPE, SandboxCursor, sandbox_cursor_scope
+from cloud_agent.admin_sandboxes import (
+    SANDBOX_CURSOR_SCOPE,
+    SANDBOX_TRAJECTORY_MEMBER_LIMIT,
+    SandboxCursor,
+    SandboxTrajectoryCursor,
+    sandbox_cursor_scope,
+    sandbox_trajectory_cursor_scope,
+)
 from cloud_agent.storage.admin_sandbox_queries import AdminSandboxQueries
 
 pytestmark = [pytest.mark.dbtest, pytest.mark.asyncio]
@@ -282,6 +289,114 @@ async def test_all_states_and_detail_include_safe_current_members(db, store):
     assert await store.admin_sandboxes.detail("missing") is None
 
 
+async def test_trajectory_pages_stably_with_member_history_and_retained_tombstones(db, store):
+    origin = await seed(db, store, "asbx_trajectory")
+    historical = await _create_job(store, user_id=origin["user_id"], repo=origin["repo"])
+    await member(db, "asbx_trajectory", origin, 0)
+    await member(db, "asbx_trajectory", historical, None)
+    async with db.acquire() as conn:
+        await conn.execute("UPDATE agent_sandboxes SET state='stopping' WHERE id='asbx_trajectory'")
+        await conn.execute("UPDATE agent_sandboxes SET state='stopped' WHERE id='asbx_trajectory'")
+
+    first = await store.admin_sandboxes.trajectory("asbx_trajectory", cursor=None, limit=2)
+    assert first is not None and len(first.events) == 2
+    assert [event.id for event in first.events] == sorted(
+        [event.id for event in first.events], reverse=True
+    )
+    assert first.next_cursor is not None
+    assert first.member_history_count == 2
+    assert first.member_history_truncated is False
+    assert first.members[0].thread_id == origin["thread_id"]
+    assert {item.thread_id for item in first.members} == {
+        origin["thread_id"],
+        historical["thread_id"],
+    }
+    assert any(item.resident_slot_id is None for item in first.members)
+    cursor = decode_cursor(
+        first.next_cursor,
+        SandboxTrajectoryCursor,
+        sandbox_trajectory_cursor_scope("asbx_trajectory"),
+    )
+    assert cursor is not None
+
+    # Archive creates newer events, but continuation remains fixed to the
+    # snapshot selected by the first page.
+    assert await archive_request(store, "asbx_trajectory") == "accepted"
+    second = await store.admin_sandboxes.trajectory("asbx_trajectory", cursor=cursor, limit=100)
+    assert second is not None
+    assert all(event.id <= cursor.snapshot_id for event in second.events)
+    assert not ({event.id for event in first.events} & {event.id for event in second.events})
+
+    archived = await store.admin_sandboxes.trajectory("asbx_trajectory", cursor=None, limit=100)
+    assert archived is not None and archived.sandbox.archived_at is not None
+    assert any(event.event_type == "admin_inventory_archived" for event in archived.events)
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE agent_sandboxes
+            SET state='lost', deletion_state='deleted', deleted_at=NOW(),
+                deletion_archive_key='s3://sandbox-archive-bucket/trajectory.tar',
+                deletion_sha256=$1, deletion_size_bytes=4096
+            WHERE id='asbx_trajectory'
+            """,
+            "a" * 64,
+        )
+    inventory = await store.admin_sandboxes.list_sandboxes(cursor=None, limit=100, state="all")
+    assert "asbx_trajectory" not in {sandbox.id for sandbox in inventory.sandboxes}
+    tombstone = await store.admin_sandboxes.trajectory("asbx_trajectory", cursor=None, limit=100)
+    assert tombstone is not None
+    assert tombstone.sandbox.archived_at is not None
+    assert tombstone.sandbox.deleted_at is not None
+    assert tombstone.sandbox.deletion_state == "deleted"
+    assert {item.thread_id for item in tombstone.members} == {
+        origin["thread_id"],
+        historical["thread_id"],
+    }
+    assert "deletion_state_changed" in {event.event_type for event in tombstone.events}
+    assert "PRIVATE" not in tombstone.model_dump_json()
+
+
+async def test_trajectory_bounds_member_history_and_keeps_origin_first(db, store):
+    origin = await seed(db, store, "asbx_many_members")
+    await member(db, "asbx_many_members", origin, 0)
+    historical_thread_ids = [
+        f"athr_historical_{index:03d}" for index in range(SANDBOX_TRAJECTORY_MEMBER_LIMIT)
+    ]
+    async with db.acquire() as conn:
+        await conn.executemany(
+            """
+            INSERT INTO agent_threads (id, user_id, repo, title, execution_profile)
+            VALUES ($1, $2, $3, $4, $5)
+            """,
+            [
+                (
+                    thread_id,
+                    origin["user_id"],
+                    origin["repo"],
+                    f"Historical {index}",
+                    origin["execution_profile"],
+                )
+                for index, thread_id in enumerate(historical_thread_ids)
+            ],
+        )
+        await conn.executemany(
+            """
+            INSERT INTO agent_thread_sandbox_memberships
+                (thread_id, user_id, sandbox_id, created_at, updated_at)
+            VALUES ($1, $2, 'asbx_many_members', $3, $3)
+            """,
+            [(thread_id, origin["user_id"], START) for thread_id in historical_thread_ids],
+        )
+
+    trajectory = await store.admin_sandboxes.trajectory("asbx_many_members", cursor=None, limit=100)
+
+    assert trajectory is not None
+    assert trajectory.member_history_count == SANDBOX_TRAJECTORY_MEMBER_LIMIT + 1
+    assert trajectory.member_history_truncated is True
+    assert len(trajectory.members) == SANDBOX_TRAJECTORY_MEMBER_LIMIT
+    assert trajectory.members[0].thread_id == origin["thread_id"]
+
+
 async def test_admin_stop_survives_running_heartbeats_and_clears_on_confirmation(db, store):
     origin = await seed(db, store, "asbx_stop")
     await member(db, "asbx_stop", origin, 0)
@@ -395,9 +510,12 @@ async def test_stop_fences_claims_until_confirmation_then_allows_native_resume(d
         **fence, container_id="container-controlled", context_status="new"
     )
     assert await stop_request(db, store, sandbox["sandbox_id"]) == "busy"
-    assert await store.sandbox.admit_thread_sandbox_turn(**fence, job_id=job["id"])
+    assert await store.sandbox.admit_thread_sandbox_turn(
+        **fence, residency_generation=sandbox["residency_generation"], job_id=job["id"]
+    )
     assert await store.sandbox.settle_thread_sandbox(
         **fence,
+        residency_generation=sandbox["residency_generation"],
         job_id=job["id"],
         context_status="live",
         native_session_id="native-control",
@@ -551,9 +669,12 @@ async def test_follow_up_reservation_keeps_running_container_visible(db, store, 
     assert await store.sandbox.mark_thread_sandbox_running(
         **fence, container_id="container-retained-inventory", context_status="new"
     )
-    assert await store.sandbox.admit_thread_sandbox_turn(**fence, job_id=job["id"])
+    assert await store.sandbox.admit_thread_sandbox_turn(
+        **fence, residency_generation=sandbox["residency_generation"], job_id=job["id"]
+    )
     settled = await store.sandbox.settle_thread_sandbox(
         **fence,
+        residency_generation=sandbox["residency_generation"],
         job_id=job["id"],
         context_status="live",
         native_session_id="retained-inventory-session",

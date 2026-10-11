@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
 
+import cloud_agent.source_control as source_control
 from cloud_agent.source_control import (
     GitLabOAuthClient,
     GitLabOAuthConfig,
@@ -26,12 +29,22 @@ class MemoryStore:
     def __init__(self) -> None:
         self.states: dict[str, dict] = {}
         self.token_update: dict | None = None
+        self.gitlab_refresh_claim: dict | None = None
         self.row: dict | None = None
         self.generation = 0
         self.lease_held = False
         self.reject_write = False
         self.writes: list[dict] = []
         self.after_rejected_write = None
+        self.after_failed_claim = None
+        self.after_claim = None
+        self._explicit_claim = False
+        self.claimed_lease_seconds: int | None = None
+
+    @asynccontextmanager
+    async def serialize_gitlab_account(self, *, user_id: str):
+        assert user_id == "user-a"
+        yield self
 
     async def create_oauth_state(self, **row) -> None:
         self.states[row["state_hash"]] = {**row, "consumed": False}
@@ -52,16 +65,25 @@ class MemoryStore:
     async def claim_gitlab_token_refresh(
         self, *, connection_id: int, user_id: str, lease_seconds: int, margin_seconds: int
     ) -> dict | None:
-        assert (lease_seconds, margin_seconds) == (30, 300)
+        assert margin_seconds == 300
+        self.claimed_lease_seconds = lease_seconds
+        if self.gitlab_refresh_claim is not None:
+            claim, self.gitlab_refresh_claim = self.gitlab_refresh_claim, None
+            self._explicit_claim = True
+            return claim
         if (
             self.row is None
             or self.lease_held
             or self.row.get("id") != connection_id
             or self.row.get("user_id") != user_id
         ):
+            if self.lease_held and self.after_failed_claim is not None:
+                self.after_failed_claim()
             return None
         self.lease_held = True
         self.generation += 1
+        if self.after_claim is not None:
+            self.after_claim()
         return {
             "refresh_generation": self.generation,
             "refresh_token_ciphertext": self.row["refresh_token_ciphertext"],
@@ -69,6 +91,10 @@ class MemoryStore:
 
     async def update_gitlab_tokens(self, **values) -> bool:
         self.writes.append(dict(values))
+        if self._explicit_claim:
+            self._explicit_claim = False
+            self.token_update = values
+            return True
         accepted = (
             not self.reject_write
             and self.row is not None
@@ -79,6 +105,7 @@ class MemoryStore:
         if not accepted:
             if self.after_rejected_write is not None:
                 self.after_rejected_write()
+                self.lease_held = False
             return False
         self.token_update = values
         self.lease_held = False
@@ -87,13 +114,19 @@ class MemoryStore:
             "access_token_ciphertext": values["access_token_ciphertext"],
             "refresh_token_ciphertext": values["refresh_token_ciphertext"],
             "expires_at": values["expires_at"],
+            "refresh_lease_expires_at": None,
         }
         return True
 
     async def get_gitlab_connection(self, *, user_id: str) -> dict | None:
         if self.row is None or self.row.get("user_id") != user_id:
             return None
-        return dict(self.row)
+        row = dict(self.row)
+        if self.lease_held:
+            row["refresh_lease_expires_at"] = datetime.now(timezone.utc) + timedelta(seconds=30)
+        else:
+            row.setdefault("refresh_lease_expires_at", None)
+        return row
 
 
 @pytest.mark.asyncio
@@ -317,16 +350,22 @@ async def test_gitlab_pkce_exchange_identity_projects_refresh_and_revoke() -> No
     connection = {
         "id": 7,
         "user_id": "user-a",
+        "refresh_generation": 0,
+        "refresh_lease_expires_at": None,
         "access_token_ciphertext": cipher.encrypt("access-one"),
         "refresh_token_ciphertext": cipher.encrypt("refresh-one"),
         "expires_at": datetime.now(timezone.utc) - timedelta(seconds=1),
     }
-    store.row = connection
+    store.gitlab_refresh_claim = {
+        "refresh_generation": 1,
+        "refresh_token_ciphertext": connection["refresh_token_ciphertext"],
+    }
     refreshed = await client.access_token_for_connection(store, connection)
     assert refreshed == "access-two"
     assert store.token_update is not None
     assert store.token_update["refresh_generation"] == 1
     assert "access-two" not in store.token_update["access_token_ciphertext"]
+    assert store.token_update["refresh_generation"] == 1
     assert "refresh-two" not in store.token_update["refresh_token_ciphertext"]
     await client.revoke(refreshed)
     assert any(path == "/oauth/revoke" for _, path, _ in calls)
@@ -349,10 +388,11 @@ async def test_gitlab_network_failures_are_safe_integration_errors() -> None:
         await client.verify_user("secret-access-token")
 
 
-def _gitlab_client(handler) -> GitLabOAuthClient:
+def _gitlab_client(handler, *, timeout_s: float | None = None) -> GitLabOAuthClient:
     return GitLabOAuthClient(
         GitLabOAuthConfig("client-id", "client-secret", "https://example.com/callback"),
         cipher=SourceControlCipher("server-secret"),
+        timeout_s=timeout_s,
         transport=httpx.MockTransport(handler),
     )
 
@@ -387,6 +427,88 @@ async def test_a_gitlab_token_outside_the_refresh_window_is_not_refreshed() -> N
 
 
 @pytest.mark.asyncio
+async def test_gitlab_refresh_lease_outlasts_a_delayed_provider_timeout_override(
+    monkeypatch,
+) -> None:
+    cipher = SourceControlCipher("server-secret")
+    store = MemoryStore()
+    connection = _connection(
+        cipher=cipher,
+        access="access-old",
+        refresh="refresh-old",
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+    store.row = connection
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request: {request.url.path}")
+
+    client = _gitlab_client(handler, timeout_s=300)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_refresh(_refresh_token: str, *, timeout_s: float) -> dict:
+        assert timeout_s == 300
+        started.set()
+        await release.wait()
+        return {
+            "access_token": "access-new",
+            "refresh_token": "refresh-new",
+            "created_at": datetime.now(timezone.utc).timestamp(),
+            "expires_in": 7200,
+        }
+
+    monkeypatch.setattr(client, "_refresh", delayed_refresh)
+    pending = asyncio.create_task(client.access_token_for_connection(store, connection))
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    assert store.claimed_lease_seconds == 330
+    assert not pending.done(), "the provider call should still hold the serialized account lock"
+
+    release.set()
+    assert await pending == "access-new"
+
+
+@pytest.mark.asyncio
+async def test_gitlab_refresh_pins_one_dynamic_timeout_for_lease_and_http(
+    monkeypatch,
+) -> None:
+    """A setting increase during claim cannot lengthen this refresh request."""
+    values = {"gitlab_request_timeout_s": 20.0}
+    monkeypatch.setattr(
+        source_control, "number_setting", lambda name, default=None: values.get(name, default)
+    )
+    cipher = SourceControlCipher("server-secret")
+    store = MemoryStore()
+    connection = _connection(
+        cipher=cipher,
+        access="access-old",
+        refresh="refresh-old",
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+    store.row = connection
+    store.after_claim = lambda: values.update(gitlab_request_timeout_s=300.0)
+    request_timeouts: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_timeouts.append(request.extensions["timeout"]["read"])
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "access-new",
+                "refresh_token": "refresh-new",
+                "created_at": datetime.now(timezone.utc).timestamp(),
+                "expires_in": 7200,
+            },
+        )
+
+    client = _gitlab_client(handler)
+    assert await client.access_token_for_connection(store, connection) == "access-new"
+    assert store.claimed_lease_seconds == 50
+    assert request_timeouts == [20.0]
+
+
+@pytest.mark.asyncio
 async def test_a_gitlab_refresh_without_the_lease_uses_the_stored_token() -> None:
     """The loser does not spend the refresh token or return the one it read."""
     cipher = SourceControlCipher("server-secret")
@@ -398,6 +520,11 @@ async def test_a_gitlab_refresh_without_the_lease_uses_the_stored_token() -> Non
         refresh="refresh-current",
         expires_at=datetime.now(timezone.utc) + timedelta(minutes=2),
     )
+
+    def winner_lands() -> None:
+        store.lease_held = False
+
+    store.after_failed_claim = winner_lands
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError(f"refresh must not run: {request.url.path}")
@@ -466,7 +593,10 @@ async def test_a_lost_gitlab_refresh_returns_the_replacement_not_its_own_token()
 
 
 @pytest.mark.asyncio
-async def test_a_lost_gitlab_refresh_is_unavailable_when_nothing_valid_is_stored() -> None:
+async def test_a_lost_gitlab_refresh_is_unavailable_when_nothing_valid_is_stored(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("cloud_agent.source_control._GITLAB_REFRESH_WAIT_INTERVAL_S", 0)
     cipher = SourceControlCipher("server-secret")
     store = MemoryStore()
     store.reject_write = True
@@ -489,14 +619,17 @@ async def test_a_lost_gitlab_refresh_is_unavailable_when_nothing_valid_is_stored
             },
         )
 
-    with pytest.raises(SourceControlError, match="GitLab token refresh is unavailable"):
+    with pytest.raises(SourceControlError, match="token is being refreshed"):
         await _gitlab_client(handler).access_token_for_connection(store, connection)
     assert store.token_update is None
     assert cipher.decrypt(store.row["access_token_ciphertext"]) == "access-old"
 
 
 @pytest.mark.asyncio
-async def test_a_gitlab_refresh_without_the_lease_is_unavailable_once_the_token_lapses() -> None:
+async def test_a_gitlab_refresh_without_the_lease_is_unavailable_once_the_token_lapses(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("cloud_agent.source_control._GITLAB_REFRESH_WAIT_INTERVAL_S", 0)
     cipher = SourceControlCipher("server-secret")
     store = MemoryStore()
     store.lease_held = True
@@ -511,6 +644,6 @@ async def test_a_gitlab_refresh_without_the_lease_is_unavailable_once_the_token_
     def handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError(f"refresh must not run: {request.url.path}")
 
-    with pytest.raises(SourceControlError, match="GitLab token refresh is unavailable"):
+    with pytest.raises(SourceControlError, match="token is being refreshed"):
         await _gitlab_client(handler).access_token_for_connection(store, connection)
     assert store.writes == []

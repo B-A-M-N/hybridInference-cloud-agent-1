@@ -602,3 +602,194 @@ async def test_a_failed_background_task_cannot_skip_later_cleanup(
     assert prepared.clients[0].closed == 1
     assert prepared.events.index("http") < prepared.events.index("pool")
     assert not lifespan_module._BACKGROUND_TASKS
+
+
+async def test_shutdown_cancellation_joins_send_now_before_closing_resources() -> None:
+    """Cancellation is restored only after eager handoffs and later cleanup finish."""
+    from cloud_agent.api import turns
+
+    events: list[str] = []
+    unwinding = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handoff() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            unwinding.set()
+            await release.wait()
+            events.append("handoff")
+
+    handoff_task = asyncio.create_task(handoff())
+    turns._hand_overs.add(handoff_task)
+    handoff_task.add_done_callback(turns._hand_overs.discard)
+    await asyncio.sleep(0)
+
+    async def close_host() -> None:
+        events.append("host")
+
+    async def close_brokers() -> None:
+        events.append("brokers")
+
+    app = FastAPI()
+    shutdown = asyncio.create_task(
+        lifespan_module._shutdown_lifespan(
+            app,
+            pool=_Pool(events, None),
+            http=None,
+            writer=None,
+            writer_installed=False,
+            log_stopped=False,
+            close_host=close_host,
+            close_broker_clients=close_brokers,
+            reset_writer=lambda _writer: None,
+            reset_settings=lambda: events.append("reset_settings"),
+        )
+    )
+    await asyncio.wait_for(unwinding.wait(), 1)
+    shutdown.cancel()
+    await asyncio.sleep(0)
+    assert not shutdown.done()
+
+    release.set()
+    errors = await asyncio.wait_for(shutdown, 1)
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], asyncio.CancelledError)
+    assert events.index("handoff") < events.index("pool")
+    assert events[-1] == "reset_settings"
+    with pytest.raises(asyncio.CancelledError):
+        lifespan_module._surface_cleanup_errors(None, errors)
+
+
+async def test_measurement_writer_cancellation_propagates_after_later_cleanup() -> None:
+    """A cancelled writer cannot skip tasks, clients, the pool, or registries."""
+    events: list[str] = []
+    app = FastAPI()
+    writer = type(
+        "_Writer",
+        (),
+        {"shutdown": AsyncMock(side_effect=asyncio.CancelledError())},
+    )()
+
+    async def close_host() -> None:
+        events.append("host")
+
+    async def close_brokers() -> None:
+        events.append("brokers")
+
+    errors = await lifespan_module._shutdown_lifespan(
+        app,
+        pool=_Pool(events, None),
+        http=_Client(events),
+        writer=writer,
+        writer_installed=True,
+        log_stopped=False,
+        close_host=close_host,
+        close_broker_clients=close_brokers,
+        reset_writer=lambda _writer: events.append("reset_writer"),
+        reset_settings=lambda: events.append("reset_settings"),
+    )
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], asyncio.CancelledError)
+    assert events == ["reset_writer", "host", "brokers", "http", "pool", "reset_settings"]
+    with pytest.raises(asyncio.CancelledError):
+        lifespan_module._surface_cleanup_errors(None, errors)
+
+
+async def test_owner_cancellation_while_joining_a_resistant_child_finishes_cleanup() -> None:
+    """Owner cancellation is not mistaken for the child's expected cancellation."""
+    events: list[str] = []
+    first_cancel_seen = asyncio.Event()
+    never = asyncio.Event()
+
+    async def resist_first_cancel() -> None:
+        try:
+            await never.wait()
+        except asyncio.CancelledError:
+            first_cancel_seen.set()
+            await never.wait()
+
+    child = asyncio.create_task(resist_first_cancel())
+    app = FastAPI()
+    app.state.settings_task = child
+
+    async def close_host() -> None:
+        events.append("host")
+
+    async def close_brokers() -> None:
+        events.append("brokers")
+
+    shutdown = asyncio.create_task(
+        lifespan_module._shutdown_lifespan(
+            app,
+            pool=_Pool(events, None),
+            http=_Client(events),
+            writer=None,
+            writer_installed=False,
+            log_stopped=False,
+            close_host=close_host,
+            close_broker_clients=close_brokers,
+            reset_writer=lambda _writer: None,
+            reset_settings=lambda: events.append("reset_settings"),
+        )
+    )
+    await asyncio.wait_for(first_cancel_seen.wait(), 1)
+    shutdown.cancel()
+    errors = await asyncio.wait_for(shutdown, 1)
+
+    assert child.cancelled()
+    assert len([error for error in errors if isinstance(error, asyncio.CancelledError)]) == 1
+    assert events == ["host", "brokers", "http", "pool", "reset_settings"]
+    with pytest.raises(asyncio.CancelledError):
+        lifespan_module._surface_cleanup_errors(None, errors)
+
+
+async def test_primary_error_survives_owner_cancellation_during_cleanup() -> None:
+    """A cancellation in teardown is recorded once without replacing the primary."""
+    events: list[str] = []
+    primary = Boom("primary")
+    first_cancel_seen = asyncio.Event()
+    never = asyncio.Event()
+
+    async def resist_first_cancel() -> None:
+        try:
+            await never.wait()
+        except asyncio.CancelledError:
+            first_cancel_seen.set()
+            await never.wait()
+
+    child = asyncio.create_task(resist_first_cancel())
+    app = FastAPI()
+    app.state.settings_task = child
+
+    async def unwind_primary() -> None:
+        try:
+            raise primary
+        finally:
+            errors = await lifespan_module._shutdown_lifespan(
+                app,
+                pool=_Pool(events, None),
+                http=_Client(events),
+                writer=None,
+                writer_installed=False,
+                log_stopped=False,
+                close_host=lambda: None,
+                close_broker_clients=lambda: None,
+                reset_writer=lambda _writer: None,
+                reset_settings=lambda: events.append("reset_settings"),
+            )
+            lifespan_module._surface_cleanup_errors(primary, errors)
+
+    cleanup = asyncio.create_task(unwind_primary())
+    await asyncio.wait_for(first_cancel_seen.wait(), 1)
+    cleanup.cancel()
+    with pytest.raises(Boom) as caught:
+        await asyncio.wait_for(cleanup, 1)
+
+    assert caught.value is primary
+    cancellation_notes = [note for note in primary.__notes__ if "CancelledError" in note]
+    assert len(cancellation_notes) == 1
+    assert child.cancelled()
+    assert events[-2:] == ["pool", "reset_settings"]

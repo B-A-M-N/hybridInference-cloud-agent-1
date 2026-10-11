@@ -1891,6 +1891,7 @@ class WorkerSandboxProcessRequest(BaseModel):
 
     sandbox_generation: int = Field(..., ge=1)
     activation_generation: int = Field(..., ge=1)
+    residency_generation: int = Field(..., ge=1)
     process_generation: int = Field(..., ge=1)
 
 
@@ -1899,6 +1900,7 @@ class WorkerSandboxAdmissionRequest(BaseModel):
 
     sandbox_generation: int = Field(..., ge=1)
     activation_generation: int = Field(..., ge=1)
+    residency_generation: int = Field(..., ge=1)
 
 
 class WorkerSandboxSettleRequest(BaseModel):
@@ -1906,6 +1908,7 @@ class WorkerSandboxSettleRequest(BaseModel):
 
     sandbox_generation: int = Field(..., ge=1)
     activation_generation: int = Field(..., ge=1)
+    residency_generation: int = Field(..., ge=1)
     context_status: Literal["new", "live", "restored"]
     native_session_id: str | None = Field(None, max_length=512)
     base_sha: str | None = Field(None, min_length=7, max_length=64)

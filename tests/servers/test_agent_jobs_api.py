@@ -29,6 +29,7 @@ import asyncio
 import base64
 import hashlib
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock
@@ -384,7 +385,9 @@ class FakeStorage(EmptySkillLibrary, EmptyAttachments, AllCapabilities):
         self.attempt_grants: dict[int, str] = {}
         self.terminal_readiness: dict[int, bool] = {}
         self.thread_workspace_readiness: dict[str, bool] = {}
+        self.sandbox_processes: list[dict[str, Any]] = []
         self.sandbox_admissions: list[dict[str, Any]] = []
+        self.sandbox_settlements: list[dict[str, Any]] = []
         self.released: list[tuple[str, int]] = []
         self.runner_hosts: dict[str, dict[str, Any]] = {}
         self.active_host: str | None = None
@@ -1499,12 +1502,43 @@ class FakeStorage(EmptySkillLibrary, EmptyAttachments, AllCapabilities):
         }
         return "stored"
 
+    async def record_thread_sandbox_process(self, **kwargs: Any) -> bool:
+        """Record the process RPC under the worker and residency fences."""
+        if not self._fenced(kwargs["attempt_id"], kwargs["lease_generation"]):
+            return False
+        self.sandbox_processes.append(dict(kwargs))
+        return True
+
     async def admit_thread_sandbox_turn(self, **kwargs: Any) -> bool:
         """Record the at-most-once admission RPC under the worker fence."""
         if not self._fenced(kwargs["attempt_id"], kwargs["lease_generation"]):
             return False
         self.sandbox_admissions.append(dict(kwargs))
         return True
+
+    async def settle_thread_sandbox(self, **kwargs: Any) -> dict[str, Any] | None:
+        """Record settlement and return the minimal retained mapping response."""
+        if not self._fenced(kwargs["attempt_id"], kwargs["lease_generation"]):
+            return None
+        self.sandbox_settlements.append(dict(kwargs))
+        job = self.jobs[kwargs["job_id"]]
+        return {
+            "thread_id": kwargs["thread_id"],
+            "sandbox_id": "asbx_test",
+            "generation": kwargs["sandbox_generation"],
+            "host": "runner-a",
+            "container_name": "freeinference-test",
+            "runtime_id": "claude-code",
+            "execution_profile": job["execution_profile"],
+            "state": "running",
+            "context_status": kwargs["context_status"],
+            "activation_generation": kwargs["activation_generation"],
+            "process_generation": 4,
+            "residency_generation": kwargs["residency_generation"],
+            "admitted_job_id": kwargs["job_id"],
+            "last_settled_job_id": kwargs["job_id"],
+            "native_session_id": kwargs["native_session_id"],
+        }
 
     async def list_jobs(
         self,
@@ -4628,20 +4662,115 @@ async def test_worker_flow_claim_event_finish(client: AsyncClient, store: FakeSt
     assert store.jobs[job_id]["state"] == "succeeded"
 
 
-async def test_retained_prompt_admission_is_worker_and_generation_fenced(
+async def test_worker_residency_establish_uses_the_token_attempt_fence(
+    client: AsyncClient, store: FakeStorage, monkeypatch
+):
+    """The API must not substitute a same-host current attempt for its caller."""
+    job_id = await _create_job(client)
+    claim = await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})
+    auth = {"Authorization": f"Bearer {claim.json()['worker_token']}"}
+    calls: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
+
+    async def establish_residency(**kwargs: Any) -> dict[str, Any]:
+        calls.append(dict(kwargs))
+        return {
+            "thread_id": store.jobs[job_id]["thread_id"],
+            "sandbox_id": "asbx_test",
+            "generation": 7,
+            "previous_grant_id": None,
+            "establishing_attempt_id": kwargs["attempt_id"],
+            "user_id": _OWNER,
+            "model": store.jobs[job_id]["model"],
+        }
+
+    async def record_shared_thread_residency(**kwargs: Any) -> bool:
+        records.append(dict(kwargs))
+        return True
+
+    monkeypatch.setattr(store, "establish_residency", establish_residency, raising=False)
+    monkeypatch.setattr(
+        store, "record_shared_thread_residency", record_shared_thread_residency, raising=False
+    )
+    response = await client.post(
+        f"/v1/agent/worker/jobs/{job_id}/sandbox/residency",
+        json={
+            "sandbox_id": "asbx_test",
+            "runtime_id": "claude-code",
+            "runtime_version": "2.1.220",
+        },
+        headers=auth,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["generation"] == 7
+    assert calls[0]["attempt_id"] == 100
+    assert calls[0]["lease_generation"] == 1
+    assert calls[0]["thread_id"] == store.jobs[job_id]["thread_id"]
+    assert calls[0]["host"] == "runner-test"
+    assert records == [
+        {
+            "thread_id": store.jobs[job_id]["thread_id"],
+            "attempt_id": 100,
+            "lease_generation": 1,
+            "sandbox_id": "asbx_test",
+            "residency_generation": 7,
+        }
+    ]
+
+
+async def test_retained_lifecycle_writes_echo_every_generation_fence(
     client: AsyncClient, store: FakeStorage
 ):
     job_id = await _create_job(client)
     claim = await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})
     auth = {"Authorization": f"Bearer {claim.json()['worker_token']}"}
 
+    process = await client.post(
+        f"/v1/agent/worker/jobs/{job_id}/sandbox/process",
+        json={
+            "sandbox_generation": 3,
+            "activation_generation": 7,
+            "residency_generation": 11,
+            "process_generation": 4,
+        },
+        headers=auth,
+    )
     admitted = await client.post(
         f"/v1/agent/worker/jobs/{job_id}/sandbox/admit",
-        json={"sandbox_generation": 3, "activation_generation": 7},
+        json={
+            "sandbox_generation": 3,
+            "activation_generation": 7,
+            "residency_generation": 11,
+        },
+        headers=auth,
+    )
+    settled = await client.post(
+        f"/v1/agent/worker/jobs/{job_id}/sandbox/settle",
+        json={
+            "sandbox_generation": 3,
+            "activation_generation": 7,
+            "residency_generation": 11,
+            "context_status": "live",
+            "native_session_id": "native-one",
+        },
         headers=auth,
     )
 
+    assert process.status_code == 200, process.text
     assert admitted.status_code == 200, admitted.text
+    assert settled.status_code == 200, settled.text
+    assert store.sandbox_processes == [
+        {
+            "thread_id": store.jobs[job_id]["thread_id"],
+            "attempt_id": 100,
+            "lease_generation": 1,
+            "sandbox_generation": 3,
+            "activation_generation": 7,
+            "residency_generation": 11,
+            "process_generation": 4,
+        }
+    ]
     assert store.sandbox_admissions == [
         {
             "thread_id": store.jobs[job_id]["thread_id"],
@@ -4650,6 +4779,22 @@ async def test_retained_prompt_admission_is_worker_and_generation_fenced(
             "lease_generation": 1,
             "sandbox_generation": 3,
             "activation_generation": 7,
+            "residency_generation": 11,
+        }
+    ]
+    assert store.sandbox_settlements == [
+        {
+            "thread_id": store.jobs[job_id]["thread_id"],
+            "attempt_id": 100,
+            "lease_generation": 1,
+            "sandbox_generation": 3,
+            "activation_generation": 7,
+            "residency_generation": 11,
+            "job_id": job_id,
+            "context_status": "live",
+            "native_session_id": "native-one",
+            "base_sha": None,
+            "idle_timeout_seconds": 1800.0,
         }
     ]
 
@@ -5572,6 +5717,20 @@ def _store_with_grants(store: FakeStorage) -> FakeStorage:
         store.issued_oauth_states.append(kwargs)
 
     store.github_accounts = {}
+    store.github_account_locks = {}
+    store.github_account_lock_attempts = []
+
+    @asynccontextmanager
+    async def serialize_github_account(*, user_id):
+        lock = store.github_account_locks.setdefault(user_id, asyncio.Lock())
+        task = asyncio.current_task()
+        store.github_account_lock_attempts.append(
+            task.get_name() if task is not None else "unknown"
+        )
+        async with lock:
+            yield store
+
+    store.serialize_github_account = serialize_github_account
 
     async def connect_github_account(
         *,
@@ -5584,6 +5743,8 @@ def _store_with_grants(store: FakeStorage) -> FakeStorage:
         refresh_token_ciphertext=None,
         refresh_expires_at=None,
     ):
+        previous = store.github_accounts.get(user_id)
+        refresh_generation = 0 if previous is None else previous["refresh_generation"] + 1
         store.github_accounts[user_id] = {
             "github_user_id": github_user_id,
             "login": login,
@@ -5591,6 +5752,7 @@ def _store_with_grants(store: FakeStorage) -> FakeStorage:
             "access_expires_at": access_expires_at,
             "refresh_token_ciphertext": refresh_token_ciphertext,
             "refresh_expires_at": refresh_expires_at,
+            "refresh_generation": refresh_generation,
         }
         store.grants[user_id] = {
             item["installation_id"]: item.get("account_login") for item in installations
@@ -5614,8 +5776,11 @@ def _store_with_grants(store: FakeStorage) -> FakeStorage:
         return True
 
     async def disconnect_github_account(*, user_id):
-        store.github_accounts.pop(user_id, None)
+        account = store.github_accounts.pop(user_id, None)
+        if account is None:
+            return None
         store.grants.pop(user_id, None)
+        return dict(account)
 
     store.record_repo_grant = record_repo_grant
     store.list_repo_grants = list_repo_grants
@@ -5974,6 +6139,143 @@ async def test_disconnecting_github_forgets_the_token_and_withdraws_the_authoriz
     assert grants_store.github_accounts == {}
     assert config.json()["github_connected"] is False
     assert after.status_code == 403
+
+
+async def test_github_connect_first_is_revoked_by_later_disconnect(store: FakeStorage, monkeypatch):
+    """The whole-grant lock makes a later disconnect win after OAuth completes."""
+    monkeypatch.delenv("AGENT_REPO_ALLOWLIST", raising=False)
+    monkeypatch.setenv("AGENT_GITHUB_APP_INSTALL_URL", _INSTALL_URL)
+    app_creds = _FakeGitHubApp(
+        installations=[{"installation_id": 77, "account_login": "acme", "account_id": 1001}],
+        repos_by_installation={77: ["acme/service"]},
+    )
+    grants_store = _store_with_grants(store)
+    original_exchange = app_creds.exchange_user_code
+    exchange_started = asyncio.Event()
+    release_exchange = asyncio.Event()
+
+    async def blocked_exchange(code: str):
+        exchange_started.set()
+        await release_exchange.wait()
+        return await original_exchange(code)
+
+    app_creds.exchange_user_code = blocked_exchange
+    app = _connectable_app(grants_store, app_creds)
+    connect: asyncio.Task | None = None
+    disconnect: asyncio.Task | None = None
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        try:
+            connect = asyncio.create_task(
+                client.post(
+                    "/v1/agent/integrations/github/connect",
+                    json={"code": "connect-first", "state": "connect-first-state-value"},
+                ),
+                name="github-connect-first",
+            )
+            await asyncio.wait_for(exchange_started.wait(), timeout=1)
+            disconnect = asyncio.create_task(
+                client.delete("/v1/agent/integrations/github"),
+                name="github-disconnect-second",
+            )
+            for _ in range(100):
+                if "github-disconnect-second" in grants_store.github_account_lock_attempts:
+                    break
+                await asyncio.sleep(0.01)
+            assert "github-disconnect-second" in grants_store.github_account_lock_attempts
+            assert not disconnect.done(), "disconnect bypassed the in-flight OAuth exchange"
+
+            release_exchange.set()
+            connected, removed = await asyncio.gather(connect, disconnect)
+        finally:
+            release_exchange.set()
+            pending = [
+                task for task in (connect, disconnect) if task is not None and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    assert connected.status_code == 200
+    assert removed.status_code == 200
+    assert app_creds.revoked == ["user-token-for-connect-first"]
+    assert grants_store.github_accounts == {}
+    assert grants_store.grants.get(_OWNER, {}) == {}
+
+
+async def test_github_disconnect_first_blocks_exchange_then_reconnect_wins(
+    store: FakeStorage, monkeypatch
+):
+    """A reconnect mints its grant only after an earlier full revoke completes."""
+    monkeypatch.delenv("AGENT_REPO_ALLOWLIST", raising=False)
+    monkeypatch.setenv("AGENT_GITHUB_APP_INSTALL_URL", _INSTALL_URL)
+    app_creds = _FakeGitHubApp(
+        installations=[{"installation_id": 77, "account_login": "acme", "account_id": 1001}],
+        repos_by_installation={77: ["acme/service"]},
+    )
+    grants_store = _store_with_grants(store)
+    app = _connectable_app(grants_store, app_creds)
+    revoke_started = asyncio.Event()
+    release_revoke = asyncio.Event()
+    exchange_started = asyncio.Event()
+    original_revoke = app_creds.revoke_user_authorization
+    original_exchange = app_creds.exchange_user_code
+
+    async def blocked_revoke(access_token: str) -> None:
+        revoke_started.set()
+        await release_revoke.wait()
+        await original_revoke(access_token)
+
+    async def observed_exchange(code: str):
+        exchange_started.set()
+        return await original_exchange(code)
+
+    disconnect: asyncio.Task | None = None
+    reconnect: asyncio.Task | None = None
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        old = await client.post(
+            "/v1/agent/integrations/github/connect",
+            json={"code": "old", "state": "old-state-value-123456"},
+        )
+        assert old.status_code == 200
+        app_creds.revoke_user_authorization = blocked_revoke
+        app_creds.exchange_user_code = observed_exchange
+        try:
+            disconnect = asyncio.create_task(
+                client.delete("/v1/agent/integrations/github"),
+                name="github-disconnect-first",
+            )
+            await asyncio.wait_for(revoke_started.wait(), timeout=1)
+            reconnect = asyncio.create_task(
+                client.post(
+                    "/v1/agent/integrations/github/connect",
+                    json={"code": "new", "state": "new-state-value-123456"},
+                ),
+                name="github-connect-second",
+            )
+            for _ in range(100):
+                if "github-connect-second" in grants_store.github_account_lock_attempts:
+                    break
+                await asyncio.sleep(0.01)
+            assert "github-connect-second" in grants_store.github_account_lock_attempts
+            assert not exchange_started.is_set(), "reconnect exchanged before revoke completed"
+
+            release_revoke.set()
+            removed, connected = await asyncio.gather(disconnect, reconnect)
+        finally:
+            release_revoke.set()
+            pending = [
+                task for task in (disconnect, reconnect) if task is not None and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    assert removed.status_code == 200
+    assert connected.status_code == 200
+    assert app_creds.revoked == ["user-token-for-old"]
+    account = grants_store.github_accounts[_OWNER]
+    assert app_creds.cipher.decrypt(account["access_token_ciphertext"]) == "user-token-for-new"
+    assert grants_store.grants[_OWNER] == {77: "acme"}
 
 
 async def test_refresh_asks_github_again_rather_than_reusing_the_last_answer(
