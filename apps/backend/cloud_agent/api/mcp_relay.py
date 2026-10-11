@@ -45,6 +45,7 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from cloud_agent import web_search
 from cloud_agent.api.deps import get_mcp_decision_signal, get_storage
 from cloud_agent.logging_utils import get_logger
 from cloud_agent.mcp import protocol
@@ -91,6 +92,7 @@ if TYPE_CHECKING:
     from cloud_agent.ports import (
         CredentialQueries,
         McpConnectionRepository,
+        WebSearchRepository,
     )
     from cloud_agent.workers.mcp_decision_signal import McpDecisionSignal
 
@@ -107,6 +109,7 @@ class _McpRelayStorage(Protocol):
 
     credential_queries: CredentialQueries
     mcp: McpConnectionRepository
+    web_search: WebSearchRepository
 
 
 router = APIRouter(prefix="/v1/agent/mcp")
@@ -1379,17 +1382,19 @@ async def _host_post(
             continue
         if method == protocol.TOOLS_LIST:
             catalogue = await _host_catalogue(identity, store)
+            tools = [
+                _host_tool_entry(name, authorized, capability)
+                for name, (authorized, capability) in sorted(
+                    catalogue.items(), key=lambda item: item[0]
+                )
+            ]
+            if web_search.configured():
+                tools.append(web_search.TOOL_DEFINITION)
+                tools.sort(key=lambda tool: str(tool["name"]))
             replies.append(
                 _result_reply(
                     request_id,
-                    {
-                        "tools": [
-                            _host_tool_entry(name, authorized, capability)
-                            for name, (authorized, capability) in sorted(
-                                catalogue.items(), key=lambda item: item[0]
-                            )
-                        ]
-                    },
+                    {"tools": tools},
                     stateless=stateless,
                 )
             )
@@ -1619,6 +1624,148 @@ async def _host_fetch(
     )
 
 
+async def _release_web_search(store: _McpRelayStorage, *, call_id: str, job_id: str) -> None:
+    """Release provider concurrency without ever replacing the call's outcome."""
+    try:
+        released = await store.web_search.release_web_search(call_id=call_id)
+        if not released:
+            logger.warning(
+                "agent_web_search_release_missing",
+                extra={"event": "agent_web_search_release_missing", "job_id": job_id},
+            )
+    except Exception:
+        logger.exception(
+            "agent_web_search_release_failed",
+            extra={"event": "agent_web_search_release_failed", "job_id": job_id},
+        )
+
+
+async def _host_web_search(
+    arguments: Any,
+    *,
+    request_id: Any,
+    identity: dict[str, Any],
+    store: _McpRelayStorage,
+    authorization: str | None,
+    stateless: bool,
+) -> dict[str, Any]:
+    """Dispatch the platform search tool without exposing its provider key."""
+    search_arguments = arguments if isinstance(arguments, dict) else {}
+    try:
+        # Validate before consuming a shared-key admission slot. ``search`` repeats
+        # this at the provider boundary so it remains safe as a standalone client.
+        web_search.validate(
+            search_arguments,
+            provider=web_search.selected_provider(),
+        )
+    except web_search.WebSearchInputError as exc:
+        return _error_reply(request_id, str(exc), INVALID_PARAMS)
+
+    attempt_id = _attempt_id_of(authorization)
+    lease_generation = _lease_of(authorization)
+    if attempt_id is None or lease_generation <= 0:
+        return _result_reply(
+            request_id,
+            {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Web search authorization expired. Retry in the active turn.",
+                    }
+                ],
+                "isError": True,
+            },
+            stateless=stateless,
+        )
+
+    try:
+        admission = await store.web_search.acquire_web_search(
+            job_id=str(identity["job_id"]),
+            attempt_id=attempt_id,
+            lease_generation=lease_generation,
+        )
+    except Exception:
+        logger.exception(
+            "agent_web_search_admission_failed",
+            extra={
+                "event": "agent_web_search_admission_failed",
+                "job_id": identity["job_id"],
+            },
+        )
+        return _result_reply(
+            request_id,
+            {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Web search is temporarily unavailable. Try again.",
+                    }
+                ],
+                "isError": True,
+            },
+            stateless=stateless,
+        )
+
+    if admission.call_id is None:
+        message = (
+            "Web search is busy. Try again shortly."
+            if admission.reason == "concurrency_limited"
+            else "Web search usage limit reached. Try again in a minute."
+        )
+        if admission.reason == "stale_fence":
+            message = "Web search authorization expired. Retry in the active turn."
+        logger.warning(
+            "agent_web_search_limited",
+            extra={
+                "event": "agent_web_search_limited",
+                "job_id": identity["job_id"],
+                "kind": admission.reason,
+            },
+        )
+        return _result_reply(
+            request_id,
+            {"content": [{"type": "text", "text": message}], "isError": True},
+            stateless=stateless,
+        )
+
+    try:
+        result = await web_search.search(search_arguments)
+    except web_search.WebSearchError as exc:
+        logger.warning(
+            "agent_web_search_failed",
+            extra={
+                "event": "agent_web_search_failed",
+                "job_id": identity["job_id"],
+                "kind": exc.kind,
+            },
+        )
+        return _result_reply(
+            request_id,
+            {
+                "content": [{"type": "text", "text": str(exc)}],
+                "isError": True,
+            },
+            stateless=stateless,
+        )
+    else:
+        return _result_reply(
+            request_id,
+            {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(result, ensure_ascii=False, separators=(",", ":")),
+                    }
+                ]
+            },
+            stateless=stateless,
+        )
+    finally:
+        await asyncio.shield(
+            _release_web_search(store, call_id=admission.call_id, job_id=str(identity["job_id"]))
+        )
+
+
 async def _host_call(
     payload: dict[str, Any],
     *,
@@ -1633,6 +1780,15 @@ async def _host_call(
     params = payload.get("params")
     name = str(params.get("name") or "") if isinstance(params, dict) else ""
     arguments = params.get("arguments") if isinstance(params, dict) else None
+    if name == web_search.TOOL_NAME and web_search.configured():
+        return await _host_web_search(
+            arguments,
+            request_id=request_id,
+            identity=identity,
+            store=store,
+            authorization=authorization,
+            stateless=stateless,
+        )
     catalogue = await _host_catalogue(identity, store)
     entry = catalogue.get(name)
     if entry is None:

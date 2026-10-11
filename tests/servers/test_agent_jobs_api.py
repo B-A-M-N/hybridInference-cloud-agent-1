@@ -6964,6 +6964,43 @@ async def test_the_claim_hands_over_the_mcp_credential_too(client: AsyncClient):
     assert body["mcp_token"] != body["sandbox_token"]
 
 
+@pytest.mark.parametrize("runtime", ["codex", "kilo", "claude-code", "opencode", "pi"])
+@pytest.mark.parametrize(
+    ("selection", "serper_key", "brave_key"),
+    [
+        ("serper", "serper-claim-secret", ""),
+        ("brave", "", "brave-claim-secret"),
+        ("auto", "serper-both-secret", "brave-both-secret"),
+    ],
+)
+async def test_web_search_provider_enables_mcp_without_exposing_keys(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: str,
+    selection: str,
+    serper_key: str,
+    brave_key: str,
+) -> None:
+    values = {
+        worker.web_search.PROVIDER_SETTING: selection,
+        worker.web_search.SERPER_API_KEY_SETTING: serper_key,
+        worker.web_search.BRAVE_API_KEY_SETTING: brave_key,
+    }
+    monkeypatch.setattr(
+        worker.web_search,
+        "text_setting",
+        lambda key, fallback="": values.get(key, fallback),
+    )
+    created = await client.post("/v1/agent/jobs", json=_job_body(runtime=runtime))
+    assert created.status_code == 201, created.text
+
+    body = (await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})).json()
+
+    assert body["mcp_bindings"] == [worker.web_search.RUNTIME_SERVER_ID]
+    assert body["mcp_token"]
+    assert all(secret not in json.dumps(body) for secret in (serper_key, brave_key) if secret)
+
+
 async def test_the_claim_names_no_mcp_relay_address(client: AsyncClient, monkeypatch):
     """The relay is the claiming host's own, so the control plane names none.
 

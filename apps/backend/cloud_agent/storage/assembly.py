@@ -53,6 +53,7 @@ from cloud_agent.storage.repositories import (
     PostgresSnapshotRepository,
     PostgresSourceControlRepository,
     PostgresUserMemoryRepository,
+    PostgresWebSearchRepository,
 )
 
 if TYPE_CHECKING:
@@ -88,6 +89,7 @@ if TYPE_CHECKING:
         SnapshotRepository,
         SourceControlRepository,
         UserMemoryRepository,
+        WebSearchRepository,
     )
 
 
@@ -137,3 +139,4 @@ class Storage:
         self.snapshot: SnapshotRepository = PostgresSnapshotRepository(pool)
         self.source_control: SourceControlRepository = PostgresSourceControlRepository(pool)
         self.user_memory: UserMemoryRepository = PostgresUserMemoryRepository(pool)
+        self.web_search: WebSearchRepository = PostgresWebSearchRepository(pool)

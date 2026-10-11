@@ -360,6 +360,43 @@ SETTINGS: tuple[Setting, ...] = (
     _numeric("mcp_connect_timeout_s", "MCP connection timeout (seconds)", "MCP", 10.0, 0.1, 300),
     _numeric("mcp_metadata_timeout_s", "MCP metadata timeout (seconds)", "MCP", 20.0, 0.1, 300),
     Setting(
+        "web_search_provider",
+        "Web search provider",
+        "Web search",
+        "auto",
+        env="WEB_SEARCH_PROVIDER",
+        choices=("auto", "serper", "brave"),
+        description=(
+            "Selects the provider behind the built-in web_search tool. Auto prefers Serper "
+            "when both provider keys are configured."
+        ),
+    ),
+    Setting(
+        "serper_api_key",
+        "Serper API key",
+        "Web search",
+        "",
+        env="SERPER_API_KEY",
+        secret=True,
+        description=(
+            "Enables Serper.dev for the built-in web_search tool. The key stays in the "
+            "control plane and never enters an agent sandbox."
+        ),
+    ),
+    Setting(
+        "brave_search_api_key",
+        "Brave Search API key",
+        "Web search",
+        "",
+        env="BRAVE_SEARCH_API_KEY",
+        secret=True,
+        description=(
+            "Enables Brave Search for the built-in web_search tool. Review Brave's result "
+            "retention and end-user terms before enabling it. Queries go only to Brave, and "
+            "the key never enters an agent sandbox."
+        ),
+    ),
+    Setting(
         "site.app_name", "Application name", "Appearance", "Cloud Agent", env="AGENT_WEB_APP_NAME"
     ),
     Setting("site.org_name", "Organization name", "Appearance", "", env="AGENT_WEB_ORG_NAME"),
