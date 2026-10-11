@@ -209,17 +209,21 @@ def _mcp_case_step() -> dict[str, Any]:
     )
 
 
-def test_pull_requests_split_the_mcp_cases_and_trusted_events_run_them_whole() -> None:
+SANDBOX_CELL_SELECTION = "${{ github.event_name == 'pull_request' && 'not kilo]' || '' }}"
+
+
+def test_pull_requests_give_kilo_its_own_vms_and_trusted_events_run_every_case_together() -> None:
     """Every event runs all fifteen cases; only where they run differs.
 
-    Three parallel cases fill a four-vCPU hosted VM — the suite took 222s there
-    and 86s on the persistent pool — so a pull request spreads the runtimes
-    over five VMs. Trusted events keep the single persistent-pool step.
+    On a hosted VM each of Kilo's three cases took about 190s, while three cases
+    of any other runtime took 20-40s together. A pull request therefore runs the
+    other twelve in the sandbox cell and each Kilo case on a VM of its own.
+    Trusted events keep all fifteen in the persistent-pool step.
     """
     jobs = workflow()["jobs"]
-    assert step("All five CLIs retain MCP")["if"] == (
-        "matrix.artifact.name == 'sandbox' && github.event_name != 'pull_request'"
-    )
+    in_cell = step("All five CLIs retain MCP")
+    assert in_cell["if"] == "matrix.artifact.name == 'sandbox'"
+    assert in_cell["env"]["MCP_TEST_SELECTION"] == SANDBOX_CELL_SELECTION
     assert jobs["mcp"]["if"] == (
         "github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'"
     )
@@ -230,13 +234,23 @@ def test_pull_requests_split_the_mcp_cases_and_trusted_events_run_them_whole() -
     assert "mcp=${{ needs.mcp.result }}" in str(step("Every job succeeded", job="ci-gate")["env"])
 
 
-def test_the_mcp_cells_partition_the_parity_suite() -> None:
-    """Five selections, three cases each, every case once.
+def _selects(expression: str, case: str) -> bool:
+    """`-k` for the two shapes used here: `<id fragment>` and `not <id fragment>`.
 
-    Collected from the real test file, so a runtime added to its parametrization
-    and not to the matrix fails here rather than silently going untested. Each
-    selection ends in `]`, which only an item name can contain, so a substring
-    of the collected id is exactly what `-k` matches.
+    Each fragment ends in `]`, which only an item name can contain, so a
+    substring of the collected id is exactly what `-k` matches.
+    """
+    negated = expression.startswith("not ")
+    fragment = expression.removeprefix("not ").lower()
+    return (fragment in case.lower()) != negated
+
+
+def test_the_mcp_cells_partition_the_parity_suite() -> None:
+    """On a pull request every case runs exactly once; on a trusted event, all of them.
+
+    Collected from the real test file, so a runtime or policy added to its
+    parametrization and not to these selections fails here rather than silently
+    going untested.
     """
     collected = subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-q", "-m", "external", PARITY],
@@ -248,14 +262,18 @@ def test_the_mcp_cells_partition_the_parity_suite() -> None:
     cases = {line for line in collected.splitlines() if line.startswith(f"{PARITY}::")}
     assert len(cases) == 15
     template = _mcp_case_step()["env"]["MCP_TEST_SELECTION"]
-    assert template == "${{ matrix.runtime }}]"
+    assert template == "${{ matrix.case }}-kilo]"
+    selections = ["not kilo]"] + [
+        template.replace("${{ matrix.case }}", case)
+        for case in workflow()["jobs"]["mcp"]["strategy"]["matrix"]["case"]
+    ]
     selected: list[str] = []
-    for runtime in workflow()["jobs"]["mcp"]["strategy"]["matrix"]["runtime"]:
-        selection = template.replace("${{ matrix.runtime }}", runtime).lower()
-        mine = sorted(case for case in cases if selection in case.lower())
-        assert len(mine) == 3, (runtime, mine)
+    for selection in selections:
+        mine = sorted(case for case in cases if _selects(selection, case))
+        assert mine, f"{selection} selects nothing"
         selected.extend(mine)
     assert sorted(selected) == sorted(cases), "the cells overlap or leave a case out"
+    assert len([case for case in cases if _selects("not kilo]", case)]) == 12
 
 
 def test_the_mcp_cells_build_and_clean_up_exactly_like_the_sandbox_cell() -> None:
@@ -267,16 +285,16 @@ def test_the_mcp_cells_build_and_clean_up_exactly_like_the_sandbox_cell() -> Non
     ours, theirs = _mcp_case_step(), step("All five CLIs retain MCP")
     assert ours["run"] == theirs["run"], "the cases must run the way the sandbox cell runs them"
     assert ours["timeout-minutes"] == theirs["timeout-minutes"]
-    assert theirs["env"]["MCP_TEST_SELECTION"] == "", "trusted events must still run every case"
-    assert {**ours["env"], "MCP_TEST_SELECTION": ""} == theirs["env"]
+    selection = {"MCP_TEST_SELECTION": "compared in the partition test"}
+    assert {**ours["env"], **selection} == {**theirs["env"], **selection}
     assert '-k "${MCP_TEST_SELECTION}"' in ours["run"]
 
 
 def test_each_mcp_cell_removes_only_what_it_started() -> None:
-    """Five cells of one run share its id, so the label carries the runtime too."""
+    """The cells of one run share its id, so the label carries the case too."""
     steps = workflow()["jobs"]["mcp"]["steps"]
     naming = str(step("Name this cell", job="mcp")["run"])
-    assert "matrix.runtime" in naming and "GITHUB_RUN_ATTEMPT" in naming
+    assert "matrix.case" in naming and "GITHUB_RUN_ATTEMPT" in naming
     assert 'echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-config" >> "${GITHUB_ENV}"' in naming
     assert steps[-1]["name"] == "Drop this pull request's builder"
     assert not any("secrets." in str(candidate) for candidate in steps)
@@ -471,8 +489,9 @@ def test_a_change_to_what_both_images_ship_runs_the_image_jobs(entry: str) -> No
 
 
 def test_a_failed_run_leaves_nothing_behind() -> None:
+    """On every persistent runner, whatever happened; a hosted VM is deleted whole."""
     cleanup = step("Drop this run's")
-    assert cleanup["if"] == "always()"
+    assert cleanup["if"] == "always() && runner.environment != 'github-hosted'"
     run = str(cleanup["run"])
     assert run.index("docker rm") < run.index("docker image rm"), (
         "containers first: an image with a container still referencing it is not removed, "

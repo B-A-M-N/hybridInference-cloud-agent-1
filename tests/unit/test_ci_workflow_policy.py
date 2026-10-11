@@ -314,10 +314,13 @@ def test_builder_configuration_is_disposable_for_prs_and_persistent_for_pushes(
 
 
 def test_pull_request_builder_is_always_removed_after_the_artifact_job() -> None:
+    """Whatever happened, on any persistent runner. A hosted VM is deleted with it."""
     steps = _document()["jobs"]["artifacts"]["steps"]
     cleanup = [step for step in steps if 'docker buildx rm "${BUILDER}"' in step.get("run", "")]
     assert len(cleanup) == 1
-    assert cleanup[0]["if"] == "always() && github.event_name == 'pull_request'"
+    assert cleanup[0]["if"] == (
+        "always() && github.event_name == 'pull_request' && runner.environment != 'github-hosted'"
+    )
     assert steps[-1] is cleanup[0]
 
 

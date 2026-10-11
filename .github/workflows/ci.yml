@@ -1078,10 +1078,11 @@ jobs:
           enable-cache: true
           prune-cache: false
 
-      # Trusted events run all fifteen cases here, on the image this cell just
-      # built. A pull request runs the same cases split by runtime in `mcp`.
+      # On the image this cell just built. Trusted events run all fifteen cases
+      # here; a pull request runs the twelve that are not Kilo's, and `mcp`
+      # runs Kilo's three on VMs of their own.
       - name: All five CLIs retain MCP through approval, resume and fork
-        if: matrix.artifact.name == 'sandbox' && github.event_name != 'pull_request'
+        if: matrix.artifact.name == 'sandbox'
         timeout-minutes: 20
         env:
           MCP_TEST_SANDBOX_IMAGE: ${{ env.IMAGE_TAG }}
@@ -1091,8 +1092,9 @@ jobs:
           TEST_DB_USER: postgres
           TEST_DB_PASSWORD: mcp-conformance-only
           MCP_TEST_WORKERS: "3"
-          # Empty selects every case; `mcp` narrows the same script to one runtime.
-          MCP_TEST_SELECTION: ""
+          # A pytest `-k` expression; empty selects every case. Test ids end
+          # `-<runtime>]`, which no other runtime's ids contain.
+          MCP_TEST_SELECTION: ${{ github.event_name == 'pull_request' && 'not kilo]' || '' }}
         run: |
           set -euo pipefail
           database="mcp-db-${SUFFIX}"
@@ -1142,13 +1144,13 @@ jobs:
             --revision "${GITHUB_SHA}"
 
       # The harness removes what it started; this is the backstop for the paths
-      # where it never got that far. Hosted runners are discarded, these are
-      # not: without it the machine accumulates a container and an image per
-      # attempt until the disk fills, and the symptom lands on whatever job
-      # happens to be running then. Containers first — an image with a
-      # container still referencing it is not removed even with `-f`.
+      # where it never got that far. Hosted runners are discarded, so it runs on
+      # the persistent ones only: without it the machine accumulates a container
+      # and an image per attempt until the disk fills, and the symptom lands on
+      # whatever job happens to be running then. Containers first — an image with
+      # a container still referencing it is not removed even with `-f`.
       - name: Drop this run's containers and image
-        if: always()
+        if: always() && runner.environment != 'github-hosted'
         run: |
           # Scoped by this cell's label, not by the name prefix: a shared
           # runner hosts several cells at once, so `--filter name=smoke-`
@@ -1163,20 +1165,21 @@ jobs:
           docker image rm "${IMAGE_TAG}" >/dev/null 2>&1 || true
 
       # Pull requests use job-local builders even on persistent runners. Remove
-      # the buildkit container as well as its temporary configuration.
+      # the buildkit container as well as its temporary configuration. A hosted
+      # VM is deleted with both, and removing them first took 20-30s.
       - name: Drop this pull request's builder
-        if: always() && github.event_name == 'pull_request'
+        if: always() && github.event_name == 'pull_request' && runner.environment != 'github-hosted'
         run: |
           if [ -n "${BUILDER:-}" ]; then
             docker buildx rm "${BUILDER}" >/dev/null 2>&1 || true
           fi
 
   # ------------------------------------------------------------------- mcp
-  # The fifteen real-CLI cases, split by runtime, for pull requests. On a
-  # four-vCPU hosted VM three parallel cases already fill the machine: the
-  # suite took 222s there against 86s on the persistent pool, so it is spread
-  # over five VMs rather than given more workers on one. Trusted events still
-  # run all fifteen in the sandbox cell above, which this job leaves untouched.
+  # Kilo's three real-CLI cases, one per VM, for pull requests. On a hosted VM
+  # each of them took about 190s, against 20-40s for three cases of any other
+  # runtime, so they set the sandbox cell's pace on their own. The sandbox cell
+  # keeps the other twelve; trusted events still run all fifteen there, which
+  # this job leaves untouched.
   #
   # Each cell builds the sandbox itself, importing the layers `pr-caches`
   # exports. Everything from the SDK step to the builder removal is copied from
@@ -1184,16 +1187,16 @@ jobs:
   # way it is. `test_artifacts_workflow.py` fails if the copies diverge, so the
   # image these cases run is the image the sandbox cell builds and starts.
   mcp:
-    name: MCP conformance (${{ matrix.runtime }})
+    name: MCP conformance (kilo, ${{ matrix.case }})
     needs: changes
     if: github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || matrix.artifact.runner) }}
     strategy:
       fail-fast: false
       matrix:
-        # Exactly the runtimes the parity test is parametrized over; the policy
-        # test collects the suite to prove these five selections partition it.
-        runtime: [codex, kilo, opencode, pi, claude-code]
+        # Kilo's three policy cases. With the sandbox cell's selection these
+        # partition the parity suite; the policy test collects it to prove so.
+        case: [allow, confirm, confirm-normalized-name]
         artifact:
           - name: sandbox
             arch: amd64
@@ -1207,11 +1210,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # Per runtime as well as per run and attempt: the five cells share a run
-      # id, and cleanup removes containers by this label.
+      # Per case as well as per run and attempt: the cells share a run id, and
+      # cleanup removes containers by this label.
       - name: Name this cell's artifacts
         run: |
-          suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-mcp-${{ matrix.runtime }}"
+          suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-mcp-kilo-${{ matrix.case }}"
           echo "IMAGE_TAG=${{ matrix.artifact.name }}:ci-${suffix}" >> "${GITHUB_ENV}"
           echo "SUFFIX=${suffix}" >> "${GITHUB_ENV}"
           mkdir -p "${RUNNER_TEMP}/docker-config"
@@ -1324,7 +1327,7 @@ jobs:
           enable-cache: true
           prune-cache: false
 
-      - name: ${{ matrix.runtime }} retains MCP through approval, resume and fork
+      - name: Kilo retains MCP through approval, resume and fork (${{ matrix.case }})
         timeout-minutes: 20
         env:
           MCP_TEST_SANDBOX_IMAGE: ${{ env.IMAGE_TAG }}
@@ -1334,8 +1337,8 @@ jobs:
           TEST_DB_USER: postgres
           TEST_DB_PASSWORD: mcp-conformance-only
           MCP_TEST_WORKERS: "3"
-          # Test ids end `-<runtime>]`, which no other runtime's ids contain.
-          MCP_TEST_SELECTION: "${{ matrix.runtime }}]"
+          # The id `[<case>-kilo]`, which names exactly one case.
+          MCP_TEST_SELECTION: "${{ matrix.case }}-kilo]"
         run: |
           set -euo pipefail
           database="mcp-db-${SUFFIX}"
@@ -1375,7 +1378,7 @@ jobs:
             -m external -k "${MCP_TEST_SELECTION}" tests/external/test_resident_mcp_parity.py
 
       - name: Drop this run's containers and image
-        if: always()
+        if: always() && runner.environment != 'github-hosted'
         run: |
           # Scoped by this cell's label, not by the name prefix: a shared
           # runner hosts several cells at once, so `--filter name=smoke-`
@@ -1390,7 +1393,7 @@ jobs:
           docker image rm "${IMAGE_TAG}" >/dev/null 2>&1 || true
 
       - name: Drop this pull request's builder
-        if: always() && github.event_name == 'pull_request'
+        if: always() && github.event_name == 'pull_request' && runner.environment != 'github-hosted'
         run: |
           if [ -n "${BUILDER:-}" ]; then
             docker buildx rm "${BUILDER}" >/dev/null 2>&1 || true
