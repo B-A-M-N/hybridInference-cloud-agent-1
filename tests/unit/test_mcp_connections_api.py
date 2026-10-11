@@ -1639,9 +1639,11 @@ class TestAuthorization:
         )
 
         async def save_flow(**kwargs):
-            store.oauth_flow = kwargs
+            generation = int(kwargs["expected_oauth_generation"]) + 1
+            store.oauth_flow = {**kwargs, "oauth_generation": generation}
             store.oauth_state_hash = kwargs["state_hash"]
-            store.connections[connection_id]["oauth_generation"] = kwargs["oauth_generation"]
+            store.connections[connection_id]["oauth_generation"] = generation
+            return generation
 
         monkeypatch.setattr(store, "create_mcp_oauth_flow", save_flow, raising=False)
         with _client(store) as client:
