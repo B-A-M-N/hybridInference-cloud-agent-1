@@ -22,13 +22,7 @@ const NAV_ITEM_CURRENT =
 // App-mode shell (same fixed-overlay pattern as the playground): slim header +
 // repo/task sidebar + main pane. Deep links keep working — /agents/* are real
 // routes; only the marketing chrome is replaced.
-function AgentsHeader({
-  sidebarCollapsed,
-  onToggleSidebar,
-}: {
-  sidebarCollapsed: boolean;
-  onToggleSidebar: () => void;
-}) {
+function AgentsHeader({ sidebarToggle }: { sidebarToggle?: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname() ?? '/';
   const { state, logout } = useAuth();
@@ -53,29 +47,7 @@ function AgentsHeader({
   return (
     <header className="flex shrink-0 flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-gray-200/80 bg-white/95 px-4 py-3 shadow-[0_1px_0_rgba(17,24,39,0.02)] backdrop-blur sm:px-5 dark:border-white/10 dark:bg-gray-900/95">
       <div className="flex min-w-0 items-center gap-2.5">
-        <button
-          id="agents-sidebar-toggle"
-          type="button"
-          onClick={onToggleSidebar}
-          aria-label={sidebarCollapsed ? t('nav.expandTaskList') : t('nav.collapseTaskList')}
-          aria-expanded={!sidebarCollapsed}
-          aria-controls="agents-sidebar"
-          aria-keyshortcuts="Meta+B Control+B"
-          title={sidebarCollapsed ? t('nav.expandTaskList') : t('nav.collapseTaskList')}
-          className="-ml-1.5 inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-crimson/25 dark:text-gray-400 dark:hover:bg-white/10 dark:hover:text-gray-100"
-        >
-          <svg
-            aria-hidden="true"
-            className="h-4 w-4"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-            strokeWidth={1.8}
-          >
-            <rect x="3.5" y="4" width="17" height="16" rx="2" />
-            <path d="M9.5 4v16" />
-          </svg>
-        </button>
+        {sidebarToggle}
         <Link
           href="/"
           className="flex min-w-0 items-center gap-2.5 rounded-md text-[17px] font-semibold tracking-[-0.02em] text-gray-950 transition-colors hover:text-crimson focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-crimson/30 dark:text-gray-50 dark:hover:text-crimson-light"
@@ -168,6 +140,41 @@ function AgentsHeader({
   );
 }
 
+function SidebarToggleButton({
+  sidebarCollapsed,
+  onToggleSidebar,
+}: {
+  sidebarCollapsed: boolean;
+  onToggleSidebar: () => void;
+}) {
+  const t = useT();
+  return (
+    <button
+      id="agents-sidebar-toggle"
+      type="button"
+      onClick={onToggleSidebar}
+      aria-label={sidebarCollapsed ? t('nav.expandTaskList') : t('nav.collapseTaskList')}
+      aria-expanded={!sidebarCollapsed}
+      aria-controls="agents-sidebar"
+      aria-keyshortcuts="Meta+B Control+B"
+      title={sidebarCollapsed ? t('nav.expandTaskList') : t('nav.collapseTaskList')}
+      className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-crimson/25 dark:text-gray-400 dark:hover:bg-white/10 dark:hover:text-gray-100"
+    >
+      <svg
+        aria-hidden="true"
+        className="h-4 w-4"
+        fill="none"
+        viewBox="0 0 24 24"
+        stroke="currentColor"
+        strokeWidth={1.8}
+      >
+        <rect x="3.5" y="4" width="17" height="16" rx="2" />
+        <path d="M9.5 4v16" />
+      </svg>
+    </button>
+  );
+}
+
 /** The owner's change stream, held once per tab for every list and page in it. */
 function AgentChangeStream({ userId }: { userId: string | undefined }) {
   useAgentChangeStream(userId);
@@ -177,11 +184,13 @@ function AgentChangeStream({ userId }: { userId: string | undefined }) {
 function AgentsShell({
   children,
   sidebarCollapsed,
+  sidebarToggle,
   mobileSidebarOpen,
   onSidebarNavigate,
 }: {
   children: React.ReactNode;
   sidebarCollapsed: boolean;
+  sidebarToggle?: React.ReactNode;
   mobileSidebarOpen: boolean;
   onSidebarNavigate: () => void;
 }) {
@@ -222,7 +231,7 @@ function AgentsShell({
               onSidebarNavigate();
           }}
         >
-          <AgentsSidebar collapsed={sidebarCollapsed} />
+          <AgentsSidebar collapsed={sidebarCollapsed} headerAction={sidebarToggle} />
         </div>
         <main
           id="agents-workspace"
@@ -347,11 +356,22 @@ export default function AgentsLayout({ children }: { children: React.ReactNode }
     <ProtectedRoute>
       <div className="fixed inset-0 z-50 flex flex-col bg-gray-50 dark:bg-gray-950">
         <AgentsHeader
-          sidebarCollapsed={mobile ? !mobileSidebarOpen : sidebarCollapsed}
-          onToggleSidebar={toggleSidebar}
+          sidebarToggle={
+            mobile || sidebarCollapsed ? (
+              <SidebarToggleButton
+                sidebarCollapsed={mobile ? !mobileSidebarOpen : sidebarCollapsed}
+                onToggleSidebar={toggleSidebar}
+              />
+            ) : undefined
+          }
         />
         <AgentsShell
           sidebarCollapsed={mobile ? !mobileSidebarOpen : sidebarCollapsed}
+          sidebarToggle={
+            !mobile && !sidebarCollapsed ? (
+              <SidebarToggleButton sidebarCollapsed={false} onToggleSidebar={toggleSidebar} />
+            ) : undefined
+          }
           mobileSidebarOpen={mobileSidebarOpen}
           onSidebarNavigate={closeMobileSidebar}
         >

@@ -56,10 +56,17 @@ vi.mock('@/components/providers/SiteConfigProvider', () => ({
 }));
 
 vi.mock('@/components/features/agents/AgentsSidebar', () => ({
-  AgentsSidebar: ({ collapsed }: { collapsed?: boolean }) =>
+  AgentsSidebar: ({
+    collapsed,
+    headerAction,
+  }: {
+    collapsed?: boolean;
+    headerAction?: React.ReactNode;
+  }) =>
     collapsed ? null : (
       <aside id="agents-sidebar" data-testid="sidebar-stub">
         tasks
+        {headerAction}
         <Link href="/" onClick={(event) => event.preventDefault()}>
           New task
         </Link>
@@ -87,7 +94,7 @@ describe('AgentsLayout sidebar collapse', () => {
   beforeEach(() => localStorage.clear());
   afterEach(() => cleanup());
 
-  it('collapses and restores the task list from the header toggle', () => {
+  it('keeps the collapse control in the task list and the expand control in the header', () => {
     render(
       <AgentsLayout>
         <p>job</p>
@@ -99,17 +106,20 @@ describe('AgentsLayout sidebar collapse', () => {
     expect(toggle()).toHaveAttribute('aria-expanded', 'true');
     expect(toggle()).toHaveAttribute('aria-controls', 'agents-sidebar');
     expect(toggle()).toHaveAttribute('aria-keyshortcuts', 'Meta+B Control+B');
+    expect(screen.getByTestId('sidebar-stub')).toContainElement(toggle());
 
     fireEvent.click(toggle());
 
     expect(screen.queryByTestId('sidebar-stub')).not.toBeInTheDocument();
     expect(toggle()).toHaveAccessibleName('Expand task list');
     expect(toggle()).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.getByRole('banner')).toContainElement(toggle());
     expect(localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY)).toBe('1');
 
     fireEvent.click(toggle());
 
     expect(screen.getByTestId('sidebar-stub')).toBeInTheDocument();
+    expect(screen.getByTestId('sidebar-stub')).toContainElement(toggle());
     expect(localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY)).toBe('0');
   });
 

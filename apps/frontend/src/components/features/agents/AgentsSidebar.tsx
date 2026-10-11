@@ -39,7 +39,13 @@ import {
   type SidebarReorderProps,
 } from './SidebarRows';
 export const SIDEBAR_WIDTH_STORAGE_KEY = 'agents.sidebar.width';
-export function AgentsSidebar({ collapsed = false }: { collapsed?: boolean }) {
+export function AgentsSidebar({
+  collapsed = false,
+  headerAction,
+}: {
+  collapsed?: boolean;
+  headerAction?: React.ReactNode;
+}) {
   const pathname = usePathname() ?? '';
   const params = useSearchParams();
   const router = useRouter();
@@ -564,31 +570,34 @@ export function AgentsSidebar({ collapsed = false }: { collapsed?: boolean }) {
         className="flex shrink-0 flex-col border-r border-gray-200/70 bg-gray-50/80 dark:border-white/10 dark:bg-gray-900/60"
       >
         <div className="flex-1 overflow-y-auto px-3 py-4">
-          <Link
-            href="/"
-            aria-current={pathname === '/' ? 'page' : undefined}
-            className={`flex min-h-10 w-full items-center gap-2.5 rounded-lg border px-3 py-2 text-[13px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-crimson/25 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-gray-900 ${
-              pathname === '/'
-                ? 'border-crimson/15 bg-crimson/[0.07] text-crimson-dark shadow-sm dark:border-crimson/25 dark:bg-crimson/15 dark:text-crimson-light'
-                : 'border-gray-200/80 bg-white text-gray-700 shadow-sm hover:border-crimson/20 hover:bg-crimson/[0.03] hover:text-crimson-dark dark:border-white/10 dark:bg-gray-900 dark:text-gray-300 dark:hover:border-crimson/25 dark:hover:bg-crimson/10 dark:hover:text-crimson-light'
-            }`}
-          >
-            <svg
-              aria-hidden="true"
-              className={`h-4 w-4 shrink-0 ${pathname === '/' ? 'text-crimson dark:text-crimson-light' : 'text-gray-500 dark:text-gray-400'}`}
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-              strokeWidth={2}
+          <div className="flex items-center gap-2">
+            <Link
+              href="/"
+              aria-current={pathname === '/' ? 'page' : undefined}
+              className={`flex min-h-10 min-w-0 flex-1 items-center gap-2.5 rounded-lg border px-3 py-2 text-[13px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-crimson/25 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-gray-900 ${
+                pathname === '/'
+                  ? 'border-crimson/15 bg-crimson/[0.07] text-crimson-dark shadow-sm dark:border-crimson/25 dark:bg-crimson/15 dark:text-crimson-light'
+                  : 'border-gray-200/80 bg-white text-gray-700 shadow-sm hover:border-crimson/20 hover:bg-crimson/[0.03] hover:text-crimson-dark dark:border-white/10 dark:bg-gray-900 dark:text-gray-300 dark:hover:border-crimson/25 dark:hover:bg-crimson/10 dark:hover:text-crimson-light'
+              }`}
             >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="M16.86 4.49a1.5 1.5 0 0 1 2.12 0l.53.53a1.5 1.5 0 0 1 0 2.12L8.53 18.12 4 19.5l1.38-4.53L16.86 4.49Z"
-              />
-            </svg>
-            {t('sidebar.newTask')}
-          </Link>
+              <svg
+                aria-hidden="true"
+                className={`h-4 w-4 shrink-0 ${pathname === '/' ? 'text-crimson dark:text-crimson-light' : 'text-gray-500 dark:text-gray-400'}`}
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                strokeWidth={2}
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="M16.86 4.49a1.5 1.5 0 0 1 2.12 0l.53.53a1.5 1.5 0 0 1 0 2.12L8.53 18.12 4 19.5l1.38-4.53L16.86 4.49Z"
+                />
+              </svg>
+              {t('sidebar.newTask')}
+            </Link>
+            {headerAction}
+          </div>
 
           {!searching && (pinnedRows.length > 0 || pinnedList.error) && (
             <section aria-labelledby="sidebar-pinned-heading" className="mt-4">
