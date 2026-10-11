@@ -18,6 +18,7 @@ import {
 import { APIError, getErrorMessage } from '@/lib/utils/errors';
 
 import AddComputeServer from './AddComputeServer';
+import ComputeSetup from './ComputeSetup';
 import ServerAccess from './ServerAccess';
 import ServerActions from './ServerActions';
 import ComputeResourcePanel from './ComputeResourcePanel';
@@ -35,6 +36,7 @@ import {
 
 type OpenPanel =
   | { kind: 'add' }
+  | { kind: 'setup' }
   | { kind: 'operations' }
   | { kind: 'resource'; id: string }
   | { kind: 'host'; hosts: string[]; name: string }
@@ -256,6 +258,13 @@ export default function ComputeResources({
           <button
             className="rounded-lg px-3 py-2 text-sm text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-white/5"
             type="button"
+            onClick={() => setPanel({ kind: 'setup' })}
+          >
+            Server setup
+          </button>
+          <button
+            className="rounded-lg px-3 py-2 text-sm text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-white/5"
+            type="button"
             onClick={() => setPanel({ kind: 'operations' })}
           >
             Activity
@@ -341,6 +350,17 @@ export default function ComputeResources({
               </li>
             ))}
           </ul>
+        </Panel>
+      )}
+
+      {panel?.kind === 'setup' && (
+        <Panel title="Server setup" onClose={() => setPanel(null)}>
+          <ComputeSetup
+            onSaved={() => {
+              setPanel({ kind: 'add' });
+              void refresh();
+            }}
+          />
         </Panel>
       )}
 

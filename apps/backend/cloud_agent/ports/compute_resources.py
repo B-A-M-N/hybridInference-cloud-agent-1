@@ -8,6 +8,27 @@ from typing import Any, Protocol
 class ComputeResourceRepository(Protocol):
     """Local state only; no provider calls or plaintext credentials."""
 
+    async def list_deployment_profiles(self) -> list[dict[str, Any]]:
+        """List profile metadata without bundles, plaintext inputs or ciphertext."""
+        ...
+
+    async def get_deployment_profile(self, profile_id: str) -> dict[str, Any] | None:
+        """Read one trusted profile including its bundle and encrypted inputs."""
+        ...
+
+    async def save_deployment_profile(
+        self,
+        *,
+        profile_id: str,
+        label: str,
+        configuration: dict[str, Any],
+        source_bundle: bytes,
+        source_sha256: str,
+        secret_ciphertext: str,
+    ) -> dict[str, Any]:
+        """Create one immutable profile; active allocations retain exact inputs."""
+        ...
+
     async def list_connections(self) -> list[dict[str, Any]]:
         """Return metadata only; ciphertext is restricted to trusted get_connection."""
         ...

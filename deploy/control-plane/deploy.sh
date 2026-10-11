@@ -90,9 +90,51 @@ esac
   || die "SHARED_READY_TIMEOUT must be a positive integer (got '${SHARED_READY_TIMEOUT}')"
 
 cd "${DEPLOY_ROOT}" 2>/dev/null || die "${DEPLOY_ROOT} does not exist"
+[ -f .env ] || die ".env is missing from ${DEPLOY_ROOT} — it holds this deployment's secrets and is deliberately not in git"
+
+# Compute credentials are write-only in Admin and encrypted before they reach
+# Postgres. Make that surface usable without asking an operator to invent one
+# more secret, while keeping the key outside the database it protects. The
+# persistent .env is deliberately untracked and survives both source and
+# artifact upgrades. Never replace a non-empty value: doing so would orphan
+# every saved SSH key and provider token.
+ensure_compute_secret_key() {
+  local configured="" generated="" temporary=""
+  configured="$(grep -E '^AGENT_COMPUTE_SECRET_KEY=' .env 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+  configured="${configured%\"}"; configured="${configured#\"}"
+  configured="${configured%\'}"; configured="${configured#\'}"
+  if [ -n "${configured}" ]; then
+    return 0
+  fi
+
+  generated="${AGENT_COMPUTE_SECRET_KEY:-}"
+  if [ -n "${generated}" ]; then
+    [[ "${generated}" =~ ^[A-Za-z0-9_+=./-]{32,}$ ]] \
+      || die "AGENT_COMPUTE_SECRET_KEY must be at least 32 dotenv-safe bytes"
+  else
+    command -v openssl >/dev/null 2>&1 \
+      || die "openssl is required to generate AGENT_COMPUTE_SECRET_KEY"
+    generated="$(openssl rand -hex 32)"
+  fi
+
+  temporary="$(mktemp "${DEPLOY_ROOT}/.env.compute-key.XXXXXX")"
+  chmod 600 "${temporary}"
+  awk -v replacement="AGENT_COMPUTE_SECRET_KEY=${generated}" '
+    BEGIN { written = 0 }
+    /^AGENT_COMPUTE_SECRET_KEY=/ {
+      if (!written) { print replacement; written = 1 }
+      next
+    }
+    { print }
+    END { if (!written) print replacement }
+  ' .env > "${temporary}"
+  mv "${temporary}" .env
+  log "generated and persisted the compute credential encryption key"
+}
+
+ensure_compute_secret_key
 
 if [[ "$AGENT_DEPLOY_MODE" == "artifacts" ]]; then
-  [ -f .env ] || die ".env is missing from ${DEPLOY_ROOT}"
   source "$SCRIPT_DIR/../release/artifact_env.sh"
   prepare_artifact_deployment control-plane
   COMPOSE_PROJECT="$(artifact_env_value COMPOSE_PROJECT)"
@@ -120,8 +162,6 @@ else
     fi
     log "ALLOW_DIRTY=1 — discarding the above"
   fi
-
-  [ -f .env ] || die ".env is missing from ${DEPLOY_ROOT} — it holds this deployment's secrets and is deliberately not in git"
 
   PREVIOUS="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
   log "previous: ${PREVIOUS}"

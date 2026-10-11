@@ -7,7 +7,11 @@ runs provider mutations inline with an HTTP request.
 
 from __future__ import annotations
 
+import hashlib
+import io
+import json
 import re
+import tarfile
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -21,6 +25,7 @@ from cloud_agent.domain.compute import (
     public_operation,
 )
 from cloud_agent.host_pool import hash_secret
+from cloud_agent.ports.external.host_bootstrap import DeploymentProfile
 from cloud_agent.schemas_compute import RenewalPolicy
 
 if TYPE_CHECKING:
@@ -28,9 +33,9 @@ if TYPE_CHECKING:
     from cloud_agent.compute_registry import ComputeProviderRegistration, ComputeProviderRegistry
     from cloud_agent.compute_secrets import ComputeSecretStore
     from cloud_agent.ports.compute_resources import ComputeResourceRepository
-    from cloud_agent.ports.external.host_bootstrap import DeploymentProfile
     from cloud_agent.schemas_compute import (
         AddComputeConnection,
+        AddDeploymentProfile,
         AddServerRequest,
         ExtendComputeRequest,
         ImportComputeRequest,
@@ -60,15 +65,134 @@ class ComputeCommands:
             repository, registry, secrets, observation_seconds=configuration.observation_seconds
         )
 
-    def catalog(self) -> dict[str, Any]:
+    async def catalog(self) -> dict[str, Any]:
         """Return enabled implementations and public profile names only."""
+        profiles = await self.deployment_profiles()
         return {
             "providers": [entry.catalog() for entry in self.registry.entries.values()],
-            "deployment_profiles": [
-                {"id": p.id, "label": p.label} for p in self.configuration.profiles.values()
-            ],
+            "deployment_profiles": [{"id": p.id, "label": p.label} for p in profiles.values()],
             "secret_store_configured": self.secrets.configured,
         }
+
+    async def deployment_profiles(self) -> dict[str, DeploymentProfile]:
+        """Merge legacy operator files with profiles registered through Admin."""
+        profiles = dict(self.configuration.profiles)
+        listing = getattr(self.repository, "list_deployment_profiles", None)
+        if listing is None:
+            return profiles
+        for row in await listing():
+            profile = self._stored_profile(row)
+            profiles[profile.id] = profile
+        return profiles
+
+    async def create_deployment_profile(self, request: AddDeploymentProfile) -> dict[str, Any]:
+        """Validate, encrypt and persist one write-only Host setup."""
+        try:
+            bundle = request.bundle()
+        except ValueError:
+            raise ComputeRefusal(
+                "invalid_configuration", "The release bundle is invalid.", status=422
+            ) from None
+        self._validate_bundle(bundle)
+        files = {name: value.get_secret_value() for name, value in request.files.items()}
+        if any(
+            not name.startswith(".compute-secrets/")
+            or name.endswith("/")
+            or ".." in name.split("/")
+            for name in files
+        ):
+            raise ComputeRefusal(
+                "invalid_configuration",
+                "Deployment credential files must be inside .compute-secrets/.",
+                status=422,
+            )
+        digest = hashlib.sha256(bundle).hexdigest()
+        configuration = {
+            "deployment_sha": request.deployment_sha,
+            "deploy_root": request.deploy_root,
+            "files": list(files),
+            "install_prerequisites": request.install_prerequisites,
+            "timeout_seconds": request.timeout_seconds,
+            "data_mount": request.data_mount,
+        }
+        self._stored_profile(
+            {
+                "id": request.id,
+                "label": request.label,
+                "source_sha256": digest,
+                "configuration": configuration,
+            }
+        )
+        plaintext = json.dumps(
+            {"environment": request.environment.get_secret_value(), "files": files},
+            separators=(",", ":"),
+        )
+        row = await self.repository.save_deployment_profile(
+            profile_id=request.id,
+            label=request.label,
+            configuration=configuration,
+            source_bundle=bundle,
+            source_sha256=digest,
+            secret_ciphertext=self.secrets.encrypt(
+                "profile:" + request.id, "deployment_profile", plaintext
+            ),
+        )
+        return {"id": row["id"], "label": row["label"]}
+
+    @staticmethod
+    def _validate_bundle(bundle: bytes) -> None:
+        """Reject unsafe or incomplete archives before they become selectable."""
+        try:
+            with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:*") as archive:
+                names: set[str] = set()
+                for member in archive.getmembers():
+                    name = member.name.removeprefix("./")
+                    if (
+                        not name
+                        or name.startswith("/")
+                        or ".." in name.split("/")
+                        or not (member.isdir() or member.isfile())
+                        or name in {".env", ".compute-identity.json"}
+                        or name.startswith((".compute-secrets/", ".git/"))
+                    ):
+                        raise ValueError
+                    names.add(name)
+        except (tarfile.TarError, OSError, ValueError):
+            raise ComputeRefusal(
+                "invalid_configuration", "The release bundle is invalid or unsafe.", status=422
+            ) from None
+        required = {
+            "deploy/host/sandbox_host.sh",
+            "deploy/host/setup_kata_runtime.sh",
+            "deploy/host/docker-compose.sandbox.yml",
+            "pyproject.toml",
+        }
+        if not required <= names:
+            raise ComputeRefusal(
+                "invalid_configuration",
+                "The release bundle is missing the Host recipe.",
+                status=422,
+            )
+
+    @staticmethod
+    def _stored_profile(row: dict[str, Any]) -> DeploymentProfile:
+        config = row["configuration"]
+        profile_id = row["id"]
+        return DeploymentProfile(
+            id=profile_id,
+            label=row["label"],
+            source_bundle=f"stored-profile:{profile_id}:bundle",
+            source_sha256=row["source_sha256"],
+            deployment_sha=config["deployment_sha"],
+            deploy_root=config["deploy_root"],
+            environment_ref=f"stored-profile:{profile_id}:environment",
+            files={
+                name: f"stored-profile:{profile_id}:file:{name}" for name in config.get("files", [])
+            },
+            install_prerequisites=config.get("install_prerequisites", True),
+            timeout_seconds=config.get("timeout_seconds", 3600),
+            data_mount=config.get("data_mount"),
+        )
 
     async def connections(self) -> dict[str, Any]:
         """List metadata with a second whitelist above the storage boundary."""
@@ -546,7 +670,7 @@ class ComputeCommands:
 
     async def _deployment_profile(self, requested: str | None) -> DeploymentProfile:
         """Choose configured setup capacity without sharing a live broker endpoint."""
-        profiles = self.configuration.profiles
+        profiles = await self.deployment_profiles()
         if requested is not None:
             profile = profiles.get(requested)
             if profile is not None:

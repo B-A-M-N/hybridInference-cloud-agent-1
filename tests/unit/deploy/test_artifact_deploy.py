@@ -817,6 +817,39 @@ def test_compute_overlay_is_packaged_and_enabled_by_persistent_configuration(tmp
     assert (script.parent / "compute.example.json").is_file()
 
 
+def test_control_plane_generates_one_persistent_compute_encryption_key(tmp_path: Path):
+    script, env = deployment(tmp_path, "control-plane")
+    dotenv = Path(env["DEPLOY_ROOT"]) / ".env"
+    assert "AGENT_COMPUTE_SECRET_KEY=" not in dotenv.read_text()
+
+    first, _ = run(script, env, "--phase", "prepare", COMMIT)
+    assert first.returncode == 0, first.stdout + first.stderr
+    values = dict(line.split("=", 1) for line in dotenv.read_text().splitlines() if "=" in line)
+    generated = values["AGENT_COMPUTE_SECRET_KEY"]
+    assert re.fullmatch(r"[a-f0-9]{64}", generated)
+    assert dotenv.stat().st_mode & 0o077 == 0
+    assert generated not in first.stdout + first.stderr
+
+    second, _ = run(script, env, "--phase", "prepare", COMMIT)
+    assert second.returncode == 0, second.stdout + second.stderr
+    repeated = dict(line.split("=", 1) for line in dotenv.read_text().splitlines() if "=" in line)
+    assert repeated["AGENT_COMPUTE_SECRET_KEY"] == generated
+
+
+def test_control_plane_preserves_an_existing_compute_encryption_key(tmp_path: Path):
+    script, env = deployment(tmp_path, "control-plane")
+    dotenv = Path(env["DEPLOY_ROOT"]) / ".env"
+    existing = "existing-compute-key-material-0123456789"
+    with dotenv.open("a") as output:
+        output.write(f"AGENT_COMPUTE_SECRET_KEY={existing}\n")
+
+    result, _ = run(script, env, "--phase", "prepare", COMMIT)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert dotenv.read_text().splitlines().count(f"AGENT_COMPUTE_SECRET_KEY={existing}") == 1
+    assert "generated and persisted" not in result.stdout
+
+
 def test_compute_overlay_gives_credentials_and_mount_only_to_main_control_plane(tmp_path: Path):
     script, env = deployment(tmp_path, "control-plane", real_compose=True)
     private = tmp_path / "private compute"

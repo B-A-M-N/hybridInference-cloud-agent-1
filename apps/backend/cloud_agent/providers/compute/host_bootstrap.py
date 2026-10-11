@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 from dotenv import dotenv_values
 
+from cloud_agent.compute_secrets import ComputeSecretError
 from cloud_agent.ports.external.compute_provider import ProviderError
 from cloud_agent.ports.external.host_bootstrap import (
     BootstrapResult,
@@ -320,8 +321,11 @@ class SshHostBootstrap:
         enrollment_token: SecretStr | None,
     ) -> bytes:
         try:
-            source = Path(profile.source_bundle).read_bytes()
-        except OSError:
+            if profile.source_bundle.startswith("stored-profile:"):
+                source = await self._resolver.bundle(profile.source_bundle)
+            else:
+                source = Path(profile.source_bundle).read_bytes()
+        except (OSError, ComputeSecretError):
             raise ProviderError(
                 "deployment_profile_invalid", "Trusted deployment bundle is unavailable"
             ) from None
@@ -330,8 +334,9 @@ class SshHostBootstrap:
                 "deployment_profile_invalid",
                 "Trusted deployment bundle digest differs from its profile",
             )
-        if not profile.environment_ref.startswith("deployment:") or any(
-            not ref.startswith("deployment:") for ref in profile.files.values()
+        approved = ("deployment:", "stored-profile:")
+        if not profile.environment_ref.startswith(approved) or any(
+            not ref.startswith(approved) for ref in profile.files.values()
         ):
             raise ProviderError(
                 "deployment_profile_invalid",

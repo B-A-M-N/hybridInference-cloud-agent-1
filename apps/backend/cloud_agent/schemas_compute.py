@@ -6,6 +6,7 @@ Secrets have their own write-only field and never enter operation requests.
 
 from __future__ import annotations
 
+import base64
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, SecretStr, model_validator
@@ -75,6 +76,36 @@ class UpdateComputeConnection(ComputeRequest):
     name: str | None = Field(default=None, min_length=1, max_length=120)
     configuration: dict[str, Any] | None = None
     secret: SecretStr | None = Field(default=None, min_length=1, max_length=65536)
+
+
+class AddDeploymentProfile(ComputeRequest):
+    """Create a reviewed Host deployment profile from write-only Admin inputs."""
+
+    id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+    label: str = Field(min_length=1, max_length=120)
+    deployment_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
+    deploy_root: str = Field(default="/opt/cloud-agent", pattern=r"^/[a-zA-Z0-9/_-]+$")
+    environment: SecretStr = Field(min_length=1, max_length=65536)
+    files: dict[str, Annotated[SecretStr, Field(min_length=1, max_length=65536)]] = Field(
+        min_length=1, max_length=24
+    )
+    source_bundle_base64: SecretStr = Field(min_length=1)
+    install_prerequisites: bool = True
+    timeout_seconds: int = Field(default=3600, ge=60, le=7200)
+    data_mount: str | None = Field(default=None, pattern=r"^/[a-zA-Z0-9/_-]+$")
+
+    def bundle(self) -> bytes:
+        """Decode with a hard ceiling before the value reaches persistence."""
+        try:
+            encoded = self.source_bundle_base64.get_secret_value().encode("ascii")
+            if len(encoded) > 96 * 1024 * 1024:
+                raise ValueError
+            payload = base64.b64decode(encoded, validate=True)
+        except (UnicodeError, ValueError):
+            raise ValueError("invalid deployment bundle") from None
+        if not payload or len(payload) > 64 * 1024 * 1024:
+            raise ValueError("invalid deployment bundle")
+        return payload
 
 
 class AddServerRequest(ComputeRequest):

@@ -53,6 +53,49 @@ class PostgresComputeResourceRepository:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
 
+    async def list_deployment_profiles(self) -> list[dict[str, Any]]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT id,label,configuration,source_sha256,revision,created_at,updated_at
+                FROM agent_compute_deployment_profiles ORDER BY created_at,id"""
+            )
+        return [_row(row) for row in rows]
+
+    async def get_deployment_profile(self, profile_id: str) -> dict[str, Any] | None:
+        async with self._pool.acquire() as conn:
+            return _optional_row(
+                await conn.fetchrow(
+                    "SELECT * FROM agent_compute_deployment_profiles WHERE id=$1", profile_id
+                )
+            )
+
+    async def save_deployment_profile(
+        self,
+        *,
+        profile_id: str,
+        label: str,
+        configuration: dict[str, Any],
+        source_bundle: bytes,
+        source_sha256: str,
+        secret_ciphertext: str,
+    ) -> dict[str, Any]:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """INSERT INTO agent_compute_deployment_profiles
+                (id,label,configuration,source_bundle,source_sha256,secret_ciphertext)
+                VALUES ($1,$2,$3::jsonb,$4,$5,$6)
+                ON CONFLICT (id) DO NOTHING RETURNING *""",
+                profile_id,
+                label,
+                _json(configuration),
+                source_bundle,
+                source_sha256,
+                secret_ciphertext,
+            )
+        if row is None:
+            raise ValueError("deployment_profile_exists")
+        return _row(row)
+
     async def list_connections(self) -> list[dict[str, Any]]:
         """Return metadata only; ciphertext is restricted to trusted get_connection."""
         async with self._pool.acquire() as conn:

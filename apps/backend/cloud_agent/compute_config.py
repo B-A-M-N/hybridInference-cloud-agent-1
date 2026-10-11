@@ -17,7 +17,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import ValidationError
 
-from cloud_agent.compute_secrets import ComputeSecretError
+from cloud_agent.compute_secrets import ComputeSecretError, StoredDeploymentResolver
 from cloud_agent.ports.external.host_bootstrap import DeploymentProfile
 
 if TYPE_CHECKING:
@@ -136,10 +136,13 @@ class ComputeSecretResolver:
     ) -> None:
         self.connections = connections
         self._paths = dict(configuration.deployment_secrets)
+        self._stored = StoredDeploymentResolver(connections.repository, connections)
 
     async def resolve(self, ref: str) -> str:
         """Resolve only configured deployment files or registered connection IDs."""
         if not ref.startswith("deployment:"):
+            if ref.startswith(StoredDeploymentResolver.PREFIX):
+                return await self._stored.resolve(ref)
             return await self.connections.resolve(ref)
         path = self._paths.get(ref[11:])
         if path is None:
@@ -148,6 +151,12 @@ class ComputeSecretResolver:
             return await asyncio.to_thread(self._read, path)
         except (OSError, UnicodeError, ValueError):
             raise ComputeSecretError("deployment credential cannot be read") from None
+
+    async def bundle(self, ref: str) -> bytes:
+        """Resolve a bundle registered through the trusted Admin profile API."""
+        if not ref.startswith(StoredDeploymentResolver.PREFIX):
+            raise ComputeSecretError("deployment bundle reference is invalid")
+        return await self._stored.bundle(ref)
 
     @staticmethod
     def _read(path: str) -> str:
