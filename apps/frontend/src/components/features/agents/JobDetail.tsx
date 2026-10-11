@@ -2719,6 +2719,7 @@ export function JobDetail({
               >
                 {filesInitialized ? (
                   <WorkspaceFiles
+                    key={workspaceScope}
                     job={job}
                     active={workspaceOpen && workspaceTab === 'files'}
                     requestedPath={
