@@ -1033,6 +1033,14 @@ describe('TaskComposer source-control onboarding', () => {
     expect(
       within(dialog).getByRole('link', { name: 'Configure repository access' }),
     ).toHaveAttribute('href', '/integrations');
+    expect(within(dialog).getByRole('link', { name: 'Create new repository' })).toHaveAttribute(
+      'href',
+      'https://github.com/new',
+    );
+    expect(within(dialog).getByRole('link', { name: 'Create new repository' })).toHaveAttribute(
+      'target',
+      '_blank',
+    );
     // Enter with nothing to take chooses nothing.
     fireEvent.keyDown(search, { key: 'Enter' });
     expect(screen.getByRole('dialog', { name: 'Repository' })).toBeInTheDocument();

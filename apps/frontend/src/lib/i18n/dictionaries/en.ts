@@ -282,6 +282,7 @@ export const en = {
   'composer.repositoryEmpty': 'No repositories yet.',
   'composer.repositoryNoMatch': 'Nothing matches “{query}”.',
   'composer.repositoryMissing': 'A repository appears here once the GitHub App has access to it.',
+  'composer.repositoryCreate': 'Create new repository',
   'composer.repositoryConfigure': 'Configure repository access',
   'composer.repositoryRefresh': 'Refresh',
   'composer.repositoryRefreshing': 'Refreshing…',

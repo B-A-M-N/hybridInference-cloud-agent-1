@@ -273,6 +273,15 @@ export function RepositoryPicker({
             ) : null}
           </div>
           <div className="mt-1 flex shrink-0 items-center gap-1 border-t border-gray-100 pt-1 dark:border-white/5">
+            <a
+              href="https://github.com/new"
+              target="_blank"
+              rel="noreferrer"
+              className={CONFIGURE_CLASS}
+            >
+              <GitHubMark className="h-4 w-4 shrink-0" />
+              <span className="truncate">{t('composer.repositoryCreate')}</span>
+            </a>
             {onConfigure ? (
               <button
                 type="button"

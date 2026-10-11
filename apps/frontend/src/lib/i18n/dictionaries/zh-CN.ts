@@ -273,6 +273,7 @@ export const zhCN: Record<TranslationKey, string> = {
   'composer.repositoryEmpty': '还没有可用的仓库。',
   'composer.repositoryNoMatch': '没有匹配“{query}”的仓库。',
   'composer.repositoryMissing': '给 GitHub App 授权某个仓库之后，它才会出现在这里。',
+  'composer.repositoryCreate': '新建仓库',
   'composer.repositoryConfigure': '配置仓库权限',
   'composer.repositoryRefresh': '刷新',
   'composer.repositoryRefreshing': '刷新中…',
