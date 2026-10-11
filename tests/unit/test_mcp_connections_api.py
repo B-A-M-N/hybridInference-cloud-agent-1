@@ -31,9 +31,9 @@ from tests.support.storage import AllCapabilities, OneFake
 from cloud_agent.api import mcp_connections
 from cloud_agent.api._owner_auth import require_agent_owner
 from cloud_agent.api.deps import get_storage
+from cloud_agent.mcp.errors import McpCredentialWriteRejected
 from cloud_agent.mcp.models import CapabilityKind, ToolPolicy
 from cloud_agent.mcp.registry import mcp_cipher
-from cloud_agent.ports.mcp import McpCredentialWriteRejected
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence

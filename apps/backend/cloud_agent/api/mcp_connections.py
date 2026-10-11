@@ -45,6 +45,7 @@ from cloud_agent.logging_utils import get_logger
 from cloud_agent.mcp import config_import, github_oauth, launch, oauth
 from cloud_agent.mcp.authorization import binding_from_selection
 from cloud_agent.mcp.binding_aliases import binding_aliases
+from cloud_agent.mcp.errors import McpCredentialWriteRejected
 from cloud_agent.mcp.host import HostError, McpHost, SessionKey
 from cloud_agent.mcp.http_body import IDENTITY_ENCODING_HEADERS
 from cloud_agent.mcp.launch import LaunchPlanError, ManagedLaunchPolicy, build_launch_plan
@@ -74,7 +75,6 @@ from cloud_agent.mcp.registry import (
     oauth_cipher,
     resolve_connection,
 )
-from cloud_agent.ports.mcp import McpCredentialWriteRejected
 from cloud_agent.settings import setting_env
 from cloud_agent.source_control import SourceControlError
 

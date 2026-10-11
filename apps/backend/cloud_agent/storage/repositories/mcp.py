@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
-from cloud_agent.ports.mcp import McpCredentialWriteRejected
+from cloud_agent.mcp.errors import McpCredentialWriteRejected
 from cloud_agent.storage._sql.mcp import ensure_mcp_bindings, mcp_binding_row
 from cloud_agent.storage._sql.rows import load_json as _load_json
 
@@ -200,7 +200,7 @@ class PostgresMcpConnectionRepository:
 
         ``access_token_ciphertext`` and ``sealed_launch_spec`` are written in
         the same transaction as the insert. A rejected write raises
-        :class:`~cloud_agent.ports.mcp.McpCredentialWriteRejected` and leaves
+        :class:`~cloud_agent.mcp.errors.McpCredentialWriteRejected` and leaves
         no row.
         """
         async with self._pool.acquire() as conn, conn.transaction():

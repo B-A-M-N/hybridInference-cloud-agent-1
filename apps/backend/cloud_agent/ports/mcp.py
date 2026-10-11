@@ -8,15 +8,6 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
 
-class McpCredentialWriteRejected(Exception):
-    """A credential write matched no row, so its connection must not remain.
-
-    Raised inside the creation transaction. The insert rolls back with it,
-    which is what keeps a rejected secret from leaving a credential-less
-    connection behind.
-    """
-
-
 class McpConnectionRepository(Protocol):
     """Persistence operations needed by the MCP control plane."""
 
@@ -65,7 +56,7 @@ class McpConnectionRepository(Protocol):
 
         ``access_token_ciphertext`` and ``sealed_launch_spec`` are written in
         the same transaction as the insert. A rejected write raises
-        :class:`McpCredentialWriteRejected` and leaves no row.
+        ``McpCredentialWriteRejected`` and leaves no row.
         """
         ...
 
