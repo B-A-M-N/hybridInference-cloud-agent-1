@@ -41,6 +41,96 @@
         "title": "AddComputeConnection",
         "type": "object"
       },
+      "AddDeploymentProfile": {
+        "additionalProperties": false,
+        "description": "Create a reviewed Host deployment profile from write-only Admin inputs.",
+        "properties": {
+          "data_mount": {
+            "anyOf": [
+              {
+                "pattern": "^/[a-zA-Z0-9/_-]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Mount"
+          },
+          "deploy_root": {
+            "default": "/opt/cloud-agent",
+            "pattern": "^/[a-zA-Z0-9/_-]+$",
+            "title": "Deploy Root",
+            "type": "string"
+          },
+          "deployment_sha": {
+            "pattern": "^[a-f0-9]{40}$",
+            "title": "Deployment Sha",
+            "type": "string"
+          },
+          "environment": {
+            "format": "password",
+            "maxLength": 65536,
+            "minLength": 1,
+            "title": "Environment",
+            "type": "string",
+            "writeOnly": true
+          },
+          "files": {
+            "additionalProperties": {
+              "format": "password",
+              "maxLength": 65536,
+              "minLength": 1,
+              "type": "string",
+              "writeOnly": true
+            },
+            "maxProperties": 24,
+            "minProperties": 1,
+            "title": "Files",
+            "type": "object"
+          },
+          "id": {
+            "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "install_prerequisites": {
+            "default": true,
+            "title": "Install Prerequisites",
+            "type": "boolean"
+          },
+          "label": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          },
+          "source_bundle_base64": {
+            "format": "password",
+            "minLength": 1,
+            "title": "Source Bundle Base64",
+            "type": "string",
+            "writeOnly": true
+          },
+          "timeout_seconds": {
+            "default": 3600,
+            "maximum": 7200.0,
+            "minimum": 60.0,
+            "title": "Timeout Seconds",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "deployment_sha",
+          "environment",
+          "files",
+          "source_bundle_base64"
+        ],
+        "title": "AddDeploymentProfile",
+        "type": "object"
+      },
       "AddServerRequest": {
         "additionalProperties": false,
         "description": "Acquire or attach a resource and deploy a configured Host profile.",
@@ -16295,6 +16385,65 @@
           }
         },
         "summary": "Validate Connection"
+      }
+    },
+    "/admin/agent/compute-deployment-profiles": {
+      "post": {
+        "description": "Save a write-only deployment bundle and encrypted Host inputs.",
+        "operationId": "create_deployment_profile_admin_agent_compute_deployment_profiles_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddDeploymentProfile"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Deployment Profile Admin Agent Compute Deployment Profiles Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Deployment Profile"
       }
     },
     "/admin/agent/compute-operations": {
