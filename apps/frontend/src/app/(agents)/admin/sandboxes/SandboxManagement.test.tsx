@@ -490,6 +490,62 @@ describe('archive before physical sandbox deletion', () => {
     vi.mocked(getAdminSandbox).mockResolvedValue(detail({ state: 'stopped' }));
   });
 
+  it('offers guarded force deletion for a reviewed idle sandbox still recorded as running', async () => {
+    vi.mocked(getAdminSandbox).mockResolvedValue(detail({ state: 'running' }));
+    vi.mocked(deleteAdminSandbox).mockResolvedValue(
+      detail({ state: 'stopped', deletion_state: 'pending', deletion_requested_at: observedAt }),
+    );
+    mount();
+
+    const button = await screen.findByRole('button', {
+      name: 'Verify stopped and force delete',
+    });
+    expect(button).toBeEnabled();
+    fireEvent.click(button);
+
+    expect(window.confirm).toHaveBeenCalledWith(
+      expect.stringContaining('exact retained container'),
+    );
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('stopped and idle'));
+    expect(window.confirm).toHaveBeenCalledWith(
+      expect.stringContaining('does not stop a running container'),
+    );
+    expect(window.confirm).toHaveBeenCalledWith(
+      expect.stringMatching(/uploaded to S3 and verified before deletion/i),
+    );
+    expect(deleteAdminSandbox).toHaveBeenCalledWith(
+      'sandbox-one',
+      { generation: 4, container_id: 'container-one', last_activity_at: observedAt },
+      expect.any(AbortSignal),
+      true,
+    );
+    expect(await screen.findByText(/Archiving to S3/)).toBeInTheDocument();
+    expect(onChanged).toHaveBeenCalledOnce();
+  });
+
+  it('shows the server refusal when the exact force-delete container is still live', async () => {
+    vi.mocked(getAdminSandbox).mockResolvedValue(detail({ state: 'running' }));
+    vi.mocked(deleteAdminSandbox).mockRejectedValue(
+      new APIError('CONFLICT', 'The exact retained container is still running.', 409),
+    );
+    mount();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Verify stopped and force delete' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'The exact retained container is still running.',
+    );
+    expect(deleteAdminSandbox).toHaveBeenCalledWith(
+      'sandbox-one',
+      { generation: 4, container_id: 'container-one', last_activity_at: observedAt },
+      expect.any(AbortSignal),
+      true,
+    );
+    await waitFor(() => expect(getAdminSandbox).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole('button', { name: 'Verify stopped and force delete' })).toBeEnabled();
+    expect(onChanged).not.toHaveBeenCalled();
+  });
+
   it('confirms the shared loss of live resume and sends the reviewed container fence', async () => {
     vi.mocked(deleteAdminSandbox).mockResolvedValue(
       detail({ state: 'stopped', deletion_state: 'pending', deletion_requested_at: observedAt }),
@@ -521,7 +577,6 @@ describe('archive before physical sandbox deletion', () => {
   });
 
   it.each([
-    { state: 'running' },
     { state: 'stopping' },
     { state: 'stopped_dirty' },
     { state: 'lost' },

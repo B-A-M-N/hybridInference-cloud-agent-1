@@ -189,8 +189,9 @@ export function deleteAdminSandbox(
   sandboxId: string,
   reviewed: AdminSandboxStopRequest,
   signal?: AbortSignal,
+  force = false,
 ): Promise<AdminSandboxDetail> {
-  return postSandboxAction(sandboxId, 'delete', reviewed, signal);
+  return postSandboxAction(sandboxId, 'delete', reviewed, signal, force ? '?force=true' : '');
 }
 
 function postSandboxAction(
@@ -198,10 +199,11 @@ function postSandboxAction(
   operation: 'archive' | 'restore' | 'delete',
   reviewed: AdminSandboxInventoryRequest,
   signal?: AbortSignal,
+  query = '',
 ): Promise<AdminSandboxDetail> {
   return fetchWithAuth(
     config.apiBase,
-    `/admin/agent/sandboxes/${encodeURIComponent(sandboxId)}/${operation}`,
+    `/admin/agent/sandboxes/${encodeURIComponent(sandboxId)}/${operation}${query}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

@@ -84,6 +84,35 @@ describe('admin sandbox inventory client', () => {
     });
   });
 
+  it('marks a server-verified running-state deletion with the force query', async () => {
+    const response = {
+      sandbox: { state: 'stopped', deletion_state: 'pending', deletion_request_id: 'request-one' },
+      members: [],
+      observed_at: 'now',
+    };
+    const fetch = vi
+      .spyOn(client, 'fetchWithAuth')
+      .mockResolvedValue(new Response(JSON.stringify(response), { status: 202 }));
+    const reviewed = {
+      generation: 3,
+      container_id: 'container-one',
+      last_activity_at: '2026-10-10T09:59:00Z',
+    };
+    const controller = new AbortController();
+
+    expect(await deleteAdminSandbox('sandbox/one', reviewed, controller.signal, true)).toEqual(
+      response,
+    );
+    expect(fetch.mock.calls[0][1]).toBe('/admin/agent/sandboxes/sandbox%2Fone/delete?force=true');
+    expect(fetch.mock.calls[0][2]).toEqual({
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(reviewed),
+      signal: controller.signal,
+      cache: 'no-store',
+    });
+  });
+
   it.each([
     ['archive', archiveAdminSandbox],
     ['restore', restoreAdminSandbox],
