@@ -1742,6 +1742,40 @@ async def test_inventory_reports_configured_period_only_for_observable_resources
     assert "next_check_at" not in resource
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["terminated", "absent"])
+async def test_inventory_omits_stale_observation_warning_for_terminal_resources(compute_api, state):
+    client, repo, _ = compute_api
+    _, operation = await allocation(client)
+    repo.allocations[operation["allocation_id"]].update(
+        observed_state=state,
+        observation_error="credentials_expired",
+    )
+
+    response = await client.get("/admin/agent/servers", headers=ADMIN)
+
+    assert response.status_code == 200
+    reasons = response.json()["allocations"][0]["blocked_reasons"]
+    assert not any(reason["code"] == "observation_stale" for reason in reasons)
+
+
+@pytest.mark.asyncio
+async def test_inventory_keeps_stale_observation_warning_until_release_is_confirmed(compute_api):
+    client, repo, _ = compute_api
+    _, operation = await allocation(client)
+    repo.allocations[operation["allocation_id"]].update(
+        observed_state="unknown",
+        observation_error="credentials_expired",
+        release_committed_at=datetime.now(UTC),
+    )
+
+    response = await client.get("/admin/agent/servers", headers=ADMIN)
+
+    assert response.status_code == 200
+    reasons = response.json()["allocations"][0]["blocked_reasons"]
+    assert [reason["code"] for reason in reasons] == ["observation_stale"]
+
+
 def deployment_bundle() -> str:
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w:gz") as archive:

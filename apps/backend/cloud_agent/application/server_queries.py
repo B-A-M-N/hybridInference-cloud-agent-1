@@ -52,7 +52,10 @@ class ServerQueries:
             reasons.append(
                 {"code": "provider_unavailable", "message": "Provider is not configured."}
             )
-        if row.get("observation_error"):
+        if row.get("observation_error") and row.get("observed_state") not in {
+            "terminated",
+            "absent",
+        }:
             reasons.append(
                 {"code": "observation_stale", "message": "Resource observation needs refresh."}
             )
