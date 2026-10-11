@@ -36,6 +36,7 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, TypeVar
 
+from cloud_agent_host.bounded_output import OutputPump
 from cloud_agent_host.runtimes import (
     DIFF,
     EMPTY_RUNTIME_MCP_CONFIG,
@@ -2243,16 +2244,23 @@ class ClaudeCodeLiveTurn(HarnessTurn[ClaudeCodeRuntime]):
                 "options": [
                     {"label": "Approve plan", "description": "Continue with implementation."}
                 ],
-                "allow_custom": False,
+                "allow_custom": True,
+                "kind": "plan_approval",
             }
         ]
 
-        def respond(_answers: dict[str, list[str]], reject: bool) -> None:
-            response = (
-                {"behavior": "deny", "message": "The user declined this plan. Keep planning."}
-                if reject
-                else {"behavior": "allow", "updatedInput": original_input}
-            )
+        def respond(answers: dict[str, list[str]], reject: bool) -> None:
+            feedback = ", ".join(answers.get("0", [])).strip()
+            approved = not reject and feedback == "Approve plan"
+            if approved:
+                response: dict[str, Any] = {"behavior": "allow", "updatedInput": original_input}
+            else:
+                declined = (
+                    "The user declined this plan. Keep planning."
+                    if not feedback
+                    else f"The user declined this plan: {feedback}"
+                )
+                response = {"behavior": "deny", "message": declined}
             self._reply_permission(native_id, response)
 
         self._remember_question(native_id, questions, respond)
@@ -2400,7 +2408,8 @@ class ClaudeCodeLiveSession(HarnessSession[ClaudeCodeRuntime]):
         # Reading with a deadline takes a thread that reads stdout into this
         # queue from then on; ``None`` in it is the end of the stream. Started
         # only when a turn needs one, which is rare.
-        self._stdout: queue.Queue[str | None] | None = None
+        self._stdout: OutputPump[str] | None = None
+        self._stdout_ended = False
         self._pushed_back: deque[str] = deque()
         self._model: str | None = None
         #: Pinned by the first turn alongside the model, and compared against
@@ -2423,30 +2432,20 @@ class ClaudeCodeLiveSession(HarnessSession[ClaudeCodeRuntime]):
             raise DriverError("Claude resident process is not alive")
         self._write_line(self.runtime.user_message_line(text))
 
-    @staticmethod
-    def _pump(lines: Iterator[str], into: queue.Queue[str | None]) -> None:
-        try:
-            for line in lines:
-                into.put(line)
-        finally:
-            into.put(None)
-
     def next_line(self, timeout: float | None) -> str | None:
         """The next stdout line, ``None`` at its end; ``queue.Empty`` on timeout."""
         if self._pushed_back:
             return self._pushed_back.popleft()
         assert self._lines is not None
+        if self._stdout_ended:
+            return None
         if self._stdout is None:
             if timeout is None:
                 return next(self._lines, None)
-            self._stdout = queue.Queue()
-            threading.Thread(
-                target=self._pump, args=(self._lines, self._stdout), daemon=True
-            ).start()
+            self._stdout = OutputPump(self._lines, name="claude-resident-output")
         line = self._stdout.get(timeout=timeout)
         if line is None:
-            # Stay at the end for whoever reads next.
-            self._stdout.put(None)
+            self._stdout_ended = True
         return line
 
     def shared_lines(self) -> Iterator[str]:
@@ -2629,6 +2628,11 @@ class ClaudeCodeLiveSession(HarnessSession[ClaudeCodeRuntime]):
         if self._closed:
             return
         self._closed = True
+        if self._stdout is not None:
+            # A graceful EOF can still produce native JSONL while it flushes
+            # history. Discard that output under the same memory limits so
+            # a full pipe does not turn the grace period into a forced kill.
+            self._stdout.close(drain=True)
         if self._process is not None:
             self._process.close_stdin()
             # A result event can precede Claude's asynchronous JSONL flush.

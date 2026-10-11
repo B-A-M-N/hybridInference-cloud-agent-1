@@ -3463,6 +3463,14 @@
             "title": "Models",
             "type": "array"
           },
+          "plugin_runtimes": {
+            "description": "Runtime ids that support plugins installed at sandbox initialization.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Plugin Runtimes",
+            "type": "array"
+          },
           "repos": {
             "description": "Repositories this deployment is entitled to work on. Empty means none.",
             "items": {
@@ -4236,6 +4244,22 @@
             "title": "Model",
             "type": "string"
           },
+          "plugins": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/SandboxPlugin"
+                },
+                "maxItems": 8,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Plugins installed for this chat during sandbox initialization.",
+            "title": "Plugins"
+          },
           "reasoning_effort": {
             "anyOf": [
               {
@@ -4782,6 +4806,13 @@
               }
             ],
             "title": "Pinned At"
+          },
+          "plugins": {
+            "items": {
+              "$ref": "#/components/schemas/SandboxPlugin"
+            },
+            "title": "Plugins",
+            "type": "array"
           },
           "published_commit_sha": {
             "anyOf": [
@@ -5473,6 +5504,18 @@
           "id": {
             "title": "Id",
             "type": "string"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "const": "plan_approval",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
           },
           "multiple": {
             "default": false,
@@ -7689,6 +7732,17 @@
             "default": false,
             "title": "Needs Client Id",
             "type": "boolean"
+          },
+          "redirect_uri": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Redirect Uri"
           }
         },
         "title": "AuthorizeResponse",
@@ -10846,6 +10900,17 @@
             "title": "Arguments Digest",
             "type": "string"
           },
+          "attempt_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attempt Id"
+          },
           "capability_annotations": {
             "additionalProperties": true,
             "title": "Capability Annotations",
@@ -12546,6 +12611,36 @@
           }
         },
         "title": "SandboxArchiveSettingsResponse",
+        "type": "object"
+      },
+      "SandboxPlugin": {
+        "additionalProperties": false,
+        "description": "One native marketplace plugin or npm plugin package for a chat.",
+        "properties": {
+          "marketplace": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 3,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Marketplace"
+          },
+          "plugin": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Plugin",
+            "type": "string"
+          }
+        },
+        "required": [
+          "plugin"
+        ],
+        "title": "SandboxPlugin",
         "type": "object"
       },
       "SandboxResourceSample": {
@@ -14384,6 +14479,21 @@
         "title": "UpdateConnectorRequest",
         "type": "object"
       },
+      "UpdateMemorySettings": {
+        "additionalProperties": false,
+        "description": "Enable or pause automatic memory creation and use.",
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "title": "UpdateMemorySettings",
+        "type": "object"
+      },
       "UpdateSettingsRequest": {
         "additionalProperties": false,
         "description": "A partial settings update; omitted keys retain their existing values.",
@@ -14464,6 +14574,215 @@
           "revision"
         ],
         "title": "UpdateSkill",
+        "type": "object"
+      },
+      "UserAvatar": {
+        "description": "An illustrated portrait that can be displayed directly by an image element.",
+        "properties": {
+          "data_url": {
+            "title": "Data Url",
+            "type": "string"
+          },
+          "style": {
+            "const": "illustrated",
+            "default": "illustrated",
+            "title": "Style",
+            "type": "string"
+          }
+        },
+        "required": [
+          "data_url"
+        ],
+        "title": "UserAvatar",
+        "type": "object"
+      },
+      "UserMemory": {
+        "description": "A compact preference or task with its original job reference.",
+        "properties": {
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "preference",
+              "task"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "source_job_id": {
+            "title": "Source Job Id",
+            "type": "string"
+          },
+          "source_repo": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Repo"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "content",
+          "source_job_id"
+        ],
+        "title": "UserMemory",
+        "type": "object"
+      },
+      "UserMemoryView": {
+        "description": "Public view of a user's bounded recent work profile and memory.",
+        "properties": {
+          "avatar": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UserAvatar"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "memories": {
+            "items": {
+              "$ref": "#/components/schemas/UserMemory"
+            },
+            "title": "Memories",
+            "type": "array"
+          },
+          "portrait": {
+            "$ref": "#/components/schemas/UserPortrait"
+          },
+          "revision": {
+            "default": 0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "suggestions": {
+            "items": {
+              "$ref": "#/components/schemas/UserSuggestion"
+            },
+            "title": "Suggestions",
+            "type": "array"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "title": "UserMemoryView",
+        "type": "object"
+      },
+      "UserPortrait": {
+        "description": "Observed work areas and commonly used agent settings.",
+        "properties": {
+          "focus_areas": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Focus Areas",
+            "type": "array"
+          },
+          "preferred_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preferred Model"
+          },
+          "preferred_runtime": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preferred Runtime"
+          },
+          "projects": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Projects",
+            "type": "array"
+          },
+          "summary": {
+            "default": "No recent work recorded yet.",
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "title": "UserPortrait",
+        "type": "object"
+      },
+      "UserSuggestion": {
+        "description": "An actionable improvement supported by recent requests.",
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "reason",
+          "action"
+        ],
+        "title": "UserSuggestion",
         "type": "object"
       },
       "ValidationError": {
@@ -14793,6 +15112,13 @@
               }
             ],
             "title": "Parent Job Id"
+          },
+          "plugins": {
+            "items": {
+              "$ref": "#/components/schemas/SandboxPlugin"
+            },
+            "title": "Plugins",
+            "type": "array"
           },
           "reasoning_effort": {
             "anyOf": [
@@ -28696,6 +29022,162 @@
         ]
       }
     },
+    "/v1/agent/user-memory": {
+      "delete": {
+        "description": "Forget historical memory; only newer requests can build it again.",
+        "operationId": "clear_user_memory_v1_agent_user_memory_delete",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserMemoryView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clear User Memory",
+        "tags": [
+          "user-memory"
+        ]
+      },
+      "get": {
+        "description": "Automatically create the owner's avatar and refresh their recent memory.",
+        "operationId": "read_user_memory_v1_agent_user_memory_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserMemoryView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read User Memory",
+        "tags": [
+          "user-memory"
+        ]
+      },
+      "patch": {
+        "description": "Pause generation and prompt personalization, or resume future updates.",
+        "operationId": "update_user_memory_v1_agent_user_memory_patch",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateMemorySettings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserMemoryView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update User Memory",
+        "tags": [
+          "user-memory"
+        ]
+      }
+    },
     "/v1/agent/worker/claim": {
       "post": {
         "description": "Claim the next queued job and mint this attempt's capability token.\n\nReturns ``null`` (HTTP 200) when the queue is empty, and equally when an\noperator has pinned agent jobs to a different host than the one this runner\nreports. The two are deliberately the same answer on the wire: a runner\nthat has been switched away from should idle exactly as it does when there\nis no work, not treat it as an error worth retrying differently. Which host\nis active is an admin question, answered on the admin surface.\n\n**Enrolled-host only.** ``claim_job`` takes the oldest queued job across all\ntenants, and the response carries that job's repo, prompt, and metadata\nplus a working capability token for it — so ordinary API-key auth here\nwould let any customer dequeue and read another customer's job, and drain\nthe queue besides.\n\nThe per-host credential opens registration/heartbeat/claim surfaces and\nnever enters the sandbox; only the returned per-attempt tokens go in.",
@@ -29214,7 +29696,7 @@
     },
     "/v1/agent/worker/jobs/{job_id}/release": {
       "post": {
-        "description": "Hand a claimed turn back to the queue, having never started it.\n\nThe one path from a claim back to ``queued`` without spending an attempt.\nA host claims a turn and then starts the process that will run it; when\nthat process cannot be started, or exits without taking delivery, the turn\nhas provably not begun and the person waiting on it should not wait out a\nlease that nothing is holding.\n\n**Not an escape hatch for a turn that is running.** The release is refused\nonce the turn has been admitted to the CLI, and the check is the database's\nrather than the caller's: replaying an admitted prompt executes the same\ninstruction twice, which is what the retained-session rules exist to\nprevent. A caller that is refused has lost nothing — the lease was always\nthe backstop, and it still is.",
+        "description": "Hand a claimed turn back to the queue, having never started it.\n\nThe one path from a claim back to ``queued`` without spending an attempt.\nA host claims a turn and then starts the process that will run it; when\nthat process cannot be started, or exits without taking delivery, the turn\nhas provably not begun and the person waiting on it should not wait out a\nlease that nothing is holding.\n\nA short retry delay lets other queued work proceed while the host recovers\nfrom a temporary refusal, including work that can resume an existing sandbox.\n\n**Not an escape hatch for a turn that is running.** The release is refused\nonce the turn has been admitted to the CLI, and the check is the database's\nrather than the caller's: replaying an admitted prompt executes the same\ninstruction twice, which is what the retained-session rules exist to\nprevent. A caller that is refused has lost nothing — the lease was always\nthe backstop, and it still is.",
         "operationId": "worker_release_v1_agent_worker_jobs__job_id__release_post",
         "parameters": [
           {

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import io
 import json
 import subprocess
+import tarfile
 import threading
 import time
 from dataclasses import asdict, replace
@@ -15,8 +17,11 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from cloud_agent_host.chat_sandbox import (
+    FINAL_ARCHIVE_MARKER_NAME,
+    INITIAL_ARCHIVE_MARKER_ROOT,
     MEMBER_UID_BASE,
     ChatSandboxInspection,
+    ChatSandboxManager,
     ChatSandboxSpec,
     ChatSandboxStatus,
     RetainedChatFailStopped,
@@ -2019,7 +2024,10 @@ def test_snapshot_start_failure_releases_the_admission_barrier():
 
 
 @pytest.mark.parametrize("reserved_child", [False, True])
-def test_native_fork_tracks_activity_but_does_not_lock_a_sibling_operation(reserved_child):
+@pytest.mark.parametrize("with_plugins", [False, True])
+def test_native_fork_tracks_activity_but_does_not_lock_a_sibling_operation(
+    reserved_child, with_plugins
+):
     manager = _Manager()
     factory = _TransportFactory()
     supervisor: SharedChatSessionSupervisor
@@ -2028,6 +2036,7 @@ def test_native_fork_tracks_activity_but_does_not_lock_a_sibling_operation(reser
         assert source_transport.native_session_id == "native-source"
         assert operation_id == "fork-one"
         assert source_native_turn_no == 1
+        assert target_launch.plugins == source_transport.launch.plugins
         token, peer = supervisor.operation_opened("athr_peer")
         assert peer.operation_count == 1
         assert supervisor.status("athr_source").operation_count == 1
@@ -2049,7 +2058,12 @@ def test_native_fork_tracks_activity_but_does_not_lock_a_sibling_operation(reser
         manifest=_members(),
         expected_container_id="container-shared",
     )
-    source_launch = _launch("athr_source", native_session_id="native-source", slot=0)
+    plugins = (
+        ({"plugin": "review@fixture", "marketplace": "owner/marketplace"},) if with_plugins else ()
+    )
+    source_launch = replace(
+        _launch("athr_source", native_session_id="native-source", slot=0), plugins=plugins
+    )
     supervisor.ensure_resident("athr_source", lease.token, source_launch)
     supervisor.settle(
         "athr_source",
@@ -2079,7 +2093,9 @@ def test_native_fork_tracks_activity_but_does_not_lock_a_sibling_operation(reser
         target_thread_id="athr_child",
         target_slot_id=2,
         source_launch=source_launch,
-        target_launch=_launch("athr_child", native_session_id=None, slot=2),
+        target_launch=replace(
+            _launch("athr_child", native_session_id=None, slot=2), plugins=plugins
+        ),
     )
 
     assert result.container_id == "container-shared"
@@ -2087,6 +2103,8 @@ def test_native_fork_tracks_activity_but_does_not_lock_a_sibling_operation(reser
     assert supervisor.status("athr_child").resident_state == "live"
     assert supervisor.status("athr_source").operation_count == 0
     assert supervisor.status("athr_source").idle_deadline_monotonic is not None
+    assert factory.opened[-1].thread_id == "athr_child"
+    assert factory.opened[-1].plugins == plugins
 
     if reserved_child:
         # A concurrent Files/Git request can still carry the pending database
@@ -3027,6 +3045,116 @@ def test_durable_flush_block_survives_stop_failure_and_replacement_controller() 
     with pytest.raises(SessionBusy, match="native flush failure"):
         replacement.operation_opened(_spec().thread_id)
     replacement_controller.close()
+
+
+def test_cold_acquire_accepts_an_absent_final_marker_and_completes_the_start_fence() -> None:
+    class MarkerManager(_Manager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.marker: bytes | None = None
+            self.missing_exports = 0
+            self.marker_writes = 0
+            self.marker_clears = 0
+
+        def _require(self, spec: ChatSandboxSpec) -> ChatSandboxInspection:
+            return self.items[spec.container_name]
+
+        def read_final_archive_marker(self, spec, *, expected_container_id) -> bytes:
+            return ChatSandboxManager.read_final_archive_marker(
+                self, spec, expected_container_id=expected_container_id
+            )
+
+        def read_stopped_final_archive_marker_optional(
+            self, spec, *, expected_container_id
+        ) -> bytes | None:
+            return ChatSandboxManager.read_stopped_final_archive_marker_optional(
+                self, spec, expected_container_id=expected_container_id
+            )
+
+        def export_archive(self, spec, path, destination, **kwargs) -> int:
+            current = self._require(spec)
+            assert current.container_id == kwargs["expected_container_id"]
+            assert current.running is False
+            assert path == f"{INITIAL_ARCHIVE_MARKER_ROOT}/{FINAL_ARCHIVE_MARKER_NAME}"
+            if self.marker is None:
+                self.missing_exports += 1
+                # The real Docker copy normalizes this exact missing source
+                # into FileNotFoundError before writing any archive bytes.
+                raise FileNotFoundError(path)
+            with tarfile.open(fileobj=destination, mode="w") as archive:
+                entry = tarfile.TarInfo(FINAL_ARCHIVE_MARKER_NAME)
+                entry.uid = entry.gid = 0
+                entry.mode = 0o600
+                entry.size = len(self.marker)
+                archive.addfile(entry, io.BytesIO(self.marker))
+            return destination.tell()
+
+        def write_stopped_final_archive_marker(
+            self, spec, payload, *, expected_container_id
+        ) -> None:
+            self.marker = payload
+            self.marker_writes += 1
+            assert (
+                self.read_final_archive_marker(spec, expected_container_id=expected_container_id)
+                == payload
+            )
+            self.events.append("fence")
+
+        def start(self, spec, **kwargs) -> ChatSandboxInspection:
+            current = super().start(spec, **kwargs)
+            self.events.append("start")
+            return current
+
+        def clear_final_archive_marker(self, spec, *, expected_container_id) -> None:
+            current = self._require(spec)
+            assert current.container_id == expected_container_id
+            assert current.running is True
+            self.marker = None
+            self.marker_clears += 1
+            self.events.append("clear")
+
+    manager = MarkerManager()
+    spec = _spec()
+    manager.items[spec.container_name] = replace(
+        manager._inspection(spec, running=False), status=ChatSandboxStatus.CREATED
+    )
+    controller = SandboxArchiveController(manager, namespace="pool-east")
+    controller.start()
+    controller.apply(SandboxArchivePolicy(enabled=False, revision=1).as_dict())
+    supervisor = SharedChatSessionSupervisor(
+        manager,
+        starting_archive_prepare_hook=controller.prepare_start,
+        started_archive_hook=controller.complete_start,
+    )
+    try:
+        cold = supervisor.acquire(
+            spec,
+            thread_id=spec.thread_id,
+            owner="attempt:1",
+            activation_generation=1,
+            has_settled_context=False,
+            manifest=_members(),
+            expected_container_id="container-shared",
+        )
+        assert cold.token
+        assert cold.context_status == "new"
+        assert manager.events == ["fence", "start", "clear"]
+        supervisor.abandon(spec.thread_id, cold.token, lost=False)
+        warm = supervisor.acquire(
+            spec,
+            thread_id=spec.thread_id,
+            owner="attempt:2",
+            activation_generation=2,
+            has_settled_context=False,
+            manifest=_members(),
+            expected_container_id="container-shared",
+        )
+        assert warm.token != cold.token
+        assert manager.items[spec.container_name].running is True
+        assert manager.marker is None
+        assert manager.missing_exports == manager.marker_writes == manager.marker_clears == 1
+    finally:
+        controller.close()
 
 
 def test_archive_start_fence_runs_only_for_a_stopped_to_running_transition() -> None:

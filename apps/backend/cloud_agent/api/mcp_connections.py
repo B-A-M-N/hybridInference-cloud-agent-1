@@ -26,6 +26,7 @@ import hashlib
 import json
 import secrets
 from collections.abc import Mapping
+from contextlib import suppress
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import urlencode, urlsplit, urlunsplit
@@ -44,6 +45,7 @@ from cloud_agent.mcp import config_import, launch, oauth
 from cloud_agent.mcp.authorization import binding_from_selection
 from cloud_agent.mcp.binding_aliases import binding_aliases
 from cloud_agent.mcp.host import HostError, McpHost, SessionKey
+from cloud_agent.mcp.http_body import IDENTITY_ENCODING_HEADERS
 from cloud_agent.mcp.launch import LaunchPlanError, ManagedLaunchPolicy, build_launch_plan
 from cloud_agent.mcp.models import (
     AuthKind,
@@ -51,6 +53,7 @@ from cloud_agent.mcp.models import (
     ConnectionErrorKind,
     ConnectionStatus,
     ExecutionLocation,
+    HeaderAuth,
     InvocationStatus,
     LaunchSpec,
     ToolPolicy,
@@ -103,6 +106,52 @@ ENV_MCP_PUBLIC_BASE_URL = "AGENT_MCP_PUBLIC_BASE_URL"
 #: convenience, never a gate: a server with no template is added the same way.
 _TEMPLATES: tuple[dict[str, Any], ...] = (
     {
+        "name": "github",
+        "label": "GitHub",
+        "description": (
+            "Read issues, pull requests, code and releases across the repositories your "
+            "GitHub account can see."
+        ),
+        "url": "https://api.githubcopilot.com/mcp/readonly",
+        "transport": Transport.STREAMABLE_HTTP.value,
+        "auth_kind": AuthKind.STATIC.value,
+        "documentation_url": "https://github.com/github/github-mcp-server",
+        "notes": [
+            "Use a personal access token with access to the repositories your agents should read.",
+            "This connection uses GitHub's read-only endpoint.",
+        ],
+    },
+    {
+        "name": "slack",
+        "label": "Slack",
+        "description": "Search conversations and work with messages in your Slack workspace.",
+        "url": "https://mcp.slack.com/mcp",
+        "transport": Transport.STREAMABLE_HTTP.value,
+        "auth_kind": AuthKind.OAUTH.value,
+        "documentation_url": "https://docs.slack.dev/ai/slack-mcp-server/",
+        "notes": [
+            "Slack requires a registered internal or Marketplace app. Have its OAuth client "
+            "id and client secret ready, and register the callback URL shown during sign-in.",
+        ],
+    },
+    {
+        "name": "google-drive",
+        "label": "Google Drive",
+        "description": "Find files and work with documents in your Google Drive.",
+        "url": "https://drivemcp.googleapis.com/mcp/v1",
+        "transport": Transport.STREAMABLE_HTTP.value,
+        "auth_kind": AuthKind.OAUTH.value,
+        "documentation_url": (
+            "https://developers.google.com/workspace/drive/api/guides/configure-mcp-server"
+        ),
+        "notes": [
+            "Google Drive MCP requires Workspace Developer Preview membership. Enable the "
+            "Drive API and Google Drive MCP API in your Google Cloud project before connecting.",
+            "Have your OAuth client id and client secret ready, and register the callback URL "
+            "shown during sign-in.",
+        ],
+    },
+    {
         "name": "linear",
         "label": "Linear",
         "description": "Find issues, plan projects and keep your team's work up to date.",
@@ -128,22 +177,6 @@ _TEMPLATES: tuple[dict[str, Any], ...] = (
         "transport": Transport.STREAMABLE_HTTP.value,
         "auth_kind": AuthKind.OAUTH.value,
         "notes": [],
-    },
-    {
-        "name": "github",
-        "label": "GitHub",
-        "description": (
-            "Read issues, pull requests, code and releases across the repositories your "
-            "GitHub account can see."
-        ),
-        "url": "https://api.githubcopilot.com/mcp/readonly",
-        "transport": Transport.STREAMABLE_HTTP.value,
-        "auth_kind": AuthKind.OAUTH.value,
-        "notes": [
-            "GitHub does not register clients on behalf of an MCP host, so a client id is "
-            "required before the browser flow can start.",
-            "The /readonly variant is a GitHub-specific convenience, not a general rule.",
-        ],
     },
 )
 
@@ -381,6 +414,7 @@ class AuthorizeResponse(BaseModel):
     authorization_url: str | None = None
     needs_client_id: bool = False
     message: str = ""
+    redirect_uri: str | None = None
 
 
 class BindingRequest(BaseModel):
@@ -437,6 +471,8 @@ class InvocationView(BaseModel):
 
     id: int
     job_id: str
+    #: The attempt that raised the call, even when the job has since been retried.
+    attempt_id: int | None = None
     thread_id: str
     thread_title: str | None = None
     connection_id: int
@@ -1178,7 +1214,11 @@ async def authorize_connection(
         )
     except oauth.OAuthError as exc:
         if exc.kind == "client_registration_required":
-            return AuthorizeResponse(needs_client_id=True, message=str(exc))
+            return AuthorizeResponse(
+                needs_client_id=True,
+                message=str(exc),
+                redirect_uri=_callback_url(base_url, connection_id),
+            )
         raise _bad_request(str(exc)) from exc
 
     if identity.registration == "dcr":
@@ -1189,6 +1229,19 @@ async def authorize_connection(
     scopes = oauth.default_scopes(
         resource_metadata, metadata, connection.auth.oauth.scopes if connection.auth.oauth else ()
     )
+    # The OAuth resource identifier can differ from the MCP transport URL.
+    # Reauthorization may reuse the issuer without fetching resource metadata;
+    # retain a saved resource only while it still describes the current URL.
+    resource = connection.config.url
+    if resource_metadata:
+        resource = resource_metadata.resource
+    elif connection.auth.oauth and connection.auth.oauth.resource:
+        # Editing the URL can leave the previous credential's resource on
+        # the row. Keep the current URL when that saved resource no longer fits.
+        with suppress(oauth.OAuthError):
+            resource = oauth.parse_protected_resource_metadata(
+                {"resource": connection.auth.oauth.resource}, expect=connection.config.url
+            ).resource
     flow = oauth.OAuthFlow(
         versions=oauth.FlowVersions(
             connection_id=str(connection_id),
@@ -1200,7 +1253,7 @@ async def authorize_connection(
         pkce=oauth.PkcePair.generate(),
         client=identity,
         metadata=metadata,
-        resource=connection.config.url,
+        resource=resource,
         redirect_uri=_callback_url(base_url, connection_id),
         scopes=scopes,
     )
@@ -1291,7 +1344,10 @@ async def _post_json(
         raise _bad_request(f"that address could not be resolved: {exc}") from exc
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(15.0), follow_redirects=False, transport=pinned_transport()
+            timeout=httpx.Timeout(15.0),
+            follow_redirects=False,
+            headers=IDENTITY_ENCODING_HEADERS,
+            transport=pinned_transport(),
         ) as client:
             # Streamed, so the size limit is applied while the body arrives
             # rather than to a body the registration server already chose the
@@ -1302,7 +1358,7 @@ async def _post_json(
                     "POST",
                     endpoint.url,
                     json=dict(body),
-                    headers={"accept": "application/json"},
+                    headers={"accept": "application/json", **IDENTITY_ENCODING_HEADERS},
                 ),
                 stream=True,
             )
@@ -1404,7 +1460,7 @@ async def oauth_callback(
     )
     identity = oauth.ClientIdentity(
         client_id=str(flow["client_id"]),
-        registration="dcr",
+        registration=flow.get("registration") or "dcr",
         client_secret=(
             cipher.decrypt(str(flow["client_secret_ciphertext"]))
             if flow.get("client_secret_ciphertext")
@@ -1526,14 +1582,20 @@ async def _post_form(request: oauth.TokenRequest, *, policy: EgressPolicy) -> Ma
 
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(20.0), follow_redirects=False, transport=pinned_transport()
+            timeout=httpx.Timeout(20.0),
+            follow_redirects=False,
+            headers=IDENTITY_ENCODING_HEADERS,
+            transport=pinned_transport(),
         ) as client:
             # Streamed for the same reason as everywhere else on this path: a
             # token response is a body a server chooses the size of, and this
             # one carries the access and refresh tokens.
             response = await client.send(
                 client.build_request(
-                    "POST", endpoint.url, data=request.form(), headers=request.headers()
+                    "POST",
+                    endpoint.url,
+                    data=request.form(),
+                    headers={**request.headers(), **IDENTITY_ENCODING_HEADERS},
                 ),
                 stream=True,
             )
@@ -1941,6 +2003,7 @@ async def _invocation_view(
     return InvocationView(
         id=int(row["id"]),
         job_id=str(row["job_id"]),
+        attempt_id=int(row["attempt_id"]) if row.get("attempt_id") is not None else None,
         thread_id=thread_id,
         thread_title=thread_title,
         connection_id=int(row["connection_id"]),
@@ -2314,11 +2377,12 @@ def _build_auth(
             if header_scheme is not None
             else ("Bearer" if name.lower() == "authorization" else "")
         ).strip()
-        from cloud_agent.mcp.net_policy import sanitize_headers
-
         # Validated here rather than at dispatch time, so a header the platform
         # would refuse is reported while the user is still on the form.
-        sanitize_headers({name: "x"})
+        try:
+            HeaderAuth(header_name=name, scheme=scheme).render("x")
+        except EndpointRejected as exc:
+            raise _bad_request(str(exc)) from exc
         return kind, {"header_name": name, "scheme": scheme}
     if kind is AuthKind.OAUTH:
         return kind, {}
@@ -2387,6 +2451,10 @@ async def _store_static_secret(
     _kind, config = _build_auth(
         AuthKind.STATIC.value, header_name or _header_of(row), header_scheme
     )
+    try:
+        HeaderAuth(header_name=config["header_name"], scheme=config["scheme"]).render(secret)
+    except EndpointRejected as exc:
+        raise _bad_request(str(exc)) from exc
     # Two characters and two more, so a person can tell *which* credential is
     # stored without the page ever holding one it could be made to render.
     config["hint"] = f"{secret[:2]}{secret[-2:]}" if len(secret) > 4 else ""

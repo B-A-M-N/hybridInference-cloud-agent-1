@@ -79,6 +79,8 @@ export const en = {
     'A follow-up would fail the same way. Ask an admin to raise the repository import limit, or use a smaller repository.',
   'runDetails.siteMisconfigured':
     'An admin needs to finish setting up the site before you try another turn.',
+  'runDetails.restart': 'Restart in a new session',
+  'runDetails.restarting': 'Restarting…',
   'turnResults.region': 'Recorded turn results',
   'turnResults.title': 'Recorded changes',
   'turnResults.files': '{count} changed files',
@@ -205,11 +207,13 @@ export const en = {
   'sidebar.retry': 'Retry',
   'sidebar.closeSearch': 'Close search',
   'sidebar.unread': 'Unread result',
+  'sidebar.needsReview': 'Needs review',
+  'sidebar.waitingForAnswer': 'Waiting for your answer',
+  'sidebar.waitingForApproval': 'Waiting for your tool approval',
   'sidebar.reorderHint': 'Drag to reorder, or press Alt + Arrow Up / Down',
   'sidebar.moved': 'Order updated',
   'sidebar.newTask': 'New task',
   'sidebar.archived': 'Archived',
-  'sidebar.integrations': 'Integrations',
   'sidebar.noJobs': 'No jobs yet.',
   'sidebar.resize': 'Resize task list',
   'sidebar.showMore': 'Show {count} more',
@@ -223,7 +227,6 @@ export const en = {
   'sidebar.archiveTask': 'Archive task',
   'sidebar.archiveFailed': 'Could not archive the task.',
   'sidebar.pinFailed': 'Could not pin the task.',
-  'sidebar.openSettings': 'Open settings',
   'sidebar.justNow': 'now',
   'sidebar.minutesAgo': '{count}m',
   'sidebar.hoursAgo': '{count}h',
@@ -232,9 +235,49 @@ export const en = {
   'sidebar.dateOtherYear': '{month}/{day}/{year}',
 
   // ── Settings ────────────────────────────────────────────────────────────
-  'settings.title': 'Settings',
-  'settings.close': 'Close settings',
-  'settings.done': 'Done',
+  'settings.title': 'Setting',
+  'settings.description': 'Manage your connections, skills, memory, and notifications.',
+  'settings.memory.title': 'Avatar & memory',
+  'settings.memory.description':
+    'Your illustrated avatar is generated automatically and evolves with recent work. Memory uses up to your 50 latest requests to suggest improvements. Explicit preferences can guide future tasks in the same project.',
+  'settings.memory.avatar': 'Your avatar',
+  'settings.memory.avatarAlt': 'Your automatically generated illustrated avatar',
+  'settings.memory.avatarDescription':
+    'Your base character stays the same while colors and details reflect your recent work.',
+  'settings.memory.automatic': 'Automatically build memory',
+  'settings.memory.enabled':
+    'Your avatar’s theme, memory, and suggestions update automatically from your requests.',
+  'settings.memory.disabled':
+    'Avatar theme updates, memory updates, and personalization are paused.',
+  'settings.memory.loading': 'Loading your avatar and memory…',
+  'settings.memory.error': 'Could not load or update your memory. Please try again.',
+  'settings.memory.retry': 'Retry',
+  'settings.memory.signIn': 'Sign in to see your avatar and memory.',
+  'settings.memory.updated': 'Memory updated {date}',
+  'settings.memory.refresh': 'Refresh',
+  'settings.memory.refreshing': 'Refreshing…',
+  'settings.memory.clear': 'Clear memory',
+  'settings.memory.confirmTitle': 'Clear saved memory and suggestions?',
+  'settings.memory.confirmDescription':
+    'Clearing resets your avatar’s work theme while keeping its base character. Old requests won’t be used again. Future requests can build new memory and update the avatar when enabled.',
+  'settings.memory.confirmClear': 'Confirm clear memory',
+  'settings.memory.clearing': 'Clearing…',
+  'settings.memory.cancel': 'Cancel',
+  'settings.memory.portrait': 'Recent work',
+  'settings.memory.projects': 'Projects',
+  'settings.memory.focusAreas': 'Focus areas',
+  'settings.memory.runtime': 'Preferred runtime',
+  'settings.memory.model': 'Preferred model',
+  'settings.memory.emptyPortrait':
+    'Recent work will appear after you send requests with memory enabled.',
+  'settings.memory.memories': 'Saved memory',
+  'settings.memory.preference': 'Preference',
+  'settings.memory.task': 'Task context',
+  'settings.memory.source': 'View source task',
+  'settings.memory.emptyMemory': 'No saved memory yet.',
+  'settings.memory.suggestions': 'Suggestions for future tasks',
+  'settings.memory.emptySuggestions':
+    'Suggestions will appear when your activity provides enough context.',
   'settings.notifications.title': 'Notifications',
   'settings.notifications.description':
     'Get browser notifications when an agent asks a question or finishes a turn. Keep the app open to receive them.',
@@ -477,6 +520,37 @@ export const en = {
   'attach.mcpUnsupported': '{runtime} cannot be given MCP connections',
   'attach.skills': 'Skills',
   'attach.skillsDefaults': 'defaults',
+  'plugins.title': 'Plugins',
+  'plugins.description': 'Install {runtime} plugins when this conversation’s sandbox starts.',
+  'plugins.dismiss': 'Dismiss plugin dialog',
+  'plugins.plugin': 'Plugin',
+  'plugins.package': 'npm package',
+  'plugins.packageHint':
+    'Use a package name, optionally with an exact version. The npm: prefix is optional.',
+  'plugins.marketplace': 'Marketplace source',
+  'plugins.marketplaceHint':
+    'GitHub owner/repo or an HTTPS Git URL without credentials, query, or fragment.',
+  'plugins.empty': 'No plugins selected.',
+  'plugins.add': 'Add plugin',
+  'plugins.remove': 'Remove',
+  'plugins.removeNamed': 'Remove {name}',
+  'plugins.done': 'Done',
+  'plugins.manage': 'Manage plugins',
+  'plugins.limit': 'Select up to {limit} plugins.',
+  'plugins.invalidName':
+    'Enter a plugin as name@marketplace, for example code-review@claude-plugins-official.',
+  'plugins.invalidPackage':
+    'Enter an npm package name, optionally with an exact version such as @scope/plugin@1.2.3.',
+  'plugins.invalidCodexName':
+    'Enter name@marketplace using letters, numbers, hyphens, and underscores. Codex plugin names cannot contain dots.',
+  'plugins.invalidMarketplace':
+    'Enter a GitHub owner/repo or an HTTPS Git URL without credentials, query, or fragment.',
+  'plugins.duplicate': 'This plugin is already selected.',
+  'plugins.sourceConflict': 'Plugins from the same marketplace must use the same source.',
+  'plugins.unsupported':
+    '{runtime} does not support plugins. Remove the selected plugins or choose a supported agent to start this task.',
+  'plugins.incompatible':
+    'Selected plugins do not match {runtime}. Remove them or choose the agent they were added for.',
   'attach.uploading': 'uploading…',
   'attach.fileCount': '{count} files',
   'attach.remove': 'Remove {name}',
@@ -652,6 +726,8 @@ export const en = {
   'queue.attachmentsMany': '{count} attachments',
   // ── Shared ──────────────────────────────────────────────────────────────
   'common.loading': 'Loading…',
+  'common.retry': 'Retry',
+  'common.refreshFailed': 'Refresh failed — showing the last successful read.',
 } as const;
 
 export type TranslationKey = keyof typeof en;

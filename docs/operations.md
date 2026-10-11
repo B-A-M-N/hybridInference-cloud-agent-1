@@ -10,10 +10,11 @@ control plane.
 
 # Cloud agent sandbox — operations
 
-Use this runbook to provision hosts, deploy Cloud Agent, protect retained
-workspaces, and diagnose job or network failures. The control plane owns the job
-API, database, publisher, MCP relay, and admin settings. The gateway provides
-inference and identity over HTTP.
+This is a task-based runbook; you do not need to read it from beginning to end.
+Use it to provision hosts, deploy Cloud Agent, protect retained workspaces, and
+diagnose job or network failures. The control plane owns the job API, database,
+publisher, MCP relay, and admin settings. The gateway provides inference and
+identity over HTTP.
 
 Start with the task you need:
 
@@ -40,35 +41,40 @@ Start with the task you need:
 [compute-resource runbook](operations-compute.md) covers administrator-managed
 SSH and CloudLab hosts. For pre-drain checks, migration regression, failed peers,
 and queue alerts, use [deployment reliability](deployment-reliability.md).
-Historical measurements below describe the runs that were recorded; consult the
-deployment's own records for its current readiness. Replace `<...>` placeholders
-with deployment values before running commands.
+The historical measurements below describe the recorded runs, not the current
+state of your deployment. Check the deployment's own records for current
+readiness, and replace every `<...>` placeholder before running a command.
 
 ## Admin Settings
 
-Open **Admin → Settings** to manage application and integration configuration,
+Use **Admin → Settings** to manage application and integration configuration,
 publication, web appearance, operational intervals, upload and skill limits,
-task-title generation, sandbox/workspace limits, and sandbox archives. Application settings are
-persisted in the Agent database. The application API is
-`GET /admin/agent/settings` and `PUT /admin/agent/settings` with a partial body
-such as `{"settings": {"max_attempts": 3}}`; omitted keys retain their values.
-Writes use the existing administrator guard and record changes in the Audit
-log. Credential fields show only whether a value is configured. Enter and save
-a replacement to change one; **Reset** restores its built-in default. Missing
-required fields and partially configured optional integrations produce an
-**Administrator setup required** prompt with links to the fields to complete.
+task-title generation, sandbox/workspace limits, and sandbox archives. These
+settings are stored in the Agent database.
+
+The application API uses `GET /admin/agent/settings` and
+`PUT /admin/agent/settings`. Send a partial body such as
+`{"settings": {"max_attempts": 3}}`; omitted keys keep their current values.
+Writes use the existing administrator guard and appear in the Audit log.
+Credential fields show only whether a value is configured. To change one, enter
+and save a replacement. **Reset** restores the built-in default. If a required
+field is missing or an optional integration is only partly configured, the
+**Administrator setup required** prompt links to the fields that still need
+attention.
 
 For the first deployment of this release, run `alembic upgrade head` through
-`0042_sandbox_archive_settings`, then start the main control-plane listener with its
-existing complete environment. It imports registered environment settings once.
-The MCP-only listener waits for initialization and reads the same settings.
-Newly migrated runtime identity, service keys, broker credentials and policy
-fields are imported only when absent, under the same atomic preservation rule.
-Subsequent deployments preserve admin values, and resetting a field never
+`0048_sandbox_plugins`. Rebuild the sandbox image for explicit plugin loading.
+Then start the main control-plane listener with its
+existing complete environment. It imports registered environment settings once,
+while the MCP-only listener waits for initialization and then reads the same
+settings. Newly migrated runtime identity, service keys, broker credentials,
+and policy fields are imported only when absent, under the same atomic
+preservation rule.
+
+Later deployments keep the saved admin values, and resetting a field never
 restores an old `.env` value. Listeners synchronize saved changes every five
-seconds; web appearance uses the saved public fields on each request. Apply
-changes to subsequent operations according to the description beside each
-setting.
+seconds. The web server reads saved public appearance fields on every request.
+Apply changes to subsequent operations as described beside each setting.
 
 Automatic session archiving after a verified GitHub PR merge is enabled by
 default. Configure it under **Publication**; see
@@ -1170,6 +1176,7 @@ with no leader and no sharding.
 | `AGENT_HOST_SLOTS` | `3` | Turns at once until an admin sets a number on the Servers page; at least two, at most 128. `AGENT_RUNNER_REPLICAS` is no longer read |
 | `AGENT_RETAINED_DOCKER_DATA_ROOT` | `/var/lib/docker` | Expected daemon `DockerRootDir`; provision this root on durable storage. It is verified by the host and broker and is never mounted into a chat container |
 | `AGENT_HOST_STORAGE_PROBE` | `overlay_root` | Which probe measures the filesystem holding the sandbox writable layers, shown as the Servers page's Storage column. `off` stops measuring storage on that host and is the rollback; an unrecognized name reports `unsupported` rather than measuring something else. A reading is published only for a topology the host deployment has attested; see _How full is the sandbox storage?_ |
+| `AGENT_STORAGE_MIN_AVAILABLE_MIB` | `1024` | Bootstrap value for **Storage reserve for new sandboxes**; the admin runtime setting replaces it after the host's first settings heartbeat. Fresh verified available space below this reserve declines a new sandbox allocation without spending the turn. Existing sandboxes may resume; unknown capacity does not establish a pressure verdict. This is an admission guard, not a disk quota |
 | `AGENT_SANDBOX_UID` / `_GID` | `10001` | Only for a custom sandbox image; must match its user |
 | `AGENT_REPO_ALLOWLIST` | — | Comma-separated `owner/name`, or `owner/*`, for the single-tenant dogfood. Users who connect the App themselves do not need it; unset simply means the only entitlement is a user's own connection |
 | `AGENT_GITHUB_APP_CLIENT_ID` / `_CLIENT_SECRET` | — | The App's OAuth half. Only the user-facing connect flow needs it; minting installation tokens uses the private key alone |
@@ -1190,9 +1197,16 @@ disconnect.
 
 GitHub repositories retain the complete Agent lifecycle: checkout, branch
 discovery, push, and draft PR publishing use short-lived GitHub App installation
-tokens. New draft PR titles use a short excerpt from the included turns' closing
-summaries, with Markdown removed, and fall back to the changed files when no
-usable closing summary exists. The original task remains in the PR body.
+tokens. Draft PR titles summarize the captured user and assistant messages across
+the shared session through a bounded inference request under a separate,
+owner-scoped grant. Generic completion text is rejected and retried. If inference
+is unavailable, the publisher uses the first concrete line from each included
+turn's closing summary, skipping headings and generic completion preambles. It
+falls back to the changed files when no usable summary exists. The
+`agent_pr_title_generation_failed` log records the snapshot ID and fallback
+reason as structured fields, plus the exception type and HTTP status when
+available, without logging conversation text or credentials. Enable JSON logging
+in Admin Settings to see these fields. The original task remains in the PR body.
 A conversation keeps one draft PR across its turns while that PR is open; once
 someone closes or merges it, the next published snapshot opens a new draft PR
 from the same `agent/…` branch.
@@ -1682,6 +1696,13 @@ deactivate a healthy group:
 - no workspace-cleanup TTL addresses chat data. This phase never removes a
   retained sandbox; operators monitor Docker storage separately.
 
+A bounded workspace command's timeout or output overflow kills its own verified
+process group and preserves the sandbox's other resident sessions and terminals.
+Host output readers use fixed-size chunks, byte-bounded diagnostic tails, and
+bounded queues; oversized native CLI records stop the affected member. Resource
+checkpoints continue to reach the control plane while CLI output is silent. See
+[Host execution limits](host-execution-limits.md) for the limits and boundaries.
+
 #### Resume, Fork, and publication
 
 There is no retained/shared feature flag or runtime allowlist switch. Claude
@@ -1747,23 +1768,25 @@ in parallel under the exact-SHA readiness fence described here. See
 The host prepares the replacement sandbox/runner artifacts and proves Kata
 before invalidating its ready marker. It resolves the old runner's exact
 Compose container IDs, then asks Docker Engine for an unbounded graceful stop.
-The runner stops claiming and waits for every admitted turn; the broker and
-tunnels remain available until those turns settle. Only then does activation
-replace the broker and runner. After the isolation, tunnel, runtime and
-retained Docker-root checks pass, it records `.deployed-sha` and only then
+The runner stops claiming and waits for every admitted turn. Graceful shutdown
+does not signal its turn children: each child finishes its one turn and exits
+naturally, including a child whose acceptance handover is still uncertain. The
+broker and tunnels remain available until those turns settle. Only then does
+activation replace the broker and runner. After the isolation, tunnel, runtime
+and retained Docker-root checks pass, it records `.deployed-sha` and only then
 publishes an exact `shared-sandbox-deployment:<sha>` capability. In parallel,
-the control-plane
-deployment prepares its artifacts and migrates, then waits for a heartbeat newer than the start of that
-check and reverse-probes every new-chat placement broker before `compose up`
-can replace a running API. The claim route enforces that same exact deployment
+the control-plane deployment prepares its artifacts and runs migrations. Before
+`compose up` can replace a running API, the deployment waits for a heartbeat
+newer than the start of its readiness check and reverse-probes every broker
+eligible for new-chat placement. The claim route enforces that same exact deployment
 capability. A pending runner registers and heartbeats its base protocol so the
 host checks can inspect them, but does not poll; this also prevents the previous
 API from assigning work before it knows the new claim field. A runner with a
 pending/failed marker therefore cannot take work even during a cold-start API
-bootstrap. When placement was moved between hosts,
-it also probes every online host that still owns a retained group; changing the
-pin must not make old chats disappear from rollout safety. `SHARED_READY_TIMEOUT`
-controls that wait and defaults to 900 seconds.
+bootstrap. When placement has moved between hosts, the check also probes every
+online host that still owns a retained group; changing the pin must not make old
+chats disappear from rollout safety. `SHARED_READY_TIMEOUT` controls that wait
+and defaults to 900 seconds.
 
 The deploy user writes `.shared-live-ready` in the deployment checkout, separate
 from the container-owned enrollment directory. Runners mount only that file
@@ -1774,9 +1797,9 @@ No credential ownership or permission changes are needed for a rollout.
 
 #### Rollback compatibility
 
-The deployment orchestrator runs separately from the target checkout. In an
-Actions deployment, it comes from the workflow commit. Online rollback cannot execute a
-pre-fence target's old scripts; commits without the current
+The deployment orchestrator runs separately from the target checkout. In a
+GitHub Actions deployment, it comes from the workflow commit. An online rollback
+cannot execute a pre-fence target's old scripts; commits without the current
 `deploy/DEPLOY_PROTOCOL`, or with an incompatible protocol value, are refused
 before changing Docker state. The current protocol,
 `shared-live-exact-sha-v4`, marks the one sandbox network: a v3 deployer cannot
@@ -2185,6 +2208,19 @@ filesystem, not one chat: a repository, its dependencies, uncommitted changes
 and the native CLI session all live in a container's writable layer, and
 stopping a container does not release it.
 
+**Storage reserve for new sandboxes** is a runtime setting in Admin Settings and
+each server's configuration. Its default is 1024 MiB. The runner uses a fresh
+attested reading before accepting a turn that would create a sandbox. Below the
+reserve it declines the handover, returns the untouched turn to the queue, and
+reports a launch error with the available space and suggested remedies. Existing
+retained sessions can resume and cleanup stays available. Free Docker storage or
+adjust the reserve to restore new allocation.
+
+The check does not reserve space or impose per-container quotas: existing or
+concurrent writers can consume space afterward. Disabled or unverified storage
+measurement remains explicitly unmeasured and does not block allocation; never
+substitute another filesystem's available space for Docker writable-layer capacity.
+
 #### What the reading measures
 
 A runner is an ordinary container under
@@ -2510,6 +2546,27 @@ port, Git over SSH for one, is refused. Long-lived platform and upstream
 credentials stay outside the sandbox; member-scoped inference and MCP tokens
 enter their CLI processes. The sandbox runs unprivileged, so `apt install`
 does not work — use `pip --user`, a virtualenv, `npm ci`.
+
+New chats can also select up to eight runtime plugins through **+ → Plugins**
+or the create request's `plugins` field. This is thread configuration: follow-ups
+keep the selections, and Fork copies them to the new member. Claude Code and
+Codex use entries such as
+`{"plugin": "review@example", "marketplace": "example/plugins"}`; their
+marketplace source may be a GitHub repository or a credential-free public HTTPS
+source (a Git repository for Codex). pi, OpenCode, and Kilo use npm package
+entries such as `{"plugin": "@example/plugin@1.2.3"}` with no marketplace.
+Exact npm versions are optional; ranges, tags, local paths, arbitrary install
+commands, and credentials in source URLs are rejected.
+
+Installation runs during member runtime initialization, before its resident CLI
+accepts a prompt, using the pinned runtime version and the member's private
+home/configuration. Successful installation is retained across process and
+container restarts; failed installs can retry and never mark the selection
+complete. Errors and timeouts fail startup with a bounded diagnostic. Plugins
+use the group's existing network and unprivileged member identity. Project
+configuration and automatic plugin discovery remain disabled where the runtime
+supports those guards; explicitly selected plugins are loaded through the native
+runtime mechanism, alongside the platform's MCP configuration.
 
 There is one network, the same for every task and every phase, and nothing
 selects it ([design](specs/2026-09-23-agent-public-egress-design.zh-CN.md)).
