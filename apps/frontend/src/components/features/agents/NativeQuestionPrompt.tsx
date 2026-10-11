@@ -1,6 +1,7 @@
 'use client';
 
 import { useModalDialog } from '@/components/ui/useModalDialog';
+import { Markdown } from '@/components/ui/Markdown';
 
 import { useId, useRef, useState, type FormEvent } from 'react';
 import { createPortal } from 'react-dom';
@@ -69,6 +70,9 @@ function QuestionDialog({
     if (submitting || !complete) return;
     onAnswer(
       Object.fromEntries(request.questions.map((question, index) => [question.id, values[index]])),
+      request.questions.some(
+        (question, index) => question.kind === 'plan_approval' && answers[index].custom,
+      ),
     );
   }
 
@@ -102,11 +106,24 @@ function QuestionDialog({
                   className={index ? 'mt-6' : undefined}
                 >
                   <legend className="text-sm font-semibold text-gray-900 dark:text-gray-100">
-                    {question.header ? <span className="mb-1 block">{question.header}</span> : null}
-                    <span className="block whitespace-pre-wrap break-words">
-                      {question.question}
-                    </span>
+                    {question.kind === 'plan_approval' ? (
+                      question.header || 'Plan approval'
+                    ) : (
+                      <>
+                        {question.header ? (
+                          <span className="mb-1 block">{question.header}</span>
+                        ) : null}
+                        <span className="block whitespace-pre-wrap break-words">
+                          {question.question}
+                        </span>
+                      </>
+                    )}
                   </legend>
+                  {question.kind === 'plan_approval' ? (
+                    <div className="mt-3 max-h-[50vh] overflow-y-auto rounded-lg border border-gray-200 px-4 py-3 text-gray-900 dark:border-white/10 dark:text-gray-100">
+                      <Markdown text={question.question} />
+                    </div>
+                  ) : null}
                   {question.multiple && question.options.length ? (
                     <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
                       Select all that apply.
@@ -175,12 +192,12 @@ function QuestionDialog({
                             })
                           }
                         />
-                        Other
+                        {question.kind === 'plan_approval' ? 'Request changes' : 'Other'}
                       </label>
                     ) : null}
                     {question.allow_custom && answer.custom ? (
                       <label className="block text-xs font-medium text-gray-700 dark:text-gray-300">
-                        Your answer
+                        {question.kind === 'plan_approval' ? 'Your feedback' : 'Your answer'}
                         <textarea
                           value={answer.text}
                           onChange={(event) => update(index, { text: event.target.value })}
