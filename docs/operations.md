@@ -2549,7 +2549,7 @@ This is the supported standalone topology. It does not start a gateway
 | `AGENT_TUNNEL_*` | Inference relay destination, key, known-hosts file and ports; remote default `127.0.0.1:8080` |
 | `AGENT_MCP_TUNNEL_*` | MCP-only relay's independent destination and SSH material; remote default `127.0.0.1:8001`. Do not point it at the full control API on 8000 |
 | `AGENT_CONTROL_PLANE_TUNNEL_*` | Runner-only control API relay; remote default `127.0.0.1:8000`. It is deliberately absent from sandbox networks |
-| `AGENT_*_TUNNEL_SSH_KEY` | Private key, mounted read-only. Use a separate restricted key per relay with `command="",restrict,port-forwarding,permitopen="127.0.0.1:<that relay's port>"`; no relay needs a shell or permission to open another relay's port |
+| `AGENT_*_TUNNEL_SSH_KEY` | Private key, mounted read-only. Each relay has its own key and its own account on the far machine, restricted as [described below](#authorizing-the-tunnels-on-the-far-machines); no relay needs a shell or permission to open another relay's port |
 | `AGENT_*_TUNNEL_SSH_KNOWN_HOSTS` | Required host-key file for each relay. Host checking is not disableable: an unverified hop would hand scoped tokens and tunnel traffic to whatever answers there |
 | `AGENT_GATEWAY_HOSTNAME` / `AGENT_MCP_HOSTNAME` | The two names a sandbox resolves on its group bridge, `agent-gateway` and `agent-mcp` by default. Do not replace them with service addresses: a relay named by IP is refused at startup |
 | `AGENT_CONTROL_PLANE_HOSTNAME` | Runner-only control relay name, `agent-control-plane` by default |
@@ -2560,6 +2560,41 @@ record for the service host:
 ```bash
 ssh-keyscan -p 22 "<gateway-host>" > /etc/agent-tunnel/known_hosts
 ```
+
+#### Authorizing the tunnels on the far machines
+
+Prefer **Admin → Servers → Server setup → Automatic setup**
+([compute runbook](operations-compute.md#automatic-setup)). It creates the
+accounts below, writes and reads back their sshd policy, and refuses an
+existing policy that would widen it. Authorize a tunnel by hand only when that
+is not available, and then reproduce exactly what it generates.
+
+Give each relay a dedicated account with no shell: the inference account on the
+gateway machine, the MCP and control accounts on the control-plane machine.
+Each account's `authorized_keys` holds one line:
+
+```text
+# gateway machine, inference account
+command="",restrict,port-forwarding,permitopen="127.0.0.1:8080" ssh-ed25519 AAAA... inference
+# control-plane machine, MCP account
+command="",restrict,port-forwarding,permitopen="127.0.0.1:8001" ssh-ed25519 AAAA... mcp
+# control-plane machine, control account
+command="",restrict,port-forwarding,permitopen="127.0.0.1:8000",permitlisten="172.24.0.1:18092" ssh-ed25519 AAAA... control
+```
+
+After `restrict`, `port-forwarding` re-enables remote (`-R`) as well as local
+forwarding, and `permitopen` limits only the local destination. On its own,
+any of these keys could open listeners on the far machine. So the control
+key's `permitlisten` names its single reverse listener — the control-plane
+machine's Docker bridge gateway and this host's `AGENT_BROKER_REVERSE_PORT` —
+and each account gets its `Match User` block from
+[`deploy/host/sshd-tunnels.conf.example`](../deploy/host/sshd-tunnels.conf.example).
+The inference and MCP blocks set `AllowTcpForwarding local` and
+`PermitListen none`. The control block allows that one `PermitListen` with
+`GatewayPorts clientspecified`. Install the blocks before any other `Match`
+block that could apply to these accounts, run `sshd -t`, and confirm each
+account with `sshd -T -C user=<account>,host=localhost,addr=127.0.0.1` before
+reloading sshd.
 
 Run `sandbox_host.sh check` from the host checkout. Sandbox-runtime containers
 on the relay network must receive HTTP 200 from inference `/health` and MCP
