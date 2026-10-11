@@ -69,7 +69,6 @@ function host(over: Partial<AgentRunnerHost> = {}): AgentRunnerHost {
     last_seen_at: '2026-09-11T12:00:00Z',
     seconds_since_seen: 1,
     status: 'online',
-    drain_fence_epoch: '00000000-0000-4000-8000-000000000001',
     enrolled: true,
     labels: {},
     capabilities: ['host-settings-v1'],
