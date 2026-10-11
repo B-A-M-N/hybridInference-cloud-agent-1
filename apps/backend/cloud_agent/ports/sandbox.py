@@ -27,12 +27,15 @@ class SandboxRepository(Protocol):
         last_activity_at: datetime,
         actor_id: str,
         admin_ip: str,
+        broker_confirmed_stopped: bool = False,
     ) -> str:
         """Fence an idle stopped sandbox for verified S3 archival and deletion.
 
         A durable request closes admission before host export. No native state
         or ledger row is removed; only a verified host receipt may finalize
-        physical container deletion and mark its native context lost.
+        physical container deletion and mark its native context lost. An admin
+        recovery may also repair a stale RUNNING row, but only after the API
+        independently proves the exact host container is stopped and idle.
         """
         ...
 
