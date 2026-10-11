@@ -1077,12 +1077,9 @@ function HostsView() {
 
         <ComputeResources
           placementControl={
-            <div className="mb-4 rounded-xl border border-gray-200 bg-gray-50/70 p-4 dark:border-white/10 dark:bg-white/[0.03]">
+            <div className="mb-4 rounded-2xl border border-border bg-surface p-4 shadow-subtle sm:p-5">
               <div className="flex flex-wrap items-center justify-between gap-4">
-                <label
-                  htmlFor="server-placement"
-                  className="text-sm font-semibold text-gray-900 dark:text-gray-100"
-                >
+                <label htmlFor="server-placement" className="text-sm font-semibold text-foreground">
                   New sandbox location
                 </label>
                 <select
@@ -1090,7 +1087,7 @@ function HostsView() {
                   disabled={busy || pool === null}
                   value={activeHost ? (selectionUnavailable ? '__unavailable__' : activeHost) : ''}
                   onChange={(event) => void handlePin(event.target.value || null)}
-                  className="rounded-lg border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-900 px-3 py-1.5 text-sm"
+                  className="ui-input min-h-11 w-full sm:w-auto sm:min-w-64"
                 >
                   <option value="">Automatic — available servers</option>
                   {selectionUnavailable && (
@@ -1124,7 +1121,7 @@ function HostsView() {
                   })}
                 </select>
               </div>
-              <p className="mt-3 text-sm text-gray-500 dark:text-gray-400">
+              <p className="mt-3 text-sm leading-6 text-muted">
                 All new sandboxes use this location. Existing sandboxes stay on their current
                 server.
               </p>

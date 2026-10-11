@@ -247,12 +247,11 @@ function SettingsView() {
         />
         <AdminNavigation current="settings" />
         <div className="max-w-4xl">
-          <p className="mt-6 text-sm text-gray-500 dark:text-gray-400">
-            Application settings, default agent versions, sandbox settings, and CloudLab defaults.
+          <p className="mt-6 max-w-2xl text-sm leading-6 text-muted">
             Override sandbox settings for one server in{' '}
             <Link
               href="/admin/hosts"
-              className="underline hover:text-gray-700 dark:hover:text-gray-200"
+              className="font-medium text-accent underline underline-offset-2"
             >
               Servers
             </Link>
