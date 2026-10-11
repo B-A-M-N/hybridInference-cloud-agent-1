@@ -1101,6 +1101,82 @@ class TestConnectionManagement:
             )
         assert response.status_code == 409
 
+    @pytest.mark.parametrize(
+        "location,launch,reason",
+        [
+            ("managed-worker", {"command": "npx", "args": ["-y", "@scope/server"]}, "pin"),
+            ("user-connector", {"command": "sh", "args": ["-c", "server"]}, "shell"),
+            ("user-connector", {"args": ["server"]}, "command"),
+        ],
+    )
+    def test_an_edited_launch_is_checked_like_a_new_one(self, location, launch, reason) -> None:
+        """A PATCH is not a way around the launch policy creation enforces."""
+        store = FakeStore()
+        stored = {"command": "uvx", "args": ["server==1.0"], "env": {}, "cwd": None, "mounts": []}
+        connection_id = _seed(
+            store,
+            transport="stdio",
+            location=location,
+            url=None,
+            auth_kind="none",
+            launch_spec=dict(stored),
+        )
+        with _client(store) as client:
+            response = client.patch(
+                f"/v1/agent/mcp/connections/{connection_id}",
+                json={"expected_config_revision": 1, "launch": launch},
+            )
+        assert response.status_code == 400
+        assert reason in response.json()["detail"]["error"]["message"]
+        assert store.connections[connection_id]["launch_spec"] == stored
+        assert store.connections[connection_id]["config_revision"] == 1
+
+    def test_an_edited_launch_is_stored_as_validated_not_as_sent(self) -> None:
+        """Mounts and stored secrets are not the edit's to supply."""
+        store = FakeStore()
+        connection_id = _seed(
+            store,
+            transport="stdio",
+            location="user-connector",
+            url=None,
+            auth_kind="none",
+            launch_spec={"command": "uvx", "args": ["server==1.0"], "env": {}, "mounts": []},
+        )
+        with _client(store) as client:
+            response = client.patch(
+                f"/v1/agent/mcp/connections/{connection_id}",
+                json={
+                    "expected_config_revision": 1,
+                    "launch": {
+                        "command": "uvx",
+                        "args": ["server==2.0"],
+                        "env": {"TOKEN": "secret://TOKEN"},
+                        "mounts": [{"source": "/", "target": "host", "read_only": False}],
+                        "env_secrets": {"TOKEN": "supplied-ciphertext"},
+                    },
+                },
+            )
+        assert response.status_code == 200, response.text
+        assert store.connections[connection_id]["launch_spec"] == {
+            "command": "uvx",
+            "args": ["server==2.0"],
+            "env": {"TOKEN": "secret://TOKEN"},
+            "cwd": None,
+            "mounts": [],
+        }
+
+    def test_a_remote_connection_cannot_be_given_a_launch(self) -> None:
+        """A process spec on a URL connection is refused, not stored beside it."""
+        store = FakeStore()
+        connection_id = _seed(store)
+        with _client(store) as client:
+            response = client.patch(
+                f"/v1/agent/mcp/connections/{connection_id}",
+                json={"expected_config_revision": 1, "launch": {"command": "uvx"}},
+            )
+        assert response.status_code == 400
+        assert store.connections[connection_id]["launch_spec"] is None
+
     async def test_edit_cannot_erase_a_discovery_of_the_new_target(self, monkeypatch):
         """A second request can discover the edited target before PATCH returns."""
         store = FakeStore()

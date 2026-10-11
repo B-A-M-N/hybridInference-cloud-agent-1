@@ -846,14 +846,26 @@ async def update_connection(
     if existing is None:
         raise _not_found("no such MCP connection")
 
+    transport = Transport(str(existing["transport"]))
+    location = ExecutionLocation(str(existing["location"]))
     url = body.url
     if url is not None:
-        transport = Transport(str(existing["transport"]))
         url, _unused = _validate_target(
             transport=transport,
-            location=ExecutionLocation(str(existing["location"])),
+            location=location,
             url=url,
             launch=None,
+        )
+    launch_spec = None
+    if body.launch is not None:
+        if location is ExecutionLocation.REMOTE:
+            raise _bad_request("a remote connection has no process to launch")
+        # The check create applies, and only the form it renders is stored. A
+        # submitted document is not stored as sent: its ``mounts`` are the
+        # plan's to decide and its ``env_secrets`` are ciphertext only the
+        # secret routes write, so neither may arrive through an edit.
+        _unused_url, launch_spec = _validate_target(
+            transport=transport, location=location, url=None, launch=body.launch
         )
     auth_kind = body.auth_kind
     if auth_kind is not None:
@@ -865,7 +877,7 @@ async def update_connection(
         expected_config_revision=body.expected_config_revision,
         label=body.label.strip() if body.label else None,
         url=url,
-        launch_spec=body.launch,
+        launch_spec=launch_spec,
         auth_kind=auth_kind,
         account_label=body.account_label,
         request_timeout_s=body.request_timeout_s,
