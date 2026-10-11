@@ -128,6 +128,7 @@ class StoredDeploymentResolver:
         self._secrets = secrets
 
     async def bundle(self, reference: str) -> bytes:
+        """Return the immutable source bundle for a stored profile reference."""
         profile_id = self._profile_id(reference, kind="bundle")
         row = await self._row(profile_id)
         value = row.get("source_bundle")
@@ -136,6 +137,7 @@ class StoredDeploymentResolver:
         return bytes(value)
 
     async def resolve(self, reference: str) -> str:
+        """Decrypt one environment or credential-file profile reference."""
         parts = reference.split(":", 3)
         if len(parts) < 3 or parts[0] != "stored-profile":
             raise ComputeSecretError("deployment credential reference is not configured")
