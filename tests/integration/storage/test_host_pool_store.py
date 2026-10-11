@@ -1860,6 +1860,93 @@ async def test_removing_a_busy_host_is_refused_unless_forced(
     assert await hosts.remove_host(host="runner-a", force=True) == "ok"
 
 
+async def test_a_forced_removal_ends_the_work_the_host_was_holding(
+    store, hosts: PostgresHostPoolRepository
+):
+    """Revoking the credential also ends what the host's worker tokens open.
+
+    Those tokens name the attempt, never the machine, so before the removal
+    expired the leases a removed host kept heartbeating them — and with the
+    lease alive its grant was renewed, the relay served it tools, and it could
+    mint fresh residency grants. From the commit on, none of that succeeds,
+    and the reaper's next pass (residencies, then attempts, then grants, as
+    the loop runs them) ends the work and hands both grants over for
+    revocation.
+    """
+    await _enrol(store, "runner-a", hosts=hosts)
+    job, claim, _sandbox = await _resident_chat(store, "runner-a", hosts=hosts)
+    fence = {"attempt_id": claim["attempt_id"], "lease_generation": claim["lease_generation"]}
+    residency = await store.residency.establish_residency(
+        thread_id=job["thread_id"],
+        host="runner-a",
+        runtime_id="claude-code",
+        runtime_version=None,
+        ttl_seconds=600,
+    )
+    assert residency is not None
+    assert await store.grants.link_residency_grant(
+        thread_id=job["thread_id"], generation=residency["generation"], grant_id="agr_resident"
+    )
+    assert await store.grants.record_attempt_grant(**fence, grant_id="agr_attempt")
+
+    assert await hosts.remove_host(host="runner-a", force=True) == "ok"
+
+    assert await store.attempt_commands.heartbeat(**fence, lease_ttl_seconds=600) == {"ok": False}
+    assert await store.grants.list_renewable_grants() == []
+    assert (
+        await store.credential_queries.resolve_model_credential(job_id=job["id"], **fence) is None
+    )
+    assert await store.residency.resident_host(thread_id=job["thread_id"]) is None
+    assert (
+        await store.residency.establish_residency(
+            thread_id=job["thread_id"],
+            host="runner-a",
+            runtime_id="claude-code",
+            runtime_version=None,
+            ttl_seconds=600,
+        )
+        is None
+    )
+
+    lapsed = await store.residency.reap_expired_residencies()
+    assert [row["grant_id"] for row in lapsed] == ["agr_resident"]
+    reaped = await store.attempt_commands.reap_expired(max_attempts=3)
+    assert [row["attempt_id"] for row in reaped] == [claim["attempt_id"]]
+    assert [row["grant_id"] for row in await store.grants.take_revocable_grants()] == [
+        "agr_attempt"
+    ]
+    assert (await hosts.get_host(host="runner-a"))["slots_used"] == 0
+
+
+async def test_a_disabled_host_can_no_longer_extend_or_earn(
+    store, hosts: PostgresHostPoolRepository
+):
+    """The live-host predicate on its own, without the revocation's expiry.
+
+    ``disabled`` reached through the status table keeps the credential and
+    leaves every lease where it was. Neither the lease nor the residency may
+    be kept going from that machine, whatever its worker token still proves.
+    """
+    await _enrol(store, "runner-a", hosts=hosts)
+    job, claim, _sandbox = await _resident_chat(store, "runner-a", hosts=hosts)
+    fence = {"attempt_id": claim["attempt_id"], "lease_generation": claim["lease_generation"]}
+    assert (await store.attempt_commands.heartbeat(**fence, lease_ttl_seconds=60))["ok"] is True
+
+    assert await hosts.set_host_status(host="runner-a", status=HOST_DISABLED) == "ok"
+
+    assert await store.attempt_commands.heartbeat(**fence, lease_ttl_seconds=60) == {"ok": False}
+    assert (
+        await store.residency.establish_residency(
+            thread_id=job["thread_id"],
+            host="runner-a",
+            runtime_id="claude-code",
+            runtime_version=None,
+            ttl_seconds=60,
+        )
+        is None
+    )
+
+
 async def test_forgetting_a_host_does_not_break_its_attempts(
     db, store, hosts: PostgresHostPoolRepository
 ):

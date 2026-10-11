@@ -765,12 +765,14 @@ class PostgresHostPoolRepository:
         """Revoke a host's credential and take it out of the pool.
 
         Returns ``"ok"``, ``"unknown"`` or ``"busy"``. Busy means the host is
-        still holding slots: removing it then would leave running attempts
-        whose machine has officially stopped existing, and nothing would notice
-        until their leases lapsed. ``force`` accepts exactly that — the lease
-        expiry *is* the recovery path. A retained activation cannot be replayed
-        safely after its host disappears, so its expiry marks that chat LOST
-        and fails already-queued descendants instead.
+        still holding slots: removing it then ends running attempts whose
+        machine has officially stopped existing. ``force`` accepts exactly
+        that — lease expiry *is* the recovery path, and the revocation brings
+        it forward to now (see ``revoke_host_credentials``): the attempts'
+        worker tokens name no host, so a lease left to run would let the
+        removed machine keep renewing it. A retained activation cannot be
+        replayed safely after its host disappears, so its expiry marks that
+        chat LOST and fails already-queued descendants instead.
 
         Disabling rather than deleting. The row is what
         ``agent_attempts.host_id`` points at, and what an operator reads when
@@ -780,6 +782,15 @@ class PostgresHostPoolRepository:
         Docker writable layer was deleted.
         """
         async with self._pool.acquire() as conn, conn.transaction():
+            # The host's running attempts before its row: the order every
+            # writer that ends an attempt keeps (move the attempt, then give
+            # its slot back). Expiring those leases while holding the host row
+            # first would deadlock against an attempt finishing at that moment.
+            await conn.execute(
+                "SELECT id FROM agent_attempts WHERE host_id = $1 AND status = 'running' "
+                "ORDER BY id FOR UPDATE",
+                host,
+            )
             row = await conn.fetchrow(
                 "SELECT status, slots_used, drain_fence_active "
                 "FROM agent_runner_hosts WHERE host = $1 FOR UPDATE",

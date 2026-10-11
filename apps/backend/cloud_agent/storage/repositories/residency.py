@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from cloud_agent.storage._sql.hosts import LIVE_ATTEMPT_HOST
+
 if TYPE_CHECKING:
     import asyncpg
 
@@ -33,10 +35,12 @@ class PostgresResidencyRepository:
         """Take (or rotate) a chat's residency; ``None`` = not earned.
 
         Residency is something a host earns by *currently* running the
-        thread's turn — attempt on this host, ``running``, lease unexpired —
-        and the check shares a transaction and a row lock with the write, so
-        a finish or a supersede cannot slip between them, and an expired
-        attempt the reaper has not reached yet earns nothing. The lease lives
+        thread's turn — attempt on this host, ``running``, lease unexpired,
+        host still enrolled — and the check shares a transaction and a row
+        lock with the write, so a finish or a supersede cannot slip between
+        them, and an expired attempt the reaper has not reached yet earns
+        nothing. The enrollment check is what stops a removed machine's saved
+        worker token from minting fresh member grants. The lease lives
         on the chat's membership row: its generation only ever increments,
         and every rotation clears the grant so the caller revokes the
         predecessor's (``previous_grant_id``) and mints anew.
@@ -48,12 +52,13 @@ class PostgresResidencyRepository:
         del runtime_id, runtime_version
         async with self._pool.acquire() as conn, conn.transaction():
             earns = await conn.fetchrow(
-                """
+                f"""
                 SELECT j.id AS job_id, j.user_id, j.model, a.id AS attempt_id
                 FROM agent_jobs j
                 JOIN agent_attempts a ON a.id = j.current_attempt_id
                 WHERE j.thread_id = $1 AND a.host_id = $2
                   AND a.status = 'running' AND a.lease_expires_at > NOW()
+                  AND {LIVE_ATTEMPT_HOST}
                 LIMIT 1
                 FOR SHARE OF a
                 """,

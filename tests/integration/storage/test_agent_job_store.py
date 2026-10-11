@@ -1632,6 +1632,55 @@ async def test_native_fork_finalizes_two_concurrent_members_in_one_sandbox(
     assert second_claim["thread_sandbox"]["disk_limit_mib"] == 16384
 
 
+async def test_native_fork_mints_no_residency_on_a_disabled_host(store: Storage):
+    """Fork hands two fresh member grants to the group's machine; not a removed one."""
+    job, claim, sandbox = await _reserve_shared_chat(store)
+    fence = {
+        "thread_id": job["thread_id"],
+        "attempt_id": claim["attempt_id"],
+        "lease_generation": claim["lease_generation"],
+        "sandbox_generation": sandbox["generation"],
+        "activation_generation": sandbox["activation_generation"],
+    }
+    assert await store.sandbox.mark_thread_sandbox_running(
+        **fence, container_id="container-shared-one", context_status="new"
+    )
+    assert await store.sandbox.admit_thread_sandbox_turn(**fence, job_id=job["id"])
+    assert await store.sandbox.settle_thread_sandbox(
+        **fence,
+        job_id=job["id"],
+        context_status="live",
+        native_session_id="native-source",
+        idle_timeout_seconds=1800,
+        base_sha=job["base_sha"],
+    )
+    assert await store.attempt_commands.transition(
+        job_id=job["id"],
+        attempt_id=claim["attempt_id"],
+        lease_generation=claim["lease_generation"],
+        from_states=("running",),
+        to_state="succeeded",
+    )
+    operation = await store.session_fork.prepare_session_fork(
+        source_job_id=job["id"],
+        user_id=job["user_id"],
+        idempotency_key="native-fork-disabled-host",
+    )
+    assert operation is not None and operation.get("error") is None
+    assert await store.session_fork.claim_session_fork_materialization(
+        operation_id=operation["id"], coordinator_token="coordinator", lease_seconds=60
+    )
+
+    assert await store.host_pool.set_host_status(host="shared-runner", status="disabled") == "ok"
+
+    assert (
+        await store.session_fork.establish_session_fork_residencies(
+            operation_id=operation["id"], coordinator_token="coordinator", ttl_seconds=120
+        )
+        is None
+    )
+
+
 async def test_native_fork_ordinal_counts_settlement_even_if_job_finalization_failed(
     store: Storage,
 ):
@@ -4168,6 +4217,11 @@ async def test_model_credential_uses_only_agent_owned_metadata(
                 "CREATE TEMP VIEW agent_attempts AS SELECT * FROM public.agent_attempts"
             )
             await conn.execute("CREATE TEMP VIEW agent_jobs AS SELECT * FROM public.agent_jobs")
+            # The fence asks whether the attempt's machine is still enrolled;
+            # the host pool is agent-owned too.
+            await conn.execute(
+                "CREATE TEMP VIEW agent_runner_hosts AS SELECT * FROM public.agent_runner_hosts"
+            )
             # The thread carries the tool servers now; still agent-owned.
             await conn.execute(
                 "CREATE TEMP VIEW agent_threads AS SELECT * FROM public.agent_threads"

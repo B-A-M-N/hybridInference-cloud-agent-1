@@ -373,8 +373,16 @@ class PostgresSessionForkRepository:
                 "source": str(operation["source_thread_id"]),
                 "target": str(operation["target_thread_id"]),
             }
+            # The group's machine must still be enrolled: the two grants minted
+            # from this answer are handed to processes on that host, and a host
+            # whose credential was revoked must not be given fresh ones.
             sandbox_host = await conn.fetchval(
-                "SELECT host FROM agent_sandboxes WHERE id = $1 AND generation = $2",
+                """
+                SELECT g.host FROM agent_sandboxes g
+                JOIN agent_runner_hosts h ON h.host = g.host
+                WHERE g.id = $1 AND g.generation = $2
+                  AND h.credential_hash IS NOT NULL AND h.status <> 'disabled'
+                """,
                 operation["sandbox_id"],
                 operation["sandbox_generation"],
             )

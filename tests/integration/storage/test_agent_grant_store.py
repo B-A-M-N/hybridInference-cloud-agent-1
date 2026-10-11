@@ -245,6 +245,66 @@ async def test_recording_against_a_stale_fence_is_refused(
     assert await grants.list_renewable_grants() == []
 
 
+async def test_a_disabled_hosts_grant_is_neither_renewed_nor_recorded(
+    store: Storage, grants: PostgresGrantRepository
+) -> None:
+    """The worker token names no host, so the fence has to ask about it.
+
+    Disabling the machine leaves its attempt ``running`` with a live lease —
+    only the reaper or a revocation ends those — yet nothing on that host may
+    keep a capability alive from that moment on.
+    """
+    claim = await _claimed(store)
+    assert await grants.record_attempt_grant(
+        attempt_id=claim["attempt_id"],
+        lease_generation=claim["lease_generation"],
+        grant_id="agr_1",
+    )
+
+    assert await store.host_pool.set_host_status(host="grant-runner", status="disabled") == "ok"
+
+    assert await grants.list_renewable_grants() == []
+    assert not await grants.record_attempt_grant(
+        attempt_id=claim["attempt_id"],
+        lease_generation=claim["lease_generation"],
+        grant_id="agr_2",
+    )
+
+
+async def test_a_stopped_turns_grant_is_not_renewed(
+    store: Storage, grants: PostgresGrantRepository
+) -> None:
+    """Stop interrupts the turn at its next heartbeat; renewal must not outlast it.
+
+    The turn keeps its lease so it can settle, and its grant stays recorded so
+    the revocation pass collects it when the turn ends. Only the renewal stops.
+    """
+    claim = await _claimed(store)
+    assert await grants.record_attempt_grant(
+        attempt_id=claim["attempt_id"],
+        lease_generation=claim["lease_generation"],
+        grant_id="agr_1",
+    )
+
+    assert await store.attempt_commands.request_cancel(job_id=claim["id"]) == "running"
+
+    assert await grants.list_renewable_grants() == []
+    beat = await store.attempt_commands.heartbeat(
+        attempt_id=claim["attempt_id"],
+        lease_generation=claim["lease_generation"],
+        lease_ttl_seconds=60,
+    )
+    assert beat["ok"] is True and beat["cancel_requested"] is True
+    assert await store.attempt_commands.transition(
+        job_id=claim["id"],
+        attempt_id=claim["attempt_id"],
+        lease_generation=claim["lease_generation"],
+        from_states=("running",),
+        to_state="cancelled",
+    )
+    assert [row["grant_id"] for row in await grants.take_revocable_grants()] == ["agr_1"]
+
+
 async def test_an_admin_action_is_recorded(db, store: Storage) -> None:
     """The audit trail, written through the store, says who and from where."""
     row_id = await store.audit.record_admin_action(

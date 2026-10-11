@@ -180,7 +180,7 @@ class HostCommands:
             raise HostCommandError(
                 409,
                 f"{host!r} is still running attempts. Drain it first, or repeat with "
-                "force=true to let their leases expire under the retained-context fail-closed policy.",
+                "force=true to expire their leases now under the retained-context fail-closed policy.",
             )
         if outcome == "fenced":
             raise HostCommandError(
