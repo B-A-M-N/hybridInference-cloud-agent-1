@@ -554,9 +554,12 @@ async def test_retirement_freezes_fork_membership_at_source_group(store, hosts):
     assert await store.sandbox.mark_thread_sandbox_running(
         **attempt_fence, container_id="fork-container", context_status="new"
     )
-    assert await store.sandbox.admit_thread_sandbox_turn(**attempt_fence, job_id=job["id"])
+    assert await store.sandbox.admit_thread_sandbox_turn(
+        **attempt_fence, residency_generation=sandbox["residency_generation"], job_id=job["id"]
+    )
     assert await store.sandbox.settle_thread_sandbox(
         **attempt_fence,
+        residency_generation=sandbox["residency_generation"],
         job_id=job["id"],
         context_status="live",
         native_session_id="native-source",
@@ -645,6 +648,27 @@ async def test_unknown_expiry_observation_preserves_known_hard_deadline(db, stor
     assert row["expires_at"] == expired and not row["expiration_known"]
     async with db.acquire() as conn, conn.transaction():
         await lock_compute_entry(conn)
+        assert await host_compute_admission(conn, "machine") == (False, False)
+
+
+async def test_compute_admission_uses_wall_time_in_an_aged_transaction(db, store, hosts):
+    allocation_id, _, _ = await resource(store, hosts)
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE agent_compute_allocations
+            SET expires_at = clock_timestamp() + INTERVAL '400 milliseconds',
+                policy = '{"stop_new_groups_before_seconds": 0,
+                           "stop_claims_before_seconds": 0}'::jsonb
+            WHERE id = $1
+            """,
+            allocation_id,
+        )
+    async with db.acquire() as conn, conn.transaction():
+        started_at = await conn.fetchval("SELECT NOW()")
+        await asyncio.sleep(0.55)
+        await lock_compute_entry(conn)
+        assert await conn.fetchval("SELECT NOW() = $1", started_at)
         assert await host_compute_admission(conn, "machine") == (False, False)
 
 

@@ -80,41 +80,46 @@ async def user_access_token(
         ciphertext = account["access_token_ciphertext"]
         return LiveUserToken(cipher.decrypt(ciphertext), ciphertext)
 
-    claim = await store.claim_github_token_refresh(
-        user_id=user_id,
-        lease_seconds=_LEASE_SECONDS,
-        margin_seconds=int(_RENEW_BEFORE.total_seconds()),
-    )
-    if claim is None:
-        return await _await_renewal(user_id, store=store, cipher=cipher)
-
-    try:
-        tokens = await app_credentials.refresh_user_token(
-            cipher.decrypt(claim["refresh_token_ciphertext"])
+    claim = None
+    renewed = None
+    async with store.serialize_github_account(user_id=user_id) as account_store:
+        claim = await account_store.claim_github_token_refresh(
+            user_id=user_id,
+            lease_seconds=_LEASE_SECONDS,
+            margin_seconds=int(_RENEW_BEFORE.total_seconds()),
         )
-    except UserAuthorizationRevoked:
-        await store.clear_github_tokens(
-            user_id=user_id, access_token_ciphertext=account["access_token_ciphertext"]
-        )
-        logger.info(
-            "agent_github_user_token_revoked",
-            extra={"event": "agent_github_user_token_revoked", "stage": "refresh"},
-        )
-        return None
-    # A failure for a passing reason leaves the lease to lapse, and the next
-    # caller to try again; the current token is still good until it expires.
-    ciphertext = cipher.encrypt(tokens.access_token)
-    await store.store_github_tokens(
-        user_id=user_id,
-        refresh_generation=claim["refresh_generation"],
-        access_token_ciphertext=ciphertext,
-        access_expires_at=tokens.access_expires_at,
-        refresh_token_ciphertext=(
-            cipher.encrypt(tokens.refresh_token) if tokens.refresh_token else None
-        ),
-        refresh_expires_at=tokens.refresh_expires_at,
-    )
-    return LiveUserToken(tokens.access_token, ciphertext)
+        if claim is not None:
+            try:
+                tokens = await app_credentials.refresh_user_token(
+                    cipher.decrypt(claim["refresh_token_ciphertext"])
+                )
+            except UserAuthorizationRevoked:
+                await account_store.clear_github_tokens(
+                    user_id=user_id,
+                    access_token_ciphertext=claim["access_token_ciphertext"],
+                )
+                logger.info(
+                    "agent_github_user_token_revoked",
+                    extra={"event": "agent_github_user_token_revoked", "stage": "refresh"},
+                )
+                return None
+            ciphertext = cipher.encrypt(tokens.access_token)
+            if await account_store.store_github_tokens(
+                user_id=user_id,
+                refresh_generation=claim["refresh_generation"],
+                access_token_ciphertext=ciphertext,
+                access_expires_at=tokens.access_expires_at,
+                refresh_token_ciphertext=(
+                    cipher.encrypt(tokens.refresh_token) if tokens.refresh_token else None
+                ),
+                refresh_expires_at=tokens.refresh_expires_at,
+            ):
+                renewed = LiveUserToken(tokens.access_token, ciphertext)
+    if renewed is not None:
+        return renewed
+    # Poll only after releasing the provider lock; the winning refresh or
+    # reconnect needs that same lock to publish what this caller awaits.
+    return await _await_renewal(user_id, store=store, cipher=cipher)
 
 
 async def _await_renewal(

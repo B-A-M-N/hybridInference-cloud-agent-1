@@ -157,6 +157,40 @@ async def test_delete_claim_excludes_other_workers_and_expired_worker_receipts(d
     assert await checkpoint_archive(store, replacement)
 
 
+async def test_deletion_receipt_rechecks_claim_expiry_after_a_plain_row_lock(db, store):
+    await seed(db, store, "asbx_blocked_lease", state="stopped")
+    assert await request_delete(store, "asbx_blocked_lease") == "accepted"
+    claim = await store.sandbox.claim_due_admin_sandbox_deletion(ttl_seconds=0.4)
+    assert claim is not None
+    archiving = None
+    async with db.acquire() as blocker, blocker.transaction():
+        blocker_pid = await blocker.fetchval("SELECT pg_backend_pid()")
+        await blocker.fetchval(
+            "SELECT id FROM agent_sandboxes WHERE id = $1 FOR UPDATE",
+            claim["id"],
+        )
+        archiving = asyncio.create_task(checkpoint_archive(store, claim))
+        waiting = False
+        for _ in range(100):
+            waiting = await blocker.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks "
+                "WHERE NOT granted AND $1 = ANY(pg_blocking_pids(pid)))",
+                blocker_pid,
+            )
+            if waiting:
+                break
+            await asyncio.sleep(0.01)
+        assert waiting, "archive receipt did not wait on the sandbox row lock"
+        await asyncio.sleep(0.55)
+
+    assert archiving is not None
+    assert not await asyncio.wait_for(archiving, timeout=2)
+    detail = await store.admin_sandboxes.detail(claim["id"])
+    assert detail is not None
+    assert detail.sandbox.deletion_state == "pending"
+    assert detail.sandbox.deletion_archive_key is None
+
+
 @pytest.mark.parametrize(
     "changed",
     [
@@ -305,9 +339,12 @@ async def settled_group(db, store):
     assert await store.sandbox.mark_thread_sandbox_running(
         **fence, container_id="container-deletion", context_status="new"
     )
-    assert await store.sandbox.admit_thread_sandbox_turn(**fence, job_id=job["id"])
+    assert await store.sandbox.admit_thread_sandbox_turn(
+        **fence, residency_generation=sandbox["residency_generation"], job_id=job["id"]
+    )
     assert await store.sandbox.settle_thread_sandbox(
         **fence,
+        residency_generation=sandbox["residency_generation"],
         job_id=job["id"],
         context_status="live",
         native_session_id="native-survives",

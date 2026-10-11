@@ -68,6 +68,26 @@ async def test_mint_retries_reuse_a_grant_but_a_new_resident_generation_does_not
     assert len(grants.issued) == 2
 
 
+async def test_a_grant_refused_by_the_residency_fence_is_never_returned():
+    """A failed orphan cleanup cannot turn a rejected late link into authority."""
+    grants = IdempotentGrants()
+    grants.revoke = AsyncMock(side_effect=RuntimeError("gateway is down"))
+    store = SimpleNamespace(link_residency_grant=AsyncMock(return_value=False))
+    row = {
+        "thread_id": "athr_1",
+        "user_id": "owner",
+        "model": "model-1",
+        "generation": 1,
+        "establishing_attempt_id": "aatt_1",
+    }
+
+    credential = await residency._mint_residency_grant(store, grants, row=row)
+
+    assert credential is None
+    grant_id = next(iter(grants.issued.values()))["grant_id"]
+    grants.revoke.assert_awaited_once_with(grant_id)
+
+
 @pytest.mark.parametrize("revoke_raises", [False, True])
 async def test_worker_replacement_revokes_only_its_previous_resident_grant(
     monkeypatch, revoke_raises

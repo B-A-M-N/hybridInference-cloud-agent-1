@@ -1,11 +1,12 @@
-"""The attempt reaper, and the grant passes that ride its loop.
+"""The attempt reaper, and the maintenance passes that ride its loop.
 
 One pass closes attempts whose lease expired, abandons the ones the gateway has
 definitively refused, renews the grants that are still live, reaps offline hosts
 and lapsed residencies, cleans up the residencies a stranded fork left behind,
-and reconciles the forks and snapshot publishes an expiry stranded. It ran from
-``app.py`` before this module existed; it runs from the same place in the same
-process now, started and stopped by the same lifespan.
+collects abandoned staged uploads, and reconciles the forks and snapshot
+publishes an expiry stranded. It ran from ``app.py`` before this module existed;
+it runs from the same place in the same process now, started and stopped by the
+same lifespan.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import contextlib
 from typing import TYPE_CHECKING, Any, Protocol
 
 from cloud_agent.application.pending_messages import settle_waiting_queues
+from cloud_agent.application.send_now import recover_handoffs
 from cloud_agent.gateway import GatewayError
 from cloud_agent.goals.controller import run_goal_wakeups
 from cloud_agent.grants import GRANT_TTL_S, RENEWAL_INTERVAL_S
@@ -99,6 +101,14 @@ REAP_INTERVAL_S = RENEWAL_INTERVAL_S
 
 
 MAX_ATTEMPTS = 3
+
+
+#: Staged uploads have no durable owner other than the user who is still
+#: composing a request. After this many hours with neither a job nor a pending
+#: message holding them, the maintenance loop releases their quota and bytes.
+#: Administrators can change the live value through
+#: ``attachments.staged_retention_hours``.
+STAGED_ATTACHMENT_RETENTION_HOURS = 24
 
 
 #: The gateway refusals that are a verdict on the grant itself.
@@ -530,7 +540,7 @@ async def _cleanup_reaped_shared_residencies(
                 await grants.revoke(grant_id)
 
 
-async def reap_expired_attempts(
+async def _run_attempt_reaper(
     store: _Reaping,
     *,
     interval_seconds: float = REAP_INTERVAL_S,
@@ -594,6 +604,27 @@ async def reap_expired_attempts(
             await _reap_lapsed_residencies(store.residency, grants)
         except Exception:
             logger.warning("Residency reaper pass failed", exc_info=True)
+        # Abandoned composer uploads have no request path that will release
+        # them later. Keep this in its own pass: attachment storage trouble
+        # must not stop attempt leases from being recovered. The repository's
+        # predicate excludes both job-claimed and pending-message uploads.
+        try:
+            purged_attachments = await store.attachments.purge_stale_staged(
+                older_than_hours=integer_setting(
+                    "attachments.staged_retention_hours",
+                    STAGED_ATTACHMENT_RETENTION_HOURS,
+                )
+            )
+            if purged_attachments:
+                logger.info(
+                    "agent_staged_attachments_purged",
+                    extra={
+                        "event": "agent_staged_attachments_purged",
+                        "count": purged_attachments,
+                    },
+                )
+        except Exception:
+            logger.warning("Staged attachment cleanup pass failed", exc_info=True)
         # Queued follow-ups after residencies, before the attempt pass: give
         # legacy turns a terminal answer if their native context is missing.
         # Normal ordering is enforced at claim time; this cleanup uses the
@@ -720,3 +751,47 @@ async def reap_expired_attempts(
                 await _renew_live_grants(store, grants, failures=renewal_failures)
             except Exception:
                 logger.warning("Grant renewal pass failed", exc_info=True)
+
+
+async def _recover_send_now_handoffs(store: _Reaping, *, interval_seconds: float) -> None:
+    """Recover durable handoffs without delaying attempt or grant safety passes."""
+    while True:
+        try:
+            await recover_handoffs(store)
+        except Exception:
+            logger.warning("Send-now handoff recovery pass failed", exc_info=True)
+        await asyncio.sleep(interval_seconds)
+
+
+async def reap_expired_attempts(
+    store: _Reaping,
+    *,
+    interval_seconds: float = REAP_INTERVAL_S,
+    max_attempts: int | None = None,
+    grants: Any | None = None,
+    github_app: GitHubAppSource | None = None,
+    gateway: Any | None = None,
+) -> None:
+    """Run attempt maintenance alongside independently bounded handoff recovery.
+
+    The owned recovery task runs once at startup and then on the same cadence,
+    but a slow host broker cannot hold up attempt reaping, queue settlement, or
+    grant revocation and renewal. Cancelling this worker also cancels and joins
+    the recovery task, including any broker calls it currently owns.
+    """
+    recovery = asyncio.create_task(
+        _recover_send_now_handoffs(store, interval_seconds=interval_seconds),
+        name="agent-send-now-recovery",
+    )
+    try:
+        await _run_attempt_reaper(
+            store,
+            interval_seconds=interval_seconds,
+            max_attempts=max_attempts,
+            grants=grants,
+            github_app=github_app,
+            gateway=gateway,
+        )
+    finally:
+        recovery.cancel()
+        await asyncio.gather(recovery, return_exceptions=True)

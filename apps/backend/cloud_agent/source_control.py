@@ -8,6 +8,7 @@ request publishing lifecycle supports GitLab end to end.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import secrets
@@ -27,6 +28,9 @@ if TYPE_CHECKING:
 GITLAB_ORIGIN = "https://gitlab.com"
 OAUTH_STATE_TTL = timedelta(minutes=10)
 _TOKEN_REFRESH_MARGIN = timedelta(minutes=5)
+_GITLAB_REFRESH_LEASE_SECONDS = 30
+_GITLAB_REFRESH_WAIT_ATTEMPTS = 10
+_GITLAB_REFRESH_WAIT_INTERVAL_S = 0.3
 
 #: Wraps stored provider credentials. Its own secret, not the gateway's — the
 #: source derived this key from ``API_KEY_SECRET``, which meant the gateway
@@ -384,6 +388,28 @@ class GitLabOAuthClient:
                 break
         return projects
 
+    async def _await_gitlab_refresh(
+        self,
+        store: SourceControlRepository,
+        *,
+        user_id: str,
+    ) -> str:
+        """Return only a winning refresh/reconnect token, or fail retryably."""
+        for attempt in range(_GITLAB_REFRESH_WAIT_ATTEMPTS):
+            current = await store.get_gitlab_connection(user_id=user_id)
+            if current is None:
+                raise SourceControlError("The GitLab connection changed while its token refreshed.")
+            # A missing lease means either the winner stored its result or a
+            # reconnect installed the current credential. This also handles a
+            # loser whose initial snapshot already observed the winner's
+            # generation. An abandoned lease retains its (possibly expired)
+            # timestamp, so it fails retryably instead of exposing an old token.
+            if current.get("refresh_lease_expires_at") is None:
+                return self.cipher.decrypt(current["access_token_ciphertext"])
+            if attempt + 1 < _GITLAB_REFRESH_WAIT_ATTEMPTS:
+                await asyncio.sleep(_GITLAB_REFRESH_WAIT_INTERVAL_S)
+        raise SourceControlError("The GitLab token is being refreshed. Try again shortly.")
+
     async def access_token_for_connection(
         self, store: SourceControlRepository, connection: dict[str, Any]
     ) -> str:
@@ -393,16 +419,35 @@ class GitLabOAuthClient:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         if expires_at > datetime.now(timezone.utc) + _TOKEN_REFRESH_MARGIN:
             return self.cipher.decrypt(connection["access_token_ciphertext"])
-        refresh_token = self.cipher.decrypt(connection["refresh_token_ciphertext"])
-        refreshed = await self._refresh(refresh_token)
-        await store.update_gitlab_tokens(
-            connection_id=connection["id"],
-            user_id=connection["user_id"],
-            access_token_ciphertext=self.cipher.encrypt(refreshed["access_token"]),
-            refresh_token_ciphertext=self.cipher.encrypt(refreshed["refresh_token"]),
-            expires_at=self.token_expiry(refreshed),
-        )
-        return refreshed["access_token"]
+        connection_id = int(connection["id"])
+        user_id = str(connection["user_id"])
+        renewed = None
+        async with store.serialize_gitlab_account(user_id=user_id) as account_store:
+            claim = await account_store.claim_gitlab_token_refresh(
+                connection_id=connection_id,
+                user_id=user_id,
+                lease_seconds=_GITLAB_REFRESH_LEASE_SECONDS,
+                margin_seconds=int(_TOKEN_REFRESH_MARGIN.total_seconds()),
+            )
+            if claim is not None:
+                refresh_generation = int(claim["refresh_generation"])
+                refresh_token = self.cipher.decrypt(claim["refresh_token_ciphertext"])
+                # The claim committed before provider I/O. A transient failure
+                # leaves its recoverable lease and releases this outer lock.
+                refreshed = await self._refresh(refresh_token)
+                if await account_store.update_gitlab_tokens(
+                    connection_id=connection_id,
+                    user_id=user_id,
+                    refresh_generation=refresh_generation,
+                    access_token_ciphertext=self.cipher.encrypt(refreshed["access_token"]),
+                    refresh_token_ciphertext=self.cipher.encrypt(refreshed["refresh_token"]),
+                    expires_at=self.token_expiry(refreshed),
+                ):
+                    renewed = str(refreshed["access_token"])
+        if renewed is not None:
+            return renewed
+        # Poll only after releasing serialization, so the winner can store.
+        return await self._await_gitlab_refresh(store, user_id=user_id)
 
     async def projects_for_connection(
         self, store: SourceControlRepository, connection: dict[str, Any]

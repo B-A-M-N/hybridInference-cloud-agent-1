@@ -339,7 +339,18 @@ class FakeHostPoolStore(AllCapabilities):
     # the store said — mint on establish, revoke the predecessor, renew on the
     # beat that extends, revoke on release.
 
-    async def establish_residency(self, **_kwargs: Any) -> dict[str, Any] | None:
+    async def establish_residency(
+        self,
+        *,
+        thread_id: str,
+        attempt_id: int,
+        lease_generation: int,
+        host: str,
+        runtime_id: str,
+        runtime_version: str | None,
+        ttl_seconds: float,
+        sandbox_id: str | None = None,
+    ) -> dict[str, Any] | None:
         return self.establish_answer
 
     async def link_residency_grant(self, *, thread_id: str, generation: int, grant_id: str) -> bool:

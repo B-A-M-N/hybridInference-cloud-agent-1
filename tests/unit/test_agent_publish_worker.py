@@ -19,6 +19,7 @@ from tests.support.storage import AllCapabilities
 
 from cloud_agent import publish_worker
 from cloud_agent.entitlement import RepoAccessUnavailable
+from cloud_agent.github_app import GitHubAppError
 from cloud_agent.publish_worker import (
     GitHubCredential,
     create_draft_pull_request,
@@ -44,6 +45,7 @@ def _entitled(monkeypatch):
 _JOB = {
     "publication_kind": "shared_snapshot",
     "snapshot_id": 9,
+    "publish_retry_count": 0,
     "workspace_epoch": 4,
     "included_job_ids": ["ajob_1"],
     "anchor_job_id": "ajob_1",
@@ -82,15 +84,24 @@ class FakeStore(AllCapabilities):
         return []
 
     async def record_snapshot_publish(
-        self, *, snapshot_id: int, pr_url: str, commit_sha: str
+        self,
+        *,
+        snapshot_id: int,
+        expected_publish_retry_count: int,
+        pr_url: str,
+        commit_sha: str,
     ) -> bool:
         self.snapshot_recorded = (snapshot_id, pr_url, commit_sha)
         return self._record_ok
 
-    async def fail_snapshot_publish(self, *, snapshot_id: int, detail: str) -> None:
+    async def fail_snapshot_publish(
+        self, *, snapshot_id: int, expected_publish_retry_count: int, detail: str
+    ) -> None:
         self.snapshot_failed = (snapshot_id, detail)
 
-    async def defer_snapshot_publish(self, *, snapshot_id: int, detail: str) -> bool:
+    async def defer_snapshot_publish(
+        self, *, snapshot_id: int, expected_publish_retry_count: int, detail: str
+    ) -> bool:
         self.snapshot_deferred = (snapshot_id, detail)
         return True
 
@@ -504,11 +515,64 @@ async def test_pr_closed_during_update_creates_a_new_draft(monkeypatch):
     assert requests == ["GET", "PATCH", "POST"]
 
 
+@pytest.mark.parametrize(
+    "create_response",
+    [
+        pytest.param(httpx.Response(201, json={}), id="response-lost"),
+        pytest.param(
+            httpx.Response(422, json={"message": "A pull request already exists"}),
+            id="create-race",
+        ),
+    ],
+)
+async def test_retry_reconciles_an_uncertain_or_duplicate_pr_create(monkeypatch, create_response):
+    """A later lookup reconciles create uncertainty instead of duplicating or failing."""
+    requests: list[str] = []
+    lookup_count = 0
+    pr_url = "https://github.com/o/n/pull/7"
+
+    def handle(request):
+        nonlocal lookup_count
+        requests.append(request.method)
+        if request.method == "GET":
+            lookup_count += 1
+            if lookup_count == 1:
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[{"number": 7, "state": "open", "html_url": pr_url}])
+        if request.method == "POST":
+            return create_response
+        assert request.method == "PATCH"
+        return httpx.Response(200, json={"state": "open", "html_url": pr_url})
+
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: original_client(transport=httpx.MockTransport(handle), **kwargs),
+    )
+    _patch_publish(
+        monkeypatch,
+        PublishResult(branch="agent/athr_1", commit_sha="next", changed_files=["x"]),
+    )
+
+    first = FakeStore(dict(_JOB))
+    assert await publish_one(first, credential=GitHubCredential("t")) is None
+    assert first.snapshot_deferred is not None
+    assert first.snapshot_failed is None
+
+    restarted = FakeStore(dict(_JOB))
+    assert await publish_one(restarted, credential=GitHubCredential("t")) == pr_url
+    assert restarted.snapshot_recorded == (9, pr_url, "next")
+    assert requests == ["GET", "POST", "GET", "PATCH"]
+
+
 @pytest.mark.parametrize("failure", ["lookup", "update"])
 @pytest.mark.parametrize(
     "response",
     [
         httpx.Response(404, json={"message": "Not Found"}),
+        httpx.Response(408, text="request timeout"),
+        httpx.Response(429, text="rate limited"),
         httpx.Response(502, text="bad gateway"),
         httpx.Response(503, text="unavailable"),
         httpx.Response(200, text="not json"),
@@ -545,10 +609,58 @@ async def test_pr_api_failure_does_not_record_the_stale_url(monkeypatch, failure
     store = FakeStore({**_JOB, "parent_pr_url": "https://github.com/o/n/pull/7"})
     assert await publish_one(store, credential=GitHubCredential("t")) is None
     assert store.snapshot_recorded is None
-    assert store.snapshot_failed is not None
-    if isinstance(response, httpx.Response) and response.status_code >= 400:
-        assert str(response.status_code) in store.snapshot_failed[1]
+    permanent = isinstance(response, httpx.Response) and response.status_code == 404
+    if permanent:
+        assert store.snapshot_failed is not None
+        assert store.snapshot_deferred is None
+        assert "404" in store.snapshot_failed[1]
+    else:
+        assert store.snapshot_failed is None
+        assert store.snapshot_deferred is not None
+        assert "retry" in store.snapshot_deferred[1]
     assert requests == (["GET", "PATCH"] if failure == "update" else ["GET"])
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(408, text="request timeout"),
+        httpx.Response(429, text="rate limited"),
+        httpx.Response(503, text="unavailable"),
+        httpx.Response(201, text="not json"),
+        httpx.ConnectError("create response lost"),
+    ],
+)
+async def test_pr_create_transient_failures_requeue(monkeypatch, response):
+    """An uncertain create outcome is retried and reconciled by the next lookup."""
+    requests: list[str] = []
+
+    def handle(request):
+        requests.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(200, json=[])
+        assert request.method == "POST"
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: original_client(transport=httpx.MockTransport(handle), **kwargs),
+    )
+    _patch_publish(
+        monkeypatch,
+        PublishResult(branch="agent/athr_1", commit_sha="next", changed_files=["x"]),
+    )
+    store = FakeStore(dict(_JOB))
+
+    assert await publish_one(store, credential=GitHubCredential("t")) is None
+    assert store.snapshot_recorded is None
+    assert store.snapshot_failed is None
+    assert store.snapshot_deferred is not None
+    assert requests == ["GET", "POST"]
 
 
 async def test_gate_rejection_fails_the_job_and_never_pushes(monkeypatch):
@@ -808,6 +920,26 @@ async def test_no_credential_at_all_fails_the_job_rather_than_hanging(monkeypatc
     assert "credential" in store.snapshot_failed[1]
 
 
+@pytest.mark.parametrize(
+    ("failure", "deferred"),
+    [
+        pytest.param(GitHubAppError("mint outage", status=503), True, id="github-503"),
+        pytest.param(GitHubAppError("rate limited", status=429), True, id="github-429"),
+        pytest.param(GitHubAppError("installation refused", status=401), False, id="github-401"),
+        pytest.param(httpx.ConnectError("offline"), True, id="transport"),
+    ],
+)
+async def test_credential_minting_retries_only_transient_failures(failure, deferred):
+    class App:
+        async def token_for(self, *_args, **_kwargs):
+            raise failure
+
+    store = FakeStore(dict(_JOB))
+    assert await publish_one(store, app_credentials=App()) is None
+    assert (store.snapshot_deferred is not None) is deferred
+    assert (store.snapshot_failed is not None) is (not deferred)
+
+
 async def test_publishing_stops_when_the_entitlement_was_withdrawn(monkeypatch):
     """The write credential must not outlive the permission to use it.
 
@@ -858,7 +990,7 @@ async def test_entitlement_outage_defers_before_any_publication_effect(monkeypat
     pull_request.assert_not_awaited()
 
 
-async def test_entitlement_error_after_publication_started_does_not_requeue(monkeypatch):
+async def test_entitlement_error_after_push_requeues_for_branch_reconciliation(monkeypatch):
     store = FakeStore(dict(_JOB))
     _patch_publish(
         monkeypatch, PublishResult(branch="agent/ajob_1", commit_sha="s", changed_files=["x"])
@@ -869,9 +1001,9 @@ async def test_entitlement_error_after_publication_started_does_not_requeue(monk
         AsyncMock(side_effect=RepoAccessUnavailable("unavailable after push")),
     )
     assert await publish_one(store, credential=GitHubCredential("t")) is None
-    assert store.snapshot_deferred is None
-    assert store.snapshot_failed is not None
-    assert "unavailable after push" in store.snapshot_failed[1]
+    assert store.snapshot_failed is None
+    assert store.snapshot_deferred is not None
+    assert "unavailable after push" in store.snapshot_deferred[1]
 
 
 @pytest.mark.parametrize(
@@ -884,7 +1016,7 @@ async def test_entitlement_error_after_publication_started_does_not_requeue(monk
         ({"html_url": 7}, "not a string"),
     ],
 )
-async def test_a_created_pr_with_no_usable_url_fails_instead_of_recording(
+async def test_a_created_pr_with_no_usable_url_retries_instead_of_recording(
     monkeypatch, payload, why
 ):
     """**A success this worker cannot record must not be recorded.**
@@ -915,8 +1047,9 @@ async def test_a_created_pr_with_no_usable_url_fails_instead_of_recording(
     await publish_one(store, credential=GitHubCredential("t"), base_branch="dev")
 
     assert store.snapshot_recorded is None, f"an unusable url was recorded ({why})"
-    assert store.snapshot_failed is not None, f"the snapshot was not failed ({why})"
-    assert "html_url" in store.snapshot_failed[1]
+    assert store.snapshot_failed is None, f"the snapshot was terminal ({why})"
+    assert store.snapshot_deferred is not None, f"the snapshot was not retried ({why})"
+    assert "html_url" in store.snapshot_deferred[1]
 
 
 @pytest.mark.parametrize(

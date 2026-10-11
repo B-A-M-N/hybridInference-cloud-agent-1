@@ -640,6 +640,15 @@ SETTINGS: tuple[Setting, ...] = (
         20971520,
     ),
     _numeric("attachments.max_files", "Maximum upload file count", "Attachments", 50, 1, 50),
+    _numeric(
+        "attachments.staged_retention_hours",
+        "Abandoned upload retention (hours)",
+        "Attachments",
+        24,
+        1,
+        8760,
+        description="Remove uploads this old only when no job or pending message holds them. Changes apply on the next maintenance pass.",
+    ),
     _numeric("skills.max_skill_bytes", "Maximum skill size (bytes)", "Skills", 65536, 1, 65536),
     _numeric(
         "skills.max_selection_bytes",

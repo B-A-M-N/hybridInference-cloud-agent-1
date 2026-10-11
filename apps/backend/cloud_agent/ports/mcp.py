@@ -8,6 +8,10 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 
+class McpConnectionCreateConflict(Exception):
+    """A connection draft became invalid before its atomic insert."""
+
+
 class McpConnectionRepository(Protocol):
     """Persistence operations needed by the MCP control plane."""
 
@@ -39,6 +43,7 @@ class McpConnectionRepository(Protocol):
         account_label: str | None = None,
         request_timeout_s: float | None = None,
         reuse_pending: bool = False,
+        access_token_ciphertext: str | None = None,
     ) -> dict[str, Any]:
         """Insert a connection and return it, at revision one.
 
@@ -50,6 +55,23 @@ class McpConnectionRepository(Protocol):
         ``reuse_pending`` resumes an identical remote setup without credentials
         instead of inserting another row. Existing credentials, settings, and
         approvals are never changed; authenticated accounts remain independent.
+
+        ``access_token_ciphertext`` is inserted with the row. Callers must
+        encrypt and validate it before entering this persistence operation, so
+        a failed request cannot leave a visible connection without its
+        credential.
+        """
+        ...
+
+    async def create_mcp_connections(
+        self, *, connections: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Create every supplied connection in one transaction.
+
+        This is the save boundary for configuration imports: either every row,
+        including its already-encrypted credential material, becomes visible or
+        none does. The dictionaries accept the same fields as
+        :meth:`create_mcp_connection`.
         """
         ...
 
@@ -294,7 +316,7 @@ class McpConnectionRepository(Protocol):
         connection_id: int,
         config_revision: int,
         authorization_epoch: int,
-        oauth_generation: int,
+        expected_oauth_generation: int,
         code_verifier_ciphertext: str,
         client_id: str,
         client_secret_ciphertext: str | None,
@@ -309,12 +331,13 @@ class McpConnectionRepository(Protocol):
         revocation_endpoint: str | None,
         registration_endpoint: str | None,
         expires_at: Any,
-    ) -> None:
+    ) -> int | None:
         """Record one started authorization.
 
-        Starting a flow also moves the OAuth generation, in the same
-        transaction, so any callback still in flight for an earlier attempt is
-        refused rather than being allowed to win a race against the newer one.
+        The configuration, authorization, and OAuth versions are write fences.
+        A matching connection allocates and returns the next OAuth generation
+        in the same transaction as the flow row; a stale start returns ``None``
+        without deleting the newer pending flow.
         """
         ...
 
@@ -545,7 +568,7 @@ class McpConnectionRepository(Protocol):
         ...
 
     async def set_mcp_connector_status(self, *, connector_id: int, status: str) -> bool:
-        """Record a heartbeat or a status change for one connector."""
+        """Record a non-terminal heartbeat status; revocation uses the atomic path."""
         ...
 
     async def update_mcp_connector(
@@ -581,13 +604,14 @@ class McpConnectionRepository(Protocol):
         ...
 
     async def unbind_mcp_connection_connector(
-        self, *, connection_id: int, user_id: str
+        self, *, connection_id: int, user_id: str, connector_id: int
     ) -> dict[str, Any] | None:
         """Stop routing one connection through its connector.
 
         The same version movement as binding, for the same reason: a connection
         that has moved back to "nowhere to run" is not the one a session was
-        approved against.
+        approved against. ``connector_id`` is the caller's write fence: a stale
+        request for the connector the connection moved away from changes nothing.
         """
         ...
 
@@ -600,12 +624,6 @@ class McpConnectionRepository(Protocol):
         connection has its versions moved so the sessions approved against it
         stop working rather than quietly pointing somewhere else.
         """
-        ...
-
-    async def authorize_mcp_connector_connection(
-        self, *, connector_id: int, connection_id: int
-    ) -> None:
-        """Record that a connector is allowed to serve one connection."""
         ...
 
     async def list_mcp_connector_connections(self, *, connector_id: int) -> list[int]:

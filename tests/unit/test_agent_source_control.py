@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 
@@ -26,6 +27,12 @@ class MemoryStore:
     def __init__(self) -> None:
         self.states: dict[str, dict] = {}
         self.token_update: dict | None = None
+        self.gitlab_refresh_claim: dict | None = None
+
+    @asynccontextmanager
+    async def serialize_gitlab_account(self, *, user_id: str):
+        assert user_id == "user-a"
+        yield self
 
     async def create_oauth_state(self, **row) -> None:
         self.states[row["state_hash"]] = {**row, "consumed": False}
@@ -43,8 +50,13 @@ class MemoryStore:
         row["consumed"] = True
         return {"code_verifier_ciphertext": row["code_verifier_ciphertext"]}
 
-    async def update_gitlab_tokens(self, **values) -> None:
+    async def claim_gitlab_token_refresh(self, **_values):
+        claim, self.gitlab_refresh_claim = self.gitlab_refresh_claim, None
+        return claim
+
+    async def update_gitlab_tokens(self, **values) -> bool:
         self.token_update = values
+        return True
 
 
 @pytest.mark.asyncio
@@ -268,14 +280,21 @@ async def test_gitlab_pkce_exchange_identity_projects_refresh_and_revoke() -> No
     connection = {
         "id": 7,
         "user_id": "user-a",
+        "refresh_generation": 0,
+        "refresh_lease_expires_at": None,
         "access_token_ciphertext": cipher.encrypt("access-one"),
         "refresh_token_ciphertext": cipher.encrypt("refresh-one"),
         "expires_at": datetime.now(timezone.utc) - timedelta(seconds=1),
+    }
+    store.gitlab_refresh_claim = {
+        "refresh_generation": 1,
+        "refresh_token_ciphertext": connection["refresh_token_ciphertext"],
     }
     refreshed = await client.access_token_for_connection(store, connection)
     assert refreshed == "access-two"
     assert store.token_update is not None
     assert "access-two" not in store.token_update["access_token_ciphertext"]
+    assert store.token_update["refresh_generation"] == 1
     assert "refresh-two" not in store.token_update["refresh_token_ciphertext"]
     await client.revoke(refreshed)
     assert any(path == "/oauth/revoke" for _, path, _ in calls)

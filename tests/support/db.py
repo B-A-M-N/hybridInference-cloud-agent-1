@@ -32,7 +32,36 @@ async def reset_agent_tables(conn: Any) -> None:
     )
     names = ", ".join(sorted(row["tablename"] for row in rows))
     if names:
-        await conn.execute(f"TRUNCATE TABLE {names} CASCADE")
+        protects_sandbox_events = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_trigger AS trigger
+                JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+                JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+                WHERE namespace.nspname = 'public'
+                  AND relation.relname = 'agent_sandbox_events'
+                  AND trigger.tgname = 'trg_agent_sandbox_events_no_truncate'
+                  AND NOT trigger.tgisinternal
+            )
+            """
+        )
+        if protects_sandbox_events:
+            # Production has no bypass for the append-only trigger. Test reset
+            # owns the migrated schema, so disable only this named guard inside
+            # one transaction; a failed TRUNCATE rolls the ALTER TABLE back.
+            async with conn.transaction():
+                await conn.execute(
+                    "ALTER TABLE agent_sandbox_events "
+                    "DISABLE TRIGGER trg_agent_sandbox_events_no_truncate"
+                )
+                await conn.execute(f"TRUNCATE TABLE {names} CASCADE")
+                await conn.execute(
+                    "ALTER TABLE agent_sandbox_events "
+                    "ENABLE TRIGGER trg_agent_sandbox_events_no_truncate"
+                )
+        else:
+            await conn.execute(f"TRUNCATE TABLE {names} CASCADE")
     # The baseline seeds this row; every claim reads it, and a test that left
     # a host pinned would otherwise gate every later claim.
     await conn.execute(

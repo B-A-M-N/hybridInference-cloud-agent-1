@@ -82,18 +82,28 @@ class SnapshotRepository(Protocol):
         """
         ...
 
-    async def defer_snapshot_publish(self, *, snapshot_id: int, detail: str) -> bool:
-        """Return an unstarted publication to captured with a 30-second retry.
+    async def defer_snapshot_publish(
+        self, *, snapshot_id: int, expected_publish_retry_count: int, detail: str
+    ) -> bool:
+        """Spend one durable retry after a transient publication failure.
 
-        Call only after an entitlement preflight failure, before minting a write
-        credential or performing external publication effects. Retains the patch
-        and included turns, and bounds the visible detail to 2,000 characters.
-        Returns ``False`` unless the snapshot is still ``publishing``.
+        The deterministic branch and PR are reconciled on replay, including
+        after uncertain remote effects. Retains the immutable artifact and its
+        included turns. Exhaustion makes the snapshot terminal and deliberately
+        preserves the lineage block for manual review rather than publishing a
+        later workspace epoch out of order. The expected retry count fences a
+        publisher whose stalled claim was already reclaimed. Returns ``False``
+        unless this exact claim is still ``publishing``.
         """
         ...
 
     async def record_snapshot_publish(
-        self, *, snapshot_id: int, pr_url: str, commit_sha: str
+        self,
+        *,
+        snapshot_id: int,
+        expected_publish_retry_count: int,
+        pr_url: str,
+        commit_sha: str,
     ) -> bool:
         """Advance one group lineage and wait for object-only base import.
 
@@ -103,7 +113,9 @@ class SnapshotRepository(Protocol):
         """
         ...
 
-    async def fail_snapshot_publish(self, *, snapshot_id: int, detail: str) -> None:
+    async def fail_snapshot_publish(
+        self, *, snapshot_id: int, expected_publish_retry_count: int, detail: str
+    ) -> None:
         """Retain a rejected group artifact without failing included turns."""
         ...
 
@@ -147,5 +159,5 @@ class SnapshotRepository(Protocol):
         ...
 
     async def reap_stalled_snapshot_publishes(self, *, stall_seconds: float = 900.0) -> list[int]:
-        """Fail ambiguous shared publishes without changing Agent turn state."""
+        """Requeue abandoned claims through the same bounded retry budget."""
         ...

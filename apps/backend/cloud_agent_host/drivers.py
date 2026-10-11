@@ -771,6 +771,33 @@ class _ProtocolReply:
         return self._value if self._settled.wait(timeout) else None
 
 
+class _InputReceipt:
+    """One turn-local message-ID receipt shared by concurrent broker retries."""
+
+    def __init__(self) -> None:
+        self._settled = threading.Event()
+        self._outcome: InputOutcome | None = None
+        self._error: BaseException | None = None
+
+    def settle(self, outcome: InputOutcome) -> None:
+        self._outcome = outcome
+        self._settled.set()
+
+    def fail(self, error: BaseException) -> None:
+        """Replay an uncertain native failure to every concurrent waiter."""
+        self._error = error
+        self._settled.set()
+
+    def wait(self) -> InputOutcome:
+        """Wait for the one native write attempt and replay its answer."""
+        self._settled.wait()
+        if self._error is not None:
+            raise self._error
+        if self._outcome is None:  # pragma: no cover - settle writes before set
+            raise DriverError("input receipt settled without an outcome")
+        return self._outcome
+
+
 class _JsonResidentTurn(HarnessTurn[_LiveRuntimeT], Generic[_LiveRuntimeT]):
     """One framed activation on a process whose stdout survives the turn."""
 
@@ -795,6 +822,11 @@ class _JsonResidentTurn(HarnessTurn[_LiveRuntimeT], Generic[_LiveRuntimeT]):
         # the stream reports the message taken whenever its answer arrives.
         self._steers: dict[str, PendingInput] = {}
         self._replies_lock = threading.Lock()
+        # The control plane may lose the broker's accepted response and replay
+        # the same durable handoff after its lease expires.  One message ID is
+        # one native steer for this exact turn, including concurrent retries.
+        self._input_receipts: dict[str, _InputReceipt] = {}
+        self._input_receipts_lock = threading.Lock()
         self._question_commands: dict[str, str] = {}
 
     def track_question_reply(self, command_id: str, native_key: str) -> None:
@@ -900,9 +932,33 @@ class _JsonResidentTurn(HarnessTurn[_LiveRuntimeT], Generic[_LiveRuntimeT]):
 
     def inject(self, text: str, *, message_id: str) -> InputOutcome:
         """Hand ``text`` to the running turn through the session's native seam."""
-        if self._cancelled or self._saw_result or self._result is not None:
-            return InputOutcome(False, INPUT_TURN_ENDED)
-        return self._session.inject_input(self, PendingInput(message_id, text))
+        with self._input_receipts_lock:
+            receipt = self._input_receipts.get(message_id)
+            if receipt is None:
+                if self._cancelled or self._saw_result or self._result is not None:
+                    return InputOutcome(False, INPUT_TURN_ENDED)
+                receipt = _InputReceipt()
+                self._input_receipts[message_id] = receipt
+                owner = True
+            else:
+                owner = False
+        if not owner:
+            return receipt.wait()
+        try:
+            outcome = self._session.inject_input(self, PendingInput(message_id, text))
+        except BaseException as exc:
+            # The native call may have taken the message before failing. Every
+            # concurrent duplicate must preserve that uncertainty rather than
+            # turn it into an explicit refusal that the control plane requeues.
+            receipt.fail(exc)
+            with self._input_receipts_lock:
+                self._input_receipts.pop(message_id, None)
+            raise
+        receipt.settle(outcome)
+        if not outcome.accepted:
+            with self._input_receipts_lock:
+                self._input_receipts.pop(message_id, None)
+        return outcome
 
     def cancel(self) -> None:
         """Use the exact native interrupt; preserve the resident transport."""
@@ -2035,6 +2091,11 @@ class ClaudeCodeLiveTurn(HarnessTurn[ClaudeCodeRuntime]):
         # calls a tool, then written, then taken once the CLI echoes them.
         self._held: list[PendingInput] = []
         self._written: list[PendingInput] = []
+        # An accepted broker response can be lost after the CLI takes the
+        # message and removes it from ``_written``. Keep its ID for this turn
+        # so a later durable replay returns the same receipt without writing it
+        # to the native process a second time.
+        self._input_receipts: set[str] = set()
         # Set when the stream reaches the result: nothing is taken after it.
         self._input_closed = False
         self._input_lock = threading.Lock()
@@ -2324,6 +2385,7 @@ class ClaudeCodeLiveTurn(HarnessTurn[ClaudeCodeRuntime]):
             with self._input_lock:
                 if pending in self._written:
                     self._written.remove(pending)
+                self._input_receipts.discard(pending.message_id)
             return False
         return True
 
@@ -2343,8 +2405,9 @@ class ClaudeCodeLiveTurn(HarnessTurn[ClaudeCodeRuntime]):
         with self._input_lock:
             if self._cancelled or self._input_closed or self._result is not None:
                 return InputOutcome(False, INPUT_TURN_ENDED)
-            if any(held.message_id == message_id for held in (*self._held, *self._written)):
+            if message_id in self._input_receipts:
                 return InputOutcome(True)
+            self._input_receipts.add(message_id)
             if not self._open_tool_uses:
                 self._held.append(pending)
                 return InputOutcome(True)

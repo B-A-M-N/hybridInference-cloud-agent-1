@@ -40,9 +40,15 @@ from typing import TYPE_CHECKING, Any, Protocol
 import httpx
 
 from cloud_agent.entitlement import RepoAccessUnavailable, RepoNotAllowed, require_entitled_repo
+from cloud_agent.github_app import GitHubAppError
 from cloud_agent.logging_utils import get_logger
 from cloud_agent.pr_titles import generate_pr_title, is_generic_pr_summary
-from cloud_agent.publisher import PublishError, fetch_base_bundle, publish_patch
+from cloud_agent.publisher import (
+    PublishError,
+    TransientPublishError,
+    fetch_base_bundle,
+    publish_patch,
+)
 from cloud_agent.schemas import BASE_REF_METADATA_KEY
 from cloud_agent.settings import number_setting, setting_env
 from cloud_agent.source_control_runtime import SourceControlUnavailable
@@ -96,6 +102,18 @@ _PUBLISH_SCOPE = {"contents": "write", "pull_requests": "write"}
 # accept `abcdef1\n` — reachable only if the `.strip()` above ever goes away.
 # A branch called `deadbee-release` is not affected either way.
 _LOOKS_LIKE_SHA = re.compile(r"^[0-9a-fA-F]{7,64}$")
+
+
+def _retryable_github_status(status: int | None) -> bool:
+    return status is not None and (status in {408, 429} or 500 <= status < 600)
+
+
+def _github_api_error(operation: str, response: httpx.Response) -> PublishError:
+    """Classify an API refusal without retaining an untrusted response body."""
+    error = (
+        TransientPublishError if _retryable_github_status(response.status_code) else PublishError
+    )
+    return error(f"GitHub refused {operation} ({response.status_code})")
 
 
 def _pr_base_branch(job: dict[str, Any], fallback: str) -> str:
@@ -169,18 +187,25 @@ async def create_draft_pull_request(
                 "draft": True,
             },
         )
+    if response.status_code == 422:
+        # An earlier create can have committed while its response was lost,
+        # then remain briefly absent from the lookup. Re-enter the bounded
+        # lookup/create reconciliation instead of terminally failing it.
+        raise TransientPublishError("GitHub refused the draft PR (422); publication will reconcile")
     if response.status_code >= 400:
-        raise PublishError(
-            f"GitHub refused the draft PR ({response.status_code}): {response.text[:300]}"
-        )
-    url = response.json().get("html_url")
+        raise _github_api_error("the draft PR", response)
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise TransientPublishError("GitHub returned an invalid draft PR response") from exc
+    url = payload.get("html_url") if isinstance(payload, dict) else None
     if not isinstance(url, str) or not url.strip():
         # A 2xx with no usable URL is not a success this worker can record.
         # Returning "" put an empty `published_pr_url` on the job, which marks
         # it published — and the query this worker claims from selects on
         # `published_pr_url IS NULL`, so the job would never be retried and the
         # owner would never get a link. Failing is recoverable; that is not.
-        raise PublishError(
+        raise TransientPublishError(
             f"GitHub accepted the draft PR ({response.status_code}) but returned no html_url"
         )
     return url
@@ -214,26 +239,32 @@ async def ensure_draft_pull_request(
             },
         )
         if response.status_code >= 400:
-            raise PublishError(f"GitHub refused the PR lookup ({response.status_code})")
-        pulls = response.json()
+            raise _github_api_error("the PR lookup", response)
+        try:
+            pulls = response.json()
+        except ValueError as exc:
+            raise TransientPublishError("GitHub returned an invalid PR list") from exc
         if not isinstance(pulls, list):
-            raise PublishError("GitHub returned an invalid PR list")
+            raise TransientPublishError("GitHub returned an invalid PR list")
         for pull in pulls:
             if not isinstance(pull, dict):
-                raise PublishError("GitHub returned an invalid PR list entry")
+                raise TransientPublishError("GitHub returned an invalid PR list entry")
             if pull.get("state") != "open":
                 continue
             number, url = pull.get("number"), pull.get("html_url")
             if not isinstance(number, int) or not isinstance(url, str) or not url.strip():
-                raise PublishError("GitHub returned an open PR without its number or URL")
+                raise TransientPublishError("GitHub returned an open PR without its number or URL")
             updated = await client.patch(
                 f"{endpoint}/{number}", headers=headers, json={"title": title, "body": body}
             )
             if updated.status_code >= 400:
-                raise PublishError(f"GitHub refused the PR update ({updated.status_code})")
-            payload = updated.json()
+                raise _github_api_error("the PR update", updated)
+            try:
+                payload = updated.json()
+            except ValueError as exc:
+                raise TransientPublishError("GitHub returned an invalid PR update") from exc
             if not isinstance(payload, dict) or payload.get("state") not in {"open", "closed"}:
-                raise PublishError("GitHub returned an invalid PR update")
+                raise TransientPublishError("GitHub returned an invalid PR update")
             if payload["state"] == "closed":
                 # The owner can close/merge while publication is updating it.
                 break
@@ -518,10 +549,19 @@ async def _publish_claimed(
     job_id = job["job_id"]
     base_sha = job["base_sha"]
     pr_base = _pr_base_branch(job, base_branch)
+    expected_publish_retry_count = int(job["publish_retry_count"])
 
     async def fail(detail: str) -> None:
         await store.snapshot.fail_snapshot_publish(
             snapshot_id=int(job["snapshot_id"]),
+            expected_publish_retry_count=expected_publish_retry_count,
+            detail=detail,
+        )
+
+    async def retry(detail: str) -> None:
+        await store.snapshot.defer_snapshot_publish(
+            snapshot_id=int(job["snapshot_id"]),
+            expected_publish_retry_count=expected_publish_retry_count,
             detail=detail,
         )
 
@@ -539,13 +579,7 @@ async def _publish_claimed(
             app_credentials=app_credentials,
         )
     except RepoAccessUnavailable as exc:
-        # No write credential, git push, or PR request has happened yet. Only
-        # this preflight failure can safely return the immutable artifact to
-        # the queue; later failures may have changed the remote repository.
-        await store.snapshot.defer_snapshot_publish(
-            snapshot_id=int(job["snapshot_id"]),
-            detail=f"repository access check unavailable; publication will retry: {exc}",
-        )
+        await retry(f"repository access check unavailable; publication will retry: {exc}")
         return None
     except RepoNotAllowed as exc:
         await fail(f"no longer entitled to publish to {job['repo']}: {exc}")
@@ -566,6 +600,15 @@ async def _publish_claimed(
                     job["repo"], permissions=_PUBLISH_SCOPE, repository_scoped=True
                 )
             )
+        except (httpx.TransportError, SourceControlUnavailable) as exc:
+            await retry(f"could not obtain a GitHub credential; publication will retry: {exc}")
+            return None
+        except GitHubAppError as exc:
+            if _retryable_github_status(exc.status):
+                await retry(f"could not obtain a GitHub credential; publication will retry: {exc}")
+            else:
+                await fail(f"could not obtain a GitHub credential: {exc}")
+            return None
         except Exception as exc:
             await fail(f"could not obtain a GitHub credential: {exc}")
             return None
@@ -599,6 +642,20 @@ async def _publish_claimed(
             body=_pr_body(job, result.changed_files),
             credential=credential,
         )
+    except TransientPublishError as exc:
+        logger.warning(
+            "agent_job_publish_deferred",
+            extra={"event": "agent_job_publish_deferred", "job_id": job_id},
+        )
+        await retry(f"transient publication failure; publication will retry: {exc}")
+        return None
+    except (httpx.TransportError, RepoAccessUnavailable, SourceControlUnavailable) as exc:
+        logger.warning(
+            "agent_job_publish_deferred",
+            extra={"event": "agent_job_publish_deferred", "job_id": job_id},
+        )
+        await retry(f"transient publication transport failure; publication will retry: {exc}")
+        return None
     except PublishError as exc:
         logger.warning(
             "agent_job_publish_rejected",
@@ -613,6 +670,7 @@ async def _publish_claimed(
 
     recorded = await store.snapshot.record_snapshot_publish(
         snapshot_id=int(job["snapshot_id"]),
+        expected_publish_retry_count=expected_publish_retry_count,
         pr_url=pr_url,
         commit_sha=result.commit_sha,
     )

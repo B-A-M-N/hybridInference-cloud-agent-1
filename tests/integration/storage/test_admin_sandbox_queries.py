@@ -365,11 +365,17 @@ async def test_trajectory_bounds_member_history_and_keeps_origin_first(db, store
     async with db.acquire() as conn:
         await conn.executemany(
             """
-            INSERT INTO agent_threads (id, user_id, repo, title)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO agent_threads (id, user_id, repo, title, execution_profile)
+            VALUES ($1, $2, $3, $4, $5)
             """,
             [
-                (thread_id, origin["user_id"], origin["repo"], f"Historical {index}")
+                (
+                    thread_id,
+                    origin["user_id"],
+                    origin["repo"],
+                    f"Historical {index}",
+                    origin["execution_profile"],
+                )
                 for index, thread_id in enumerate(historical_thread_ids)
             ],
         )
@@ -504,9 +510,12 @@ async def test_stop_fences_claims_until_confirmation_then_allows_native_resume(d
         **fence, container_id="container-controlled", context_status="new"
     )
     assert await stop_request(db, store, sandbox["sandbox_id"]) == "busy"
-    assert await store.sandbox.admit_thread_sandbox_turn(**fence, job_id=job["id"])
+    assert await store.sandbox.admit_thread_sandbox_turn(
+        **fence, residency_generation=sandbox["residency_generation"], job_id=job["id"]
+    )
     assert await store.sandbox.settle_thread_sandbox(
         **fence,
+        residency_generation=sandbox["residency_generation"],
         job_id=job["id"],
         context_status="live",
         native_session_id="native-control",
@@ -660,9 +669,12 @@ async def test_follow_up_reservation_keeps_running_container_visible(db, store, 
     assert await store.sandbox.mark_thread_sandbox_running(
         **fence, container_id="container-retained-inventory", context_status="new"
     )
-    assert await store.sandbox.admit_thread_sandbox_turn(**fence, job_id=job["id"])
+    assert await store.sandbox.admit_thread_sandbox_turn(
+        **fence, residency_generation=sandbox["residency_generation"], job_id=job["id"]
+    )
     settled = await store.sandbox.settle_thread_sandbox(
         **fence,
+        residency_generation=sandbox["residency_generation"],
         job_id=job["id"],
         context_status="live",
         native_session_id="retained-inventory-session",

@@ -103,7 +103,7 @@ class PostgresHostPoolRepository:
             row = await conn.fetchrow(
                 """
                 INSERT INTO agent_host_enroll_tokens (token_hash, host, issued_by, expires_at)
-                VALUES ($1, $2, $3, NOW() + make_interval(secs => $4))
+                VALUES ($1, $2, $3, clock_timestamp() + make_interval(secs => $4))
                 RETURNING expires_at, created_at
                 """,
                 token_hash,
@@ -132,12 +132,20 @@ class PostgresHostPoolRepository:
         matches nothing, because ``NULL = $2`` is never true. That is the
         fail-closed direction: such a token was redeemable under any name.
         """
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            locked = await conn.fetchval(
+                "SELECT token_hash FROM agent_host_enroll_tokens "
+                "WHERE token_hash = $1 AND consumed_at IS NULL AND host = $2 FOR UPDATE",
+                token_hash,
+                host,
+            )
+            if locked is None:
+                return False
             consumed = await conn.fetchval(
                 """
                 UPDATE agent_host_enroll_tokens
                 SET consumed_at = NOW(), consumed_host = $2
-                WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > NOW()
+                WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > clock_timestamp()
                   AND host = $2
                 RETURNING token_hash
                 """,

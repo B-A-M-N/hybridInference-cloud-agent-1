@@ -8,6 +8,7 @@ each caller does when it does not hold it.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -59,7 +60,13 @@ class _Store:
         self.cleared: list[str] = []
         #: Stands in for another caller's renewal landing while this one waits.
         self.on_reread: Any = None
+        self.store_result = True
         self.reads = 0
+
+    @asynccontextmanager
+    async def serialize_github_account(self, *, user_id: str):
+        assert user_id == _USER
+        yield self
 
     async def get_github_account(self, *, user_id: str) -> dict[str, Any] | None:
         assert user_id == _USER
@@ -79,11 +86,12 @@ class _Store:
         return {
             "refresh_generation": self.row["refresh_generation"],
             "refresh_token_ciphertext": self.row["refresh_token_ciphertext"],
+            "access_token_ciphertext": self.row["access_token_ciphertext"],
         }
 
     async def store_github_tokens(self, **written: Any) -> bool:
         self.written.append(written)
-        return True
+        return self.store_result
 
     async def clear_github_tokens(self, *, user_id: str, access_token_ciphertext: str) -> bool:
         self.cleared.append(access_token_ciphertext)
@@ -125,6 +133,18 @@ async def test_an_expiring_token_is_renewed_under_the_lease_and_written_back():
     assert app.cipher.decrypt(written["access_token_ciphertext"]) == "ghu_new"
     assert app.cipher.decrypt(written["refresh_token_ciphertext"]) == "ghr_new"
     assert token.ciphertext == written["access_token_ciphertext"]
+
+
+async def test_a_refresh_that_outlives_its_lease_falls_back_to_the_still_live_token():
+    app = _App()
+    store = _Store(app, expires_in=timedelta(minutes=2))
+    store.store_result = False
+
+    token = await user_access_token(_USER, store=store, app_credentials=app)
+
+    assert token is not None and token.value == "ghu_old"
+    [rejected] = store.written
+    assert app.cipher.decrypt(rejected["access_token_ciphertext"]) == "ghu_new"
 
 
 async def test_a_caller_without_the_lease_uses_the_old_token_while_it_still_works():

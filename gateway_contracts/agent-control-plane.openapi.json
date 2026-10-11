@@ -15922,6 +15922,11 @@
             "title": "Activation Generation",
             "type": "integer"
           },
+          "residency_generation": {
+            "minimum": 1.0,
+            "title": "Residency Generation",
+            "type": "integer"
+          },
           "sandbox_generation": {
             "minimum": 1.0,
             "title": "Sandbox Generation",
@@ -15930,7 +15935,8 @@
         },
         "required": [
           "sandbox_generation",
-          "activation_generation"
+          "activation_generation",
+          "residency_generation"
         ],
         "title": "WorkerSandboxAdmissionRequest",
         "type": "object"
@@ -16100,6 +16106,11 @@
             "title": "Process Generation",
             "type": "integer"
           },
+          "residency_generation": {
+            "minimum": 1.0,
+            "title": "Residency Generation",
+            "type": "integer"
+          },
           "sandbox_generation": {
             "minimum": 1.0,
             "title": "Sandbox Generation",
@@ -16109,6 +16120,7 @@
         "required": [
           "sandbox_generation",
           "activation_generation",
+          "residency_generation",
           "process_generation"
         ],
         "title": "WorkerSandboxProcessRequest",
@@ -16354,6 +16366,11 @@
             ],
             "title": "Native Session Id"
           },
+          "residency_generation": {
+            "minimum": 1.0,
+            "title": "Residency Generation",
+            "type": "integer"
+          },
           "sandbox_generation": {
             "minimum": 1.0,
             "title": "Sandbox Generation",
@@ -16363,6 +16380,7 @@
         "required": [
           "sandbox_generation",
           "activation_generation",
+          "residency_generation",
           "context_status"
         ],
         "title": "WorkerSandboxSettleRequest",
@@ -23201,7 +23219,7 @@
     },
     "/v1/agent/integrations/gitlab/connections/{connection_id}": {
       "delete": {
-        "description": "Revoke GitLab best-effort, then always remove the local credential.",
+        "description": "Conditionally remove the local credential and revoke its original token.",
         "operationId": "disconnect_gitlab_integration_v1_agent_integrations_gitlab_connections__connection_id__delete",
         "parameters": [
           {

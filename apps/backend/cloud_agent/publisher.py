@@ -73,6 +73,17 @@ class PublishError(Exception):
     """Raised when publication fails; the message is safe to store as detail."""
 
 
+class TransientPublishError(PublishError):
+    """An external publication failure that is safe to retry durably.
+
+    The branch name is deterministic and the publisher reconciles an already
+    pushed matching commit before it writes again. Callers may therefore put
+    these failures back on the publication queue without duplicating remote
+    work. Gate, patch, and branch-divergence failures remain ``PublishError``
+    and require a person rather than a retry loop.
+    """
+
+
 @dataclass
 class PublishResult:
     """Outcome of publishing one job's patch."""
@@ -101,6 +112,7 @@ def _run_git(
     *,
     cwd: Path | None = None,
     env_extra: dict[str, str] | None = None,
+    remote: bool = False,
 ) -> str:
     """Run one git command hermetically and return stdout."""
     timeout_s = number_setting("publish_git_timeout_s", _GIT_TIMEOUT_S)
@@ -116,11 +128,13 @@ def _run_git(
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        raise PublishError(f"git {args[0]} timed out after {timeout_s:.0f}s") from exc
+        error = TransientPublishError if remote else PublishError
+        raise error(f"git {args[0]} timed out after {timeout_s:.0f}s") from exc
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "").strip().splitlines()
         tail = detail[-1] if detail else "no output"
-        raise PublishError(f"git {args[0]} failed: {tail}")
+        error = TransientPublishError if remote else PublishError
+        raise error(f"git {args[0]} failed: {tail}")
     return completed.stdout
 
 
@@ -145,37 +159,60 @@ class _StagedChangeSet:
 def _remote_branch_tip(repo: Path, branch: str) -> str | None:
     """Return the remote tip of ``branch``, or ``None`` when it does not exist."""
     raw = _run_git(
-        ["ls-remote", "origin", "--end-of-options", f"refs/heads/{branch}"], cwd=repo
+        ["ls-remote", "origin", "--end-of-options", f"refs/heads/{branch}"],
+        cwd=repo,
+        remote=True,
     ).strip()
     if not raw:
         return None
     return raw.split()[0]
 
 
-def _check_branch_unmoved(repo: Path, branch: str, base_sha: str) -> None:
-    """Refuse to publish onto a branch that has commits this run did not build on.
-
-    A turn's commit is built on its pinned ``base_sha`` — for a follow-up,
-    that is the previous turn's published commit, so the push fast-forwards.
-    If the remote tip is anything else, someone (a human, most likely) pushed
-    to the agent branch after the sandbox last saw it, and this patch was
-    generated against a tree that does not contain their work. Pushing would
-    fail anyway (the refspec never forces); the point of checking first is the
-    recorded reason: "failed to push some refs" reads like an infrastructure
-    fault, and this reads like what happened.
-    """
-    tip = _remote_branch_tip(repo, branch)
-    if tip is None:
-        return
-    if tip.lower().startswith(base_sha.lower()):
-        return
-    raise PublishError(
+def _branch_moved(branch: str, tip: str, base_sha: str) -> PublishError:
+    """Build the actionable permanent error for a divergent remote branch."""
+    return PublishError(
         f"branch {branch} has moved: its tip is {tip[:12]} but this run built on "
         f"{base_sha[:12]}. Commits were pushed to the branch after this run started — "
         "the platform never force-pushes, so review them and either start a new "
         "follow-up (which builds on the branch's published state) or delete the "
         "branch to republish from scratch."
     )
+
+
+def _matching_remote_commit(
+    repo: Path,
+    *,
+    branch: str,
+    tip: str,
+    base_sha: str,
+    expected_tree: str,
+) -> str | None:
+    """Return ``tip`` when it is exactly this publication's lost push.
+
+    A process can die after the remote accepts the deterministic branch but
+    before the PR or database write. Rebuilding the commit is not a reliable
+    identity check because Git records timestamps. Its parent and tree are:
+    the intended retry must be one direct child of the pinned base and have the
+    tree produced by the revalidated patch. A different parent or tree is a
+    human/divergent branch and remains a permanent refusal.
+
+    The final ordinary (non-force) push is a receive-pack fence. It changes
+    nothing when the branch still names ``tip`` and fails if somebody advanced
+    it while this process was reconciling.
+    """
+    ancestry = _run_git(["rev-list", "--parents", "-n", "1", tip], cwd=repo).split()
+    # Publisher commits have one parent. Never hide a second, human parent.
+    if len(ancestry) != 2 or not ancestry[1].lower().startswith(base_sha.lower()):
+        return None
+    remote_tree = _run_git(["rev-parse", "--verify", f"{tip}^{{tree}}"], cwd=repo).strip()
+    if remote_tree != expected_tree:
+        return None
+    _run_git(
+        ["push", "--quiet", "origin", f"{tip}:refs/heads/{branch}"],
+        cwd=repo,
+        remote=True,
+    )
+    return tip
 
 
 def _staged_change_set(repo: Path) -> _StagedChangeSet:
@@ -314,9 +351,7 @@ def publish_patch(
         # a patch cannot be applied onto some other branch's tree by accident.
         _run_git(["init", "--quiet", str(repo)])
         _run_git(["remote", "add", "origin", clone_url], cwd=repo)
-        # Before any expensive work: a branch someone pushed to gets a clear
-        # refusal naming their commits, not a late "failed to push some refs".
-        _check_branch_unmoved(repo, branch, base_sha)
+        remote_tip = _remote_branch_tip(repo, branch)
         # `--end-of-options` plus the shape check above: git parses a leading
         # `--` argument as an option even after the remote name, so an
         # owner-supplied base_sha of `--upload-pack=/bin/sh -c ...` would run a
@@ -325,17 +360,37 @@ def publish_patch(
         _run_git(
             ["fetch", "--quiet", "--depth", "1", "origin", "--end-of-options", base_sha],
             cwd=repo,
+            remote=True,
         )
-        _run_git(["checkout", "--quiet", "-b", branch, "FETCH_HEAD"], cwd=repo)
+        base_commit = _run_git(
+            ["rev-parse", "--verify", f"{base_sha}^{{commit}}"], cwd=repo
+        ).strip()
+        recovering_tip = (
+            remote_tip
+            if remote_tip is not None and remote_tip.lower() != base_commit.lower()
+            else None
+        )
+        if recovering_tip is not None:
+            _run_git(
+                ["fetch", "--quiet", "--depth", "2", "origin", recovering_tip],
+                cwd=repo,
+                remote=True,
+            )
+        _run_git(["checkout", "--quiet", "-b", branch, base_commit], cwd=repo)
 
         patch_file = workdir / "job.patch"
         patch_file.write_text(patch, encoding="utf-8")
         # `--3way` recovers from minor context drift; `--whitespace=nowarn`
         # keeps whitespace-only noise from failing the apply.
-        _run_git(
-            ["apply", "--3way", "--whitespace=nowarn", str(patch_file)],
-            cwd=repo,
-        )
+        try:
+            _run_git(
+                ["apply", "--3way", "--whitespace=nowarn", str(patch_file)],
+                cwd=repo,
+            )
+        except PublishError:
+            if recovering_tip is not None:
+                raise _branch_moved(branch, recovering_tip, base_commit) from None
+            raise
 
         _run_git(["add", "--all"], cwd=repo)
         if not _run_git(["status", "--porcelain"], cwd=repo).strip():
@@ -353,6 +408,38 @@ def publish_patch(
             raise PublishError(f"patch rejected after apply: {post.reason}")
         _validate_staged_blobs(repo, staged.blobs)
         gate = post
+        if recovering_tip is not None:
+            expected_tree = _run_git(["write-tree"], cwd=repo).strip()
+            commit_sha = _matching_remote_commit(
+                repo,
+                branch=branch,
+                tip=recovering_tip,
+                base_sha=base_commit,
+                expected_tree=expected_tree,
+            )
+            if commit_sha is None:
+                raise _branch_moved(branch, recovering_tip, base_commit)
+            _run_git(["reset", "--soft", commit_sha], cwd=repo)
+            base_bundle = (
+                build_base_bundle(str(repo), commit=commit_sha, prerequisite=base_commit)
+                if include_base_bundle
+                else None
+            )
+            logger.info(
+                "agent_job_publish_reconciled",
+                extra={
+                    "event": "agent_job_publish_reconciled",
+                    "job_id": job_id,
+                    "branch": branch,
+                    "files": len(gate.changed_files),
+                },
+            )
+            return PublishResult(
+                branch=branch,
+                commit_sha=commit_sha,
+                changed_files=gate.changed_files,
+                base_bundle=base_bundle,
+            )
         _run_git(["commit", "--quiet", "--no-verify", "-m", commit_message], cwd=repo)
         commit_sha = _run_git(["rev-parse", "HEAD"], cwd=repo).strip()
         base_bundle = (
@@ -366,6 +453,7 @@ def publish_patch(
         _run_git(
             ["push", "--quiet", "origin", f"refs/heads/{branch}:refs/heads/{branch}"],
             cwd=repo,
+            remote=True,
         )
         logger.info(
             "agent_job_published",

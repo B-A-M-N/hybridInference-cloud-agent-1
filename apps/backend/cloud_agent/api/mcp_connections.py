@@ -73,6 +73,7 @@ from cloud_agent.mcp.registry import (
     oauth_cipher,
     resolve_connection,
 )
+from cloud_agent.ports.mcp import McpConnectionCreateConflict
 from cloud_agent.settings import setting_env
 from cloud_agent.source_control import SourceControlError
 
@@ -689,40 +690,53 @@ async def create_connection(
         # nothing makes the provenance unreadable.
         raise _bad_request(f"unknown template: {template!r}")
 
-    row = await job_store.mcp.create_mcp_connection(
-        user_id=user["user_id"],
-        label=body.label.strip(),
-        transport=transport.value,
-        location=location.value,
-        url=url,
-        launch_spec=launch_spec,
-        auth_kind=auth_kind.value,
-        auth_config=auth_config,
-        template=template,
-        connector_id=body.connector_id,
-        account_label=body.account_label,
-        request_timeout_s=body.request_timeout_s,
-        reuse_pending=not body.secret and not body.env_secrets,
-    )
+    if body.connector_id is not None:
+        if location is not ExecutionLocation.USER_CONNECTOR:
+            raise _bad_request("connector_id is only valid when location is 'user-connector'")
+        connector = await _require_connector(
+            job_store, connector_id=body.connector_id, user_id=user["user_id"]
+        )
+        if str(connector.get("status")) == "revoked":
+            raise _conflict("that connector has been revoked")
+    access_token_ciphertext = None
     if body.secret:
-        await _store_static_secret(
-            job_store,
-            row=row,
+        access_token_ciphertext, credential_config = _encrypt_static_secret(
             secret=body.secret,
             header_name=body.header_name,
             header_scheme=body.header_scheme,
-            replaces_identity=False,
         )
+        auth_config.update(credential_config)
     if body.env_secrets:
-        await _store_env_secrets(job_store, row=row, secrets=body.env_secrets)
+        launch_spec = _encrypt_env_secrets(launch_spec, secrets=body.env_secrets)
+    try:
+        rows = await job_store.mcp.create_mcp_connections(
+            connections=[
+                {
+                    "user_id": user["user_id"],
+                    "label": body.label.strip(),
+                    "transport": transport.value,
+                    "location": location.value,
+                    "url": url,
+                    "launch_spec": launch_spec,
+                    "auth_kind": auth_kind.value,
+                    "auth_config": auth_config,
+                    "template": template,
+                    "connector_id": body.connector_id,
+                    "account_label": body.account_label,
+                    "request_timeout_s": body.request_timeout_s,
+                    "reuse_pending": not body.secret and not body.env_secrets,
+                    "access_token_ciphertext": access_token_ciphertext,
+                }
+            ]
+        )
+    except McpConnectionCreateConflict as exc:
+        raise _conflict(str(exc)) from exc
+    row = rows[0]
     logger.info(
         "agent_mcp_connection_created",
         extra={"event": "agent_mcp_connection_created", "connection_id": row["id"]},
     )
-    refreshed = await job_store.mcp.get_mcp_connection(
-        connection_id=int(row["id"]), user_id=user["user_id"]
-    )
-    return await _view(job_store, refreshed or row)
+    return await _view(job_store, row)
 
 
 @router.post("/connections/import", response_model=ImportPreview)
@@ -752,7 +766,7 @@ async def import_connections(
             dialect=result.dialect,
         )
 
-    saved: list[ConnectionView] = []
+    connections: list[dict[str, Any]] = []
     for draft in result.drafts:
         location = body.locations.get(draft.label, draft.location)
         parsed_location = _parse_location(location)
@@ -780,30 +794,38 @@ async def import_connections(
                 if header_name == draft.header_auth.header_name
                 else "",
             }
-        row = await job_store.mcp.create_mcp_connection(
-            user_id=user["user_id"],
-            label=draft.label,
-            transport=draft.transport.value,
-            location=parsed_location.value,
-            url=draft.url,
-            launch_spec=launch_spec,
-            auth_kind=auth_kind.value,
-            auth_config=auth_config,
-            template=None,
-            reuse_pending=not draft.secrets,
-        )
         secrets = {secret.name: secret.value for secret in draft.secrets if secret.value}
         supplied = body.server_secrets.get(draft.label, {})
         for secret in draft.secrets:
             value = supplied.get(secret.name, body.env_secrets.get(secret.name))
             if secret.value is None and value is not None:
                 secrets[secret.name] = value
-        if secrets:
-            await _store_import_secrets(job_store, row=row, secrets=secrets)
-        refreshed = await job_store.mcp.get_mcp_connection(
-            connection_id=int(row["id"]), user_id=user["user_id"]
+        launch_spec, auth_config, access_token_ciphertext = _encrypt_import_secrets(
+            transport=draft.transport,
+            launch_spec=launch_spec,
+            auth_config=auth_config,
+            secrets=secrets,
         )
-        saved.append(await _view(job_store, refreshed or row))
+        connections.append(
+            {
+                "user_id": user["user_id"],
+                "label": draft.label,
+                "transport": draft.transport.value,
+                "location": parsed_location.value,
+                "url": draft.url,
+                "launch_spec": launch_spec,
+                "auth_kind": auth_kind.value,
+                "auth_config": auth_config,
+                "template": None,
+                "reuse_pending": not secrets,
+                "access_token_ciphertext": access_token_ciphertext,
+            }
+        )
+    try:
+        rows = await job_store.mcp.create_mcp_connections(connections=connections)
+    except McpConnectionCreateConflict as exc:
+        raise _conflict(str(exc)) from exc
+    saved = [await _view(job_store, row) for row in rows]
     return ImportPreview(
         drafts=preview,
         saved=saved,
@@ -1247,7 +1269,7 @@ async def authorize_connection(
             connection_id=str(connection_id),
             config_revision=connection.config_revision,
             authorization_epoch=connection.authorization_epoch,
-            oauth_generation=connection.oauth_generation,
+            oauth_generation=connection.oauth_generation + 1,
         ),
         state=oauth.new_state(),
         pkce=oauth.PkcePair.generate(),
@@ -1262,13 +1284,13 @@ async def authorize_connection(
     except oauth.OAuthError as exc:
         raise _bad_request(str(exc)) from exc
     cipher = oauth_cipher()
-    await job_store.mcp.create_mcp_oauth_flow(
+    oauth_generation = await job_store.mcp.create_mcp_oauth_flow(
         state_hash=oauth.state_hash(flow.state),
         user_id=user["user_id"],
         connection_id=connection_id,
         config_revision=connection.config_revision,
         authorization_epoch=connection.authorization_epoch,
-        oauth_generation=connection.oauth_generation + 1,
+        expected_oauth_generation=connection.oauth_generation,
         code_verifier_ciphertext=cipher.encrypt(flow.pkce.verifier),
         client_id=identity.client_id,
         client_secret_ciphertext=(
@@ -1286,6 +1308,8 @@ async def authorize_connection(
         registration_endpoint=metadata.registration_endpoint,
         expires_at=datetime.now(timezone.utc) + oauth.FLOW_LIFETIME,
     )
+    if oauth_generation is None:
+        raise _conflict("this connection changed while you were authorizing it")
     return AuthorizeResponse(authorization_url=authorization_url)
 
 
@@ -2309,7 +2333,9 @@ async def unbind_connector_connection(
     job_store = _require_store(store)
     await _require_connector(job_store, connector_id=connector_id, user_id=user["user_id"])
     unbound = await job_store.mcp.unbind_mcp_connection_connector(
-        connection_id=connection_id, user_id=user["user_id"]
+        connection_id=connection_id,
+        user_id=user["user_id"],
+        connector_id=connector_id,
     )
     if unbound is None or unbound.get("connector_id") is not None:
         raise _not_found("that connection is not routed through this connector")
@@ -2448,9 +2474,26 @@ async def _store_static_secret(
     expected_epoch: int | None = None,
 ) -> bool:
     """Encrypt and store one static credential."""
-    _kind, config = _build_auth(
-        AuthKind.STATIC.value, header_name or _header_of(row), header_scheme
+    ciphertext, config = _encrypt_static_secret(
+        secret=secret,
+        header_name=header_name or _header_of(row),
+        header_scheme=header_scheme,
     )
+    epoch = int(row["authorization_epoch"]) if expected_epoch is None else expected_epoch
+    return await store.mcp.set_mcp_credential(
+        connection_id=int(row["id"]),
+        expected_authorization_epoch=epoch,
+        access_token_ciphertext=ciphertext,
+        auth_config_patch=config,
+        bump_epoch=replaces_identity,
+    )
+
+
+def _encrypt_static_secret(
+    *, secret: str, header_name: str | None, header_scheme: str | None
+) -> tuple[str, dict[str, Any]]:
+    """Validate and encrypt a static credential before any database write."""
+    _kind, config = _build_auth(AuthKind.STATIC.value, header_name, header_scheme)
     try:
         HeaderAuth(header_name=config["header_name"], scheme=config["scheme"]).render(secret)
     except EndpointRejected as exc:
@@ -2462,14 +2505,7 @@ async def _store_static_secret(
         ciphertext = mcp_cipher().encrypt(secret)
     except SourceControlError as exc:
         raise _no_encryption_key() from exc
-    epoch = int(row["authorization_epoch"]) if expected_epoch is None else expected_epoch
-    return await store.mcp.set_mcp_credential(
-        connection_id=int(row["id"]),
-        expected_authorization_epoch=epoch,
-        access_token_ciphertext=ciphertext,
-        auth_config_patch=config,
-        bump_epoch=replaces_identity,
-    )
+    return ciphertext, config
 
 
 def _header_of(row: Mapping[str, Any]) -> str:
@@ -2479,9 +2515,9 @@ def _header_of(row: Mapping[str, Any]) -> str:
     return str(settings.get("header_name") or "Authorization")
 
 
-async def _store_env_secrets(
-    store: _McpConnectionsStorage, *, row: Mapping[str, Any], secrets: Mapping[str, str]
-) -> None:
+def _encrypt_env_secrets(
+    launch_spec: Mapping[str, Any] | None, *, secrets: Mapping[str, str]
+) -> dict[str, Any] | None:
     """Encrypt a stdio connection's environment secrets into its launch spec.
 
     The reference a launch spec carries is ``secret://NAME``; the value lives
@@ -2490,32 +2526,33 @@ async def _store_env_secrets(
     them either, which is the property that stops a half-restored connection
     from starting with an empty credential.
     """
-    spec = row.get("launch_spec")
-    launch_spec = dict(spec) if isinstance(spec, Mapping) else {}
-    env = {str(k): str(v) for k, v in (launch_spec.get("env") or {}).items()}
+    if launch_spec is None:
+        return None
+    encrypted_spec = dict(launch_spec)
+    env = {str(k): str(v) for k, v in (encrypted_spec.get("env") or {}).items()}
     wanted = launch.declared_secret_names(env, {})
     if not wanted:
-        return
+        return encrypted_spec
     try:
         cipher = mcp_cipher()
     except SourceControlError as exc:
         raise _no_encryption_key() from exc
-    stored = {str(k): str(v) for k, v in (launch_spec.get("env_secrets") or {}).items()}
+    stored = {str(k): str(v) for k, v in (encrypted_spec.get("env_secrets") or {}).items()}
     for name in wanted:
         if name in secrets:
             stored[name] = cipher.encrypt(secrets[name])
-    launch_spec["env_secrets"] = stored
-    await store.mcp.set_mcp_launch_spec(
-        connection_id=int(row["id"]),
-        expected_authorization_epoch=int(row["authorization_epoch"]),
-        launch_spec=launch_spec,
-    )
+    encrypted_spec["env_secrets"] = stored
+    return encrypted_spec
 
 
-async def _store_import_secrets(
-    store: _McpConnectionsStorage, *, row: Mapping[str, Any], secrets: Mapping[str, str]
-) -> None:
-    """Store whatever an imported configuration carried, encrypted.
+def _encrypt_import_secrets(
+    *,
+    transport: Transport,
+    launch_spec: dict[str, Any] | None,
+    auth_config: dict[str, Any],
+    secrets: Mapping[str, str],
+) -> tuple[dict[str, Any] | None, dict[str, Any], str | None]:
+    """Prepare whatever an imported configuration carried for atomic storage.
 
     A header credential goes in the credential column and a stdio environment
     value goes in the launch spec, because that is where each one is read from
@@ -2523,24 +2560,19 @@ async def _store_import_secrets(
     connection that looks configured and authenticates with nothing.
     """
     if not secrets:
-        return
-    if str(row.get("transport")) == Transport.STDIO.value:
-        await _store_env_secrets(store, row=row, secrets=secrets)
-        return
-    header_name = _header_of(row)
+        return launch_spec, auth_config, None
+    if transport is Transport.STDIO:
+        return _encrypt_env_secrets(launch_spec, secrets=secrets), auth_config, None
+    header_name = str(auth_config.get("header_name") or "Authorization")
     secret = secrets.get(header_name)
     if secret is None:
-        return
-    config = row.get("auth_config")
-    settings = config if isinstance(config, Mapping) else {}
-    await _store_static_secret(
-        store,
-        row=row,
+        return launch_spec, auth_config, None
+    ciphertext, credential_config = _encrypt_static_secret(
         secret=secret,
         header_name=header_name,
-        header_scheme=str(settings.get("scheme") or ""),
-        replaces_identity=False,
+        header_scheme=str(auth_config.get("scheme") or ""),
     )
+    return launch_spec, {**auth_config, **credential_config}, ciphertext
 
 
 def _no_encryption_key() -> HTTPException:
