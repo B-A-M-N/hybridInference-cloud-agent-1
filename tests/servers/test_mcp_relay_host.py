@@ -39,6 +39,7 @@ from cloud_agent.api.deps import get_storage
 from cloud_agent.mcp.host import ContentBlock, Session, ToolResult
 from cloud_agent.mcp.protocol import Handshake
 from cloud_agent.mcp.registry import mcp_cipher
+from cloud_agent.ports.web_search import WebSearchAdmission
 from cloud_agent.tokens import SCOPE_MCP, mint_worker_token
 
 pytestmark = pytest.mark.asyncio
@@ -61,6 +62,7 @@ def _secrets(monkeypatch: pytest.MonkeyPatch) -> None:
     # admit both for the guard to let the per-connection route through.
     monkeypatch.setenv("AGENT_MCP_ALLOW_PRIVATE_TARGETS", "1")
     monkeypatch.setenv("AGENT_MCP_ALLOW_PLAIN_HTTP", "1")
+    monkeypatch.setattr(agent_mcp_router.web_search, "configured", lambda: False)
     yield
 
 
@@ -207,6 +209,10 @@ class FakeStore(AllCapabilities):
         self.wait_action = "expired"
         self.finished = []
         self.invocation_created = asyncio.Event()
+        self.search_admission = WebSearchAdmission(call_id="search-call-1", reason="admitted")
+        self.search_admission_error = False
+        self.search_acquired: list[dict[str, Any]] = []
+        self.search_released: list[str] = []
 
     async def resolve_model_credential(
         self, *, job_id: str, attempt_id: int, lease_generation: int
@@ -263,6 +269,24 @@ class FakeStore(AllCapabilities):
 
     async def finish_mcp_invocation(self, **kwargs):
         self.finished.append(kwargs)
+        return True
+
+    async def acquire_web_search(
+        self, *, job_id: str, attempt_id: int, lease_generation: int
+    ) -> WebSearchAdmission:
+        if self.search_admission_error:
+            raise RuntimeError("web search admission storage unavailable")
+        self.search_acquired.append(
+            {
+                "job_id": job_id,
+                "attempt_id": attempt_id,
+                "lease_generation": lease_generation,
+            }
+        )
+        return self.search_admission
+
+    async def release_web_search(self, *, call_id: str) -> bool:
+        self.search_released.append(call_id)
         return True
 
 
@@ -1037,3 +1061,236 @@ async def test_legacy_duplicate_aliases_cannot_route_to_the_first_connection(
     assert response.status_code == 403 or "error" in response.json()
     assert host.opened == []
     assert host.called == []
+
+
+class TestBuiltInWebSearch:
+    """The platform tool shares the fenced host without becoming a fake connection."""
+
+    async def test_unconfigured_search_is_neither_listed_nor_callable(
+        self, client: AsyncClient, host: StubHost
+    ) -> None:
+        listing = await client.post(_HOST_URL, json=_rpc("tools/list"), headers=_auth())
+        assert "web_search" not in _tool_names(listing)
+
+        call = await client.post(
+            _HOST_URL,
+            json=_rpc("tools/call", name="web_search", arguments={"query": "latest release"}),
+            headers=_auth(),
+        )
+        assert "error" in call.json()
+        assert host.opened == []
+        assert host.called == []
+
+    async def test_configured_search_has_a_bounded_public_schema(
+        self, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(agent_mcp_router.web_search, "configured", lambda: True)
+
+        listing = await client.post(_HOST_URL, json=_rpc("tools/list"), headers=_auth())
+        assert _tool_names(listing).count("web_search") == 1
+        tool = next(item for item in _result(listing)["tools"] if item["name"] == "web_search")
+
+        assert tool["inputSchema"]["required"] == ["query"]
+        assert tool["inputSchema"]["properties"]["num_results"]["maximum"] == 10
+        assert tool["inputSchema"]["additionalProperties"] is False
+        assert "Serper.dev" in tool["description"] and "Brave Search" in tool["description"]
+
+    async def test_search_call_uses_the_platform_dispatch_not_a_user_connection(
+        self,
+        client: AsyncClient,
+        store: FakeStore,
+        host: StubHost,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calls: list[dict[str, Any]] = []
+        monkeypatch.setattr(agent_mcp_router.web_search, "configured", lambda: True)
+
+        async def search(arguments):
+            calls.append(arguments)
+            return {
+                "query": arguments["query"],
+                "organic": [{"title": "Result", "link": "https://example.com"}],
+            }
+
+        monkeypatch.setattr(agent_mcp_router.web_search, "search", search)
+        response = await client.post(
+            _HOST_URL,
+            json=_rpc(
+                "tools/call",
+                name="web_search",
+                arguments={"query": "current package version", "num_results": 3},
+            ),
+            headers=_auth(),
+        )
+
+        assert response.status_code == 200
+        assert calls == [{"query": "current package version", "num_results": 3}]
+        assert json.loads(_result(response)["content"][0]["text"]) == {
+            "query": "current package version",
+            "organic": [{"title": "Result", "link": "https://example.com"}],
+        }
+        assert store.search_acquired == [
+            {
+                "job_id": _JOB,
+                "attempt_id": _ATTEMPT,
+                "lease_generation": _LEASE,
+            }
+        ]
+        assert store.search_released == ["search-call-1"]
+        assert host.opened == []
+        assert host.called == []
+
+    async def test_provider_failure_is_a_tool_error_with_no_provider_body(
+        self,
+        client: AsyncClient,
+        store: FakeStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(agent_mcp_router.web_search, "configured", lambda: True)
+
+        async def failed(arguments):
+            del arguments
+            raise agent_mcp_router.web_search.WebSearchError(
+                "Web search is rate limited. Try again later.",
+                kind="rate_limited",
+            )
+
+        monkeypatch.setattr(agent_mcp_router.web_search, "search", failed)
+        response = await client.post(
+            _HOST_URL,
+            json=_rpc("tools/call", name="web_search", arguments={"query": "anything"}),
+            headers=_auth(),
+        )
+
+        assert _result(response)["isError"] is True
+        assert _result(response)["content"] == [
+            {"type": "text", "text": "Web search is rate limited. Try again later."}
+        ]
+        assert store.search_released == ["search-call-1"]
+
+    async def test_invalid_arguments_consume_no_shared_key_admission(
+        self,
+        client: AsyncClient,
+        store: FakeStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(agent_mcp_router.web_search, "configured", lambda: True)
+
+        response = await client.post(
+            _HOST_URL,
+            json=_rpc("tools/call", name="web_search", arguments={"unexpected": True}),
+            headers=_auth(),
+        )
+
+        assert response.json()["error"]["code"] == agent_mcp_router.INVALID_PARAMS
+        assert store.search_acquired == []
+        assert store.search_released == []
+
+    async def test_unsupported_brave_locale_consumes_no_shared_key_admission(
+        self,
+        client: AsyncClient,
+        store: FakeStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(agent_mcp_router.web_search, "configured", lambda: True)
+        monkeypatch.setattr(
+            agent_mcp_router.web_search,
+            "selected_provider",
+            lambda: "brave",
+        )
+
+        response = await client.post(
+            _HOST_URL,
+            json=_rpc(
+                "tools/call",
+                name="web_search",
+                arguments={"query": "current package version", "language": "en-us"},
+            ),
+            headers=_auth(),
+        )
+
+        assert response.json()["error"]["code"] == agent_mcp_router.INVALID_PARAMS
+        assert store.search_acquired == []
+        assert store.search_released == []
+
+    async def test_usage_refusal_does_not_call_a_provider_or_user_connection(
+        self,
+        client: AsyncClient,
+        store: FakeStore,
+        host: StubHost,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(agent_mcp_router.web_search, "configured", lambda: True)
+        store.search_admission = WebSearchAdmission(call_id=None, reason="user_rate_limited")
+
+        async def unexpected(arguments):
+            raise AssertionError(f"rate-limited search reached a provider: {arguments!r}")
+
+        monkeypatch.setattr(agent_mcp_router.web_search, "search", unexpected)
+        response = await client.post(
+            _HOST_URL,
+            json=_rpc("tools/call", name="web_search", arguments={"query": "anything"}),
+            headers=_auth(),
+        )
+
+        assert _result(response)["isError"] is True
+        assert "usage limit" in _result(response)["content"][0]["text"]
+        assert store.search_released == []
+        assert host.opened == []
+        assert host.called == []
+
+    async def test_admission_storage_failure_fails_closed(
+        self,
+        client: AsyncClient,
+        store: FakeStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(agent_mcp_router.web_search, "configured", lambda: True)
+        store.search_admission_error = True
+
+        async def unexpected(arguments):
+            raise AssertionError(f"unadmitted search reached a provider: {arguments!r}")
+
+        monkeypatch.setattr(agent_mcp_router.web_search, "search", unexpected)
+        response = await client.post(
+            _HOST_URL,
+            json=_rpc("tools/call", name="web_search", arguments={"query": "anything"}),
+            headers=_auth(),
+        )
+
+        assert _result(response)["isError"] is True
+        assert _result(response)["content"][0]["text"] == (
+            "Web search is temporarily unavailable. Try again."
+        )
+        assert store.search_released == []
+
+    async def test_cancellation_releases_the_admission(
+        self, store: FakeStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        started = asyncio.Event()
+
+        async def blocked(arguments):
+            del arguments
+            started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(agent_mcp_router.web_search, "search", blocked)
+        identity = await store.resolve_model_credential(
+            job_id=_JOB, attempt_id=_ATTEMPT, lease_generation=_LEASE
+        )
+        assert identity is not None
+        task = asyncio.create_task(
+            agent_mcp_router._host_web_search(
+                {"query": "anything"},
+                request_id=1,
+                identity=identity,
+                store=store,
+                authorization=_auth()["Authorization"],
+                stateless=False,
+            )
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert store.search_released == ["search-call-1"]

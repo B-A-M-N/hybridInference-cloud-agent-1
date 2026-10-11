@@ -26,6 +26,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 
+from cloud_agent import web_search
 from cloud_agent.api._workspace_access import (
     _workspace_id,
     _workspace_not_ready,
@@ -841,7 +842,7 @@ async def worker_claim(
     # Resolve at every claim, including existing conversations and native
     # resumes. Loading the bindings adds newly connected servers while retaining
     # explicit opt-outs, independently of whether anyone opened the Tools UI.
-    mcp_aliases = []
+    mcp_aliases: list[str] = []
     if claim["runtime"] in runtimes_supporting_mcp():
         mcp_aliases = [
             binding.alias
@@ -852,6 +853,10 @@ async def worker_claim(
             and resolved.usable
             and resolved.connection.status is not ConnectionStatus.ERROR
         ]
+        if web_search.configured():
+            # A non-secret marker makes the runtime load the merged MCP endpoint
+            # even when this conversation selected no user-owned connections.
+            mcp_aliases.append(web_search.RUNTIME_SERVER_ID)
     # Counted for the whole conversation, not this turn: a rebuilt sandbox has
     # to restore every upload the chat ever carried, and a host that reads zero
     # here skips the fetch entirely — which is every turn that attached nothing.
