@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock
+from uuid import UUID
 
 from cloud_agent.storage.repositories import attempt_commands
 
@@ -47,6 +48,7 @@ class _Connection:
                 "slots_used": 0,
                 "slots_desired": None,
                 "sandbox_archive_settings_applied_revision": None,
+                "capacity_epoch": UUID("00000000-0000-0000-0000-000000000001"),
                 "credential_matches": True,
             }
         raise AssertionError(f"unexpected query: {sql}")

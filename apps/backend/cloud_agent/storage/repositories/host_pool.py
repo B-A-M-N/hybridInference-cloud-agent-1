@@ -257,7 +257,7 @@ class PostgresHostPoolRepository:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 f"""
-                SELECT {HOST_COLUMNS} FROM agent_runner_hosts
+                SELECT {HOST_COLUMNS}, capacity_epoch FROM agent_runner_hosts
                 WHERE host = $1 AND credential_hash IS NOT NULL AND credential_hash = $2
                   AND status <> '{HOST_DISABLED}'
                 """,
@@ -385,7 +385,9 @@ class PostgresHostPoolRepository:
                         ELSE sandbox_archive_settings_applied_revision
                     END
                 WHERE host = $1
-                RETURNING {HOST_COLUMNS}, settings_imported, settings_import_excluded
+                  AND ($16::text IS NULL OR credential_hash = $16)
+                RETURNING {HOST_COLUMNS}, capacity_epoch,
+                          settings_imported, settings_import_excluded
                 """,
                 host,
                 slots_total,
@@ -444,11 +446,14 @@ class PostgresHostPoolRepository:
                     UPDATE agent_runner_hosts
                     SET settings_desired = $2::jsonb, settings_imported = $3
                     WHERE host = $1
-                    RETURNING {HOST_COLUMNS}, settings_imported, settings_import_excluded
+                      AND ($4::text IS NULL OR credential_hash = $4)
+                    RETURNING {HOST_COLUMNS}, capacity_epoch,
+                              settings_imported, settings_import_excluded
                     """,
                     host,
                     json.dumps({**previous, **imports}),
                     complete,
+                    credential_hash,
                 )
             if (
                 capacity is not None
@@ -749,7 +754,7 @@ class PostgresHostPoolRepository:
                 """
                 SELECT DISTINCT host
                 FROM agent_sandboxes
-                WHERE state <> 'lost'
+                WHERE state <> 'lost' AND deleted_at IS NULL
                 """
             )
         active = None if policy is None else policy["active_host"]
@@ -800,7 +805,8 @@ class PostgresHostPoolRepository:
                     FROM agent_jobs j
                     JOIN agent_threads t ON t.id = j.thread_id
                     LEFT JOIN agent_thread_sandbox_memberships m ON m.thread_id = t.id
-                    LEFT JOIN agent_sandboxes g ON g.id = m.sandbox_id
+                    LEFT JOIN agent_sandboxes g
+                      ON g.id = m.sandbox_id AND g.deleted_at IS NULL
                     WHERE j.state = 'queued' AND NOT j.cancel_requested
                       AND j.updated_at < NOW() - $3 * INTERVAL '1 second'
                       AND NOT EXISTS (
@@ -1095,7 +1101,7 @@ class PostgresHostPoolRepository:
             if active == host:
                 return "active"
             retained = await conn.fetchval(
-                "SELECT 1 FROM agent_sandboxes WHERE host=$1 LIMIT 1", host
+                "SELECT 1 FROM agent_sandboxes WHERE host=$1 AND deleted_at IS NULL LIMIT 1", host
             )
             if retained:
                 return "retained_groups_present"

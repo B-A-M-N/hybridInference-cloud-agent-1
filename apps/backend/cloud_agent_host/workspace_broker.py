@@ -291,6 +291,23 @@ class SharedIdleStopRequest(BaseModel):
     ) = Field(None, max_length=128)
 
 
+class SharedSandboxDeleteRequest(BaseModel):
+    """Full immutable identity for one reviewed stopped-container deletion."""
+
+    sandbox_id: str = Field(..., min_length=1, max_length=256)
+    generation: int = Field(..., ge=1)
+    container_id: str = Field(..., min_length=12, max_length=256)
+    origin_thread_id: str = Field(..., min_length=1, max_length=256)
+    runtime_id: str = Field(..., min_length=1, max_length=128)
+    runtime_version: str | None = Field(None, max_length=128)
+    sandbox_image_digest: str | None = Field(None, max_length=512)
+    resident_slot_capacity: int = Field(8, ge=2, le=128)
+    memory_limit: str = Field("4g", min_length=1, max_length=32)
+    cpu_limit: str = Field("2", min_length=1, max_length=32)
+    stop_timeout_s: int = Field(10, ge=1, le=300)
+    shared_live: Literal[True] = True
+
+
 class SharedSandboxMemberRequest(BaseModel):
     """Authoritative durable identity for one member alias."""
 
@@ -2512,6 +2529,38 @@ def create_app(
         except (SandboxError, ValueError) as exc:
             raise supervisor_error(exc) from exc
         return asdict(descriptor)
+
+    @app.post("/shared-sandboxes/{thread_id}/delete-stopped")
+    async def delete_stopped_shared_chat_sandbox(
+        thread_id: str,
+        body: SharedSandboxDeleteRequest,
+        _: None = Depends(authenticate),
+    ) -> dict[str, str]:
+        owner = require_shared_supervisor()
+        if thread_id != body.origin_thread_id:
+            raise HTTPException(status_code=409, detail="shared sandbox origin is stale")
+        spec = ChatSandboxSpec(
+            thread_id=body.origin_thread_id,
+            sandbox_id=body.sandbox_id,
+            generation=body.generation,
+            runtime_id=body.runtime_id,
+            runtime_version=body.runtime_version,
+            sandbox_image_digest=body.sandbox_image_digest,
+            memory_limit=body.memory_limit,
+            cpu_limit=body.cpu_limit,
+            stop_timeout_s=body.stop_timeout_s,
+            shared_live=True,
+            resident_slot_capacity=body.resident_slot_capacity,
+        )
+        try:
+            outcome = await asyncio.to_thread(
+                owner.delete_stopped,
+                spec,
+                container_id=body.container_id,
+            )
+        except (SandboxError, ValueError) as exc:
+            raise supervisor_error(exc) from exc
+        return {"outcome": outcome}
 
     @app.post("/shared-sandboxes/{thread_id}/fork")
     async def fork_shared_chat_session(

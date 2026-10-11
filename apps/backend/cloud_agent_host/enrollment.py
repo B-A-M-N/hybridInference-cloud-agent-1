@@ -36,6 +36,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -329,6 +330,9 @@ def heartbeat(
     sandbox_archive_settings_applied_revision: int | None = None,
     on_residencies_lost: Callable[[list[dict[str, Any]]], None] | None = None,
     on_retained_sandboxes_stop: Callable[[list[dict[str, Any]]], None] | None = None,
+    on_admin_sandbox_deletions: (
+        Callable[[list[dict[str, Any]]], list[dict[str, Any]]] | None
+    ) = None,
 ) -> HostIdentity:
     """Report liveness and capacity, and read back what the pool decided.
 
@@ -412,6 +416,43 @@ def heartbeat(
         if isinstance(updated_at, str):
             archive_settings["updated_at"] = updated_at
 
+    delete_commands = answer.get("admin_sandbox_deletions")
+    if delete_commands and on_admin_sandbox_deletions is not None:
+        receipts = on_admin_sandbox_deletions(
+            [item for item in delete_commands if isinstance(item, dict)]
+        )
+        for receipt in receipts:
+            sandbox_id = receipt.get("sandbox_id")
+            generation = receipt.get("generation")
+            container_id = receipt.get("container_id")
+            host_capacity_epoch = receipt.get("host_capacity_epoch")
+            outcome = receipt.get("outcome")
+            if (
+                not isinstance(sandbox_id, str)
+                or not sandbox_id
+                or isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation < 1
+                or not isinstance(container_id, str)
+                or not container_id
+                or not isinstance(host_capacity_epoch, str)
+                or not host_capacity_epoch
+                or outcome not in {"deleted", "already_absent"}
+            ):
+                raise EnrollmentError("sandbox deletion callback returned an invalid receipt")
+            _post(
+                (
+                    f"{base_url.rstrip('/')}/v1/agent/host/sandboxes/"
+                    f"{urllib.parse.quote(sandbox_id, safe='')}/deleted"
+                ),
+                {
+                    "generation": generation,
+                    "container_id": container_id,
+                    "host_capacity_epoch": host_capacity_epoch,
+                    "outcome": outcome,
+                },
+                bearer=identity.credential,
+            )
     identity.status = str(answer.get("status") or identity.status)
     interval = answer.get("heartbeat_interval_seconds")
     if isinstance(interval, (int, float)) and interval > 0:
@@ -565,6 +606,9 @@ class HostHeartbeat:
         on_sandbox_archive_settings: Callable[[dict[str, Any] | None], None] | None = None,
         on_residencies_lost: Callable[[list[dict[str, Any]]], None] | None = None,
         on_retained_sandboxes_stop: Callable[[list[dict[str, Any]]], None] | None = None,
+        on_admin_sandbox_deletions: (
+            Callable[[list[dict[str, Any]]], list[dict[str, Any]]] | None
+        ) = None,
     ) -> None:
         self._base_url = base_url
         self._identity = identity
@@ -620,6 +664,7 @@ class HostHeartbeat:
         self._on_sandbox_archive_settings = on_sandbox_archive_settings
         self._on_residencies_lost = on_residencies_lost
         self._on_retained_sandboxes_stop = on_retained_sandboxes_stop
+        self._on_admin_sandbox_deletions = on_admin_sandbox_deletions
         self._stop = threading.Event()
         #: Set to cut the wait between beats short. The supervisor pulls it
         #: when its executor count changes, so the control plane learns the
@@ -721,6 +766,7 @@ class HostHeartbeat:
                     sandbox_archive_settings_applied_revision=(archive_settings_applied_revision),
                     on_residencies_lost=self._on_residencies_lost,
                     on_retained_sandboxes_stop=self._on_retained_sandboxes_stop,
+                    on_admin_sandbox_deletions=self._on_admin_sandbox_deletions,
                 )
                 self._apply_settings()
                 self._apply_sandbox_archive_settings()

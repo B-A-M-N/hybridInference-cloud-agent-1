@@ -19,7 +19,7 @@ from httpx import ASGITransport, AsyncClient
 
 from cloud_agent.workspace_broker_client import WorkspaceBrokerClient
 from cloud_agent_host import workspace_broker as broker_mod
-from cloud_agent_host.chat_sandbox import RetainedChatBackend
+from cloud_agent_host.chat_sandbox import ChatSandboxSpec, RetainedChatBackend
 from cloud_agent_host.drivers import InputOutcome
 from cloud_agent_host.guest_observer import GuestObservation, GuestProcess
 from cloud_agent_host.resident_transport import ResidentLaunch
@@ -320,6 +320,10 @@ class _SharedSupervisor:
         return InputOutcome(
             kwargs["owner"] == "attempt:1", None if kwargs["owner"] == "attempt:1" else "turn_ended"
         )
+
+    def delete_stopped(self, spec, *, container_id):
+        self.calls.append(("delete_stopped", spec, container_id))
+        return "deleted"
 
 
 def _launch() -> dict[str, object]:
@@ -858,6 +862,26 @@ def _runner_client(app) -> SessionSupervisorClient:
         headers={"X-Agent-Workspace-Token": "broker-secret"},
     )
     return client
+
+
+def test_runner_client_deletes_exact_stopped_shared_sandbox_through_broker():
+    supervisor = _SharedSupervisor()
+    client = _runner_client(_app(supervisor))
+    spec = ChatSandboxSpec(
+        thread_id="athr_source",
+        sandbox_id="asbx_shared",
+        generation=3,
+        runtime_id="claude-code",
+        runtime_version="2.1.220",
+        sandbox_image_digest="sha256:image",
+    )
+    try:
+        answer = client.delete_shared_stopped(spec, container_id="container-shared")
+    finally:
+        client.close()
+
+    assert answer == {"outcome": "deleted"}
+    assert supervisor.calls[-1] == ("delete_stopped", spec, "container-shared")
 
 
 def _resident_launch(**changes: object) -> ResidentLaunch:

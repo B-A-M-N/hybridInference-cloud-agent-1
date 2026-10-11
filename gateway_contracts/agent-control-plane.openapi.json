@@ -1631,6 +1631,41 @@
             "title": "Created At",
             "type": "string"
           },
+          "delete_requested_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delete Requested At"
+          },
+          "delete_requested_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delete Requested By"
+          },
+          "deleted_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deleted At"
+          },
           "disk_limit_mib": {
             "default": 0,
             "maximum": 16777216.0,
@@ -1827,6 +1862,185 @@
           "updated_at"
         ],
         "title": "AdminSandbox",
+        "type": "object"
+      },
+      "AdminSandboxDeleteCommand": {
+        "description": "Exact stopped-container identity an admin authorized a host to remove.",
+        "properties": {
+          "container_id": {
+            "maxLength": 256,
+            "minLength": 12,
+            "title": "Container Id",
+            "type": "string"
+          },
+          "cpu_limit": {
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Cpu Limit",
+            "type": "string"
+          },
+          "generation": {
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "host_capacity_epoch": {
+            "format": "uuid",
+            "title": "Host Capacity Epoch",
+            "type": "string"
+          },
+          "memory_limit": {
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Memory Limit",
+            "type": "string"
+          },
+          "resident_slot_capacity": {
+            "maximum": 128.0,
+            "minimum": 2.0,
+            "title": "Resident Slot Capacity",
+            "type": "integer"
+          },
+          "runtime_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Runtime Id",
+            "type": "string"
+          },
+          "runtime_version": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Version"
+          },
+          "sandbox_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Sandbox Id",
+            "type": "string"
+          },
+          "sandbox_image_digest": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sandbox Image Digest"
+          },
+          "shared_live": {
+            "const": true,
+            "default": true,
+            "title": "Shared Live",
+            "type": "boolean"
+          },
+          "stop_timeout_seconds": {
+            "maximum": 300.0,
+            "minimum": 1.0,
+            "title": "Stop Timeout Seconds",
+            "type": "integer"
+          },
+          "thread_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Thread Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id",
+          "sandbox_id",
+          "generation",
+          "container_id",
+          "host_capacity_epoch",
+          "runtime_id",
+          "memory_limit",
+          "cpu_limit",
+          "stop_timeout_seconds",
+          "resident_slot_capacity"
+        ],
+        "title": "AdminSandboxDeleteCommand",
+        "type": "object"
+      },
+      "AdminSandboxDeleteRequest": {
+        "additionalProperties": false,
+        "description": "A confirmed deletion of the exact stopped container an admin reviewed.",
+        "properties": {
+          "confirm": {
+            "const": true,
+            "title": "Confirm",
+            "type": "boolean"
+          },
+          "container_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Container Id",
+            "type": "string"
+          },
+          "generation": {
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "last_activity_at": {
+            "format": "date-time",
+            "title": "Last Activity At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "confirm",
+          "generation",
+          "container_id",
+          "last_activity_at"
+        ],
+        "title": "AdminSandboxDeleteRequest",
+        "type": "object"
+      },
+      "AdminSandboxDeletedRequest": {
+        "description": "Authenticated host receipt for one exact physical container removal.",
+        "properties": {
+          "container_id": {
+            "maxLength": 256,
+            "minLength": 12,
+            "title": "Container Id",
+            "type": "string"
+          },
+          "generation": {
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "host_capacity_epoch": {
+            "format": "uuid",
+            "title": "Host Capacity Epoch",
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "deleted",
+              "already_absent"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          }
+        },
+        "required": [
+          "generation",
+          "container_id",
+          "host_capacity_epoch",
+          "outcome"
+        ],
+        "title": "AdminSandboxDeletedRequest",
         "type": "object"
       },
       "AdminSandboxDetail": {
@@ -2217,6 +2431,144 @@
           "last_activity_at"
         ],
         "title": "AdminSandboxStopRequest",
+        "type": "object"
+      },
+      "AdminSandboxTrajectoryEvent": {
+        "description": "One content-free retained-sandbox lifecycle observation.",
+        "properties": {
+          "actor_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor Id"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "details": {
+            "additionalProperties": true,
+            "title": "Details",
+            "type": "object"
+          },
+          "event_type": {
+            "title": "Event Type",
+            "type": "string"
+          },
+          "from_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "From State"
+          },
+          "generation": {
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "source": {
+            "enum": [
+              "system",
+              "admin",
+              "host",
+              "migration"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "to_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "To State"
+          }
+        },
+        "required": [
+          "id",
+          "generation",
+          "event_type",
+          "source",
+          "created_at"
+        ],
+        "title": "AdminSandboxTrajectoryEvent",
+        "type": "object"
+      },
+      "AdminSandboxTrajectoryPage": {
+        "description": "Current tombstone and bounded membership context beside a stable event page.",
+        "properties": {
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/AdminSandboxTrajectoryEvent"
+            },
+            "title": "Events",
+            "type": "array"
+          },
+          "member_history_count": {
+            "minimum": 0.0,
+            "title": "Member History Count",
+            "type": "integer"
+          },
+          "member_history_truncated": {
+            "title": "Member History Truncated",
+            "type": "boolean"
+          },
+          "members": {
+            "items": {
+              "$ref": "#/components/schemas/AdminSandboxMember"
+            },
+            "maxItems": 128,
+            "title": "Members",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "sandbox": {
+            "$ref": "#/components/schemas/AdminSandbox"
+          }
+        },
+        "required": [
+          "sandbox",
+          "members",
+          "member_history_count",
+          "member_history_truncated",
+          "events",
+          "observed_at"
+        ],
+        "title": "AdminSandboxTrajectoryPage",
         "type": "object"
       },
       "AdminStep": {
@@ -10059,6 +10411,14 @@
       "HostHeartbeatResponse": {
         "description": "What the control plane thinks of this host after the heartbeat.",
         "properties": {
+          "admin_sandbox_deletions": {
+            "description": "Reviewed physical-delete commands for stopped containers on this host. They are selected independently of the host's inventory report and remain due until an explicit authenticated completion receipt is recorded.",
+            "items": {
+              "$ref": "#/components/schemas/AdminSandboxDeleteCommand"
+            },
+            "title": "Admin Sandbox Deletions",
+            "type": "array"
+          },
           "broker_error": {
             "anyOf": [
               {
@@ -20645,6 +21005,70 @@
       }
     },
     "/admin/agent/sandboxes/{sandbox_id}": {
+      "delete": {
+        "description": "Queue confirmed physical deletion of an exact, stopped sandbox.",
+        "operationId": "delete_admin_sandbox_admin_agent_sandboxes__sandbox_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "title": "Sandbox Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdminSandboxDeleteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminSandboxDetail"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Admin Sandbox"
+      },
       "get": {
         "description": "Inspect safe container metadata and its current member identities.",
         "operationId": "get_admin_sandbox_admin_agent_sandboxes__sandbox_id__get",
@@ -20764,6 +21188,91 @@
           }
         },
         "summary": "Stop Admin Sandbox"
+      }
+    },
+    "/admin/agent/sandboxes/{sandbox_id}/trajectory": {
+      "get": {
+        "description": "Read one sandbox's newest-first lifecycle without private session content.",
+        "operationId": "get_admin_sandbox_trajectory_admin_agent_sandboxes__sandbox_id__trajectory_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "title": "Sandbox Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 2048,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminSandboxTrajectoryPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Admin Sandbox Trajectory"
       }
     },
     "/admin/agent/server-preflights": {
@@ -21925,6 +22434,68 @@
           }
         },
         "summary": "Register Host",
+        "tags": [
+          "agent-hosts"
+        ]
+      }
+    },
+    "/v1/agent/host/sandboxes/{sandbox_id}/deleted": {
+      "post": {
+        "description": "Record an explicit host receipt for one exact physical deletion.",
+        "operationId": "confirm_admin_sandbox_deleted_v1_agent_host_sandboxes__sandbox_id__deleted_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "title": "Sandbox Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdminSandboxDeletedRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Confirm Admin Sandbox Deleted",
         "tags": [
           "agent-hosts"
         ]

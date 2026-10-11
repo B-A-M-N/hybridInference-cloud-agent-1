@@ -3786,6 +3786,53 @@ class SharedChatSessionSupervisor:
             self._condition.notify_all()
             return descriptor
 
+    def delete_stopped(
+        self,
+        spec: ChatSandboxSpec,
+        *,
+        container_id: str,
+    ) -> Literal["deleted", "already_absent"]:
+        """Delete an exact stopped group while holding admission behind a barrier."""
+        group: _Group | None
+        member_ids: tuple[str, ...] = ()
+        with self._lock:
+            group = self._groups.get(spec.sandbox_id)
+            if group is not None:
+                if group.spec != spec:
+                    raise SessionLeaseLost("shared sandbox deletion identity is stale")
+                if group.inspection.container_id != container_id:
+                    raise SessionLeaseLost("shared sandbox deletion container is stale")
+                if group.inspection.running:
+                    raise SessionBusy("shared sandbox must be stopped before deletion")
+                if not self._is_quiescent(group) or any(
+                    member.transport is not None for member in group.members.values()
+                ):
+                    raise SessionBusy("shared sandbox group still has active members")
+                group.stopping = True
+                group.lifecycle_generation += 1
+                group.idle_deadline = None
+                member_ids = tuple(group.members)
+        try:
+            outcome = self._manager.delete_stopped(spec, container_id=container_id)
+        except BaseException:
+            if group is not None:
+                with self._lock:
+                    if self._groups.get(spec.sandbox_id) is group:
+                        group.stopping = False
+                        self._condition.notify_all()
+            raise
+        if group is not None:
+            with self._lock:
+                if self._groups.get(spec.sandbox_id) is not group:
+                    raise SessionLeaseLost("shared sandbox changed during deletion")
+                self._groups.pop(spec.sandbox_id, None)
+                for member_id in member_ids:
+                    if self._members.get(member_id) is group:
+                        self._members.pop(member_id, None)
+                    self._held_inputs.pop(member_id, None)
+                self._condition.notify_all()
+        return outcome
+
     def sweep(self) -> builtins.list[SharedSessionDescriptor]:
         """Stop groups whose single refreshed inactivity deadline elapsed."""
         now = self._clock()

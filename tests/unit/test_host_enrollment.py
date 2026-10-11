@@ -762,6 +762,76 @@ def test_heartbeat_delivers_fenced_idle_stop_commands(monkeypatch) -> None:
     assert delivered == [commands]
 
 
+def test_heartbeat_acknowledges_only_successful_admin_sandbox_deletions(monkeypatch) -> None:
+    identity = enrollment.HostIdentity(host="h1", credential="host-secret")
+    commands = [
+        {
+            "sandbox_id": "asbx/one",
+            "generation": 2,
+            "host_capacity_epoch": "00000000-0000-4000-8000-000000000002",
+        }
+    ]
+    calls: list[tuple[str, dict, str]] = []
+
+    def post(url, body, bearer=""):
+        calls.append((url, body, bearer))
+        if url.endswith("/heartbeat"):
+            return {"status": "online", "admin_sandbox_deletions": commands}
+        return {}
+
+    def delete(received):
+        assert received == commands
+        return [
+            {
+                "sandbox_id": "asbx/one",
+                "generation": 2,
+                "container_id": "0123456789abcdef",
+                "host_capacity_epoch": "00000000-0000-4000-8000-000000000002",
+                "outcome": "deleted",
+            }
+        ]
+
+    monkeypatch.setattr(enrollment, "_post", post)
+
+    enrollment.heartbeat(
+        base_url="http://cp",
+        identity=identity,
+        on_admin_sandbox_deletions=delete,
+    )
+
+    assert calls == [
+        ("http://cp/v1/agent/host/heartbeat", calls[0][1], "host-secret"),
+        (
+            "http://cp/v1/agent/host/sandboxes/asbx%2Fone/deleted",
+            {
+                "generation": 2,
+                "container_id": "0123456789abcdef",
+                "host_capacity_epoch": "00000000-0000-4000-8000-000000000002",
+                "outcome": "deleted",
+            },
+            "host-secret",
+        ),
+    ]
+
+
+def test_heartbeat_never_infers_admin_deletion_without_a_callback(monkeypatch) -> None:
+    identity = enrollment.HostIdentity(host="h1", credential="c")
+    calls: list[str] = []
+
+    def post(url, body, bearer=""):
+        calls.append(url)
+        return {
+            "status": "online",
+            "admin_sandbox_deletions": [{"sandbox_id": "asbx_1", "generation": 1}],
+        }
+
+    monkeypatch.setattr(enrollment, "_post", post)
+
+    enrollment.heartbeat(base_url="http://cp", identity=identity)
+
+    assert calls == ["http://cp/v1/agent/host/heartbeat"]
+
+
 def test_a_nonsense_interval_is_ignored(monkeypatch) -> None:
     """Zero or negative would busy-loop against the control plane."""
     identity = enrollment.HostIdentity(host="h1", credential="c")

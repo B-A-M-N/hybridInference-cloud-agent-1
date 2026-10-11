@@ -290,6 +290,59 @@ def test_retained_heartbeat_passes_group_resources_and_terminal_count(
     supervisor.close.assert_called_once()
 
 
+def test_admin_delete_command_is_bounded_and_receipts_only_after_broker_success(monkeypatch):
+    supervisor = Mock()
+    supervisor.delete_shared_stopped.return_value = {"outcome": "deleted"}
+    monkeypatch.setattr(runner_mod, "_session_supervisor_from_env", lambda: supervisor)
+    command = {
+        "thread_id": "athr_source",
+        "sandbox_id": "asbx_shared",
+        "generation": 3,
+        "container_id": "0123456789abcdef",
+        "host_capacity_epoch": "00000000-0000-4000-8000-000000000003",
+        "runtime_id": "claude-code",
+        "runtime_version": "2.1.220",
+        "sandbox_image_digest": "sha256:image",
+        "memory_limit": "4g",
+        "cpu_limit": "2",
+        "stop_timeout_seconds": 10,
+        "resident_slot_capacity": 8,
+    }
+
+    receipts = runner_mod._delete_retained_sandboxes(
+        [command, {**command, "thread_id": "athr_later", "sandbox_id": "asbx_later"}]
+    )
+
+    assert receipts == [
+        {
+            "sandbox_id": "asbx_shared",
+            "generation": 3,
+            "container_id": "0123456789abcdef",
+            "host_capacity_epoch": "00000000-0000-4000-8000-000000000003",
+            "outcome": "deleted",
+        }
+    ]
+    spec = supervisor.delete_shared_stopped.call_args.args[0]
+    assert spec == ChatSandboxSpec(
+        thread_id="athr_source",
+        sandbox_id="asbx_shared",
+        generation=3,
+        runtime_id="claude-code",
+        runtime_version="2.1.220",
+        sandbox_image_digest="sha256:image",
+        memory_limit="4g",
+        cpu_limit="2",
+        stop_timeout_s=10,
+        resident_slot_capacity=8,
+    )
+    supervisor.delete_shared_stopped.assert_called_once_with(
+        spec,
+        container_id="0123456789abcdef",
+        timeout=runner_mod._ADMIN_SANDBOX_DELETE_TIMEOUT_S,
+    )
+    supervisor.close.assert_called_once()
+
+
 def test_resume_requires_the_exact_native_session():
     assert (
         runner_mod._verified_native_session_id(
