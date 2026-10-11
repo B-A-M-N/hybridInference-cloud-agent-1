@@ -254,9 +254,10 @@ def _require_store(store: _WorkerStorage | None) -> _WorkerStorage:
 # The clone credential is narrowed at the point it is minted, not merely by
 # convention: the App also holds `contents: write` for the publisher, and an
 # installation token inherits every permission the App has unless it is asked
-# for less. Without this the runner would be handed push rights it must not
-# have, on a host that runs untrusted repository code.
+# for less. Keep checkout authority separate from the token explicitly
+# delivered to the sandbox for branch and pull-request publication.
 _CLONE_SCOPE = {"contents": "read"}
+_SANDBOX_GITHUB_SCOPE = {"contents": "write", "pull_requests": "write"}
 
 
 #: Cheap structural check before touching the signing key: host credentials
@@ -790,14 +791,18 @@ async def worker_claim(
         ) from exc
 
     clone_token: str | None = None
+    github_token: str | None = None
     if app_credentials is not None:
         try:
             clone_token = await app_credentials.token_for(
                 claim["repo"], permissions=_CLONE_SCOPE, repository_scoped=True
             )
+            github_token = await app_credentials.token_for(
+                claim["repo"], permissions=_SANDBOX_GITHUB_SCOPE, repository_scoped=True
+            )
         except AppNotInstalled:
             # A settled answer: the App does not cover this repository. Hand
-            # the job over without a credential — a public repository clones
+            # the job over without credentials — a public repository clones
             # anonymously, and a private one fails with a message the owner can
             # act on ("install the App"), which retrying would not improve.
             logger.info(
@@ -914,6 +919,7 @@ async def worker_claim(
         sandbox_token=sandbox_token,
         mcp_token=mcp_token,
         clone_token=clone_token,
+        github_token=github_token,
         # Aliases, because that is what the runtime config addresses: the relay
         # path segment is the binding alias, and the runner learns nothing about
         # where the connection points.

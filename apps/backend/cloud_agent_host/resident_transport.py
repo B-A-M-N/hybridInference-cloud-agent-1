@@ -12,7 +12,7 @@ import contextlib
 import hashlib
 import json
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
 
 from cloud_agent_host.chat_sandbox import (
@@ -93,6 +93,10 @@ class ResidentLaunch:
     slot_id: int = 0
     residency_generation: int = 0
     plugins: tuple[dict[str, str], ...] = ()
+    # Short-lived, single-repository, contents/PR write GitHub App token. Kept in
+    # this member's environment, never in shared workspace or image config.
+    github_token: str | None = field(default=None, repr=False)
+    github_repo: str = ""
 
     def __post_init__(self) -> None:
         if not self.thread_id or not self.runtime_id or not self.model:
@@ -220,9 +224,10 @@ class ResidentTransport(Generic[_RuntimeT_co]):
 
         The caller normally carries a fresh attempt credential, while the
         resident process intentionally keeps its renewable residency grant.
-        Credentials therefore cannot participate in equality. Everything the
-        CLI fixes at process start still does, including model, effort and MCP
-        configuration.
+        The inference grant therefore does not participate in equality.
+        Everything the CLI fixes at process start still does, including model,
+        effort, MCP configuration and the non-renewable GitHub token. A fresh
+        GitHub token requires native resume in a replacement process.
         """
         same_mcp = self.launch.mcp_server_ids == launch.mcp_server_ids and (
             not launch.mcp_server_ids
@@ -240,6 +245,8 @@ class ResidentTransport(Generic[_RuntimeT_co]):
             and self.launch.plugins == launch.plugins
             and self.launch.gateway_base_url == launch.gateway_base_url
             and same_mcp
+            and self.launch.github_token == launch.github_token
+            and self.launch.github_repo == launch.github_repo
             and self.launch.slot_id == launch.slot_id
         )
 
@@ -627,6 +634,29 @@ class ResidentTransportFactory:
                 "GIT_CONFIG_VALUE_0": CHAT_WORKDIR,
             }
         )
+        # Only the claim's repository-scoped token may authenticate gh. Do not
+        # fall back to a credential inherited from a custom host backend.
+        base_env.pop("GH_TOKEN", None)
+        base_env.pop("GITHUB_TOKEN", None)
+        if launch.github_token:
+            base_env.update(
+                {
+                    "GH_TOKEN": launch.github_token,
+                    "GH_HOST": "github.com",
+                    "GH_PROMPT_DISABLED": "1",
+                    "GIT_TERMINAL_PROMPT": "0",
+                    # Reset inherited helpers before selecting gh. These
+                    # invocation-only settings never write credentials or
+                    # helper configuration into the shared .git directory.
+                    "GIT_CONFIG_COUNT": "3",
+                    "GIT_CONFIG_KEY_1": "credential.https://github.com.helper",
+                    "GIT_CONFIG_VALUE_1": "",
+                    "GIT_CONFIG_KEY_2": "credential.https://github.com.helper",
+                    "GIT_CONFIG_VALUE_2": "!gh auth git-credential",
+                }
+            )
+            if launch.github_repo:
+                base_env["GH_REPO"] = launch.github_repo
         if launch.runtime_version:
             base_env["PATH"] = (
                 f"{runtime_bin_dir(runtime_id, launch.runtime_version)}:{base_env['PATH']}"

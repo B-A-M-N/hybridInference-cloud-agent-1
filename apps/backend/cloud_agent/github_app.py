@@ -389,9 +389,8 @@ class GitHubAppCredentials:
         installation token inherits *every* App permission unless it asks for
         less, so a consumer that only needs to read must say so. Combined with
         ``repository_scoped``, which limits the token to this repository alone,
-        that is how one App serves both the publisher (write, to push a branch)
-        and the runner (read, to check the repository out) without handing the
-        runner push rights on a host that executes untrusted code.
+        that is how one App serves checkout (read), sandbox branch/PR writes,
+        and the trusted publisher without sharing broader installation scope.
         """
         installation_id = await self.installation_id_for(repo)
         token, minted = await self._token_in_scope(

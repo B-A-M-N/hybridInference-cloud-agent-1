@@ -389,6 +389,8 @@ class SharedResidentLaunchConfig(BaseModel):
     # Replaced, like the gateway's, by this host's own MCP relay address.
     mcp_base_url: str = Field("", max_length=2048)
     mcp_credential: str = Field("", max_length=16384)
+    github_token: str | None = Field(None, max_length=16384, repr=False)
+    github_repo: str = Field("", max_length=512)
     slot_id: int = Field(..., ge=0, le=127)
     residency_generation: int = Field(0, ge=0)
 
@@ -2108,6 +2110,8 @@ def create_app(
                 else ""
             ),
             mcp_credential=body.mcp_credential,
+            github_token=body.github_token,
+            github_repo=body.github_repo,
             slot_id=body.slot_id,
             residency_generation=body.residency_generation,
         )
