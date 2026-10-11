@@ -415,6 +415,42 @@ async def test_an_unavailable_repository_lookup_delays_the_claim(claim, monkeypa
     assert store.retry_delays == [30]
 
 
+@pytest.mark.parametrize("refusal", ["not_allowed", "unavailable"])
+async def test_a_repository_refusal_is_decided_before_any_grant_is_minted(
+    claim, monkeypatch, refusal
+):
+    """A job that cannot run asks the gateway for nothing.
+
+    The entitlement re-check used to follow the mint, so each claim of a job
+    whose owner could no longer reach its repository cost the gateway a grant
+    and, a reaper pass later, a revocation — for a turn that was never going to
+    start. Ended or delayed, the job is decided with no credential in play.
+    """
+    from cloud_agent.entitlement import RepoAccessUnavailable, RepoNotAllowed
+
+    async def refused(*args: Any, **kwargs: Any) -> None:
+        if refusal == "not_allowed":
+            raise RepoNotAllowed("owner/name is no longer reachable by its owner")
+        raise RepoAccessUnavailable("GitHub is temporarily unavailable")
+
+    monkeypatch.setattr(agent_worker, "require_entitled_repo", refused)
+    store, grants = _ClaimStore(), _Grants()
+
+    response = await claim(store, grants)
+
+    assert response.status_code == (403 if refusal == "not_allowed" else 503)
+    assert grants.calls == []
+    assert grants.revoked == []
+    assert store.linked == {}
+    if refusal == "not_allowed":
+        assert response.json()["detail"]["error"]["type"] == "repo_not_allowed"
+        assert store.failed == [_JOB]
+        assert store.released == []
+    else:
+        assert store.failed == []
+        assert store.retry_delays == [30]
+
+
 @pytest.mark.parametrize("pending", [True, False])
 async def test_title_generation_is_scheduled_after_successful_claim(monkeypatch, pending):
     """Claim returns before title inference and never gives its token extra scope."""

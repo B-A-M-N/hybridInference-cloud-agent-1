@@ -738,39 +738,15 @@ async def worker_claim(
         "attempt_id": claim["attempt_id"],
         "lease_generation": claim["lease_generation"],
     }
-    # Two credentials with different powers. The runner keeps the full one and
-    # passes only the sandbox one inside, so a credential that leaks from inside
-    # the agent can make model calls the gateway already meters but cannot touch
-    # this job's event log, lifecycle, or terminal state.
-    #
-    # Only the first is ours to mint. ``SCOPE_FULL`` is this service's own
-    # control credential, signed with this service's own secret and verified by
-    # this service — correctly local. The sandbox's credential is not: it buys
-    # inference, which is the gateway's to authorize and the gateway's to meter,
-    # so it is asked for rather than minted. Before this, the claim minted
-    # a ``SCOPE_MODEL`` token signed with a root the gateway does not know —
-    # which bought nothing, and failed at the sandbox's first model call.)
-    token = mint_worker_token(**fence, scope=SCOPE_FULL)
-    sandbox_token = await _mint_sandbox_grant(job_store, grants, claim)
-
-    # The sandbox's *second* credential, and this one is ours to mint: MCP is
-    # served by this service's relay, against this service's registry and this
-    # service's attempt fence. Scoped `mcp` so it opens the relay and nothing
-    # else — not the worker surface, and certainly not the gateway.
-    #
-    # Two credentials rather than one because they authorize at two services
-    # now. A leak is bounded by whichever it was: the grant buys models it
-    # names, this buys tools the job asked for, and neither buys the other.
-    mcp_token = mint_worker_token(**fence, scope=SCOPE_MCP)
-    # A third credential, weaker than either: read-only, this repository only,
-    # one hour. The runner needs it to check the repository out — a runner that
-    # cannot clone runs the agent in an empty directory — and it is deliberately
-    # not the publisher's token, which can write. It stays in the runner and
-    # never enters the sandbox. Absent (null) is a working configuration: a
-    # public repository clones without any credential at all.
-    # Re-checked at mint time, not just at create time. A row written before
+    # Re-checked at claim time, not just at create time. A row written before
     # this check existed — or while the allowlist was wider — must not be able
     # to produce a credential now.
+    #
+    # **And before any credential is minted.** A refusal here used to arrive
+    # after the gateway had already issued this attempt a grant, so every
+    # claim of a job whose repository its owner can no longer reach cost a
+    # mint and, later, a revocation, for a turn that was never going to run.
+    # Nothing below is asked for until the job is known to be runnable.
     try:
         # The same check create used. The allowlist-only variant here meant a
         # job entitled by its owner's own GitHub connection passed creation and
@@ -809,6 +785,36 @@ async def worker_claim(
             detail={"error": {"type": "repo_not_allowed", "message": str(exc)}},
         ) from exc
 
+    # Two credentials with different powers. The runner keeps the full one and
+    # passes only the sandbox one inside, so a credential that leaks from inside
+    # the agent can make model calls the gateway already meters but cannot touch
+    # this job's event log, lifecycle, or terminal state.
+    #
+    # Only the first is ours to mint. ``SCOPE_FULL`` is this service's own
+    # control credential, signed with this service's own secret and verified by
+    # this service — correctly local. The sandbox's credential is not: it buys
+    # inference, which is the gateway's to authorize and the gateway's to meter,
+    # so it is asked for rather than minted. Before this, the claim minted
+    # a ``SCOPE_MODEL`` token signed with a root the gateway does not know —
+    # which bought nothing, and failed at the sandbox's first model call.)
+    token = mint_worker_token(**fence, scope=SCOPE_FULL)
+    sandbox_token = await _mint_sandbox_grant(job_store, grants, claim)
+
+    # The sandbox's *second* credential, and this one is ours to mint: MCP is
+    # served by this service's relay, against this service's registry and this
+    # service's attempt fence. Scoped `mcp` so it opens the relay and nothing
+    # else — not the worker surface, and certainly not the gateway.
+    #
+    # Two credentials rather than one because they authorize at two services
+    # now. A leak is bounded by whichever it was: the grant buys models it
+    # names, this buys tools the job asked for, and neither buys the other.
+    mcp_token = mint_worker_token(**fence, scope=SCOPE_MCP)
+    # A third credential, weaker than either: read-only, this repository only,
+    # one hour. The runner needs it to check the repository out — a runner that
+    # cannot clone runs the agent in an empty directory — and it is deliberately
+    # not the publisher's token, which can write. It stays in the runner and
+    # never enters the sandbox. Absent (null) is a working configuration: a
+    # public repository clones without any credential at all.
     clone_token: str | None = None
     github_token: str | None = None
     if app_credentials is not None:
