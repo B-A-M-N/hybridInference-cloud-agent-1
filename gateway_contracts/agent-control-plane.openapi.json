@@ -10304,6 +10304,7 @@
             "anyOf": [
               {
                 "items": {
+                  "maxLength": 256,
                   "type": "string"
                 },
                 "maxItems": 64,
@@ -10402,9 +10403,13 @@
             "anyOf": [
               {
                 "additionalProperties": {
+                  "maxLength": 128,
                   "type": "string"
                 },
                 "maxProperties": 64,
+                "propertyNames": {
+                  "maxLength": 64
+                },
                 "type": "object"
               },
               {
@@ -10419,11 +10424,16 @@
               {
                 "additionalProperties": {
                   "items": {
+                    "maxLength": 128,
                     "type": "string"
                   },
+                  "maxItems": 64,
                   "type": "array"
                 },
                 "maxProperties": 64,
+                "propertyNames": {
+                  "maxLength": 64
+                },
                 "type": "object"
               },
               {
@@ -10640,6 +10650,7 @@
           "capabilities": {
             "description": "What this machine can run — runtime tiers, sandbox backends, whatever a job may ask for. A job goes to a host only when the host declares everything the job requires.",
             "items": {
+              "maxLength": 256,
               "type": "string"
             },
             "maxItems": 64,
@@ -10654,7 +10665,12 @@
           },
           "labels": {
             "additionalProperties": {
+              "maxLength": 255,
               "type": "string"
+            },
+            "maxProperties": 32,
+            "propertyNames": {
+              "maxLength": 64
             },
             "title": "Labels",
             "type": "object"
@@ -15362,9 +15378,13 @@
           },
           "helper_versions": {
             "additionalProperties": {
+              "maxLength": 128,
               "type": "string"
             },
             "maxProperties": 64,
+            "propertyNames": {
+              "maxLength": 64
+            },
             "title": "Helper Versions",
             "type": "object"
           },
@@ -15382,6 +15402,7 @@
           },
           "runner_capabilities": {
             "items": {
+              "maxLength": 256,
               "type": "string"
             },
             "maxItems": 64,
@@ -15390,20 +15411,29 @@
           },
           "runtime_versions": {
             "additionalProperties": {
+              "maxLength": 128,
               "type": "string"
             },
             "maxProperties": 64,
+            "propertyNames": {
+              "maxLength": 64
+            },
             "title": "Runtime Versions",
             "type": "object"
           },
           "runtime_versions_available": {
             "additionalProperties": {
               "items": {
+                "maxLength": 128,
                 "type": "string"
               },
+              "maxItems": 64,
               "type": "array"
             },
             "maxProperties": 64,
+            "propertyNames": {
+              "maxLength": 64
+            },
             "title": "Runtime Versions Available",
             "type": "object"
           },
@@ -15472,6 +15502,7 @@
           },
           "worker_id": {
             "description": "Stable identifier of the claiming worker.",
+            "maxLength": 512,
             "title": "Worker Id",
             "type": "string"
           }
@@ -15817,6 +15848,7 @@
                 "type": "null"
               }
             ],
+            "description": "Why the turn ended as it did. Kept to the first 4000 characters; a longer one is trimmed, not refused.",
             "title": "Detail"
           },
           "setup_script": {

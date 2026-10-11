@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 
+from cloud_agent.api._body_limits import HostBodyLimitRoute
 from cloud_agent.api.deps import get_grant_client, get_storage
 from cloud_agent.broker_routing import BrokerUrlRefused, probe_broker, validate_broker_url
 from cloud_agent.host_pool import (
@@ -67,7 +68,8 @@ class _HostsStorage(Protocol):
     sandbox: SandboxRepository
 
 
-router = APIRouter(prefix="/v1/agent/host", tags=["agent-hosts"])
+# Host traffic arrives through the tunnel, past the edge's body limits.
+router = APIRouter(prefix="/v1/agent/host", tags=["agent-hosts"], route_class=HostBodyLimitRoute)
 
 
 def _require_store(store: _HostsStorage | None) -> _HostsStorage:

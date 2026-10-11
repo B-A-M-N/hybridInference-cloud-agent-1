@@ -109,6 +109,33 @@ MAX_LEASE_TTL_SECONDS = 900.0
 # while still letting runtime adapters introduce new kinds.
 EVENT_TYPE_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
 
+# What a host may say about itself, bounded. A host is trusted to run turns,
+# not to size rows: these values are stored as JSONB that the admin pool view
+# and the owner's job view read back on every load. Each cap sits far above
+# anything a real runner sends — runtime and helper ids and their versions come
+# from image labels, capabilities from the shared protocol's own constants, the
+# worker id from a hostname — so only a machine that is misbehaving meets one.
+HOST_REPORT_KEY_MAX_CHARS = 64
+HOST_REPORT_VERSION_MAX_CHARS = 128
+HOST_CAPABILITY_MAX_CHARS = 256
+HOST_VERSION_MENU_MAX_ITEMS = 64
+HOST_LABELS_MAX_ITEMS = 32
+HOST_LABEL_VALUE_MAX_CHARS = 255
+WORKER_ID_MAX_CHARS = 512
+#: A worker's terminal explanation is trimmed to this rather than refused.
+#: Refusing it would refuse the finish, and a turn whose finish cannot land
+#: sits on its lease until the reaper takes it — a worse outcome for the owner
+#: than a long message cut short.
+WORKER_FINISH_DETAIL_MAX_CHARS = 4000
+
+_HostReportKey = Annotated[str, Field(max_length=HOST_REPORT_KEY_MAX_CHARS)]
+_HostReportVersion = Annotated[str, Field(max_length=HOST_REPORT_VERSION_MAX_CHARS)]
+_HostVersionMenu = Annotated[
+    list[_HostReportVersion], Field(max_length=HOST_VERSION_MENU_MAX_ITEMS)
+]
+_HostCapability = Annotated[str, Field(max_length=HOST_CAPABILITY_MAX_CHARS)]
+_HostLabelValue = Annotated[str, Field(max_length=HOST_LABEL_VALUE_MAX_CHARS)]
+
 # Where a job's `base_ref` lives once it is persisted. The column stores the
 # resolved `base_sha` — a branch moves — so the branch the owner actually
 # picked is kept alongside it in `metadata` under a reserved key, which the API
@@ -1524,7 +1551,9 @@ class WorkerClaimAttestation(BaseModel):
 
     sandbox_runtime: str | None = Field(None, max_length=128)
     sandbox_image_digest: str | None = Field(None, max_length=512)
-    runtime_versions: dict[str, str] = Field(default_factory=dict, max_length=64)
+    runtime_versions: dict[_HostReportKey, _HostReportVersion] = Field(
+        default_factory=dict, max_length=64
+    )
     #: Every version this replica's image holds, keyed by runtime id — the menu
     #: a stored selection is checked against before the claim honours it.
     #:
@@ -1533,12 +1562,16 @@ class WorkerClaimAttestation(BaseModel):
     #: not name: the field went over the wire, Pydantic discarded it, the claim
     #: saw an empty menu and fell back to the image default. Every selection an
     #: admin made was a no-op, and the only sign was one log line.
-    runtime_versions_available: dict[str, list[str]] = Field(default_factory=dict, max_length=64)
+    runtime_versions_available: dict[_HostReportKey, _HostVersionMenu] = Field(
+        default_factory=dict, max_length=64
+    )
     #: Versions of in-image protocol helpers that are not Agent CLIs (for
     #: example the Claude SDK fork bridge). They ride the same attestation so
     #: the API cannot silently discard evidence used by capability gating.
-    helper_versions: dict[str, str] = Field(default_factory=dict, max_length=64)
-    runner_capabilities: list[str] = Field(default_factory=list, max_length=64)
+    helper_versions: dict[_HostReportKey, _HostReportVersion] = Field(
+        default_factory=dict, max_length=64
+    )
+    runner_capabilities: list[_HostCapability] = Field(default_factory=list, max_length=64)
     sandbox_archive_settings_applied_revision: StrictInt | None = Field(None, ge=0)
     host_kernel: str | None = Field(None, max_length=256)
     guest_kernel: str | None = Field(None, max_length=256)
@@ -1553,7 +1586,11 @@ class WorkerClaimRequest(BaseModel):
     # healthy while the server ignored what the client thought it requested.
     model_config = ConfigDict(extra="forbid")
 
-    worker_id: str = Field(..., description="Stable identifier of the claiming worker.")
+    worker_id: str = Field(
+        ...,
+        max_length=WORKER_ID_MAX_CHARS,
+        description="Stable identifier of the claiming worker.",
+    )
     lease_ttl_seconds: float = Field(
         120.0,
         gt=0,
@@ -2170,7 +2207,14 @@ class WorkerFinishRequest(BaseModel):
     """Terminal transition reported by a worker."""
 
     state: str = Field(..., description="succeeded|failed|cancelled")
-    detail: str | None = None
+    detail: str | None = Field(
+        None,
+        description=(
+            "Why the turn ended as it did. Kept to the first "
+            f"{WORKER_FINISH_DETAIL_MAX_CHARS} characters; a longer one is trimmed, "
+            "not refused."
+        ),
+    )
     setup_script: str | None = Field(
         None,
         max_length=8000,
@@ -2199,6 +2243,14 @@ class WorkerFinishRequest(BaseModel):
             "knowing its base, and a job may be submitted without naming a commit."
         ),
     )
+
+    @field_validator("detail")
+    @classmethod
+    def _trim_detail(cls, value: str | None) -> str | None:
+        """Keep the stored explanation bounded without refusing the finish."""
+        if value is None or len(value) <= WORKER_FINISH_DETAIL_MAX_CHARS:
+            return value
+        return value[: WORKER_FINISH_DETAIL_MAX_CHARS - 1] + "\u2026"
 
 
 class WorkerAckResponse(BaseModel):
@@ -3084,7 +3136,7 @@ class HostRegisterRequest(BaseModel):
             "register under a name an admin did not choose for it."
         ),
     )
-    capabilities: list[str] = Field(
+    capabilities: list[_HostCapability] = Field(
         default_factory=list,
         max_length=64,
         description=(
@@ -3110,7 +3162,9 @@ class HostRegisterRequest(BaseModel):
         ),
     )
     runner_version: str | None = Field(None, max_length=128)
-    labels: dict[str, str] = Field(default_factory=dict)
+    labels: dict[_HostReportKey, _HostLabelValue] = Field(
+        default_factory=dict, max_length=HOST_LABELS_MAX_ITEMS
+    )
 
 
 class HostRegisterResponse(BaseModel):
@@ -3238,7 +3292,7 @@ class HostHeartbeatRequest(BaseModel):
     )
     runner_version: str | None = Field(None, max_length=128)
     broker_url: str | None = Field(None, max_length=2048)
-    capabilities: list[str] | None = Field(None, max_length=64)
+    capabilities: list[_HostCapability] | None = Field(None, max_length=64)
     sandbox_runtime: str | None = Field(
         None,
         max_length=128,
@@ -3261,7 +3315,7 @@ class HostHeartbeatRequest(BaseModel):
             "can know exactly what executed the original."
         ),
     )
-    runtime_versions: dict[str, str] | None = Field(
+    runtime_versions: dict[_HostReportKey, _HostReportVersion] | None = Field(
         None,
         max_length=64,
         description=(
@@ -3270,7 +3324,7 @@ class HostHeartbeatRequest(BaseModel):
             "means 'inspected, image carries no version labels'."
         ),
     )
-    runtime_versions_available: dict[str, list[str]] | None = Field(
+    runtime_versions_available: dict[_HostReportKey, _HostVersionMenu] | None = Field(
         None,
         max_length=64,
         description=(

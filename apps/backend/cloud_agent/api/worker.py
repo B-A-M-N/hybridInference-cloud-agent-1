@@ -27,6 +27,11 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 
 from cloud_agent import web_search
+from cloud_agent.api._body_limits import (
+    HostBodyLimitRoute,
+    payload_too_large,
+    read_bounded_body,
+)
 from cloud_agent.api._workspace_access import (
     _workspace_id,
     _workspace_not_ready,
@@ -169,44 +174,30 @@ async def _refresh_claim_memory(
         return None
 
 
-class _BoundedTurnResourcesRoute(APIRoute):
-    """Limit turn-resource reports before parsing, including chunked requests."""
+class _BoundedTurnResourcesRoute(HostBodyLimitRoute):
+    """Limit every worker request body before parsing, including chunked ones.
+
+    Every body-carrying worker route gets the host ceiling. Turn-resource
+    reports get their own, much smaller one, and a fixed validation answer.
+    """
 
     def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
-        """Wrap only the resource-report endpoint before its normal handler."""
-        handler = super().get_route_handler()
+        """Wrap the resource-report endpoint specially; the rest generically."""
         if (
             not self.path.endswith("/turn-resources")
             or self.methods is None
             or "POST" not in self.methods
         ):
-            return handler
+            return super().get_route_handler()
+        handler = APIRoute.get_route_handler(self)
 
         async def bounded_handler(request: Request) -> Response:
-            chunks: list[bytes] = []
-            size = 0
-            async for chunk in request.stream():
-                size += len(chunk)
-                if size > MAX_TURN_RESOURCES_BODY_BYTES:
-                    return JSONResponse(
-                        status_code=413,
-                        content={
-                            "detail": {
-                                "error": {
-                                    "type": "payload_too_large",
-                                    "message": (
-                                        "A turn resource snapshot is limited to "
-                                        f"{MAX_TURN_RESOURCES_BODY_BYTES} bytes."
-                                    ),
-                                }
-                            }
-                        },
-                        headers={"Cache-Control": "no-store"},
-                    )
-                chunks.append(chunk)
+            body = await read_bounded_body(request, MAX_TURN_RESOURCES_BODY_BYTES)
+            if body is None:
+                return payload_too_large(MAX_TURN_RESOURCES_BODY_BYTES, "A turn resource snapshot")
             # Request.body() uses this same cache; give FastAPI only the bytes
             # accepted above rather than asking it to consume the stream again.
-            request._body = b"".join(chunks)
+            request._body = body
             try:
                 response = await handler(request)
             except RequestValidationError:
