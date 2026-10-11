@@ -686,6 +686,69 @@ class TestTheBarePrefix:
         assert response.status_code == 401
 
 
+class TestTheRequestBounds:
+    """One request cannot make the relay every tenant shares hold or run without limit."""
+
+    async def test_a_declared_length_over_the_bound_is_refused_unread(
+        self, client: AsyncClient, host: StubHost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A body announced as too large is refused before any of it is read."""
+        monkeypatch.setattr(agent_mcp_router, "MAX_RELAY_BODY_BYTES", 64)
+        body = json.dumps(
+            _rpc("tools/call", name="github__get_issue", arguments={"pad": "x" * 64})
+        ).encode()
+
+        response = await client.post(
+            _HOST_URL, content=body, headers={**_auth(), "content-type": "application/json"}
+        )
+
+        assert response.status_code == 413
+        assert response.json()["error"]["code"] == -32600
+        assert host.called == []
+
+    async def test_a_chunked_body_stops_being_read_at_the_bound(
+        self, client: AsyncClient, host: StubHost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A body with no declared length is measured as it arrives, not afterwards."""
+        monkeypatch.setattr(agent_mcp_router, "MAX_RELAY_BODY_BYTES", 64)
+        produced: list[int] = []
+
+        async def endless() -> Any:
+            for _ in range(1_000):
+                produced.append(32)
+                yield b" " * 32
+
+        response = await client.post(_HOST_URL, content=endless(), headers=_auth())
+
+        assert response.status_code == 413
+        assert sum(produced) < 1_000 * 32
+        assert host.called == []
+
+    async def test_a_batch_over_the_cap_runs_nothing(
+        self, client: AsyncClient, host: StubHost
+    ) -> None:
+        """An oversized batch is refused whole, before its first message runs."""
+        batch = [
+            _rpc("tools/call", index, name="github__get_issue")
+            for index in range(agent_mcp_router.MAX_RELAY_BATCH_MESSAGES + 1)
+        ]
+
+        response = await client.post(_HOST_URL, json=batch, headers=_auth())
+
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == -32600
+        assert host.called == []
+
+    async def test_a_batch_at_the_cap_is_answered(self, client: AsyncClient) -> None:
+        """The cap is a ceiling, not a ban on batching."""
+        batch = [_rpc("ping", index) for index in range(agent_mcp_router.MAX_RELAY_BATCH_MESSAGES)]
+
+        response = await client.post(_HOST_URL, json=batch, headers=_auth())
+
+        assert response.status_code == 200
+        assert len(response.json()) == agent_mcp_router.MAX_RELAY_BATCH_MESSAGES
+
+
 def agent_mcp_relay_app_router() -> Any:
     """The relay router, for a case that needs its own store overrides."""
     return agent_mcp_router.router
