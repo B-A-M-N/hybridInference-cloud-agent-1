@@ -104,9 +104,14 @@ async def test_integrations_gitlab_uses_source_control_repository(
 
     gitlab = _gitlab(handler)
     if connection_state != "disconnected":
-        store.source_control.get_gitlab_connection.return_value = _connection(
-            gitlab, expired=connection_state == "expired"
-        )
+        connection = _connection(gitlab, expired=connection_state == "expired")
+        store.source_control.get_gitlab_connection.return_value = connection
+        if connection_state == "expired":
+            store.source_control.claim_gitlab_token_refresh.return_value = {
+                "refresh_generation": 4,
+                "refresh_token_ciphertext": connection["refresh_token_ciphertext"],
+            }
+            store.source_control.update_gitlab_tokens.return_value = True
     app = _app(store, gitlab)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -132,12 +137,17 @@ async def test_integrations_gitlab_uses_source_control_repository(
         assert provider["repositories"][0]["name"] == "octo/project"
         assert "/api/v4/projects" in requests
     if connection_state == "expired":
+        claim = store.source_control.claim_gitlab_token_refresh.await_args.kwargs
+        assert (claim["user_id"], claim["connection_id"]) == (_OWNER, 7)
+        assert (claim["lease_seconds"], claim["margin_seconds"]) == (30, 300)
         update = store.source_control.update_gitlab_tokens.await_args.kwargs
         assert update["user_id"] == _OWNER
         assert update["connection_id"] == 7
+        assert update["refresh_generation"] == 4
         assert gitlab.cipher.decrypt(update["access_token_ciphertext"]) == "access-two"
         assert gitlab.cipher.decrypt(update["refresh_token_ciphertext"]) == "refresh-two"
     else:
+        store.source_control.claim_gitlab_token_refresh.assert_not_awaited()
         store.source_control.update_gitlab_tokens.assert_not_awaited()
 
 
@@ -160,10 +170,13 @@ async def test_disconnect_gitlab_refreshes_and_revokes_with_source_control_repos
         return httpx.Response(200, json={})
 
     gitlab = _gitlab(handler)
-    store.source_control.get_gitlab_connection.side_effect = [
-        _connection(gitlab, expired=True),
-        None,
-    ]
+    connection = _connection(gitlab, expired=True)
+    store.source_control.get_gitlab_connection.side_effect = [connection, None]
+    store.source_control.claim_gitlab_token_refresh.return_value = {
+        "refresh_generation": 4,
+        "refresh_token_ciphertext": connection["refresh_token_ciphertext"],
+    }
+    store.source_control.update_gitlab_tokens.return_value = True
     app = _app(store, gitlab)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
