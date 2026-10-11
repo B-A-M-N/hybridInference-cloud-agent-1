@@ -162,74 +162,76 @@ function UserMemoryPanel({ userId }: { userId: string | undefined }) {
 
           {view ? (
             <>
-              <div className="mt-4 flex items-center gap-4">
+              <div className="mt-4 flex flex-wrap items-center gap-x-6 gap-y-4">
                 {/* The API generates this illustration as a data URL for the account. */}
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
                   src={view.avatar.data_url}
                   alt={t('settings.memory.avatarAlt')}
-                  width={80}
-                  height={80}
-                  className="h-20 w-20 shrink-0 rounded-full border border-border object-cover"
+                  width={64}
+                  height={64}
+                  className="h-16 w-16 shrink-0 rounded-full border border-border object-cover"
                 />
-                <div>
+                <div className="min-w-0">
                   <h3 className="text-sm font-semibold text-foreground">
                     {t('settings.memory.avatar')}
                   </h3>
-                  <p className="mt-1 text-xs leading-relaxed text-muted">
+                  <p className="text-xs leading-relaxed text-muted">
                     {t('settings.memory.avatarDescription')}
                   </p>
                 </div>
-              </div>
-              <label className="mt-4 flex min-h-11 items-center gap-3 text-sm font-medium text-foreground">
-                <input
-                  type="checkbox"
-                  role="switch"
-                  checked={view.enabled}
-                  onChange={(event) => {
-                    const enabled = event.target.checked;
-                    void run('toggle', (signal) => updateUserMemory(enabled, signal));
-                  }}
-                  disabled={pending !== null}
-                  className="h-4 w-4 accent-crimson"
-                />
-                {t('settings.memory.automatic')}
-              </label>
-              <p aria-live="polite" className="mt-1 text-xs leading-relaxed text-muted">
-                {t(view.enabled ? 'settings.memory.enabled' : 'settings.memory.disabled')}
-              </p>
-              {updatedAt && !Number.isNaN(updatedAt.getTime()) ? (
-                <p className="mt-2 text-xs text-muted">
-                  {t('settings.memory.updated', {
-                    date: updatedAt.toLocaleString(locale, {
-                      dateStyle: 'medium',
-                      timeStyle: 'short',
-                    }),
-                  })}
-                </p>
-              ) : null}
-              <div className="mt-3 flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  onClick={() => void run('refresh', getUserMemory)}
-                  disabled={pending !== null}
-                  className="ui-button ui-button-secondary min-h-11"
-                >
-                  {t(
-                    pending === 'refresh'
-                      ? 'settings.memory.refreshing'
-                      : 'settings.memory.refresh',
-                  )}
-                </button>
-                <button
-                  ref={clearButton}
-                  type="button"
-                  onClick={() => setConfirmClear(true)}
-                  disabled={pending !== null || confirmClear}
-                  className="ui-button ui-button-secondary min-h-11"
-                >
-                  {t('settings.memory.clear')}
-                </button>
+                <div className="min-w-0">
+                  <label className="flex min-h-11 items-center gap-3 text-sm font-medium text-foreground">
+                    <input
+                      type="checkbox"
+                      role="switch"
+                      checked={view.enabled}
+                      onChange={(event) => {
+                        const enabled = event.target.checked;
+                        void run('toggle', (signal) => updateUserMemory(enabled, signal));
+                      }}
+                      disabled={pending !== null}
+                      className="h-4 w-4 accent-crimson"
+                    />
+                    {t('settings.memory.automatic')}
+                  </label>
+                  <p aria-live="polite" className="text-xs leading-relaxed text-muted">
+                    {t(view.enabled ? 'settings.memory.enabled' : 'settings.memory.disabled')}
+                  </p>
+                  {updatedAt && !Number.isNaN(updatedAt.getTime()) ? (
+                    <p className="text-xs text-muted">
+                      {t('settings.memory.updated', {
+                        date: updatedAt.toLocaleString(locale, {
+                          dateStyle: 'medium',
+                          timeStyle: 'short',
+                        }),
+                      })}
+                    </p>
+                  ) : null}
+                </div>
+                <div className="flex flex-wrap gap-2 lg:ml-auto">
+                  <button
+                    type="button"
+                    onClick={() => void run('refresh', getUserMemory)}
+                    disabled={pending !== null}
+                    className="ui-button ui-button-secondary min-h-11"
+                  >
+                    {t(
+                      pending === 'refresh'
+                        ? 'settings.memory.refreshing'
+                        : 'settings.memory.refresh',
+                    )}
+                  </button>
+                  <button
+                    ref={clearButton}
+                    type="button"
+                    onClick={() => setConfirmClear(true)}
+                    disabled={pending !== null || confirmClear}
+                    className="ui-button ui-button-secondary min-h-11"
+                  >
+                    {t('settings.memory.clear')}
+                  </button>
+                </div>
               </div>
 
               {confirmClear ? (
