@@ -57,7 +57,13 @@ from cloud_agent.mcp.http_body import (
     require_identity_encoding,
 )
 from cloud_agent.mcp.invocations import deadline_for
-from cloud_agent.mcp.jsonrpc import INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, PARSE_ERROR
+from cloud_agent.mcp.jsonrpc import (
+    INTERNAL_ERROR,
+    INVALID_PARAMS,
+    INVALID_REQUEST,
+    MAX_MESSAGE_BYTES,
+    PARSE_ERROR,
+)
 from cloud_agent.mcp.models import CapabilityKind, McpServer
 from cloud_agent.mcp.net_policy import EndpointRejected, credential_headers, policy_from_environment
 from cloud_agent.mcp.refresh import RefreshRefused, ensure_fresh
@@ -153,6 +159,18 @@ _SSE_HEADERS = {
     "X-Accel-Buffering": "no",
 }
 
+#: The largest request body either POST route reads: the bound every JSON-RPC
+#: frame in this service already has. It is enforced while the bytes arrive,
+#: not after: the relay is one process every tenant's sandboxes share, and a
+#: body read whole before it is measured has already cost what the bound was
+#: there to save.
+MAX_RELAY_BODY_BYTES = MAX_MESSAGE_BYTES
+
+#: The most messages one JSON-RPC batch may carry. Current MCP revisions do not
+#: batch at all, and no client batches tool calls in practice; the cap bounds
+#: how much work one request can queue behind itself.
+MAX_RELAY_BATCH_MESSAGES = 32
+
 
 @dataclass
 class Authorized:
@@ -235,6 +253,47 @@ def _refused(status_code: int, kind: str, message: str) -> HTTPException:
     return HTTPException(
         status_code=status_code, detail={"error": {"type": kind, "message": message}}
     )
+
+
+class _BodyRefused(Exception):
+    """A request this relay will not read or run, carrying the reply that says so."""
+
+    def __init__(self, status_code: int, message: str) -> None:
+        """Build the JSON-RPC refusal, with the null id an unread request gets."""
+        super().__init__(message)
+        self.response = JSONResponse(
+            _error_reply(None, message, INVALID_REQUEST), status_code=status_code
+        )
+
+
+async def _read_body(request: Request) -> bytes:
+    """Read a POST body under :data:`MAX_RELAY_BODY_BYTES`, or refuse it.
+
+    A declared length over the bound is refused before anything is read. The
+    bound is applied again to the bytes as they stream in, because
+    ``Content-Length`` is only the sender's claim and a chunked body makes none.
+    """
+    too_large = f"An MCP request body is limited to {MAX_RELAY_BODY_BYTES} bytes."
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > MAX_RELAY_BODY_BYTES:
+        raise _BodyRefused(413, too_large)
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > MAX_RELAY_BODY_BYTES:
+            raise _BodyRefused(413, too_large)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _bounded_batch(document: Any) -> Any:
+    """Return a parsed document, refusing a batch over :data:`MAX_RELAY_BATCH_MESSAGES`."""
+    if isinstance(document, list) and len(document) > MAX_RELAY_BATCH_MESSAGES:
+        raise _BodyRefused(
+            400, f"A JSON-RPC batch is limited to {MAX_RELAY_BATCH_MESSAGES} messages."
+        )
+    return document
 
 
 async def _authorize_fence(
@@ -1355,13 +1414,16 @@ async def _host_post(
     authorization: str | None,
 ) -> Any:
     """Dispatch one JSON-RPC message addressed to the merged surface."""
-    body = await request.body()
     try:
-        document = json.loads(body or b"{}")
-    except (json.JSONDecodeError, ValueError) as exc:
-        return JSONResponse(
-            _error_reply(None, f"invalid JSON: {exc}", PARSE_ERROR), status_code=400
-        )
+        body = await _read_body(request)
+        try:
+            document = _bounded_batch(json.loads(body or b"{}"))
+        except (ValueError, RecursionError) as exc:
+            return JSONResponse(
+                _error_reply(None, f"invalid JSON: {exc}", PARSE_ERROR), status_code=400
+            )
+    except _BodyRefused as exc:
+        return exc.response
 
     payloads = document if isinstance(document, list) else [document]
     replies: list[dict[str, Any]] = []
@@ -1920,14 +1982,16 @@ async def mcp_post(
         # Keep the existing JSON-RPC refusal for disabled selections, including
         # housekeeping requests, without resolving or refreshing credentials.
         try:
-            payload = json.loads(await request.body())
-        except ValueError:
+            payload = json.loads(await _read_body(request))
+        except (_BodyRefused, ValueError, RecursionError):
             payload = None
         request_id = payload.get("id") if isinstance(payload, dict) else None
         return JSONResponse(_error_reply(request_id, str(exc.detail)))
     assert store is not None
     try:
-        document = parse_request(await request.body())
+        document = _bounded_batch(parse_request(await _read_body(request)))
+    except _BodyRefused as exc:
+        return exc.response
     except UnreadableRequest as exc:
         # The merged endpoint's answer to the same body. Nothing below may see
         # bytes other than the ones decided, so nothing below sees these.

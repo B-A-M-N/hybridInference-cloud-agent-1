@@ -783,6 +783,35 @@ async def test_notifications_and_batches_still_travel(client, upstream):
     assert json.loads(upstream.requests[0].content) == batch
 
 
+async def test_an_oversized_body_is_refused_before_it_is_decided(monkeypatch, store, upstream):
+    """The per-connection route reads under the same bound as the merged one."""
+    monkeypatch.setattr(agent_mcp_router, "MAX_RELAY_BODY_BYTES", 64)
+    async with _relay(monkeypatch, store, upstream) as api:
+        response = await api.post(
+            f"/v1/agent/mcp/{_ALIAS}",
+            json=_rpc("tools/call", name="get_issue", arguments={"pad": "x" * 64}),
+            headers=_auth(),
+        )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == -32600
+    assert upstream.requests == []
+
+
+async def test_a_batch_over_the_cap_is_never_forwarded(client, upstream, store):
+    """An oversized batch is refused whole rather than decided message by message."""
+    batch = [
+        {**_rpc("tools/call", name="get_issue"), "id": index}
+        for index in range(agent_mcp_router.MAX_RELAY_BATCH_MESSAGES + 1)
+    ]
+    response = await client.post(f"/v1/agent/mcp/{_ALIAS}", json=batch, headers=_auth())
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == -32600
+    assert upstream.requests == []
+    assert store.looked_up == []
+
+
 async def test_a_denied_tool_is_never_advertised(monkeypatch, store, upstream):
     """A model cannot be talked into a tool it was never offered."""
     upstream.body = _catalogue("get_issue", "create_issue")
