@@ -246,7 +246,7 @@ function SettingsView() {
           description="Configure application defaults, agent versions, and sandbox behavior."
         />
         <AdminNavigation current="settings" />
-        <div className="max-w-4xl">
+        <>
           <p className="mt-6 max-w-2xl text-sm leading-6 text-muted">
             Override sandbox settings for one server in{' '}
             <Link
@@ -260,7 +260,7 @@ function SettingsView() {
           <div
             role="tablist"
             aria-label="Settings sections"
-            className="mt-6 flex gap-1 overflow-x-auto rounded-xl border border-border bg-surface-muted p-1 sm:flex-wrap sm:overflow-x-visible"
+            className="mt-6 flex w-full gap-1 overflow-x-auto rounded-xl border border-border bg-surface-muted p-1 sm:flex-wrap sm:overflow-x-visible"
           >
             {settingsTabs.map(({ id, label }, index) => (
               <button
@@ -482,7 +482,7 @@ function SettingsView() {
               <CloudLabSettings onAccessDenied={fail} />
             )}
           </div>
-        </div>
+        </>
       </section>
     </div>
   );

@@ -148,7 +148,7 @@ function CloudLabSettingsForm({ onAccessDenied }: { onAccessDenied?: (cause: unk
   const inputClass = 'ui-input min-h-11 w-full';
 
   return (
-    <div className="max-w-4xl">
+    <>
       <div className="mt-6">
         <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-50">CloudLab defaults</h2>
         <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
@@ -327,6 +327,6 @@ function CloudLabSettingsForm({ onAccessDenied }: { onAccessDenied?: (cause: unk
           </fieldset>
         </form>
       )}
-    </div>
+    </>
   );
 }
