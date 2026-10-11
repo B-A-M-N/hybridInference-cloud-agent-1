@@ -212,6 +212,15 @@ async def _shutdown_lifespan(
     lifespan itself did not already fail.
     """
     errors: list[BaseException] = []
+    # Drop send-now lock connections before the pool closes. A row the host
+    # has not accepted stays recoverable. One it already accepted stays marked
+    # and is not injected again.
+    try:
+        from cloud_agent.api.turns import cancel_send_now_handoffs
+
+        await cancel_send_now_handoffs()
+    except Exception as exc:
+        errors.append(exc)
     if writer_installed and writer is not None:
         # The writer reports its own drops. A failure here is not a reason to
         # skip the pool, and it never was: shutdown used to suppress it.
@@ -245,6 +254,45 @@ async def _shutdown_lifespan(
     if log_stopped:
         await _invoke(lambda: logger.info("cloud agent control plane stopped"), errors)
     return errors
+
+
+async def _recover_send_now_handoffs(app: Any, storage: Any) -> None:
+    """Resume send-now handoffs this process lost. A failure must not refuse to boot."""
+    from cloud_agent.api.turns import recover_send_now_handoffs
+
+    try:
+        pending = await storage.pending_messages.list_sending_handoffs()
+    except Exception:
+        logger.warning(
+            "agent_send_now_recovery_failed",
+            extra={"event": "agent_send_now_recovery_failed"},
+            exc_info=True,
+        )
+        return
+    if not pending:
+        return
+    try:
+        app_credentials = app.state.source_control.github.get()
+    except Exception:
+        logger.warning(
+            "agent_send_now_recovery_credentials_unavailable",
+            extra={"event": "agent_send_now_recovery_credentials_unavailable"},
+            exc_info=True,
+        )
+        app_credentials = None
+    try:
+        await recover_send_now_handoffs(
+            storage,
+            gateway=app.state.gateway,
+            app_credentials=app_credentials,
+            signal=app.state.job_event_signal,
+        )
+    except Exception:
+        logger.warning(
+            "agent_send_now_recovery_failed",
+            extra={"event": "agent_send_now_recovery_failed"},
+            exc_info=True,
+        )
 
 
 @asynccontextmanager
@@ -447,6 +495,7 @@ async def lifespan(app: FastAPI, *, background: bool = True) -> AsyncIterator[No
             app.state.mcp_decision_signal = None
             _start_publisher(app, storage)
             _start_pr_archiver(app, storage)
+            await _recover_send_now_handoffs(app, storage)
             logger.info("cloud agent control plane started")
         else:
             # The relay listener roots no file or terminal request, so it has no

@@ -267,6 +267,50 @@ async def test_a_turn_no_host_has_taken_yet_gets_it_once_one_has(api, monkeypatc
     assert [row["state"] for row in (await api.queue(thread_id))["messages"]] == ["sending"]
 
 
+async def test_a_restart_before_claim_still_injects_once(api, monkeypatch):
+    """The in-memory wait is gone; the ``sending`` row is enough to hand it over once."""
+    monkeypatch.setattr(turns, "HAND_OVER_POLL_S", 0.05)
+    await _steerable(api)
+    broker = _Broker()
+    _route_input_to(monkeypatch, broker)
+    first = await api.create()
+    thread_id = first["thread_id"]
+    await api.run(first)
+    second = (await api.send(thread_id, "next step")).json()["job"]
+    waiting = (await api.send(thread_id, "and mind the tests")).json()["pending"]
+    began = await api.store.pending_messages.begin_send_now(
+        thread_id=thread_id,
+        user_id=_OWNER,
+        message_id=waiting["id"],
+        revision=waiting["revision"],
+    )
+    assert began["attempt_id"] is None
+    assert began["message"]["state"] == "sending"
+    # The process that marked it ``sending`` exited before a host claimed the turn.
+    turns._hand_overs.clear()
+    turns._completed_send_now.discard((waiting["id"], int(began["message"]["revision"])))
+
+    await turns.recover_send_now_handoffs(
+        api.store, gateway=api.gateway, app_credentials=None, signal=None
+    )
+    assert broker.calls == []
+
+    running = await api.start(second)
+    await asyncio.wait_for(asyncio.gather(*list(turns._hand_overs)), 10)
+
+    assert broker.calls == [
+        (thread_id, f"attempt:{running['attempt_id']}", waiting["id"], "and mind the tests")
+    ]
+    await turns.recover_send_now_handoffs(
+        api.store, gateway=api.gateway, app_credentials=None, signal=None
+    )
+    await asyncio.sleep(0.2)
+    assert broker.calls == [
+        (thread_id, f"attempt:{running['attempt_id']}", waiting["id"], "and mind the tests")
+    ]
+    assert [row["state"] for row in (await api.queue(thread_id))["messages"]] == ["sending"]
+
+
 async def test_send_now_refuses_what_it_cannot_do_and_leaves_the_message_as_it_was(
     api, monkeypatch
 ):

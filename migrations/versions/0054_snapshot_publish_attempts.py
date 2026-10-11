@@ -1,13 +1,13 @@
 """Count transient snapshot publication attempts.
 
 Revision ID: 0054_snapshot_publish_attempts
-Revises: 0052_memory_overrides
+Revises: 0053_gitlab_refresh_fence
 """
 
 from alembic import op
 
 revision = "0054_snapshot_publish_attempts"
-down_revision = "0052_memory_overrides"
+down_revision = "0053_gitlab_refresh_fence"
 branch_labels = None
 depends_on = None
 

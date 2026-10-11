@@ -142,6 +142,43 @@ class PendingMessageRepository(Protocol):
         """
         ...
 
+    async def list_sending_handoffs(self) -> list[dict[str, Any]]:
+        """Messages in ``sending`` tied to a turn, for a restarted control plane.
+
+        The wait that hands one to a host is not durable. The row is: ``sending``
+        with ``send_now_job_id`` set, and not yet marked handed off.
+        """
+        ...
+
+    async def send_now_handoff_pending(self, *, message_id: str, revision: int) -> bool:
+        """True when this revision is still ``sending`` and the host has not accepted it.
+
+        Called while this process holds the send-now session lock. Another
+        process may have injected already and left the row ``sending``; that
+        mark is what makes this return false.
+        """
+        ...
+
+    async def mark_send_now_handed(self, *, message_id: str, revision: int) -> bool:
+        """Record that this revision was accepted by the host.
+
+        A later restart skips it. The row stays ``sending`` until the turn
+        takes the message; without this mark, recovery would inject it again.
+        """
+        ...
+
+    async def try_acquire_send_now_lock(self, message_id: str) -> Any | None:
+        """A dedicated connection holding this message's session lock, or ``None``.
+
+        The lock is ``pg_try_advisory_lock`` on ``'send-now:' || message_id``,
+        session-level, so it lasts until the connection closes and not until a
+        transaction commits. The connection is opened beside the pool, not
+        checked out of it: returning a pooled connection early would drop the
+        lock or leave it on the next borrower. The caller closes it when the
+        handoff finishes. A caller that gets ``None`` does not inject.
+        """
+        ...
+
     async def settle_queue(
         self, *, thread_id: str, prepared: PreparedHead | None = None
     ) -> SettleOutcome:

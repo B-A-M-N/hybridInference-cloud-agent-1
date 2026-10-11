@@ -9,6 +9,7 @@ settlement waits for the first, then sees the turn it created and does nothing.
 
 from __future__ import annotations
 
+import inspect
 import json
 from typing import Any
 
@@ -164,6 +165,25 @@ async def _pin_attachments(
 def _json_or_null(value: list[int] | None) -> str | None:
     """A JSON array column's text, or NULL — this pool registers no JSONB codec."""
     return None if value is None else json.dumps(value)
+
+
+_SEND_NOW_LOCK_SQL = "SELECT pg_try_advisory_lock(hashtextextended('send-now:' || $1, 0))"
+
+
+async def _open_dedicated_connection(pool: asyncpg.Pool) -> Any:
+    """A connection the pool does not own, opened the same way the pool opens one.
+
+    The pool's reset runs ``pg_advisory_unlock_all`` when a connection is
+    returned, so a session lock cannot live on a pooled connection. This one
+    stays open until the caller closes it.
+    """
+    return await pool._connect(
+        *pool._connect_args,
+        loop=pool._loop,
+        connection_class=pool._connection_class,
+        record_class=pool._record_class,
+        **pool._connect_kwargs,
+    )
 
 
 class PostgresPendingMessageRepository:
@@ -594,6 +614,7 @@ class PostgresPendingMessageRepository:
                 """
                 UPDATE agent_pending_messages
                 SET state = $2, send_now_job_id = $3, send_now_requested_at = NOW(),
+                    send_now_handed_off = FALSE,
                     revision = revision + 1, updated_at = NOW()
                 WHERE id = $1
                 """,
@@ -627,6 +648,7 @@ class PostgresPendingMessageRepository:
                 """
                 UPDATE agent_pending_messages
                 SET state = $3, send_now_job_id = NULL, send_now_requested_at = NULL,
+                    send_now_handed_off = FALSE,
                     revision = revision + 1, updated_at = NOW()
                 WHERE id = $1 AND state = $2 AND revision = $4
                 """,
@@ -636,6 +658,91 @@ class PostgresPendingMessageRepository:
                 revision,
             )
             return await read_pending_message(conn, message_id)
+
+    async def list_sending_handoffs(self) -> list[dict[str, Any]]:
+        """Messages in ``sending`` tied to a turn, for a restarted control plane.
+
+        The wait that hands one to a host is not durable. The row is: ``sending``
+        with ``send_now_job_id`` set, and not yet accepted by the host. A row
+        marked handed off stays ``sending`` until the turn takes it, and a
+        restart must not inject it again.
+        """
+        acquired = self._pool.acquire()
+        # A stand-in pool's ``acquire`` is a coroutine, not a context manager.
+        # Closing it here is what keeps that failure from warning at shutdown.
+        if inspect.iscoroutine(acquired):
+            acquired.close()
+            raise RuntimeError("send-now handoff list needs a pool connection")
+        async with acquired as conn:
+            rows = await conn.fetch(
+                f"SELECT {PENDING_MESSAGE_COLUMNS} FROM agent_pending_messages "
+                "WHERE state = $1 AND send_now_job_id IS NOT NULL "
+                "AND send_now_handed_off = FALSE "
+                "ORDER BY send_now_requested_at, id",
+                PENDING_SENDING,
+            )
+        # ``fetch`` returns a list of rows. Anything else is not that result,
+        # and iterating it would invent handoffs.
+        if not isinstance(rows, list):
+            raise RuntimeError("send-now handoff query did not return rows")
+        return [pending_message_row(row) for row in rows]
+
+    async def send_now_handoff_pending(self, *, message_id: str, revision: int) -> bool:
+        """True when this revision is still ``sending`` and the host has not accepted it."""
+        async with self._pool.acquire() as conn:
+            pending = await conn.fetchval(
+                """
+                SELECT id FROM agent_pending_messages
+                WHERE id = $1 AND revision = $2 AND state = $3
+                  AND send_now_handed_off = FALSE
+                """,
+                message_id,
+                revision,
+                PENDING_SENDING,
+            )
+        return pending is not None
+
+    async def try_acquire_send_now_lock(self, message_id: str) -> Any | None:
+        """A dedicated connection holding this message's session lock, or ``None``.
+
+        ``pg_try_advisory_lock(hashtextextended('send-now:' || message_id, 0))``
+        is session-level: a commit does not release it, and a dropped connection
+        does. The connection is opened the way the pool opens one and is not
+        checked out of the pool, so it cannot be returned early with the lock
+        still on it or already gone. The caller holds it for the whole handoff
+        and closes it to release. ``None`` means another session has the lock.
+        """
+        conn = await _open_dedicated_connection(self._pool)
+        try:
+            locked = await conn.fetchval(_SEND_NOW_LOCK_SQL, message_id)
+        except Exception:
+            await conn.close()
+            raise
+        if not locked:
+            await conn.close()
+            return None
+        return conn
+
+    async def mark_send_now_handed(self, *, message_id: str, revision: int) -> bool:
+        """Remember that this revision was accepted, so a restart does not inject it again.
+
+        The row stays ``sending`` until the turn takes it. The session lock is
+        gone by then, and the host writes a duplicate if recovery hands the
+        same text over a second time.
+        """
+        async with self._pool.acquire() as conn:
+            marked = await conn.fetchval(
+                """
+                UPDATE agent_pending_messages
+                SET send_now_handed_off = TRUE, updated_at = NOW()
+                WHERE id = $1 AND revision = $2 AND state = $3
+                RETURNING id
+                """,
+                message_id,
+                revision,
+                PENDING_SENDING,
+            )
+        return marked is not None
 
     async def settle_queue(
         self, *, thread_id: str, prepared: PreparedHead | None = None
@@ -681,6 +788,7 @@ class PostgresPendingMessageRepository:
                 """
                 UPDATE agent_pending_messages
                 SET state = 'queued', send_now_job_id = NULL, send_now_requested_at = NULL,
+                    send_now_handed_off = FALSE,
                     revision = revision + 1, updated_at = NOW()
                 WHERE thread_id = $1 AND state = $2
                 """,
