@@ -917,6 +917,30 @@ def _resident_launch(**changes: object) -> ResidentLaunch:
     return ResidentLaunch(**fields)  # type: ignore[arg-type]
 
 
+def test_runner_github_token_survives_broker_roundtrip_without_entering_the_response():
+    launches = []
+
+    class RecordingSupervisor(_SharedSupervisor):
+        def ensure_resident(self, thread_id, token, launch, profiling=None):
+            launches.append(launch)
+            return _descriptor(thread_id)
+
+    client = _runner_client(_app(RecordingSupervisor()))
+    try:
+        answer = client.ensure_shared_resident(
+            "athr_source",
+            token="lease",
+            launch=_resident_launch(github_token="sandbox-write-token", github_repo="owner/repo"),
+        )
+    finally:
+        client.close()
+
+    assert launches[0].github_token == "sandbox-write-token"
+    assert launches[0].github_repo == "owner/repo"
+    assert "sandbox-write-token" not in repr(launches[0])
+    assert "sandbox-write-token" not in str(answer)
+
+
 @pytest.mark.parametrize(
     "refusal",
     [

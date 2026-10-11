@@ -6,8 +6,9 @@ selected by configuration, so the same runner code serves dogfooding on CI,
 self-hosted machines, and a multi-tenant fleet.
 
 The production topology is runner outside, retained container per chat group
-(``container`` / ``kata``). Only scoped inference/MCP credentials cross into
-the sandbox; control-plane and repository credentials remain outside. The
+(``container`` / ``kata``). Scoped inference/MCP credentials and a short-lived
+repository-scoped GitHub App token cross into the sandbox; control-plane,
+account and service credentials remain outside. The
 ``process`` backend exists only as a deterministic test seam and cannot attest
 or claim a retained job.
 

@@ -5141,22 +5141,19 @@ async def test_event_type_guard_rejects_a_trailing_newline(client: AsyncClient):
 
 
 async def test_the_claim_carries_a_read_only_clone_credential(store: FakeStorage):
-    """The runner needs to check the repository out; it must not get push rights.
-
-    An installation token inherits *every* permission the App holds unless it
-    asks for less — and this App holds `contents: write` so the publisher can
-    push. Handing that to the runner would put a write credential on the host
-    that executes untrusted repository code, which is exactly the thing the
-    patch-out design exists to avoid.
-    """
+    """Checkout stays read-only; sandbox publication uses a separate scoped token."""
     from cloud_agent.api.deps import get_agent_app_credentials
 
-    asked: dict[str, Any] = {}
+    asked: list[dict[str, Any]] = []
 
     class FakeApp:
         async def token_for(self, repo: str, **kwargs: Any) -> str:
-            asked.update({"repo": repo, **kwargs})
-            return "ghs_clone_only"
+            asked.append({"repo": repo, **kwargs})
+            return (
+                "ghs_clone_only"
+                if kwargs["permissions"] == {"contents": "read"}
+                else "sandbox-write-token"
+            )
 
     app = _build_app(store)
     app.dependency_overrides[get_agent_app_credentials] = lambda: FakeApp()
@@ -5166,8 +5163,15 @@ async def test_the_claim_carries_a_read_only_clone_credential(store: FakeStorage
         claim = await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})
 
     assert claim.json()["clone_token"] == "ghs_clone_only"
-    assert asked["permissions"] == {"contents": "read"}
-    assert asked["repository_scoped"] is True
+    assert asked[0]["permissions"] == {"contents": "read"}
+    assert asked[0]["repository_scoped"] is True
+    assert claim.json()["github_token"] == "sandbox-write-token"
+    assert asked[1] == {
+        "repo": claim.json()["repo"],
+        "permissions": {"contents": "write", "pull_requests": "write"},
+        "repository_scoped": True,
+    }
+    assert len(asked) == 2
 
 
 async def test_a_deployment_without_a_github_app_still_claims_jobs(client: AsyncClient):
@@ -5177,6 +5181,7 @@ async def test_a_deployment_without_a_github_app_still_claims_jobs(client: Async
 
     assert claim.status_code == 200
     assert claim.json()["clone_token"] is None
+    assert claim.json()["github_token"] is None
 
 
 async def test_an_uninstalled_app_hands_the_job_over_without_a_credential(
@@ -5204,10 +5209,15 @@ async def test_an_uninstalled_app_hands_the_job_over_without_a_credential(
     assert claim.status_code == 200
     assert claim.json()["job_id"] == job_id
     assert claim.json()["clone_token"] is None
+    assert claim.json()["github_token"] is None
 
 
+@pytest.mark.parametrize(
+    "failure_scope", [{"contents": "read"}, {"contents": "write", "pull_requests": "write"}]
+)
 async def test_a_transient_credential_error_is_retryable_not_terminal(
     store: FakeStorage,
+    failure_scope: dict[str, str],
 ):
     """GitHub having a bad minute must not permanently fail someone's job.
 
@@ -5220,7 +5230,9 @@ async def test_a_transient_credential_error_is_retryable_not_terminal(
 
     class FlakyApp:
         async def token_for(self, repo: str, **kwargs: Any) -> str:
-            raise TimeoutError("api.github.com timed out")
+            if kwargs["permissions"] == failure_scope:
+                raise TimeoutError("api.github.com timed out")
+            return "host-clone-token"
 
     app = _build_app(store)
     app.dependency_overrides[get_agent_app_credentials] = lambda: FlakyApp()
