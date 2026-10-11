@@ -57,6 +57,7 @@ class FakeHostStore(AllCapabilities):
         self.active_host: str | None = None
         self.runtime_versions: dict[str, str] = {}
         self.global_settings: dict[str, Any] = {}
+        self.autoscaling_managed: set[str] = set()
         self.archive_settings: dict[str, Any] = {
             "enabled": False,
             "s3_uri": "s3://freeinference/cloud-agent/sandbox",
@@ -135,6 +136,8 @@ class FakeHostStore(AllCapabilities):
         row = self.rows.get(host)
         if row is None:
             return "unknown"
+        if host in self.autoscaling_managed:
+            return "autoscaling_managed"
         row["slots_desired"] = slots
         return "ok"
 
@@ -514,6 +517,23 @@ async def test_sizing_an_unknown_host_is_a_404(admin_client):
     )
 
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_sizing_an_autoscaling_managed_host_is_refused(admin_client):
+    client, store = admin_client
+    store.seed("runner-a")
+    store.rows["runner-a"]["slots_desired"] = 6
+    store.autoscaling_managed.add("runner-a")
+
+    response = await client.put(
+        "/admin/agent/runner-hosts/runner-a/slots", json={"slots": 8}, headers=ADMIN
+    )
+
+    assert response.status_code == 409
+    assert "managed by CloudLab autoscaling" in response.json()["detail"]
+    assert store.rows["runner-a"]["slots_desired"] == 6
+    assert len(store.audit) == 0
 
 
 @pytest.mark.asyncio

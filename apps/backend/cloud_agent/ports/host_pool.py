@@ -20,6 +20,22 @@ if TYPE_CHECKING:
 class HostPoolRepository(Protocol):
     """Port: the runner-host pool and its enrollment."""
 
+    async def autoscaling_observation(self, *, expected_deployment_sha: str) -> dict[str, Any]:
+        """Observe new-group demand and capacity without claiming work.
+
+        The queue count deliberately excludes jobs whose thread already owns
+        a retained sandbox: another machine cannot serve those turns. Free
+        slots include only fresh, enrolled hosts that may create a new group
+        under the same durable compute fences as the claim path. Unmatched
+        demand is the exact capability/profile matching against those slots;
+        once an owned fresh template exists, work that no such template can
+        run is omitted from scale-up pressure. No job identifiers or job
+        requirements leave this projection. The result also carries raw host
+        telemetry for conservative per-host slot sizing; callers must not
+        treat a stale sample as evidence for an increase.
+        """
+        ...
+
     async def queue_health(self, *, expected_deployment_sha: str) -> dict[str, int]:
         """Observe configured queue stalls without claiming or changing jobs.
 
@@ -242,8 +258,8 @@ class HostPoolRepository(Protocol):
     async def set_host_slots_desired(self, *, host: str, slots: int | None) -> str:
         """Ask a host to run ``slots`` turns at once, or with ``None`` its default.
 
-        Returns ``"ok"`` or ``"unknown"``. Nothing here starts or stops
-        anything: the host reads the value off its next heartbeat answer,
+        Returns ``"ok"``, ``"unknown"`` or ``"autoscaling_managed"``. Nothing
+        here starts or stops anything: the host reads the value off its next heartbeat answer,
         serves it as its limit, and reports it back as ``slots_total``. The
         claim honours the lower of the two from the next poll on, so a number
         the host has not confirmed admits nothing extra and a lowered one takes

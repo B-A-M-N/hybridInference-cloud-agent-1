@@ -8,10 +8,12 @@ they were; only the class holding them changed.
 from __future__ import annotations
 
 import json
+from collections import deque
 from typing import TYPE_CHECKING
 
 from cloud_agent.capacity_protocol import (
     CAPACITY_HISTORY_MAX_AGE_S,
+    FRESH_AFTER_SECONDS,
     history_point_write_from_block,
 )
 from cloud_agent.execution_profiles import KATA_RUNTIME
@@ -58,7 +60,7 @@ from cloud_agent_shared.sandbox_archive_settings import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
     from datetime import datetime
     from typing import Any
 
@@ -70,6 +72,95 @@ logger = get_logger(__name__)
 _LEGACY_BROKER_KEYS = frozenset(
     {"terminal_idle_ttl_s", "terminal_hard_ttl_s", "terminal_max_sessions"}
 )
+
+_JobDemand = tuple[frozenset[str] | None, str]
+_HostShape = tuple[frozenset[str], str | None]
+_HostCapacity = tuple[_HostShape, int]
+
+
+def _job_matches_host(job: _JobDemand, host: _HostShape) -> bool:
+    """Mirror the capability and execution-profile half of a new-group claim."""
+    required, execution_profile = job
+    capabilities, sandbox_runtime = host
+    if required is None or not required.issubset(capabilities):
+        return False
+    return execution_profile == "trusted-v1" or (
+        execution_profile == "untrusted-kata-v1" and sandbox_runtime == KATA_RUNTIME
+    )
+
+
+def _maximum_compatible_jobs(jobs: Sequence[_JobDemand], hosts: Sequence[_HostCapacity]) -> int:
+    """Return the exact maximum cardinality of the job/host-capacity matching.
+
+    Equal jobs and equal host shapes are aggregated before a small Dinic flow.
+    That keeps the graph bounded by compatibility shapes rather than queue
+    depth, while retaining the same answer as expanding every free slot into a
+    separate host vertex. In particular it handles the constrained/generic
+    trap where a greedy pass can waste the only flexible slot.
+    """
+    job_counts: dict[_JobDemand, int] = {}
+    for job in jobs:
+        job_counts[job] = job_counts.get(job, 0) + 1
+    host_counts: dict[_HostShape, int] = {}
+    for shape, capacity in hosts:
+        if capacity > 0:
+            host_counts[shape] = host_counts.get(shape, 0) + capacity
+    if not job_counts or not host_counts:
+        return 0
+
+    job_types = list(job_counts)
+    host_types = list(host_counts)
+    source = 0
+    job_offset = 1
+    host_offset = job_offset + len(job_types)
+    sink = host_offset + len(host_types)
+    graph: list[list[list[int]]] = [[] for _ in range(sink + 1)]
+
+    def add_edge(start: int, end: int, capacity: int) -> None:
+        graph[start].append([end, capacity, len(graph[end])])
+        graph[end].append([start, 0, len(graph[start]) - 1])
+
+    for index, job in enumerate(job_types):
+        count = job_counts[job]
+        add_edge(source, job_offset + index, count)
+        for host_index, host in enumerate(host_types):
+            if _job_matches_host(job, host):
+                add_edge(job_offset + index, host_offset + host_index, count)
+    for index, host in enumerate(host_types):
+        add_edge(host_offset + index, sink, host_counts[host])
+
+    def send(node: int, available: int, level: list[int], next_edge: list[int]) -> int:
+        if node == sink:
+            return available
+        while next_edge[node] < len(graph[node]):
+            edge = graph[node][next_edge[node]]
+            target, capacity, reverse = edge
+            if capacity > 0 and level[target] == level[node] + 1:
+                pushed = send(target, min(available, capacity), level, next_edge)
+                if pushed:
+                    edge[1] -= pushed
+                    graph[target][reverse][1] += pushed
+                    return pushed
+            next_edge[node] += 1
+        return 0
+
+    total = 0
+    while True:
+        level = [-1] * len(graph)
+        level[source] = 0
+        pending = deque([source])
+        while pending:
+            node = pending.popleft()
+            for target, capacity, _reverse in graph[node]:
+                if capacity > 0 and level[target] < 0:
+                    level[target] = level[node] + 1
+                    pending.append(target)
+        if level[sink] < 0:
+            return total
+
+        next_edge = [0] * len(graph)
+        while pushed := send(source, sum(job_counts.values()), level, next_edge):
+            total += pushed
 
 
 def _changed_settings(
@@ -595,8 +686,8 @@ class PostgresHostPoolRepository:
     async def set_host_slots_desired(self, *, host: str, slots: int | None) -> str:
         """Ask a host to run ``slots`` turns at once, or with ``None`` its default.
 
-        Returns ``"ok"`` or ``"unknown"``. Nothing here starts or stops
-        anything: the host reads the value off its next heartbeat answer,
+        Returns ``"ok"``, ``"unknown"`` or ``"autoscaling_managed"``. Nothing
+        here starts or stops anything: the host reads the value off its next heartbeat answer,
         serves it as its limit, and reports it back as ``slots_total``. The
         claim honours the lower of the two from the next poll on, so a number
         the host has not confirmed admits nothing extra and a lowered one takes
@@ -608,13 +699,29 @@ class PostgresHostPoolRepository:
         the request schema's business; the column refuses only a non-positive
         size, which is not a size.
         """
-        async with self._pool.acquire() as conn:
-            updated = await conn.fetchval(
-                "UPDATE agent_runner_hosts SET slots_desired = $2 WHERE host = $1 RETURNING host",
+        async with self._pool.acquire() as conn, conn.transaction():
+            await lock_compute_entry(conn)
+            current = await conn.fetchrow(
+                """SELECT h.host,
+                          EXISTS (
+                              SELECT 1 FROM agent_compute_nodes n
+                              JOIN agent_cloudlab_autoscaling_members m
+                                ON m.allocation_id=n.allocation_id
+                              WHERE n.id=h.compute_node_id AND m.state<>'released'
+                          ) AS autoscaling_managed
+                   FROM agent_runner_hosts h WHERE h.host=$1 FOR UPDATE OF h""",
+                host,
+            )
+            if current is None:
+                return "unknown"
+            if current["autoscaling_managed"]:
+                return "autoscaling_managed"
+            await conn.execute(
+                "UPDATE agent_runner_hosts SET slots_desired=$2 WHERE host=$1",
                 host,
                 slots,
             )
-        return "ok" if updated is not None else "unknown"
+        return "ok"
 
     async def set_runner_host_settings(
         self, *, host: str, changes: Mapping[str, int | None]
@@ -872,6 +979,191 @@ class PostgresHostPoolRepository:
             selected,
             {str(row["host"]) for row in owner_rows},
         )
+
+    async def autoscaling_observation(self, *, expected_deployment_sha: str) -> dict[str, Any]:
+        """Read the durable, content-free signal used by compute autoscaling.
+
+        A retained turn is tied to its existing Host and therefore cannot be
+        relieved by adding a CloudLab node. Only the first runnable turn of a
+        thread with no sandbox membership is demand here. Capacity is the
+        effective claim ceiling (the lower of reported and desired slots),
+        after liveness, placement, release/rotation holds, deployment
+        attestation, and archive-policy gates have all been applied. Pressure
+        is an exact maximum compatibility matching, not queue depth minus an
+        interchangeable slot count. The shared topology lock stabilizes
+        bindings, but it deliberately remains compatible with claims; repeatable
+        read prevents a claim committed between the job and host queries from
+        combining pre-claim demand with post-claim capacity into a state that
+        never existed.
+        """
+        async with (
+            self._pool.acquire() as conn,
+            conn.transaction(isolation="repeatable_read"),
+        ):
+            policy = await conn.fetchrow(
+                """
+                SELECT active_host, sandbox_archive_settings, sandbox_archive_revision
+                FROM agent_runner_policy WHERE id FOR SHARE
+                """
+            )
+            await lock_compute_topology(conn)
+            observed_at = await conn.fetchval("SELECT NOW()")
+            job_rows = await conn.fetch(
+                """
+                SELECT t.execution_profile,
+                       COALESCE(j.metadata->'requires', '[]'::jsonb) AS requires
+                FROM agent_jobs j
+                JOIN agent_threads t ON t.id=j.thread_id
+                WHERE j.state='queued' AND NOT j.cancel_requested
+                  AND NOT EXISTS (
+                      SELECT 1 FROM agent_thread_sandbox_memberships m
+                      WHERE m.thread_id=j.thread_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM agent_jobs earlier
+                      WHERE earlier.thread_id=j.thread_id
+                        AND earlier.turn_no < j.turn_no
+                        AND earlier.state IN ('queued','running')
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM agent_jobs parent
+                      WHERE parent.id=j.parent_job_id AND parent.state='succeeded'
+                  )
+                  AND (
+                      j.turn_source <> 'goal'
+                      OR (
+                          t.goal_state='active'
+                          AND t.goal_id=j.goal_id
+                          AND t.goal_revision=j.goal_revision
+                      )
+                  )
+                ORDER BY j.created_at, j.id
+                """
+            )
+            rows = await conn.fetch(
+                f"""
+                SELECT {HOST_COLUMNS}, {HOST_CAPACITY_COLUMNS}, n.allocation_id,
+                       (am.allocation_id IS NOT NULL) AS autoscaler_owned,
+                       (SELECT COUNT(*) FROM agent_sandboxes g WHERE g.host=h.host)
+                           AS retained_groups
+                FROM agent_runner_hosts h
+                LEFT JOIN agent_compute_nodes n ON n.id=h.compute_node_id
+                LEFT JOIN agent_cloudlab_autoscaling_members am
+                  ON am.allocation_id=n.allocation_id AND am.state<>'released'
+                ORDER BY h.host
+                """
+            )
+
+            archive_raw = (
+                {}
+                if policy is None
+                else {
+                    **(load_json(policy["sandbox_archive_settings"]) or {}),
+                    "revision": policy["sandbox_archive_revision"],
+                }
+            )
+            try:
+                archive_policy = SandboxArchivePolicy.from_mapping(archive_raw)
+            except SandboxArchivePolicyError:
+                archive_policy = None
+
+            jobs: list[_JobDemand] = []
+            for row in job_rows:
+                raw_requires = load_json(row["requires"])
+                required = (
+                    frozenset(raw_requires)
+                    if isinstance(raw_requires, list)
+                    and all(isinstance(value, str) for value in raw_requires)
+                    else None
+                )
+                jobs.append((required, str(row["execution_profile"])))
+
+            hosts: list[dict[str, Any]] = []
+            matching_hosts: list[_HostCapacity] = []
+            templates: list[tuple[str, _HostShape]] = []
+            free_slots = 0
+            for raw in rows:
+                host = self._host_row_to_dict(raw)
+                host["allocation_id"] = raw["allocation_id"]
+                host["retained_groups"] = int(raw["retained_groups"])
+                hosts.append(host)
+
+                capabilities = host.get("capabilities") or []
+                heartbeat = host.get("last_heartbeat_at")
+                deployment_ready = any(
+                    isinstance(capability, str)
+                    and capability.startswith("shared-sandbox-deployment:")
+                    for capability in capabilities
+                ) and (
+                    not expected_deployment_sha
+                    or f"shared-sandbox-deployment:{expected_deployment_sha}" in capabilities
+                )
+                archive_ready = bool(
+                    archive_policy is not None
+                    and (
+                        not archive_policy.enabled
+                        or (
+                            SANDBOX_ARCHIVE_CAPABILITY in capabilities
+                            and host.get("sandbox_archive_settings_applied_revision")
+                            == archive_policy.revision
+                        )
+                    )
+                )
+                fresh = bool(
+                    heartbeat is not None
+                    and (observed_at - heartbeat).total_seconds() <= FRESH_AFTER_SECONDS
+                )
+                if not (
+                    host.get("status") == HOST_ONLINE
+                    and host.get("enrolled")
+                    and not host.get("launch_error")
+                    and fresh
+                    and (policy is None or policy["active_host"] in (None, host["host"]))
+                    and "shared-sandbox-v1" in capabilities
+                    and "native-fork-at-anchor-v1" in capabilities
+                    and deployment_ready
+                    and archive_ready
+                ):
+                    continue
+                allows_new_groups, _ = await host_compute_admission(conn, host["host"])
+                if not allows_new_groups:
+                    continue
+                shape = (
+                    frozenset(str(capability) for capability in capabilities),
+                    host.get("sandbox_runtime")
+                    if isinstance(host.get("sandbox_runtime"), str)
+                    else None,
+                )
+                if raw["autoscaler_owned"]:
+                    templates.append((str(host["host"]), shape))
+                total = host.get("slots_total")
+                desired = host.get("slots_desired")
+                ceilings = [value for value in (total, desired) if isinstance(value, int)]
+                if not ceilings:
+                    continue
+                free = max(0, min(ceilings) - int(host.get("slots_used") or 0))
+                free_slots += free
+                if free:
+                    matching_hosts.append((shape, free))
+
+            matchable_jobs = jobs
+            if templates:
+                matchable_jobs = [
+                    job
+                    for job in jobs
+                    if any(_job_matches_host(job, shape) for _host, shape in templates)
+                ]
+            matched = _maximum_compatible_jobs(matchable_jobs, matching_hosts)
+
+        return {
+            "observed_at": observed_at,
+            "active_host": None if policy is None else policy["active_host"],
+            "runnable_new_group_jobs": len(jobs),
+            "fresh_effective_free_slots": free_slots,
+            "unmatched_new_group_jobs": len(matchable_jobs) - matched,
+            "autoscaling_template_hosts": [host for host, _shape in templates],
+            "hosts": hosts,
+        }
 
     async def queue_health(self, *, expected_deployment_sha: str) -> dict[str, int]:
         """Observe configured queue stalls without claiming or changing jobs.

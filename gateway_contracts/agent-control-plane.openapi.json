@@ -7931,6 +7931,168 @@
         "title": "BindingsResponse",
         "type": "object"
       },
+      "CloudLabAutoscalingPolicy": {
+        "additionalProperties": false,
+        "description": "Desired singleton policy; provider secrets remain connection references.",
+        "properties": {
+          "configuration": {
+            "additionalProperties": true,
+            "title": "Configuration",
+            "type": "object"
+          },
+          "connection_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id"
+          },
+          "cooldown_seconds": {
+            "default": 600,
+            "maximum": 86400.0,
+            "minimum": 0.0,
+            "title": "Cooldown Seconds",
+            "type": "integer"
+          },
+          "deployment_profiles": {
+            "items": {
+              "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+              "type": "string"
+            },
+            "maxItems": 8,
+            "title": "Deployment Profiles",
+            "type": "array"
+          },
+          "enabled": {
+            "default": false,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "max_hosts": {
+            "default": 0,
+            "maximum": 8.0,
+            "minimum": 0.0,
+            "title": "Max Hosts",
+            "type": "integer"
+          },
+          "min_hosts": {
+            "default": 0,
+            "maximum": 8.0,
+            "minimum": 0.0,
+            "title": "Min Hosts",
+            "type": "integer"
+          },
+          "renewal_policy": {
+            "$ref": "#/components/schemas/RenewalPolicy"
+          },
+          "sandbox_storage_path": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sandbox Storage Path"
+          },
+          "scale_down_enabled": {
+            "default": false,
+            "title": "Scale Down Enabled",
+            "type": "boolean"
+          },
+          "scale_down_idle_seconds": {
+            "default": 3600,
+            "maximum": 604800.0,
+            "minimum": 60.0,
+            "title": "Scale Down Idle Seconds",
+            "type": "integer"
+          },
+          "scale_up_sustain_seconds": {
+            "default": 120,
+            "maximum": 86400.0,
+            "minimum": 0.0,
+            "title": "Scale Up Sustain Seconds",
+            "type": "integer"
+          },
+          "slot_policy": {
+            "$ref": "#/components/schemas/CloudLabAutoscalingSlotPolicy"
+          },
+          "ssh_connection_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ssh Connection Id"
+          }
+        },
+        "title": "CloudLabAutoscalingPolicy",
+        "type": "object"
+      },
+      "CloudLabAutoscalingSlotPolicy": {
+        "additionalProperties": false,
+        "description": "Versioned slot-sizing formula applied to fresh Host capacity telemetry.",
+        "properties": {
+          "cpu_per_slot": {
+            "const": 2,
+            "default": 2,
+            "title": "Cpu Per Slot",
+            "type": "integer"
+          },
+          "cpu_reservation_fraction": {
+            "default": 0.75,
+            "maximum": 0.75,
+            "minimum": 0.75,
+            "title": "Cpu Reservation Fraction",
+            "type": "number"
+          },
+          "formula_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Formula Version",
+            "type": "integer"
+          },
+          "max_slots": {
+            "const": 128,
+            "default": 128,
+            "title": "Max Slots",
+            "type": "integer"
+          },
+          "memory_per_slot_gib": {
+            "const": 4,
+            "default": 4,
+            "title": "Memory Per Slot Gib",
+            "type": "integer"
+          },
+          "memory_reserve_gib": {
+            "const": 8,
+            "default": 8,
+            "title": "Memory Reserve Gib",
+            "type": "integer"
+          },
+          "min_slots": {
+            "const": 2,
+            "default": 2,
+            "title": "Min Slots",
+            "type": "integer"
+          }
+        },
+        "title": "CloudLabAutoscalingSlotPolicy",
+        "type": "object"
+      },
       "CloudLabDefaults": {
         "additionalProperties": false,
         "description": "Non-secret defaults applied to new CloudLab server requests.",
@@ -14457,6 +14619,26 @@
         "title": "TurnStorageIoResources",
         "type": "object"
       },
+      "UpdateCloudLabAutoscaling": {
+        "additionalProperties": false,
+        "description": "Compare and replace the autoscaling policy observed by an administrator.",
+        "properties": {
+          "expected_revision": {
+            "minimum": 0.0,
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/CloudLabAutoscalingPolicy"
+          }
+        },
+        "required": [
+          "expected_revision",
+          "policy"
+        ],
+        "title": "UpdateCloudLabAutoscaling",
+        "type": "object"
+      },
       "UpdateComputeConnection": {
         "additionalProperties": false,
         "description": "Replace a credential only against the revision the editor observed.",
@@ -17762,6 +17944,161 @@
           }
         },
         "summary": "Automatic Setup Status"
+      }
+    },
+    "/admin/agent/compute-autoscaling/cloudlab": {
+      "get": {
+        "description": "Read the safe autoscaling policy, controller status and owned members.",
+        "operationId": "cloudlab_autoscaling_admin_agent_compute_autoscaling_cloudlab_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Cloudlab Autoscaling Admin Agent Compute Autoscaling Cloudlab Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cloudlab Autoscaling"
+      },
+      "put": {
+        "description": "Compare and replace the singleton CloudLab autoscaling policy.",
+        "operationId": "set_cloudlab_autoscaling_admin_agent_compute_autoscaling_cloudlab_put",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateCloudLabAutoscaling"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Set Cloudlab Autoscaling Admin Agent Compute Autoscaling Cloudlab Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Cloudlab Autoscaling"
+      }
+    },
+    "/admin/agent/compute-availability/cloudlab": {
+      "get": {
+        "description": "List fresh, plentiful CloudLab node types from the public inventory.",
+        "operationId": "cloudlab_preferred_nodes_admin_agent_compute_availability_cloudlab_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Cloudlab Preferred Nodes Admin Agent Compute Availability Cloudlab Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cloudlab Preferred Nodes"
       }
     },
     "/admin/agent/compute-connections": {
