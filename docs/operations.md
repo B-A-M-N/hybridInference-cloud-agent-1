@@ -63,9 +63,10 @@ field is missing or an optional integration is only partly configured, the
 attention.
 
 For the first deployment of this release, run `alembic upgrade head` through
-`0048_sandbox_plugins`. Rebuild the sandbox image for explicit plugin loading.
-Then start the main control-plane listener with its
-existing complete environment. It imports registered environment settings once,
+`0049_host_drain_fence`. Existing hosts begin without a deployment drain owner
+or release receipt. Rebuild the sandbox image for explicit plugin loading. Then
+start the main control-plane listener with its existing complete environment. It
+imports registered environment settings once,
 while the MCP-only listener waits for initialization and then reads the same
 settings. Newly migrated runtime identity, service keys, broker credentials,
 and policy fields are imported only when absent, under the same atomic
@@ -1816,6 +1817,60 @@ For downstream Actions triggered by `workflow_run`, the workflow definition
 comes from that repository's default branch. Synchronize orchestrator changes
 there before relying on a new rollback fence, and do not dispatch an older
 default-branch workflow against an environment during that rollout window.
+
+Migration `0049_host_drain_fence` establishes a second permanent compatibility
+floor. After a fence-capable control plane has been activated, the deployment
+orchestrator must reject every candidate whose control-plane recipe lacks
+`AGENT_DEPLOY_DRAIN_FENCE_V1` before migration, drain, or activation. Do not
+downgrade the application or schema below that release. A released fence keeps
+its token as an idempotency receipt, and an older writer cannot change the
+host status without violating the database constraint. That failure is
+deliberately fail-closed, but an old control plane is not operationally
+compatible with the receipt.
+
+Inspect fence state before rollback or recovery:
+
+```sql
+SELECT host, status, slots_used, drain_fence_token,
+       drain_fence_status_before, drain_fence_active
+FROM agent_runner_hosts
+WHERE drain_fence_token IS NOT NULL;
+```
+
+The compatibility floor remains even when this query is empty: the current
+control plane may create a receipt on its next automated deployment. If an
+active fence is abandoned, redeploy the fence-capable release and use its
+token-conditional release (or the audited force override). If that is
+impossible, stop the old control plane and every deployment workflow, begin a
+transaction, lock exactly one host row, and verify the expected token plus
+`slots_used = 0`. Only then may an operator clear that one active fence:
+
+```sql
+BEGIN;
+SELECT host, status, slots_used, drain_fence_token, drain_fence_active
+FROM agent_runner_hosts
+WHERE host = '<exact-host>'
+FOR UPDATE;
+
+UPDATE agent_runner_hosts
+SET status = 'online',
+    drain_fence_token = NULL,
+    drain_fence_status_before = NULL,
+    drain_fence_active = FALSE
+WHERE host = '<exact-host>'
+  AND status = 'draining'
+  AND slots_used = 0
+  AND drain_fence_token = '<expected-uuid>'::uuid
+  AND drain_fence_active
+RETURNING host;
+COMMIT;
+```
+
+Require exactly one returned row. To clear only an inactive receipt, use the
+same exact host and token predicates with `status = 'online'` and
+`NOT drain_fence_active`; do not change status. Never bulk-clear fence fields.
+If the owner or token is uncertain, leave the host draining and restore the
+fence-capable control plane.
 
 #### Cold starts and failed deployments
 

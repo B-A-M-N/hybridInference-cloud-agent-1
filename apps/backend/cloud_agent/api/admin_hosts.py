@@ -48,10 +48,12 @@ from cloud_agent.host_pool import (
     HOST_ONLINE,
 )
 from cloud_agent.schemas import (
+    AcquireHostDrainFenceRequest,
     AgentRunnerHost,
     IssueHostEnrollTokenRequest,
     IssueHostEnrollTokenResponse,
     ListAgentRunnerHostsResponse,
+    ReleaseHostDrainFenceRequest,
     SandboxArchiveSettingsResponse,
     SetActiveAgentRunnerHostRequest,
     SetHostSettingsRequest,
@@ -153,6 +155,9 @@ def _to_item(row: dict[str, Any], *, now: datetime | None = None) -> AgentRunner
         runner_version=row.get("runner_version"),
         broker_url=row.get("broker_url"),
         last_heartbeat_at=row.get("last_heartbeat_at"),
+        drain_fence_token=row.get("drain_fence_token"),
+        drain_fence_status_before=row.get("drain_fence_status_before"),
+        drain_fence_active=bool(row.get("drain_fence_active")),
         sandbox_runtime=row.get("sandbox_runtime"),
         sandbox_image_digest=row.get("sandbox_image_digest"),
         runtime_versions=row.get("runtime_versions"),
@@ -538,11 +543,19 @@ async def _set_status(
     action: str,
     job_store: _AdminHostsStorage,
     actor_id: str,
+    force: bool = False,
 ) -> ListAgentRunnerHostsResponse:
     """Apply one table-driven status change, or say why it was refused."""
-    await _apply(HostCommands(job_store.host_pool).set_status(host=host, status=status))
+    await _apply(
+        HostCommands(job_store.host_pool).set_status(host=host, status=status, force=force)
+    )
     await log_admin_action(
-        job_store, get_client_ip(request), action, None, {"host": host}, actor_id=actor_id
+        job_store,
+        get_client_ip(request),
+        action,
+        None,
+        {"host": host, "force": force},
+        actor_id=actor_id,
     )
     return await _snapshot(job_store.host_pool)
 
@@ -551,6 +564,7 @@ async def _set_status(
 async def drain_agent_runner_host(
     request: Request,
     host: str,
+    payload: AcquireHostDrainFenceRequest | None = None,
     _admin_id: str = Depends(verify_admin_access),
     store: _AdminHostsStorage | None = Depends(get_storage),
 ) -> ListAgentRunnerHostsResponse:
@@ -562,12 +576,30 @@ async def drain_agent_runner_host(
     counter that walks down to zero, which is the number ``remove`` refuses to
     act before.
     """
+    job_store = _require_store(store)
+    if payload is not None:
+        await _apply(
+            HostCommands(job_store.host_pool).acquire_drain_fence(
+                host=host,
+                expected_fence_token=payload.expected_fence_token,
+                fence_token=payload.fence_token,
+            )
+        )
+        await log_admin_action(
+            job_store,
+            get_client_ip(request),
+            "agent.runner_host.drain",
+            None,
+            {"host": host},
+            actor_id=_admin_id,
+        )
+        return await _snapshot(job_store.host_pool)
     return await _set_status(
         request,
         host=host,
         status=HOST_DRAINING,
         action="agent.runner_host.drain",
-        job_store=_require_store(store),
+        job_store=job_store,
         actor_id=_admin_id,
     )
 
@@ -576,6 +608,14 @@ async def drain_agent_runner_host(
 async def undrain_agent_runner_host(
     request: Request,
     host: str,
+    payload: ReleaseHostDrainFenceRequest | None = None,
+    force: bool = Query(
+        False,
+        description=(
+            "Override an active deployment fence. A forced legacy transition clears its "
+            "ownership and idempotency receipt."
+        ),
+    ),
     _admin_id: str = Depends(verify_admin_access),
     store: _AdminHostsStorage | None = Depends(get_storage),
 ) -> ListAgentRunnerHostsResponse:
@@ -585,13 +625,35 @@ async def undrain_agent_runner_host(
     to be sure about before making, and the whole value of draining is that it
     is the safe thing to try first.
     """
+    job_store = _require_store(store)
+    if payload is not None:
+        if force:
+            raise HTTPException(
+                status_code=400,
+                detail="force cannot be combined with a fenced drain release.",
+            )
+        await _apply(
+            HostCommands(job_store.host_pool).release_drain_fence(
+                host=host, fence_token=payload.fence_token
+            )
+        )
+        await log_admin_action(
+            job_store,
+            get_client_ip(request),
+            "agent.runner_host.undrain",
+            None,
+            {"host": host},
+            actor_id=_admin_id,
+        )
+        return await _snapshot(job_store.host_pool)
     return await _set_status(
         request,
         host=host,
         status=HOST_ONLINE,
         action="agent.runner_host.undrain",
-        job_store=_require_store(store),
+        job_store=job_store,
         actor_id=_admin_id,
+        force=force,
     )
 
 

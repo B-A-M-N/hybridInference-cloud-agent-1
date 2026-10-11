@@ -17,6 +17,7 @@ from cloud_agent.capacity_protocol import (
 from cloud_agent.execution_profiles import KATA_RUNTIME
 from cloud_agent.host_pool import (
     HOST_DISABLED,
+    HOST_DRAINING,
     HOST_ENROLLING,
     HOST_OFFLINE,
     HOST_ONLINE,
@@ -192,6 +193,12 @@ class PostgresHostPoolRepository:
         """
         async with self._pool.acquire() as conn, conn.transaction():
             await lock_compute_entry(conn)
+            existing = await conn.fetchrow(
+                "SELECT drain_fence_active FROM agent_runner_hosts WHERE host = $1 FOR UPDATE",
+                host,
+            )
+            if existing is not None and existing["drain_fence_active"]:
+                raise ValueError("host_drain_fenced")
             retiring = await conn.fetchval(
                 """SELECT 1 FROM agent_runner_hosts h
                 JOIN agent_compute_nodes n ON n.id=h.compute_node_id
@@ -210,6 +217,9 @@ class PostgresHostPoolRepository:
                 VALUES ($1, '{HOST_ENROLLING}', $2::jsonb, $3, $4, $5, $6::jsonb, $7)
                 ON CONFLICT (host) DO UPDATE
                 SET status = '{HOST_ENROLLING}',
+                    drain_fence_token = NULL,
+                    drain_fence_status_before = NULL,
+                    drain_fence_active = FALSE,
                     capabilities = EXCLUDED.capabilities,
                     slots_total = EXCLUDED.slots_total,
                     broker_url = EXCLUDED.broker_url,
@@ -464,27 +474,110 @@ class PostgresHostPoolRepository:
                 )
         return self._host_row_to_dict(row)
 
-    async def set_host_status(self, *, host: str, status: str) -> str:
+    async def set_host_status(self, *, host: str, status: str, force: bool = False) -> str:
         """Move a host to ``status``, refusing transitions the table forbids.
 
-        Returns ``"ok"``, ``"unknown"`` or ``"invalid"``. The table is consulted
+        Returns ``"ok"``, ``"unknown"``, ``"invalid"`` or ``"fenced"``. The table is consulted
         inside the transaction that writes, on a locked row: checking it in the
         caller means an admin draining a host and the reaper marking it offline
         can both read ``online`` and both write, and the loser's decision is the
         one that sticks.
         """
         async with self._pool.acquire() as conn, conn.transaction():
-            current = await conn.fetchval(
-                "SELECT status FROM agent_runner_hosts WHERE host = $1 FOR UPDATE", host
+            row = await conn.fetchrow(
+                "SELECT status, drain_fence_active FROM agent_runner_hosts "
+                "WHERE host = $1 FOR UPDATE",
+                host,
             )
-            if current is None:
+            if row is None:
                 return "unknown"
+            current = row["status"]
+            if row["drain_fence_active"]:
+                if current == HOST_DRAINING and status == HOST_DRAINING:
+                    return "ok"
+                if not force:
+                    return "fenced"
             if not transition_allowed(current, status):
                 return "invalid"
             await conn.execute(
-                "UPDATE agent_runner_hosts SET status = $2 WHERE host = $1", host, status
+                "UPDATE agent_runner_hosts SET status = $2, drain_fence_token = NULL, "
+                "drain_fence_status_before = NULL, drain_fence_active = FALSE WHERE host = $1",
+                host,
+                status,
             )
         return "ok"
+
+    async def acquire_host_drain_fence(
+        self,
+        *,
+        host: str,
+        expected_fence_token: Any | None,
+        fence_token: Any,
+    ) -> tuple[str, str | None]:
+        """CAS one deployment drain under the host row lock."""
+        expected = None if expected_fence_token is None else str(expected_fence_token)
+        requested = str(fence_token)
+        async with self._pool.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT status, drain_fence_token, drain_fence_status_before, "
+                "drain_fence_active FROM agent_runner_hosts WHERE host = $1 FOR UPDATE",
+                host,
+            )
+            if row is None:
+                return "unknown", None
+            current_token = (
+                None if row["drain_fence_token"] is None else str(row["drain_fence_token"])
+            )
+            if current_token == requested:
+                if row["drain_fence_active"] and row["status"] == HOST_DRAINING:
+                    return "ok", row["drain_fence_status_before"]
+                if not row["drain_fence_active"] and row["status"] == HOST_ONLINE:
+                    return "released", None
+                return "invalid", None
+            if current_token != expected:
+                return "stale", None
+            if row["status"] == HOST_DRAINING and current_token is None:
+                return "manual", None
+            if row["status"] not in (HOST_ONLINE, HOST_DRAINING):
+                return "invalid", None
+            status_before = row["status"]
+            await conn.execute(
+                "UPDATE agent_runner_hosts SET status = $2, drain_fence_token = $3::uuid, "
+                "drain_fence_status_before = $4, drain_fence_active = TRUE WHERE host = $1",
+                host,
+                HOST_DRAINING,
+                requested,
+                status_before,
+            )
+        return "ok", status_before
+
+    async def release_host_drain_fence(self, *, host: str, fence_token: Any) -> str:
+        """Release only the exact active owner, retaining its idempotency receipt."""
+        requested = str(fence_token)
+        async with self._pool.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT status, drain_fence_token, drain_fence_active "
+                "FROM agent_runner_hosts WHERE host = $1 FOR UPDATE",
+                host,
+            )
+            if row is None:
+                return "unknown"
+            current_token = (
+                None if row["drain_fence_token"] is None else str(row["drain_fence_token"])
+            )
+            if current_token != requested:
+                return "stale"
+            if row["drain_fence_active"]:
+                if row["status"] != HOST_DRAINING:
+                    return "invalid"
+                await conn.execute(
+                    "UPDATE agent_runner_hosts SET status = $2, drain_fence_active = FALSE "
+                    "WHERE host = $1",
+                    host,
+                    HOST_ONLINE,
+                )
+                return "ok"
+            return "ok" if row["status"] == HOST_ONLINE else "invalid"
 
     async def set_host_slots_desired(self, *, host: str, slots: int | None) -> str:
         """Ask a host to run ``slots`` turns at once, or with ``None`` its default.
@@ -568,11 +661,14 @@ class PostgresHostPoolRepository:
         """
         async with self._pool.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
-                "SELECT status, slots_used FROM agent_runner_hosts WHERE host = $1 FOR UPDATE",
+                "SELECT status, slots_used, drain_fence_active "
+                "FROM agent_runner_hosts WHERE host = $1 FOR UPDATE",
                 host,
             )
             if row is None:
                 return "unknown"
+            if row["drain_fence_active"] and not force:
+                return "fenced"
             if row["slots_used"] > 0 and not force:
                 return "busy"
             await revoke_host_credentials(conn, [host])
@@ -612,7 +708,10 @@ class PostgresHostPoolRepository:
             rows = await conn.fetch(
                 f"""
                 UPDATE agent_runner_hosts
-                SET status = '{HOST_OFFLINE}'
+                SET status = '{HOST_OFFLINE}',
+                    drain_fence_token = NULL,
+                    drain_fence_status_before = NULL,
+                    drain_fence_active = FALSE
                 WHERE credential_hash IS NOT NULL
                   AND status IN ('{HOST_ENROLLING}', '{HOST_ONLINE}')
                   AND COALESCE(last_heartbeat_at, first_seen_at)
@@ -1076,6 +1175,7 @@ class PostgresHostPoolRepository:
         """Drop a host from the pool. A runner still polling re-adds itself.
 
         Returns ``"deleted"`` or ``"unknown"``; refuses ``"active"``,
+        ``"fenced"``,
         ``"retained_groups_present"``, ``"resource_bound"``,
         ``"active_attempts_present"`` and ``"pending_compute_operations"``.
         A disabled attached machine without external release capability may
@@ -1100,9 +1200,12 @@ class PostgresHostPoolRepository:
             if retained:
                 return "retained_groups_present"
             host_row = await conn.fetchrow(
-                "SELECT compute_node_id,status FROM agent_runner_hosts WHERE host=$1 FOR UPDATE",
+                "SELECT compute_node_id,status,drain_fence_active "
+                "FROM agent_runner_hosts WHERE host=$1 FOR UPDATE",
                 host,
             )
+            if host_row is not None and host_row["drain_fence_active"]:
+                return "fenced"
             bound = None if host_row is None else host_row["compute_node_id"]
             local_cleanup_allocation = None
             if bound is not None:

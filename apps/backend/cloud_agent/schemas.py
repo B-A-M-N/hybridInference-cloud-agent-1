@@ -11,6 +11,7 @@ import binascii
 # silently unbuilt and raises at the first request instead of at import.
 from datetime import datetime  # noqa: TC003
 from typing import Annotated, Any, Final, Literal
+from uuid import UUID  # noqa: TC003 -- Pydantic resolves this at runtime.
 
 from pydantic import (
     BaseModel,
@@ -2545,6 +2546,25 @@ class AgentRunnerHost(BaseModel):
         description="Where this host's workspace broker listens, as the control plane reaches it.",
     )
     last_heartbeat_at: datetime | None = None
+    drain_fence_token: UUID | None = Field(
+        None,
+        repr=False,
+        description=(
+            "Opaque owner of an automated deployment drain, retained after release "
+            "as an idempotency receipt."
+        ),
+    )
+    drain_fence_status_before: Literal["online", "draining"] | None = Field(
+        None,
+        description="Host status immediately before the current drain-fence token was acquired.",
+    )
+    drain_fence_active: bool = Field(
+        False,
+        description=(
+            "True only while the recorded deployment fence owns a draining host; "
+            "false for an absent fence or released receipt."
+        ),
+    )
     sandbox_runtime: str | None = Field(
         None,
         description=(
@@ -2621,6 +2641,19 @@ class AgentRunnerHost(BaseModel):
             "the host predates database-backed archive settings or has not synchronized yet."
         ),
     )
+
+
+class AcquireHostDrainFenceRequest(BaseModel):
+    """Atomically replace the expected drain owner with a new opaque owner."""
+
+    expected_fence_token: UUID | None = Field(..., repr=False)
+    fence_token: UUID = Field(..., repr=False)
+
+
+class ReleaseHostDrainFenceRequest(BaseModel):
+    """Release only the automated drain owned by this opaque token."""
+
+    fence_token: UUID = Field(..., repr=False)
 
 
 class HostSettingDefinition(BaseModel):

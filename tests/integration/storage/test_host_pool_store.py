@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from uuid import uuid4
 
 import pytest
 import pytest_asyncio
@@ -406,6 +407,143 @@ async def test_an_illegal_transition_is_refused_by_the_store(
 
 async def test_an_unknown_host_cannot_be_transitioned(store, hosts: PostgresHostPoolRepository):
     assert await hosts.set_host_status(host="nope", status=HOST_DRAINING) == "unknown"
+
+
+async def test_drain_fence_acquire_and_release_are_response_loss_idempotent(
+    store, hosts: PostgresHostPoolRepository
+):
+    await _enrol(store, "runner-a", hosts=hosts)
+    token = uuid4()
+
+    assert await hosts.acquire_host_drain_fence(
+        host="runner-a", expected_fence_token=None, fence_token=token
+    ) == ("ok", HOST_ONLINE)
+    assert await hosts.acquire_host_drain_fence(
+        host="runner-a", expected_fence_token=None, fence_token=token
+    ) == ("ok", HOST_ONLINE)
+    assert await hosts.release_host_drain_fence(host="runner-a", fence_token=token) == "ok"
+    assert await hosts.release_host_drain_fence(host="runner-a", fence_token=token) == "ok"
+
+    row = await hosts.get_host(host="runner-a")
+    assert row["status"] == HOST_ONLINE
+    assert row["drain_fence_token"] == token
+    assert row["drain_fence_status_before"] == HOST_ONLINE
+    assert row["drain_fence_active"] is False
+    assert await hosts.acquire_host_drain_fence(
+        host="runner-a", expected_fence_token=None, fence_token=token
+    ) == ("released", None)
+
+
+async def test_drain_fence_transfer_fences_stale_release_and_records_inheritance(
+    store, hosts: PostgresHostPoolRepository
+):
+    await _enrol(store, "runner-a", hosts=hosts)
+    first, second = uuid4(), uuid4()
+    assert await hosts.acquire_host_drain_fence(
+        host="runner-a", expected_fence_token=None, fence_token=first
+    ) == ("ok", HOST_ONLINE)
+
+    assert await hosts.acquire_host_drain_fence(
+        host="runner-a", expected_fence_token=first, fence_token=second
+    ) == ("ok", HOST_DRAINING)
+    assert await hosts.release_host_drain_fence(host="runner-a", fence_token=first) == "stale"
+    row = await hosts.get_host(host="runner-a")
+    assert row["status"] == HOST_DRAINING
+    assert row["drain_fence_token"] == second
+    assert row["drain_fence_status_before"] == HOST_DRAINING
+    assert row["drain_fence_active"] is True
+
+
+async def test_drain_fence_refuses_manual_drain_and_legacy_undrain_without_force(
+    store, hosts: PostgresHostPoolRepository
+):
+    await _enrol(store, "runner-a", hosts=hosts)
+    assert await hosts.set_host_status(host="runner-a", status=HOST_DRAINING) == "ok"
+    assert await hosts.acquire_host_drain_fence(
+        host="runner-a", expected_fence_token=None, fence_token=uuid4()
+    ) == ("manual", None)
+    assert await hosts.set_host_status(host="runner-a", status=HOST_ONLINE) == "ok"
+
+    token = uuid4()
+    assert await hosts.acquire_host_drain_fence(
+        host="runner-a", expected_fence_token=None, fence_token=token
+    ) == ("ok", HOST_ONLINE)
+    assert await hosts.set_host_status(host="runner-a", status=HOST_DRAINING) == "ok"
+    assert await hosts.set_host_status(host="runner-a", status=HOST_ONLINE) == "fenced"
+    assert await hosts.set_host_status(host="runner-a", status=HOST_ONLINE, force=True) == "ok"
+    row = await hosts.get_host(host="runner-a")
+    assert row["drain_fence_token"] is None
+    assert row["drain_fence_status_before"] is None
+    assert row["drain_fence_active"] is False
+
+
+async def test_database_constraint_rejects_old_binary_writes_and_partial_receipts(
+    db, store, hosts: PostgresHostPoolRepository
+):
+    import asyncpg
+
+    await _enrol(store, "runner-a", hosts=hosts)
+    token = uuid4()
+    assert await hosts.acquire_host_drain_fence(
+        host="runner-a", expected_fence_token=None, fence_token=token
+    ) == ("ok", HOST_ONLINE)
+    with pytest.raises(asyncpg.CheckViolationError):
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE agent_runner_hosts SET status=$2 WHERE host=$1",
+                "runner-a",
+                HOST_ONLINE,
+            )
+    assert (await hosts.get_host(host="runner-a"))["status"] == HOST_DRAINING
+
+    await _enrol(store, "runner-b", hosts=hosts)
+    with pytest.raises(asyncpg.CheckViolationError):
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE agent_runner_hosts SET drain_fence_token=$2::uuid WHERE host=$1",
+                "runner-b",
+                str(uuid4()),
+            )
+
+
+async def test_reenrollment_cannot_clear_an_active_drain_fence(
+    store, hosts: PostgresHostPoolRepository
+):
+    await _enrol(store, "runner-a", hosts=hosts)
+    token = uuid4()
+    await hosts.acquire_host_drain_fence(
+        host="runner-a", expected_fence_token=None, fence_token=token
+    )
+
+    with pytest.raises(ValueError, match="host_drain_fenced"):
+        await hosts.register_host(host="runner-a", credential_hash=hash_secret("replacement"))
+
+    row = await hosts.get_host(host="runner-a")
+    assert row["status"] == HOST_DRAINING
+    assert row["drain_fence_token"] == token
+    assert row["drain_fence_status_before"] == HOST_ONLINE
+    assert row["drain_fence_active"] is True
+    assert await hosts.authenticate_host(
+        host="runner-a", credential_hash=hash_secret("cred-runner-a")
+    )
+    assert (
+        await hosts.authenticate_host(host="runner-a", credential_hash=hash_secret("replacement"))
+        is None
+    )
+
+
+async def test_an_active_drain_fence_cannot_be_forgotten(store, hosts: PostgresHostPoolRepository):
+    await _enrol(store, "runner-a", hosts=hosts)
+    token = uuid4()
+    await hosts.acquire_host_drain_fence(
+        host="runner-a", expected_fence_token=None, fence_token=token
+    )
+
+    assert await hosts.forget_runner_host(host="runner-a") == "fenced"
+    row = await hosts.get_host(host="runner-a")
+    assert row["status"] == HOST_DRAINING
+    assert row["drain_fence_token"] == token
+    assert row["drain_fence_active"] is True
 
 
 async def test_the_reaper_marks_a_silent_enrolled_host_offline(
