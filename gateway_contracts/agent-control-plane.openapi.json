@@ -21577,7 +21577,7 @@
     },
     "/admin/agent/sandboxes/{sandbox_id}/delete": {
       "post": {
-        "description": "Queue archive-before-delete under the exact reviewed stopped-container fence.",
+        "description": "Queue verified deletion, with fail-closed recovery for stale running state.",
         "operationId": "delete_admin_sandbox_admin_agent_sandboxes__sandbox_id__delete_post",
         "parameters": [
           {
@@ -21587,6 +21587,16 @@
             "schema": {
               "title": "Sandbox Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "force",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Force",
+              "type": "boolean"
             }
           },
           {
