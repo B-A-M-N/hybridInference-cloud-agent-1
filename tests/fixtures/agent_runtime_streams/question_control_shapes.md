@@ -1,4 +1,4 @@
-# Native user questions
+# Native user interactions
 
 The Claude fixture is a sanitized request and accepted response exercised with
 the actual `@anthropic-ai/claude-code` 2.1.220 Linux binary. A local deterministic
@@ -10,6 +10,15 @@ the following tool result. The response envelope agrees with the pinned
 `claude-agent-sdk==0.2.148` `_internal/query.py` permission handler. The CLI's
 `sdk-tools.d.ts` defines answers by full question text, with comma-separated
 strings for multiple choices.
+
+The same real binary was driven through
+`EnterPlanMode` → `ExitPlanMode` → `Bash` under that production invocation.
+Entering plan mode emitted no control request. Exiting emitted `can_use_tool`
+with `requires_user_interaction: true`; replying with `behavior: allow` and the
+unchanged `updatedInput` restored `bypassPermissions`, and the following Bash
+call ran without another prompt. No `updatedPermissions` response was needed.
+The observed 2.1.220 exit input was empty; its type also permits the deprecated
+`allowedPrompts` field covered by the unit regression.
 
 The Codex fixture is synthetic and follows `ToolRequestUserInputParams` and
 `ToolRequestUserInputResponse` JSON schemas generated from the actual pinned
