@@ -145,6 +145,18 @@ export interface ServerRequest {
   deployment_profile?: string;
 }
 
+export interface DeploymentProfileRequest {
+  id: string;
+  label: string;
+  deployment_sha: string;
+  deploy_root: string;
+  environment: string;
+  files: Record<string, string>;
+  source_bundle_base64: string;
+  install_prerequisites: boolean;
+  timeout_seconds: number;
+  data_mount?: string;
+}
 export interface RetirementImpact {
   allocation_id: string;
   revision: number;
@@ -177,6 +189,9 @@ export const getComputeProviders = (signal?: AbortSignal) =>
   get<ComputeCatalog>('/compute-providers', signal);
 export const getComputeConnections = (signal?: AbortSignal) =>
   get<{ connections: ComputeConnection[] }>('/compute-connections', signal);
+export const saveComputeDeploymentProfile = (body: DeploymentProfileRequest) =>
+  write<{ profile: { id: string; label: string } }>('/compute-deployment-profiles', body);
+
 export interface ComputeServerSnapshot {
   allocations: ComputeAllocation[];
   hosts: {

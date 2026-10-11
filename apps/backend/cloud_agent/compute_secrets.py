@@ -31,6 +31,10 @@ class ComputeConnectionReader(Protocol):
         """Read a connection including its encrypted secret."""
         ...
 
+    async def get_deployment_profile(self, profile_id: str) -> dict[str, Any] | None:
+        """Read a profile including its bundle and encrypted inputs."""
+        ...
+
 
 class ComputeSecretStore:
     """Encrypt secrets for storage and resolve stable references on demand."""
@@ -57,6 +61,11 @@ class ComputeSecretStore:
             digest = hashlib.sha256(_DOMAIN + b"\0" + material.encode()).digest()
             self._cipher = Fernet(base64.urlsafe_b64encode(digest))
         self._material = material
+
+    @property
+    def repository(self) -> ComputeConnectionReader:
+        """Expose the trusted reader to the deployment resolver only."""
+        return self._connections
 
     @property
     def configured(self) -> bool:
@@ -107,3 +116,55 @@ class ComputeSecretStore:
         if self._cipher is None:
             raise ComputeSecretError("compute secret storage is not configured")
         return self._cipher
+
+
+class StoredDeploymentResolver:
+    """Resolve database-backed profile bundles and encrypted deployment inputs."""
+
+    PREFIX = "stored-profile:"
+
+    def __init__(self, repository: ComputeConnectionReader, secrets: ComputeSecretStore) -> None:
+        self._repository = repository
+        self._secrets = secrets
+
+    async def bundle(self, reference: str) -> bytes:
+        profile_id = self._profile_id(reference, kind="bundle")
+        row = await self._row(profile_id)
+        value = row.get("source_bundle")
+        if not isinstance(value, (bytes, bytearray, memoryview)):
+            raise ComputeSecretError("deployment bundle is unavailable")
+        return bytes(value)
+
+    async def resolve(self, reference: str) -> str:
+        parts = reference.split(":", 3)
+        if len(parts) < 3 or parts[0] != "stored-profile":
+            raise ComputeSecretError("deployment credential reference is not configured")
+        profile_id, kind = parts[1], parts[2]
+        row = await self._row(profile_id)
+        plaintext = self._secrets.decrypt(
+            "profile:" + profile_id, "deployment_profile", row["secret_ciphertext"]
+        )
+        try:
+            payload = json.loads(plaintext)
+            if kind == "environment" and isinstance(payload.get("environment"), str):
+                return str(payload["environment"])
+            if kind == "file" and len(parts) == 4:
+                value = payload.get("files", {}).get(parts[3])
+                if isinstance(value, str):
+                    return value
+        except (ValueError, TypeError):
+            pass
+        raise ComputeSecretError("deployment credential cannot be decrypted")
+
+    async def _row(self, profile_id: str) -> dict[str, Any]:
+        row = await self._repository.get_deployment_profile(profile_id)
+        if row is None:
+            raise ComputeSecretError("deployment profile no longer exists")
+        return row
+
+    @staticmethod
+    def _profile_id(reference: str, *, kind: str) -> str:
+        parts = reference.split(":")
+        if len(parts) != 3 or parts[0] != "stored-profile" or parts[2] != kind:
+            raise ComputeSecretError("deployment bundle reference is invalid")
+        return parts[1]

@@ -510,7 +510,7 @@ class ComputeRotation:
             for row in await self.repository.list_allocations()
             if row.get("observed_state") not in {"terminated", "absent"}
         }
-        for profile in self.commands.configuration.profiles.values():
+        for profile in (await self.commands.deployment_profiles()).values():
             if (
                 profile.id not in occupied
                 and profile.id != exclude.get("id")

@@ -20,8 +20,9 @@ managed resource runs only the Host, workspace broker, tunnels and sandboxes.
 Provider expiry remains a hard limit; renewal does not guarantee uptime.
 
 Stored API tokens and management SSH keys are encrypted with
-`AGENT_COMPUTE_SECRET_KEY`. Provide at least 32 bytes of independent random
-material through the deployment's secret mechanism. Back it up with the
+`AGENT_COMPUTE_SECRET_KEY`. The supported deployer generates a random 32-byte
+value in its persistent `.env` when none is configured; other deployment
+systems must provide equivalent stable key material. Back it up with the
 encrypted database: restoring the database without this key cannot recover
 compute connections. Do not reuse gateway, session, enrollment or broker keys.
 Compute management credentials never enter sandboxes or the deployed Host.
@@ -58,6 +59,23 @@ rather than selecting one node. Failed or unsupported installation leaves the
 resource visible and does not destroy it.
 
 ## Prepare a trusted deployment profile
+
+### Admin-managed setup
+
+For new deployments, open **Admin → Servers → Server setup**. Upload the
+reviewed source archive, enter its exact 40-character revision and remote
+installation directory, paste the completed Host environment, and provide the
+three tunnel keys plus their verified known-hosts files. The control plane
+validates the archive before it becomes selectable, encrypts every environment
+and credential value with `AGENT_COMPUTE_SECRET_KEY`, and stores the bundle and
+ciphertext in Postgres. Read APIs return only the profile ID and label.
+
+Profiles are immutable so admitted operations and retries keep their exact
+deployment inputs. To rotate or replace one, create a profile under a new ID.
+
+The file-backed configuration below remains supported for existing deployments
+and recovery, but is no longer required for initial setup through Admin.
+
 
 Start with these operator templates:
 
@@ -182,13 +200,18 @@ through the CloudLab console and verify that the node can reach the registration
 URL. `registration_unavailable` means no public HTTPS control-plane address
 is configured.
 
-## Enable the control plane
+## Enable legacy file-backed profiles
+
+Admin-managed profiles require no compute directory or JSON configuration.
+CloudLab deployments still set the verified Portal API URL; existing-SSH
+deployments do not. The variables below are retained for deployments that
+continue to mount profiles and credential files.
 
 Set these values in the private deployment environment:
 
 ```text
 AGENT_COMPUTE_DIRECTORY=/private/compute
-AGENT_COMPUTE_SECRET_KEY=<independent random secret supplied by deployment>
+AGENT_COMPUTE_SECRET_KEY=<leave blank for deploy.sh to generate, or supply a stable secret>
 AGENT_CLOUDLAB_API_URL=<operator-verified HTTPS Portal API base URL>
 ```
 

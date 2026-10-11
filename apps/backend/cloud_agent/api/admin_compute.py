@@ -24,6 +24,7 @@ from cloud_agent.domain.compute import ComputeRefusal
 from cloud_agent.ports.external.compute_provider import ProviderError
 from cloud_agent.schemas_compute import (  # noqa: TC001 - FastAPI request models.
     AddComputeConnection,
+    AddDeploymentProfile,
     AddServerRequest,
     ComputeOperationAction,
     ExtendComputeRequest,
@@ -46,6 +47,7 @@ _STORAGE_ERRORS: dict[str, tuple[int, str]] = {
         409,
         "The deployment profile is already used by another managed resource.",
     ),
+    "deployment_profile_exists": (409, "A deployment profile with this ID already exists."),
     "resource_already_managed": (409, "This resource already belongs to a managed allocation."),
     "operation_not_resolvable": (409, "This operation can no longer adopt an external result."),
     "record_not_found": (404, "The resource no longer exists."),
@@ -164,7 +166,20 @@ async def providers(
     commands: ComputeCommands = Depends(get_compute_commands),
 ) -> dict[str, Any]:
     """List enabled resource providers and public deployment choices."""
-    return commands.catalog()
+    return await commands.catalog()
+
+
+@router.post("/compute-deployment-profiles", status_code=201)
+async def create_deployment_profile(
+    request: Request,
+    payload: AddDeploymentProfile,
+    actor: str = Depends(verify_admin_access),
+    commands: ComputeCommands = Depends(get_compute_commands),
+) -> dict[str, Any]:
+    """Save a write-only deployment bundle and encrypted Host inputs."""
+    profile = await commands.create_deployment_profile(payload)
+    await _audit(request, actor, "profile.create", profile_id=profile["id"])
+    return {"profile": profile}
 
 
 @router.get("/compute-connections")

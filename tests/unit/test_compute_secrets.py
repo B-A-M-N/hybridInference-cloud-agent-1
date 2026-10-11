@@ -1,18 +1,27 @@
 """Compute credentials are bound, write-only, and unavailable without a key."""
 
+import json
 from typing import Any
 
 import pytest
 
-from cloud_agent.compute_secrets import ComputeSecretError, ComputeSecretStore
+from cloud_agent.compute_secrets import (
+    ComputeSecretError,
+    ComputeSecretStore,
+    StoredDeploymentResolver,
+)
 
 
 class Connections:
     def __init__(self) -> None:
         self.rows: dict[str, dict[str, Any]] = {}
+        self.profiles: dict[str, dict[str, Any]] = {}
 
     async def get_connection(self, connection_id: str) -> dict[str, Any] | None:
         return self.rows.get(connection_id)
+
+    async def get_deployment_profile(self, profile_id: str) -> dict[str, Any] | None:
+        return self.profiles.get(profile_id)
 
 
 def test_cipher_refuses_plaintext_fallback_and_short_keys() -> None:
@@ -54,3 +63,28 @@ async def test_resolution_separates_private_credentials_from_verified_host_keys(
         await secrets.resolve("ssh:known_hosts")
     with pytest.raises(ComputeSecretError, match="no longer exists"):
         await secrets.resolve("missing")
+
+
+@pytest.mark.asyncio
+async def test_stored_profile_resolver_decrypts_assets_and_returns_bundle() -> None:
+    connections = Connections()
+    secrets = ComputeSecretStore(connections, key="k" * 32)
+    plaintext = json.dumps(
+        {
+            "environment": "AGENT_SANDBOX_IMAGE=image",
+            "files": {".compute-secrets/key": "secret"},
+        }
+    )
+    connections.profiles["profile"] = {
+        "source_bundle": b"bundle",
+        "secret_ciphertext": secrets.encrypt("profile:profile", "deployment_profile", plaintext),
+    }
+    resolver = StoredDeploymentResolver(connections, secrets)
+
+    assert await resolver.bundle("stored-profile:profile:bundle") == b"bundle"
+    assert (
+        await resolver.resolve("stored-profile:profile:environment") == "AGENT_SANDBOX_IMAGE=image"
+    )
+    assert await resolver.resolve("stored-profile:profile:file:.compute-secrets/key") == "secret"
+    with pytest.raises(ComputeSecretError, match="credential"):
+        await resolver.resolve("stored-profile:profile:file:missing")

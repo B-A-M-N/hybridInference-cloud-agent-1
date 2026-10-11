@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
+import tarfile
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -27,10 +30,32 @@ class MemoryResources:
     """A command-store fake: external work is never executed by HTTP handlers."""
 
     def __init__(self) -> None:
+        self.profiles: dict[str, dict[str, Any]] = {}
         self.connections: dict[str, dict[str, Any]] = {}
         self.allocations: dict[str, dict[str, Any]] = {}
         self.operations: dict[str, dict[str, Any]] = {}
         self.audit_rows: list[dict[str, Any]] = []
+
+    async def list_deployment_profiles(self):
+        return [
+            {
+                key: value
+                for key, value in row.items()
+                if key not in {"source_bundle", "secret_ciphertext"}
+            }
+            for row in self.profiles.values()
+        ]
+
+    async def get_deployment_profile(self, profile_id):
+        return self.profiles.get(profile_id)
+
+    async def save_deployment_profile(self, **kwargs):
+        profile_id = kwargs.pop("profile_id")
+        if profile_id in self.profiles:
+            raise ValueError("deployment_profile_exists")
+        row = {"id": profile_id, **kwargs, "revision": 1}
+        self.profiles[profile_id] = row
+        return row
 
     async def record_admin_action(self, **kwargs: Any) -> None:
         self.audit_rows.append(kwargs)
@@ -738,3 +763,50 @@ async def test_inventory_reports_configured_period_only_for_observable_resources
     resource = response.json()["allocations"][0]
     assert resource["check_interval_seconds"] == expected
     assert "next_check_at" not in resource
+
+
+def deployment_bundle() -> str:
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w:gz") as archive:
+        for name in (
+            "deploy/host/sandbox_host.sh",
+            "deploy/host/setup_kata_runtime.sh",
+            "deploy/host/docker-compose.sandbox.yml",
+            "pyproject.toml",
+        ):
+            data = b"fixture"
+            member = tarfile.TarInfo(name)
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
+    return base64.b64encode(output.getvalue()).decode()
+
+
+@pytest.mark.asyncio
+async def test_admin_profile_inputs_are_encrypted_and_never_returned(compute_api):
+    client, repo, _ = compute_api
+    response = await client.post(
+        "/admin/agent/compute-deployment-profiles",
+        headers=ADMIN,
+        json={
+            "id": "admin-kata",
+            "label": "Admin Kata",
+            "deployment_sha": "c" * 40,
+            "deploy_root": "/opt/cloud-agent-admin",
+            "environment": "AGENT_SANDBOX_IMAGE=image",
+            "files": {
+                ".compute-secrets/gateway.key": "private-key-canary",
+                ".compute-secrets/gateway.known_hosts": "known-host-canary",
+            },
+            "source_bundle_base64": deployment_bundle(),
+        },
+    )
+    assert response.status_code == 201, response.text
+    assert response.json() == {"profile": {"id": "admin-kata", "label": "Admin Kata"}}
+    assert "private-key-canary" not in response.text
+    stored = repo.profiles["admin-kata"]
+    assert "private-key-canary" not in stored["secret_ciphertext"]
+    assert "private-key-canary" not in str(stored["configuration"])
+
+    catalog = await client.get("/admin/agent/compute-providers", headers=ADMIN)
+    assert {"id": "admin-kata", "label": "Admin Kata"} in catalog.json()["deployment_profiles"]
+    assert "private-key-canary" not in catalog.text

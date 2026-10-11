@@ -26,6 +26,7 @@ vi.mock('@/lib/api/compute', () => ({
   createComputeServer: vi.fn(),
   preflightComputeServer: vi.fn(),
   importComputeResource: vi.fn(),
+  saveComputeDeploymentProfile: vi.fn(),
   saveComputeConnection: vi.fn(),
   validateComputeConnection: vi.fn(),
   setComputePolicy: vi.fn(),

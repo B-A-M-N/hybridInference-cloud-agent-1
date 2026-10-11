@@ -25,6 +25,10 @@ class SecretResolver(Protocol):
         """Return the secret for an authorized reference without logging it."""
         ...
 
+    async def bundle(self, ref: str) -> bytes:
+        """Return a trusted Admin-registered release bundle."""
+        ...
+
 
 class ProviderCapabilities(ComputeValue):
     """Declare supported acquisition and lifecycle actions."""
