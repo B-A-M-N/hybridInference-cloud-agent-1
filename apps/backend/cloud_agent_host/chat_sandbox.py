@@ -44,6 +44,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
 
+from cloud_agent_host.bounded_output import OutputPump, TextTail, protocol_lines, text_chunks
 from cloud_agent_host.guest_observer import (
     GUEST_OBSERVER_BINARY,
     GUEST_OBSERVER_EVENTS,
@@ -3218,7 +3219,7 @@ class ChatSandboxManager:
         user_uid: int,
         user_gid: int,
     ) -> None:
-        """Signal one verified resident process group, never the container."""
+        """Signal one verified resident or command process group, never the container."""
         self._validate_member_pidfile(spec, pidfile, user_uid=user_uid)
         argv = [
             "/bin/sh",
@@ -3253,6 +3254,15 @@ class ChatSandboxManager:
         """Build an exact PID/start receipt wait, verification, and group kill."""
         return (
             'set -eu; expected_uid="$1"; '
+            # kill -0 sees zombies too. Docker's init normally reaps them,
+            # but a delayed reap is not a surviving command. Examine state
+            # before declaring cleanup failed, without requiring procps.
+            'group_alive() { kill -0 "-$pid" 2>/dev/null || return 1; '
+            "for task in /proc/[0-9]*/stat; do "
+            'read -r raw < "$task" 2>/dev/null || continue; '
+            'set -- ${raw##*) }; [ "${3:-}" = "$pid" ] || continue; '
+            'case "${1:-}" in Z|X) continue;; esac; return 0; '
+            "done; return 1; }; "
             f"for pidfile in {pidfile_expression}; do "
             'attempt=0; ready=0; pid=""; started=""; '
             'while [ "$attempt" -lt 40 ]; do '
@@ -3268,10 +3278,10 @@ class ChatSandboxManager:
             "set -- $fields; current_pgid=${3:-}; current_started=${20:-}; "
             '[ "$current_pgid" = "$pid" ] && [ "$current_started" = "$started" ] '
             '|| { rm -f -- "$pidfile"; exit 126; }; '
-            'kill -TERM -- "-$pid" 2>/dev/null || :; attempt=0; '
-            'while kill -0 -- "-$pid" 2>/dev/null; do attempt=$((attempt + 1)); '
-            '[ "$attempt" -lt 40 ] || { kill -KILL -- "-$pid" 2>/dev/null || :; '
-            'attempt=0; while kill -0 -- "-$pid" 2>/dev/null; do '
+            'kill -TERM "-$pid" 2>/dev/null || :; attempt=0; '
+            "while group_alive; do attempt=$((attempt + 1)); "
+            '[ "$attempt" -lt 40 ] || { kill -KILL "-$pid" 2>/dev/null || :; '
+            "attempt=0; while group_alive; do "
             'attempt=$((attempt + 1)); [ "$attempt" -lt 100 ] || exit 124; '
             "sleep 0.05; done; break; }; "
             'sleep 0.05; done; rm -f -- "$pidfile"; '
@@ -5038,7 +5048,7 @@ class _RetainedExecProcess(SandboxProcess):
         self._process_pidfile = process_pidfile
         self._user_uid = user_uid
         self._user_gid = user_gid
-        self._stderr_chunks: builtins.list[str] = []
+        self._stderr_tail = TextTail()
         self._stderr_thread: threading.Thread | None = None
         if process.stderr is not None:
             self._stderr_thread = threading.Thread(
@@ -5054,13 +5064,23 @@ class _RetainedExecProcess(SandboxProcess):
 
     def _drain_stderr(self) -> None:
         assert self._process.stderr is not None
-        for line in self._process.stderr:
-            self._stderr_chunks.append(line)
-            del self._stderr_chunks[:-200]
+        for chunk in text_chunks(self._process.stderr):
+            self._stderr_tail.append(chunk)
 
     def lines(self) -> Iterator[str]:
+        try:
+            yield from protocol_lines(self.chunks())
+        except SandboxError:
+            # Docker's attached exec channels can backpressure cleanup execs.
+            # Discard any remaining stdout while the scoped reaper runs.
+            drain = OutputPump(self.chunks(), name="oversized-resident-output")
+            drain.close(drain=True)
+            self.kill()
+            raise
+
+    def chunks(self) -> Iterator[str]:
         assert self._process.stdout is not None
-        yield from self._process.stdout
+        yield from text_chunks(self._process.stdout)
 
     def write_line(self, text: str) -> None:
         if self._process.stdin is None:
@@ -5098,7 +5118,7 @@ class _RetainedExecProcess(SandboxProcess):
     def stderr_text(self) -> str:
         if self._stderr_thread is not None:
             self._stderr_thread.join(timeout=5)
-        return "".join(self._stderr_chunks)
+        return self._stderr_tail.text()
 
 
 def _set_pty_size(fd: int, rows: int, cols: int) -> None:

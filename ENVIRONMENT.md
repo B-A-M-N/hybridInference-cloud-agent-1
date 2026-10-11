@@ -27,8 +27,10 @@ settings live in the Agent database and are authoritative across restarts.
 The inventory below records defaults and the environment names used for an
 initial import; registered settings are no longer continuously read from `.env`.
 
-Run `alembic upgrade head` (through `0042_sandbox_archive_settings`) before starting
-this release. The main control-plane listener initializes the settings document
+Run `alembic upgrade head` (through `0046_job_claim_retry`) before starting
+this release. The updated worker claim query requires `agent_jobs.claim_retry_at`;
+existing queued jobs remain immediately eligible after the migration.
+The main control-plane listener initializes the settings document
 once from its existing environment. The MCP-only listener waits for that document and uses the same
 saved values. Later environment edits do not overwrite it. **Reset** restores
 the setting's built-in default, including an empty default for a credential;

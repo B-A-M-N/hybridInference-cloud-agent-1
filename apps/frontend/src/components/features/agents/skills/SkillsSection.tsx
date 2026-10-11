@@ -265,6 +265,7 @@ export function SkillsSection() {
   return (
     <section
       aria-labelledby="skills-heading"
+      lang="en"
       className="ui-card mt-6 rounded-2xl bg-surface px-4 pb-2 pt-4 sm:px-6 sm:pt-6"
     >
       <div className="flex flex-wrap items-start justify-between gap-4">

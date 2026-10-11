@@ -246,7 +246,7 @@ export function McpConnectionsSection({
 
   const connections = data?.connections ?? [];
   return (
-    <section aria-labelledby="mcp-servers-heading">
+    <section aria-labelledby="mcp-servers-heading" lang="en">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-0 flex-1 basis-64">
           <h2 id="mcp-servers-heading" className="text-base font-semibold text-foreground">
