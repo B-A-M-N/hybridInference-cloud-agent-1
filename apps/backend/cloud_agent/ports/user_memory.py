@@ -36,6 +36,12 @@ class UserMemoryRepository(Protocol):
         """Remove an existing entry durably at the profile revision the user read."""
         ...
 
+    async def replace_memories(
+        self, user_id: str, revision: int, memories: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Save source-backed edits only at the current revision."""
+        ...
+
     async def refresh_active_users(self, limit: int = 100) -> int:
         """Visit a bounded, fair batch of eligible owners and return its size."""
         ...

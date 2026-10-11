@@ -8323,6 +8323,22 @@
         "title": "ConnectorView",
         "type": "object"
       },
+      "ConsolidateMemoryRequest": {
+        "additionalProperties": false,
+        "description": "Consolidate only the version the owner currently sees.",
+        "properties": {
+          "revision": {
+            "minimum": 0.0,
+            "title": "Revision",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision"
+        ],
+        "title": "ConsolidateMemoryRequest",
+        "type": "object"
+      },
       "ConversationUsage": {
         "description": "Cached usage for the owned conversation, without per-attempt diagnostics.",
         "properties": {
@@ -11497,6 +11513,39 @@
         "title": "McpIntegrationResponse",
         "type": "object"
       },
+      "MemoryEdit": {
+        "additionalProperties": false,
+        "description": "A bounded owner edit; provenance remains server controlled.",
+        "properties": {
+          "content": {
+            "maxLength": 240,
+            "minLength": 1,
+            "title": "Content",
+            "type": "string"
+          },
+          "id": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "scope": {
+            "enum": [
+              "repo",
+              "user"
+            ],
+            "title": "Scope",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "content",
+          "scope"
+        ],
+        "title": "MemoryEdit",
+        "type": "object"
+      },
       "MemoryEntryRevision": {
         "additionalProperties": false,
         "description": "Require the version the owner examined before changing an entry.",
@@ -14454,7 +14503,7 @@
         "description": "Edit content while retaining the entry's original kind and project.",
         "properties": {
           "content": {
-            "maxLength": 500,
+            "maxLength": 240,
             "minLength": 1,
             "title": "Content",
             "type": "string"
@@ -14477,13 +14526,44 @@
         "description": "Enable or pause automatic memory creation and use.",
         "properties": {
           "enabled": {
-            "title": "Enabled",
-            "type": "boolean"
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "memories": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/MemoryEdit"
+                },
+                "maxItems": 12,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memories"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision"
           }
         },
-        "required": [
-          "enabled"
-        ],
         "title": "UpdateMemorySettings",
         "type": "object"
       },
@@ -14608,6 +14688,11 @@
             ],
             "title": "Created At"
           },
+          "edited": {
+            "default": false,
+            "title": "Edited",
+            "type": "boolean"
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -14619,6 +14704,22 @@
             ],
             "title": "Kind",
             "type": "string"
+          },
+          "scope": {
+            "default": "repo",
+            "enum": [
+              "repo",
+              "user"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "source_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Source Ids",
+            "type": "array"
           },
           "source_job_id": {
             "title": "Source Job Id",
@@ -29144,6 +29245,66 @@
           }
         },
         "summary": "Update User Memory",
+        "tags": [
+          "user-memory"
+        ]
+      }
+    },
+    "/v1/agent/user-memory/consolidate": {
+      "post": {
+        "description": "Merge and classify durable preferences using the owner's available model.",
+        "operationId": "consolidate_user_memory_v1_agent_user_memory_consolidate_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConsolidateMemoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserMemoryView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Consolidate User Memory",
         "tags": [
           "user-memory"
         ]

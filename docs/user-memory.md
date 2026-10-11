@@ -1,7 +1,7 @@
 # Avatars and personal memory
 
-**Setting → Avatar & memory** displays an automatically generated illustrated
-portrait for your account. Its face, hair, and skin stay recognizable across
+The homepage displays an automatically generated illustrated portrait for
+your account. **Setting → Memory** manages your saved preferences. Its face, hair, and skin stay recognizable across
 devices. Its backdrop, clothing colors, and illustrated work motifs evolve with
 your recent work areas, such as APIs, UI, testing, or data storage. The most-used
 work areas lead the theme; the same recent-work profile produces the same image.
@@ -25,11 +25,23 @@ they are not added to future task prompts. Quoted text, fenced code, and
 recognized credential-like text are excluded from saved preferences.
 You can examine each entry's original chat, project, and date, then edit its
 text or remove it. Edited preferences can guide future tasks without an
-“I prefer” prefix; they keep their original project and source order. Editing a
-task reference does not turn it into a preference.
+“I prefer” prefix. Repository preferences guide their source project, while
+user preferences apply across projects. Editing a task reference does not turn
+it into a preference.
+
+Saved memory is limited to 12 entries, 240 characters per entry, and 2,400
+characters total. At most three entries apply across repositories. Each entry
+shows its scope, and the editor lets you choose repository or user scope.
+Repository scope is the default for project conventions and technical choices.
 
 ## Controls
 
+- **Consolidate** uses an available model under your account's permissions and
+  quota to merge duplicates, shorten preferences, and decide their scope. It
+  favors repository memory and reserves user memory for general communication
+  and collaboration preferences. It drops temporary instructions and task
+  references. Saving is revision-checked so a slow model cannot overwrite
+  newer edits or a clear. Consolidation is disabled while an editor is open.
 - **Refresh** rebuilds memory and the avatar's usage theme from currently eligible
   requests.
 - Turning off **Automatically build memory** pauses automatic updates and
@@ -38,7 +50,7 @@ task reference does not turn it into a preference.
   removed.
 - **Edit** opens the saved text for correction. **Save** persists the correction
   across automatic updates, while **Cancel** leaves it unchanged. Text must be
-  nonempty, at most 500 characters, and contain no recognized credentials.
+  nonempty, at most 240 characters, and contain no recognized credentials.
   Preference edits must apply to future tasks rather than a temporary request.
 - **Remove** asks for confirmation and excludes that entry from subsequent
   refreshes. The original chat remains available.
@@ -65,7 +77,7 @@ it cannot be saved to a missing entry.
 
 ## Deployment and storage
 
-Apply Alembic migrations through `0050_user_memory_edits` before starting the
+Apply Alembic migrations through `0052_memory_overrides` before starting the
 updated control plane. The `agent_user_memories` table stores one derived record
 per account, including its enabled setting and a reset fence that prevents
 forgotten history from reappearing. Writes and refreshes serialize per account.
@@ -75,15 +87,17 @@ avatar from that saved work profile, so usage changes appear on the next page
 load or refresh. The MCP-only listener serves no memory management routes.
 
 The `agent_user_memory_edits` table stores owner-scoped corrections and removal
-markers separately from automatic snapshots. Clear removes these records too.
+markers separately from automatic snapshots. Consolidated and scope-edited
+entries use source-backed overlays in `agent_user_memories.overrides`. Overlays
+expire with eligible evidence and never pin deleted chats. Clear removes both.
 
 The owner API exposes `GET`, `PATCH`, and `DELETE` at
 `/v1/agent/user-memory`. The authenticated session selects the account; callers
 cannot supply a different account identifier. Reads and mutations require
 current Agent admission and return `Cache-Control: no-store`. `PATCH` accepts
-only an `enabled` boolean; `DELETE` clears derived context and advances the reset
-fence. Each response includes the account's generated avatar as a safe SVG data
-URL. No additional model calls are made.
+an `enabled` boolean or `{revision, memories: [{id, content, scope}]}`; `DELETE`
+clears derived context and advances the reset fence. Each response includes the account's generated avatar as a safe SVG data
+URL. Automatic refresh makes no additional model calls.
 
 `PATCH /v1/agent/user-memory/entries/{memory_id}` accepts `content` and a
 nonnegative integer `expected_revision`. `DELETE` at the same path accepts
@@ -91,6 +105,11 @@ nonnegative integer `expected_revision`. `DELETE` at the same path accepts
 with `409`, and return `404` when the owner has no such visible entry. Entry
 kind and source information cannot be changed. Responses mark corrected
 entries with `user_edited`.
+
+`POST /v1/agent/user-memory/consolidate` accepts `{revision}` and returns the
+updated profile. Model output is checked for owned source references, duplicate
+references, cross-repository merges, credentials, temporary instructions, and
+all memory limits before saving. Stale output returns `409`.
 
 ## Future improvements
 

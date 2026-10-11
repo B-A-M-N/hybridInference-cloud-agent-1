@@ -4,6 +4,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useAuth, useLocale } from '@/components/providers';
 import {
   clearUserMemory,
+  consolidateUserMemory,
+  saveUserMemories,
   deleteUserMemoryEntry,
   editUserMemoryEntry,
   getUserMemory,
@@ -14,7 +16,7 @@ import {
 import { APIError } from '@/lib/utils/errors';
 import { UserMemoryEntryCard, type UserMemoryRequestResult } from './UserMemoryEntryCard';
 
-type Operation = 'refresh' | 'toggle' | 'clear' | 'edit' | 'delete';
+type Operation = 'refresh' | 'toggle' | 'clear' | 'edit' | 'delete' | 'consolidate';
 
 export function UserMemorySettings() {
   const { state } = useAuth();
@@ -136,6 +138,9 @@ function UserMemoryPanel({ userId }: { userId: string | undefined }) {
         {t('settings.memory.title')}
       </h2>
       <p className="mt-3 text-sm leading-relaxed text-muted">{t('settings.memory.description')}</p>
+      <p className="mt-2 text-xs leading-relaxed text-muted">
+        {t('settings.memory.consolidateDescription')}
+      </p>
 
       {!userId ? (
         <p className="mt-3 text-sm text-muted">{t('settings.memory.signIn')}</p>
@@ -203,6 +208,22 @@ function UserMemoryPanel({ userId }: { userId: string | undefined }) {
                       pending === 'refresh'
                         ? 'settings.memory.refreshing'
                         : 'settings.memory.refresh',
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void run('consolidate', (signal) =>
+                        consolidateUserMemory(view.revision, signal),
+                      )
+                    }
+                    disabled={pending !== null || editingEntries.size > 0 || !view.memories.length}
+                    className="ui-button ui-button-secondary min-h-11"
+                  >
+                    {t(
+                      pending === 'consolidate'
+                        ? 'settings.memory.consolidating'
+                        : 'settings.memory.consolidate',
                     )}
                   </button>
                   <button
@@ -326,10 +347,17 @@ function UserMemoryPanel({ userId }: { userId: string | undefined }) {
                     {t('settings.memory.memories')}
                   </h3>
                   <p className="mt-2 text-xs leading-relaxed text-muted">
-                    {t('settings.memory.entriesDescription')}
+                    {t('settings.memory.entriesDescription')}{' '}
+                    {t('settings.memory.bounds', {
+                      count: view.memories.length,
+                      characters: view.memories.reduce(
+                        (total, memory) => total + memory.content.length,
+                        0,
+                      ),
+                    })}
                   </p>
                   {shownMemories.length ? (
-                    <ul className="mt-2 space-y-2">
+                    <ul className="mt-2 max-h-96 space-y-2 overflow-y-auto">
                       {shownMemories.map((memory, index) => (
                         <UserMemoryEntryCard
                           key={memory.id}
@@ -347,11 +375,29 @@ function UserMemoryPanel({ userId }: { userId: string | undefined }) {
                             if (!editing && !savedIds.has(memory.id))
                               setRemovedEntries((count) => count + 1);
                           }}
-                          onSave={(content) =>
+                          onSave={(content, scope) =>
                             run(
                               'edit',
-                              (signal) =>
-                                editUserMemoryEntry(memory.id, content, view.revision, signal),
+                              (signal) => {
+                                const savedScope =
+                                  memory.scope ?? (memory.source_repo ? 'repo' : 'user');
+                                if (scope === savedScope)
+                                  return editUserMemoryEntry(
+                                    memory.id,
+                                    content,
+                                    view.revision,
+                                    signal,
+                                  );
+                                const memories = view.memories.map((entry) => ({
+                                  id: entry.id,
+                                  content: entry.id === memory.id ? content : entry.content,
+                                  scope:
+                                    entry.id === memory.id
+                                      ? scope
+                                      : (entry.scope ?? (entry.source_repo ? 'repo' : 'user')),
+                                }));
+                                return saveUserMemories(view.revision, memories, signal);
+                              },
                               false,
                             )
                           }

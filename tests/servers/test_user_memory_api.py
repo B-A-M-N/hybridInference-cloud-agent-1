@@ -14,7 +14,12 @@ from cloud_agent.api import user_memory
 from cloud_agent.api.deps import get_gateway_client, get_storage
 from cloud_agent.app import create_app, create_mcp_app, install_admin_no_store
 from cloud_agent.user_avatar import generate_user_avatar
-from cloud_agent.user_memory import UserMemoryConflict, UserMemoryNotFound, build_user_memory
+from cloud_agent.user_memory import (
+    MemoryRevisionConflict,
+    UserMemoryConflict,
+    UserMemoryNotFound,
+    build_user_memory,
+)
 
 PATH = "/v1/agent/user-memory"
 
@@ -398,3 +403,121 @@ async def test_revoked_admission_cannot_edit_or_delete_entries(app, method):
     assert response.headers["Cache-Control"] == "no-store"
     app.state.repository.update_entry.assert_not_awaited()
     app.state.repository.delete_entry.assert_not_awaited()
+
+
+async def test_owner_can_edit_content_scope_and_remove_entries(app):
+    current = build_user_memory(
+        [
+            {
+                "job_id": "owner-job",
+                "repo": "owner/repo",
+                "content": "I prefer small changes.",
+                "title": "Recent work",
+            }
+        ],
+        {"revision": 7},
+    )
+    app.state.repository.refresh.side_effect = None
+    app.state.repository.refresh.return_value = current
+    app.state.repository.replace_memories.side_effect = lambda **kw: {
+        **current,
+        "memories": kw["memories"],
+        "revision": 8,
+    }
+    entry = current["memories"][0]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://agent.example"
+    ) as client:
+        response = await client.patch(
+            PATH,
+            headers=session_headers(),
+            json={
+                "revision": 7,
+                "memories": [
+                    {"id": entry["id"], "content": "Keep changes small.", "scope": "user"}
+                ],
+            },
+        )
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    assert len(response.json()["memories"]) == 1
+    memory = response.json()["memories"][0]
+    assert memory["content"] == "Keep changes small." and memory["scope"] == "user"
+    assert memory["source_job_id"] == "owner-job" and memory["source_repo"] == "owner/repo"
+    saved = app.state.repository.replace_memories.await_args.kwargs
+    assert saved["user_id"] == "owner-1" and saved["revision"] == 7
+
+
+@pytest.mark.parametrize(
+    "invalid", ["stale", "unknown", "provenance", "length", "empty", "duplicate", "total", "global"]
+)
+async def test_invalid_edits_do_not_mutate_saved_memory(app, invalid):
+    current = build_user_memory(
+        [
+            {
+                "job_id": f"job-{index}",
+                "repo": "owner/repo",
+                "content": f"Always use setting {index}.",
+            }
+            for index in range(12)
+        ],
+        {"revision": 7},
+    )
+    app.state.repository.refresh.side_effect = None
+    app.state.repository.refresh.return_value = current
+    edits = [{"id": current["memories"][0]["id"], "content": "Run tests.", "scope": "repo"}]
+    body = {"revision": 6 if invalid == "stale" else 7, "memories": edits}
+    if invalid == "unknown":
+        edits[0]["id"] = "other-owner-memory"
+    elif invalid == "provenance":
+        edits[0]["source_repo"] = "other-owner/repo"
+    elif invalid == "length":
+        edits[0]["content"] = "x" * 241
+    elif invalid == "empty":
+        edits[0]["content"] = "   "
+    elif invalid == "duplicate":
+        edits.append(edits[0])
+    elif invalid in ("total", "global"):
+        body["memories"] = [
+            {
+                "id": memory["id"],
+                "content": "x" * 240,
+                "scope": "user" if invalid == "global" else "repo",
+            }
+            for memory in current["memories"]
+        ]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://agent.example"
+    ) as client:
+        response = await client.patch(PATH, headers=session_headers(), json=body)
+    assert response.status_code == (409 if invalid == "stale" else 422)
+    app.state.repository.replace_memories.assert_not_awaited()
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+async def test_consolidation_runs_for_owner_and_fences_slow_model_results(
+    app, monkeypatch, conflict
+):
+    current = activity_profile("I prefer concise replies.")
+    app.state.repository.refresh.side_effect = None
+    app.state.repository.refresh.return_value = current
+    consolidate = AsyncMock(return_value=current["memories"])
+    monkeypatch.setattr(user_memory, "consolidate_memory", consolidate)
+    if conflict:
+        app.state.repository.replace_memories.side_effect = MemoryRevisionConflict()
+    else:
+        app.state.repository.replace_memories.return_value = {**current, "revision": 1}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://agent.example"
+    ) as client:
+        response = await client.post(
+            PATH + "/consolidate", headers=session_headers(), json={"revision": 0}
+        )
+    assert response.status_code == (409 if conflict else 200)
+    assert response.headers["Cache-Control"] == "no-store"
+    assert consolidate.await_args.kwargs["user_id"] == "owner-1"
+    app.state.repository.replace_memories.assert_awaited_once_with(
+        user_id="owner-1",
+        revision=0,
+        memories=current["memories"],
+    )

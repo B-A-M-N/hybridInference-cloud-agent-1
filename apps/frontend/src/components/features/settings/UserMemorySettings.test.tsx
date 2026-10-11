@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LocaleProvider } from '@/components/providers/LocaleProvider';
 import {
   clearUserMemory,
+  consolidateUserMemory,
+  saveUserMemories,
   deleteUserMemoryEntry,
   editUserMemoryEntry,
   getUserMemory,
@@ -20,6 +22,8 @@ vi.mock('@/components/providers/AuthProvider', () => ({
   useAuth: () => ({ state: { user: auth.userId ? { id: auth.userId } : null } }),
 }));
 vi.mock('@/lib/api/userMemory', () => ({
+  consolidateUserMemory: vi.fn(),
+  saveUserMemories: vi.fn(),
   getUserMemory: vi.fn(),
   updateUserMemory: vi.fn(),
   clearUserMemory: vi.fn(),
@@ -315,10 +319,10 @@ describe('memory settings', () => {
     let editor = within(first).getByRole('textbox', { name: 'Memory content' });
     expect(editor).toHaveFocus();
     expect(editor).toHaveValue(populated.memories[0].content);
-    expect(editor).toHaveAttribute('maxlength', '500');
+    expect(editor).toHaveAttribute('maxlength', '240');
     fireEvent.change(editor, { target: { value: '   ' } });
     expect(within(first).getByRole('button', { name: 'Save memory' })).toBeDisabled();
-    fireEvent.change(editor, { target: { value: 'x'.repeat(501) } });
+    fireEvent.change(editor, { target: { value: 'x'.repeat(241) } });
     expect(within(first).getByRole('button', { name: 'Save memory' })).toBeDisabled();
     fireEvent.click(within(first).getByRole('button', { name: 'Cancel' }));
     expect(within(first).getByRole('button', { name: 'Edit memory' })).toHaveFocus();
@@ -650,5 +654,58 @@ describe('memory settings', () => {
     fireEvent.click(within(first).getByRole('button', { name: '移除记忆' }));
     expect(within(first).getByRole('button', { name: '确认移除记忆' })).toHaveFocus();
     expect(within(first).getByText(/刷新记忆后，此条记忆也不会恢复/)).toBeInTheDocument();
+  });
+});
+
+describe('bounded scoped memory', () => {
+  it('consolidates the current revision and replaces entries with the returned scopes', async () => {
+    vi.mocked(getUserMemory).mockResolvedValue(populated);
+    vi.mocked(consolidateUserMemory).mockResolvedValue({
+      ...populated,
+      revision: 2,
+      memories: [{ ...populated.memories[0], content: 'Keep reviews concise.', scope: 'user' }],
+    });
+    render(
+      <LocaleProvider>
+        <UserMemorySettings />
+      </LocaleProvider>,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Consolidate' }));
+    await screen.findByText('Keep reviews concise.');
+    expect(consolidateUserMemory).toHaveBeenCalledWith(1, expect.any(AbortSignal));
+    expect(screen.queryByText('Fix the test runner.')).not.toBeInTheDocument();
+    expect(screen.getByText(/1\/12 memories/)).toBeInTheDocument();
+  });
+
+  it('saves a user scope correction and disables consolidation while editing', async () => {
+    vi.mocked(getUserMemory).mockResolvedValue(populated);
+    vi.mocked(saveUserMemories).mockResolvedValue({
+      ...populated,
+      revision: 2,
+      memories: [{ ...populated.memories[0], scope: 'user' }, populated.memories[1]],
+    });
+    render(
+      <LocaleProvider>
+        <UserMemorySettings />
+      </LocaleProvider>,
+    );
+    const entry = await screen.findByRole('listitem', { name: 'Saved memory 1' });
+    fireEvent.click(within(entry).getByRole('button', { name: 'Edit memory' }));
+    expect(screen.getByRole('button', { name: 'Consolidate' })).toBeDisabled();
+    fireEvent.change(within(entry).getByRole('combobox', { name: 'Applies to' }), {
+      target: { value: 'user' },
+    });
+    expect(within(entry).getByRole('textbox')).toHaveAttribute('maxlength', '240');
+    fireEvent.click(within(entry).getByRole('button', { name: 'Save memory' }));
+    await waitFor(() =>
+      expect(saveUserMemories).toHaveBeenCalledWith(
+        1,
+        [
+          { id: 'preference-1', content: 'Use small pull requests.', scope: 'user' },
+          { id: 'task-1', content: 'Fix the test runner.', scope: 'user' },
+        ],
+        expect.any(AbortSignal),
+      ),
+    );
   });
 });

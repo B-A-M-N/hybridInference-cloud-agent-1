@@ -100,7 +100,7 @@ def test_memory_and_activity_are_bounded_and_preferences_take_priority():
 
     result = build_user_memory(activity, None)
 
-    assert len(result["memories"]) == 20
+    assert len(result["memories"]) == 12
     assert all(memory["kind"] == "preference" for memory in result["memories"])
     assert len(result["portrait"]["projects"]) == 10
     assert "outside/window" not in str(result)
@@ -387,10 +387,10 @@ def test_memory_edit_normalizes_controls_format_characters_and_whitespace():
     content = "  Brief\u200b\x00 replies\n\twith \u202e clear\u00a0examples.  "
 
     assert normalize_memory_edit(content) == "Brief replies with clear examples."
-    assert normalize_memory_edit("x" * 500 + "\u200b\n\t ") == "x" * 500
+    assert normalize_memory_edit("x" * 240 + "\u200b\n\t ") == "x" * 240
 
 
-@pytest.mark.parametrize("content", ["", " \t\n\u200b\x00\u202e", "x" * 501])
+@pytest.mark.parametrize("content", ["", " \t\n\u200b\x00\u202e", "x" * 241])
 def test_memory_edit_rejects_empty_or_oversized_normalized_content(content):
     with pytest.raises(ValueError):
         normalize_memory_edit(content)
@@ -408,7 +408,7 @@ def test_memory_edit_rejects_empty_or_oversized_normalized_content(content):
         "Use sk-abcdefghijklmnop.",
         "Use https://username:password@example.com/project.",
         "Store -----BEGIN PRIVATE KEY----- here.",
-        "x" * 501 + " password=privatevalue",
+        "x" * 241 + " password=privatevalue",
     ],
 )
 def test_memory_edit_rejects_credentials_after_normalization(content):
@@ -497,3 +497,42 @@ def test_user_edits_do_not_bypass_task_temporary_scope_or_credential_guards(kind
     }
 
     assert prompt_with_user_memory("Task", view) == "Task"
+
+
+def test_content_and_total_text_and_user_memory_have_independent_bounds():
+    long = build_user_memory(
+        [
+            _activity(job_id=f"job-{index}", content="Always use " + str(index) + "x" * 700)
+            for index in range(20)
+        ],
+        None,
+    )
+    assert len(long["memories"]) <= 12
+    assert all(len(memory["content"]) <= 240 for memory in long["memories"])
+    assert sum(len(memory["content"]) for memory in long["memories"]) <= 2400
+    user = build_user_memory(
+        [
+            _activity(job_id=f"job-{index}", repo=None, content=f"I prefer reply style {index}.")
+            for index in range(10)
+        ],
+        None,
+    )
+    assert sum(memory["scope"] == "user" for memory in user["memories"]) <= 3
+
+
+def test_edited_repeated_preference_links_to_remaining_eligible_source():
+    first = _activity(content="I prefer concise replies.")
+    entry = build_user_memory([first], None)["memories"][0]
+    override = {
+        "source_ids": entry["source_ids"],
+        "memory": {
+            **entry,
+            "content": "Keep replies concise.",
+            "scope": "user",
+            "edited": True,
+        },
+    }
+    remaining = _activity(job_id="remaining-job", content="I prefer concise replies.")
+    rebuilt = build_user_memory([remaining], None, [override])
+    assert rebuilt["memories"][0]["content"] == "Keep replies concise."
+    assert rebuilt["memories"][0]["source_job_id"] == "remaining-job"

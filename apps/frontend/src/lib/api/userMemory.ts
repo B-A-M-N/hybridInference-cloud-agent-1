@@ -18,7 +18,15 @@ export interface UserMemoryEntry {
   source_job_id: string;
   source_repo: string | null;
   user_edited: boolean;
+  scope?: 'repo' | 'user';
+  edited?: boolean;
   created_at: string | null;
+}
+
+export interface UserMemoryEdit {
+  id: string;
+  content: string;
+  scope: 'repo' | 'user';
 }
 
 export interface UserMemorySuggestion {
@@ -102,5 +110,32 @@ export async function deleteUserMemoryEntry(
       signal,
     },
   );
+  return jsonOrThrow<UserMemoryView>(response);
+}
+
+export async function saveUserMemories(
+  revision: number,
+  memories: UserMemoryEdit[],
+  signal?: AbortSignal,
+): Promise<UserMemoryView> {
+  const response = await fetchWithAuth(config.apiBase, USER_MEMORY, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ revision, memories }),
+    signal,
+  });
+  return jsonOrThrow<UserMemoryView>(response);
+}
+
+export async function consolidateUserMemory(
+  revision: number,
+  signal?: AbortSignal,
+): Promise<UserMemoryView> {
+  const response = await fetchWithAuth(config.apiBase, `${USER_MEMORY}/consolidate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ revision }),
+    signal,
+  });
   return jsonOrThrow<UserMemoryView>(response);
 }

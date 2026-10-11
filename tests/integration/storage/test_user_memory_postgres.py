@@ -676,3 +676,54 @@ async def test_live_entry_transactions_serialize_against_privacy_controls(
             assert matches == []
         else:
             assert [memory["content"] for memory in matches] == ["Keep API tests readable."]
+
+
+async def test_consolidated_scope_and_native_editor_share_durable_revision_fences(store, pool):
+    from cloud_agent.user_memory import MemoryRevisionConflict
+
+    job = await _create_job(
+        store, user_id="alice", repo="alice/api", task_prompt="I prefer concise reviews."
+    )
+    current = await store.user_memory.refresh("alice")
+    original = current["memories"][0]
+    native = await store.user_memory.update_entry(
+        "alice",
+        original["id"],
+        content="Keep reviews short.",
+        expected_revision=current["revision"],
+    )
+    entry = native["memories"][0]
+    edited = {**entry, "content": "Explain changes clearly.", "scope": "user", "edited": True}
+    saved = await store.user_memory.replace_memories("alice", native["revision"], [edited])
+    with pytest.raises(MemoryRevisionConflict):
+        await store.user_memory.replace_memories("alice", native["revision"], [])
+    await _create_job(store, user_id="alice", repo="alice/other", task_prompt="Add backend tests.")
+    refreshed = await store.user_memory.refresh("alice")
+    assert edited in saved["memories"] and edited in refreshed["memories"]
+    assert "Explain changes clearly." in prompt_with_user_memory("Task", refreshed, "alice/other")
+    corrected = await store.user_memory.update_entry(
+        "alice",
+        edited["id"],
+        content="Use concise explanations.",
+        expected_revision=refreshed["revision"],
+    )
+    assert corrected["memories"][0]["scope"] == "user"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_threads SET deleted_at = NOW() WHERE id = $1", job["thread_id"]
+        )
+    assert not any(
+        memory["id"] == edited["id"]
+        for memory in (await store.user_memory.refresh("alice"))["memories"]
+    )
+    await store.user_memory.clear("alice")
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT overrides = '[]'::jsonb FROM agent_user_memories WHERE user_id = 'alice'"
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT COUNT(*) FROM agent_user_memory_edits WHERE user_id = 'alice'"
+            )
+            == 0
+        )
