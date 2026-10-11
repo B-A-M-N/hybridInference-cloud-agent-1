@@ -988,7 +988,10 @@ class _JsonResidentSession(HarnessSession[_LiveRuntimeT], Generic[_LiveRuntimeT]
             # from an ordinary EOF.  The sandbox process already retains only
             # a bounded stderr tail; cap it again here because this exception
             # crosses the broker boundary.  Agent credentials are supplied in
-            # environment variables, never stderr/argv, but avoid reflecting
+            # environment variables, never in the CLI's argv; the host's
+            # ``docker exec`` names them without their values, which reach
+            # the Docker client through its environment, not its argv (see
+            # ``ChatSandboxManager.build_exec_command``). Avoid reflecting
             # arbitrary multiline CLI output to an API caller all the same.
             diagnostic = ""
             if self._process is not None:

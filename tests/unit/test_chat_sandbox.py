@@ -1032,6 +1032,88 @@ def test_exec_is_bound_to_the_inspected_container_and_workspace(monkeypatch):
     assert exec_command[-4:] == ["sha256:container-one", "git", "status", "--short"]
 
 
+_MEMBER_SECRETS = {
+    "ANTHROPIC_API_KEY": "sk-member-inference-secret",
+    "AGENT_MCP_TOKEN": "mcp-member-relay-secret",
+    "GIT_CONFIG_VALUE_0": "Authorization: Bearer git-secret",
+}
+
+
+def test_exec_names_member_credentials_without_putting_values_on_the_client_argv():
+    manager = ChatSandboxManager(ContainerBackend(image="img"))
+    env = {
+        **_MEMBER_SECRETS,
+        "PATH": "/sandbox/bin",
+        "HOME": "/home/agent-member-0",
+        "XDG_CONFIG_HOME": "/agent-state/opencode-members/x/opencode/config",
+        "https_proxy": "http://sandbox-proxy",
+    }
+
+    command = manager.build_exec_command(_spec(), ["true"], env=env)
+    client_env = manager.exec_client_env(env)
+
+    for key, secret in _MEMBER_SECRETS.items():
+        assert not any(secret in token for token in command)
+        assert command[command.index(key) - 1] == "--env"
+        assert client_env[key] == secret
+    # The client's own executable lookup, config, and proxy are never
+    # replaced by a sandbox value; those names alone keep KEY=VALUE.
+    for key in ("PATH", "HOME", "XDG_CONFIG_HOME", "https_proxy"):
+        assert f"{key}={env[key]}" in command
+        assert client_env.get(key) == os.environ.get(key)
+
+
+def test_exec_delivers_named_values_through_the_docker_client_environment(monkeypatch, tmp_path):
+    """Run a stand-in Docker CLI that resolves ``--env KEY`` as Docker does."""
+    seen_argv = tmp_path / "argv.json"
+    docker = tmp_path / "docker"
+    docker.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        f"open({str(seen_argv)!r}, 'w').write(json.dumps(sys.argv))\n"
+        "args = sys.argv[2:]\n"
+        "env = {}\n"
+        "while args[0].startswith('-'):\n"
+        "    flag = args.pop(0)\n"
+        "    if flag == '--env':\n"
+        "        key, sep, value = args.pop(0).partition('=')\n"
+        "        if not sep:\n"
+        "            value = os.environ[key]\n"
+        "        env[key] = value\n"
+        "    elif flag in ('--user', '--workdir'):\n"
+        "        args.pop(0)\n"
+        "args.pop(0)\n"
+        "os.execve(args[0], args, env)\n"
+    )
+    docker.chmod(0o755)
+    spec = _spec()
+    manager = ChatSandboxManager(ContainerBackend(image="img", docker_binary=str(docker)))
+    current = ChatSandboxInspection(
+        container_id="sha256:container-one",
+        name=spec.container_name,
+        status=ChatSandboxStatus.RUNNING,
+        running=True,
+        image="img",
+        labels=spec.docker_labels(),
+        mounts=(),
+        networks=("agent-net",),
+    )
+    monkeypatch.setattr(manager, "_require", lambda _spec: current)
+
+    result = manager.exec_capture(
+        spec,
+        [sys.executable, "-c", "import json, os; print(json.dumps(dict(os.environ)))"],
+        env={**_MEMBER_SECRETS, "PATH": "/sandbox/bin"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    delivered = json.loads(result.stdout)
+    assert {key: delivered[key] for key in _MEMBER_SECRETS} == _MEMBER_SECRETS
+    assert delivered["PATH"] == "/sandbox/bin"
+    argv = json.loads(seen_argv.read_text())
+    assert not any(secret in token for token in argv for secret in _MEMBER_SECRETS.values())
+
+
 def _archive_export_failure(monkeypatch, detail: str) -> tuple[ChatSandboxManager, ChatSandboxSpec]:
     spec = _spec()
     manager = ChatSandboxManager(ContainerBackend(image="img"))

@@ -343,7 +343,50 @@ KATA_HELPER_CAPABILITIES = (
     "SYS_PTRACE",
 )
 _UNPRIVILEGED_EXEC = ("/usr/bin/setpriv", "--no-new-privs", "--")
+# A sandbox environment reaches ``docker exec`` by name (``--env KEY``), its
+# value through the Docker CLI's own environment, so a member's inference or
+# MCP credential never sits in the client's argv (``/proc/<pid>/cmdline``,
+# ``ps``, process accounting) for the life of a resident CLI. Only the names
+# the Docker CLI itself reads -- its endpoint and config directory, executable,
+# plugin and credential-helper lookup, TLS roots, proxies, the Go runtime and
+# the dynamic loader -- still travel as ``KEY=VALUE``: a sandbox value under one
+# of them must not reconfigure the client, and none of them carries a secret.
+_DOCKER_CLIENT_ENV = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "GODEBUG",
+        "GOGC",
+        "GOMAXPROCS",
+        "GOMEMLIMIT",
+        "GOTRACEBACK",
+        "GLIBC_TUNABLES",
+    }
+)
+_DOCKER_CLIENT_ENV_PREFIXES = (
+    "DOCKER_",
+    "BUILDKIT_",
+    "BUILDX_",
+    "COMPOSE_",
+    "LD_",
+    "OTEL_",
+    "XDG_",
+)
+_PROXY_ENV = frozenset({"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "FTP_PROXY"})
 _FULL_OBJECT_ID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
+
+
+def _exec_env_by_name(key: str) -> bool:
+    """Whether one sandbox variable crosses ``docker exec`` as a bare name."""
+    return not (
+        key in _DOCKER_CLIENT_ENV
+        or key.upper() in _PROXY_ENV
+        or key.startswith(_DOCKER_CLIENT_ENV_PREFIXES)
+    )
+
 
 # PID 1 contains no chat credential and owns no chat state outside the
 # container writable layer. A reconnectable protocol bridge may later replace
@@ -2463,7 +2506,11 @@ class ChatSandboxManager:
         user_gid: int | None = None,
         container_id: str | None = None,
     ) -> builtins.list[str]:
-        """Compose ``docker exec`` after identity/running checks at spawn time."""
+        """Compose ``docker exec`` after identity/running checks at spawn time.
+
+        Most of ``env`` is named here and valued only in the client environment
+        :meth:`exec_client_env` builds; run the command with that environment.
+        """
         if not argv:
             raise ValueError("a retained sandbox exec needs an argv")
         command = [self.backend.docker_binary, "exec"]
@@ -2481,7 +2528,7 @@ class ChatSandboxManager:
         for key, value in sorted((env or {}).items()):
             if not key or "=" in key or "\x00" in key or "\x00" in value:
                 raise ValueError(f"invalid environment entry {key!r}")
-            command += ["--env", f"{key}={value}"]
+            command += ["--env", key if _exec_env_by_name(key) else f"{key}={value}"]
         command.append(container_id or spec.container_name)
         if self.backend.runtime == KATA_RUNTIME:
             command += list(_UNPRIVILEGED_EXEC)
@@ -2491,6 +2538,17 @@ class ChatSandboxManager:
                 command += ["/bin/sh", "-c", 'exec "$@" </dev/null', "sh"]
         command += argv
         return command
+
+    @staticmethod
+    def exec_client_env(env: dict[str, str] | None = None) -> dict[str, str]:
+        """Return the Docker CLI environment that supplies a named ``env``.
+
+        The broker's own environment still configures the client; only the
+        values :meth:`build_exec_command` passed by name are added to it.
+        """
+        client = {**os.environ}
+        client.update({key: value for key, value in (env or {}).items() if _exec_env_by_name(key)})
+        return client
 
     def spawn(
         self,
@@ -2543,7 +2601,7 @@ class ChatSandboxManager:
         )
         process = subprocess.Popen(
             command,
-            env={**os.environ},
+            env=self.exec_client_env(env),
             stdin=subprocess.PIPE if live_input else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -3372,7 +3430,7 @@ class ChatSandboxManager:
             # learns the browser's dimensions.
             process = subprocess.Popen(
                 command,
-                env={**os.environ},
+                env=self.exec_client_env(env),
                 stdin=slave_fd,
                 stdout=slave_fd,
                 stderr=slave_fd,
@@ -3485,7 +3543,7 @@ class ChatSandboxManager:
             with substage(observer, "exec"):
                 return subprocess.run(
                     command,
-                    env={**os.environ},
+                    env=self.exec_client_env(env),
                     input=input_bytes,
                     capture_output=True,
                     timeout=timeout_s,
