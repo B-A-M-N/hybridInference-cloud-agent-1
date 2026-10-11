@@ -2145,7 +2145,7 @@ class ClaudeCodeLiveTurn(HarnessTurn[ClaudeCodeRuntime]):
         self._session.interrupt_turn()
 
     def _track_questions(self, record: dict[str, Any]) -> None:
-        """Hold AskUserQuestion's stdio permission request until its owner answers."""
+        """Route Claude's stdio interaction requests to their platform policy."""
         kind = record.get("type")
         native_id = record.get("request_id")
         if kind == "control_cancel_request" and isinstance(native_id, str):
@@ -2164,7 +2164,23 @@ class ClaudeCodeLiveTurn(HarnessTurn[ClaudeCodeRuntime]):
         ):
             return
         original = request.get("input")
-        if request.get("tool_name") != "AskUserQuestion":
+        tool_name = request.get("tool_name")
+        if tool_name == "ExitPlanMode" and isinstance(original, dict):
+            # The resident session deliberately starts in bypassPermissions.
+            # EnterPlanMode temporarily narrows that mode, but registering the
+            # stdio prompt handler for AskUserQuestion also routes its exit
+            # approval here. Preserve the autonomous permission contract and
+            # return Claude's exact plan input so it can continue execution;
+            # the CLI restores the previous permission mode on the transition.
+            self._reply_permission(
+                native_id,
+                {
+                    "behavior": "allow",
+                    "updatedInput": copy.deepcopy(original),
+                },
+            )
+            return
+        if tool_name != "AskUserQuestion":
             self._reply_permission(
                 native_id,
                 {

@@ -280,15 +280,55 @@ def test_bridge_keeps_failed_question_post_retryable_and_fences_siblings():
     assert bridge._questions == set()
 
 
-@pytest.mark.parametrize("tool_name", ["ExitPlanMode", "unsupported-tool", "AskUserQuestion"])
-def test_claude_unsupported_or_malformed_interactions_are_denied(tmp_path, tool_name):
+@pytest.mark.parametrize(
+    "tool_input",
+    [
+        {},
+        {"allowedPrompts": [{"tool": "Bash", "prompt": "run tests"}]},
+    ],
+)
+def test_claude_exit_plan_mode_allows_the_original_input(tmp_path, tool_input):
+    process, _session, turn, request, _response, _spawned = _turn(tmp_path, "claude")
+    turn.events_for_line(
+        json.dumps({"type": "control_cancel_request", "request_id": request["request_id"]})
+    )
+    request["request_id"] = "exit-plan-1"
+    request["request"]["tool_name"] = "ExitPlanMode"
+    request["request"]["input"] = tool_input
+
+    turn.events_for_line(json.dumps(request))
+
+    reply = json.loads(process.sent[-1])
+    assert reply == {
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": "exit-plan-1",
+            "response": {
+                "behavior": "allow",
+                "updatedInput": request["request"]["input"],
+            },
+        },
+    }
+    assert turn.pending_questions() == []
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input"),
+    [
+        ("unsupported-tool", {}),
+        ("AskUserQuestion", {}),
+        ("ExitPlanMode", None),
+    ],
+)
+def test_claude_unsupported_or_malformed_interactions_are_denied(tmp_path, tool_name, tool_input):
     process, _session, turn, request, _response, _spawned = _turn(tmp_path, "claude")
     turn.events_for_line(
         json.dumps({"type": "control_cancel_request", "request_id": request["request_id"]})
     )
     request["request_id"] = "unsupported-1"
     request["request"]["tool_name"] = tool_name
-    request["request"]["input"] = {}
+    request["request"]["input"] = tool_input
     turn.events_for_line(json.dumps(request))
     reply = json.loads(process.sent[-1])
     assert reply["response"]["request_id"] == "unsupported-1"
