@@ -285,12 +285,12 @@ export default function ComputeResources({
     );
 
   return (
-    <section className="mt-8" aria-label="Servers">
+    <section className="mt-6" aria-label="Servers">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-        <h2 className="text-base font-semibold text-gray-900 dark:text-gray-50">Servers</h2>
+        <h2 className="text-sm font-semibold text-foreground">Server inventory</h2>
         <div className="flex flex-wrap items-center gap-2">
           <button
-            className="rounded-lg px-3 py-2 text-sm text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-white/5"
+            className={buttonClass}
             type="button"
             onClick={() => {
               addReturnFocus.current = null;
@@ -301,13 +301,13 @@ export default function ComputeResources({
             Server setup
           </button>
           <button
-            className="rounded-lg px-3 py-2 text-sm text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-white/5"
+            className={buttonClass}
             type="button"
             onClick={() => setPanel({ kind: 'operations' })}
           >
             Activity
             {pending.length > 0 && (
-              <span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-800 dark:bg-amber-500/15 dark:text-amber-300">
+              <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800 dark:bg-amber-500/15 dark:text-amber-300">
                 {pending.length} active
               </span>
             )}
@@ -323,7 +323,7 @@ export default function ComputeResources({
             aria-label="Add server"
             disabled={!catalog?.providers.length || !catalog.secret_store_configured}
           >
-            + Add server
+            Add server
           </button>
         </div>
       </div>
