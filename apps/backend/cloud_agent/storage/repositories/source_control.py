@@ -291,6 +291,8 @@ class PostgresSourceControlRepository:
         expires_at: Any,
     ) -> int:
         """Store one GitLab.com identity per platform user."""
+        # Reconnecting replaces the account, and a refresh in flight for the
+        # previous one loses its lease: the generation moves.
         async with self._pool.acquire() as conn:
             connection_id = await conn.fetchval(
                 """
@@ -306,6 +308,8 @@ class PostgresSourceControlRepository:
                     access_token_ciphertext = EXCLUDED.access_token_ciphertext,
                     refresh_token_ciphertext = EXCLUDED.refresh_token_ciphertext,
                     expires_at = EXCLUDED.expires_at,
+                    refresh_generation = agent_gitlab_connections.refresh_generation + 1,
+                    refresh_lease_expires_at = NULL,
                     updated_at = NOW()
                 RETURNING id
                 """,
@@ -326,10 +330,41 @@ class PostgresSourceControlRepository:
             row = await conn.fetchrow(
                 """
                 SELECT id, user_id, external_user_id, username, display_name, web_url,
-                       access_token_ciphertext, refresh_token_ciphertext, expires_at
+                       access_token_ciphertext, refresh_token_ciphertext, expires_at,
+                       refresh_generation, refresh_lease_expires_at
                 FROM agent_gitlab_connections WHERE user_id = $1
                 """,
                 user_id,
+            )
+        return dict(row) if row else None
+
+    async def claim_gitlab_token_refresh(
+        self,
+        *,
+        connection_id: int,
+        user_id: str,
+        lease_seconds: int,
+        margin_seconds: int,
+    ) -> dict[str, Any] | None:
+        """Take the lease to refresh an expiring token, or ``None`` if it is not ours."""
+        # Only a token that still needs it, and only while nobody else holds a
+        # live lease. A caller that lost the race reads the row again.
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE agent_gitlab_connections SET
+                    refresh_generation = refresh_generation + 1,
+                    refresh_lease_expires_at = NOW() + make_interval(secs => $3)
+                WHERE id = $1
+                  AND user_id = $2
+                  AND expires_at <= NOW() + make_interval(secs => $4)
+                  AND (refresh_lease_expires_at IS NULL OR refresh_lease_expires_at <= NOW())
+                RETURNING refresh_generation, refresh_token_ciphertext
+                """,
+                connection_id,
+                user_id,
+                lease_seconds,
+                margin_seconds,
             )
         return dict(row) if row else None
 
@@ -338,24 +373,27 @@ class PostgresSourceControlRepository:
         *,
         connection_id: int,
         user_id: str,
+        refresh_generation: int,
         access_token_ciphertext: str,
         refresh_token_ciphertext: str,
         expires_at: Any,
     ) -> bool:
-        """Rotate encrypted OAuth tokens without crossing user ownership."""
+        """Write a refreshed token pair while this generation still owns the row."""
         async with self._pool.acquire() as conn:
             updated = await conn.fetchval(
                 """
                 UPDATE agent_gitlab_connections SET
-                    access_token_ciphertext = $3,
-                    refresh_token_ciphertext = $4,
-                    expires_at = $5,
+                    access_token_ciphertext = $4,
+                    refresh_token_ciphertext = $5,
+                    expires_at = $6,
+                    refresh_lease_expires_at = NULL,
                     updated_at = NOW()
-                WHERE id = $1 AND user_id = $2
+                WHERE id = $1 AND user_id = $2 AND refresh_generation = $3
                 RETURNING id
                 """,
                 connection_id,
                 user_id,
+                refresh_generation,
                 access_token_ciphertext,
                 refresh_token_ciphertext,
                 expires_at,
@@ -363,7 +401,7 @@ class PostgresSourceControlRepository:
         return updated is not None
 
     async def delete_gitlab_connection(self, *, user_id: str, connection_id: int) -> bool:
-        """Delete only a connection owned by the authenticated user."""
+        """Delete only this user's row, so an in-flight refresh write misses."""
         async with self._pool.acquire() as conn:
             deleted = await conn.fetchval(
                 "DELETE FROM agent_gitlab_connections WHERE user_id = $1 AND id = $2 RETURNING id",

@@ -378,6 +378,7 @@ class PostgresSnapshotRepository:
             snapshot = await conn.fetchrow(
                 """
                 SELECT s.id AS snapshot_id, s.sandbox_id, s.workspace_epoch,
+                       s.publish_attempt_count,
                        s.anchor_job_id AS id, s.base_sha, s.patch_content AS patch,
                        (
                            SELECT COALESCE(
@@ -520,6 +521,7 @@ class PostgresSnapshotRepository:
                 return {
                     "publication_kind": "shared_snapshot",
                     "snapshot_id": int(snapshot["snapshot_id"]),
+                    "publish_attempt_count": int(snapshot["publish_attempt_count"]),
                     "sandbox_id": snapshot["sandbox_id"],
                     "workspace_epoch": int(snapshot["workspace_epoch"]),
                     "included_job_ids": load_json(snapshot["included_job_ids"]) or [],
@@ -554,10 +556,11 @@ class PostgresSnapshotRepository:
             return None
 
     async def defer_snapshot_publish(self, *, snapshot_id: int, detail: str) -> bool:
-        """Return an unstarted publication to captured with a 30-second retry.
+        """Return a publication to captured and try again 30 seconds later.
 
-        Call only after an entitlement preflight failure, before minting a write
-        credential or performing external publication effects. Retains the patch
+        Used when entitlement cannot be checked, and when a credential mint,
+        git exchange, or PR call failed transiently. Those effects are
+        idempotent. Increments ``publish_attempt_count``. Retains the patch
         and included turns, and bounds the visible detail to 2,000 characters.
         Returns ``False`` unless the snapshot is still ``publishing``.
         """
@@ -566,6 +569,7 @@ class PostgresSnapshotRepository:
                 """
                 UPDATE agent_sandbox_snapshots
                 SET state = 'captured', last_error = $2,
+                    publish_attempt_count = publish_attempt_count + 1,
                     retry_at = NOW() + make_interval(secs => $3), updated_at = NOW()
                 WHERE id = $1 AND state = 'publishing'
                 RETURNING id

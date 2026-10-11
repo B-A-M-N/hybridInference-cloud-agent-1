@@ -83,12 +83,14 @@ class SnapshotRepository(Protocol):
         ...
 
     async def defer_snapshot_publish(self, *, snapshot_id: int, detail: str) -> bool:
-        """Return an unstarted publication to captured with a 30-second retry.
+        """Return a publication to captured and try again 30 seconds later.
 
-        Call only after an entitlement preflight failure, before minting a write
-        credential or performing external publication effects. Retains the patch
-        and included turns, and bounds the visible detail to 2,000 characters.
-        Returns ``False`` unless the snapshot is still ``publishing``.
+        Used when entitlement cannot be checked, and when a credential mint,
+        git exchange, or PR call failed transiently. Those effects are
+        idempotent. Increments ``publish_attempt_count``. The caller fails the
+        snapshot instead once that count reaches the attempt budget. Retains
+        the patch and included turns, and bounds the visible detail to 2,000
+        characters. Returns ``False`` unless the snapshot is still ``publishing``.
         """
         ...
 

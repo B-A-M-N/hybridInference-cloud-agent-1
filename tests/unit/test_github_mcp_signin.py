@@ -49,23 +49,16 @@ def managed_app(monkeypatch):
     return metadata
 
 
-def _flow_store(monkeypatch):
-    """Persist flows with the same generation fence as the SQL repository."""
+def _flow_store():
+    """A GitHub connection whose flow uses the repository generation fence."""
     store = FakeStore()
     connection_id = _seed(store, url=URL, template="github", auth_kind="oauth", auth_config={})
-
-    async def save_flow(**kwargs):
-        store.oauth_flow = kwargs
-        store.oauth_state_hash = kwargs["state_hash"]
-        store.connections[connection_id]["oauth_generation"] = kwargs["oauth_generation"]
-
-    monkeypatch.setattr(store, "create_mcp_oauth_flow", save_flow, raising=False)
     return store, connection_id
 
 
 def test_browser_signin_completes_without_user_client_credentials(managed_app, monkeypatch):
     """A stable callback uses single-use state and stores only the user's token."""
-    store, connection_id = _flow_store(monkeypatch)
+    store, connection_id = _flow_store()
     exchange = AsyncMock(return_value={"access_token": "user-token", "refresh_token": "refresh"})
     monkeypatch.setattr(mcp_connections, "_post_form", exchange)
     with _client(store) as client:
@@ -115,7 +108,7 @@ def test_managed_secret_never_follows_unexpected_metadata(managed_app, monkeypat
     monkeypatch.setattr(
         oauth, "discover_authorization_server", AsyncMock(return_value=(None, metadata))
     )
-    store, connection_id = _flow_store(monkeypatch)
+    store, connection_id = _flow_store()
     with _client(store) as client:
         response = client.post(f"/v1/agent/mcp/connections/{connection_id}/authorize")
     assert response.status_code == 400
@@ -126,9 +119,9 @@ def test_managed_secret_never_follows_unexpected_metadata(managed_app, monkeypat
 @pytest.mark.parametrize(
     "url", ["https://attacker.example/mcp", "https://api.githubcopilot.com.attacker.example/mcp"]
 )
-def test_template_name_does_not_grant_shared_client_access(managed_app, monkeypatch, url):
+def test_template_name_does_not_grant_shared_client_access(managed_app, url):
     """A GitHub label or template on a custom URL does not authorize the app."""
-    store, connection_id = _flow_store(monkeypatch)
+    store, connection_id = _flow_store()
     store.connections[connection_id]["url"] = url
     with _client(store) as client:
         response = client.post(f"/v1/agent/mcp/connections/{connection_id}/authorize")
@@ -158,7 +151,7 @@ def test_refresh_refuses_redirected_managed_connections(managed_app, field):
 def test_unconfigured_browser_signin_keeps_token_fallback(managed_app, monkeypatch, missing):
     """Partial service setup must not advertise a working browser sign-in."""
     monkeypatch.delenv(missing)
-    store, connection_id = _flow_store(monkeypatch)
+    store, connection_id = _flow_store()
     with _client(store) as client:
         preset = client.get("/v1/agent/mcp/connections").json()["templates"][0]
         assert preset["auth_kind"] == "static"
@@ -171,7 +164,7 @@ def test_unconfigured_browser_signin_keeps_token_fallback(managed_app, monkeypat
 
 def test_managed_callback_rejects_wrong_state_and_other_connections(managed_app, monkeypatch):
     """The stable path cannot complete another user's connection without its state."""
-    store, connection_id = _flow_store(monkeypatch)
+    store, connection_id = _flow_store()
     exchange = AsyncMock()
     monkeypatch.setattr(mcp_connections, "_post_form", exchange)
     with _client(store, user_id="user-other") as other_client:
@@ -207,7 +200,7 @@ def test_cancelled_github_signin_offers_a_friendly_retry(managed_app):
 
 def test_explicit_registration_can_replace_an_existing_managed_connection(managed_app, monkeypatch):
     """Keep existing API clients able to use their own registered app."""
-    store, connection_id = _flow_store(monkeypatch)
+    store, connection_id = _flow_store()
     store.connections[connection_id]["auth_config"] = {
         "client_id": "service-client",
         "managed_github_oauth": True,
@@ -236,7 +229,7 @@ def test_explicit_registration_can_replace_an_existing_managed_connection(manage
 
 def test_retry_preserves_stored_custom_github_app(managed_app, monkeypatch):
     """A normal UI retry keeps an existing user's app identity and permissions."""
-    store, connection_id = _flow_store(monkeypatch)
+    store, connection_id = _flow_store()
     cipher = mcp_cipher(_ENCRYPTION_KEY)
     client_cipher = oauth_cipher(_ENCRYPTION_KEY)
     store.connections[connection_id]["auth_config"] = {"client_id": "own-client"}

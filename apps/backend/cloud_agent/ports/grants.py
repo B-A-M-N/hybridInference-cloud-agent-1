@@ -104,10 +104,10 @@ class GrantRepository(Protocol):
     async def link_residency_grant(
         self, *, thread_id: str, generation: int, grant_id: str, binding_id: str | None = None
     ) -> bool:
-        """Record the grant a residency runs on — only its own generation.
+        """Record the grant a residency runs on — only its own live generation.
 
         A link that matched nothing means the residency was taken over between
-        mint and link; the caller revokes the orphan grant rather than handing
-        out a credential nothing owns.
+        mint and link, or its lease has already expired. The caller revokes
+        the orphan grant rather than handing out a credential nothing owns.
         """
         ...

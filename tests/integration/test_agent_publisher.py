@@ -686,6 +686,41 @@ def test_base_bundle_carries_only_what_the_published_commit_adds(origin, tmp_pat
     assert _git(["rev-parse", "HEAD"], cwd=workspace).strip() == base_sha
 
 
+def test_republishing_the_same_patch_reuses_the_commit_already_pushed(origin):
+    """A retry after the push, and before the PR is recorded, must not refuse.
+
+    The second commit object differs because its timestamps do, but it is the
+    same change on the same base. The branch already has that change, and the
+    platform does not force-push, so the retry keeps the existing tip.
+    """
+    clone_url, base_sha = origin
+    kwargs = {
+        "job_id": "ajob_retry",
+        "branch_id": "athr_retry",
+        "patch": _PATCH_APP,
+        "clone_url": clone_url,
+        "base_sha": base_sha,
+        "commit_message": "agent: turn 1",
+        "include_base_bundle": True,
+    }
+    first = publish_patch(**kwargs)
+    second = publish_patch(**kwargs)
+
+    assert second.commit_sha == first.commit_sha
+    assert second.branch == first.branch
+    assert second.changed_files == first.changed_files
+    assert second.base_bundle is not None
+    tip = subprocess.run(
+        ["git", "rev-parse", "refs/heads/agent/athr_retry"],
+        cwd=clone_url,
+        env=_GIT_ENV,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert tip == first.commit_sha
+
+
 def test_branch_moved_by_someone_else_is_refused_with_the_reason(origin, tmp_path):
     """Human commits on the agent branch refuse the publish, by name.
 
