@@ -551,6 +551,7 @@ async def test_the_lifespan_hands_the_loops_the_provider_not_a_snapshot(
         compute_builder.assert_called_once_with(
             repository=app.state.storage.compute_resources,
             host_pool=app.state.storage.host_pool,
+            http=app.state.http,
         )
         assert "compute" in started
         assert not app.state.compute_resource_task.done()

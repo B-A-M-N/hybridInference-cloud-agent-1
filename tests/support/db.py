@@ -74,6 +74,11 @@ async def reset_agent_tables(conn: Any) -> None:
         '"multipart_threshold_bytes":8388608,"multipart_part_bytes":8388608}\'::jsonb, '
         "sandbox_archive_revision = 0, sandbox_archive_updated_at = NOW()"
     )
+    # Autoscaling uses the same singleton/CAS shape. Keep older migration
+    # targets usable by checking for the additive tables before reseeding.
+    if await conn.fetchval("SELECT to_regclass('agent_cloudlab_autoscaling_policy')") is not None:
+        await conn.execute("INSERT INTO agent_cloudlab_autoscaling_policy (id) VALUES (TRUE)")
+        await conn.execute("INSERT INTO agent_cloudlab_autoscaling_runtime (id) VALUES (TRUE)")
     # The profiling control row is seeded by its migration for the same reason:
     # every Start, Stop and policy read takes it, so a truncate that left it out
     # would make a correct deployment look like one that was never configured.

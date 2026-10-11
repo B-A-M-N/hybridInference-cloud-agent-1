@@ -185,7 +185,8 @@ async def test_scheduler_reloads_poll_interval_between_passes(monkeypatch):
         commands=SimpleNamespace(configuration=configuration),
         schedule=AsyncMock(),
     )
-    worker = compute_resources.ComputeResourceWorker(reconciler)
+    autoscaler = SimpleNamespace(reconcile=AsyncMock())
+    worker = compute_resources.ComputeResourceWorker(reconciler, autoscaler=autoscaler)
     delays = []
 
     async def tick(delay):
@@ -198,3 +199,4 @@ async def test_scheduler_reloads_poll_interval_between_passes(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await worker._schedule()
     assert delays == [10, 25]
+    assert autoscaler.reconcile.await_count == 2

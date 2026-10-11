@@ -579,6 +579,7 @@ class PostgresSnapshotRepository:
     async def defer_snapshot_publish(
         self, *, snapshot_id: int, expected_publish_attempt_count: int, detail: str
     ) -> bool:
+        """Retry a transient publication under this exact fenced claim."""
         return await self._defer_snapshot_publish(
             snapshot_id=snapshot_id,
             expected_publish_attempt_count=expected_publish_attempt_count,

@@ -1,13 +1,13 @@
 """Restore nonnegative guards on durable authority counters.
 
-Revision ID: 0058_counter_constraints
-Revises: 0057_mcp_connector_invariant
+Revision ID: 0059_counter_constraints
+Revises: 0058_mcp_connector_invariant
 """
 
 from alembic import op
 
-revision = "0058_counter_constraints"
-down_revision = "0057_mcp_connector_invariant"
+revision = "0059_counter_constraints"
+down_revision = "0058_mcp_connector_invariant"
 branch_labels = None
 depends_on = None
 

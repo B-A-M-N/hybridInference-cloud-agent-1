@@ -95,7 +95,7 @@ def _revision_pair(path: Path) -> tuple[str, tuple[str, ...]]:
 
 
 def test_the_chain_is_connected_with_one_intentional_merge() -> None:
-    """One root/head remains after merging the two committed 0046 branches."""
+    """One root/head remains after merging the committed trajectory branch."""
     pairs = dict(map(_revision_pair, VERSIONS.glob("*.py")))
     assert "0001_schema_baseline" in pairs and pairs["0001_schema_baseline"] == ()
     roots = [rev for rev, parents in pairs.items() if not parents]
@@ -107,9 +107,9 @@ def test_the_chain_is_connected_with_one_intentional_merge() -> None:
 
     merges = {revision: parents for revision, parents in pairs.items() if len(parents) > 1}
     assert merges == {
-        "0056_admin_sandbox_trajectory": (
+        "0057_admin_sandbox_trajectory": (
             "0046_admin_sandbox_trajectory",
-            "0055_send_now_handed_off",
+            "0056_cloudlab_autoscaling",
         )
     }
     children: dict[str, list[str]] = {}

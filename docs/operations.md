@@ -544,7 +544,7 @@ control-plane and host releases. Apply `alembic upgrade head` before starting
 the updated API. Inventory removal additionally requires
 `0044_admin_sandbox_archive`, and S3-backed container deletion requires
 `0045_admin_sandbox_deletion` plus the matching workspace broker release.
-The append-only admin trajectory requires `0056_admin_sandbox_trajectory`.
+The append-only admin trajectory requires `0057_admin_sandbox_trajectory`.
 Resource persistence requires migration
 `0034_sandbox_resource_usage` and a host running the updated workspace broker.
 Older hosts still appear in the inventory with resource usage unavailable.
@@ -2209,7 +2209,7 @@ actual source and target versions before choosing a rolling deploy.
   `0011_mcp_rolling_compat` restores inert compatibility columns on databases
   upgraded by the original `0008`, which dropped/renamed them. Apply through
   head before starting the updated control plane and MCP relay.
-- `0057_mcp_connector_invariant` repairs the singular connector route for MCP
+- `0058_mcp_connector_invariant` repairs the singular connector route for MCP
   connections and adds a unique constraint on each connection's authorization
   mapping. Treat this revision as a stopped-writer boundary. Older binaries can
   recreate a missing mapping, leave a stale mapping after disconnect, or retain
@@ -2218,8 +2218,8 @@ actual source and target versions before choosing a rolling deploy.
   revision. Instead:
 
   1. stop every control-plane, MCP relay and web-tier database writer;
-  2. run `alembic upgrade 0057_mcp_connector_invariant` (or upgrade through
-     `0057` to the intended later revision);
+  2. run `alembic upgrade 0058_mcp_connector_invariant` (or upgrade through
+     `0058` to the intended later revision);
   3. deploy the invariant-aware control-plane, MCP relay and web-tier release;
      and
   4. resume writers only after every old binary has been replaced.

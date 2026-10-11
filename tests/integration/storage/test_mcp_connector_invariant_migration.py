@@ -16,8 +16,9 @@ from cloud_agent.storage.assembly import Storage
 
 pytestmark = pytest.mark.dbtest
 
-_BEFORE = "0056_admin_sandbox_trajectory"
-_THIS = "0057_mcp_connector_invariant"
+_BEFORE = "0057_admin_sandbox_trajectory"
+_THIS = "0058_mcp_connector_invariant"
+_HEAD = "0059_counter_constraints"
 _OWNER = "user-owner"
 _OTHER = "user-other"
 _PRESERVED_AUTHORIZED_AT = datetime(2001, 2, 3, 4, 5, 6, tzinfo=timezone.utc)
@@ -30,7 +31,8 @@ def test_mcp_connector_invariant_revision_follows_trajectory_merge() -> None:
     script = ScriptDirectory.from_config(config)
 
     assert script.get_revision(_THIS).down_revision == _BEFORE
-    assert _THIS in script.get_heads()
+    assert script.get_current_head() == _HEAD
+    assert script.get_revision(_HEAD).down_revision == _THIS
 
 
 async def _local_connection(
@@ -69,7 +71,7 @@ async def _remote_connection(store: Storage, *, label: str) -> dict:
 
 @pytest.mark.asyncio
 async def test_migration_repairs_routes_and_preserves_only_the_canonical_pair(pool) -> None:
-    """0057 backfills valid authority and removes every stale alternative."""
+    """0058 backfills valid authority and removes every stale alternative."""
     config = _db_config()
     downgrade_to(config, _BEFORE)
     store = Storage(pool)

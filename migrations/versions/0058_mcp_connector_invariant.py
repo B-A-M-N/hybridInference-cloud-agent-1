@@ -1,13 +1,13 @@
 """Repair and enforce singular MCP connector authorization.
 
-Revision ID: 0057_mcp_connector_invariant
-Revises: 0056_admin_sandbox_trajectory
+Revision ID: 0058_mcp_connector_invariant
+Revises: 0057_admin_sandbox_trajectory
 """
 
 from alembic import op
 
-revision = "0057_mcp_connector_invariant"
-down_revision = "0056_admin_sandbox_trajectory"
+revision = "0058_mcp_connector_invariant"
+down_revision = "0057_admin_sandbox_trajectory"
 branch_labels = None
 depends_on = None
 

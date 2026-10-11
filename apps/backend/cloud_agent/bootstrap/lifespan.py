@@ -400,6 +400,7 @@ async def lifespan(app: FastAPI, *, background: bool = True) -> AsyncIterator[No
             app.state.compute_commands, compute_worker = build_compute_runtime(
                 repository=storage.compute_resources,
                 host_pool=storage.host_pool,
+                http=http,
             )
             app.state.compute_resource_task = asyncio.create_task(compute_worker.run())
             _BACKGROUND_TASKS.add(app.state.compute_resource_task)
