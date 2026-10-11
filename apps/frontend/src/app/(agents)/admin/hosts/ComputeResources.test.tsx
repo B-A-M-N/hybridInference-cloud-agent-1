@@ -816,6 +816,42 @@ describe('resource management', () => {
 });
 
 describe('resource dashboard', () => {
+  it('shows only the newest periodic inspection for each server', async () => {
+    vi.mocked(api.getComputeOperations).mockResolvedValue({
+      operations: [
+        operation({
+          id: 'inspect-newest',
+          kind: 'inspect',
+          state: 'blocked',
+          message: "CloudLab cannot confirm this experiment's existence or visibility",
+          updated_at: '2026-10-04T08:05:00Z',
+        }),
+        operation({
+          id: 'inspect-older',
+          kind: 'inspect',
+          state: 'blocked',
+          message: "CloudLab cannot confirm this experiment's existence or visibility",
+          updated_at: '2026-10-04T08:03:00Z',
+        }),
+        operation({ id: 'acquire-original', state: 'succeeded' }),
+      ],
+    });
+
+    render(<ComputeResources onHostsChanged={vi.fn()} />);
+    fireEvent.click(await screen.findByRole('button', { name: /Activity.*1 active/ }));
+
+    expect(
+      screen.getAllByRole('button', { name: /inspect · CloudLab experiment · blocked/ }),
+    ).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Show recent operations' }));
+    expect(
+      screen.getAllByRole('button', { name: /inspect · CloudLab experiment · blocked/ }),
+    ).toHaveLength(1);
+    expect(
+      screen.getByRole('button', { name: /acquire · CloudLab experiment · succeeded/ }),
+    ).toBeInTheDocument();
+  });
+
   it('shows actual retained locations separately and recovers ongoing operations on page open', async () => {
     vi.mocked(api.getComputeOperations).mockResolvedValue({
       operations: [

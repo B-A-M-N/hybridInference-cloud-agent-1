@@ -43,6 +43,16 @@ type OpenPanel =
 
 const FINISHED = new Set(['succeeded', 'cancelled', 'failed']);
 
+function withoutSupersededInspections(operations: ComputeOperation[]): ComputeOperation[] {
+  const inspectedAllocations = new Set<string>();
+  return operations.filter((operation) => {
+    if (operation.kind !== 'inspect' || operation.allocation_id === null) return true;
+    if (inspectedAllocations.has(operation.allocation_id)) return false;
+    inspectedAllocations.add(operation.allocation_id);
+    return true;
+  });
+}
+
 export default function ComputeResources({
   onHostsChanged,
   onInventory,
@@ -227,8 +237,12 @@ export default function ComputeResources({
   const operationAllocation = allocations.find(
     (item) => item.id === currentOperation?.allocation_id,
   );
-  const pending = operations.filter((item) => !FINISHED.has(item.state));
-  const shownOperations = showAllOperations ? operations : pending;
+  // Each scheduled inspection replaces the previous observation for that server.
+  // Keep the durable attempts in the API, but do not let recurring failures fill
+  // either activity view with copies of the same current condition.
+  const visibleOperations = withoutSupersededInspections(operations);
+  const pending = visibleOperations.filter((item) => !FINISHED.has(item.state));
+  const shownOperations = showAllOperations ? visibleOperations : pending;
 
   const resourceActions = [];
   if (catalog)
@@ -453,13 +467,14 @@ export default function ComputeResources({
             />
           </div>
           <div hidden={serverTab !== 'activity'}>
-            {operations.filter((operation) => operation.allocation_id === currentAllocation.id)
-              .length === 0 && (
+            {visibleOperations.filter(
+              (operation) => operation.allocation_id === currentAllocation.id,
+            ).length === 0 && (
               <p className="py-6 text-sm text-gray-500 dark:text-gray-400">
                 No operations for this server.
               </p>
             )}
-            {operations
+            {visibleOperations
               .filter((operation) => operation.allocation_id === currentAllocation.id)
               .map((operation) => (
                 <button
