@@ -17,9 +17,7 @@ export function DeploymentFooter() {
   const version = deployment?.version ?? '';
   const shortVersion = /^[a-f\d]{40}$/i.test(version) ? version.slice(0, 7) : version;
   const deployedAt = deployment?.deployedAt;
-  const deployedDate = deployedAt
-    ? new Date(deployedAt).toISOString().slice(0, 10)
-    : null;
+  const deployedDate = deployedAt ? new Date(deployedAt).toISOString().slice(0, 10) : null;
   const deployedTimeEastern = deployedAt ? easternTime.format(new Date(deployedAt)) : null;
 
   return (
