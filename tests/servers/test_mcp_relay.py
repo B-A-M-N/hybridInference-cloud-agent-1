@@ -771,6 +771,35 @@ async def test_the_upstream_receives_the_request_as_it_was_decided(client, upstr
     assert sent.headers["content-type"] == "application/json"
 
 
+@pytest.mark.parametrize("number", ["9007199254740993.0", "0.12345678901234567890", "1e-400"])
+@pytest.mark.parametrize("location", ["argument", "id", "batch"])
+async def test_a_number_that_would_change_is_never_forwarded(
+    client, upstream, store, number: str, location: str
+):
+    """A lossy number refuses the whole request before any call is held or sent."""
+    body = (
+        b'{"jsonrpc":"2.0","id":REQUEST_ID,"method":"tools/call",'
+        b'"params":{"name":"get_issue","arguments":{"n":ARGUMENT}}}'
+    )
+    body = body.replace(b"REQUEST_ID", number.encode() if location == "id" else b"2")
+    body = body.replace(b"ARGUMENT", b"0" if location == "id" else number.encode())
+    if location == "batch":
+        body = b"[" + json.dumps(_rpc("tools/call", name="get_issue")).encode() + b"," + body + b"]"
+
+    response = await client.post(
+        f"/v1/agent/mcp/{_ALIAS}",
+        content=body,
+        headers={**_auth(), "content-type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == -32700
+    assert response.json()["id"] is None
+    assert "without changing its value" in response.json()["error"]["message"]
+    assert upstream.requests == []
+    assert store.created_invocations == []
+
+
 async def test_notifications_and_batches_still_travel(client, upstream):
     """A batch is decided message by message and forwarded whole."""
     batch = [

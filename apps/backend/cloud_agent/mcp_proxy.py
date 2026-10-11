@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 
 from cloud_agent.mcp.jsonrpc import INVALID_REQUEST, PARSE_ERROR
@@ -125,10 +126,20 @@ def _unique_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _finite(text: str) -> float:
-    """Read a JSON number with a fraction or exponent, refusing overflow to infinity."""
+    """Read a finite number only when its JSON encoding preserves its decimal value."""
     value = float(text)
     if not math.isfinite(value):
         raise UnreadableRequest(PARSE_ERROR, f"invalid JSON: {text} is not a finite number")
+    try:
+        unchanged = Decimal(text) == Decimal(str(value))
+    except InvalidOperation:
+        unchanged = False
+    if not unchanged:
+        raise UnreadableRequest(
+            PARSE_ERROR,
+            "this number cannot be relayed without changing its value; "
+            "send an exactly representable number or a string if the tool accepts one",
+        )
     return value
 
 
@@ -157,8 +168,11 @@ def parse_request(body: bytes) -> Any:
     replaces invalid UTF-8 or keeps the last of two repeated members would
     otherwise run a call other than the one decided. So the body has to be
     UTF-8, every member name unique within its object, and the members a
-    decision reads spelled exactly. A number that would overflow to infinity is
-    refused too, because :func:`canonical_request` could not write it back.
+    decision reads spelled exactly. Fractional or exponent numbers must retain
+    their exact decimal value when re-encoded: overflow, underflow and rounding
+    are refused rather than forwarding different arguments or a different id.
+    Ordinary values such as ``0.1`` still travel, because their JSON encoding
+    retains that decimal value despite the float's binary representation.
     """
     try:
         document = json.loads(

@@ -22,6 +22,7 @@ empty means nothing is reachable.
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 
 import pytest
 
@@ -156,6 +157,48 @@ def test_an_ambiguous_body_is_refused_by_both_decisions(body: bytes, code: int):
         parse_request(body)
     assert caught.value.code == code
     assert plan_request(body, _server()).rejection["error"]["code"] == code
+
+
+@pytest.mark.parametrize(
+    "number",
+    [
+        "9007199254740993.0",
+        "9007199254740993e0",
+        "0.12345678901234567890",
+        "1.0000000000000001",
+        "1e-400",
+        "-1e-400",
+        "0e999999999999999999999999999999",
+    ],
+)
+def test_a_number_changed_by_reencoding_is_refused(number: str):
+    """An exact-number upstream must never receive rounded arguments."""
+    body = (
+        '{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+        '"params":{"name":"get_issue","arguments":{"n":' + number + "}}}"
+    ).encode()
+
+    with pytest.raises(UnreadableRequest, match="without changing its value") as caught:
+        parse_request(body)
+
+    assert caught.value.code == -32700
+    assert plan_request(body, _server()).rejection["error"]["code"] == -32700
+
+
+@pytest.mark.parametrize(
+    "number", ["0.1", "-0.1", "1E2", "1.2300000", "9007199254740992.0", "1e-20", "5e-324"]
+)
+def test_a_number_with_an_unchanged_decimal_value_still_travels(number: str):
+    """Compare exact decimal values, since float comparisons would hide rounding."""
+    body = (
+        '{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+        '"params":{"name":"get_issue","arguments":{"n":' + number + "}}}"
+    ).encode()
+
+    canonical = canonical_request(parse_request(body))
+
+    assert json.loads(canonical, parse_float=Decimal) == json.loads(body, parse_float=Decimal)
+    assert not plan_request(canonical, _server()).rejected
 
 
 def test_a_member_this_relay_does_not_read_keeps_its_own_spelling():
