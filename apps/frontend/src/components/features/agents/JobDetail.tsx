@@ -2415,20 +2415,6 @@ export function JobDetail({
                         onRemove={attachments.remove}
                         disabled={contextLost || submitting}
                       />
-                      <PromptRewrite
-                        key={threadId}
-                        compact
-                        value={followUp}
-                        model={model}
-                        disabled={
-                          contextLost || submitting || goalCommand.busy || /^\s*\//.test(followUp)
-                        }
-                        onActiveChange={setRewriting}
-                        onApply={(prompt) => {
-                          setFollowUp(prompt);
-                          followUpBox.current?.focus();
-                        }}
-                      />
                       <div className="flex flex-wrap items-center gap-0.5 border-t border-gray-100/90 px-2 py-1 dark:border-white/5">
                         <ComposerPlusMenu
                           onFiles={attachments.add}
@@ -2465,6 +2451,21 @@ export function JobDetail({
                             />
                           </>
                         ) : null}
+                        <PromptRewrite
+                          key={threadId}
+                          compact
+                          inline
+                          value={followUp}
+                          model={model}
+                          disabled={
+                            contextLost || submitting || goalCommand.busy || /^\s*\//.test(followUp)
+                          }
+                          onActiveChange={setRewriting}
+                          onApply={(prompt) => {
+                            setFollowUp(prompt);
+                            followUpBox.current?.focus();
+                          }}
+                        />
                         <ComposerMessageActions
                           label={t(isActive ? 'composer.queue' : 'composer.send')}
                           title={t(isActive ? 'composer.queueHint' : 'composer.sendHint')}

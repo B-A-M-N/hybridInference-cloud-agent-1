@@ -9,6 +9,8 @@ interface PromptRewriteProps {
   model: string;
   disabled?: boolean;
   compact?: boolean;
+  // Share the composer toolbar; expanded content occupies a full row below it.
+  inline?: boolean;
   onApply: (prompt: string) => void;
   onActiveChange?: (active: boolean) => void;
 }
@@ -18,6 +20,7 @@ export function PromptRewrite({
   model,
   disabled = false,
   compact = false,
+  inline = false,
   onApply,
   onActiveChange,
 }: PromptRewriteProps) {
@@ -156,9 +159,9 @@ export function PromptRewrite({
   const complete = questions.length > 0 && answers.every((answer) => answer.trim());
 
   return (
-    <div className={compact ? 'space-y-2 px-3 pb-1' : 'space-y-3 px-4 pb-3'}>
+    <div className={inline ? 'contents' : compact ? 'space-y-2 px-3 pb-1' : 'space-y-3 px-4 pb-3'}>
       <div
-        className={`flex flex-wrap items-center ${compact ? 'gap-x-3 gap-y-1' : 'gap-x-4 gap-y-2'}`}
+        className={`flex max-w-full flex-wrap items-center ${compact ? 'gap-x-3 gap-y-1' : 'gap-x-4 gap-y-2'}`}
       >
         <button
           ref={trigger}
@@ -210,7 +213,7 @@ export function PromptRewrite({
         <section
           aria-labelledby={`${id}-heading`}
           aria-busy={pending}
-          className="space-y-3 rounded-xl border border-gray-200 bg-gray-50/70 p-4 dark:border-white/10 dark:bg-white/[0.03]"
+          className={`${inline ? 'order-last w-full' : ''} space-y-3 rounded-xl border border-gray-200 bg-gray-50/70 p-4 dark:border-white/10 dark:bg-white/[0.03]`}
           onKeyDown={(event) => {
             // The enclosing composer owns submit and stop shortcuts. These
             // textareas collect answers and never submit the task itself.
@@ -273,12 +276,18 @@ export function PromptRewrite({
         </section>
       ) : null}
       {error ? (
-        <p role="alert" className="text-xs text-red-600 dark:text-red-400">
+        <p
+          role="alert"
+          className={`${inline ? 'order-last w-full px-2 py-1' : ''} text-xs text-red-600 dark:text-red-400`}
+        >
           {t(error)}
         </p>
       ) : null}
       {appliedPrompt === value ? (
-        <p role="status" className="text-xs text-gray-500 dark:text-gray-400">
+        <p
+          role="status"
+          className={`${inline ? 'order-last w-full px-2 py-1' : ''} text-xs text-gray-500 dark:text-gray-400`}
+        >
           {t('rewrite.applied')}
         </p>
       ) : null}
