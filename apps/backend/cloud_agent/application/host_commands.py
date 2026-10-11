@@ -133,6 +133,13 @@ class HostCommands:
         before = await self.repository.get_host(host=host)
         if before is None:
             raise HostCommandError(404, f"Unknown runner host: {host}")
-        if await self.repository.set_host_slots_desired(host=host, slots=slots) == "unknown":
+        outcome = await self.repository.set_host_slots_desired(host=host, slots=slots)
+        if outcome == "unknown":
             raise HostCommandError(404, f"Unknown runner host: {host}")
+        if outcome == "autoscaling_managed":
+            raise HostCommandError(
+                409,
+                f"{host!r} is managed by CloudLab autoscaling; its slot target is derived "
+                "from fresh capacity telemetry and cannot be edited directly.",
+            )
         return before

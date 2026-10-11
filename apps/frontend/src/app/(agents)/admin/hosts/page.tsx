@@ -743,6 +743,14 @@ function HostsView() {
                   const open = expanded === name;
                   const panelId = panelIdFor(name);
                   const concurrency = concurrencyFacts(host);
+                  const allocationId = computeInventory?.hosts.find(
+                    (item) => item.host === host.host,
+                  )?.allocation_id;
+                  const autoscalingManaged =
+                    computeInventory?.allocations
+                      .find((allocation) => allocation.id === allocationId)
+                      ?.blocked_reasons.some((reason) => reason.code === 'autoscaling_managed') ??
+                    false;
                   const sandboxTitle = [
                     facts.sandboxes.explanation,
                     ...facts.sandboxes.reasons.map(reasonLabel),
@@ -812,43 +820,51 @@ function HostsView() {
                                 on hover. Nothing else is written under the
                                 field: the number is the host's number, and an
                                 operator who wants a different one types it. */}
-                          <form
-                            className="mt-2 flex min-w-0 max-w-full flex-wrap items-center gap-2"
-                            onSubmit={(event) => {
-                              event.preventDefault();
-                              const value = Number(new FormData(event.currentTarget).get('slots'));
-                              if (
-                                !Number.isInteger(value) ||
-                                value < MIN_HOST_SLOTS ||
-                                value > MAX_HOST_SLOTS
-                              ) {
-                                return;
-                              }
-                              void handleSlots(host.host, value);
-                            }}
-                          >
-                            <input
-                              key={`${host.host}:${concurrency.requested ?? 'default'}`}
-                              name="slots"
-                              type="number"
-                              min={MIN_HOST_SLOTS}
-                              max={MAX_HOST_SLOTS}
-                              step={1}
-                              defaultValue={
-                                concurrency.requested ?? host.slots_total ?? MIN_HOST_SLOTS
-                              }
-                              aria-label={`Turns at once for ${name}`}
-                              disabled={busy}
-                              className="ui-input min-h-9 w-20 min-w-0 max-w-full px-2.5 py-1.5 tabular-nums [@media(pointer:coarse)]:min-h-11"
-                            />
-                            <button
-                              type="submit"
-                              disabled={busy}
-                              className="ui-button ui-button-secondary min-h-9 px-3 py-1.5 text-xs [@media(pointer:coarse)]:min-h-11"
+                          {autoscalingManaged ? (
+                            <p className="mt-2 max-w-[15rem] text-[11px] text-gray-500 dark:text-gray-400">
+                              Slots are managed from fresh capacity by CloudLab auto-scaling.
+                            </p>
+                          ) : (
+                            <form
+                              className="mt-2 flex min-w-0 max-w-full flex-wrap items-center gap-2"
+                              onSubmit={(event) => {
+                                event.preventDefault();
+                                const value = Number(
+                                  new FormData(event.currentTarget).get('slots'),
+                                );
+                                if (
+                                  !Number.isInteger(value) ||
+                                  value < MIN_HOST_SLOTS ||
+                                  value > MAX_HOST_SLOTS
+                                ) {
+                                  return;
+                                }
+                                void handleSlots(host.host, value);
+                              }}
                             >
-                              Apply
-                            </button>
-                          </form>
+                              <input
+                                key={`${host.host}:${concurrency.requested ?? 'default'}`}
+                                name="slots"
+                                type="number"
+                                min={MIN_HOST_SLOTS}
+                                max={MAX_HOST_SLOTS}
+                                step={1}
+                                defaultValue={
+                                  concurrency.requested ?? host.slots_total ?? MIN_HOST_SLOTS
+                                }
+                                aria-label={`Turns at once for ${name}`}
+                                disabled={busy}
+                                className="ui-input min-h-9 w-20 min-w-0 max-w-full px-2.5 py-1.5 tabular-nums [@media(pointer:coarse)]:min-h-11"
+                              />
+                              <button
+                                type="submit"
+                                disabled={busy}
+                                className="ui-button ui-button-secondary min-h-9 px-3 py-1.5 text-xs [@media(pointer:coarse)]:min-h-11"
+                              >
+                                Apply
+                              </button>
+                            </form>
+                          )}
                           {concurrency.launchError !== null && (
                             <span
                               role="alert"

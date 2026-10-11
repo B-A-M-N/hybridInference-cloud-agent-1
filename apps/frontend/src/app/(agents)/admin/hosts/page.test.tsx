@@ -23,8 +23,12 @@ import type { AgentAccessApi } from '@/lib/api/session';
 import { APIError } from '@/lib/utils/errors';
 
 const auth = vi.hoisted(() => ({ role: 'admin', access: undefined as AgentAccessApi | undefined }));
+const computeServerInventory = vi.hoisted(() => ({
+  current: null as Record<string, unknown> | null,
+}));
 beforeEach(() => {
   auth.access = { allowed: true, permissions: ['agent.use', 'agent.admin'] };
+  computeServerInventory.current = null;
 });
 
 vi.mock('@/components/providers', () => ({
@@ -74,24 +78,36 @@ import AdminHostsPage from './page';
 
 // Exercise the parent's Host commands and polling through its scoped render contract.
 // ComputeResources.test verifies the real drawer selection and navigation.
-vi.mock('./ComputeResources', () => ({
-  default: ({
+vi.mock('./ComputeResources', async () => {
+  const { useEffect } = await vi.importActual<typeof import('react')>('react');
+
+  function MockComputeResources({
     renderHostControls,
     serverGroups,
     placementControl,
+    onInventory,
   }: {
     placementControl?: ReactNode;
     renderHostControls: (hosts: string[]) => ReactNode;
     serverGroups?: { members: { host: string }[] }[];
-  }) => (
-    <section aria-label="Servers">
-      {placementControl}
-      {renderHostControls(
-        (serverGroups ?? []).flatMap((server) => server.members.map((host) => host.host)),
-      )}
-    </section>
-  ),
-}));
+    onInventory?: (snapshot: Record<string, unknown>) => void;
+  }) {
+    const inventorySnapshot = computeServerInventory.current;
+    useEffect(() => {
+      if (inventorySnapshot !== null) onInventory?.(inventorySnapshot);
+    }, [inventorySnapshot, onInventory]);
+    return (
+      <section aria-label="Servers">
+        {placementControl}
+        {renderHostControls(
+          (serverGroups ?? []).flatMap((server) => server.members.map((host) => host.host)),
+        )}
+      </section>
+    );
+  }
+
+  return { default: MockComputeResources };
+});
 
 const mocked = {
   list: getAgentRunnerHosts as unknown as ReturnType<typeof vi.fn>,
@@ -693,6 +709,39 @@ describe('capacity columns', () => {
       'title',
       expect.stringContaining('next heartbeat'),
     );
+  });
+
+  it('keeps autoscaler-managed slot capacity visible without a manual editor', async () => {
+    computeServerInventory.current = {
+      allocations: [
+        {
+          id: 'resource-a',
+          name: 'Autoscaled CloudLab',
+          nodes: [{ hosts: ['runner-a'] }],
+          blocked_reasons: [
+            {
+              code: 'autoscaling_managed',
+              message: 'Lifecycle is managed by CloudLab autoscaling.',
+            },
+          ],
+        },
+      ],
+      hosts: [{ host: 'runner-a', allocation_id: 'resource-a' }],
+      active_host: null,
+      observed_at: '2026-10-11T12:34:31Z',
+    };
+    mocked.list.mockResolvedValue(pool([host({ slots_total: 4, slots_used: 1 })]));
+    renderPage();
+
+    const explanation = await screen.findByText(
+      'Slots are managed from fresh capacity by CloudLab auto-scaling.',
+    );
+    const row = screen.getByRole('rowheader', { name: 'runner-a' }).closest('tr')!;
+    expect(within(row).getByText('1 / 4 in use')).toBeInTheDocument();
+    expect(explanation).toBeInTheDocument();
+    expect(within(row).queryByLabelText('Turns at once for runner-a')).not.toBeInTheDocument();
+    expect(within(row).queryByRole('button', { name: 'Apply' })).not.toBeInTheDocument();
+    expect(mocked.slots).not.toHaveBeenCalled();
   });
 
   it('offers no reset: the saved number is simply the number the host has', async () => {
