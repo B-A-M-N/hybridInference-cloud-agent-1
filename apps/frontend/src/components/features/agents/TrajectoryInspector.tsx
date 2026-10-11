@@ -6,7 +6,7 @@
 // and keeps its own scroll position, so reading a step never means losing the
 // place in the turn the reader was scanning.
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type Ref } from 'react';
 
 import { getAgentAttemptTelemetry, type AgentJobApi } from '@/lib/api/agents';
 
@@ -225,6 +225,9 @@ export function TrajectoryInspector({
   onClose: () => void;
   onOpenGitDiff: () => void;
 }) {
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => closeButtonRef.current?.focus(), []);
+
   const byKey = useMemo(() => new Map(steps.map((step) => [step.key, step])), [steps]);
   const step = selection.kind === 'step' ? byKey.get(selection.stepKey) : undefined;
   const toolStep = step?.kind === 'tool' ? step : undefined;
@@ -249,7 +252,7 @@ export function TrajectoryInspector({
               Run details
             </h2>
           </div>
-          <CloseButton onClose={onClose} />
+          <CloseButton buttonRef={closeButtonRef} onClose={onClose} />
         </header>
         <TabStrip
           idPrefix={`run-${selection.jobId}`}
@@ -277,7 +280,7 @@ export function TrajectoryInspector({
           <h2 className="min-w-0 flex-1 text-[13px] font-semibold text-gray-900 dark:text-gray-50">
             Step details
           </h2>
-          <CloseButton onClose={onClose} />
+          <CloseButton buttonRef={closeButtonRef} onClose={onClose} />
         </header>
         <div className="p-4">
           <EmptyNote>This step is no longer in the stored trajectory.</EmptyNote>
@@ -319,7 +322,7 @@ export function TrajectoryInspector({
             {step.label}
           </h2>
         </div>
-        <CloseButton onClose={onClose} />
+        <CloseButton buttonRef={closeButtonRef} onClose={onClose} />
       </header>
       {hiddenByQuery ? (
         <p
@@ -377,9 +380,16 @@ export function TrajectoryInspector({
   );
 }
 
-function CloseButton({ onClose }: { onClose: () => void }) {
+function CloseButton({
+  buttonRef,
+  onClose,
+}: {
+  buttonRef: Ref<HTMLButtonElement>;
+  onClose: () => void;
+}) {
   return (
     <button
+      ref={buttonRef}
       type="button"
       onClick={onClose}
       aria-label="Close details"

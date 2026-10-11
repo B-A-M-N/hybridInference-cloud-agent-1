@@ -58,10 +58,12 @@ import { BackToBottom, TurnRail } from './TurnNavigator';
 import { TerminalWorkspace } from './TerminalWorkspace';
 import { ThreadStatsBar } from './ThreadStatsBar';
 import { LiveAgentStatus } from './LiveAgentStatus';
+import { ActivityIcon, ActivityWindow } from './ActivityWindow';
+import { buildActivityOverview, hasActivityOverview } from './activityOverview';
 import { ThreadActions } from './ThreadActions';
 import { McpSessionPanel } from './mcp/McpSessionPanel';
 import { NativeQuestionPrompt } from './NativeQuestionPrompt';
-import type { AgentJob } from './types';
+import type { AgentEvent, AgentJob } from './types';
 import type { AgentJobApi, AgentJobEventApi, AgentThreadEventApi } from '@/lib/api/agents';
 import { AttemptTurnFooter } from './AttemptTurnFooter';
 import { TrajectoryView } from './TrajectoryView';
@@ -620,6 +622,8 @@ export function JobDetail({
   useEffect(() => setTitle(job.title), [job.title, job.threadId]);
   const [tab, setTab] = useState<'chat' | 'trajectory'>('chat');
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const [activityOpen, setActivityOpen] = useState(true);
+  const activityToggleRef = useRef<HTMLButtonElement>(null);
   const workspaceTabs = useWorkspaceTabs(userId, job, threadJobs);
   const workspaceTab = workspaceTabs.selected;
   // The right region holds either the workspace or one selected step, never
@@ -882,6 +886,7 @@ export function JobDetail({
     inspectorTriggerRef.current = null;
     // Escape closes the panel, not the reader's place in it.
     if (trigger && document.contains(trigger)) trigger.focus();
+    else if (trigger) activityToggleRef.current?.focus();
   }, []);
 
   // Remember what opened the panel so closing it can hand focus back.
@@ -1201,6 +1206,53 @@ export function JobDetail({
   const currentTurn = describeCurrentTurn(job, { attemptNo, currentAttemptNo });
   const threadMessages = currentTurn.messages;
   const visibleEvents = currentTurn.events;
+  const activityOverview = useMemo(() => buildActivityOverview(visibleEvents), [visibleEvents]);
+  const hasActivity = hasActivityOverview(activityOverview);
+  const activityVisible = activityOpen && hasActivity && !workspaceOpen && inspector === null;
+  const closeActivity = useCallback(() => {
+    setActivityOpen(false);
+    activityToggleRef.current?.focus();
+  }, []);
+  const toggleActivity = useCallback(() => {
+    if (activityVisible) {
+      closeActivity();
+      return;
+    }
+    setWorkspaceOpen(false);
+    setInspector(null);
+    setFocusJobId(null);
+    setActivityOpen(true);
+  }, [activityVisible, closeActivity]);
+  const activityStepKey = useCallback(
+    (event: Extract<AgentEvent, { kind: 'tool_use' }>) =>
+      trajectorySteps.find(
+        (step) =>
+          step.kind === 'tool' &&
+          step.jobId === job.id &&
+          event.sourceEventId !== undefined &&
+          step.sourceEvents.some((source) => source.id === event.sourceEventId),
+      )?.key,
+    [job.id, trajectorySteps],
+  );
+  useEffect(() => {
+    if (!activityVisible) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (
+        event.key !== 'Escape' ||
+        event.repeat ||
+        event.defaultPrevented ||
+        !target?.closest('#job-activity-window') ||
+        target.closest('input, textarea, select, [contenteditable="true"], [role="dialog"]')
+      )
+        return;
+      event.preventDefault();
+      event.stopPropagation();
+      closeActivity();
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [activityVisible, closeActivity]);
   const currentRewindAnchor = job.historyTurns
     ? [...job.historyTurns].reverse().find((turn) => turn.forkable)?.jobId
     : undefined;
@@ -1272,6 +1324,7 @@ export function JobDetail({
     scroll.unavailableKey === null ? (announcedTurn ?? '') : t('turnNavigation.unavailable');
   const showRail =
     tab === 'chat' &&
+    !activityVisible &&
     navigationEntries.length > 1 &&
     scroll.viewport.width >= RAIL_MIN_COLUMN_WIDTH &&
     scroll.viewport.readingHeight >= RAIL_MIN_READING_HEIGHT &&
@@ -1326,8 +1379,8 @@ export function JobDetail({
             <span>{t('sessionArchive.badge')}</span>
           </div>
         ) : null}
-        <div className="flex w-full items-center gap-3 py-3.5 pr-14">
-          <div className="min-w-0 flex-1">
+        <div className="flex w-full flex-wrap items-center gap-2 py-3.5 pr-14 sm:flex-nowrap sm:gap-3">
+          <div className="min-w-0 basis-full flex-1 sm:basis-auto">
             <h1 className="truncate text-base font-semibold tracking-[-0.01em] text-gray-950 dark:text-gray-50">
               {title}
             </h1>
@@ -1374,6 +1427,24 @@ export function JobDetail({
               </button>
             ))}
           </nav>
+          {hasActivity ? (
+            <button
+              ref={activityToggleRef}
+              type="button"
+              onClick={toggleActivity}
+              aria-label={activityVisible ? 'Hide tasks and subagents' : 'Show tasks and subagents'}
+              aria-expanded={activityVisible}
+              aria-controls="job-activity-window"
+              title="Tasks and subagents"
+              className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md border transition-colors focus-visible:outline-crimson ${
+                activityVisible
+                  ? 'border-gray-300 bg-gray-100 text-gray-900 dark:border-white/20 dark:bg-white/10 dark:text-gray-100'
+                  : 'border-gray-200 bg-white text-gray-500 hover:bg-gray-100 dark:border-white/10 dark:bg-gray-900 dark:text-gray-400 dark:hover:bg-white/5'
+              }`}
+            >
+              <ActivityIcon />
+            </button>
+          ) : null}
           {job.diffFiles.length ? (
             <button
               type="button"
@@ -1491,6 +1562,7 @@ export function JobDetail({
                       <HistoryTurn
                         key={turn.key}
                         turn={turn}
+                        showActivityDetails={false}
                         rewindAnchorJobId={rewindAnchorJobId}
                         busy={forking}
                         onFork={
@@ -1633,6 +1705,7 @@ export function JobDetail({
                     <div aria-label="Agent activity" className="mt-2">
                       <EventList
                         events={visibleEvents}
+                        showActivityDetails={false}
                         jobId={job.id}
                         renderEvent={(event, index, blockKey) => (
                           <EventRow
@@ -1969,6 +2042,32 @@ export function JobDetail({
               </div>
             </div>
           </div>
+
+          {activityVisible ? (
+            <div
+              className="pointer-events-none absolute inset-x-0 top-0 z-10 flex justify-end px-4 pt-4 sm:px-6"
+              style={{ bottom: composerHeight + 64 }}
+            >
+              <aside
+                id="job-activity-window"
+                role="region"
+                aria-label="Tasks and subagents"
+                className="pointer-events-auto flex max-h-full w-full max-w-sm flex-col overflow-hidden rounded-xl bg-white/95 shadow-xl ring-1 ring-gray-200/90 backdrop-blur-sm dark:bg-gray-900/95 dark:ring-white/10"
+              >
+                <ActivityWindow
+                  overview={activityOverview}
+                  turnNo={currentTurn.displayNo}
+                  attemptNo={attemptNo}
+                  onClose={closeActivity}
+                  stepKeyForEvent={activityStepKey}
+                  onSelectStep={(stepKey) => {
+                    setTab('trajectory');
+                    selectStep(stepKey);
+                  }}
+                />
+              </aside>
+            </div>
+          ) : null}
 
           {/* Above the transcript, below its composer and the page header:
               the design's order is body, rail preview, composer, header. */}

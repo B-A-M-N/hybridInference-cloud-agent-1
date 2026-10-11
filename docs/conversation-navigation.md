@@ -63,12 +63,18 @@ the newest turn.
 
 ## Tasks and subagents
 
-Chat displays recorded plans and task tools as checklists, including each item's
-status and task dependencies when available. Delegation tools show the assigned
-work, agent type, model, and an expandable prompt. The card distinguishes the
-tool call's result from the subagent's reported state, so a successful background
-launch does not imply the delegated work has finished. Call details retain the
-recorded arguments and output.
+The floating **Tasks and subagents** window shows the selected turn and attempt's
+latest recorded task list and delegated agents without narrowing the conversation.
+It appears only when at least one task or subagent has meaningful recorded data;
+an empty Tasks or Subagents section is omitted. Close it to read underneath, and
+use the header toggle to reopen it.
+
+Task checklists include recorded status and dependencies. Subagent cards show
+assigned work, agent type, model, expandable prompts, and the latest reported
+agent state. A successful background launch does not imply that delegated work
+has finished. Chat keeps compact tool calls with expandable recorded arguments
+and output. **View subagent execution** opens the source call in the trajectory
+inspector when its stored record is available.
 
 Trajectory marks explicitly recorded child activity with a **Subagent** label.
 Select a delegation step to browse its child steps in the inspector, or use

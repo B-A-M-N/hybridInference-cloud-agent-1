@@ -196,6 +196,52 @@ describe('grouped tool calls', () => {
     expect(groups[1].compareDocumentPosition(plan) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
+  it('keeps activity calls compact and their raw details available when an overview owns them', () => {
+    const events: AgentEvent[] = [
+      {
+        kind: 'tool_use',
+        tool: 'Task',
+        detail: 'Review tests',
+        sourceEventId: 3,
+        input: { description: 'Review tests', prompt: 'Check the tests.' },
+        output: ['Started in background.'],
+        resultState: 'received',
+      },
+      {
+        kind: 'tool_use',
+        tool: 'update_plan',
+        detail: 'Plan',
+        sourceEventId: 6,
+        input: { plan: [{ step: 'Review', status: 'in_progress' }] },
+        output: ['Plan updated.'],
+        resultState: 'received',
+      },
+    ];
+
+    render(
+      <EventList
+        events={events}
+        jobId={jobId}
+        renderEvent={renderEvent}
+        showActivityDetails={false}
+      />,
+    );
+
+    expect(screen.queryByRole('region', { name: 'Subagent activity' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Task activity' })).not.toBeInTheDocument();
+    const chips = within(screen.getByRole('list', { name: 'Tool calls' })).getAllByRole('listitem');
+    expect(chips.map((chip) => chip.getAttribute('data-block-key'))).toEqual([
+      'ajob_1:e3',
+      'ajob_1:e6',
+    ]);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Show tool calls' }));
+    expect(screen.getByText('Started in background.')).toBeVisible();
+    expect(screen.getByText('Plan updated.')).toBeVisible();
+    expect(screen.getByText(/"description": "Review tests"/)).toBeVisible();
+    expect(screen.getByText(/"step": "Review"/)).toBeVisible();
+  });
+
   it('groups child calls only with calls from the same recorded delegation', () => {
     render(
       <EventList

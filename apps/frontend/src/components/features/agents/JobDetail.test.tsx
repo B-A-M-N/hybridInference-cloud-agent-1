@@ -2130,6 +2130,218 @@ describe('JobDetail', () => {
     expect(screen.getByText(stateNote)).toHaveClass('[overflow-wrap:anywhere]');
   });
 
+  describe('the floating tasks and subagents window', () => {
+    function activityEvents(
+      subject = 'Implement the activity window',
+      attemptNo = 1,
+    ): AgentJob['events'] {
+      return [
+        {
+          kind: 'tool_use',
+          tool: 'update_plan',
+          detail: 'Update the plan',
+          input: {
+            plan: [
+              { step: 'Inspect the transcript events', status: 'completed' },
+              { step: subject, status: 'in_progress' },
+            ],
+          },
+          resultState: 'received',
+          output: ['Plan updated'],
+          attemptNo,
+          sourceEventId: attemptNo * 10 + 1,
+        },
+        {
+          kind: 'tool_use',
+          tool: 'spawn_agent',
+          id: `spawn-review-${attemptNo}`,
+          detail: 'Review window interactions',
+          input: {
+            task_name: 'Review window interactions',
+            message: 'Check focus restoration and floating layout.',
+          },
+          output: [
+            JSON.stringify({
+              agent_id: `agent-ui-review-${attemptNo}`,
+              agents_states: { [`agent-ui-review-${attemptNo}`]: { status: 'running' } },
+            }),
+          ],
+          resultState: 'received',
+          attemptNo,
+          sourceEventId: attemptNo * 10 + 2,
+        },
+      ];
+    }
+
+    it('floats over the transcript and renders only populated sections', () => {
+      const view = render(<JobDetail job={makeJob({ events: activityEvents() })} />);
+
+      let activity = screen.getByRole('region', { name: 'Tasks and subagents' });
+      expect(activity).toHaveAttribute('id', 'job-activity-window');
+      expect(activity.parentElement).toHaveClass('absolute', 'pointer-events-none');
+      expect(activity).toHaveClass('pointer-events-auto', 'max-w-sm', 'shadow-xl');
+      expect(screen.getByRole('region', { name: 'Task progress' })).toBeVisible();
+      expect(within(activity).getByRole('region', { name: 'Tasks overview' })).toBeVisible();
+      expect(within(activity).getByRole('region', { name: 'Subagents overview' })).toBeVisible();
+      const details = within(activity).getByRole('region', {
+        name: 'Tasks and subagents details',
+      });
+      expect(details).toHaveAttribute('tabindex', '0');
+      details.focus();
+      expect(details).toHaveFocus();
+      expect(within(activity).getByText('Implement the activity window')).toBeVisible();
+      expect(within(activity).getAllByText('agent-ui-review-1')).toHaveLength(2);
+      expect(screen.queryByRole('region', { name: 'Task activity' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('region', { name: 'Subagent activity' })).not.toBeInTheDocument();
+
+      view.rerender(<JobDetail job={makeJob({ events: activityEvents().slice(0, 1) })} />);
+      activity = screen.getByRole('region', { name: 'Tasks and subagents' });
+      expect(within(activity).getByRole('region', { name: 'Tasks overview' })).toBeVisible();
+      expect(
+        within(activity).queryByRole('region', { name: 'Subagents overview' }),
+      ).not.toBeInTheDocument();
+
+      view.rerender(<JobDetail job={makeJob({ events: activityEvents().slice(1) })} />);
+      activity = screen.getByRole('region', { name: 'Tasks and subagents' });
+      expect(
+        within(activity).queryByRole('region', { name: 'Tasks overview' }),
+      ).not.toBeInTheDocument();
+      expect(within(activity).getByRole('region', { name: 'Subagents overview' })).toBeVisible();
+    });
+
+    it('omits the toggle and window when recorded activity is empty', () => {
+      const job = makeJob({
+        events: [
+          {
+            kind: 'tool_use',
+            tool: 'update_plan',
+            detail: 'Empty plan',
+            input: { plan: [] },
+            attemptNo: 1,
+          },
+          {
+            kind: 'tool_use',
+            tool: 'list_agents',
+            detail: 'No agents',
+            input: {},
+            output: [JSON.stringify({ agents_states: {} })],
+            resultState: 'received',
+            attemptNo: 1,
+          },
+        ],
+      });
+      const view = render(<JobDetail job={job} />);
+
+      expect(screen.queryByRole('region', { name: 'Tasks and subagents' })).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole('button', { name: /tasks and subagents/i }),
+      ).not.toBeInTheDocument();
+
+      view.rerender(<JobDetail job={{ ...job, events: activityEvents() }} />);
+      expect(screen.getByRole('region', { name: 'Tasks and subagents' })).toBeVisible();
+
+      view.rerender(<JobDetail job={job} />);
+      expect(screen.queryByRole('region', { name: 'Tasks and subagents' })).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole('button', { name: /tasks and subagents/i }),
+      ).not.toBeInTheDocument();
+    });
+
+    it('closes, reopens, and returns focus without stopping the task', () => {
+      render(<JobDetail job={makeJob({ events: activityEvents() })} />);
+
+      const toggle = screen.getByRole('button', { name: 'Hide tasks and subagents' });
+      expect(toggle).toHaveAttribute('aria-controls', 'job-activity-window');
+      expect(toggle).toHaveAttribute('aria-expanded', 'true');
+      const close = within(screen.getByRole('region', { name: 'Tasks and subagents' })).getByRole(
+        'button',
+        { name: 'Close tasks and subagents' },
+      );
+      close.focus();
+      fireEvent.click(close);
+      expect(screen.queryByRole('region', { name: 'Tasks and subagents' })).not.toBeInTheDocument();
+      expect(toggle).toHaveFocus();
+
+      fireEvent.click(toggle);
+      const reopenedClose = within(
+        screen.getByRole('region', { name: 'Tasks and subagents' }),
+      ).getByRole('button', { name: 'Close tasks and subagents' });
+      reopenedClose.focus();
+      fireEvent.keyDown(reopenedClose, { key: 'Escape' });
+      expect(screen.queryByRole('region', { name: 'Tasks and subagents' })).not.toBeInTheDocument();
+      expect(toggle).toHaveFocus();
+      expect(cancelAgentJob).not.toHaveBeenCalled();
+    });
+
+    it('follows the selected attempt instead of mixing activity', () => {
+      render(
+        <JobDetail
+          job={makeJob({
+            state: 'done',
+            currentAttemptNo: 2,
+            attempts: [
+              { no: 1, status: 'superseded' },
+              { no: 2, status: 'finished' },
+            ],
+            events: [
+              ...activityEvents('Superseded implementation plan', 1),
+              ...activityEvents('Current implementation plan', 2),
+            ],
+          })}
+        />,
+      );
+
+      let activity = screen.getByRole('region', { name: 'Tasks and subagents' });
+      expect(within(activity).getByText('Current implementation plan')).toBeVisible();
+      expect(
+        within(activity).queryByText('Superseded implementation plan'),
+      ).not.toBeInTheDocument();
+      fireEvent.click(screen.getByText('Execution history (2)'));
+      fireEvent.click(screen.getByRole('button', { name: '1 · superseded' }));
+      activity = screen.getByRole('region', { name: 'Tasks and subagents' });
+      expect(within(activity).getByText('Superseded implementation plan')).toBeVisible();
+      expect(within(activity).queryByText('Current implementation plan')).not.toBeInTheDocument();
+    });
+
+    it('moves focus into subagent execution details and restores it to the toggle', () => {
+      render(
+        <JobDetail
+          job={makeJob({ events: activityEvents() })}
+          events={
+            [
+              {
+                id: 12,
+                job_id: 'ajob_1',
+                turn_no: 1,
+                attempt_id: 1,
+                seq: 1,
+                event_type: 'tool_use',
+                payload: {
+                  id: 'spawn-review-1',
+                  name: 'spawn_agent',
+                  input: { task_name: 'Review window interactions' },
+                },
+                created_at: '2026-10-10T12:00:00.000Z',
+              },
+            ] as never
+          }
+        />,
+      );
+
+      const viewExecution = screen.getByRole('button', { name: 'View subagent execution' });
+      viewExecution.focus();
+      fireEvent.click(viewExecution);
+
+      const closeDetails = screen.getByRole('button', { name: 'Close details' });
+      expect(screen.getByRole('region', { name: 'Step details' })).toBeVisible();
+      expect(closeDetails).toHaveFocus();
+
+      fireEvent.keyDown(closeDetails, { key: 'Escape' });
+      expect(screen.queryByRole('region', { name: 'Step details' })).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Hide tasks and subagents' })).toHaveFocus();
+    });
+  });
+
   it('keeps the task as the default view behind an icon-only, accessible workspace toggle', () => {
     render(<JobDetail job={makeJob()} />);
 
