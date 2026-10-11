@@ -107,9 +107,11 @@ async def test_project_memory_upgrade_preserves_owner_scope_controls_and_round_t
         for _ in range(2):
             apply_migrations(config, "0053_project_memory")
             async with pool.acquire() as conn:
-                assert await conn.fetchval("SELECT version_num FROM alembic_version") == (
-                    "0053_project_memory"
-                )
+                versions = await conn.fetch("SELECT version_num FROM alembic_version")
+                assert {row["version_num"] for row in versions} == {
+                    "0046_admin_sandbox_trajectory",
+                    "0053_project_memory",
+                }
                 rows = await conn.fetch(
                     "SELECT * FROM agent_project_memories ORDER BY user_id, repo"
                 )
@@ -754,10 +756,11 @@ async def test_project_memory_offline_upgrade_refuses_populated_overlay_data(poo
                 async with conn.transaction():
                     await conn.execute(rendered)
             assert await conn.fetchval("SELECT to_regclass('agent_project_memories')") is None
-            assert (
-                await conn.fetchval("SELECT version_num FROM alembic_version")
-                == "0052_memory_overrides"
-            )
+            versions = await conn.fetch("SELECT version_num FROM alembic_version")
+            assert {row["version_num"] for row in versions} == {
+                "0046_admin_sandbox_trajectory",
+                "0052_memory_overrides",
+            }
             # Leave a schema-valid profile for the normal online cleanup.
             await conn.execute("UPDATE agent_user_memories SET overrides = '[]'::jsonb")
     finally:

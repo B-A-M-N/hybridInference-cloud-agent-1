@@ -132,50 +132,53 @@ class PendingMessageRepository(Protocol):
         """
         ...
 
-    async def return_to_queue(self, *, message_id: str, revision: int) -> dict[str, Any] | None:
+    async def claim_send_now_handoff(
+        self, *, message_id: str, revision: int, lease_seconds: float
+    ) -> dict[str, Any] | None:
+        """Lease one running turn's handoff at the revision the caller saw.
+
+        The lease is durable and reclaimable after ``lease_seconds``. Only one
+        control-plane process can win a revision; the result names the message,
+        target job, and exact current attempt it owns.
+        """
+        ...
+
+    async def recoverable_send_now_handoffs(
+        self, *, lease_seconds: float, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """List unclaimed or expired handoffs whose target attempt is running."""
+        ...
+
+    async def mark_send_now_handoff_accepted(
+        self, *, message_id: str, revision: int, attempt_id: int
+    ) -> bool:
+        """Record acceptance only for the exact current live, unexpired attempt."""
+        ...
+
+    async def expired_send_now_handoffs(
+        self, *, wait_seconds: float, lease_seconds: float, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """List reclaimable handoffs whose turn ended or never acquired a host."""
+        ...
+
+    async def return_to_queue(
+        self,
+        *,
+        message_id: str,
+        revision: int,
+        last_error: str | None = None,
+        attempt_id: int | None = None,
+    ) -> dict[str, Any] | None:
         """Put a message its turn will not take back in line, as it was.
 
         ``revision`` is the one it took when it was chosen to send now; a
         message the queue has moved on from since — taken by the turn, or
-        already back in line — is left alone. Returns the message as it now
-        is, or ``None`` when it is gone.
-        """
-        ...
-
-    async def list_sending_handoffs(self) -> list[dict[str, Any]]:
-        """Messages in ``sending`` tied to a turn, for a restarted control plane.
-
-        The wait that hands one to a host is not durable. The row is: ``sending``
-        with ``send_now_job_id`` set, and not yet marked handed off.
-        """
-        ...
-
-    async def send_now_handoff_pending(self, *, message_id: str, revision: int) -> bool:
-        """True when this revision is still ``sending`` and the host has not accepted it.
-
-        Called while this process holds the send-now session lock. Another
-        process may have injected already and left the row ``sending``; that
-        mark is what makes this return false.
-        """
-        ...
-
-    async def mark_send_now_handed(self, *, message_id: str, revision: int) -> bool:
-        """Record that this revision was accepted by the host.
-
-        A later restart skips it. The row stays ``sending`` until the turn
-        takes the message; without this mark, recovery would inject it again.
-        """
-        ...
-
-    async def try_acquire_send_now_lock(self, message_id: str) -> Any | None:
-        """A dedicated connection holding this message's session lock, or ``None``.
-
-        The lock is ``pg_try_advisory_lock`` on ``'send-now:' || message_id``,
-        session-level, so it lasts until the connection closes and not until a
-        transaction commits. The connection is opened beside the pool, not
-        checked out of it: returning a pooled connection early would drop the
-        lock or leave it on the next borrower. The caller closes it when the
-        handoff finishes. A caller that gets ``None`` does not inject.
+        already back in line — is left alone. ``last_error`` persists a
+        recovery status for a request whose original HTTP response is gone.
+        ``attempt_id`` additionally fences a live broker answer to the exact
+        live, unexpired attempt it addressed. If that attempt expires during
+        broker I/O, recovery owns the later target-ended requeue. Returns the
+        message as it now is, or ``None`` when it is gone.
         """
         ...
 

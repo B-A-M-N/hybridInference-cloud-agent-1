@@ -71,7 +71,7 @@ class PostgresCredentialQueries:
                 WHERE a.id = $1
                   AND a.lease_generation = $2
                   AND a.status = 'running'
-                  AND a.lease_expires_at > NOW()
+                  AND a.lease_expires_at > clock_timestamp()
                   AND j.id = $3
                   AND j.current_attempt_id = a.id
                   AND j.state = 'running'

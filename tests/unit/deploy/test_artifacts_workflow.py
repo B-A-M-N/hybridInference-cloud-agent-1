@@ -372,7 +372,7 @@ def _runs_the_image_jobs(path: str) -> bool:
             "CHANGED_PATH": path,
         }
         subprocess.run(
-            ["bash", "-c", script],
+            ["bash", "--noprofile", "--norc", "-c", script],
             env=environment,
             cwd=temporary,
             check=True,

@@ -8,6 +8,10 @@ import { absoluteTime, inputClass, remainingTime } from './compute-ui';
 
 type InventoryHost = ComputeServerSnapshot['hosts'][number];
 
+function isTerminalAllocation(allocation: ComputeAllocation): boolean {
+  return allocation.state === 'terminated' || allocation.state === 'absent';
+}
+
 export interface ComputeServerGroup {
   name: string;
   host?: { host: string };
@@ -170,8 +174,11 @@ export default function ComputeServerList({
 }) {
   const [search, setSearch] = useState('');
   const [providerFilter, setProviderFilter] = useState('');
+  const [showReleased, setShowReleased] = useState(false);
+  const currentAllocations = allocations.filter((allocation) => !isTerminalAllocation(allocation));
+  const releasedCount = allocations.length - currentAllocations.length;
   const linkedHosts = new Set(
-    allocations.flatMap((allocation) => allocation.nodes.flatMap((node) => node.hosts)),
+    currentAllocations.flatMap((allocation) => allocation.nodes.flatMap((node) => node.hosts)),
   );
   const existingHosts: InventoryHost[] =
     inventory?.hosts.filter((host) => !host.allocation_id && !linkedHosts.has(host.host)) ??
@@ -210,7 +217,7 @@ export default function ComputeServerList({
       .map((host) => ({ ...host, name: host.host, members: [host] })),
   );
   const matches = (text: string) => text.toLowerCase().includes(search.toLowerCase());
-  const shownAllocations = allocations.filter(
+  const shownAllocations = (showReleased ? allocations : currentAllocations).filter(
     (allocation) =>
       (!providerFilter || allocation.provider_id === providerFilter) &&
       matches(
@@ -229,7 +236,10 @@ export default function ComputeServerList({
 
   return (
     <div className="ui-card overflow-hidden rounded-2xl">
-      {(allocations.length + existingServers.length > 5 || search || providerFilter) && (
+      {(currentAllocations.length + existingServers.length > 5 ||
+        releasedCount > 0 ||
+        search ||
+        providerFilter) && (
         <div className="flex flex-wrap gap-2 border-b border-border bg-surface-muted/60 p-4">
           <input
             aria-label="Search servers"
@@ -253,6 +263,16 @@ export default function ComputeServerList({
             ))}
             <option value="unmanaged">Existing server</option>
           </select>
+          {releasedCount > 0 && (
+            <button
+              type="button"
+              aria-pressed={showReleased}
+              className="ml-auto rounded-lg px-3 py-2 text-xs font-medium text-muted hover:bg-surface-hover hover:text-foreground"
+              onClick={() => setShowReleased((current) => !current)}
+            >
+              {showReleased ? 'Hide released' : `Show released (${releasedCount})`}
+            </button>
+          )}
         </div>
       )}
       {!inventory && !serverGroups ? (
@@ -261,11 +281,14 @@ export default function ComputeServerList({
         <p className="p-10 text-center text-sm text-muted">
           {search || providerFilter
             ? 'No matching servers.'
-            : 'Add your first server to run sandboxes.'}
+            : releasedCount > 0 && !showReleased
+              ? 'No active servers. Released servers are hidden.'
+              : 'Add your first server to run sandboxes.'}
         </p>
       ) : (
         <ul aria-label="Server inventory" className="divide-y divide-border">
           {shownAllocations.map((allocation) => {
+            const terminal = isTerminalAllocation(allocation);
             const hostIds = allocation.nodes.flatMap((node) => node.hosts);
             const hosts = (inventory?.hosts ?? []).filter(
               (host) => host.allocation_id === allocation.id || hostIds.includes(host.host),
@@ -285,11 +308,11 @@ export default function ComputeServerList({
                 }
                 sandboxes={hosts.reduce((total, host) => total + host.retained_groups, 0)}
                 lease={
-                  allocation.expires_at
+                  !terminal && allocation.expires_at
                     ? { expiresAt: allocation.expires_at, nodes: allocation.nodes.length }
                     : undefined
                 }
-                warning={allocation.blocked_reasons[0]?.message}
+                warning={terminal ? undefined : allocation.blocked_reasons[0]?.message}
                 onManage={() => onManage(allocation.id)}
               />
             );

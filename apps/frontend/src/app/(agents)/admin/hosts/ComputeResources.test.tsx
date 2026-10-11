@@ -1218,6 +1218,104 @@ describe('resource dashboard', () => {
     expect(within(oldRow).getByText('3 sandboxes')).toBeInTheDocument();
   });
 
+  it('hides released resources without letting their old host bindings conceal live inventory', async () => {
+    const staleObservation = {
+      code: 'observation_stale',
+      message: 'Resource observation needs refresh.',
+    };
+    vi.mocked(api.getComputeServers).mockResolvedValue({
+      allocations: [
+        allocation({
+          id: 'current-resource',
+          name: 'Current CloudLab',
+          external_id: 'current-experiment',
+          expires_at: '2099-10-05T08:00:00Z',
+        }),
+        allocation({
+          id: 'released-resource',
+          name: 'Released CloudLab',
+          state: 'terminated',
+          external_id: 'released-experiment',
+          expires_at: '2000-10-05T08:00:00Z',
+          blocked_reasons: [staleObservation],
+          nodes: [{ id: 'released-node', name: 'old node', hosts: ['old-host'] }],
+        }),
+        allocation({
+          id: 'absent-resource',
+          name: 'Absent CloudLab',
+          state: 'absent',
+          external_id: 'absent-experiment',
+          expires_at: '2000-10-05T08:00:00Z',
+          blocked_reasons: [staleObservation],
+          nodes: [],
+        }),
+      ],
+      hosts: [
+        {
+          host: 'old-host',
+          status: 'online',
+          retained_groups: 3,
+          allocation_id: null,
+          compute_node_id: null,
+        },
+      ],
+      active_host: null,
+      observed_at: '2026-10-04T08:00:00Z',
+    });
+
+    render(<ComputeResources onHostsChanged={vi.fn()} />);
+
+    const table = await screen.findByRole('list', { name: 'Server inventory' });
+    expect(within(table).getAllByRole('listitem')).toHaveLength(2);
+    expect(screen.getByRole('listitem', { name: 'Current CloudLab' })).toBeInTheDocument();
+    expect(screen.getByRole('listitem', { name: 'old-host' })).toBeInTheDocument();
+    expect(screen.queryByRole('listitem', { name: 'Released CloudLab' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('listitem', { name: 'Absent CloudLab' })).not.toBeInTheDocument();
+
+    const showReleased = screen.getByRole('button', { name: 'Show released (2)' });
+    expect(showReleased).toHaveAttribute('aria-pressed', 'false');
+    fireEvent.click(showReleased);
+
+    const released = screen.getByRole('listitem', { name: 'Released CloudLab' });
+    const absent = screen.getByRole('listitem', { name: 'Absent CloudLab' });
+    expect(within(released).getByText('Released')).toBeInTheDocument();
+    expect(within(absent).getByText('Disconnected')).toBeInTheDocument();
+    expect(screen.queryByText(staleObservation.message)).not.toBeInTheDocument();
+    expect(screen.queryByText('Deadline passed')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Hide released' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Hide released' }));
+    expect(screen.queryByRole('listitem', { name: 'Released CloudLab' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('listitem', { name: 'Absent CloudLab' })).not.toBeInTheDocument();
+  });
+
+  it('describes an empty active inventory when every resource is released', async () => {
+    vi.mocked(api.getComputeServers).mockResolvedValue({
+      allocations: [
+        allocation({
+          id: 'released-resource',
+          name: 'Released CloudLab',
+          state: 'terminated',
+        }),
+      ],
+      hosts: [],
+      active_host: null,
+      observed_at: '2026-10-04T08:00:00Z',
+    });
+
+    render(<ComputeResources onHostsChanged={vi.fn()} />);
+
+    expect(
+      await screen.findByText('No active servers. Released servers are hidden.'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('Add your first server to run sandboxes.')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Show released (1)' }));
+    expect(screen.getByRole('listitem', { name: 'Released CloudLab' })).toBeInTheDocument();
+  });
+
   it('opens one management panel for all enrollments of the selected machine', async () => {
     const controls = vi.fn((hosts: string[]) => <div>Controls: {hosts.join(', ')}</div>);
     vi.mocked(api.getComputeServers).mockResolvedValue({

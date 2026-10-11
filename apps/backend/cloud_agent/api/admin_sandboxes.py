@@ -12,9 +12,12 @@ from cloud_agent.admin_sandboxes import (
     AdminSandboxDetail,
     AdminSandboxList,
     AdminSandboxStopRequest,
+    AdminSandboxTrajectoryPage,
     SandboxCursor,
     SandboxStateFilter,
+    SandboxTrajectoryCursor,
     sandbox_cursor_scope,
+    sandbox_trajectory_cursor_scope,
 )
 from cloud_agent.api.deps import (
     get_client_ip,
@@ -216,6 +219,28 @@ async def list_admin_sandboxes(
     if state == "running":
         return await queries.list_running(cursor=parsed, limit=limit)
     return await queries.list_sandboxes(cursor=parsed, limit=limit, state=state)
+
+
+@router.get("/{sandbox_id}/trajectory", response_model=AdminSandboxTrajectoryPage)
+async def get_admin_sandbox_trajectory(
+    sandbox_id: str,
+    cursor: str | None = Query(None, max_length=2048),
+    limit: int = Query(100, ge=1, le=200),
+    queries: AdminSandboxQueries = Depends(get_admin_sandbox_queries),
+) -> AdminSandboxTrajectoryPage:
+    """Read one sandbox's newest-first lifecycle without private session content."""
+    try:
+        parsed = decode_cursor(
+            cursor,
+            SandboxTrajectoryCursor,
+            sandbox_trajectory_cursor_scope(sandbox_id),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    trajectory = await queries.trajectory(sandbox_id, cursor=parsed, limit=limit)
+    if trajectory is None:
+        raise HTTPException(status_code=404, detail="Sandbox not found.")
+    return trajectory
 
 
 @router.get("/{sandbox_id}", response_model=AdminSandboxDetail)

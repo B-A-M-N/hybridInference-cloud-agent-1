@@ -82,20 +82,38 @@ class SnapshotRepository(Protocol):
         """
         ...
 
-    async def defer_snapshot_publish(self, *, snapshot_id: int, detail: str) -> bool:
-        """Return a publication to captured and try again 30 seconds later.
+    async def renew_snapshot_publish_claim(
+        self, *, snapshot_id: int, expected_publish_attempt_count: int
+    ) -> bool:
+        """Keep a live publisher's fenced claim out of stalled recovery.
 
-        Used when entitlement cannot be checked, and when a credential mint,
-        git exchange, or PR call failed transiently. Those effects are
-        idempotent. Increments ``publish_attempt_count``. The caller fails the
-        snapshot instead once that count reaches the attempt budget. Retains
-        the patch and included turns, and bounds the visible detail to 2,000
-        characters. Returns ``False`` unless the snapshot is still ``publishing``.
+        The attempt count is the ownership generation: a publisher whose
+        claim was reclaimed cannot renew the replacement's heartbeat.
+        """
+        ...
+
+    async def defer_snapshot_publish(
+        self, *, snapshot_id: int, expected_publish_attempt_count: int, detail: str
+    ) -> bool:
+        """Spend one durable retry after a transient publication failure.
+
+        The deterministic branch and PR are reconciled on replay, including
+        after uncertain remote effects. Retains the immutable artifact and its
+        included turns. Exhaustion makes the snapshot terminal and deliberately
+        preserves the lineage block for manual review rather than publishing a
+        later workspace epoch out of order. The expected attempt count fences a
+        publisher whose stalled claim was already reclaimed. Returns ``False``
+        unless this exact claim is still ``publishing``.
         """
         ...
 
     async def record_snapshot_publish(
-        self, *, snapshot_id: int, pr_url: str, commit_sha: str
+        self,
+        *,
+        snapshot_id: int,
+        expected_publish_attempt_count: int,
+        pr_url: str,
+        commit_sha: str,
     ) -> bool:
         """Advance one group lineage and wait for object-only base import.
 
@@ -105,8 +123,10 @@ class SnapshotRepository(Protocol):
         """
         ...
 
-    async def fail_snapshot_publish(self, *, snapshot_id: int, detail: str) -> None:
-        """Retain a rejected group artifact without failing included turns."""
+    async def fail_snapshot_publish(
+        self, *, snapshot_id: int, expected_publish_attempt_count: int, detail: str
+    ) -> None:
+        """Retain a rejected group artifact if this publisher still owns its claim."""
         ...
 
     async def pending_snapshot_base_import(self) -> dict[str, Any] | None:

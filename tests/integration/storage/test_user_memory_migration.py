@@ -34,9 +34,14 @@ async def test_user_memory_upgrade_defaults_constraints_and_round_trip_preserve_
         for _ in range(2):
             apply_migrations(config, "0047_user_memory")
             async with pool.acquire() as conn:
-                assert await conn.fetchval("SELECT version_num FROM alembic_version") == (
-                    "0047_user_memory"
-                )
+                versions = {
+                    row["version_num"]
+                    for row in await conn.fetch("SELECT version_num FROM alembic_version")
+                }
+                assert versions == {
+                    "0046_admin_sandbox_trajectory",
+                    "0047_user_memory",
+                }
                 assert await conn.fetchval("SELECT COUNT(*) FROM agent_user_memories") == 0
                 row = await conn.fetchrow(
                     "INSERT INTO agent_user_memories (user_id, portrait) "

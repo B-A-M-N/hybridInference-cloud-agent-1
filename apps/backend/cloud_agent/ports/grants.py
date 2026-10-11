@@ -53,7 +53,7 @@ class GrantRepository(Protocol):
         alive and spending, and the gateway could not catch it — it has no
         attempt state to check. Every predicate here is load-bearing:
         ``status = 'running'`` drops superseded and finished attempts, and
-        ``lease_expires_at > NOW()`` drops the ones whose lease died before the
+        ``lease_expires_at > clock_timestamp()`` drops the ones whose lease died before the
         reaper noticed.
 
         ``lease_generation`` rides along because the renewal pass may have to

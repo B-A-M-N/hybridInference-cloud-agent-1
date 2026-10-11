@@ -45,7 +45,10 @@ from cloud_agent.logging_utils import get_logger
 from cloud_agent.mcp import config_import, github_oauth, launch, oauth
 from cloud_agent.mcp.authorization import binding_from_selection
 from cloud_agent.mcp.binding_aliases import binding_aliases
-from cloud_agent.mcp.errors import McpCredentialWriteRejected
+from cloud_agent.mcp.errors import (
+    McpConnectionCreateConflict,
+    McpCredentialWriteRejected,
+)
 from cloud_agent.mcp.host import HostError, McpHost, SessionKey
 from cloud_agent.mcp.http_body import IDENTITY_ENCODING_HEADERS
 from cloud_agent.mcp.launch import LaunchPlanError, ManagedLaunchPolicy, build_launch_plan
@@ -707,6 +710,16 @@ async def create_connection(
         # column means "which preset this came from", and a value that names
         # nothing makes the provenance unreadable.
         raise _bad_request(f"unknown template: {template!r}")
+
+    if body.connector_id is not None:
+        if location is not ExecutionLocation.USER_CONNECTOR:
+            raise _bad_request("connector_id is only valid when location is 'user-connector'")
+        connector = await _require_connector(
+            job_store, connector_id=body.connector_id, user_id=user["user_id"]
+        )
+        if str(connector.get("status")) == "revoked":
+            raise _conflict("that connector has been revoked")
+
     # Encrypt before the insert. A missing key used to commit the row and then
     # return 503, and the next attempt inserted another credential-less row.
     access_token_ciphertext, auth_config_patch = _optional_static_credential(
@@ -738,6 +751,8 @@ async def create_connection(
             auth_config_patch=auth_config_patch,
             sealed_launch_spec=sealed_launch_spec,
         )
+    except McpConnectionCreateConflict as exc:
+        raise _conflict(str(exc)) from exc
     except McpCredentialWriteRejected as exc:
         raise _conflict("the credential could not be stored with this connection") from exc
     logger.info(

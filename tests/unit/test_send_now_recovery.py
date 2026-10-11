@@ -1,265 +1,163 @@
-"""A restarted control plane picks up a send-now that was still waiting.
-
-The wait lives in one process. The row does not: ``sending`` with a turn named
-on it is enough to start that wait again. Two callers cannot both inject, and
-a row that is no longer that handoff is left where it is.
-"""
+"""The durable send-now consumer stays bounded inside the attempt reaper."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
-import pytest
-
-from cloud_agent.api import turns
-
-JOB = "ajob_1"
-MESSAGE = {
-    "id": "apmsg_1",
-    "thread_id": "athr_1",
-    "user_id": "u1",
-    "revision": 2,
-    "prompt": "and mind the tests",
-    "state": "sending",
-    "send_now_job_id": JOB,
-}
-
-
-class _Conn:
-    def __init__(self, held: set[str], message_id: str) -> None:
-        self.held = held
-        self.message_id = message_id
-        self.closed = False
-
-    async def close(self) -> None:
-        self.closed = True
-        self.held.discard(self.message_id)
+from cloud_agent.application import send_now
+from cloud_agent.workers import attempts
 
 
 class _Pending:
-    """The queue and the session lock, without a database."""
-
-    def __init__(self, messages: list[dict]) -> None:
-        self.messages = messages
-        self.held: set[str] = set()
-        self.conns: list[_Conn] = []
-        self.returned: list[tuple[str, int]] = []
-        self.handed: list[tuple[str, int]] = []
-
-    async def queue_state(self, *, thread_id: str, user_id: str) -> dict:
-        return {"messages": list(self.messages)}
-
-    async def list_sending_handoffs(self) -> list[dict]:
-        return [
-            dict(row)
-            for row in self.messages
-            if row["state"] == "sending"
-            and row.get("send_now_job_id")
-            and not row.get("send_now_handed_off")
+    def __init__(self, count: int) -> None:
+        self.candidates = [
+            {"message_id": f"apmsg_{index}", "revision": 2} for index in range(count)
         ]
+        self.expired_called = False
 
-    async def send_now_handoff_pending(self, *, message_id: str, revision: int) -> bool:
-        return any(
-            row["id"] == message_id
-            and int(row["revision"]) == revision
-            and row["state"] == "sending"
-            and not row.get("send_now_handed_off")
-            for row in self.messages
-        )
+    async def recoverable_send_now_handoffs(self, **_kwargs):
+        return list(self.candidates)
 
-    async def mark_send_now_handed(self, *, message_id: str, revision: int) -> bool:
-        self.handed.append((message_id, revision))
-        for row in self.messages:
-            if (
-                row["id"] == message_id
-                and int(row["revision"]) == revision
-                and row["state"] == "sending"
-            ):
-                row["send_now_handed_off"] = True
-                return True
-        return False
-
-    async def try_acquire_send_now_lock(self, message_id: str) -> _Conn | None:
-        if message_id in self.held:
-            return None
-        self.held.add(message_id)
-        conn = _Conn(self.held, message_id)
-        self.conns.append(conn)
-        return conn
-
-    async def return_to_queue(self, *, message_id: str, revision: int) -> None:
-        self.returned.append((message_id, revision))
+    async def expired_send_now_handoffs(self, **_kwargs):
+        self.expired_called = True
+        return []
 
 
-class _Store:
-    def __init__(self, messages: list[dict] | None = None) -> None:
-        self.job = {"id": JOB, "state": "queued", "current_attempt_id": None}
-        self.pending = _Pending(list(messages if messages is not None else [dict(MESSAGE)]))
-        self.pending_messages = self.pending
-        self.conversation_queries = SimpleNamespace(get_job=self._get_job)
+async def test_recovery_bounds_concurrent_broker_calls(monkeypatch):
+    pending = _Pending(7)
+    store = SimpleNamespace(pending_messages=pending)
+    active = maximum = 0
 
-    async def _get_job(self, job_id: str) -> dict:
-        return dict(self.job)
+    async def deliver(_store, *, message_id, revision):
+        nonlocal active, maximum
+        assert message_id.startswith("apmsg_") and revision == 2
+        active += 1
+        maximum = max(maximum, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return send_now.HandoffOutcome(claimed=True, accepted=True)
 
+    monkeypatch.setattr(send_now, "HAND_OVER_RECOVERY_CONCURRENCY", 2)
+    monkeypatch.setattr(send_now, "HAND_OVER_RECOVERY_DEADLINE_S", 1.0)
+    monkeypatch.setattr(send_now, "deliver_handoff", deliver)
 
-@pytest.fixture(autouse=True)
-async def _reset_handoffs():
-    turns._completed_send_now.clear()
-    leftover = list(turns._hand_overs)
-    for task in leftover:
-        task.cancel()
-    for task in leftover:
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await task
-    turns._hand_overs.clear()
-    yield
-    turns._completed_send_now.clear()
-    leftover = list(turns._hand_overs)
-    for task in leftover:
-        task.cancel()
-    for task in leftover:
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await task
-    turns._hand_overs.clear()
+    result = await send_now.recover_handoffs(store)  # type: ignore[arg-type]
+
+    assert result == {"claimed": 7, "accepted": 7, "requeued": 0}
+    assert maximum == 2
+    assert pending.expired_called
 
 
-async def test_recovery_starts_a_handoff_for_a_sending_row(monkeypatch):
-    monkeypatch.setattr(turns, "HAND_OVER_POLL_S", 0.01)
-    handed = []
+async def test_recovery_deadline_cancels_broker_calls_before_the_next_pass(monkeypatch):
+    pending = _Pending(3)
+    store = SimpleNamespace(pending_messages=pending)
+    cancelled = 0
 
-    async def hand_over(_store, *, thread_id, attempt_id, message):
-        handed.append((thread_id, attempt_id, message["id"]))
-        return None
+    async def deliver(_store, *, message_id, revision):
+        nonlocal cancelled
+        assert message_id.startswith("apmsg_") and revision == 2
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled += 1
 
-    monkeypatch.setattr(turns, "_hand_over", hand_over)
-    queued = {**MESSAGE, "id": "apmsg_2", "state": "queued", "send_now_job_id": None}
-    untied = {**MESSAGE, "id": "apmsg_3", "state": "sending", "send_now_job_id": None}
-    store = _Store([dict(MESSAGE), queued, untied])
+    monkeypatch.setattr(send_now, "HAND_OVER_RECOVERY_CONCURRENCY", 2)
+    monkeypatch.setattr(send_now, "HAND_OVER_RECOVERY_DEADLINE_S", 0.01)
+    monkeypatch.setattr(send_now, "deliver_handoff", deliver)
 
-    await turns.recover_send_now_handoffs(store, gateway=None, app_credentials=None, signal=None)
+    result = await asyncio.wait_for(
+        send_now.recover_handoffs(store),  # type: ignore[arg-type]
+        1,
+    )
 
-    assert handed == []
-    assert len(turns._hand_overs) == 1
-    store.job.update(state="running", current_attempt_id=7)
-    await asyncio.wait_for(asyncio.gather(*list(turns._hand_overs)), 1)
-
-    assert handed == [("athr_1", 7, "apmsg_1")]
-    assert store.pending.conns[0].closed
-    await turns.recover_send_now_handoffs(store, gateway=None, app_credentials=None, signal=None)
-    await asyncio.sleep(0.05)
-    assert handed == [("athr_1", 7, "apmsg_1")]
+    assert result == {"claimed": 0, "accepted": 0, "requeued": 0}
+    assert cancelled == 2
+    assert pending.expired_called
 
 
-async def test_a_caller_that_loses_the_lock_does_not_inject(monkeypatch):
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    handed: list[int] = []
+async def test_handoff_recovery_runs_at_startup_and_each_pass(monkeypatch):
+    recovered_twice = asyncio.Event()
+    recoveries = 0
 
-    async def hand_over(_store, *, thread_id, attempt_id, message):
-        handed.append(attempt_id)
-        entered.set()
-        await release.wait()
-        return None
+    async def recover(_store):
+        nonlocal recoveries
+        recoveries += 1
+        if recoveries == 2:
+            recovered_twice.set()
 
-    monkeypatch.setattr(turns, "_hand_over", hand_over)
-    store = _Store()
-    first = asyncio.create_task(
-        turns.run_send_now_handoff(
-            store,
-            thread_id="athr_1",
-            job_id=JOB,
-            message=dict(MESSAGE),
-            gateway=None,
-            app_credentials=None,
-            attempt_id=7,
+    monkeypatch.setattr(attempts, "recover_handoffs", recover)
+    task = asyncio.create_task(
+        attempts._recover_send_now_handoffs(
+            SimpleNamespace(),  # type: ignore[arg-type]
+            interval_seconds=0.001,
         )
     )
-    await asyncio.wait_for(entered.wait(), 1)
     try:
-        second = await turns.run_send_now_handoff(
-            store,
-            thread_id="athr_1",
-            job_id=JOB,
-            message=dict(MESSAGE),
-            gateway=None,
-            app_credentials=None,
-            attempt_id=7,
-        )
-        assert second.injected is False
-        assert handed == [7]
+        await asyncio.wait_for(recovered_twice.wait(), 1)
     finally:
-        release.set()
-    first_result = await asyncio.wait_for(first, 1)
-    assert first_result.injected is True
-    assert handed == [7]
-    assert store.pending.returned == []
-    assert store.pending.held == set()
-    assert all(conn.closed for conn in store.pending.conns)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert recoveries == 2
 
 
-@pytest.mark.parametrize(
-    ("state", "revision"),
-    [("queued", 2), ("sending", 9)],
-    ids=["back-in-line", "revision-moved"],
-)
-async def test_a_row_that_is_no_longer_sending_is_left_alone(monkeypatch, state, revision):
-    handed = []
+async def test_hung_handoff_recovery_does_not_delay_attempt_reaping(monkeypatch):
+    recovery_started = asyncio.Event()
+    recovery_cancelled = asyncio.Event()
+    attempt_reaped = asyncio.Event()
 
-    async def hand_over(_store, *, thread_id, attempt_id, message):
-        handed.append(message["id"])
-        return None
+    async def recover(_store):
+        recovery_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            recovery_cancelled.set()
 
-    monkeypatch.setattr(turns, "_hand_over", hand_over)
-    current = {**MESSAGE, "state": state, "revision": revision}
-    store = _Store([current])
+    async def reap_expired(*, max_attempts):
+        assert max_attempts == attempts.MAX_ATTEMPTS
+        attempt_reaped.set()
+        return []
 
-    result = await turns.run_send_now_handoff(
-        store,
-        thread_id="athr_1",
-        job_id=JOB,
-        message=dict(MESSAGE),
-        gateway=None,
-        app_credentials=None,
-        attempt_id=7,
+    monkeypatch.setattr(attempts, "recover_handoffs", recover)
+    monkeypatch.setattr(attempts, "_reconcile_settled_terminals", AsyncMock())
+    monkeypatch.setattr(attempts, "_reap_offline_hosts", AsyncMock())
+    monkeypatch.setattr(attempts, "_reap_lapsed_residencies", AsyncMock())
+    monkeypatch.setattr(attempts, "run_goal_wakeups", AsyncMock())
+    monkeypatch.setattr(attempts, "_cleanup_reaped_shared_residencies", AsyncMock())
+    monkeypatch.setattr(attempts, "settle_waiting_queues", AsyncMock())
+    store = SimpleNamespace(
+        host_pool=object(),
+        residency=object(),
+        attachments=SimpleNamespace(purge_stale_staged=AsyncMock(return_value=0)),
+        attempt_commands=SimpleNamespace(
+            sweep_queued_follow_ups=AsyncMock(),
+            reap_expired=reap_expired,
+        ),
+        goals=SimpleNamespace(
+            sweep_goal_scheduling=AsyncMock(return_value={"rearmed": [], "stalled": []})
+        ),
+        snapshot=SimpleNamespace(
+            reap_stalled_sandbox_snapshot_captures=AsyncMock(return_value=[]),
+            reap_stalled_snapshot_publishes=AsyncMock(return_value=[]),
+        ),
+        session_fork=SimpleNamespace(reap_stalled_session_forks=AsyncMock(return_value=[])),
     )
-
-    assert result.injected is False
-    assert handed == []
-    assert store.pending.returned == []
-    assert store.pending.conns[0].closed
-    assert (MESSAGE["id"], MESSAGE["revision"]) not in turns._completed_send_now
-
-
-async def test_a_restart_does_not_inject_a_message_the_host_already_accepted(monkeypatch):
-    handed: list[str] = []
-
-    async def hand_over(_store, *, thread_id, attempt_id, message):
-        handed.append(message["id"])
-        return None
-
-    monkeypatch.setattr(turns, "_hand_over", hand_over)
-    accepted = {**MESSAGE, "send_now_handed_off": True}
-    store = _Store([accepted])
-
-    await turns.recover_send_now_handoffs(store, gateway=None, app_credentials=None, signal=None)
-    assert turns._hand_overs == set()
-
-    # The caller still holds the dict from before the mark. The re-read under
-    # the lock is what refuses it. An empty completion set is a new process.
-    result = await turns.run_send_now_handoff(
-        store,
-        thread_id="athr_1",
-        job_id=JOB,
-        message=dict(MESSAGE),
-        gateway=None,
-        app_credentials=None,
-        attempt_id=7,
+    task = asyncio.create_task(
+        attempts.reap_expired_attempts(  # type: ignore[arg-type]
+            store,
+            interval_seconds=0.001,
+        )
     )
+    try:
+        await asyncio.wait_for(recovery_started.wait(), 1)
+        await asyncio.wait_for(attempt_reaped.wait(), 1)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
-    assert result.injected is False
-    assert handed == []
-    assert store.pending.handed == []
-    assert store.pending.conns[0].closed
-    assert turns._completed_send_now == set()
+    assert recovery_cancelled.is_set()

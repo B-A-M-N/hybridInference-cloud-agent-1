@@ -2405,6 +2405,144 @@
         "title": "AdminSandboxStopRequest",
         "type": "object"
       },
+      "AdminSandboxTrajectoryEvent": {
+        "description": "One content-free retained-sandbox lifecycle observation.",
+        "properties": {
+          "actor_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor Id"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "details": {
+            "additionalProperties": true,
+            "title": "Details",
+            "type": "object"
+          },
+          "event_type": {
+            "title": "Event Type",
+            "type": "string"
+          },
+          "from_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "From State"
+          },
+          "generation": {
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "source": {
+            "enum": [
+              "system",
+              "admin",
+              "host",
+              "migration"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "to_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "To State"
+          }
+        },
+        "required": [
+          "id",
+          "generation",
+          "event_type",
+          "source",
+          "created_at"
+        ],
+        "title": "AdminSandboxTrajectoryEvent",
+        "type": "object"
+      },
+      "AdminSandboxTrajectoryPage": {
+        "description": "Current tombstone and bounded membership context beside a stable event page.",
+        "properties": {
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/AdminSandboxTrajectoryEvent"
+            },
+            "title": "Events",
+            "type": "array"
+          },
+          "member_history_count": {
+            "minimum": 0.0,
+            "title": "Member History Count",
+            "type": "integer"
+          },
+          "member_history_truncated": {
+            "title": "Member History Truncated",
+            "type": "boolean"
+          },
+          "members": {
+            "items": {
+              "$ref": "#/components/schemas/AdminSandboxMember"
+            },
+            "maxItems": 128,
+            "title": "Members",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "sandbox": {
+            "$ref": "#/components/schemas/AdminSandbox"
+          }
+        },
+        "required": [
+          "sandbox",
+          "members",
+          "member_history_count",
+          "member_history_truncated",
+          "events",
+          "observed_at"
+        ],
+        "title": "AdminSandboxTrajectoryPage",
+        "type": "object"
+      },
       "AdminStep": {
         "description": "One model request, with the turn and the run of it that made it.",
         "properties": {
@@ -16418,6 +16556,11 @@
             "title": "Activation Generation",
             "type": "integer"
           },
+          "residency_generation": {
+            "minimum": 1.0,
+            "title": "Residency Generation",
+            "type": "integer"
+          },
           "sandbox_generation": {
             "minimum": 1.0,
             "title": "Sandbox Generation",
@@ -16426,7 +16569,8 @@
         },
         "required": [
           "sandbox_generation",
-          "activation_generation"
+          "activation_generation",
+          "residency_generation"
         ],
         "title": "WorkerSandboxAdmissionRequest",
         "type": "object"
@@ -16596,6 +16740,11 @@
             "title": "Process Generation",
             "type": "integer"
           },
+          "residency_generation": {
+            "minimum": 1.0,
+            "title": "Residency Generation",
+            "type": "integer"
+          },
           "sandbox_generation": {
             "minimum": 1.0,
             "title": "Sandbox Generation",
@@ -16605,6 +16754,7 @@
         "required": [
           "sandbox_generation",
           "activation_generation",
+          "residency_generation",
           "process_generation"
         ],
         "title": "WorkerSandboxProcessRequest",
@@ -16850,6 +17000,11 @@
             ],
             "title": "Native Session Id"
           },
+          "residency_generation": {
+            "minimum": 1.0,
+            "title": "Residency Generation",
+            "type": "integer"
+          },
           "sandbox_generation": {
             "minimum": 1.0,
             "title": "Sandbox Generation",
@@ -16859,6 +17014,7 @@
         "required": [
           "sandbox_generation",
           "activation_generation",
+          "residency_generation",
           "context_status"
         ],
         "title": "WorkerSandboxSettleRequest",
@@ -22323,6 +22479,91 @@
         "summary": "Stop Admin Sandbox"
       }
     },
+    "/admin/agent/sandboxes/{sandbox_id}/trajectory": {
+      "get": {
+        "description": "Read one sandbox's newest-first lifecycle without private session content.",
+        "operationId": "get_admin_sandbox_trajectory_admin_agent_sandboxes__sandbox_id__trajectory_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "title": "Sandbox Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 2048,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminSandboxTrajectoryPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Admin Sandbox Trajectory"
+      }
+    },
     "/admin/agent/server-preflights": {
       "post": {
         "description": "Queue read-only connection and deployment prerequisite checks.",
@@ -23823,7 +24064,7 @@
     },
     "/v1/agent/integrations/gitlab/connections/{connection_id}": {
       "delete": {
-        "description": "Revoke GitLab best-effort, then always remove the local credential.",
+        "description": "Conditionally remove the local credential and revoke its original token.",
         "operationId": "disconnect_gitlab_integration_v1_agent_integrations_gitlab_connections__connection_id__delete",
         "parameters": [
           {

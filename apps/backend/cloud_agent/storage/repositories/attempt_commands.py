@@ -15,7 +15,6 @@ import asyncpg
 
 from cloud_agent.domain.execution import (
     ATTEMPT_ABORTED,
-    ATTEMPT_RUNNING,
     CANCELLED,
     EVENT_ATTEMPT_ABORTED,
     EVENT_ATTEMPT_SUPERSEDED,
@@ -78,6 +77,25 @@ class PostgresAttemptCommands:
     def __init__(self, pool: asyncpg.Pool) -> None:
         """Wrap the pool the control plane already owns."""
         self._pool = pool
+
+    @staticmethod
+    async def _lock_live_attempt(conn: Any, attempt_id: int, lease_generation: int | None) -> bool:
+        """Lock an attempt first, then test its lease against the post-wait wall clock."""
+        locked = await conn.fetchval(
+            "SELECT id FROM agent_attempts "
+            "WHERE id = $1 AND ($2::bigint IS NULL OR lease_generation = $2) AND status = 'running' "
+            "FOR UPDATE",
+            attempt_id,
+            lease_generation,
+        )
+        if locked is None:
+            return False
+        return bool(
+            await conn.fetchval(
+                "SELECT lease_expires_at > clock_timestamp() FROM agent_attempts WHERE id = $1",
+                attempt_id,
+            )
+        )
 
     async def sweep_queued_follow_ups(self) -> None:
         """Fail queued follow-ups whose earlier native context is unavailable.
@@ -244,7 +262,7 @@ class PostgresAttemptCommands:
                 JOIN agent_threads t ON t.id = j.thread_id
                 LEFT JOIN {THREAD_SANDBOX_SOURCE} ON s.thread_id = j.thread_id
                 WHERE j.state = 'queued' AND j.cancel_requested = FALSE
-                  AND (j.claim_retry_at IS NULL OR j.claim_retry_at <= NOW())
+                  AND (j.claim_retry_at IS NULL OR j.claim_retry_at <= clock_timestamp())
                   AND NOT EXISTS (
                         SELECT 1 FROM agent_jobs earlier
                         WHERE earlier.thread_id = j.thread_id
@@ -405,7 +423,7 @@ class PostgresAttemptCommands:
                      lease_expires_at, base_sha, host_id,
                      sandbox_runtime, sandbox_image_digest, runtime_version,
                      host_kernel, guest_kernel)
-                VALUES ($1, $13, $2, $3, $4, NOW() + make_interval(secs => $5), $6, $7,
+                VALUES ($1, $13, $2, $3, $4, clock_timestamp() + make_interval(secs => $5), $6, $7,
                         $8, $9, $10, $11, $12)
                 RETURNING id, attempt_no, lease_generation,
                           sandbox_runtime, sandbox_image_digest, runtime_version
@@ -501,13 +519,15 @@ class PostgresAttemptCommands:
         if not math.isfinite(retry_after_seconds) or retry_after_seconds < 0:
             raise ValueError("claim retry delay must be finite and nonnegative")
         async with self._pool.acquire() as conn, conn.transaction():
+            if not await self._lock_live_attempt(conn, attempt_id, lease_generation):
+                return False
             released_row = await conn.fetchrow(
                 """
                 UPDATE agent_attempts
                 SET status = $2, finished_at = NOW()
                 WHERE id = $1 AND status = 'running'
                   AND ($3::bigint IS NULL OR lease_generation = $3)
-                  AND lease_expires_at > NOW()
+                  AND lease_expires_at > clock_timestamp()
                   AND NOT EXISTS (
                         SELECT 1 FROM agent_thread_sandbox_memberships m
                         WHERE m.admitted_job_id = agent_attempts.job_id
@@ -558,7 +578,7 @@ class PostgresAttemptCommands:
                                                THEN goal_report_outcome END,
                     current_attempt_id = NULL,
                     claim_retry_at = CASE WHEN cancel_requested OR $3::double precision = 0 THEN NULL
-                                         ELSE NOW() + make_interval(secs => $3) END,
+                                         ELSE clock_timestamp() + make_interval(secs => $3) END,
                     updated_at = NOW()
                 WHERE id = $1 AND current_attempt_id = $2 AND state = 'running'
                 RETURNING state
@@ -600,13 +620,15 @@ class PostgresAttemptCommands:
         it was issued under; without this predicate a removed host could keep
         its leases — and with them everything they renew — alive forever.
         """
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            if not await self._lock_live_attempt(conn, attempt_id, lease_generation):
+                return {"ok": False}
             job_id = await conn.fetchval(
                 f"""
                 UPDATE agent_attempts a
-                SET lease_expires_at = NOW() + make_interval(secs => $3)
+                SET lease_expires_at = clock_timestamp() + make_interval(secs => $3)
                 WHERE a.id = $1 AND a.lease_generation = $2 AND a.status = 'running'
-                  AND a.lease_expires_at > NOW()
+                  AND a.lease_expires_at > clock_timestamp()
                   AND {LIVE_ATTEMPT_HOST}
                 RETURNING a.job_id
                 """,
@@ -662,18 +684,7 @@ class PostgresAttemptCommands:
             # Lock the attempt before its job, matching release_claim and the
             # reaper. Without an explicit first lock, the job UPDATE below and
             # a concurrent abort can each hold the row the other needs.
-            live_attempt = await conn.fetchval(
-                """
-                SELECT id
-                FROM agent_attempts
-                WHERE id = $1 AND lease_generation = $2
-                  AND status = 'running' AND lease_expires_at > NOW()
-                FOR UPDATE
-                """,
-                attempt_id,
-                lease_generation,
-            )
-            if live_attempt is None:
+            if not await self._lock_live_attempt(conn, attempt_id, lease_generation):
                 return False
             # Then the conversation, before any job row: the terminal sweep below
             # can pause this conversation's goal, and that write has to be taken
@@ -842,7 +853,7 @@ class PostgresAttemptCommands:
                                      )
                                     THEN COALESCE(
                                         g.idle_deadline,
-                                        NOW() + make_interval(secs => g.idle_timeout_seconds)
+                                        clock_timestamp() + make_interval(secs => g.idle_timeout_seconds)
                                     )
                                     ELSE NULL
                                 END,
@@ -908,18 +919,12 @@ class PostgresAttemptCommands:
         serializes ``seq`` assignment for the single legitimate writer.
         """
         async with self._pool.acquire() as conn, conn.transaction():
+            if not await self._lock_live_attempt(conn, attempt_id, lease_generation):
+                return None
             attempt = await conn.fetchrow(
-                "SELECT job_id, status, lease_generation, "
-                "lease_expires_at <= NOW() AS expired "
-                "FROM agent_attempts WHERE id = $1 FOR UPDATE",
-                attempt_id,
+                "SELECT job_id FROM agent_attempts WHERE id = $1", attempt_id
             )
-            if (
-                attempt is None
-                or attempt["status"] != ATTEMPT_RUNNING
-                or attempt["lease_generation"] != lease_generation
-                or attempt["expired"]
-            ):
+            if attempt is None:
                 return None
             phase = (payload or {}).get("phase") if event_type == "lifecycle" else None
             if phase == "workspace_ready":
@@ -955,7 +960,9 @@ class PostgresAttemptCommands:
         context_status: str | None = None,
     ) -> bool:
         """Stamp the diagnostic rung and optional product context semantic."""
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            if not await self._lock_live_attempt(conn, attempt_id, lease_generation):
+                return False
             return bool(
                 await conn.fetchval(
                     """
@@ -963,7 +970,7 @@ class PostgresAttemptCommands:
                     SET continuity_mode = COALESCE($3, continuity_mode),
                         context_status = COALESCE($4, context_status)
                     WHERE id = $1 AND lease_generation = $2
-                      AND status = 'running' AND lease_expires_at > NOW()
+                      AND status = 'running' AND lease_expires_at > clock_timestamp()
                     RETURNING id
                     """,
                     attempt_id,
@@ -1001,6 +1008,8 @@ class PostgresAttemptCommands:
         tool_calls = rollup.get("tool_calls") or []
         processes = rollup.get("processes") or []
         async with self._pool.acquire() as conn, conn.transaction():
+            if not await self._lock_live_attempt(conn, attempt_id, lease_generation):
+                return False
             recorded = bool(
                 await conn.fetchval(
                     """
@@ -1008,7 +1017,7 @@ class PostgresAttemptCommands:
                         SELECT id, job_id
                         FROM agent_attempts
                         WHERE id = $1 AND lease_generation = $2
-                          AND status = 'running' AND lease_expires_at > NOW()
+                          AND status = 'running' AND lease_expires_at > clock_timestamp()
                     )
                     INSERT INTO agent_attempt_resources (
                         attempt_id, job_id, cpu_usec, mem_peak_bytes, mem_avg_bytes,
@@ -1215,15 +1224,10 @@ class PostgresAttemptCommands:
             # what makes the read-decide-write below atomic: two concurrent
             # checkpoints of the same attempt serialize here, so the second
             # one sees what the first wrote instead of racing it.
+            if not await self._lock_live_attempt(conn, attempt_id, lease_generation):
+                return "lease_lost"
             fenced = await conn.fetchrow(
-                """
-                SELECT id, job_id FROM agent_attempts
-                WHERE id = $1 AND lease_generation = $2
-                  AND status = 'running' AND lease_expires_at > NOW()
-                FOR UPDATE
-                """,
-                attempt_id,
-                lease_generation,
+                "SELECT job_id FROM agent_attempts WHERE id = $1", attempt_id
             )
             if fenced is None:
                 return "lease_lost"
@@ -1423,7 +1427,7 @@ class PostgresAttemptCommands:
                     JOIN agent_sandboxes sandbox
                       ON sandbox.id = member.sandbox_id
                 ) ON member.thread_id = j.thread_id
-                WHERE a.status = 'running' AND a.lease_expires_at < NOW()
+                WHERE a.status = 'running' AND a.lease_expires_at < clock_timestamp()
                 ORDER BY a.id
                 -- The conversation is locked here, with the attempt and the
                 -- job, rather than reached for later when this pass pauses a
@@ -1549,7 +1553,7 @@ class PostgresAttemptCommands:
                                           AND peer.context_status <> 'lost'
                                           AND peer.native_state <> 'lost'
                                      )
-                                    THEN NOW() + make_interval(
+                                    THEN clock_timestamp() + make_interval(
                                         secs => g.idle_timeout_seconds
                                     )
                                     ELSE NULL
@@ -1765,7 +1769,7 @@ class PostgresAttemptCommands:
                     SELECT 1 FROM agent_attempts a
                     WHERE a.id = $2 AND a.lease_generation = $6
                       AND a.status = 'running'
-                      AND a.lease_expires_at > NOW()
+                      AND a.lease_expires_at > clock_timestamp()
               )
             RETURNING j.id, j.thread_id, j.goal_id, j.goal_revision,
                       j.turn_source, j.parent_job_id

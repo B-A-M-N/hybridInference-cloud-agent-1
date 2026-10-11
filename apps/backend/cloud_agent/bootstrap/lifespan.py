@@ -11,7 +11,6 @@ serving an API that fails at every call.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import inspect
 import os
 from contextlib import asynccontextmanager
@@ -149,11 +148,17 @@ async def _invoke(action: Any, errors: list[BaseException]) -> None:
         result = action()
         if inspect.isawaitable(result):
             await result
-    except Exception as exc:
+    except BaseException as exc:
         errors.append(exc)
 
 
-async def _stop_background_task(task: asyncio.Task[Any] | None) -> None:
+async def _stop_background_task(
+    task: asyncio.Task[Any] | None,
+    *,
+    cancel: bool = True,
+    owner_cancellation_recorded: bool = False,
+    owner_cancellation_baseline: int = 0,
+) -> None:
     """Cancel one task and wait for it.
 
     Cancellation is a normal stop. Any other error — including one the task
@@ -161,10 +166,18 @@ async def _stop_background_task(task: asyncio.Task[Any] | None) -> None:
     """
     if task is None:
         return
-    task.cancel()
+    if cancel:
+        task.cancel()
     try:
         await task
     except asyncio.CancelledError:
+        owner = asyncio.current_task()
+        if (
+            not owner_cancellation_recorded
+            and owner is not None
+            and owner.cancelling() > owner_cancellation_baseline
+        ):
+            raise
         return
 
 
@@ -212,19 +225,23 @@ async def _shutdown_lifespan(
     lifespan itself did not already fail.
     """
     errors: list[BaseException] = []
-    # Drop send-now lock connections before the pool closes. A row the host
-    # has not accepted stays recoverable. One it already accepted stays marked
-    # and is not injected again.
+    owner = asyncio.current_task()
+    owner_cancellation_baseline = owner.cancelling() if owner is not None else 0
+    # Eager request waiters share the store, signal, and broker clients. Their
+    # durable rows are the recovery owner, so join them before those resources.
     try:
-        from cloud_agent.api.turns import cancel_send_now_handoffs
+        from cloud_agent.api.turns import close_send_now_handovers
 
-        await cancel_send_now_handoffs()
-    except Exception as exc:
+        await close_send_now_handovers()
+    except BaseException as exc:
+        # The handoff join shields its children, then restores the owner's
+        # cancellation. Record it so every later resource still closes;
+        # _surface_cleanup_errors re-raises it after shutdown is complete.
         errors.append(exc)
     if writer_installed and writer is not None:
         # The writer reports its own drops. A failure here is not a reason to
         # skip the pool, and it never was: shutdown used to suppress it.
-        with contextlib.suppress(Exception):
+        try:
             counts = await writer.shutdown()
             if any(counts.as_dict().get(name) for name in counts.as_dict() if name != "reasons"):
                 logger.info(
@@ -234,12 +251,38 @@ async def _shutdown_lifespan(
                         **counts.as_dict(),
                     },
                 )
-        await _invoke(lambda: reset_writer(None), errors)
-    for name in _SHUTDOWN_TASK_ATTRS:
-        try:
-            await _stop_background_task(getattr(app.state, name, None))
-        except Exception as exc:
+        except Exception:
+            # Measurement collection is best-effort and was already non-fatal.
+            logger.warning("Measurement writer shutdown failed", exc_info=True)
+        except BaseException as exc:
             errors.append(exc)
+        await _invoke(lambda: reset_writer(None), errors)
+    tasks = [
+        task
+        for name in _SHUTDOWN_TASK_ATTRS
+        if isinstance((task := getattr(app.state, name, None)), asyncio.Task)
+    ]
+    # Cancel every child before joining any one of them. A resistant child
+    # cannot otherwise leave its later siblings running.
+    for task in tasks:
+        try:
+            task.cancel()
+        except BaseException as exc:
+            errors.append(exc)
+    cancellation_recorded = any(isinstance(error, asyncio.CancelledError) for error in errors)
+    for task in tasks:
+        try:
+            await _stop_background_task(
+                task,
+                cancel=False,
+                owner_cancellation_recorded=cancellation_recorded,
+                owner_cancellation_baseline=owner_cancellation_baseline,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+            cancellation_recorded = cancellation_recorded or isinstance(exc, asyncio.CancelledError)
+        finally:
+            _BACKGROUND_TASKS.discard(task)
     await _invoke(close_host, errors)
     # Close what was opened, innermost first: the per-broker pools, the
     # GitHub App's own client, then the shared gateway pool.
@@ -254,45 +297,6 @@ async def _shutdown_lifespan(
     if log_stopped:
         await _invoke(lambda: logger.info("cloud agent control plane stopped"), errors)
     return errors
-
-
-async def _recover_send_now_handoffs(app: Any, storage: Any) -> None:
-    """Resume send-now handoffs this process lost. A failure must not refuse to boot."""
-    from cloud_agent.api.turns import recover_send_now_handoffs
-
-    try:
-        pending = await storage.pending_messages.list_sending_handoffs()
-    except Exception:
-        logger.warning(
-            "agent_send_now_recovery_failed",
-            extra={"event": "agent_send_now_recovery_failed"},
-            exc_info=True,
-        )
-        return
-    if not pending:
-        return
-    try:
-        app_credentials = app.state.source_control.github.get()
-    except Exception:
-        logger.warning(
-            "agent_send_now_recovery_credentials_unavailable",
-            extra={"event": "agent_send_now_recovery_credentials_unavailable"},
-            exc_info=True,
-        )
-        app_credentials = None
-    try:
-        await recover_send_now_handoffs(
-            storage,
-            gateway=app.state.gateway,
-            app_credentials=app_credentials,
-            signal=app.state.job_event_signal,
-        )
-    except Exception:
-        logger.warning(
-            "agent_send_now_recovery_failed",
-            extra={"event": "agent_send_now_recovery_failed"},
-            exc_info=True,
-        )
 
 
 @asynccontextmanager
@@ -496,7 +500,6 @@ async def lifespan(app: FastAPI, *, background: bool = True) -> AsyncIterator[No
             app.state.mcp_decision_signal = None
             _start_publisher(app, storage)
             _start_pr_archiver(app, storage)
-            await _recover_send_now_handoffs(app, storage)
             logger.info("cloud agent control plane started")
         else:
             # The relay listener roots no file or terminal request, so it has no

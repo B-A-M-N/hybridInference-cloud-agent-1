@@ -19,6 +19,8 @@ class ResidencyRepository(Protocol):
         self,
         *,
         thread_id: str,
+        attempt_id: int,
+        lease_generation: int,
         host: str,
         runtime_id: str,
         runtime_version: str | None,
@@ -27,14 +29,14 @@ class ResidencyRepository(Protocol):
     ) -> dict[str, Any] | None:
         """Take (or rotate) a chat's residency; ``None`` = not earned.
 
-        Residency is something a host earns by *currently* running the
-        thread's turn — attempt on this host, ``running``, lease unexpired —
-        and the check shares a transaction and a row lock with the write, so
-        a finish or a supersede cannot slip between them, and an expired
-        attempt the reaper has not reached yet earns nothing. The lease lives
-        on the chat's membership row: its generation only ever increments,
-        and every rotation clears the grant so the caller revokes the
-        predecessor's (``previous_grant_id``) and mints anew.
+        Residency is something the exact worker attempt earns by *currently*
+        running the thread's turn on this host. Attempt id, lease generation,
+        current-job ownership, membership ownership, status, and lease expiry
+        are checked in the same transaction as rotation, so a delayed request
+        from a superseded attempt cannot revoke its successor's grant. The
+        membership generation only ever increments, and every rotation clears
+        the grant so the caller revokes the predecessor's
+        (``previous_grant_id``) and mints anew.
 
         ``runtime_id`` and ``runtime_version`` are accepted for the worker
         contract and not stored: the sandbox the membership belongs to is the
@@ -47,14 +49,13 @@ class ResidencyRepository(Protocol):
     ) -> str | None:
         """Extend a residency's lease — only the generation that holds it.
 
-        Returns ``None`` when nothing was extended (lost, taken over, or
-        already expired), else the residency's grant id — ``""`` when it runs
-        without one — so the caller can renew the credential in the same pass.
-        ``host`` narrows the write to the machine the row names: a beat is a
-        holder's statement, and a guessed (thread, generation) from anywhere
-        else must extend nothing. The lease clock is the same fence
-        ``resident_host`` uses: a hot row whose lease has lapsed is already
-        lost, and a late beat must not revive it before the reaper runs.
+        Returns ``None`` when nothing was extended (lost/taken over), else the
+        residency's grant id — ``""`` when it runs without one — so the caller
+        can renew the credential in the same pass. ``host`` narrows the write
+        to the machine the row names: a beat is a holder's statement, and a
+        guessed (thread, generation) from anywhere else must extend nothing.
+        Expiry is equally final: a hot row waiting for the reaper cannot use a
+        late beat to regain authority.
         """
         ...
 

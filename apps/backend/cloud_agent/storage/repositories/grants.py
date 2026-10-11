@@ -55,14 +55,25 @@ class PostgresGrantRepository:
         Returns:
             Whether the row was still current enough to write.
         """
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            locked = await conn.fetchval(
+                "SELECT id FROM agent_attempts "
+                "WHERE id = $1 AND lease_generation = $2 AND status = 'running' FOR UPDATE",
+                attempt_id,
+                lease_generation,
+            )
+            if locked is None or not await conn.fetchval(
+                "SELECT lease_expires_at > clock_timestamp() FROM agent_attempts WHERE id = $1",
+                attempt_id,
+            ):
+                return False
             result = await conn.execute(
                 f"""
                 UPDATE agent_attempts a SET grant_id = $3
                 WHERE a.id = $1
                   AND a.lease_generation = $2
                   AND a.status = 'running'
-                  AND a.lease_expires_at > NOW()
+                  AND a.lease_expires_at > clock_timestamp()
                   AND {LIVE_ATTEMPT_HOST}
                 """,
                 attempt_id,
@@ -79,7 +90,7 @@ class PostgresGrantRepository:
         alive and spending, and the gateway could not catch it — it has no
         attempt state to check. Every predicate here is load-bearing:
         ``status = 'running'`` drops superseded and finished attempts,
-        ``lease_expires_at > NOW()`` drops the ones whose lease died before the
+        ``lease_expires_at > clock_timestamp()`` drops the ones whose lease died before the
         reaper noticed, the live-host check drops the work of a machine that
         was removed or disabled, and ``cancel_requested`` drops a turn its
         owner has stopped. A stopped turn is interrupted at its next heartbeat
@@ -107,7 +118,7 @@ class PostgresGrantRepository:
                 JOIN agent_jobs j ON j.id = a.job_id
                 WHERE a.grant_id IS NOT NULL
                   AND a.status = 'running'
-                  AND a.lease_expires_at > NOW()
+                  AND a.lease_expires_at > clock_timestamp()
                   AND NOT j.cancel_requested
                   AND {LIVE_ATTEMPT_HOST}
                 -- **Most urgent first, not lowest id.** `ORDER BY id` returns
@@ -173,7 +184,10 @@ class PostgresGrantRepository:
                     SELECT id, job_id, grant_id
                     FROM agent_attempts
                     WHERE grant_id IS NOT NULL
-                      AND (status <> 'running' OR lease_expires_at <= NOW())
+                      AND (
+                          status <> 'running'
+                          OR lease_expires_at <= clock_timestamp()
+                      )
                     ORDER BY id
                     LIMIT $1
                     FOR UPDATE SKIP LOCKED
@@ -209,16 +223,25 @@ class PostgresGrantRepository:
         mint and link, or its lease has already expired. The caller revokes
         the orphan grant rather than handing out a credential nothing owns.
         """
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            locked = await conn.fetchval(
+                "SELECT thread_id FROM agent_thread_sandbox_memberships "
+                "WHERE thread_id = $1 AND residency_generation = $2 "
+                "AND residency_status = 'hot' FOR UPDATE",
+                thread_id,
+                generation,
+            )
+            if locked is None:
+                return False
             return bool(
                 await conn.fetchval(
                     """
                     UPDATE agent_thread_sandbox_memberships
                     SET residency_grant_id = $3, residency_binding_id = $4,
-                        updated_at = NOW()
+                        updated_at = clock_timestamp()
                     WHERE thread_id = $1 AND residency_generation = $2
                       AND residency_status = 'hot'
-                      AND residency_lease_expires_at > NOW()
+                      AND residency_lease_expires_at > clock_timestamp()
                     RETURNING thread_id
                     """,
                     thread_id,

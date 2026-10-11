@@ -357,6 +357,13 @@ class PostgresSessionForkRepository:
                 or operation["coordinator_token"] != coordinator_token
             ):
                 return None
+            coordinator_is_live = await conn.fetchval(
+                "SELECT coordinator_lease_expires_at > clock_timestamp() "
+                "FROM agent_session_forks WHERE id = $1",
+                operation_id,
+            )
+            if not coordinator_is_live:
+                return None
             source_job = await conn.fetchrow(
                 """
                 SELECT user_id, model FROM agent_jobs
@@ -415,7 +422,7 @@ class PostgresSessionForkRepository:
                     UPDATE agent_thread_sandbox_memberships m
                     SET residency_generation = m.residency_generation + 1,
                         residency_status = 'hot',
-                        residency_lease_expires_at = NOW() + make_interval(secs => $3),
+                        residency_lease_expires_at = clock_timestamp() + make_interval(secs => $3),
                         residency_grant_id = NULL,
                         residency_binding_id = NULL,
                         residency_established_at = NOW(),
@@ -503,18 +510,25 @@ class PostgresSessionForkRepository:
             raise ValueError("session fork coordinator token is invalid")
         if lease_seconds <= 0:
             raise ValueError("session fork coordinator lease must be positive")
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            locked = await conn.fetchval(
+                "SELECT id FROM agent_session_forks "
+                "WHERE id = $1 AND state = 'preparing' FOR UPDATE",
+                operation_id,
+            )
+            if locked is None:
+                return False
             claimed = await conn.fetchval(
                 """
                 UPDATE agent_session_forks
                 SET coordinator_token = $2,
-                    coordinator_lease_expires_at = NOW() + make_interval(secs => $3),
+                    coordinator_lease_expires_at = clock_timestamp() + make_interval(secs => $3),
                     updated_at = NOW()
                 WHERE id = $1 AND state = 'preparing'
                   AND (
                     coordinator_token IS NULL
                     OR coordinator_lease_expires_at IS NULL
-                    OR coordinator_lease_expires_at <= NOW()
+                    OR coordinator_lease_expires_at <= clock_timestamp()
                     OR coordinator_token = $2
                   )
                 RETURNING 1
@@ -532,13 +546,22 @@ class PostgresSessionForkRepository:
         coordinator_token: str,
     ) -> bool:
         """Release a coordinator that failed before any host mutation began."""
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            locked = await conn.fetchval(
+                "SELECT id FROM agent_session_forks "
+                "WHERE id = $1 AND state = 'preparing' AND coordinator_token = $2 FOR UPDATE",
+                operation_id,
+                coordinator_token,
+            )
+            if locked is None:
+                return False
             released = await conn.fetchval(
                 """
                 UPDATE agent_session_forks
                 SET coordinator_token = NULL, coordinator_lease_expires_at = NULL,
                     updated_at = NOW()
                 WHERE id = $1 AND state = 'preparing' AND coordinator_token = $2
+                  AND coordinator_lease_expires_at > clock_timestamp()
                 RETURNING 1
                 """,
                 operation_id,
@@ -561,9 +584,13 @@ class PostgresSessionForkRepository:
             )
             if operation is None or operation["state"] not in {"preparing", "materialized"}:
                 return None
-            if (
-                operation["state"] == "preparing"
-                and operation["coordinator_token"] != coordinator_token
+            if operation["state"] == "preparing" and (
+                operation["coordinator_token"] != coordinator_token
+                or not await conn.fetchval(
+                    "SELECT coordinator_lease_expires_at > clock_timestamp() "
+                    "FROM agent_session_forks WHERE id = $1",
+                    operation_id,
+                )
             ):
                 return None
             expected = {
@@ -846,7 +873,7 @@ class PostgresSessionForkRepository:
                                 WHERE m.sandbox_id = g.id
                                   AND m.active_attempt_id IS NOT NULL
                              )
-                            THEN NOW() + make_interval(secs => idle_timeout_seconds)
+                            THEN clock_timestamp() + make_interval(secs => idle_timeout_seconds)
                             ELSE NULL
                         END,
                         updated_at = NOW()
@@ -877,7 +904,7 @@ class PostgresSessionForkRepository:
                 WHERE state IN ('preparing', 'materialized')
                   AND updated_at < NOW() - make_interval(secs => $1)
                   AND (state = 'materialized' OR coordinator_lease_expires_at IS NULL
-                       OR coordinator_lease_expires_at <= NOW())
+                       OR coordinator_lease_expires_at <= clock_timestamp())
                 ORDER BY id
                 """,
                 stall_seconds,
@@ -907,7 +934,7 @@ class PostgresSessionForkRepository:
                     WHERE id = $1 AND state = 'preparing'
                       AND updated_at < NOW() - make_interval(secs => $2)
                       AND (coordinator_lease_expires_at IS NULL
-                           OR coordinator_lease_expires_at <= NOW())
+                           OR coordinator_lease_expires_at <= clock_timestamp())
                     RETURNING *
                     """,
                     operation["id"],
@@ -941,7 +968,7 @@ class PostgresSessionForkRepository:
                                 WHERE m.sandbox_id = g.id
                                   AND m.active_attempt_id IS NOT NULL
                              )
-                            THEN NOW() + make_interval(secs => idle_timeout_seconds)
+                            THEN clock_timestamp() + make_interval(secs => idle_timeout_seconds)
                             ELSE NULL
                         END,
                         updated_at = NOW()
