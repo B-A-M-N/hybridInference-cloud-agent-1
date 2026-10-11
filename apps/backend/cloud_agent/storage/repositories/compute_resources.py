@@ -54,6 +54,7 @@ class PostgresComputeResourceRepository:
         self._pool = pool
 
     async def list_deployment_profiles(self) -> list[dict[str, Any]]:
+        """List profile metadata without bundles, plaintext inputs or ciphertext."""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 """SELECT id,label,configuration,source_sha256,revision,created_at,updated_at
@@ -62,6 +63,7 @@ class PostgresComputeResourceRepository:
         return [_row(row) for row in rows]
 
     async def get_deployment_profile(self, profile_id: str) -> dict[str, Any] | None:
+        """Read one trusted profile including its bundle and encrypted inputs."""
         async with self._pool.acquire() as conn:
             return _optional_row(
                 await conn.fetchrow(
@@ -79,6 +81,7 @@ class PostgresComputeResourceRepository:
         source_sha256: str,
         secret_ciphertext: str,
     ) -> dict[str, Any]:
+        """Create one immutable profile; active allocations retain exact inputs."""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 """INSERT INTO agent_compute_deployment_profiles
