@@ -565,7 +565,7 @@ class ComputeCommands:
             raise ComputeRefusal(
                 "rotation_needs_registration",
                 "Replacement nodes must register their own host keys; "
-                "set Node host keys to registration for this server.",
+                "set SSH host-key checking to registration for this server.",
             )
 
     async def retire(
@@ -817,5 +817,5 @@ class ComputeCommands:
         if capability == "release" and not row.get("deployment_profile"):
             raise ComputeRefusal(
                 "inventory_unavailable",
-                "Attach a deployment profile and verified SSH connection before releasing this resource.",
+                "Attach a deployment profile and configured SSH connection before releasing this resource.",
             )

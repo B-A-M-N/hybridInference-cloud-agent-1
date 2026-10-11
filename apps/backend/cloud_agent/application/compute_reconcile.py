@@ -904,7 +904,7 @@ class ComputeReconciler:
         if not allocation.get("deployment_profile"):
             raise ProviderError(
                 "inventory_unavailable",
-                "Attach a deployment profile and verified SSH connection before releasing this resource",
+                "Attach a deployment profile and configured SSH connection before releasing this resource",
             )
         profile = DeploymentProfile.model_validate(allocation["deployment_profile"])
         for host in allocation.get("hosts", []):
