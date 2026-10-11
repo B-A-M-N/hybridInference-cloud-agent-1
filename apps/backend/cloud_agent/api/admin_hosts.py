@@ -706,10 +706,11 @@ async def remove_agent_runner_host(
     force: bool = Query(
         False,
         description=(
-            "Remove a host that is still running attempts. Those attempts are "
-            "not stopped — nothing here can reach them — they are left to their "
-            "leases. An indeterminate retained-chat activation is marked LOST "
-            "instead of replayed."
+            "Remove a host that is still running attempts. Their leases expire "
+            "at once, so the removed machine can no longer heartbeat, renew "
+            "grants, establish residencies or call tools for them; the next "
+            "reaper pass requeues them or, for an indeterminate retained-chat "
+            "activation, marks the chat LOST instead of replaying it."
         ),
     ),
     _admin_id: str = Depends(verify_admin_access),
@@ -723,10 +724,14 @@ async def remove_agent_runner_host(
     minutes later. Being told "it is still busy" is the difference between
     draining first and finding out afterwards.
 
-    Forced removal is the deliberate version of the same thing. Lease fencing
-    rejects later writes from the superseded worker. A retained activation is
-    not replayed because the platform cannot know whether its prompt ran, so
-    that chat is marked LOST when the lease expires.
+    Forced removal is the deliberate version of the same thing, and it ends
+    that work rather than waiting for it: the revocation expires the host's
+    attempt and residency leases in the same transaction. The attempts' worker
+    tokens name no host, so a lease left to run would be one the removed
+    machine could keep renewing. Lease fencing then rejects every later write
+    from it, and the reaper supersedes the attempts and revokes their grants
+    on its next pass. A retained activation is not replayed because the
+    platform cannot know whether its prompt ran, so that chat is marked LOST.
 
     The row survives, disabled. ``agent_attempts.host_id`` points at it, and
     "where did this job run" should not become unanswerable because the machine

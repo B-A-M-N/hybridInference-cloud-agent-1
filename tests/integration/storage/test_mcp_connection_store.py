@@ -739,16 +739,20 @@ async def test_consuming_an_oauth_flow_has_exactly_one_winner(store: Storage) ->
     )
     assert created_generation == row["oauth_generation"] + 1
 
+    # Presented by a browser signed in as somebody else, the state matches
+    # nothing -- and the flow is left for the account that started it.
+    assert await store.mcp.consume_mcp_oauth_flow(state_hash="state-hash", user_id=_OTHER) is None
+
     first, second = await asyncio.gather(
-        store.mcp.consume_mcp_oauth_flow(state_hash="state-hash"),
-        store.mcp.consume_mcp_oauth_flow(state_hash="state-hash"),
+        store.mcp.consume_mcp_oauth_flow(state_hash="state-hash", user_id=_OWNER),
+        store.mcp.consume_mcp_oauth_flow(state_hash="state-hash", user_id=_OWNER),
     )
 
     winners = [consumed for consumed in (first, second) if consumed is not None]
     assert len(winners) == 1
     assert winners[0]["connection_id"] == row["id"]
     assert winners[0]["scopes"] == ["read"]
-    assert await store.mcp.consume_mcp_oauth_flow(state_hash="state-hash") is None
+    assert await store.mcp.consume_mcp_oauth_flow(state_hash="state-hash", user_id=_OWNER) is None
     # And starting a flow again moves the generation the row was fenced to.
     assert (await store.mcp.get_mcp_connection(connection_id=row["id"]))["oauth_generation"] == row[
         "oauth_generation"
@@ -2155,7 +2159,7 @@ async def test_target_edit_invalidates_only_its_previous_discovery_and_flow(stor
     assert (updated is None) is (operation == "stale_move")
     current = await store.mcp.get_mcp_connection(connection_id=row["id"])
     snapshot = await store.mcp.get_mcp_capabilities(connection_id=row["id"])
-    flow = await store.mcp.consume_mcp_oauth_flow(state_hash="before-edit")
+    flow = await store.mcp.consume_mcp_oauth_flow(state_hash="before-edit", user_id=_OWNER)
     invalidated = operation in ("move", "change_auth")
     assert current["status"] == ("draft" if invalidated else "active")
     assert current["config_revision"] == row["config_revision"] + invalidated

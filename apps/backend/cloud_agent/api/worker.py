@@ -27,6 +27,11 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 
 from cloud_agent import web_search
+from cloud_agent.api._body_limits import (
+    HostBodyLimitRoute,
+    payload_too_large,
+    read_bounded_body,
+)
 from cloud_agent.api._workspace_access import (
     _workspace_id,
     _workspace_not_ready,
@@ -63,6 +68,11 @@ from cloud_agent.mcp.models import ConnectionStatus
 from cloud_agent.mcp.registry import resolve_for_thread
 from cloud_agent.measurement_ingest import Owner
 from cloud_agent.measurement_persistence import persist_measurement
+from cloud_agent.owner_access import (
+    AGENT_ACCESS_WITHDRAWN,
+    AgentAccessUnavailable,
+    owner_may_use_agent,
+)
 from cloud_agent.schemas import (
     HostResidencyEstablishResponse,
     WorkerAckResponse,
@@ -164,44 +174,30 @@ async def _refresh_claim_memory(
         return None
 
 
-class _BoundedTurnResourcesRoute(APIRoute):
-    """Limit turn-resource reports before parsing, including chunked requests."""
+class _BoundedTurnResourcesRoute(HostBodyLimitRoute):
+    """Limit every worker request body before parsing, including chunked ones.
+
+    Every body-carrying worker route gets the host ceiling. Turn-resource
+    reports get their own, much smaller one, and a fixed validation answer.
+    """
 
     def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
-        """Wrap only the resource-report endpoint before its normal handler."""
-        handler = super().get_route_handler()
+        """Wrap the resource-report endpoint specially; the rest generically."""
         if (
             not self.path.endswith("/turn-resources")
             or self.methods is None
             or "POST" not in self.methods
         ):
-            return handler
+            return super().get_route_handler()
+        handler = APIRoute.get_route_handler(self)
 
         async def bounded_handler(request: Request) -> Response:
-            chunks: list[bytes] = []
-            size = 0
-            async for chunk in request.stream():
-                size += len(chunk)
-                if size > MAX_TURN_RESOURCES_BODY_BYTES:
-                    return JSONResponse(
-                        status_code=413,
-                        content={
-                            "detail": {
-                                "error": {
-                                    "type": "payload_too_large",
-                                    "message": (
-                                        "A turn resource snapshot is limited to "
-                                        f"{MAX_TURN_RESOURCES_BODY_BYTES} bytes."
-                                    ),
-                                }
-                            }
-                        },
-                        headers={"Cache-Control": "no-store"},
-                    )
-                chunks.append(chunk)
+            body = await read_bounded_body(request, MAX_TURN_RESOURCES_BODY_BYTES)
+            if body is None:
+                return payload_too_large(MAX_TURN_RESOURCES_BODY_BYTES, "A turn resource snapshot")
             # Request.body() uses this same cache; give FastAPI only the bytes
             # accepted above rather than asking it to consume the stream again.
-            request._body = b"".join(chunks)
+            request._body = body
             try:
                 response = await handler(request)
             except RequestValidationError:
@@ -486,6 +482,77 @@ async def _worker_workspace_broker(
     return broker
 
 
+async def _require_owner_agent_access(
+    job_store: _WorkerStorage,
+    gateway: Any,
+    claim: dict[str, Any],
+) -> None:
+    """Ask the Gateway again whether this job's owner may still use Agent.
+
+    Admission was decided when the job was written, and a job can sit in the
+    queue long after that — or be written by a goal or a waiting message with
+    no request behind it at all. The grant mint does not catch a withdrawal:
+    the Gateway refuses it only for an account that is unknown or inactive, so
+    an active account without ``agent.use`` would still get a working grant.
+
+    **A denial ends the job rather than handing it back.** Released, it would be
+    eligible again at the next claim and refused again, every time; failed, it
+    carries a reason the owner can read, and the owner's goal and waiting
+    messages pause on it the way they do for any failed turn.
+
+    **No answer hands it back**, with the same delay as the other transient
+    claim failures: an unreachable Gateway is not a verdict on the owner, and a
+    released claim spends no attempt.
+
+    Raises:
+        HTTPException: 403 after ending the job when access was withdrawn, or
+            503 after releasing the claim when it could not be confirmed.
+    """
+    try:
+        permitted = await owner_may_use_agent(gateway, user_id=str(claim["user_id"]))
+    except AgentAccessUnavailable as exc:
+        await job_store.attempt_commands.release_claim(
+            job_id=claim["id"],
+            attempt_id=claim["attempt_id"],
+            lease_generation=claim["lease_generation"],
+            retry_after_seconds=30,
+        )
+        logger.warning(
+            "agent_job_owner_access_unavailable",
+            extra={"event": "agent_job_owner_access_unavailable", "job_id": claim["id"]},
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "type": "agent_access_unavailable",
+                    "message": (
+                        "Could not confirm the owner's Agent access; the job has been "
+                        "returned to the queue and no attempt was spent."
+                    ),
+                }
+            },
+        ) from exc
+    if permitted:
+        return
+    await job_store.attempt_commands.transition(
+        job_id=claim["id"],
+        attempt_id=claim["attempt_id"],
+        lease_generation=claim["lease_generation"],
+        from_states=(RUNNING,),
+        to_state=FAILED,
+        detail=AGENT_ACCESS_WITHDRAWN,
+    )
+    logger.warning(
+        "agent_job_owner_access_withdrawn",
+        extra={"event": "agent_job_owner_access_withdrawn", "job_id": claim["id"]},
+    )
+    raise HTTPException(
+        status_code=403,
+        detail={"error": {"type": "agent_access_denied", "message": AGENT_ACCESS_WITHDRAWN}},
+    )
+
+
 async def _mint_sandbox_grant(
     job_store: _WorkerStorage,
     grants: Any,
@@ -691,6 +758,7 @@ async def worker_claim(
     store: _WorkerStorage | None = Depends(get_storage),
     app_credentials: Any | None = Depends(get_agent_app_credentials),
     grants: Any = Depends(get_grant_client),
+    gateway: Any = Depends(get_gateway_client),
 ) -> WorkerClaimResponse | None:
     """Claim the next queued job and mint this attempt's capability token.
 
@@ -738,39 +806,18 @@ async def worker_claim(
         "attempt_id": claim["attempt_id"],
         "lease_generation": claim["lease_generation"],
     }
-    # Two credentials with different powers. The runner keeps the full one and
-    # passes only the sandbox one inside, so a credential that leaks from inside
-    # the agent can make model calls the gateway already meters but cannot touch
-    # this job's event log, lifecycle, or terminal state.
-    #
-    # Only the first is ours to mint. ``SCOPE_FULL`` is this service's own
-    # control credential, signed with this service's own secret and verified by
-    # this service — correctly local. The sandbox's credential is not: it buys
-    # inference, which is the gateway's to authorize and the gateway's to meter,
-    # so it is asked for rather than minted. Before this, the claim minted
-    # a ``SCOPE_MODEL`` token signed with a root the gateway does not know —
-    # which bought nothing, and failed at the sandbox's first model call.)
-    token = mint_worker_token(**fence, scope=SCOPE_FULL)
-    sandbox_token = await _mint_sandbox_grant(job_store, grants, claim)
-
-    # The sandbox's *second* credential, and this one is ours to mint: MCP is
-    # served by this service's relay, against this service's registry and this
-    # service's attempt fence. Scoped `mcp` so it opens the relay and nothing
-    # else — not the worker surface, and certainly not the gateway.
-    #
-    # Two credentials rather than one because they authorize at two services
-    # now. A leak is bounded by whichever it was: the grant buys models it
-    # names, this buys tools the job asked for, and neither buys the other.
-    mcp_token = mint_worker_token(**fence, scope=SCOPE_MCP)
-    # A third credential, weaker than either: read-only, this repository only,
-    # one hour. The runner needs it to check the repository out — a runner that
-    # cannot clone runs the agent in an empty directory — and it is deliberately
-    # not the publisher's token, which can write. It stays in the runner and
-    # never enters the sandbox. Absent (null) is a working configuration: a
-    # public repository clones without any credential at all.
-    # Re-checked at mint time, not just at create time. A row written before
+    # Whether the owner may still use Agent at all comes first: it is the one
+    # check every turn passes here, including the ones no request admitted.
+    await _require_owner_agent_access(job_store, gateway, claim)
+    # Re-checked at claim time, not just at create time. A row written before
     # this check existed — or while the allowlist was wider — must not be able
     # to produce a credential now.
+    #
+    # **And before any credential is minted.** A refusal here used to arrive
+    # after the gateway had already issued this attempt a grant, so every
+    # claim of a job whose repository its owner can no longer reach cost a
+    # mint and, later, a revocation, for a turn that was never going to run.
+    # Nothing below is asked for until the job is known to be runnable.
     try:
         # The same check create used. The allowlist-only variant here meant a
         # job entitled by its owner's own GitHub connection passed creation and
@@ -809,6 +856,36 @@ async def worker_claim(
             detail={"error": {"type": "repo_not_allowed", "message": str(exc)}},
         ) from exc
 
+    # Two credentials with different powers. The runner keeps the full one and
+    # passes only the sandbox one inside, so a credential that leaks from inside
+    # the agent can make model calls the gateway already meters but cannot touch
+    # this job's event log, lifecycle, or terminal state.
+    #
+    # Only the first is ours to mint. ``SCOPE_FULL`` is this service's own
+    # control credential, signed with this service's own secret and verified by
+    # this service — correctly local. The sandbox's credential is not: it buys
+    # inference, which is the gateway's to authorize and the gateway's to meter,
+    # so it is asked for rather than minted. Before this, the claim minted
+    # a ``SCOPE_MODEL`` token signed with a root the gateway does not know —
+    # which bought nothing, and failed at the sandbox's first model call.)
+    token = mint_worker_token(**fence, scope=SCOPE_FULL)
+    sandbox_token = await _mint_sandbox_grant(job_store, grants, claim)
+
+    # The sandbox's *second* credential, and this one is ours to mint: MCP is
+    # served by this service's relay, against this service's registry and this
+    # service's attempt fence. Scoped `mcp` so it opens the relay and nothing
+    # else — not the worker surface, and certainly not the gateway.
+    #
+    # Two credentials rather than one because they authorize at two services
+    # now. A leak is bounded by whichever it was: the grant buys models it
+    # names, this buys tools the job asked for, and neither buys the other.
+    mcp_token = mint_worker_token(**fence, scope=SCOPE_MCP)
+    # A third credential, weaker than either: read-only, this repository only,
+    # one hour. The runner needs it to check the repository out — a runner that
+    # cannot clone runs the agent in an empty directory — and it is deliberately
+    # not the publisher's token, which can write. It stays in the runner and
+    # never enters the sandbox. Absent (null) is a working configuration: a
+    # public repository clones without any credential at all.
     clone_token: str | None = None
     github_token: str | None = None
     if app_credentials is not None:

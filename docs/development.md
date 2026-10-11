@@ -175,7 +175,9 @@ everything else uses `ubuntu-24.04`. The repository is public, so these runners
 consume no minute quota. Pushes to `dev` and `main`, and authorized manual
 dispatches, keep the self-hosted pools, which also run publication and
 synchronization. Every PR has only a read token, checkout does not persist it,
-image jobs use anonymous registry pulls, and no PR job receives a secret. Real
+image jobs use anonymous registry pulls, and no PR job receives a secret. Release
+publication shares no builder with any of them: each publish cell creates a
+fresh builder under its own `RUNNER_TEMP` and removes it when the job ends. Real
 Kata host qualification remains excluded from every PR and runs only on trusted
 `dev` events.
 

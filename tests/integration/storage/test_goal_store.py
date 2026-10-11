@@ -47,6 +47,20 @@ pytestmark = [pytest.mark.dbtest, pytest.mark.asyncio]
 GOAL_HOST = "goal-runner"
 
 
+class _AllowedGateway:
+    """A Gateway that admits every owner, which is what these cases assume.
+
+    The consumer asks it before scheduling any round; withdrawal itself is
+    covered against the controller's own fakes.
+    """
+
+    async def agent_access(self, user_id: str) -> dict:
+        return {"user_id": user_id, "allowed": True, "permissions": ["agent.use"]}
+
+
+_GATEWAY = _AllowedGateway()
+
+
 async def _goal_job(store, **job_overrides) -> tuple[dict, dict]:
     """A conversation whose goal is ``ship it`` for at most five rounds."""
     job = await _create_job(store, **job_overrides)
@@ -1086,7 +1100,7 @@ async def test_a_goal_created_with_the_first_message_queues_its_first_round(
     assert claim["id"] == job["id"]
     claimed = await store.goal_wakeups.claim_wakeups(limit=1)
     assert claimed and claimed[0]["id"] == armed["id"]
-    assert await consume_wakeup(store=store, wakeup=claimed[0]) == "wait"
+    assert await consume_wakeup(store=store, gateway=_GATEWAY, wakeup=claimed[0]) == "wait"
 
     # It finishes without reporting anything, which is the ordinary shape of a
     # first turn. That finish releases the wait behind it and records the
@@ -1101,7 +1115,7 @@ async def test_a_goal_created_with_the_first_message_queues_its_first_round(
         from_states=("running",),
         to_state="cancelled",
     )
-    assert await continue_after_finish(store=store, job_id=str(job["id"])) >= 1
+    assert await continue_after_finish(store=store, gateway=_GATEWAY, job_id=str(job["id"])) >= 1
 
     turns = await _thread_turns(store, pool, thread_id)
     rounds = [row for row in turns if row["turn_source"] == "goal"]
@@ -1145,7 +1159,7 @@ async def test_an_unloaded_github_app_leaves_the_goal_waiting_on_its_rows(
     claim = await _claim_round(store)
     claimed = await store.goal_wakeups.claim_wakeups(limit=1)
     assert claimed and claimed[0]["id"] == armed["id"]
-    assert await consume_wakeup(store=store, wakeup=claimed[0]) == "wait"
+    assert await consume_wakeup(store=store, gateway=_GATEWAY, wakeup=claimed[0]) == "wait"
     assert await store.attempt_commands.transition(
         job_id=str(job["id"]),
         attempt_id=claim["attempt_id"],
@@ -1157,9 +1171,14 @@ async def test_an_unloaded_github_app_leaves_the_goal_waiting_on_its_rows(
     attempts_before = due["attempts"]
 
     app = RecoveringApp()
-    assert await continue_after_finish(store=store, job_id=str(job["id"]), github_app=app) == 0
+    assert (
+        await continue_after_finish(
+            store=store, gateway=_GATEWAY, job_id=str(job["id"]), github_app=app
+        )
+        == 0
+    )
     for _ in range(MAX_WAKEUP_ATTEMPTS + 1):
-        assert await run_goal_wakeups(store=store, github_app=app) == 0
+        assert await run_goal_wakeups(store=store, gateway=_GATEWAY, github_app=app) == 0
     # Old enough to be stalled, were it not for the obligation still pending.
     async with pool.acquire() as conn:
         await conn.execute(
@@ -1180,7 +1199,7 @@ async def test_an_unloaded_github_app_leaves_the_goal_waiting_on_its_rows(
     ] == []
 
     app.loaded = True
-    assert await run_goal_wakeups(store=store, github_app=app) == 1
+    assert await run_goal_wakeups(store=store, gateway=_GATEWAY, github_app=app) == 1
     assert await store.goal_wakeups.pending_wakeup(thread_id=thread_id) is None
     rounds = [
         row for row in await _thread_turns(store, pool, thread_id) if row["turn_source"] == "goal"
@@ -1266,7 +1285,7 @@ async def test_a_resume_on_a_conversation_with_no_repository_access_pauses(
 
     claimed = await store.goal_wakeups.claim_wakeups(limit=1)
     assert claimed, "resume did not record its obligation"
-    assert await consume_wakeup(store=store, wakeup=claimed[0]) == "pause"
+    assert await consume_wakeup(store=store, gateway=_GATEWAY, wakeup=claimed[0]) == "pause"
 
     after = await store.goals.get_goal(thread_id=str(job["thread_id"]))
     assert (after["state"], after["pause_reason"]) == ("paused", "access_denied")
@@ -1323,7 +1342,7 @@ async def test_latest_turn_reports_the_conversations_real_state(
     assert resumed is not None and resumed["state"] == "active"
     claimed = await store.goal_wakeups.claim_wakeups(limit=1)
     assert claimed, "resume did not record its obligation"
-    assert await consume_wakeup(store=store, wakeup=claimed[0]) == "pause"
+    assert await consume_wakeup(store=store, gateway=_GATEWAY, wakeup=claimed[0]) == "pause"
     after = await store.goals.get_goal(thread_id=thread_id)
     assert (after["state"], after["pause_reason"]) == ("paused", "archived")
 
@@ -1358,7 +1377,7 @@ async def test_a_resume_on_a_lost_session_pauses(store, pool, monkeypatch: pytes
     assert resumed is not None and resumed["state"] == "active"
     claimed = await store.goal_wakeups.claim_wakeups(limit=1)
     assert claimed, "resume did not record its obligation"
-    assert await consume_wakeup(store=store, wakeup=claimed[0]) == "pause"
+    assert await consume_wakeup(store=store, gateway=_GATEWAY, wakeup=claimed[0]) == "pause"
     after = await store.goals.get_goal(thread_id=thread_id)
     assert (after["state"], after["pause_reason"]) == ("paused", "context_lost")
 
@@ -1418,7 +1437,7 @@ async def test_an_unbounded_goal_queues_round_fifty_one(store, pool, monkeypatch
     armed = next(
         row for row in await store.goal_wakeups.claim_wakeups(limit=16) if row["id"] == wakeup_id
     )
-    assert await consume_wakeup(store=store, wakeup=armed) == "queue_work_round"
+    assert await consume_wakeup(store=store, gateway=_GATEWAY, wakeup=armed) == "queue_work_round"
 
     rounds = [
         row for row in await _thread_turns(store, pool, thread_id) if row["turn_source"] == "goal"
@@ -1465,7 +1484,7 @@ async def test_a_goal_at_its_own_bound_pauses_instead_of_queueing(store, pool, m
     armed = next(
         row for row in await store.goal_wakeups.claim_wakeups(limit=16) if row["id"] == wakeup_id
     )
-    assert await consume_wakeup(store=store, wakeup=armed) == "pause"
+    assert await consume_wakeup(store=store, gateway=_GATEWAY, wakeup=armed) == "pause"
 
     after = await store.goals.get_goal(thread_id=thread_id)
     assert (after["state"], after["pause_reason"]) == ("paused", "round_limit")
@@ -1499,7 +1518,7 @@ async def test_stale_exhausted_wakeup_cannot_pause_a_successfully_recovered_goal
         )
     current = (await store.goal_wakeups.claim_wakeups(limit=1))[0]
     assert old["lease_owner"] != current["lease_owner"]
-    assert await consume_wakeup(store=store, wakeup=current) == "queue_work_round"
+    assert await consume_wakeup(store=store, gateway=_GATEWAY, wakeup=current) == "queue_work_round"
     await _retry_or_pause(store, old)
     goal = await store.goals.get_goal(thread_id=job["thread_id"])
     assert goal["state"] == "active"
@@ -1566,11 +1585,11 @@ async def test_repository_lookup_outages_do_not_exhaust_real_goal_wakeups(
     lookup = AsyncMock(side_effect=RepoAccessUnavailable("provider unavailable"))
     monkeypatch.setattr("cloud_agent.goals.controller.require_entitled_repo", lookup)
     for _ in range(MAX_WAKEUP_ATTEMPTS + 1):
-        assert await run_goal_wakeups(store=store) == 1
+        assert await run_goal_wakeups(store=store, gateway=_GATEWAY) == 1
         row = await store.goal_wakeups.pending_wakeup(thread_id=job["thread_id"])
         assert row["attempts"] == 0 and row["state"] == "pending"
         assert (await store.goals.get_goal(thread_id=job["thread_id"]))["state"] == "active"
-        assert await run_goal_wakeups(store=store) == 0
+        assert await run_goal_wakeups(store=store, gateway=_GATEWAY) == 0
         async with pool.acquire() as conn:
             await conn.execute(
                 "UPDATE agent_goal_wakeups SET not_before = NOW() - interval '1 second' "
@@ -1578,7 +1597,7 @@ async def test_repository_lookup_outages_do_not_exhaust_real_goal_wakeups(
                 row["id"],
             )
     lookup.side_effect = None
-    assert await run_goal_wakeups(store=store) == 1
+    assert await run_goal_wakeups(store=store, gateway=_GATEWAY) == 1
     turns = await _thread_turns(store, pool, job["thread_id"])
     assert (
         len([row for row in turns if row["turn_source"] == "goal" and row["state"] == "queued"])

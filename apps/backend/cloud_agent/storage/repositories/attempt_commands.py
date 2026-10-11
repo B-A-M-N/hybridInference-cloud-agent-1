@@ -36,7 +36,11 @@ from cloud_agent.sandbox_archive_credentials import load_stored_archive_policy
 from cloud_agent.storage._sql.compute_admission import host_compute_admission, lock_compute_topology
 from cloud_agent.storage._sql.events import insert_event
 from cloud_agent.storage._sql.goals import arm_finish_wakeup, goal_after_terminal
-from cloud_agent.storage._sql.hosts import host_slots_exhausted, release_host_slot
+from cloud_agent.storage._sql.hosts import (
+    LIVE_ATTEMPT_HOST,
+    host_slots_exhausted,
+    release_host_slot,
+)
 from cloud_agent.storage._sql.jobs import (
     QUALIFIED_JOB_COLUMNS,
     fail_discontinuous_follow_ups,
@@ -610,17 +614,23 @@ class PostgresAttemptCommands:
         (superseded, finished, or generation mismatch) — the worker must stop
         immediately. On success also returns ``cancel_requested`` so workers
         learn about cancellation without extra polling.
+
+        The machine the attempt runs on must also still be enrolled. The
+        worker token proves only the fence, and outlives the host credential
+        it was issued under; without this predicate a removed host could keep
+        its leases — and with them everything they renew — alive forever.
         """
         async with self._pool.acquire() as conn, conn.transaction():
             if not await self._lock_live_attempt(conn, attempt_id, lease_generation):
                 return {"ok": False}
             job_id = await conn.fetchval(
-                """
-                UPDATE agent_attempts
+                f"""
+                UPDATE agent_attempts a
                 SET lease_expires_at = clock_timestamp() + make_interval(secs => $3)
-                WHERE id = $1 AND lease_generation = $2 AND status = 'running'
-                  AND lease_expires_at > clock_timestamp()
-                RETURNING job_id
+                WHERE a.id = $1 AND a.lease_generation = $2 AND a.status = 'running'
+                  AND a.lease_expires_at > clock_timestamp()
+                  AND {LIVE_ATTEMPT_HOST}
+                RETURNING a.job_id
                 """,
                 attempt_id,
                 lease_generation,

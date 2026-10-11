@@ -34,6 +34,11 @@ from cloud_agent.goals.models import (
 )
 from cloud_agent.goals.prompts import render_repair_prompt, render_round_prompt
 from cloud_agent.goals.report import GoalReport, GoalReportParse
+from cloud_agent.owner_access import (
+    AGENT_ACCESS_WITHDRAWN,
+    AgentAccessUnavailable,
+    owner_may_use_agent,
+)
 from cloud_agent.source_control_runtime import SourceControlUnavailable
 
 if TYPE_CHECKING:
@@ -126,6 +131,11 @@ async def run_goal_wakeups(
     owner's goal. Unclaimed, the wakeup waits — the goal stays active, and the
     stall sweep leaves a goal with a pending wakeup alone — until a pass finds
     the App loaded.
+
+    A Gateway that cannot confirm the owner's Agent access is treated the same
+    way as a repository lookup that could not be made: the wakeup goes back
+    with its attempt restored, because an outage is not a reason to end
+    anyone's goal, and nothing is scheduled until the answer is known.
     """
     try:
         app_credentials = github_app.get() if github_app is not None else None
@@ -144,6 +154,23 @@ async def run_goal_wakeups(
                 retry_in_seconds=30.0,
                 restore_attempt=True,
                 detail="repository access is temporarily unavailable; retrying",
+            )
+        except AgentAccessUnavailable:
+            logger.warning(
+                "agent_goal_owner_access_unavailable",
+                extra={
+                    "event": "agent_goal_owner_access_unavailable",
+                    "thread_id": wakeup.get("thread_id"),
+                    "wakeup_id": wakeup.get("id"),
+                },
+                exc_info=True,
+            )
+            await store.goal_wakeups.release_wakeup(
+                wakeup_id=str(wakeup["id"]),
+                lease_owner=str(wakeup.get("lease_owner") or ""),
+                retry_in_seconds=30.0,
+                restore_attempt=True,
+                detail="Agent access could not be confirmed; retrying",
             )
         except Exception:
             logger.warning(
@@ -286,7 +313,7 @@ async def consume_wakeup(
     # A read that may reach the network happens *before* the decision's
     # transaction opens. Holding the conversation's lock across a GitHub call
     # would serialize every finish in the deployment behind one outage.
-    blocked = await _check_access(store, turn, app_credentials=app_credentials)
+    blocked = await _check_access(store, turn, app_credentials=app_credentials, gateway=gateway)
     if blocked is not None:
         return await _stop(
             store,
@@ -478,14 +505,25 @@ async def _check_access(
     turn: dict[str, Any] | None,
     *,
     app_credentials: Any | None = None,
+    gateway: Any | None = None,
 ) -> GoalAction | None:
-    """The one eligibility read that may reach outside the database.
+    """The eligibility reads, including the two that reach outside the database.
 
     ``turn`` arrives in one of two shapes — ``latest_turn``'s job-summary
     projection, which carries the thread's ``archived_at``, or the parked
     path's ``get_job``, which carries that *and* the retained sandbox — so the
     two conditions below are live in both, and the sandbox one is the belt to
     the archive route's braces.
+
+    **The owner's Agent access is asked before the repository.** An automatic
+    round is written with no request of the owner's to admit it, so this is the
+    first point at which a goal can learn that its owner's access was
+    withdrawn; without it an unbounded goal keeps queueing rounds for an owner
+    who can no longer open the conversation, and only the claim's own check
+    would stop each one. A denial pauses the goal with the reason. A Gateway
+    that cannot answer raises :class:`AgentAccessUnavailable`, which the
+    consumer turns into a retry — neither an outage nor a missing client lets
+    a round through.
     """
     if turn is None:
         return None
@@ -504,6 +542,20 @@ async def _check_access(
             kind="pause",
             reason="context_lost",
             message=("the conversation's session is gone; it cannot be resumed from a transcript"),
+        )
+    if not await owner_may_use_agent(gateway, user_id=str(turn["user_id"])):
+        logger.warning(
+            "agent_goal_owner_access_withdrawn",
+            extra={
+                "event": "agent_goal_owner_access_withdrawn",
+                "thread_id": turn["thread_id"],
+                "job_id": turn["id"],
+            },
+        )
+        return GoalAction(
+            kind="pause",
+            reason="access_denied",
+            message=AGENT_ACCESS_WITHDRAWN + " Resume the goal once access is restored.",
         )
     try:
         # The caller's own credential minter, not ``None``: with no App

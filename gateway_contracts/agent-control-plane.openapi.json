@@ -10442,6 +10442,7 @@
             "anyOf": [
               {
                 "items": {
+                  "maxLength": 256,
                   "type": "string"
                 },
                 "maxItems": 64,
@@ -10540,9 +10541,13 @@
             "anyOf": [
               {
                 "additionalProperties": {
+                  "maxLength": 128,
                   "type": "string"
                 },
                 "maxProperties": 64,
+                "propertyNames": {
+                  "maxLength": 64
+                },
                 "type": "object"
               },
               {
@@ -10557,11 +10562,16 @@
               {
                 "additionalProperties": {
                   "items": {
+                    "maxLength": 128,
                     "type": "string"
                   },
+                  "maxItems": 64,
                   "type": "array"
                 },
                 "maxProperties": 64,
+                "propertyNames": {
+                  "maxLength": 64
+                },
                 "type": "object"
               },
               {
@@ -10778,6 +10788,7 @@
           "capabilities": {
             "description": "What this machine can run — runtime tiers, sandbox backends, whatever a job may ask for. A job goes to a host only when the host declares everything the job requires.",
             "items": {
+              "maxLength": 256,
               "type": "string"
             },
             "maxItems": 64,
@@ -10792,7 +10803,12 @@
           },
           "labels": {
             "additionalProperties": {
+              "maxLength": 255,
               "type": "string"
+            },
+            "maxProperties": 32,
+            "propertyNames": {
+              "maxLength": 64
             },
             "title": "Labels",
             "type": "object"
@@ -15500,9 +15516,13 @@
           },
           "helper_versions": {
             "additionalProperties": {
+              "maxLength": 128,
               "type": "string"
             },
             "maxProperties": 64,
+            "propertyNames": {
+              "maxLength": 64
+            },
             "title": "Helper Versions",
             "type": "object"
           },
@@ -15520,6 +15540,7 @@
           },
           "runner_capabilities": {
             "items": {
+              "maxLength": 256,
               "type": "string"
             },
             "maxItems": 64,
@@ -15528,20 +15549,29 @@
           },
           "runtime_versions": {
             "additionalProperties": {
+              "maxLength": 128,
               "type": "string"
             },
             "maxProperties": 64,
+            "propertyNames": {
+              "maxLength": 64
+            },
             "title": "Runtime Versions",
             "type": "object"
           },
           "runtime_versions_available": {
             "additionalProperties": {
               "items": {
+                "maxLength": 128,
                 "type": "string"
               },
+              "maxItems": 64,
               "type": "array"
             },
             "maxProperties": 64,
+            "propertyNames": {
+              "maxLength": 64
+            },
             "title": "Runtime Versions Available",
             "type": "object"
           },
@@ -15610,6 +15640,7 @@
           },
           "worker_id": {
             "description": "Stable identifier of the claiming worker.",
+            "maxLength": 512,
             "title": "Worker Id",
             "type": "string"
           }
@@ -15955,6 +15986,7 @@
                 "type": "null"
               }
             ],
+            "description": "Why the turn ended as it did. Kept to the first 4000 characters; a longer one is trimmed, not refused.",
             "title": "Detail"
           },
           "setup_script": {
@@ -20859,7 +20891,7 @@
     },
     "/admin/agent/runner-hosts/{host}/remove": {
       "post": {
-        "description": "Revoke this host's credential and take it out of the pool.\n\nRefused while the host still holds slots, unless forced. The refusal is not\nbureaucracy: the running attempts belong to a machine the platform has just\ndeclared gone, and nobody would learn that until their leases lapsed\nminutes later. Being told \"it is still busy\" is the difference between\ndraining first and finding out afterwards.\n\nForced removal is the deliberate version of the same thing. Lease fencing\nrejects later writes from the superseded worker. A retained activation is\nnot replayed because the platform cannot know whether its prompt ran, so\nthat chat is marked LOST when the lease expires.\n\nThe row survives, disabled. ``agent_attempts.host_id`` points at it, and\n\"where did this job run\" should not become unanswerable because the machine\nwas retired. ``DELETE`` forgets that administrative row; neither action is\nevidence that the retained container or Docker data-root was deleted.",
+        "description": "Revoke this host's credential and take it out of the pool.\n\nRefused while the host still holds slots, unless forced. The refusal is not\nbureaucracy: the running attempts belong to a machine the platform has just\ndeclared gone, and nobody would learn that until their leases lapsed\nminutes later. Being told \"it is still busy\" is the difference between\ndraining first and finding out afterwards.\n\nForced removal is the deliberate version of the same thing, and it ends\nthat work rather than waiting for it: the revocation expires the host's\nattempt and residency leases in the same transaction. The attempts' worker\ntokens name no host, so a lease left to run would be one the removed\nmachine could keep renewing. Lease fencing then rejects every later write\nfrom it, and the reaper supersedes the attempts and revokes their grants\non its next pass. A retained activation is not replayed because the\nplatform cannot know whether its prompt ran, so that chat is marked LOST.\n\nThe row survives, disabled. ``agent_attempts.host_id`` points at it, and\n\"where did this job run\" should not become unanswerable because the machine\nwas retired. ``DELETE`` forgets that administrative row; neither action is\nevidence that the retained container or Docker data-root was deleted.",
         "operationId": "remove_agent_runner_host_admin_agent_runner_hosts__host__remove_post",
         "parameters": [
           {
@@ -20872,13 +20904,13 @@
             }
           },
           {
-            "description": "Remove a host that is still running attempts. Those attempts are not stopped — nothing here can reach them — they are left to their leases. An indeterminate retained-chat activation is marked LOST instead of replayed.",
+            "description": "Remove a host that is still running attempts. Their leases expire at once, so the removed machine can no longer heartbeat, renew grants, establish residencies or call tools for them; the next reaper pass requeues them or, for an indeterminate retained-chat activation, marks the chat LOST instead of replaying it.",
             "in": "query",
             "name": "force",
             "required": false,
             "schema": {
               "default": false,
-              "description": "Remove a host that is still running attempts. Those attempts are not stopped — nothing here can reach them — they are left to their leases. An indeterminate retained-chat activation is marked LOST instead of replayed.",
+              "description": "Remove a host that is still running attempts. Their leases expire at once, so the removed machine can no longer heartbeat, renew grants, establish residencies or call tools for them; the next reaper pass requeues them or, for an indeterminate retained-chat activation, marks the chat LOST instead of replaying it.",
               "title": "Force",
               "type": "boolean"
             }
@@ -27415,7 +27447,7 @@
     },
     "/v1/agent/mcp/oauth/callback/{provider}": {
       "get": {
-        "description": "Complete a browser authorization, fenced to the flow that started it.\n\nUnauthenticated by design: the browser arriving here carries a session\ncookie it may or may not still have, and the *state* is the credential that\nidentifies the flow. The user is taken from the flow row, which was written\nby an authenticated request, rather than from whatever this request claims.",
+        "description": "Complete a browser authorization, fenced to the flow that started it.\n\nThe *state* identifies the flow; the Agent session decides who may finish\nit. A flow is consumed only for the account that started it, before any\ncode is exchanged. Without that, a consent URL started by one user and\napproved in another person's browser would store that person's provider\ngrant on the first user's connection -- the authorization-code injection\nRFC 9700 describes, which PKCE does not stop because the platform holds\nthe verifier. The connection is still taken from the flow row, written by\nan authenticated request, rather than from anything this request claims.",
         "operationId": "oauth_callback_v1_agent_mcp_oauth_callback__provider__get",
         "parameters": [
           {

@@ -629,9 +629,9 @@ function HostsView() {
     // to decide anyway — with the consequence stated, before the request.
     if (slotsUsed > 0) {
       const ok = window.confirm(
-        `${host} is still running ${slotsUsed} attempt(s). Removing it does not stop them — ` +
-          'nothing here can reach them. They are left to their leases, which expire and requeue ' +
-          'the work exactly once. Remove anyway?',
+        `${host} is still running ${slotsUsed} attempt(s). Removing it ends them: their leases ` +
+          'expire now, and the work is requeued once, or a chat whose turn may already have run ' +
+          'is marked lost. Remove anyway?',
       );
       if (!ok) return;
     }

@@ -411,9 +411,11 @@ class PostgresHostPoolRepository:
         taking work", and letting it re-promote itself would make drain a
         suggestion.
 
-        Returns ``None`` for an unknown host. Every field is optional and only
-        overwrites when supplied, so a heartbeat that carries nothing but
-        liveness does not blank out what enrollment declared.
+        Returns ``None`` for an unknown host, and for one whose credential is
+        no longer the one this request authenticated with. Every field is
+        optional and only overwrites when supplied, so a heartbeat that
+        carries nothing but liveness does not blank out what enrollment
+        declared.
 
         **The capacity block is written by a second statement, deliberately.**
         Its acceptance conditions are not the heartbeat's: the credential must
@@ -435,8 +437,9 @@ class PostgresHostPoolRepository:
         Args:
             host: The authenticated host name.
             credential_hash: Digest the request authenticated with. The
-                archive revision, capacity write, and legacy settings import
-                are refused unless the row still holds it.
+                whole beat — liveness, archive revision, capacity write and
+                legacy settings import — is refused unless the row still
+                holds it.
             capacity: The validated, normalized capacity block to store.
             capacity_sample_age_ms: How old the observation was when sent.
             physical_host: Admin grouping label; never an identity.
@@ -457,7 +460,8 @@ class PostgresHostPoolRepository:
                 per-host overrides. Either ``None`` leaves the report in place.
 
         Returns:
-            The updated host row, or ``None`` when the host no longer exists.
+            The updated host row, or ``None`` when the host no longer exists
+            or no longer holds ``credential_hash``.
         """
         async with self._pool.acquire() as conn, conn.transaction():
             # Match the admin writer's lock order: policy before host. Once
@@ -498,7 +502,10 @@ class PostgresHostPoolRepository:
                         WHEN $15 AND ($16::text IS NULL OR credential_hash = $16) THEN $14
                         ELSE sandbox_archive_settings_applied_revision
                     END
-                WHERE host = $1
+                -- The credential the request authenticated with must still be
+                -- the row's: a beat delayed past a re-enrollment or a removal
+                -- must not mark the new machine online, or a removed one alive.
+                WHERE host = $1 AND ($16::text IS NULL OR credential_hash = $16)
                 RETURNING {HOST_COLUMNS}, settings_imported, settings_import_excluded
                 """,
                 host,
@@ -773,12 +780,14 @@ class PostgresHostPoolRepository:
         """Revoke a host's credential and take it out of the pool.
 
         Returns ``"ok"``, ``"unknown"`` or ``"busy"``. Busy means the host is
-        still holding slots: removing it then would leave running attempts
-        whose machine has officially stopped existing, and nothing would notice
-        until their leases lapsed. ``force`` accepts exactly that — the lease
-        expiry *is* the recovery path. A retained activation cannot be replayed
-        safely after its host disappears, so its expiry marks that chat LOST
-        and fails already-queued descendants instead.
+        still holding slots: removing it then ends running attempts whose
+        machine has officially stopped existing. ``force`` accepts exactly
+        that — lease expiry *is* the recovery path, and the revocation brings
+        it forward to now (see ``revoke_host_credentials``): the attempts'
+        worker tokens name no host, so a lease left to run would let the
+        removed machine keep renewing it. A retained activation cannot be
+        replayed safely after its host disappears, so its expiry marks that
+        chat LOST and fails already-queued descendants instead.
 
         Disabling rather than deleting. The row is what
         ``agent_attempts.host_id`` points at, and what an operator reads when
@@ -788,6 +797,15 @@ class PostgresHostPoolRepository:
         Docker writable layer was deleted.
         """
         async with self._pool.acquire() as conn, conn.transaction():
+            # The host's running attempts before its row: the order every
+            # writer that ends an attempt keeps (move the attempt, then give
+            # its slot back). Expiring those leases while holding the host row
+            # first would deadlock against an attempt finishing at that moment.
+            await conn.execute(
+                "SELECT id FROM agent_attempts WHERE host_id = $1 AND status = 'running' "
+                "ORDER BY id FOR UPDATE",
+                host,
+            )
             row = await conn.fetchrow(
                 "SELECT status, slots_used, drain_fence_active "
                 "FROM agent_runner_hosts WHERE host = $1 FOR UPDATE",

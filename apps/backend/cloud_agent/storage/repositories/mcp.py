@@ -1049,14 +1049,22 @@ class PostgresMcpConnectionRepository:
             )
         return int(generation)
 
-    async def consume_mcp_oauth_flow(self, *, state_hash: str) -> dict[str, Any] | None:
-        """Claim a flow exactly once, returning it, or ``None``.
+    async def consume_mcp_oauth_flow(
+        self, *, state_hash: str, user_id: str
+    ) -> dict[str, Any] | None:
+        """Claim one of ``user_id``'s flows exactly once, returning it, or ``None``.
 
         The ``consumed_at IS NULL`` predicate is inside the ``UPDATE``, so two
         callbacks racing on the same state cannot both proceed: the second
         matches no row. Marking it consumed before the token exchange is
         deliberate -- a callback that fails after this point must be restarted
         by the user, which is preferable to a state value that can be replayed.
+
+        The owner is part of the match, as it is for the source-control state.
+        The state alone identifies a flow, not who may finish it: a browser
+        signed in as somebody else must not complete it, or that person's
+        provider grant would be stored on the starter's connection. A flow
+        presented by another account is left untouched for its owner.
         """
         async with self._pool.acquire() as conn, conn.transaction():
             if not await self._lock_oauth_flow(conn, state_hash):
@@ -1065,10 +1073,12 @@ class PostgresMcpConnectionRepository:
                 """
                 UPDATE agent_mcp_oauth_flows
                 SET consumed_at = NOW()
-                WHERE state_hash = $1 AND consumed_at IS NULL AND expires_at > clock_timestamp()
+                WHERE state_hash = $1 AND user_id = $2
+                  AND consumed_at IS NULL AND expires_at > clock_timestamp()
                 RETURNING *
                 """,
                 state_hash,
+                user_id,
             )
         if row is None:
             return None

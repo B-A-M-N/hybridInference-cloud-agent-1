@@ -531,9 +531,9 @@ export async function setAgentRunnerHostSettings(
  * Revoke this host's credential and take it out of the pool.
  *
  * `force` is refused-by-default for a reason worth repeating at the call site:
- * attempts still running on that host are **not** stopped — nothing on this
- * side can reach them — they are left to their leases, which expire and requeue
- * the work exactly once.
+ * attempts still running on that host are ended. Their leases expire at once,
+ * and the work is requeued exactly once, or a chat whose turn may already have
+ * run is marked lost.
  */
 export async function removeAgentRunnerHost(
   host: string,

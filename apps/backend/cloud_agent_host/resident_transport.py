@@ -67,6 +67,22 @@ PRIVATE_MEMBER_STATE_ROOTS = {
     "kilo": f"{CHAT_STATE_DIR}/kilo-members",
 }
 
+# Each home is private to its member UID, not only distinct: its config and
+# plugins run at every process start as that member, with that member's grant
+# and MCP token. A collection stays group-writable so every member can add its
+# own home, but the home itself is created mode 0700 and an older release's
+# setgid, group-writable home is narrowed to that on the member's next start.
+# A home that is a symlink or belongs to another UID was planted by someone
+# else and is refused rather than adopted. Shell prologue; expects ``$target``.
+_PRIVATE_MEMBER_HOME_PROLOGUE = (
+    'collection=${target%/*}; (umask 0007; mkdir -p -- "$collection"); '
+    'umask 0077; mkdir -p -- "$target"; '
+    'if test -L "$target" || test ! -d "$target" '
+    '|| test "$(stat -c %u -- "$target")" != "$(id -u)"; then '
+    'echo "member provider home is not owned by this member" >&2; exit 1; fi; '
+    'chmod u=rwx,go=,g-s -- "$target"; '
+)
+
 # Host-owned exactly-once receipts must not live inside a provider home. Some
 # CLIs enumerate their whole state root, and the deliberately unreadable
 # platform directory otherwise turns into a provider-side EACCES. This path is
@@ -459,9 +475,9 @@ class ResidentTransportFactory:
         uid = MEMBER_UID_BASE + launch.slot_id
         script = (
             'set -eu; target="$1"; runtime="$2"; '
-            'marker="$target/.freeinference-member-state-v1"; umask 0007; '
-            'mkdir -p -- "$target"; '
-            'if test ! -e "$marker"; then '
+            'marker="$target/.freeinference-member-state-v1"; '
+            + _PRIVATE_MEMBER_HOME_PROLOGUE
+            + 'if test ! -e "$marker"; then '
             '  rm -rf -- "$target/$runtime/state/$runtime/locks"; '
             '  : > "$marker"; '
             "fi"
@@ -497,9 +513,9 @@ class ResidentTransportFactory:
         uid = MEMBER_UID_BASE + launch.slot_id
         script = (
             'set -eu; source="$1"; target="$2"; '
-            'marker="$target/.freeinference-member-state-v1"; umask 0007; '
-            'mkdir -p -- "$target"; '
-            'if test ! -e "$marker"; then '
+            'marker="$target/.freeinference-member-state-v1"; '
+            + _PRIVATE_MEMBER_HOME_PROLOGUE
+            + 'if test ! -e "$marker"; then '
             '  if test -f "$source/config.toml"; then '
             '    cp -- "$source/config.toml" "$target/config.toml"; '
             "  fi; "
@@ -541,35 +557,46 @@ class ResidentTransportFactory:
         runtime_id = source_launch.runtime_id
         if runtime_id != target_launch.runtime_id or runtime_id not in PRIVATE_MEMBER_STATE_ROOTS:
             raise DriverError("native fork cannot clone incompatible provider homes")
-        target_uid = MEMBER_UID_BASE + target_launch.slot_id
-        script = (
-            'set -eu; source="$1"; target="$2"; runtime="$3"; umask 0007; '
-            'test -d "$source"; mkdir -p -- "$target"; '
-            'find "$target" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; '
-            'for entry in "$source"/* "$source"/.[!.]* "$source"/..?*; do '
-            '  test -e "$entry" || continue; name=${entry##*/}; '
-            '  case "$name" in tmp|.tmp) continue;; esac; '
-            '  cp -R -- "$entry" "$target/"; '
+        # Neither UID can open the other's home. The source archives its own
+        # flushed home, scratch excluded, and the child unpacks that stream
+        # into a home only it can open; the copy crosses this host's pipe and
+        # is never staged inside the container where a sibling could read it.
+        archive = (
+            'set -eu; cd -- "$1"; set --; '
+            "for entry in * .[!.]* ..?*; do "
+            '  test -e "$entry" || continue; '
+            '  case "$entry" in tmp|.tmp) continue;; esac; '
+            '  set -- "$@" "./$entry"; '
             "done; "
+            'exec tar --create --file=- --files-from=/dev/null "$@"'
+        )
+        unpack = (
+            'set -eu; target="$1"; runtime="$2"; '
+            + _PRIVATE_MEMBER_HOME_PROLOGUE
+            + 'find "$target" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; '
+            'tar --extract --file=- --directory="$target" --no-same-owner '
+            "--no-same-permissions; "
             'mkdir -p -- "$target/tmp" "$target/.tmp"; '
             'case "$runtime" in '
             '  opencode|kilo) rm -rf -- "$target/$runtime/state/$runtime/locks";; '
             "esac; "
             ': > "$target/.freeinference-member-state-v1"'
         )
-        result = self._manager.exec_capture(
+        source, target = self._manager.pipe_member_exec(
             spec,
-            ["/bin/sh", "-c", script, "sh", source_dir, target_dir, runtime_id],
-            workdir="/",
-            timeout_s=120,
-            user_uid=target_uid,
+            source_argv=["/bin/sh", "-c", archive, "sh", source_dir],
+            source_uid=MEMBER_UID_BASE + source_launch.slot_id,
+            target_argv=["/bin/sh", "-c", unpack, "sh", target_dir, runtime_id],
+            target_uid=MEMBER_UID_BASE + target_launch.slot_id,
             user_gid=self._manager.backend.gid,
+            timeout_s=120,
         )
-        if result.returncode != 0:
-            raise DriverError(
-                f"{runtime_id} fork state could not be materialized for the child: "
-                + result.stderr.decode("utf-8", "replace")[-300:]
-            )
+        for result in (target, source):
+            if result.returncode != 0:
+                raise DriverError(
+                    f"{runtime_id} fork state could not be materialized for the child: "
+                    + result.stderr.decode("utf-8", "replace")[-300:]
+                )
 
     def _clear_http_member_locks(
         self,
@@ -847,9 +874,9 @@ class ResidentTransportFactory:
 
         if runtime_id in PRIVATE_MEMBER_STATE_ROOTS:
             # These providers use owner-only files, SQLite, or project locks.
-            # Stop the quiescent source so its state is flushed, expose its
-            # credential-free files to the target UID, and copy that stable
-            # post-fork state into the child's private home. The supervisor
+            # Stop the quiescent source so its state is flushed, publish its
+            # shared workspace writes, and copy that stable post-fork state
+            # from its private home into the child's. The supervisor
             # resumes the exact source immediately after this method returns;
             # PID continuity is not required. For Codex this materialization
             # is also the recovery path when the original RPC response is lost.

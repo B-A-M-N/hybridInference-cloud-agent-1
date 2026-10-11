@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 
+from cloud_agent.api._body_limits import HostBodyLimitRoute
 from cloud_agent.api.deps import get_grant_client, get_storage
 from cloud_agent.broker_routing import BrokerUrlRefused, probe_broker, validate_broker_url
 from cloud_agent.host_pool import (
@@ -67,7 +68,8 @@ class _HostsStorage(Protocol):
     sandbox: SandboxRepository
 
 
-router = APIRouter(prefix="/v1/agent/host", tags=["agent-hosts"])
+# Host traffic arrives through the tunnel, past the edge's body limits.
+router = APIRouter(prefix="/v1/agent/host", tags=["agent-hosts"], route_class=HostBodyLimitRoute)
 
 
 def _require_store(store: _HostsStorage | None) -> _HostsStorage:
@@ -294,9 +296,10 @@ async def heartbeat_host(
         ),
     )
     if updated is None:
-        # The row vanished between authentication and the write — a forget
-        # landing mid-request. Refusing is right: this credential now names
-        # nothing.
+        # The row vanished, or its credential changed, between authentication
+        # and the write — a forget, a removal or a re-enrollment landing
+        # mid-request. Refusing is right: this credential now names nothing,
+        # and the residencies below must not be extended on its word.
         raise _unauthorized("This host credential is no longer valid.")
     # Residency beats ride the host heartbeat (design §7): one wire message
     # says "I am here" and "these sandboxes are still mine", generation-scoped

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from cloud_agent.storage._sql.hosts import LIVE_ATTEMPT_HOST
+
 if TYPE_CHECKING:
     import asyncpg
 
@@ -35,12 +37,14 @@ class PostgresResidencyRepository:
         """Take (or rotate) a chat's residency; ``None`` = not earned.
 
         Residency is something the exact worker attempt earns by *currently*
-        running the thread's turn on this host. Attempt id, lease generation,
-        current-job ownership, membership ownership, status, and lease expiry
+        running the thread's turn on this host, while that host is still
+        enrolled. Attempt id, lease generation, current-job ownership,
+        membership ownership, status, lease expiry and the host's enrollment
         are checked in the same transaction as rotation, so a delayed request
-        from a superseded attempt cannot revoke its successor's grant. The
-        membership generation only ever increments, and every rotation clears
-        the grant so the caller revokes the predecessor's
+        from a superseded attempt cannot revoke its successor's grant, and a
+        removed machine's saved worker token cannot mint fresh member grants.
+        The membership generation only ever increments, and every rotation
+        clears the grant so the caller revokes the predecessor's
         (``previous_grant_id``) and mints anew.
 
         ``runtime_id`` and ``runtime_version`` are accepted for the worker
@@ -50,11 +54,12 @@ class PostgresResidencyRepository:
         del runtime_id, runtime_version
         async with self._pool.acquire() as conn, conn.transaction():
             attempt = await conn.fetchrow(
-                """
-                SELECT id, job_id FROM agent_attempts
-                WHERE id = $1 AND lease_generation = $2 AND host_id = $3
-                  AND status = 'running'
-                FOR SHARE
+                f"""
+                SELECT a.id, a.job_id FROM agent_attempts a
+                WHERE a.id = $1 AND a.lease_generation = $2 AND a.host_id = $3
+                  AND a.status = 'running'
+                  AND {LIVE_ATTEMPT_HOST}
+                FOR SHARE OF a
                 """,
                 attempt_id,
                 lease_generation,
@@ -98,7 +103,7 @@ class PostgresResidencyRepository:
             if member is None:
                 return None
             row = await conn.fetchrow(
-                """
+                f"""
                 UPDATE agent_thread_sandbox_memberships AS m
                 SET residency_generation = residency_generation + 1,
                     residency_status = 'hot',
@@ -118,6 +123,7 @@ class PostgresResidencyRepository:
                   AND a.lease_generation = $5 AND a.host_id = $4
                   AND a.status = 'running'
                   AND a.lease_expires_at > clock_timestamp()
+                  AND {LIVE_ATTEMPT_HOST}
                 RETURNING m.thread_id, m.sandbox_id,
                           m.residency_generation AS generation,
                           m.residency_status AS status,
