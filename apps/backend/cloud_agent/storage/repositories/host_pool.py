@@ -1529,8 +1529,7 @@ class PostgresHostPoolRepository:
             if active == host:
                 return "active"
             retained = await conn.fetchval(
-                "SELECT 1 FROM agent_sandboxes "
-                "WHERE host=$1 AND deletion_state<>'deleted' LIMIT 1",
+                "SELECT 1 FROM agent_sandboxes WHERE host=$1 AND deletion_state<>'deleted' LIMIT 1",
                 host,
             )
             if retained:
