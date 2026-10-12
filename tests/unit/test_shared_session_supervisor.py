@@ -2182,6 +2182,136 @@ def test_a_legacy_home_a_sibling_replaced_is_refused_after_the_move(_multi_uid_s
         assert not (home / "config.toml").exists(), "the sibling's config was adopted"
 
 
+def _poison_legacy_home(manager: _LocalMemberShell, factory, victim) -> None:
+    """An earlier release's group-writable home a sibling put its config into."""
+    legacy = manager.local(factory._legacy_member_state_dir(victim))
+    sibling = MEMBER_UID_BASE
+    made = _as_member(manager, sibling, 'umask 0007; mkdir -p -- "$1"', str(legacy.parent))
+    assert made.returncode == 0, made.stderr
+    made = _as_member(manager, victim_uid(victim), 'umask 0007; mkdir -- "$1"', str(legacy))
+    assert made.returncode == 0, made.stderr
+    made = _as_member(manager, sibling, 'umask 0; printf evil > "$1/config.toml"', str(legacy))
+    assert made.returncode == 0, made.stderr
+
+
+def victim_uid(launch) -> int:
+    return MEMBER_UID_BASE + launch.slot_id
+
+
+def _never_adopted(manager: _LocalMemberShell, factory, victim) -> None:
+    """Start again: refused is safe; a home with a sibling's file in it is not."""
+    home = manager.local(factory._member_state_dir(victim))
+    try:
+        factory._prepare_member_state(_spec(), victim, factory._member_state_dir(victim))
+    except DriverError as exc:
+        assert "another UID" in str(exc) or "not owned by this member" in str(exc)
+        return
+    assert home.stat().st_uid == victim_uid(victim)
+    owners = {path.lstat().st_uid for path in [home, *home.rglob("*")]}
+    assert owners == {victim_uid(victim)}, "a sibling-owned entry was adopted"
+    config = home / "config.toml"
+    assert not config.exists() or config.read_text() != "evil"
+
+
+def test_a_sibling_holding_every_guessable_quarantine_name_gets_nothing_adopted(
+    _multi_uid_state,
+):
+    """Codex review P1 on #568: the set-aside name must not decide adoption.
+
+    A sibling may create entries in the sticky collection. It takes the name
+    the previous release used for the set-aside home, for a whole range of
+    PIDs, plus other obvious spellings; the poisoned home is still never
+    adopted, on this start or the next.
+    """
+    base, _state = _multi_uid_state
+    manager = _LocalMemberShell(base, as_uids=True)
+    factory = ResidentTransportFactory(manager)  # type: ignore[arg-type]
+    victim = replace(_launch("athr_victim", native_session_id=None, slot=1), runtime_id="codex")
+    manager.ensure_private_member_collections(_spec())
+    _poison_legacy_home(manager, factory, victim)
+    home = manager.local(factory._member_state_dir(victim))
+    squat = (
+        'for name in "$@"; do mkdir -- "$name"; : > "$name/keep"; done; '
+        'i=1; while [ "$i" -le 2048 ]; do mkdir -- "$0.refused-$i"; i=$((i + 1)); done'
+    )
+    guessed = [f"{home}.refused", f"{home}.refused-", f"{home}.refused-0", f"{home}.old"]
+    squatted = subprocess.run(
+        manager.run_as(
+            MEMBER_UID_BASE, _SANDBOX_UID, ["/bin/sh", "-c", squat, str(home), *guessed]
+        ),
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert squatted.returncode == 0, squatted.stderr
+
+    with pytest.raises(DriverError, match="another UID"):
+        factory._prepare_member_state(_spec(), victim, factory._member_state_dir(victim))
+
+    _never_adopted(manager, factory, victim)
+    _never_adopted(manager, factory, victim)
+
+
+def test_a_poisoned_home_is_refused_on_every_start_when_it_cannot_be_set_aside(
+    _multi_uid_state, monkeypatch
+):
+    """Adoption never depends on the set-aside rename succeeding."""
+    base, _state = _multi_uid_state
+    manager = _LocalMemberShell(base, as_uids=True)
+    factory = ResidentTransportFactory(manager)  # type: ignore[arg-type]
+    victim = replace(_launch("athr_victim", native_session_id=None, slot=1), runtime_id="codex")
+    manager.ensure_private_member_collections(_spec())
+    _poison_legacy_home(manager, factory, victim)
+    home = manager.local(factory._member_state_dir(victim))
+    # Every name mktemp offers is one the sibling already holds.
+    stubs = base / "stubs"
+    stubs.mkdir()
+    stub = stubs / "mktemp"
+    stub.write_text('#!/bin/sh\nfor last; do :; done\nprintf "%staken\\n" "${last%%XXXX*}"\n')
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{stubs}:{os.environ['PATH']}")
+    taken = _as_member(
+        manager, MEMBER_UID_BASE, 'mkdir -- "$1"; : > "$1/keep"', f"{home}.refused-taken"
+    )
+    assert taken.returncode == 0, taken.stderr
+
+    for _start in range(3):
+        with pytest.raises(DriverError, match="another UID"):
+            factory._prepare_member_state(_spec(), victim, factory._member_state_dir(victim))
+        # The poisoned tree is still at the home's path, and still refused.
+        assert (home / "config.toml").read_text() == "evil"
+
+
+def test_a_clean_home_and_a_fork_copy_pass_the_every_start_check(_multi_uid_state):
+    """Every legitimate writer is the member itself, so nothing honest is refused."""
+    base, _state = _multi_uid_state
+    manager = _LocalMemberShell(base, as_uids=True)
+    factory = ResidentTransportFactory(manager)  # type: ignore[arg-type]
+    source = replace(
+        _launch("athr_source", native_session_id="native-source", slot=0), runtime_id="opencode"
+    )
+    child = replace(_launch("athr_child", native_session_id=None, slot=2), runtime_id="opencode")
+    factory._prepare_member_state(_spec(), source, factory._member_state_dir(source))
+    source_home = manager.local(factory._member_state_dir(source))
+    written = _as_member(
+        manager,
+        victim_uid(source),
+        'mkdir -p -- "$1/opencode/data"; printf session > "$1/opencode/data/opencode.db"',
+        str(source_home),
+    )
+    assert written.returncode == 0, written.stderr
+    factory._prepare_member_state(_spec(), source, factory._member_state_dir(source))
+
+    factory._clone_private_member_state(_spec(), source, child)
+    factory._prepare_member_state(_spec(), child, factory._member_state_dir(child))
+
+    child_home = manager.local(factory._member_state_dir(child))
+    assert {path.lstat().st_uid for path in [child_home, *child_home.rglob("*")]} == {
+        victim_uid(child)
+    }
+    assert (child_home / "opencode/data/opencode.db").read_text() == "session"
+
+
 def test_codex_preparing_journal_recovers_one_persisted_child_without_refork(monkeypatch):
     manager = _Manager()
     factory = ResidentTransportFactory(manager)  # type: ignore[arg-type]

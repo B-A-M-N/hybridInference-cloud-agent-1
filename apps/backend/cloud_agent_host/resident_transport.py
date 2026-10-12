@@ -100,12 +100,8 @@ _PRIVATE_MEMBER_HOME_CHECK = (
 # An earlier release kept the home in a member-created, group-writable
 # collection, where a sibling could rename or replace it at any time. The
 # member moves whatever is at that path into the trusted collection once, and
-# only then judges it, where no sibling can swap it any more: it must be a real
-# directory with every entry owned by this member, and it is narrowed to the
-# member alone. A moved home that fails that judgement is renamed aside before
-# the start is refused: left at ``$target`` it would look already migrated next
-# time, skip this check, and be adopted with the sibling's files inside. Expects
-# ``$legacy`` as well.
+# only then judges it, where no sibling can swap it any more; a moved home is
+# also narrowed to the member alone. Expects ``$legacy`` as well.
 _PRIVATE_MEMBER_HOME_MIGRATE = (
     "migrated=; "
     'if test ! -e "$target" && test ! -L "$target" '
@@ -119,17 +115,35 @@ _PRIVATE_MEMBER_HOME_CLAIM = (
     'echo "member provider home is not owned by this member" >&2; exit 1; fi; '
     'chmod u=rwx,go=,g-s -- "$target"; '
 )
+# Judged on every start, not only after a move: whether a home is adopted must
+# never depend on an earlier start having managed to set a bad one aside. Every
+# legitimate writer of a provider home runs as its member -- the CLI, plugin
+# installation, lock cleanup, and the fork copy's unpack -- so an entry owned
+# by any other UID was put there by someone else (through an earlier release's
+# group-writable home). Such a home is refused, and first renamed to an
+# unpredictable name so the next start can begin clean: a sibling can create
+# entries in the sticky collection, and a guessable name it had taken would
+# make the rename fail. If the rename still fails, the start is refused all the
+# same. A walk that cannot be completed is refused too. The walk stops at the
+# first foreign entry; a clean home costs one lstat per entry.
+_PRIVATE_MEMBER_HOME_VERIFY = (
+    'foreign=$(find "$target" -xdev ! -uid "$(id -u)" -print -quit); '
+    'if test -n "$foreign"; then '
+    "attempt=0; "
+    'until aside=$(mktemp -u -- "$target.refused-XXXXXXXXXXXXXXXX") '
+    '&& mv -T -- "$target" "$aside" 2>/dev/null; do '
+    'attempt=$((attempt + 1)); test "$attempt" -lt 3 || break; done; '
+    'echo "member provider home holds another UID files" >&2; exit 1; fi; '
+)
 _PRIVATE_MEMBER_HOME_NARROW_MIGRATED = (
     'if test -n "$migrated"; then '
-    'if test -n "$(find "$target" -xdev ! -uid "$(id -u)" -print -quit)"; then '
-    'mv -T -- "$target" "$target.refused-$$"; '
-    'echo "migrated member provider home holds another UID files" >&2; exit 1; fi; '
     'find "$target" -xdev -mindepth 1 ! -type l -exec chmod go=,g-s -- {} +; fi; '
 )
 _PRIVATE_MEMBER_HOME_PROLOGUE = (
     _PRIVATE_MEMBER_HOME_CHECK
     + _PRIVATE_MEMBER_HOME_MIGRATE
     + _PRIVATE_MEMBER_HOME_CLAIM
+    + _PRIVATE_MEMBER_HOME_VERIFY
     + _PRIVATE_MEMBER_HOME_NARROW_MIGRATED
 )
 #: For a home that has no earlier location: a fork child's.
