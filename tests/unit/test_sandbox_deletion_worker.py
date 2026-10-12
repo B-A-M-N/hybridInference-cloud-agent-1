@@ -93,6 +93,48 @@ async def run(store, archives):
 
 
 @pytest.mark.asyncio
+async def test_discard_removes_the_container_without_an_archive(monkeypatch):
+    store, broker, archives, events = setup(monkeypatch)
+    claim = store.sandbox.claim_due_admin_sandbox_deletion.return_value
+    claim["deletion_discard"] = True
+    broker.discard_sandbox_deletion = AsyncMock(
+        return_value={
+            "request_id": "request",
+            "container_id": "container-one",
+            "deleted": True,
+        }
+    )
+    store.sandbox.complete_admin_sandbox_discard = AsyncMock(return_value=True)
+    assert await run(store, archives)
+    assert events == []
+    broker.prepare_sandbox_deletion.assert_not_awaited()
+    broker.upload_sandbox_deletion_archive.assert_not_awaited()
+    broker.commit_sandbox_deletion.assert_not_awaited()
+    broker.abort_sandbox_deletion.assert_not_awaited()
+    archives.prepare_upload.assert_not_awaited()
+    archives.verify_archive.assert_not_awaited()
+    store.sandbox.record_admin_sandbox_archive.assert_not_awaited()
+    store.sandbox.complete_admin_sandbox_deletion.assert_not_awaited()
+    store.sandbox.complete_admin_sandbox_discard.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_discard_retries_without_aborting_or_uploading(monkeypatch):
+    store, broker, archives, _events = setup(monkeypatch)
+    claim = store.sandbox.claim_due_admin_sandbox_deletion.return_value
+    claim["deletion_discard"] = True
+    broker.discard_sandbox_deletion = AsyncMock(side_effect=RuntimeError("lost acknowledgement"))
+    assert await run(store, archives)
+    broker.prepare_sandbox_deletion.assert_not_awaited()
+    broker.abort_sandbox_deletion.assert_not_awaited()
+    archives.prepare_upload.assert_not_awaited()
+    failure = store.sandbox.fail_admin_sandbox_deletion.call_args.kwargs
+    assert failure["retain_pending"] is True
+    assert "without an archive" in failure["error"]
+    assert "lost acknowledgement" not in failure["error"]
+
+
+@pytest.mark.asyncio
 async def test_deletion_waits_for_verified_s3_object_and_committed_receipt(monkeypatch):
     store, broker, archives, events = setup(monkeypatch)
     assert await run(store, archives)

@@ -67,9 +67,34 @@ async def delete_one_archived_sandbox(
     }
     broker = None
     payload: dict[str, Any] | None = None
+    discarding = bool(claim.get("deletion_discard"))
     verified = claim["deletion_state"] == "archived"
     archive_verified = verified
     try:
+        if discarding:
+            host = await store.host_pool.get_host(host=str(claim["host"]))
+            broker = broker_for_host(host) if host is not None else None
+            if broker is None:
+                raise ValueError("The owning workspace broker is unavailable.")
+            payload = {
+                "request_id": fence["request_id"],
+                "generation": fence["generation"],
+                "expected_container_id": fence["container_id"],
+            }
+            deleted = await broker.discard_sandbox_deletion(str(claim["origin_thread_id"]), payload)
+            _validate_receipt(
+                deleted,
+                {
+                    "request_id": fence["request_id"],
+                    "container_id": fence["container_id"],
+                },
+            )
+            if deleted.get("deleted") is not True:
+                raise ValueError("The host did not confirm container deletion.")
+            completed = await store.sandbox.complete_admin_sandbox_discard(**fence)
+            if not completed:
+                raise ValueError("Container deletion lost its durable request fence.")
+            return True
         host = await store.host_pool.get_host(host=str(claim["host"]))
         broker = broker_for_host(host) if host is not None else None
         if broker is None:
@@ -162,7 +187,7 @@ async def delete_one_archived_sandbox(
         # Upload URLs are credentials. Never persist arbitrary SDK/HTTP errors
         # containing request URLs in user-visible state or operational logs.
         abort_acknowledged = False
-        if not archive_verified and broker is not None and payload is not None:
+        if not discarding and not archive_verified and broker is not None and payload is not None:
             with contextlib.suppress(Exception):
                 # Renew before touching the host barrier. An expired claimant
                 # must not abort a newer worker's operation for this request.
@@ -185,16 +210,24 @@ async def delete_one_archived_sandbox(
                         },
                     )
                     abort_acknowledged = aborted.get("aborted") is True
-        retain_pending = archive_verified or not abort_acknowledged
-        error = "S3 archive or sandbox deletion could not complete. " + (
-            "The verified archive is retained; deletion will be retried."
-            if archive_verified
-            else (
-                "The container is retained; the request will retry when the host is available."
-                if retain_pending
-                else "The container has not been deleted. Refresh details before retrying."
+        # A discard may already have removed Docker. Retry that exact request
+        # instead of aborting it or starting an archive for a missing container.
+        retain_pending = discarding or archive_verified or not abort_acknowledged
+        if discarding:
+            error = (
+                "Container removal without an archive could not be confirmed. "
+                "Deletion will be retried."
             )
-        )
+        else:
+            error = "S3 archive or sandbox deletion could not complete. " + (
+                "The verified archive is retained; deletion will be retried."
+                if archive_verified
+                else (
+                    "The container is retained; the request will retry when the host is available."
+                    if retain_pending
+                    else "The container has not been deleted. Refresh details before retrying."
+                )
+            )
         with contextlib.suppress(Exception):
             await store.sandbox.fail_admin_sandbox_deletion(
                 **fence, error=error, retain_pending=retain_pending

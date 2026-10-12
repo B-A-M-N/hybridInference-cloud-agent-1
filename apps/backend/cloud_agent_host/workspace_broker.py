@@ -307,6 +307,14 @@ class SandboxArchivePrepareRequest(BaseModel):
     archive_key: str = Field(..., min_length=1, max_length=1024)
 
 
+class SandboxArchiveDiscardRequest(BaseModel):
+    """Exact stopped identity for a deletion that does not upload an archive."""
+
+    request_id: str = Field(..., min_length=1, max_length=128)
+    generation: int = Field(..., ge=1)
+    expected_container_id: str = Field(..., min_length=1, max_length=256)
+
+
 class SandboxArchiveCommitRequest(SandboxArchivePrepareRequest):
     """Prepared receipt independently verified by the trusted control plane."""
 
@@ -2620,6 +2628,27 @@ def create_app(
                 sandbox_archive_identity(thread_id, body),
                 sha256=body.sha256,
                 size_bytes=body.size_bytes,
+            )
+        except (SandboxError, ValueError) as exc:
+            raise supervisor_error(exc) from exc
+
+    @app.post("/shared-sandboxes/{thread_id}/admin-delete/discard")
+    async def discard_sandbox_without_archive(
+        thread_id: str,
+        body: SandboxArchiveDiscardRequest,
+        _: None = Depends(authenticate),
+    ) -> dict[str, Any]:
+        require_shared_supervisor()
+        try:
+            return await endpoint_calls.run(
+                app.state.sandbox_deletion_archive_service.discard,
+                ArchiveIdentity(
+                    thread_id=thread_id,
+                    request_id=body.request_id,
+                    generation=body.generation,
+                    expected_container_id=body.expected_container_id,
+                    archive_key="",
+                ),
             )
         except (SandboxError, ValueError) as exc:
             raise supervisor_error(exc) from exc

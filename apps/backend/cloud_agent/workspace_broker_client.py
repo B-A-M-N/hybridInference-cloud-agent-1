@@ -453,6 +453,14 @@ class WorkspaceBrokerClient:
             "POST", thread_id, "admin-delete/abort", json=payload, timeout=120
         )
 
+    async def discard_sandbox_deletion(
+        self, thread_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Remove a stopped container without exporting or uploading an archive."""
+        return await self._shared_sandbox_request(
+            "POST", thread_id, "admin-delete/discard", json=payload, timeout=120
+        )
+
     async def register_shared_sandbox(self, sandbox: dict[str, Any]) -> dict[str, Any]:
         """Rehydrate durable member aliases after a broker process restart.
 

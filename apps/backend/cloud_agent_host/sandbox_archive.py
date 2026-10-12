@@ -10,7 +10,7 @@ import os
 import tarfile
 import tempfile
 import threading
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
@@ -359,3 +359,60 @@ class SandboxArchiveService:
                 "archive_key": identity.archive_key,
                 "aborted": True,
             }
+
+    def discard(self, identity: ArchiveIdentity) -> dict[str, Any]:
+        """Remove the exact stopped container without exporting or uploading it.
+
+        The authorization record is fsynced before Docker removal, so a lost
+        response retries the same request. A request that already prepared an
+        archive cannot be discarded.
+        """
+        if identity.archive_key:
+            raise ValueError("sandbox discard does not upload an archive")
+        with self._lock:
+            directory = self._directory(identity)
+            finished = self._read(directory / "discarded.json")
+            if finished is not None:
+                if finished.get("identity") != self._identity_dict(identity):
+                    raise SessionLeaseLost("sandbox discard request identity changed")
+                return self._discard_receipt(identity)
+            if any(
+                (directory / name).exists()
+                for name in (
+                    "prepare.json",
+                    "upload.json",
+                    "commit.json",
+                    "deleted.json",
+                    "abort.json",
+                )
+            ):
+                raise SessionLeaseLost("sandbox archive request cannot be discarded")
+            record = self._read(directory / "discard.json")
+            if record is None:
+                self._state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                directory.mkdir(mode=0o700, exist_ok=True)
+                spec, _manifest = self._supervisor.begin_archive(
+                    identity.thread_id,
+                    request_id=identity.request_id,
+                    generation=identity.generation,
+                    container_id=identity.expected_container_id,
+                )
+                record = {"identity": self._identity_dict(identity), "spec": asdict(spec)}
+                self._append(directory / "discard.json", record)
+            elif record.get("identity") != self._identity_dict(identity):
+                raise SessionLeaseLost("sandbox discard request identity changed")
+            self._supervisor.commit_archive(
+                ChatSandboxSpec(**record["spec"]),
+                request_id=identity.request_id,
+                container_id=identity.expected_container_id,
+            )
+            self._append(directory / "discarded.json", {"identity": self._identity_dict(identity)})
+            return self._discard_receipt(identity)
+
+    @staticmethod
+    def _discard_receipt(identity: ArchiveIdentity) -> dict[str, Any]:
+        return {
+            "request_id": identity.request_id,
+            "container_id": identity.expected_container_id,
+            "deleted": True,
+        }
