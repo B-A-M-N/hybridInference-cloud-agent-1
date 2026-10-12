@@ -2170,6 +2170,17 @@ def test_a_legacy_home_a_sibling_replaced_is_refused_after_the_move(_multi_uid_s
     with pytest.raises(DriverError, match=r"not owned by this member|another UID"):
         factory._prepare_member_state(_spec(), victim, factory._member_state_dir(victim))
 
+    # Codex review P1 on #568: the next start must not find the refused tree at
+    # the home's path, take it for an already migrated home, and adopt it.
+    home = manager.local(factory._member_state_dir(victim))
+    try:
+        factory._prepare_member_state(_spec(), victim, factory._member_state_dir(victim))
+    except DriverError:
+        pass  # Still refused is safe; adopting the planted tree is not.
+    else:
+        assert home.stat().st_uid == MEMBER_UID_BASE + 1
+        assert not (home / "config.toml").exists(), "the sibling's config was adopted"
+
 
 def test_codex_preparing_journal_recovers_one_persisted_child_without_refork(monkeypatch):
     manager = _Manager()

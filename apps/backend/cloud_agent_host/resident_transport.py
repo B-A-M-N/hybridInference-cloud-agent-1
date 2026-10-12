@@ -102,7 +102,10 @@ _PRIVATE_MEMBER_HOME_CHECK = (
 # member moves whatever is at that path into the trusted collection once, and
 # only then judges it, where no sibling can swap it any more: it must be a real
 # directory with every entry owned by this member, and it is narrowed to the
-# member alone. Expects ``$legacy`` as well.
+# member alone. A moved home that fails that judgement is renamed aside before
+# the start is refused: left at ``$target`` it would look already migrated next
+# time, skip this check, and be adopted with the sibling's files inside. Expects
+# ``$legacy`` as well.
 _PRIVATE_MEMBER_HOME_MIGRATE = (
     "migrated=; "
     'if test ! -e "$target" && test ! -L "$target" '
@@ -119,6 +122,7 @@ _PRIVATE_MEMBER_HOME_CLAIM = (
 _PRIVATE_MEMBER_HOME_NARROW_MIGRATED = (
     'if test -n "$migrated"; then '
     'if test -n "$(find "$target" -xdev ! -uid "$(id -u)" -print -quit)"; then '
+    'mv -T -- "$target" "$target.refused-$$"; '
     'echo "migrated member provider home holds another UID files" >&2; exit 1; fi; '
     'find "$target" -xdev -mindepth 1 ! -type l -exec chmod go=,g-s -- {} +; fi; '
 )
