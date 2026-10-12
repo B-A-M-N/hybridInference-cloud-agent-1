@@ -36,6 +36,7 @@ class ComputeResourceWorker:
         """Run scheduling independently of long SSH deployment operations."""
         async with asyncio.TaskGroup() as group:
             group.create_task(self._schedule())
+            group.create_task(self._bridges())
             for slot in range(self.concurrency):
                 group.create_task(self._consume(f"{self.identity}:{slot}"))
 
@@ -54,6 +55,15 @@ class ComputeResourceWorker:
                         extra={"error_type": type(exc).__name__},
                     )
             await asyncio.sleep(current_poll_seconds(self.reconciler.commands.configuration))
+
+    async def _bridges(self) -> None:
+        """Reopen reverse SSH for nodes that cannot dial the stable host directly."""
+        while True:
+            try:
+                await self.reconciler.maintain_ssh_bridges()
+            except Exception as exc:
+                logger.error("compute_ssh_bridge_failed", extra={"error_type": type(exc).__name__})
+            await asyncio.sleep(60)
 
     async def _consume(self, worker_id: str) -> None:
         while True:
