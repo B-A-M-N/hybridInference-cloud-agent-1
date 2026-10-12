@@ -391,15 +391,16 @@ class CloudLabProvider(ComputeProvider):
         except ProviderError as exc:
             if exc.code == "server_error":
                 try:
-                    external_id = await self._created_experiment(name, config)
+                    created = await self._created_experiment(name, config)
                 except ProviderError:
                     return ProviderReceipt(outcome="unknown")
-                if external_id is None:
+                if created is None:
                     raise ProviderError(
                         "request_rejected",
                         "CloudLab did not create the experiment. "
                         "Check the profile name and its parameters.",
                     ) from None
+                external_id = created
             elif exc.code in {"result_unknown", "invalid_response"}:
                 return ProviderReceipt(outcome="unknown")
             else:
