@@ -1411,6 +1411,81 @@ async def test_stale_worker_cannot_clear_retirement_or_bootstrap_hold(db, store,
     assert (await repo.get_allocation(allocation_id))["holds"]
 
 
+async def test_uncreated_allocation_releases_without_a_provider_observation(store):
+    repo = store.compute_resources
+    request = str(uuid4())
+    created = await repo.create_allocation_operation(
+        request_id=request,
+        fingerprint=request,
+        kind="add",
+        allocation={
+            "name": "never-created",
+            "provider_id": "cloudlab",
+            "mode": "provision",
+            "management_mode": "manage",
+            "lease_managed": True,
+            "release_supported": True,
+        },
+        parameters={},
+        requested_by="admin",
+    )
+    claimed = await repo.claim_operation(worker_id="fixture")
+    assert claimed["id"] == created["id"]
+    assert await repo.finish_operation(
+        operation_id=created["id"],
+        generation=claimed["generation"],
+        worker_id="fixture",
+        state="succeeded",
+        step="created",
+    )
+    allocation_id = created["allocation_id"]
+    blocked = await repo.create_operation(
+        request_id=str(uuid4()),
+        fingerprint=str(uuid4()),
+        kind="acquire",
+        allocation_id=allocation_id,
+        parameters={},
+        requested_by="admin",
+    )
+    claimed = await repo.claim_operation(worker_id="fixture")
+    assert claimed["id"] == blocked["id"]
+    assert await repo.finish_operation(
+        operation_id=blocked["id"],
+        generation=claimed["generation"],
+        worker_id="fixture",
+        state="blocked",
+        step="acquiring",
+    )
+    retire = await operation(repo, allocation_id)
+    await repo.begin_retirement(allocation_id=allocation_id, **fence(retire))
+    impact = await repo.retirement_impact(allocation_id)
+    assert "unmanaged_scope" not in impact["blocked_reasons"]
+    assert "observation_stale" not in impact["blocked_reasons"]
+    assert "inventory_unverified" not in impact["blocked_reasons"]
+    committed = await repo.commit_release(allocation_id=allocation_id, **fence(retire))
+    assert committed["release_committed"] is True
+    assert (await repo.get_operation(blocked["id"]))["state"] == "cancelled"
+    row = await repo.get_allocation(allocation_id)
+    assert row["external_id"] is None
+    assert row["nodes"] == []
+    assert row["release_committed_at"] is not None
+
+
+async def test_incomplete_scope_still_blocks_release_when_a_node_exists(db, store):
+    repo = store.compute_resources
+    allocation_id, _, _ = await resource(store, provision=True)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_compute_allocations SET scope_complete=FALSE, observed_at=NULL WHERE id=$1",
+            allocation_id,
+        )
+    op = await operation(repo, allocation_id)
+    await repo.begin_retirement(allocation_id=allocation_id, **fence(op))
+    impact = await repo.retirement_impact(allocation_id)
+    assert "unmanaged_scope" in impact["blocked_reasons"]
+    assert "observation_stale" in impact["blocked_reasons"]
+
+
 async def test_failed_bootstrap_with_reserved_unregistered_host_can_retire_by_full_node_proof(
     store,
 ):

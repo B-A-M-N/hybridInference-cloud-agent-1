@@ -20,6 +20,7 @@ from cloud_agent.domain.compute import (
     autoscaling_retirement_needs_settlement,
     discard_request_id,
     fingerprint as operation_fingerprint,
+    provider_resource_absent,
 )
 from cloud_agent.storage._sql.compute_admission import host_compute_admission, lock_compute_entry
 from cloud_agent.storage._sql.hosts import revoke_host_credentials
@@ -2525,7 +2526,12 @@ class PostgresComputeResourceRepository:
             raise ValueError("allocation_not_found")
         hosts = [h["host"] for h in allocation["hosts"]]
         reasons: list[str] = []
-        if allocation["management_mode"] != "manage" or not allocation["scope_complete"]:
+        # A create that never received an experiment has no scope to adopt and
+        # no observation that can become fresh. Those checks would wait forever.
+        uncreated = provider_resource_absent(allocation)
+        if allocation["management_mode"] != "manage" or (
+            not uncreated and not allocation["scope_complete"]
+        ):
             reasons.append("unmanaged_scope")
         if any(not n["managed"] for n in allocation["nodes"]):
             reasons.append("unmanaged_scope")
@@ -2562,9 +2568,9 @@ class PostgresComputeResourceRepository:
         # unadopted containers, so absence is not proof of an empty resource.
         now = await conn.fetchval("SELECT NOW()")
         verified = allocation["inventory_verified_at"]
-        if verified is None or (now - verified).total_seconds() > 120:
+        if not uncreated and (verified is None or (now - verified).total_seconds() > 120):
             reasons.append("inventory_unverified")
-        if (
+        if not uncreated and (
             allocation["observed_at"] is None
             or (now - allocation["observed_at"]).total_seconds() > 300
         ):
@@ -2650,6 +2656,23 @@ class PostgresComputeResourceRepository:
                     impact["blocked_reasons"].append("external_operation_unresolved")
                 if impact["blocked_reasons"]:
                     return impact
+            if provider_resource_absent(await self._allocation(conn, allocation_id)):
+                # Stop a create that has not reached the provider. Retry after
+                # this commit is already refused; cancelling it keeps a later
+                # worker from posting an experiment for a released server.
+                await conn.execute(
+                    """UPDATE agent_compute_operations
+                    SET state='cancelled',
+                        message='released before a provider resource existed',
+                        completed_at=NOW(),updated_at=NOW()
+                    WHERE allocation_id=$1 AND id<>$2
+                      AND kind IN ('acquire','import')
+                      AND state IN ('pending','waiting','blocked')
+                      AND COALESCE(result->>'external_pending','false') <> 'true'
+                      AND NOT (result ? 'resource_ref')""",
+                    allocation_id,
+                    operation_id,
+                )
             await conn.execute(
                 "UPDATE agent_compute_allocations SET release_committed_at=NOW(),updated_at=NOW() WHERE id=$1",
                 allocation_id,
