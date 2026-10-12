@@ -180,8 +180,8 @@ def get_mcp_decision_signal(request: Request) -> McpDecisionSignal | None:
 def get_source_control(request: Request) -> SourceControlRuntime | None:
     """Dependency to obtain the process's source-control runtime.
 
-    ``None`` only where nothing built one — a test application that injects
-    credentials through the dependencies below. The lifespan always does.
+    ``None`` in the MCP relay, which has no source-control work, and in a test
+    application that injects credentials through the dependencies below.
     """
     return getattr(request.app.state, "source_control", None)
 
