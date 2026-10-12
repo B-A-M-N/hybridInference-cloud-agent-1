@@ -23,7 +23,7 @@ export function MemoryDetails({
     view.portrait.preferred_model;
 
   return (
-    <div className="mt-5 grid gap-5 lg:grid-cols-3">
+    <div className={`mt-5 grid gap-5 ${scope === 'project' ? 'lg:grid-cols-3' : 'lg:grid-cols-2'}`}>
       <div>
         <h3 className="text-sm font-semibold text-foreground">
           {t(scope === 'project' ? 'settings.projectMemory.portrait' : 'settings.memory.portrait')}
@@ -118,36 +118,34 @@ export function MemoryDetails({
         </div>
       )}
 
-      <div>
-        <h3 className="text-sm font-semibold text-foreground">
-          {t('settings.memory.suggestions')}
-        </h3>
-        {view.suggestions.length ? (
-          <ul className="mt-2 space-y-2">
-            {view.suggestions.map((suggestion) => (
-              <li key={suggestion.id} className="rounded-lg bg-surface-muted p-3">
-                <p className="break-words text-sm font-medium text-foreground">
-                  {suggestion.title}
-                </p>
-                <p className="mt-1 whitespace-pre-wrap break-words text-xs leading-relaxed text-muted">
-                  {suggestion.reason}
-                </p>
-                <p className="mt-2 whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground">
-                  {suggestion.action}
-                </p>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className="mt-2 text-sm leading-relaxed text-muted">
-            {t(
-              scope === 'project'
-                ? 'settings.projectMemory.emptySuggestions'
-                : 'settings.memory.emptySuggestions',
-            )}
-          </p>
-        )}
-      </div>
+      {scope === 'project' ? (
+        <div>
+          <h3 className="text-sm font-semibold text-foreground">
+            {t('settings.memory.suggestions')}
+          </h3>
+          {view.suggestions.length ? (
+            <ul className="mt-2 space-y-2">
+              {view.suggestions.map((suggestion) => (
+                <li key={suggestion.id} className="rounded-lg bg-surface-muted p-3">
+                  <p className="break-words text-sm font-medium text-foreground">
+                    {suggestion.title}
+                  </p>
+                  <p className="mt-1 whitespace-pre-wrap break-words text-xs leading-relaxed text-muted">
+                    {suggestion.reason}
+                  </p>
+                  <p className="mt-2 whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground">
+                    {suggestion.action}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="mt-2 text-sm leading-relaxed text-muted">
+              {t('settings.projectMemory.emptySuggestions')}
+            </p>
+          )}
+        </div>
+      ) : null}
     </div>
   );
 }

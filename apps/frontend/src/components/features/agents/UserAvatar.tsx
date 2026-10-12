@@ -1,30 +1,23 @@
 'use client';
 
-import { useEffect, useState } from 'react';
 import { useAuth, useT } from '@/components/providers';
-import { getUserMemory } from '@/lib/api/userMemory';
+import type { UserMemoryView } from '@/lib/api/userMemory';
+import { useUserHomeProfile } from './useUserHomeProfile';
 
-export function UserAvatar() {
+export function UserAvatar({ view }: { view?: UserMemoryView | null }) {
   const { state } = useAuth();
   const userId = state.user?.id;
+  if (view !== undefined) return <AvatarImage dataUrl={view?.avatar.data_url} />;
   return <AccountAvatar key={userId ?? 'signed-out'} userId={userId} />;
 }
 
 function AccountAvatar({ userId }: { userId?: string }) {
-  const t = useT();
-  const [dataUrl, setDataUrl] = useState<string | null>(null);
+  const { view } = useUserHomeProfile(userId);
+  return <AvatarImage dataUrl={view?.avatar.data_url} />;
+}
 
-  useEffect(() => {
-    if (!userId) return;
-    const controller = new AbortController();
-    void getUserMemory(controller.signal)
-      .then((view) => {
-        if (!controller.signal.aborted) setDataUrl(view.avatar.data_url);
-      })
-      // The composer stays usable if the avatar cannot be loaded.
-      .catch(() => {});
-    return () => controller.abort();
-  }, [userId]);
+function AvatarImage({ dataUrl }: { dataUrl?: string }) {
+  const t = useT();
 
   if (dataUrl) {
     return (
