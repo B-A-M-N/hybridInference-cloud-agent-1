@@ -11,6 +11,7 @@ from tests.integration.storage.test_admin_sandbox_queries import member, seed
 from tests.integration.storage.test_host_pool_store import (
     _claim,
     _create_job,
+    _enrol,
     db as db,
     hosts as hosts,
     store as store,
@@ -886,12 +887,9 @@ async def test_completed_admin_deletion_makes_autoscaled_host_scale_down_eligibl
     assert await retained_group_counts(
         store, allocation_id=candidate, host="autoscale-retained-candidate"
     ) == (0, 0, 0)
-    # General host removal intentionally remains conservative: the audit row
-    # still owns durable history even though it no longer represents capacity.
-    assert (
-        await hosts.forget_runner_host(host="autoscale-retained-candidate")
-        == "retained_groups_present"
-    )
+    # The deleted audit row no longer counts as retained capacity. Forgetting
+    # the pool row is still refused while the live allocation owns the host.
+    assert await hosts.forget_runner_host(host="autoscale-retained-candidate") == "resource_bound"
     queued = await repo.queue_autoscale_retire(
         expected_revision=0,
         expected_generation=0,
@@ -948,10 +946,7 @@ async def test_completed_admin_deletion_unblocks_resource_retirement(db, store, 
     assert deleted["hosts"][0]["retained_groups"] == 0
     assert deleted["retained_groups"] == []
     assert "retained_groups_present" not in deleted["blocked_reasons"]
-    assert (
-        await hosts.forget_runner_host(host="retirement-after-deletion")
-        == "retained_groups_present"
-    )
+    assert await hosts.forget_runner_host(host="retirement-after-deletion") == "resource_bound"
     assert await repo.record_inventory(
         allocation_id=allocation_id,
         hosts=["retirement-after-deletion"],
@@ -962,6 +957,42 @@ async def test_completed_admin_deletion_unblocks_resource_retirement(db, store, 
     assert committed["release_committed"]
     assert committed["retained_groups"] == []
     assert committed["blocked_reasons"] == []
+
+
+async def test_completed_sandbox_deletion_lets_an_unbound_host_be_forgotten(db, store, hosts):
+    """A finished deletion is history, so Forget can drop the pool row.
+
+    The sandbox row keeps the host name. A stopped group, and one whose
+    deletion failed, still blocks. Only ``deletion_state='deleted'`` does not.
+    """
+    await _enrol(store, "retired-host", hosts=hosts)
+    origin = await seed(db, store, "retired-host-group", state="stopped", host="retired-host")
+    await member(db, "retired-host-group", origin, None)
+    assert await hosts.forget_runner_host(host="retired-host") == "retained_groups_present"
+
+    async with db.acquire() as conn:
+        await conn.execute(
+            """UPDATE agent_sandboxes
+               SET state='stopped', deletion_state='failed'
+               WHERE id='retired-host-group'"""
+        )
+    assert await hosts.forget_runner_host(host="retired-host") == "retained_groups_present"
+
+    async with db.acquire() as conn:
+        await conn.execute(
+            """UPDATE agent_sandboxes
+               SET deletion_state='none'
+               WHERE id='retired-host-group'"""
+        )
+    await complete_admin_deletion(store, "retired-host-group")
+    assert await hosts.forget_runner_host(host="retired-host") == "deleted"
+    assert await hosts.get_host(host="retired-host") is None
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT host, deletion_state FROM agent_sandboxes WHERE id='retired-host-group'"
+        )
+    assert row["host"] == "retired-host"
+    assert row["deletion_state"] == "deleted"
 
 
 async def test_terminal_provider_state_commits_release_and_revokes_host_despite_retention(
