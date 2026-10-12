@@ -8,12 +8,15 @@ the stable control-plane/gateway machines and supplied through the profile.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
+import os
 import re
 import shlex
 import tarfile
+import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -29,6 +32,16 @@ from cloud_agent.ports.external.host_bootstrap import (
     TransferResult,
 )
 from cloud_agent.providers.compute.ssh import known_hosts_line
+from cloud_agent.providers.compute.ssh_bridge import (
+    BRIDGE_LISTEN_HOST,
+    BRIDGE_PORT,
+    key_material,
+    matching_endpoint,
+    needs_bridge,
+    retarget_archive,
+    ssh_bridge_param,
+    tunnel_targets,
+)
 
 if TYPE_CHECKING:
     from pydantic import SecretStr
@@ -519,6 +532,97 @@ with open(lock_path, 'a') as lock:
         raise SystemExit(0)
     # A node that received another node's state starts with its daemons stopped.
     run('docker_start_failed', ['systemctl', 'start', 'containerd', 'docker'])
+
+    def publish_ssh_bridge():
+        bridge = params.get('ssh_bridge')
+        if not isinstance(bridge, dict):
+            return
+        port, placeholder = bridge.get('port'), bridge.get('listen_host')
+        if not isinstance(port, int) or not isinstance(placeholder, str) or not 1024 <= port <= 65535:
+            blocked('ssh_bridge_failed')
+        shown = subprocess.run(['ip', '-4', '-o', 'addr', 'show', 'dev', 'docker0'], capture_output=True, text=True)
+        address = placeholder
+        for token in shown.stdout.split():
+            if token.count('.') == 3 and '/' in token:
+                address = token.split('/', 1)[0]
+                break
+        if address != placeholder:
+            for path in [root / '.env', *(root / '.compute-secrets').glob('*.known_hosts')]:
+                if path.is_file() and not path.is_symlink():
+                    path.write_text(path.read_text().replace(placeholder, address))
+        directory = Path('/var/lib/cloud-agent-ssh-bridge')
+        if directory.is_symlink():
+            blocked('ssh_bridge_failed')
+        directory.mkdir(mode=0o755, exist_ok=True)
+        proxy = directory / 'proxy.py'
+        listen = list(dict.fromkeys([address, '172.17.0.1', '172.18.0.1', '172.19.0.1']))
+        proxy.write_text('''import select, socket, threading
+LISTEN = %s
+PORT = %s
+TARGET = ("127.0.0.1", PORT)
+
+def handle(client):
+    try:
+        upstream = socket.create_connection(TARGET, 10)
+    except OSError:
+        client.close()
+        return
+    pair = [client, upstream]
+    try:
+        while True:
+            readable, _, _ = select.select(pair, [], [], 300)
+            if not readable:
+                break
+            for sock in readable:
+                data = sock.recv(65536)
+                if not data:
+                    return
+                (upstream if sock is client else client).sendall(data)
+    finally:
+        client.close()
+        upstream.close()
+
+def serve(ip):
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        server.bind((ip, PORT))
+    except OSError:
+        return
+    server.listen(128)
+    while True:
+        client, _ = server.accept()
+        threading.Thread(target=handle, args=(client,), daemon=True).start()
+
+def main():
+    for ip in LISTEN:
+        threading.Thread(target=serve, args=(ip,), daemon=True).start()
+    threading.Event().wait()
+
+if __name__ == "__main__":
+    main()
+''' % (repr(listen), port))
+        proxy.chmod(0o755)
+        unit = Path('/etc/systemd/system/cloud-agent-ssh-bridge.service')
+        if unit.is_symlink():
+            blocked('ssh_bridge_failed')
+        unit.write_text('''[Unit]
+Description=Cloud Agent SSH bridge
+After=docker.service
+
+[Service]
+ExecStart=/usr/bin/python3 /var/lib/cloud-agent-ssh-bridge/proxy.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+''')
+        if subprocess.run(['systemctl', 'daemon-reload'], cwd=root, env=environment, **quiet).returncode:
+            blocked('ssh_bridge_failed')
+        if subprocess.run(['systemctl', 'enable', '--now', 'cloud-agent-ssh-bridge.service'], cwd=root, env=environment, **quiet).returncode:
+            blocked('ssh_bridge_failed')
+    publish_ssh_bridge()
     if params.get('reenroll'):
         # The Host name was handed back to this node and enrolled elsewhere in
         # between: its persisted credential is revoked, so spend the new token.
@@ -595,12 +699,33 @@ _FORBIDDEN_ENV = {
 }
 
 
+_KEYSCAN = r"""
+import json, subprocess, sys
+requests = json.loads(sys.argv[1])
+scans = {}
+for item in requests:
+    host, port = str(item["host"]), int(item["port"])
+    if not host or any(c in host for c in " \t\r\n'\"\\") or not 1 <= port <= 65535:
+        raise SystemExit(2)
+    try:
+        result = subprocess.run(
+            ["ssh-keyscan", "-T", "5", "-t", "ed25519,ecdsa,rsa", "-p", str(port), host],
+            capture_output=True, text=True, timeout=20,
+        )
+        scans[host + ":" + str(port)] = result.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        scans[host + ":" + str(port)] = ""
+print(json.dumps(scans))
+"""
+
+
 class SshHostBootstrap:
     """Install and verify the existing host deployment recipe through SSH."""
 
     def __init__(self, *, transport: SshTransport, resolver: SecretResolver) -> None:
         self._transport = transport
         self._resolver = resolver
+        self._bridges: dict[str, asyncio.subprocess.Process] = {}
 
     @staticmethod
     def _connection(node: NodeObservation) -> SshConnection:
@@ -902,6 +1027,168 @@ class SshHostBootstrap:
             node, profile, self._params(profile, intent, activate=False), intent, None
         )
 
+    async def ensure_ssh_bridge(self, node: NodeObservation, profile: DeploymentProfile) -> bool:
+        """Hold a reverse SSH forward when the node's dial address is a different machine.
+
+        Returns whether the deployment archive must dial the Docker bridge
+        instead of the address stored in the profile.
+        """
+        environment = await self._resolver.resolve(profile.environment_ref)
+        known = ""
+        for name, ref in profile.files.items():
+            if name.endswith(".known_hosts"):
+                known += await self._resolver.resolve(ref)
+        targets = tunnel_targets(environment)
+        if not targets or not key_material(known):
+            return False
+        scans = await self._remote_keyscan(
+            node, [(host, port) for _, host, port in targets] + [("127.0.0.1", BRIDGE_PORT)]
+        )
+        if not any(
+            needs_bridge(host, known, scans.get(f"{host}:{port}", "")) for _, host, port in targets
+        ):
+            return False
+        if key_material(known) & key_material(scans.get(f"127.0.0.1:{BRIDGE_PORT}", "")):
+            return True
+        values = {
+            key: value
+            for key, _, value in (
+                line.partition("=") for line in environment.splitlines() if "=" in line
+            )
+        }
+        bind = values.get("AGENT_BROKER_REVERSE_BIND", "").strip("'")
+        candidates = [("127.0.0.1", 22)]
+        if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", bind):
+            candidates.append((bind, 22))
+        local = matching_endpoint(known, await self._local_keyscan(candidates))
+        if local is None:
+            raise ProviderError(
+                "ssh_bridge_failed",
+                "The stable SSH daemon could not be identified for the bridge",
+                retryable=True,
+            )
+        await self._hold_reverse_ssh(node, local[0], local[1], BRIDGE_PORT)
+        return True
+
+    async def _remote_keyscan(
+        self, node: NodeObservation, targets: list[tuple[str, int]]
+    ) -> dict[str, str]:
+        command = (
+            "python3 -c "
+            + shlex.quote(_KEYSCAN)
+            + " "
+            + shlex.quote(json.dumps([{"host": host, "port": port} for host, port in targets]))
+        )
+        try:
+            payload = self._json(
+                await self._transport.run(self._connection(node), command, timeout=30)
+            )
+        except ProviderError:
+            return {}
+        return {
+            key: value
+            for key, value in payload.items()
+            if isinstance(key, str) and isinstance(value, str)
+        }
+
+    async def _local_keyscan(self, targets: list[tuple[str, int]]) -> dict[tuple[str, int], str]:
+        scans: dict[tuple[str, int], str] = {}
+        for host, port in targets:
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    "ssh-keyscan",
+                    "-T",
+                    "5",
+                    "-t",
+                    "ed25519,ecdsa,rsa",
+                    "-p",
+                    str(port),
+                    host,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await asyncio.wait_for(process.communicate(), timeout=20)
+            except (OSError, TimeoutError):
+                scans[(host, port)] = ""
+                continue
+            scans[(host, port)] = stdout.decode("utf-8", errors="replace")
+        return scans
+
+    async def _hold_reverse_ssh(
+        self, node: NodeObservation, local_host: str, local_port: int, remote_port: int
+    ) -> None:
+        """Keep the stable sshd published on the node's loopback."""
+        identity = node.instance_identity
+        current = self._bridges.get(identity)
+        if current is not None and current.returncode is None:
+            return
+        connection = self._connection(node)
+        key = await self._resolver.resolve(connection.credential_ref)
+        if connection.host_key:
+            node_known = known_hosts_line(connection.address, connection.port, connection.host_key)
+        elif connection.known_hosts_ref:
+            node_known = await self._resolver.resolve(connection.known_hosts_ref)
+        else:
+            raise ProviderError("ssh_configuration", "The node host key is not verified")
+        directory = Path(tempfile.mkdtemp(prefix="agent-ssh-bridge-"))
+        key_path = directory / "identity"
+        known_path = directory / "known_hosts"
+        key_path.write_text(key.strip() + "\n", encoding="utf-8")
+        known_path.write_text(node_known if node_known.endswith("\n") else node_known + "\n")
+        os.chmod(directory, 0o700)
+        key_path.chmod(0o600)
+        known_path.chmod(0o600)
+        process = await asyncio.create_subprocess_exec(
+            "ssh",
+            "-N",
+            "-R",
+            f"127.0.0.1:{remote_port}:{local_host}:{local_port}",
+            "-F",
+            "/dev/null",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "IdentityAgent=none",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            f"UserKnownHostsFile={known_path}",
+            "-o",
+            "GlobalKnownHostsFile=/dev/null",
+            "-o",
+            "UpdateHostKeys=no",
+            "-o",
+            "ForwardAgent=no",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-o",
+            "ConnectTimeout=20",
+            "-i",
+            str(key_path),
+            "-p",
+            str(connection.port),
+            "-l",
+            connection.username,
+            connection.address,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        self._bridges[identity] = process
+        await asyncio.sleep(0.5)
+        if process.returncode is not None:
+            raise ProviderError(
+                "ssh_bridge_failed",
+                "The SSH bridge to the node did not stay up",
+                retryable=True,
+            )
+
     async def _deploy(
         self,
         node: NodeObservation,
@@ -921,6 +1208,9 @@ class SshHostBootstrap:
                 blocked_reasons=preflight.blocked_reasons,
             )
         archive = await self._archive(profile, intent, enrollment_token)
+        if await self.ensure_ssh_bridge(node, profile):
+            archive = retarget_archive(archive, listen_host=BRIDGE_LISTEN_HOST, port=BRIDGE_PORT)
+            params = {**params, "ssh_bridge": ssh_bridge_param()}
         command = (
             "sudo -n python3 -c " + shlex.quote(_DEPLOY) + " " + shlex.quote(json.dumps(params))
         )

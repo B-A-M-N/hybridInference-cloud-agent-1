@@ -11,7 +11,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from cloud_agent.application.compute_rotation import ComputeRotation
 from cloud_agent.application.host_commands import HostCommands
@@ -60,6 +60,7 @@ _BOOTSTRAP_REASONS = {
     "kata_install_failed": "The pinned Kata runtime could not be installed.",
     "host_deployment_failed": "The Host deployment recipe failed.",
     "host_readiness_failed": "The deployed Host did not pass its readiness checks.",
+    "ssh_bridge_failed": "The node could not reach the stable SSH daemon through its bridge.",
 }
 _PREFLIGHT_CHECKS = {
     "supported_os",
@@ -182,6 +183,38 @@ class ComputeReconciler:
             except (ComputeRefusal, ValueError):
                 # Concurrent schedulers may have already persisted a fixed target.
                 logger.warning("compute_renewal_not_submitted", extra={"allocation_id": row["id"]})
+
+    async def maintain_ssh_bridges(self) -> None:
+        """Keep reverse SSH up for nodes whose dial address is not this machine."""
+        ensure = getattr(self.bootstrap, "ensure_ssh_bridge", None)
+        if ensure is None:
+            return
+        for row in await self.repository.list_allocations():
+            if row.get("release_committed_at") or row.get("observed_state") in {
+                "terminated",
+                "absent",
+            }:
+                continue
+            profile_data = row.get("deployment_profile") or {}
+            nodes = row.get("nodes") or []
+            if not profile_data.get("environment_ref") or len(nodes) != 1:
+                continue
+            if not any(host.get("status") == "online" for host in row.get("hosts") or []):
+                continue
+            connection = nodes[0].get("connection") or {}
+            if not connection.get("address") or not connection.get("credential_ref"):
+                continue
+            try:
+                profile = DeploymentProfile.model_validate(profile_data)
+            except ValidationError:
+                continue
+            try:
+                await ensure(self._node(nodes[0]), profile)
+            except ProviderError as exc:
+                logger.warning(
+                    "compute_ssh_bridge_not_held",
+                    extra={"allocation_id": row["id"], "reason": exc.code},
+                )
 
     async def execute(self, operation: dict[str, Any]) -> None:
         """Execute one claimed operation; public diagnostics contain no remote output."""
