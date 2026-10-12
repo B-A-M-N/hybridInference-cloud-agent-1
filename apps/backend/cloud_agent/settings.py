@@ -10,6 +10,7 @@ infrastructure remain bootstrap. Runtime identity and service keys are persisted
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import math
 import os
 import re
@@ -141,6 +142,10 @@ class Setting:
                         "sandbox_archive.endpoint",
                     }:
                         valid = valid and parsed.scheme == "https" and not parsed.query
+                    if self.key in _GATEWAY_TRUST_URLS and not saved:
+                        valid = valid and (
+                            parsed.scheme == "https" or _private_host(parsed.hostname or "")
+                        )
                 except (ValueError, ValidationError):
                     valid = False
         if not valid:
@@ -173,6 +178,29 @@ class Setting:
         if self.minimum_bytes:
             result["minimum_bytes"] = self.minimum_bytes
         return result
+
+
+#: Where the control plane sends its gateway dispatch token, fetches the keys
+#: that identity tokens are checked against, and sends a browser to sign in.
+#: A new value must use HTTPS unless it names this machine or a private name
+#: (see :func:`_private_host`). A value saved or imported before this rule
+#: still loads, so an internal plain-HTTP gateway keeps working.
+_GATEWAY_TRUST_URLS = frozenset({"gateway_base_url", "gateway_jwks_url", "gateway_authorize_url"})
+
+
+def _private_host(host: str) -> bool:
+    """Whether plain HTTP to ``host`` stays on this machine or a private network.
+
+    Loopback addresses and ``localhost`` names, and a single-label name such
+    as a Compose service (``local-gateway``), which public DNS cannot answer.
+    """
+    host = host.lower().rstrip(".")
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return bool(host) and "." not in host
 
 
 def _numeric(
@@ -1077,13 +1105,35 @@ def validate_stored_settings(encoded: Mapping[str, Any]) -> None:
 
 
 def validate_settings_update(previous: Mapping[str, Any], encoded: Mapping[str, Any]) -> None:
-    """Keep stored credential encryption keys stable while validating an atomic update."""
+    """Validate an atomic update against the snapshot it replaces.
+
+    Stored credential encryption keys stay stable. And the gateway URL cannot
+    move away from the dispatch token it was configured with: the token is
+    write-only, but it is sent to whatever URL is saved, so an update that
+    changes the URL must also supply the token again or clear it. A supplied
+    secret is always fresh ciphertext (Fernet's IV is random), so an encoded
+    value equal to the previous one is a token this update did not supply.
+    """
     before, after = _decode(previous), _decode(encoded)
     for key in ("source_control_encryption_key", "compute_encryption_key"):
         if before[key] and before[key] != after[key]:
             raise ValueError(
                 f"{SETTINGS_BY_KEY[key].label} cannot be replaced or reset without re-encrypting stored credentials"
             )
+    if (
+        after["gateway_base_url"]
+        and after["gateway_base_url"] != before["gateway_base_url"]
+        and after["gateway_dispatch_token"]
+        and encoded.get("gateway_dispatch_token") == previous.get("gateway_dispatch_token")
+    ):
+        url, token = (
+            SETTINGS_BY_KEY["gateway_base_url"].label,
+            SETTINGS_BY_KEY["gateway_dispatch_token"].label,
+        )
+        raise ValueError(
+            f"{token} is sent to {url}. To change {url}, clear {token} first and "
+            "enter it again afterwards, or save both in one update."
+        )
 
 
 def initial_settings(*, keys: set[str] | None = None) -> dict[str, Any]:
