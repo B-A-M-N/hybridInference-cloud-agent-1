@@ -76,6 +76,7 @@ from cloud_agent_host.sandbox_archive import (
 )
 from cloud_agent_host.sandbox_archive_runtime import SandboxArchiveController
 from cloud_agent_host.sandbox_archive_s3 import SandboxArchiveConfigError
+from cloud_agent_host.sandbox_archives import safe_archive_error_type
 from cloud_agent_host.sandbox_resources import SandboxResourceCollector
 from cloud_agent_host.session_lifecycle import (
     DEFAULT_CHAT_IDLE_TIMEOUT_S,
@@ -88,6 +89,7 @@ from cloud_agent_host.shared_session_supervisor import (
     SharedSessionDescriptor,
     SharedTurnBoundaryError,
     SharedTurnTelemetry,
+    archive_failure_http_detail,
 )
 from cloud_agent_host.source_archive import DEFAULT_MAX_BASE_BUNDLE_BYTES
 from cloud_agent_host.tool_windows import ToolWindowTracker, attribute, tool_time_ms
@@ -1739,17 +1741,25 @@ def create_app(
             _app.state.sandbox_resource_collector = resource_collector
             yield
         finally:
-            cleanup_errors: list[Exception] = []
+            cleanup_failures: list[tuple[str, str]] = []
 
             def cleanup(name: str, function: Callable[[], None]) -> None:
                 try:
                     function()
                 except Exception as exc:
-                    logger.exception(
+                    error_type = safe_archive_error_type(exc)
+                    logger.error(
                         "workspace broker shutdown cleanup failed",
-                        extra={"event": "workspace_broker_cleanup_failed", "component": name},
+                        extra={
+                            "event": "workspace_broker_cleanup_failed",
+                            "component": name,
+                            "error_type": error_type,
+                        },
                     )
-                    cleanup_errors.append(exc)
+                    # Do not retain an archive/provider exception for the final
+                    # ASGI lifespan failure: raising from it would make the raw
+                    # message and its complete cause chain visible again.
+                    cleanup_failures.append((name, error_type))
 
             # A canceled request still owns its executor call. Drain every
             # admitted mutation before closing supervisors or archive clients.
@@ -1775,10 +1785,10 @@ def create_app(
             if archive_boundary_started:
                 assert archive_boundary is not None
                 cleanup("sandbox_archive_service", archive_boundary.close)
-            if cleanup_errors:
-                raise RuntimeError("workspace broker shutdown cleanup failed") from cleanup_errors[
-                    0
-                ]
+            if cleanup_failures:
+                component, error_type = cleanup_failures[0]
+                safe_cause = RuntimeError(f"{component} cleanup failed ({error_type})")
+                raise RuntimeError("workspace broker shutdown cleanup failed") from safe_cause
 
     app = FastAPI(title="Agent workspace broker", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.state.terminal_manager = terminals
@@ -1999,16 +2009,31 @@ def create_app(
             )
         return shared_supervisor
 
-    def supervisor_error(exc: Exception) -> HTTPException:
+    def supervisor_error(exc: Exception, *, safe_detail: str | None = None) -> HTTPException:
         if isinstance(exc, RetainedChatLost):
-            return HTTPException(status_code=410, detail=str(exc))
+            return HTTPException(
+                status_code=410,
+                detail=safe_detail if safe_detail is not None else str(exc),
+            )
         if isinstance(exc, SessionBusy):
-            return HTTPException(status_code=409, detail=str(exc))
+            return HTTPException(
+                status_code=409,
+                detail=safe_detail if safe_detail is not None else str(exc),
+            )
         if isinstance(exc, SessionLeaseLost):
-            return HTTPException(status_code=409, detail=str(exc))
+            return HTTPException(
+                status_code=409,
+                detail=safe_detail if safe_detail is not None else str(exc),
+            )
         if isinstance(exc, ValueError):
-            return HTTPException(status_code=422, detail=str(exc))
-        return HTTPException(status_code=503, detail=str(exc)[:300])
+            return HTTPException(
+                status_code=422,
+                detail=safe_detail if safe_detail is not None else str(exc),
+            )
+        return HTTPException(
+            status_code=503,
+            detail=safe_detail if safe_detail is not None else str(exc)[:300],
+        )
 
     def retained_owner(workspace_id: str) -> SharedChatSessionSupervisor:
         """Resolve the only supported workspace shape: a shared chat member."""
@@ -2200,7 +2225,10 @@ def create_app(
                 ),
             )
         except (SandboxError, ValueError) as exc:
-            raise supervisor_error(exc) from exc
+            raise supervisor_error(
+                exc,
+                safe_detail=archive_failure_http_detail(exc),
+            ) from exc
 
     @app.post("/shared-sandboxes/{thread_id}/archive-initial")
     async def capture_shared_initial_archive(
@@ -2232,7 +2260,10 @@ def create_app(
                 ),
             )
         except (SandboxError, ValueError) as exc:
-            raise supervisor_error(exc) from exc
+            raise supervisor_error(
+                exc,
+                safe_detail=archive_failure_http_detail(exc),
+            ) from exc
 
     @app.post("/shared-sandboxes/{thread_id}/resident")
     async def ensure_shared_resident(
