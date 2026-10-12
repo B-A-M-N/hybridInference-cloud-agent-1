@@ -41,6 +41,7 @@ export function SettingsSearch({
             setQuery(event.target.value);
           }}
           onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing || event.keyCode === 229) return;
             if (event.key === 'Escape') {
               event.preventDefault();
               onInteract();

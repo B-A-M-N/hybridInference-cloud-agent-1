@@ -1537,6 +1537,47 @@ describe('settings search', () => {
     return screen.getByRole('region', { name: 'Settings search results' });
   }
 
+  it.each([
+    { key: 'Enter', isComposing: true, keyCode: 13, signal: 'native composition' },
+    { key: 'Escape', isComposing: true, keyCode: 27, signal: 'native composition' },
+    { key: 'Enter', isComposing: false, keyCode: 229, signal: 'legacy IME key code' },
+    { key: 'Escape', isComposing: false, keyCode: 229, signal: 'legacy IME key code' },
+  ])(
+    'ignores $key with $signal while composing a search',
+    async ({ key, isComposing, keyCode }) => {
+      renderSettings('Sandbox');
+      await screen.findByLabelText('Turn time limit for all servers');
+      const input = screen.getByRole('searchbox', { name: 'Search settings' });
+      act(() => input.focus());
+      fireEvent.compositionStart(input);
+      const results = searchFor('claude code');
+      expect(
+        within(results).getByRole('button', { name: 'Open Claude Code in Agent versions' }),
+      ).toBeVisible();
+
+      expect(fireEvent.keyDown(input, { key, isComposing, keyCode })).toBe(true);
+      expect(input).toHaveValue('claude code');
+      expect(input).toHaveFocus();
+      expect(screen.getByRole('region', { name: 'Settings search results' })).toBe(results);
+      expect(screen.getByRole('tabpanel', { name: 'Sandbox' })).toBeVisible();
+      expect(screen.getByRole('tab', { name: 'Sandbox' })).toHaveAttribute('aria-selected', 'true');
+
+      fireEvent.compositionEnd(input);
+      fireEvent.keyDown(input, { key });
+      expect(input).toHaveValue('');
+      expect(
+        screen.queryByRole('region', { name: 'Settings search results' }),
+      ).not.toBeInTheDocument();
+      if (key === 'Enter') {
+        await waitFor(() => expect(screen.getByLabelText('Claude Code')).toHaveFocus());
+        expect(screen.getByRole('tabpanel', { name: 'Agent versions' })).toBeVisible();
+      } else {
+        expect(input).toHaveFocus();
+        expect(screen.getByRole('tabpanel', { name: 'Sandbox' })).toBeVisible();
+      }
+    },
+  );
+
   it('opens an Advanced application result in its merged category and clears the query', async () => {
     vi.mocked(getAgentAdminSettings).mockResolvedValue(organizedApplicationSnapshot());
     renderSettings();
