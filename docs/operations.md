@@ -275,8 +275,13 @@ and its health state. Before setup, a waiting container is healthy and logs
 `Waiting for first-time setup in Admin -> Database.` After setup, unreadable
 bootstrap storage or unavailable PostgreSQL prevent startup. Setup records
 `agent.database.pgadmin.setup`; opening pgAdmin records
-`agent.database.pgadmin.open` in the Agent audit log; pgAdmin manages SQL
-activity itself. Resetting **Private pgAdmin URL** in Admin Settings disables
+`agent.database.pgadmin.open` in the Agent audit log, both for the launch link
+and for the first request of a new pgAdmin session at any URL. The Agent audit
+log does not record SQL: pgAdmin connects as the database owner, which can
+change any table, the audit log included, so treat pgAdmin access as full
+database access. The proxy adds `frame-ancestors 'self'`, `nosniff` and
+`X-Frame-Options: SAMEORIGIN` to pgAdmin's responses; pgAdmin's own policy still
+allows its inline scripts. Resetting **Private pgAdmin URL** in Admin Settings disables
 access after the listeners synchronize; removing the profile and stopping
 pgAdmin preserves its volume.
 
