@@ -132,6 +132,55 @@ DEFAULT_TERMINAL_HARD_TTL_S = float(_DEFAULT_SETTINGS["terminal_hard_ttl_s"])
 TERMINAL_STREAM_WAIT_S = 15.0
 _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{7,64}$")
 
+#: The Git view, and the shared-workspace snapshot that is the same capture,
+#: runs as the group UID against a ``.git/config`` any member can write. Git
+#: reads that file as instructions to run commands, and the view needs none of
+#: them: the fsmonitor daemon, hooks (``read-tree`` and ``add`` write an
+#: index, which fires ``post-index-change``), the signature check ``git log``
+#: makes under ``log.showSignature``, and the transport a partial clone's lazy
+#: fetch opens for a missing object (``remote.*.uploadpack``,
+#: ``core.sshCommand``, a remote helper). ``GIT_CONFIG_COUNT`` is command-line
+#: configuration, which outranks the repository's own and reaches every Git
+#: process the script starts, submodule ones included. An empty
+#: ``GIT_ALLOW_PROTOCOL`` allows no transport, whatever ``protocol.*.allow``
+#: says.
+_GIT_VIEW_ENV = {
+    "GIT_CONFIG_COUNT": "3",
+    "GIT_CONFIG_KEY_0": "core.fsmonitor",
+    "GIT_CONFIG_VALUE_0": "",
+    "GIT_CONFIG_KEY_1": "core.hooksPath",
+    "GIT_CONFIG_VALUE_1": "/dev/null",
+    "GIT_CONFIG_KEY_2": "log.showSignature",
+    "GIT_CONFIG_VALUE_2": "false",
+    "GIT_ALLOW_PROTOCOL": "",
+}
+
+#: Filter drivers are named by the repository, so they cannot be listed ahead
+#: of time: this reads the names configured when the script starts and empties
+#: each one, after which Git compares the file as it is. git-lfs's own driver,
+#: exactly as ``git lfs install`` writes it, is kept, so a smudged LFS file
+#: still compares equal to its committed pointer; the LFS extensions that
+#: driver would run are emptied with the rest. ``required`` is emptied for
+#: every driver, so an emptied one fails nothing. A subsection name cannot hold
+#: a newline, so one name per line is exact. Writers are stopped for a
+#: snapshot; for the live view this reads what a member left behind.
+_NEUTRALIZE_GIT_FILTERS = """set -f; IFS='
+'; n="${GIT_CONFIG_COUNT:-0}"
+for key in $(git config --name-only --get-regexp '^(filter|lfs[.]extension)[.]'); do
+  value=$(git config --get "$key")
+  case "$key=$value" in
+    'filter.lfs.clean=git-lfs clean -- %f') continue ;;
+    'filter.lfs.smudge=git-lfs smudge -- %f'|'filter.lfs.smudge=git-lfs smudge --skip -- %f')
+      continue ;;
+    'filter.lfs.process=git-lfs filter-process'|'filter.lfs.process=git-lfs filter-process --skip')
+      continue ;;
+  esac
+  export "GIT_CONFIG_KEY_$n=$key" "GIT_CONFIG_VALUE_$n="
+  n=$((n + 1))
+done
+export GIT_CONFIG_COUNT="$n"; unset IFS; set +f
+"""
+
 
 class _EndpointLifecycleCalls:
     """Track executor work through request cancellation and broker shutdown."""
@@ -1472,15 +1521,27 @@ def _run_git(
     status_tag = f"__HYI_{marker}_STATUS__"
     diff_tag = f"__HYI_{marker}_DIFF__"
     commits_tag = f"__HYI_{marker}_COMMITS__"
-    script = (
-        "git --no-pager status --porcelain=v1 --branch; status_status=$?; "
+    # Whether a submodule is dirty is answered by running Git inside it, under
+    # that submodule's own configuration, which none of the overrides here
+    # can name. So only its checked-out commit is read: ``status`` and
+    # ``diff`` are told so, and ``add -A`` (which takes no such option) is
+    # kept off every submodule by pathspec; its entry already holds the
+    # target's commit. The patch loses only the ``-dirty`` mark, which
+    # ``git apply`` cannot use. ``--submodule=short`` keeps that one form
+    # whatever ``diff.submodule`` says, and starts no Git in a submodule.
+    script = _NEUTRALIZE_GIT_FILTERS + (
+        "git --no-pager status --porcelain=v1 --branch --ignore-submodules=dirty; "
+        "status_status=$?; "
         f"printf '\n{diff_tag}\n'; "
         'index_path="${TMPDIR:-/tmp}/hyi-browser-index.$$"; '
         'rm -f "$index_path"; trap \'rm -f "$index_path"\' EXIT; '
         f'GIT_INDEX_FILE="$index_path" git read-tree {target} && '
-        'GIT_INDEX_FILE="$index_path" git add -A -N >/dev/null 2>&1 && '
-        f'GIT_INDEX_FILE="$index_path" git --no-pager diff '
-        f"--no-ext-diff --no-textconv --binary {target}; diff_status=$?; "
+        "{ printf '.\\0'; GIT_INDEX_FILE=\"$index_path\" git ls-files -z --stage | "
+        "sed -z -n 's/^160000 [0-9a-f]* [0-3]\\t/:(exclude,literal)/p'; } | "
+        'GIT_INDEX_FILE="$index_path" git add -A -N --pathspec-from-file=- '
+        "--pathspec-file-nul >/dev/null 2>&1 && "
+        f'GIT_INDEX_FILE="$index_path" git --no-pager diff --no-ext-diff --no-textconv '
+        f"--ignore-submodules=dirty --submodule=short --binary {target}; diff_status=$?; "
         f"printf '\n{commits_tag}\n'; "
         "git --no-pager log -20 --pretty=format:'%H%x09%h%x09%s%x09%an%x09%aI'; "
         "log_status=$?; overall_status=$status_status; "
@@ -1492,7 +1553,7 @@ def _run_git(
         backend,
         workdir=workdir,
         script=script,
-        env={},
+        env=dict(_GIT_VIEW_ENV),
         timeout_s=timeout_s,
         max_output_bytes=max_output_bytes,
     )

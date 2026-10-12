@@ -4965,10 +4965,15 @@ finally:
             'git bundle unbundle "$bundle" >/dev/null; '
             'git cat-file -e "$object"'
         )
+        # A partial clone fetches a missing prerequisite on demand, through a
+        # transport the workspace's own config names (``remote.*.uploadpack``,
+        # ``core.sshCommand``). These objects come only from the bundle, so an
+        # empty ``GIT_ALLOW_PROTOCOL`` allows no transport, whatever
+        # ``protocol.*.allow`` says.
         result = self.exec_capture(
             spec,
             ["/bin/sh", "-c", script, "sh", commit, f"{commit}^{{commit}}"],
-            env=env,
+            env={**(env or {}), "GIT_ALLOW_PROTOCOL": ""},
             workdir=CHAT_WORKDIR,
             timeout_s=300,
             input_bytes=bundle,
