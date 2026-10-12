@@ -467,12 +467,17 @@ async def delete_admin_sandbox(
     payload: AdminSandboxStopRequest,
     request: Request,
     force: bool = Query(False),
+    discard: bool = Query(False),
     admin: str = Depends(verify_admin_access),
     archive_available: bool = Depends(admin_sandbox_deletion_available),
     store: _AdminSandboxesStorage | None = Depends(get_storage),
 ) -> AdminSandboxDetail:
-    """Queue verified deletion, with fail-closed recovery for stale running state."""
-    if not archive_available:
+    """Queue deletion, with fail-closed recovery for stale running state.
+
+    The discard query removes the exact stopped container without an S3 upload.
+    The default path still requires a configured archive bucket.
+    """
+    if not archive_available and not discard:
         raise HTTPException(
             status_code=503,
             detail="Configure a sandbox archive S3 bucket in Admin Settings before deleting sandboxes.",
@@ -510,11 +515,17 @@ async def delete_admin_sandbox(
         actor_id=admin,
         admin_ip=get_client_ip(request),
         broker_confirmed_stopped=broker_confirmed_stopped,
+        discard=discard,
     )
     errors = {
         "not_found": (404, "Sandbox not found."),
         "stale": (409, "Sandbox activity or container changed. Refresh before deleting it."),
-        "not_stopped": (409, "Stop the sandbox before archiving it to S3 and deleting it."),
+        "not_stopped": (
+            409,
+            "Stop the sandbox before deleting it."
+            if discard
+            else "Stop the sandbox before archiving it to S3 and deleting it.",
+        ),
         "busy": (409, "Sandbox has an active turn, operation, or snapshot. Wait until it is idle."),
     }
     if result != "accepted":

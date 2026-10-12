@@ -136,6 +136,37 @@ def _upload(service, identity, receipt, monkeypatch, *, status=200, handler=None
     return calls, result
 
 
+def test_discard_removes_stopped_container_without_export_and_replays(archive_setup):
+    manager, supervisor, service, identity, _spec, _members = archive_setup
+    discard = replace(identity, request_id="discard-1", archive_key="")
+    result = service.discard(discard)
+    assert result == {
+        "request_id": "discard-1",
+        "container_id": "container-1",
+        "deleted": True,
+    }
+    assert manager.exports == 0
+    assert manager.removals == 1
+    assert not supervisor.owns("thread-origin")
+    assert not supervisor.owns("thread-peer")
+    directory = service._directory(discard)
+    assert (directory / "discard.json").exists()
+    assert (directory / "discarded.json").exists()
+    assert not (directory / "archive.tar").exists()
+    (directory / "discarded.json").unlink()
+    assert service.discard(discard)["deleted"] is True
+    assert manager.removals == 1
+
+
+def test_discard_refuses_a_request_that_already_prepared_an_archive(archive_setup):
+    manager, _supervisor, service, identity, _spec, _members = archive_setup
+    service.prepare(identity)
+    with pytest.raises(SessionLeaseLost, match="cannot be discarded"):
+        service.discard(replace(identity, archive_key=""))
+    assert manager.removals == 0
+    assert manager.exports == 1
+
+
 def test_complete_native_backup_keeps_container_until_verified_commit(archive_setup, monkeypatch):
     manager, supervisor, service, identity, spec, members = archive_setup
     receipt = service.prepare(identity)

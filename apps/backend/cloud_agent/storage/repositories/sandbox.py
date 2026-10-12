@@ -203,14 +203,16 @@ class PostgresSandboxRepository:
         actor_id: str,
         admin_ip: str,
         broker_confirmed_stopped: bool = False,
+        discard: bool = False,
     ) -> str:
-        """Fence an idle stopped sandbox for verified S3 archival and deletion.
+        """Fence an idle stopped sandbox for deletion.
 
-        A durable request closes admission before host export. No native state
-        or ledger row is removed; only a verified host receipt may finalize
-        physical container deletion and mark its native context lost. A stale
-        RUNNING row may be repaired only after the API proves the exact host
-        container is stopped and idle.
+        A durable request closes admission before the host removes Docker. The
+        default path exports and verifies an S3 archive first. ``discard``
+        removes the exact stopped container without uploading it. No native
+        state or ledger row is removed until the host confirms that removal.
+        A stale RUNNING row may be repaired only after the API proves the exact
+        host container is stopped and idle.
         """
         async with self._pool.acquire() as conn, conn.transaction():
             await conn.execute("SET LOCAL statement_timeout = '5s'")
@@ -280,7 +282,7 @@ class PostgresSandboxRepository:
                 actor_id=actor_id,
                 from_state=str(group["deletion_state"]),
                 to_state="pending",
-                details={"request_id": request_id},
+                details={"request_id": request_id, "discard": discard},
             )
             await conn.execute(
                 """
@@ -299,6 +301,7 @@ class PostgresSandboxRepository:
                     deletion_last_activity_at = last_activity_at,
                     deletion_claim_token = NULL, deletion_claim_expires_at = NULL,
                     deletion_cleanup_required = FALSE, deletion_cleanup_archive_key = NULL,
+                    deletion_discard = $4,
                     deletion_archive_key = NULL, deletion_archive_version_id = NULL,
                     deletion_sha256 = NULL, deletion_size_bytes = NULL, deletion_error = NULL,
                     updated_at = NOW()
@@ -307,6 +310,7 @@ class PostgresSandboxRepository:
                 sandbox_id,
                 request_id,
                 forced_stopped_recovery,
+                discard,
             )
             await self._audit_admin_deletion(
                 conn,
@@ -346,7 +350,7 @@ class PostgresSandboxRepository:
                 FROM due WHERE g.id = due.id
                 RETURNING g.id, g.user_id, g.origin_thread_id, g.host, g.generation,
                           g.container_id, g.last_activity_at, g.deletion_request_id,
-                          g.deletion_state, g.deletion_claim_token,
+                          g.deletion_state, g.deletion_discard, g.deletion_claim_token,
                           g.deletion_cleanup_required, g.deletion_cleanup_archive_key,
                           g.deletion_archive_key, g.deletion_archive_version_id,
                           g.deletion_sha256, g.deletion_size_bytes
@@ -562,6 +566,79 @@ class PostgresSandboxRepository:
                 sha256=group["deletion_sha256"],
                 size_bytes=group["deletion_size_bytes"],
                 archive_version_id=group["deletion_archive_version_id"],
+            )
+        return True
+
+    async def complete_admin_sandbox_discard(
+        self,
+        *,
+        sandbox_id: str,
+        request_id: str,
+        claim_token: str,
+        generation: int,
+        container_id: str,
+    ) -> bool:
+        """Mark native context lost after the host removes a container with no archive."""
+        async with self._pool.acquire() as conn, conn.transaction():
+            await conn.fetch(
+                "SELECT t.id FROM agent_threads t "
+                "JOIN agent_thread_sandbox_memberships m ON m.thread_id = t.id "
+                "WHERE m.sandbox_id = $1 ORDER BY t.id FOR UPDATE OF t",
+                sandbox_id,
+            )
+            members = await conn.fetch(
+                "SELECT thread_id FROM agent_thread_sandbox_memberships "
+                "WHERE sandbox_id = $1 ORDER BY thread_id FOR UPDATE",
+                sandbox_id,
+            )
+            group = await self._locked_admin_deletion(
+                conn, sandbox_id, request_id, claim_token, generation, container_id
+            )
+            if group is None:
+                return False
+            if group["deletion_state"] == "deleted":
+                return bool(group["deletion_discard"])
+            if group["deletion_state"] != "pending" or not group["deletion_discard"]:
+                return False
+            await self._record_trajectory_event(
+                conn,
+                group=group,
+                event_type="deletion_completed",
+                source="system",
+                actor_id="sandbox-deletion-worker",
+                from_state="pending",
+                to_state="deleted",
+                details={"request_id": request_id, "discard": True},
+            )
+            await conn.execute(
+                """
+                UPDATE agent_sandboxes
+                SET state = 'lost', deletion_state = 'deleted', deleted_at = NOW(),
+                    deletion_error = NULL, idle_deadline = NULL, stop_requested_at = NULL,
+                    deletion_retry_at = NULL, deletion_claim_expires_at = NULL,
+                    resource_snapshot = NULL, resource_sampled_at = NULL,
+                    resource_received_at = NULL, terminal_count = NULL,
+                    terminal_count_observed_at = NULL, updated_at = NOW()
+                WHERE id = $1
+                """,
+                sandbox_id,
+            )
+            await conn.execute(
+                """
+                UPDATE agent_thread_sandbox_memberships
+                SET native_state = 'lost', context_status = 'lost', resident_state = 'lost',
+                    updated_at = NOW()
+                WHERE sandbox_id = $1
+                """,
+                sandbox_id,
+            )
+            for member in members:
+                await fail_unrunnable_follow_ups(conn, thread_id=member["thread_id"])
+            await self._audit_admin_deletion(
+                conn,
+                group=group,
+                request_id=request_id,
+                action="agent.sandbox.delete.discarded",
             )
         return True
 

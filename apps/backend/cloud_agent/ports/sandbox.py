@@ -28,14 +28,16 @@ class SandboxRepository(Protocol):
         actor_id: str,
         admin_ip: str,
         broker_confirmed_stopped: bool = False,
+        discard: bool = False,
     ) -> str:
-        """Fence an idle stopped sandbox for verified S3 archival and deletion.
+        """Fence an idle stopped sandbox for deletion.
 
-        A durable request closes admission before host export. No native state
-        or ledger row is removed; only a verified host receipt may finalize
-        physical container deletion and mark its native context lost. An admin
-        recovery may also repair a stale RUNNING row, but only after the API
-        independently proves the exact host container is stopped and idle.
+        A durable request closes admission before the host removes Docker. The
+        default path exports and verifies an S3 archive first. ``discard``
+        removes the exact stopped container without uploading it. No native
+        state or ledger row is removed until the host confirms that removal.
+        An admin recovery may also repair a stale RUNNING row, but only after
+        the API independently proves the exact host container is stopped and idle.
         """
         ...
 
@@ -71,6 +73,18 @@ class SandboxRepository(Protocol):
         container_id: str,
     ) -> bool:
         """Retain the archive and ledger after an exact host deletion acknowledgement."""
+        ...
+
+    async def complete_admin_sandbox_discard(
+        self,
+        *,
+        sandbox_id: str,
+        request_id: str,
+        claim_token: str,
+        generation: int,
+        container_id: str,
+    ) -> bool:
+        """Mark native context lost after the host removes a container with no archive."""
         ...
 
     async def fail_admin_sandbox_deletion(

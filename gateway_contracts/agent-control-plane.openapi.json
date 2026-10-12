@@ -1712,6 +1712,11 @@
             ],
             "title": "Deletion Archive Version Id"
           },
+          "deletion_discard": {
+            "default": false,
+            "title": "Deletion Discard",
+            "type": "boolean"
+          },
           "deletion_error": {
             "anyOf": [
               {
@@ -22285,7 +22290,7 @@
     },
     "/admin/agent/sandboxes/{sandbox_id}/delete": {
       "post": {
-        "description": "Queue verified deletion, with fail-closed recovery for stale running state.",
+        "description": "Queue deletion, with fail-closed recovery for stale running state.\n\nThe discard query removes the exact stopped container without an S3 upload.\nThe default path still requires a configured archive bucket.",
         "operationId": "delete_admin_sandbox_admin_agent_sandboxes__sandbox_id__delete_post",
         "parameters": [
           {
@@ -22304,6 +22309,16 @@
             "schema": {
               "default": false,
               "title": "Force",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "discard",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Discard",
               "type": "boolean"
             }
           },

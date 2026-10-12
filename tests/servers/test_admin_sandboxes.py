@@ -1098,6 +1098,7 @@ async def test_reviewed_delete_queues_authenticated_atomic_request(setup, result
         actor_id="admin-token",
         admin_ip="127.0.0.1",
         broker_confirmed_stopped=False,
+        discard=False,
     )
     if result == "accepted":
         assert response.headers["cache-control"] == "no-store"
@@ -1150,6 +1151,7 @@ async def test_force_delete_repairs_only_an_exact_host_confirmed_stopped_contain
         actor_id="admin-token",
         admin_ip="127.0.0.1",
         broker_confirmed_stopped=True,
+        discard=False,
     )
 
 
@@ -1431,6 +1433,45 @@ async def test_delete_without_archive_configuration_does_not_fence_sandbox(setup
     assert response.status_code == 503
     assert "S3 bucket" in response.json()["detail"]
     commands.request_admin_delete.assert_not_awaited()
+
+
+async def test_discard_deletion_does_not_require_archive_configuration(setup):
+    from cloud_agent.admin_sandboxes import AdminSandboxDetail
+
+    app, queries, _ = setup
+    queries.detail = AsyncMock(
+        return_value=AdminSandboxDetail(
+            sandbox=sandbox() | {"state": "stopped", "deletion_state": "pending"},
+            members=[],
+            observed_at=END,
+        )
+    )
+    commands = SimpleNamespace(request_admin_delete=AsyncMock(return_value="accepted"))
+    app.dependency_overrides[get_storage] = lambda: SimpleNamespace(
+        sandbox=commands, admin_sandboxes=queries
+    )
+    app.dependency_overrides[admin_sandboxes.admin_sandbox_deletion_available] = lambda: False
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"{PREFIX}/asbx_other/delete?discard=true",
+            headers=ADMIN,
+            json={
+                "generation": 1,
+                "container_id": "container-one",
+                "last_activity_at": END.isoformat(),
+            },
+        )
+    assert response.status_code == 202
+    commands.request_admin_delete.assert_awaited_once_with(
+        sandbox_id="asbx_other",
+        generation=1,
+        container_id="container-one",
+        last_activity_at=END,
+        actor_id="admin-token",
+        admin_ip="127.0.0.1",
+        broker_confirmed_stopped=False,
+        discard=True,
+    )
 
 
 @pytest.mark.parametrize(

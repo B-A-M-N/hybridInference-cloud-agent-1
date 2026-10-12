@@ -683,6 +683,7 @@ describe('archive before physical sandbox deletion', () => {
       { generation: 4, container_id: 'container-one', last_activity_at: observedAt },
       expect.any(AbortSignal),
       true,
+      false,
     );
     expect(await screen.findByText(/Archiving to S3/)).toBeInTheDocument();
     expect(onChanged).toHaveBeenCalledOnce();
@@ -705,6 +706,7 @@ describe('archive before physical sandbox deletion', () => {
       { generation: 4, container_id: 'container-one', last_activity_at: observedAt },
       expect.any(AbortSignal),
       true,
+      false,
     );
     await waitFor(() => expect(getAdminSandbox).toHaveBeenCalledTimes(2));
     expect(screen.getByRole('button', { name: 'Verify stopped and force delete' })).toBeEnabled();
@@ -724,6 +726,8 @@ describe('archive before physical sandbox deletion', () => {
       'sandbox-one',
       { generation: 4, container_id: 'container-one', last_activity_at: observedAt },
       expect.any(AbortSignal),
+      false,
+      false,
     );
     expect(await screen.findByText(/Archiving to S3/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Archive to S3 and delete' })).toBeDisabled();
@@ -937,6 +941,8 @@ describe('archive before physical sandbox deletion', () => {
       'sandbox-one',
       { generation: 4, container_id: 'container-one', last_activity_at: observedAt },
       expect.any(AbortSignal),
+      false,
+      false,
     );
     expect(await screen.findByText(/Archiving to S3/)).toBeInTheDocument();
     expect(screen.queryByText(/Deletion failed:/)).not.toBeInTheDocument();

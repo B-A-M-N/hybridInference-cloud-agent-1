@@ -520,6 +520,14 @@ deletion acknowledgements keep admission blocked and retry the same request.
 The broker stores its deletion receipts on its own persistent volume so an
 acknowledgement can survive a broker restart.
 
+**Delete without archive** removes the same exact stopped container without
+uploading workspace files or native session history. It does not require an S3
+bucket. The host still refuses a running, busy, or changed container, and the
+control plane marks native resume lost only after the host confirms removal.
+Chat history and the lifecycle audit remain. There is no S3 object to restore
+from. An archive deletion that is already pending or verified is left unchanged;
+wait for it to finish or fail before choosing this action.
+
 **Verify stopped and force delete** recovers a sandbox still recorded as running
 only when the owning broker confirms that the exact reviewed container is
 stopped and idle. It does not stop a running container or bypass unavailable
