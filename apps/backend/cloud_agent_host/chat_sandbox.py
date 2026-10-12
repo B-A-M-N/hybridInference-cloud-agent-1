@@ -1878,11 +1878,13 @@ class ChatSandboxManager:
     def verify_host_rules(self) -> None:
         """Prove the host still enforces this deployment's rules, repairing them if not.
 
-        Cheap while the guard's last verification is fresh; otherwise it
-        reinstalls and reads the tables back. A raise means the host cannot
-        show the boundary every running group was started behind.
+        Reads the tables from the kernel on every call, so the sweep that
+        calls this sees a flushed ruleset on its next pass rather than when
+        the guard's last verification ages out; a difference reinstalls and
+        reads back. A raise means the host cannot show the boundary every
+        running group was started behind.
         """
-        self.backend.network_guard().ensure()
+        self.backend.network_guard().recheck()
 
     def require_docker_data_root(self, expected: str) -> str:
         """Verify retained state is owned by the intended Docker data root.

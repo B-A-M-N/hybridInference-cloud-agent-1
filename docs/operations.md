@@ -2920,8 +2920,9 @@ rules, not the host's.
   removed with the bridge. The relay's own default route stays on its stack
   network, because it joins every group bridge at gateway priority -1.
 - **Watched while groups run.** While any group of this deployment is
-  running, the broker re-reads the tables at most once a minute and reinstalls
-  whatever is missing. If that fails twice in a row, it logs
+  running, the broker reads the tables back on every five-second sweep, logs
+  `network_guard_rules_changed` when they differ from what it installed, and
+  reinstalls whatever is missing. If that fails twice in a row, it logs
   `shared_chat_network_unguarded` and stops every running group — workspaces
   and native sessions kept — rather than let one go on without the boundary it
   was started behind. Waking a group reinstalls and verifies the rules first,
