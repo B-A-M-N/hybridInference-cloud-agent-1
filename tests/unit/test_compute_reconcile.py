@@ -507,6 +507,47 @@ async def test_committed_release_queries_before_replaying_same_immutable_resourc
 
 
 @pytest.mark.asyncio
+async def test_release_of_a_server_the_provider_never_created_finishes_locally(monkeypatch):
+    h = harness(monkeypatch, kind="retire", identified=False)
+    h.allocation.update(
+        external_id=None,
+        nodes=[],
+        hosts=[],
+        scope_complete=False,
+        observed_at=None,
+        observed_state="unknown",
+        desired_state="present",
+    )
+
+    await h.reconciler.execute(h.operation)
+
+    assert h.operation["state"] == "succeeded"
+    assert h.operation["step"] == "released"
+    assert h.allocation["observed_state"] == "absent"
+    assert h.allocation["provider_state"] == "not_created"
+    h.provider.release.assert_not_awaited()
+    h.provider.inspect.assert_not_awaited()
+    h.repository.record_inventory.assert_not_awaited()
+    h.repository.commit_release.assert_awaited_once()
+    observation = h.repository.observe_allocation.await_args.kwargs["observation"]
+    assert observation["observed_state"] == "absent"
+    assert observation["scope_complete"] is True
+
+
+@pytest.mark.asyncio
+async def test_incomplete_scope_still_blocks_release_of_an_identified_server(monkeypatch):
+    h = harness(monkeypatch, kind="retire", identified=True)
+    h.repository.retirement_impact.return_value = {"blocked_reasons": ["unmanaged_scope"]}
+
+    await h.reconciler.execute(h.operation)
+
+    assert h.operation["state"] == "waiting"
+    assert h.operation["step"] == "waiting_for_retention"
+    h.repository.commit_release.assert_not_awaited()
+    h.provider.release.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_precommit_terminal_retire_skips_impossible_retention_wait(monkeypatch):
     h = harness(monkeypatch, kind="retire", identified=True)
     h.provider.inspect.return_value = observed(state="terminated")

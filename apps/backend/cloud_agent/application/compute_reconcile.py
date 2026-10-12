@@ -18,7 +18,7 @@ from cloud_agent.application.host_commands import HostCommands
 from cloud_agent.broker_routing import broker_for_host
 from cloud_agent.compute_config import current_observation_seconds, current_registration_url
 from cloud_agent.compute_secrets import ComputeSecretError
-from cloud_agent.domain.compute import ComputeRefusal
+from cloud_agent.domain.compute import ComputeRefusal, provider_resource_absent
 from cloud_agent.host_pool import hash_secret
 from cloud_agent.logging_utils import get_logger
 from cloud_agent.ports.external.compute_provider import (
@@ -878,7 +878,10 @@ class ComputeReconciler:
                     retry=30,
                 )
                 return
-            await self._verify_empty_inventory(operation, allocation)
+            # An empty node list cannot pass the inventory scan: that scan
+            # refuses to call zero nodes "empty". There is no machine to scan.
+            if not provider_resource_absent(allocation):
+                await self._verify_empty_inventory(operation, allocation)
             committed = await self.repository.commit_release(
                 allocation_id=allocation["id"], **self._fence(operation)
             )
@@ -897,6 +900,9 @@ class ComputeReconciler:
                 )
                 return
             allocation = await self._allocation(allocation["id"])
+        if provider_resource_absent(allocation):
+            await self._release_absent_provider_resource(operation, allocation)
+            return
         provider = self.commands.registry.get(allocation["provider_id"]).provider
         observation = await self._inspect(operation, allocation)
         if observation.state == "terminated":
@@ -955,6 +961,33 @@ class ComputeReconciler:
                 result={"external_pending": True},
                 retry=30,
             )
+
+    async def _release_absent_provider_resource(
+        self, operation: dict[str, Any], allocation: dict[str, Any]
+    ) -> None:
+        """Finish retirement when the provider never created a resource.
+
+        Inspect and delete both require an experiment id. A missing profile, or
+        a create cancelled before submission, leaves none. Recording absence
+        locally is the whole release.
+        """
+        await self.repository.observe_allocation(
+            allocation_id=allocation["id"],
+            observation={
+                "observed_state": "absent",
+                "provider_state": "not_created",
+                "scope_complete": True,
+                "expiration_known": False,
+            },
+            **self._fence(operation),
+        )
+        await self._finish(
+            operation,
+            "succeeded",
+            "released",
+            "No provider resource exists for this server, so it was released locally.",
+            result={"external_pending": False, "blocked_reasons": []},
+        )
 
     async def _verify_empty_inventory(
         self, operation: dict[str, Any], allocation: dict[str, Any]
