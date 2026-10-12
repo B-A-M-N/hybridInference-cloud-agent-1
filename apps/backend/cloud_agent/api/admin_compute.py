@@ -297,7 +297,7 @@ async def cloudlab_autoscaling(
 async def cloudlab_preferred_nodes(
     commands: ComputeCommands = Depends(get_compute_commands),
 ) -> dict[str, Any]:
-    """List fresh, plentiful CloudLab node types from the public inventory."""
+    """List newer CloudLab node types with more than 20 total nodes, in order."""
     return await commands.cloudlab_preferred_nodes()
 
 

@@ -23,6 +23,7 @@ from cloud_agent.application.compute_resources import ComputeCommands
 from cloud_agent.compute_config import ComputeConfiguration
 from cloud_agent.compute_registry import ComputeProviderRegistration, ComputeProviderRegistry
 from cloud_agent.compute_secrets import ComputeSecretStore
+from cloud_agent.domain.cloudlab import DEFAULT_CLOUDLAB_NODE_TYPES
 from cloud_agent.domain.compute import ComputeRefusal
 from cloud_agent.ports.external.compute_provider import (
     UNCHECKED_CLOUDLAB_HOST_KEY_REF,
@@ -309,6 +310,18 @@ async def compute_api(monkeypatch):
                     {"key": "profile_project", "label": "Profile project", "type": "text"},
                     {"key": "profile_name", "label": "Profile name", "type": "text"},
                     {
+                        "key": "node_types",
+                        "label": "Preferred node types",
+                        "type": "string_list",
+                        "modes": ["provision"],
+                    },
+                    {
+                        "key": "node_type_binding",
+                        "label": "Node type parameter",
+                        "type": "text",
+                        "modes": ["provision"],
+                    },
+                    {
                         "key": "ssh_username",
                         "label": "SSH user",
                         "type": "text",
@@ -349,7 +362,7 @@ async def compute_api(monkeypatch):
                 "observed_at": "2026-10-11T12:00:00+00:00",
                 "source": "CloudLab public hardware inventory",
                 "filters": {
-                    "availability_greater_than": 16,
+                    "total_greater_than": 20,
                     "minimum_introduced_year": 2021,
                     "minimum_physical_cores": 16,
                     "minimum_memory_gib": 128,
@@ -606,7 +619,11 @@ async def test_cloudlab_autoscaling_put_is_canonical_revisioned_audited_and_paus
     assert response.status_code == 200, response.text
     saved = response.json()["policy"]
     assert saved["revision"] == 1
-    assert saved["configuration"] == policy["configuration"]
+    assert saved["configuration"] == {
+        **policy["configuration"],
+        "node_types": list(DEFAULT_CLOUDLAB_NODE_TYPES),
+        "node_type_binding": "phystype",
+    }
     assert "credential_ref" not in response.text
     assert "private-canary" not in response.text
     assert repo.autoscaling["profile_reservations"][0]["deployment_profile"] == "kata"
@@ -880,11 +897,19 @@ async def test_cloudlab_defaults_are_saved_audited_and_exposed_in_the_catalog(co
     initial = await client.get("/admin/agent/compute-defaults/cloudlab", headers=ADMIN)
     assert initial.status_code == 200
     assert initial.json()["defaults"]["duration"] == 4
+    assert initial.json()["defaults"]["node_types"] == list(DEFAULT_CLOUDLAB_NODE_TYPES)
+    assert initial.json()["defaults"]["node_type_binding"] == "phystype"
 
     saved = await client.put("/admin/agent/compute-defaults/cloudlab", headers=ADMIN, json=defaults)
     assert saved.status_code == 200
-    assert saved.json() == {"defaults": {**defaults, "ssh_public_key": ""}}
-    assert repo.defaults == {"cloudlab": {**defaults, "ssh_public_key": ""}}
+    effective = {
+        **defaults,
+        "ssh_public_key": "",
+        "node_types": list(DEFAULT_CLOUDLAB_NODE_TYPES),
+        "node_type_binding": "phystype",
+    }
+    assert saved.json() == {"defaults": effective}
+    assert repo.defaults == {"cloudlab": effective}
     assert repo.audit_rows[-1]["action"] == "agent.compute.cloudlab_defaults.set"
     assert repo.audit_rows[-1]["details"] == {}
 
@@ -957,7 +982,68 @@ async def test_cloudlab_defaults_fill_omitted_request_values_but_explicit_values
         "profile_project": "default-profile-project",
         "profile_name": "default-profile",
         "credential_ref": connection_id,
+        "node_types": list(DEFAULT_CLOUDLAB_NODE_TYPES),
+        "node_type_binding": "phystype",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_types", [None, [], ["c6620", "r6615"]])
+async def test_new_cloudlab_allocations_snapshot_ordered_defaults_and_allow_overrides(
+    compute_api, explicit_types
+):
+    client, repo, _ = compute_api
+    defaults = {"node_types": ["r6525", "r650"], "node_type_binding": "hardware"}
+    saved = await client.put("/admin/agent/compute-defaults/cloudlab", headers=ADMIN, json=defaults)
+    assert saved.status_code == 200, saved.text
+    configured = {"project": "research"}
+    if explicit_types is not None:
+        configured.update(node_types=explicit_types, node_type_binding="phystype")
+    response = await client.post(
+        "/admin/agent/servers",
+        headers=ADMIN,
+        json={
+            "name": "Experiment",
+            "request_id": "ordered-node-defaults",
+            "provider_id": "cloudlab",
+            "mode": "provision",
+            "connection_id": await connection(client),
+            "configuration": configured,
+            "deployment_profile": "kata",
+        },
+    )
+    assert response.status_code == 202, response.text
+    allocation = next(iter(repo.allocations.values()))
+    expected = explicit_types if explicit_types is not None else ["r6525", "r650"]
+    assert allocation["configuration"]["node_types"] == expected
+    assert allocation["configuration"]["node_type_binding"] == (
+        "phystype" if explicit_types is not None else "hardware"
+    )
+    await client.put(
+        "/admin/agent/compute-defaults/cloudlab",
+        headers=ADMIN,
+        json={"node_types": ["c6525-25g"]},
+    )
+    assert allocation["configuration"]["node_types"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"node_types": ["r6615", "r6615"]},
+        {"node_types": ["invalid/type"]},
+        {"node_types": [f"type-{i}" for i in range(21)]},
+        {"node_type_binding": "invalid.parameter"},
+    ],
+)
+async def test_cloudlab_defaults_reject_invalid_preference_lists(compute_api, invalid):
+    client, repo, _ = compute_api
+    response = await client.put(
+        "/admin/agent/compute-defaults/cloudlab", headers=ADMIN, json=invalid
+    )
+    assert response.status_code == 422, response.text
+    assert repo.defaults == {}
 
 
 @pytest.mark.asyncio

@@ -433,6 +433,285 @@ async def test_cloudlab_provision_retains_returned_uuid_and_matches_create_contr
     assert requests[0].url.path == "/v1/experiments/"
 
 
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"node_types": ["r6615", "r6615"]},
+        {"node_types": [f"type-{index}" for index in range(21)]},
+        {"node_types": [""]},
+        {"node_types": ["r6615/c6620"]},
+        {"node_types": [" r6615"]},
+        {"node_types": ["r" * 33]},
+        {"node_type_binding": "hardware.type"},
+        {"node_type_binding": ""},
+    ],
+)
+def test_cloudlab_validates_the_preference_order_and_binding_identifier(updates):
+    with pytest.raises(ValidationError):
+        provider(lambda request: httpx.Response(201)).validate_config(
+            "provision", {**_provision(), **updates}
+        )
+
+
+@pytest.mark.asyncio
+async def test_cloudlab_tries_preferred_types_in_order_and_persists_the_selected_type():
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request.method == "GET":
+            return _profile_list()
+        node_type = json.loads(request.content)["bindings"]["phystype"]
+        return (
+            httpx.Response(201, json={"id": EXPERIMENT})
+            if node_type == "r650"
+            else httpx.Response(429, json={"error": "Not enough free nodes of type r6615"})
+        )
+
+    config = {
+        **_provision(),
+        "node_types": ["r6615", "c6620", "r650"],
+        "bindings": {"cluster": "specified-cluster", "useVMs": False},
+    }
+    receipt = await provider(respond).acquire(
+        AcquireRequest(mode="provision", config=config), intent()
+    )
+    payloads = [json.loads(request.content) for request in requests if request.method == "POST"]
+    assert [payload["bindings"]["phystype"] for payload in payloads] == [
+        "r6615",
+        "c6620",
+        "r650",
+    ]
+    assert len({payload["name"] for payload in payloads}) == 1
+    assert all(payload["bindings"]["cluster"] == "specified-cluster" for payload in payloads)
+    assert all(payload["bindings"]["useVMs"] == "False" for payload in payloads)
+    assert [request.method for request in requests] == ["GET", "POST", "POST", "POST"]
+    assert receipt.outcome == "pending"
+    assert receipt.resource.external_id == EXPERIMENT
+    assert receipt.resource.config["bindings"] == {
+        "cluster": "specified-cluster",
+        "useVMs": False,
+        "phystype": "r650",
+    }
+    assert "phystype" not in config["bindings"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("binding", ["phystype", "hardware"])
+async def test_cloudlab_explicit_node_type_wins_over_preferences_and_is_not_replaced(binding):
+    attempted = []
+
+    def respond(request):
+        if request.method == "GET":
+            return _profile_list()
+        attempted.append(json.loads(request.content)["bindings"])
+        return httpx.Response(429, json={"error": "Insufficient physical nodes"})
+
+    config = {
+        **_provision(),
+        "node_types": ["r6615", "c6620"],
+        "node_type_binding": binding,
+        "bindings": {binding: "r650"},
+    }
+    with pytest.raises(ProviderError) as caught:
+        await provider(respond).acquire(AcquireRequest(mode="provision", config=config), intent())
+    assert caught.value.code == "capacity_unavailable"
+    assert attempted == [{binding: "r650"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blank", [None, "", "   "])
+async def test_cloudlab_blank_node_type_binding_uses_preferences(blank):
+    attempted = []
+
+    def respond(request):
+        if request.method == "GET":
+            return _profile_list()
+        attempted.append(json.loads(request.content)["bindings"])
+        return httpx.Response(201, json={"id": EXPERIMENT})
+
+    config = {
+        **_provision(),
+        "node_types": ["r6615", "c6620"],
+        "node_type_binding": "hardware",
+        "bindings": {"hardware": blank},
+    }
+    receipt = await provider(respond).acquire(
+        AcquireRequest(mode="provision", config=config), intent()
+    )
+    assert attempted == [{"hardware": "r6615"}]
+    assert receipt.resource.config["bindings"] == {"hardware": "r6615"}
+
+
+@pytest.mark.asyncio
+async def test_cloudlab_exhausted_preferences_remain_retryable_and_restart_at_the_top():
+    attempted = []
+
+    def respond(request):
+        if request.method == "GET":
+            return _profile_list()
+        attempted.append(json.loads(request.content)["bindings"]["phystype"])
+        return httpx.Response(429, json={"error": "Insufficient physical nodes"})
+
+    adapter = provider(respond)
+    request = AcquireRequest(
+        mode="provision", config={**_provision(), "node_types": ["r6615", "c6620"]}
+    )
+    for _ in range(2):
+        with pytest.raises(ProviderError) as caught:
+            await adapter.acquire(request, intent())
+        assert (caught.value.code, caught.value.retryable) == ("capacity_unavailable", True)
+    assert attempted == ["r6615", "c6620", "r6615", "c6620"]
+
+
+@pytest.mark.asyncio
+async def test_cloudlab_empty_preferences_preserve_the_profiles_hardware_choice():
+    attempted = []
+
+    def respond(request):
+        if request.method == "GET":
+            return _profile_list()
+        attempted.append(json.loads(request.content)["bindings"])
+        return httpx.Response(201, json={"id": EXPERIMENT})
+
+    receipt = await provider(respond).acquire(
+        AcquireRequest(mode="provision", config={**_provision(), "node_types": []}), intent()
+    )
+    assert attempted == [{}]
+    assert receipt.resource.config["bindings"] == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "Insufficient nodes of type r6615",
+        "Not enough available physical nodes to instantiate this experiment",
+        "Not enough free nodes of type r6615",
+        "Insufficient resources at this site",
+        "Resource capacity is exhausted",
+    ],
+)
+async def test_cloudlab_falls_back_after_a_confirmed_server_capacity_rejection(diagnostic):
+    attempted = []
+
+    def respond(request):
+        if request.url.path.endswith("/profiles/"):
+            return _profile_list()
+        if request.method == "GET":
+            assert request.url.params["project"] == "research"
+            return httpx.Response(200, json={"experiments": []})
+        attempted.append(json.loads(request.content)["bindings"]["phystype"])
+        return (
+            httpx.Response(500, json={"error": diagnostic})
+            if len(attempted) == 1
+            else httpx.Response(201, json={"id": EXPERIMENT})
+        )
+
+    receipt = await provider(respond).acquire(
+        AcquireRequest(mode="provision", config={**_provision(), "node_types": ["r6615", "c6620"]}),
+        intent(),
+    )
+    assert attempted == ["r6615", "c6620"]
+    assert receipt.resource.config["bindings"]["phystype"] == "c6620"
+
+
+@pytest.mark.asyncio
+async def test_cloudlab_capacity_diagnostic_does_not_replace_an_experiment_that_was_created():
+    attempted = []
+
+    def respond(request):
+        if request.url.path.endswith("/profiles/"):
+            return _profile_list()
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "experiments": [{"id": EXPERIMENT, "name": "probe-exp", "project": "research"}]
+                },
+            )
+        attempted.append(json.loads(request.content)["bindings"]["phystype"])
+        return httpx.Response(500, json={"error": "Insufficient physical nodes"})
+
+    receipt = await provider(respond).acquire(
+        AcquireRequest(
+            mode="provision", config={**_provision("probe-exp"), "node_types": ["r6615", "c6620"]}
+        ),
+        intent(),
+    )
+    assert attempted == ["r6615"]
+    assert receipt.outcome == "pending"
+    assert receipt.resource.external_id == EXPERIMENT
+    assert receipt.resource.config["bindings"]["phystype"] == "r6615"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure,code",
+    [
+        (httpx.Response(401), "credential_invalid"),
+        (httpx.Response(403), "permission_denied"),
+        (httpx.Response(400), "request_rejected"),
+        (httpx.Response(429), "rate_limited"),
+        (httpx.Response(429, json={"error": "Request rate limit reached"}), "rate_limited"),
+        (httpx.Response(500, json={"error": "Internal server error"}), "request_rejected"),
+        (
+            httpx.Response(500, json={"error": "Invalid parameter phystype"}),
+            "request_rejected",
+        ),
+        (httpx.ConnectTimeout("handshake timed out"), "temporarily_unavailable"),
+        (httpx.ReadTimeout("create timed out"), None),
+        (httpx.Response(201, json={"error": "missing experiment ID"}), None),
+        (httpx.Response(201, text="not JSON"), None),
+    ],
+)
+async def test_cloudlab_never_falls_back_after_a_noncapacity_or_ambiguous_create(failure, code):
+    attempted = []
+
+    def respond(request):
+        if request.url.path.endswith("/profiles/"):
+            return _profile_list()
+        if request.method == "GET":
+            return httpx.Response(200, json={"experiments": []})
+        attempted.append(json.loads(request.content)["bindings"]["phystype"])
+        if isinstance(failure, httpx.RequestError):
+            raise failure
+        return failure
+
+    request = AcquireRequest(
+        mode="provision", config={**_provision(), "node_types": ["r6615", "c6620"]}
+    )
+    if code:
+        with pytest.raises(ProviderError) as caught:
+            await provider(respond).acquire(request, intent())
+        assert caught.value.code == code
+        if code == "rate_limited":
+            assert caught.value.retryable is True
+    else:
+        assert (await provider(respond).acquire(request, intent())).outcome == "unknown"
+    assert attempted == ["r6615"]
+
+
+@pytest.mark.asyncio
+async def test_cloudlab_capacity_error_with_unknown_creation_status_does_not_fall_back():
+    attempted = []
+
+    def respond(request):
+        if request.url.path.endswith("/profiles/"):
+            return _profile_list()
+        if request.method == "GET":
+            return httpx.Response(503)
+        attempted.append(json.loads(request.content)["bindings"]["phystype"])
+        return httpx.Response(500, json={"error": "Insufficient physical nodes"})
+
+    receipt = await provider(respond).acquire(
+        AcquireRequest(mode="provision", config={**_provision(), "node_types": ["r6615", "c6620"]}),
+        intent(),
+    )
+    assert attempted == ["r6615"]
+    assert receipt.outcome == "unknown"
+
+
 @pytest.mark.asyncio
 async def test_cloudlab_provision_installs_the_ssh_users_public_key():
     requests = []
@@ -538,7 +817,7 @@ async def test_known_uuid_recovers_create_by_exact_identity():
         (401, "credential_invalid"),
         (403, "permission_denied"),
         (503, "temporarily_unavailable"),
-        (429, "capacity_unavailable"),
+        (429, "rate_limited"),
         (302, "request_rejected"),
     ],
 )
@@ -900,6 +1179,38 @@ async def test_the_registration_token_rides_only_on_the_create_request():
     # What the control plane persists never holds the token.
     assert secret not in receipt.model_dump_json()
     assert secret not in repr(request)
+
+
+@pytest.mark.asyncio
+async def test_registration_survives_capacity_fallback_without_persisting_its_token():
+    payloads = []
+
+    def respond(request):
+        if request.method == "GET":
+            return _profile_list()
+        payloads.append(json.loads(request.content))
+        return (
+            httpx.Response(429, json={"error": "Insufficient physical nodes"})
+            if len(payloads) == 1
+            else httpx.Response(201, json={"id": EXPERIMENT})
+        )
+
+    secret = "r" * 43
+    config = {**REGISTERING, "bindings": {}, "node_types": ["r6615", "c6620"]}
+    request = AcquireRequest(
+        mode="provision",
+        config=config,
+        registration=NodeRegistration(url="https://example.org/register", token=secret),
+    )
+    receipt = await provider(respond).acquire(request, intent())
+    assert [payload["bindings"]["phystype"] for payload in payloads] == ["r6615", "c6620"]
+    assert all(payload["bindings"]["registrationToken"] == secret for payload in payloads)
+    assert all(
+        payload["bindings"]["registrationUrl"] == "https://example.org/register"
+        for payload in payloads
+    )
+    assert receipt.resource.config["bindings"] == {"phystype": "c6620"}
+    assert secret not in receipt.model_dump_json()
 
 
 @pytest.mark.asyncio
