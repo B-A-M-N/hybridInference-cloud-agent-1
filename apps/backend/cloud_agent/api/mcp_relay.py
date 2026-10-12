@@ -1929,10 +1929,12 @@ async def _host_call(
     # new owner the old one's upstream state.
     try:
         session = await _host_session(authorized, authorization)
+        schema = getattr(capability, "input_schema", None)
         outcome = await _host().call_tool(
             session,
             name=capability.name,
             arguments=arguments if isinstance(arguments, dict) else {},
+            input_schema=schema if isinstance(schema, dict) else None,
         )
     except asyncio.CancelledError:
         await asyncio.shield(_finish_dispatches(authorized, store, status="outcome_unknown"))
