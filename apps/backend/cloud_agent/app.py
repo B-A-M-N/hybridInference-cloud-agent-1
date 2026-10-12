@@ -25,6 +25,9 @@ garbage-collect mid-run is a task that stops silently.
 
 from __future__ import annotations
 
+import os
+from typing import Any
+
 from fastapi import FastAPI, Request, Response
 from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
@@ -140,6 +143,22 @@ def install_admin_no_store(
 
 from cloud_agent.bootstrap.lifespan import lifespan
 
+#: Serves ``/docs``, ``/redoc`` and ``/openapi.json`` on the main listener when
+#: set to ``true``. Off by default: the schema describes every route to anyone
+#: who asks, and the two pages load their scripts from a CDN at a floating
+#: major version with no integrity check, on the origin the web app shares.
+ENV_API_DOCS = "AGENT_API_DOCS"
+
+#: What FastAPI needs to serve none of the three. ``app.openapi()`` still
+#: builds the schema; only the routes that publish it are left out.
+_NO_DOCS: dict[str, Any] = {"docs_url": None, "redoc_url": None, "openapi_url": None}
+
+
+def _api_docs() -> dict[str, Any]:
+    """Return the main listener's docs arguments: FastAPI's own only on request."""
+    enabled = (os.environ.get(ENV_API_DOCS) or "").strip().lower() in {"1", "true", "yes"}
+    return {} if enabled else _NO_DOCS
+
 
 def create_app() -> FastAPI:
     """Build the control plane application."""
@@ -179,6 +198,7 @@ def create_app() -> FastAPI:
         description="Cloud coding agents on sandboxed hosts",
         version="0.1.0",
         lifespan=lifespan,
+        **_api_docs(),
     )
     app.include_router(routes.router)
     app.include_router(usage.router)
@@ -295,6 +315,9 @@ def create_mcp_app() -> FastAPI:
         # and a second copy would renew every grant twice and race the same
         # publish. This listener still maintains its own upstream MCP sockets.
         lifespan=lambda app: lifespan(app, background=False),
+        # Never, whatever the main listener does: a sandbox reaches this one,
+        # and its contract is the relay, not a description of it.
+        **_NO_DOCS,
     )
     app.include_router(mcp_relay.router)
 
