@@ -1509,8 +1509,11 @@ class PostgresHostPoolRepository:
         ``"fenced"``,
         ``"retained_groups_present"``, ``"resource_bound"``,
         ``"active_attempts_present"`` and ``"pending_compute_operations"``.
-        A disabled attached machine without external release capability may
-        be deregistered after dependency checks; this never shuts it down.
+        A sandbox whose deletion has completed is an audit row: it keeps the
+        host name and does not block forgetting. A live group, or one whose
+        deletion failed or is still in progress, does. A disabled attached
+        machine without external release capability may be deregistered after
+        dependency checks; this never shuts it down.
 
         The active-host refusal lives here rather than in the caller because
         checking there is a read the switch can outrun: the endpoint sees the
@@ -1526,7 +1529,8 @@ class PostgresHostPoolRepository:
             if active == host:
                 return "active"
             retained = await conn.fetchval(
-                "SELECT 1 FROM agent_sandboxes WHERE host=$1 LIMIT 1", host
+                "SELECT 1 FROM agent_sandboxes WHERE host=$1 AND deletion_state<>'deleted' LIMIT 1",
+                host,
             )
             if retained:
                 return "retained_groups_present"
