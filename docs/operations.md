@@ -2836,8 +2836,9 @@ Refused:
   `127.0.0.0/8`, `169.254.0.0/16` (cloud metadata among them), `172.16.0.0/12`,
   `192.0.0.0/24`, `192.0.2.0/24`, `192.88.99.0/24`, `192.168.0.0/16`,
   `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`, `224.0.0.0/4` and
-  `240.0.0.0/4` — and whatever `AGENT_EGRESS_PROTECTED_CIDRS` adds, on any
-  port;
+  `240.0.0.0/4` — plus Azure's WireServer, `168.63.129.16`, a platform
+  service on a public address, and whatever `AGENT_EGRESS_PROTECTED_CIDRS`
+  adds, on any port;
 - other groups, this deployment's or another's;
 - every other port and protocol: UDP 443 (QUIC), ping, all IPv6;
 - connections started from outside. A reply is accepted only for a connection
@@ -3069,9 +3070,10 @@ network; the workspace is kept:
   - `relay host:port unreachable: …`;
   - `the host at …:9/udp was refused by ECONNREFUSED, not by the network
     rules`, `the metadata address 169.254.169.254:80 answered; the network
-    rules are not in this guest's path`, or `… was not refused within 2s` —
-    the host and the metadata address must be refused at once by the rules'
-    own ICMP answer, and were not: the guest's traffic is not passing this
+    rules are not in this guest's path` (or the same for `the platform
+    address 168.63.129.16:80`), or `… was not refused within 2s` — the host
+    and both platform addresses must be refused at once by the rules' own
+    ICMP answer, and were not: the guest's traffic is not passing this
     deployment's tables.
 
   The sandbox is stopped, not deleted. Reaching the public internet is not

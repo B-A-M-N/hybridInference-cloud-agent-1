@@ -410,10 +410,11 @@ def _exec_env_by_name(key: str) -> bool:
 # resolver the guest should use and $2 the relays as JSON. Prints the problems
 # it found as a JSON list; an empty list is a pass. Every probe has a short
 # bound and nothing here leaves the host: the resolver answers one query for the
-# root's name servers, and the two boundary probes aim at the host itself and at
-# the metadata address, which the host rules must refuse at once with their own
-# ICMP "administratively prohibited". A host without the rules would answer
-# "port unreachable" for itself instead, and route the other onwards.
+# root's name servers, and the boundary probes aim at the host itself and at the
+# two platform addresses (cloud metadata, and Azure's WireServer on a public
+# address), which the host rules must refuse at once with their own ICMP
+# "administratively prohibited". A host without the rules would answer "port
+# unreachable" for itself instead, and route the others onwards.
 _GUEST_NETWORK_CHECK = """
 import errno, json, socket, struct, sys
 resolver, relays = sys.argv[1], json.loads(sys.argv[2])
@@ -464,10 +465,13 @@ def host_udp():
     probe.recv(1)
 if gateway is not None:
     refused_by_rules('the host at %s:9/udp' % gateway, host_udp)
-refused_by_rules(
-    'the metadata address 169.254.169.254:80',
-    lambda: socket.create_connection(('169.254.169.254', 80), timeout=2).close(),
-)
+for label, address in (
+    ('the metadata address 169.254.169.254:80', '169.254.169.254'),
+    ('the platform address 168.63.129.16:80', '168.63.129.16'),
+):
+    refused_by_rules(
+        label, lambda address=address: socket.create_connection((address, 80), timeout=2).close()
+    )
 print(json.dumps(problems))
 """
 
