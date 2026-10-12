@@ -145,8 +145,15 @@ CHAT_STATE_DIR = "/agent-state"
 CLAUDE_SHARED_PROJECTS_DIR = f"{CHAT_STATE_DIR}/claude/projects"
 #: Where Codex, OpenCode and Kilo keep one mode-0700 provider home per member
 #: (``resident_transport.PRIVATE_MEMBER_STATE_ROOTS``). Only a home's own
-#: member UID can open it.
+#: member UID can open it, and no member can rename or replace one: each
+#: collection is owned by the sandbox user and sticky, inside a sticky
+#: /agent-state (see :meth:`ChatSandboxManager.ensure_private_member_collections`).
 PRIVATE_MEMBER_HOME_COLLECTIONS = tuple(
+    f"{CHAT_STATE_DIR}/{runtime}-homes" for runtime in ("codex", "opencode", "kilo")
+)
+#: The member-created, group-writable collections earlier releases used. A
+#: member moves its own home out of one once; nothing is ever started from it.
+LEGACY_MEMBER_HOME_COLLECTIONS = tuple(
     f"{CHAT_STATE_DIR}/{runtime}-members" for runtime in ("codex", "opencode", "kilo")
 )
 ACTIVATION_TMPFS = "/run/agent-activation"
@@ -2911,6 +2918,48 @@ class ChatSandboxManager:
                 + result.stderr.decode("utf-8", "replace")[:300]
             )
 
+    def ensure_private_member_collections(self, spec: ChatSandboxSpec) -> None:
+        """Make every provider-home collection one no member can rename or swap.
+
+        A member's home is mode 0700, but that alone does not stop a sibling
+        from renaming it out of a group-writable directory and putting its own
+        tree at the known path before the member's CLI starts. Run as the
+        sandbox user, which owns /agent-state and is no member's UID, this sets
+        the sticky bit on /agent-state and creates each collection owned by the
+        sandbox user with mode 3770 (setgid, sticky). A member can then add its
+        own home but cannot rename or remove another's, nor the collection, and
+        no member UID can undo either bit. An entry at a collection's name that
+        the sandbox user does not own -- a sibling's squat, or a symlink -- is
+        moved aside, which the owner of a sticky directory may always do.
+        """
+        script = (
+            'set -eu; me=$(id -u); group=$(id -g); root="$1"; shift; '
+            'test -n "$(find "$root" -maxdepth 0 -type d -uid "$me")" '
+            '|| { echo "shared state root is not owned by the sandbox user" >&2; exit 1; }; '
+            'chmod +t -- "$root"; '
+            'for collection in "$@"; do '
+            "attempt=0; "
+            'until mkdir -m 3770 -- "$collection" 2>/dev/null '
+            '|| test -n "$(find "$collection" -maxdepth 0 -type d -uid "$me" -gid "$group")"; '
+            "do "
+            'attempt=$((attempt + 1)); test "$attempt" -le 3; '
+            'mv -T -- "$collection" "$collection.refused-$$-$attempt"; '
+            "done; "
+            'chmod 3770 -- "$collection"; '
+            "done"
+        )
+        result = self.exec_capture(
+            spec,
+            ["/bin/sh", "-c", script, "sh", CHAT_STATE_DIR, *PRIVATE_MEMBER_HOME_COLLECTIONS],
+            workdir="/",
+            timeout_s=60,
+        )
+        if result.returncode != 0:
+            raise SandboxError(
+                "private member home collections could not be secured: "
+                + result.stderr.decode("utf-8", "replace")[:300]
+            )
+
     def normalize_member_files(
         self,
         spec: ChatSandboxSpec,
@@ -2935,6 +2984,7 @@ class ChatSandboxManager:
         # /home/agent-member-N/.claude-members, outside this traversal. Only projects/
         # remains shared; never widen other legacy shared Claude files.
         # Normalize shared roots while pruning every private-home collection.
+        trusted_prunes = "".join(f"-o -path {path} " for path in PRIVATE_MEMBER_HOME_COLLECTIONS)
         script = (
             "set -eu; uid=$1; "
             'normalize_dirs() { find "$@" -xdev -uid "$uid" -type d '
@@ -2947,14 +2997,16 @@ class ChatSandboxManager:
             f"-o -path {CHAT_STATE_DIR}/claude "
             f"-o -path {CHAT_STATE_DIR}/codex-members "
             f"-o -path {CHAT_STATE_DIR}/opencode-members "
-            f"-o -path {CHAT_STATE_DIR}/kilo-members \\) -prune -o "
+            f"-o -path {CHAT_STATE_DIR}/kilo-members "
+            f"{trusted_prunes}\\) -prune -o "
             '-uid "$uid" -type d -exec chmod g+rwx,g+s -- {} +; '
             f"find {CHAT_STATE_DIR} -xdev "
             f"\\( -path {CHAT_STATE_DIR}/.platform "
             f"-o -path {CHAT_STATE_DIR}/claude "
             f"-o -path {CHAT_STATE_DIR}/codex-members "
             f"-o -path {CHAT_STATE_DIR}/opencode-members "
-            f"-o -path {CHAT_STATE_DIR}/kilo-members \\) -prune -o "
+            f"-o -path {CHAT_STATE_DIR}/kilo-members "
+            f"{trusted_prunes}\\) -prune -o "
             '-uid "$uid" -type f -exec chmod g+rw -- {} +; '
             f"if test -d {CLAUDE_SHARED_PROJECTS_DIR}; then "
             f"normalize_dirs {CLAUDE_SHARED_PROJECTS_DIR}; "
@@ -4823,7 +4875,7 @@ finally:
         those owners before it deletes anything, has each member remove its
         own homes, and only then clears both roots.
         """
-        collections = " ".join(PRIVATE_MEMBER_HOME_COLLECTIONS)
+        collections = " ".join(PRIVATE_MEMBER_HOME_COLLECTIONS + LEGACY_MEMBER_HOME_COLLECTIONS)
         script = (
             "set -eu; "
             f"owners=$(for collection in {collections}; do "
@@ -4861,7 +4913,7 @@ finally:
             if not MEMBER_UID_BASE <= uid < MEMBER_UID_BASE + spec.resident_slot_capacity:
                 raise SandboxError(f"private member home is owned by unexpected uid {uid}")
             uids.add(uid)
-        collections = " ".join(PRIVATE_MEMBER_HOME_COLLECTIONS)
+        collections = " ".join(PRIVATE_MEMBER_HOME_COLLECTIONS + LEGACY_MEMBER_HOME_COLLECTIONS)
         script = (
             "set -eu; uid=$(id -u); "
             f"for collection in {collections}; do "
