@@ -908,11 +908,13 @@ function UserMessage({
   presentation?: TranscriptPresentation;
 }) {
   return (
-    <div data-block-key={blockKey} className="group my-3 ml-auto w-fit max-w-[88%]">
-      <div className="rounded-2xl bg-gray-100 dark:bg-white/5 px-4 py-3 text-sm leading-relaxed text-gray-800 dark:text-gray-200">
-        <MessageContent text={text} presentation={presentation} />
+    <div data-block-key={blockKey} className="group my-2 ml-auto w-fit max-w-[88%]">
+      <div className="flex min-w-0 items-start gap-2 rounded-2xl bg-gray-100 dark:bg-white/5 px-3 py-2 text-sm leading-relaxed text-gray-800 dark:text-gray-200">
+        <div className="min-w-0 flex-1">
+          <MessageContent text={text} presentation={presentation} />
+        </div>
         {presentation !== 'compact' ? (
-          <MessageActions align="end" className="mt-0">
+          <MessageActions align="end" className="!mt-0 shrink-0">
             <MessageActionButton label="Copy message" onClick={() => void copyMessage(text)}>
               <CopyIcon />
               Copy
@@ -1173,7 +1175,7 @@ export function HistoryTurn({
       </div>
       {results}
       {onOpenRun ? (
-        <div className="mb-6 mt-3 flex justify-end text-[11px] text-gray-400 dark:text-gray-500">
+        <div className="mb-4 mt-2 flex justify-end text-[11px] text-gray-400 dark:text-gray-500">
           <button
             type="button"
             onClick={() => onOpenRun(turn.jobId, turn.displayNo)}

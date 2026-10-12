@@ -1796,7 +1796,7 @@ export function JobDetail({
   const panelOpen = workspaceOpen || inspector !== null;
   const content = (
     <section className="flex h-full min-h-0 flex-col bg-surface">
-      <header className="agent-conversation-header relative z-20 shrink-0 border-b border-border bg-surface px-4 sm:px-6">
+      <header className="agent-conversation-header relative z-20 shrink-0 border-b border-border bg-surface px-4">
         {isArchived ? (
           <div className="flex items-center gap-2 pt-3 text-xs text-gray-500 dark:text-gray-400">
             <Link
@@ -1809,8 +1809,8 @@ export function JobDetail({
             <span>{t('sessionArchive.badge')}</span>
           </div>
         ) : null}
-        <div className="agent-conversation-toolbar flex flex-col">
-          <div className="agent-conversation-context flex min-w-0 items-center gap-3 pb-2 pt-3">
+        <div className="agent-conversation-toolbar flex flex-col gap-1.5 py-2">
+          <div className="agent-conversation-context flex min-w-0 items-center gap-2">
             <div className="min-w-0 flex-1">
               <h1
                 title={title}
@@ -1818,10 +1818,10 @@ export function JobDetail({
               >
                 {title}
               </h1>
-              <div className="mt-1 flex items-center gap-2 text-xs text-muted">
+              <div className="mt-0.5 flex items-center gap-1.5 text-xs text-muted">
                 <svg
                   aria-hidden="true"
-                  className="h-3.5 w-3.5"
+                  className="h-3.5 w-3.5 shrink-0"
                   fill="none"
                   viewBox="0 0 24 24"
                   stroke="currentColor"
@@ -1845,7 +1845,7 @@ export function JobDetail({
               onRename={setTitle}
             />
           </div>
-          <div className="agent-conversation-controls flex flex-wrap items-center gap-x-3 gap-y-2 pb-3">
+          <div className="agent-conversation-controls flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1.5">
             <nav
               aria-label="Run views"
               className="flex shrink-0 items-center gap-1 rounded-xl bg-surface-muted p-1 text-xs"
@@ -1986,10 +1986,10 @@ export function JobDetail({
                 trajectory is a wide table of steps, so it keeps the width the
                 inspector is not holding instead of a reading column. */}
             <div
-              className={`flex w-full flex-1 flex-col pb-6 pt-7 ${
+              className={`flex w-full flex-1 flex-col pb-3 pt-4 ${
                 tab === 'trajectory'
-                  ? 'px-6'
-                  : `mx-auto max-w-4xl ${showRail ? 'pl-6 pr-12' : 'px-6'}`
+                  ? 'px-4 sm:px-5'
+                  : `mx-auto max-w-5xl ${showRail ? 'pl-4 pr-10 sm:pl-5' : 'px-4 sm:px-5'}`
               }`}
             >
               {tab === 'trajectory' ? (
@@ -2087,14 +2087,16 @@ export function JobDetail({
                     {job.historyIncludesPrompt ? null : (
                       <div
                         data-block-key={`${job.id}:prompt`}
-                        className="group my-4 rounded-xl border border-gray-200/90 dark:border-white/10 bg-white dark:bg-gray-900 px-4 py-3 shadow-subtle"
+                        className="group my-2 flex items-start gap-2 rounded-xl border border-gray-200/90 dark:border-white/10 bg-white dark:bg-gray-900 px-3 py-2.5 shadow-subtle"
                       >
-                        <MessageContent
-                          text={job.prompt || job.title}
-                          presentation={presentation}
-                        />
+                        <div className="min-w-0 flex-1">
+                          <MessageContent
+                            text={job.prompt || job.title}
+                            presentation={presentation}
+                          />
+                        </div>
                         {presentation !== 'compact' || (currentRewindAnchor && canForkWorkspace) ? (
-                          <MessageActions align="end">
+                          <MessageActions align="end" className="!mt-0 max-w-[45%] shrink-0">
                             {presentation !== 'compact' ? (
                               <MessageActionButton
                                 label="Copy message"
@@ -2204,7 +2206,7 @@ export function JobDetail({
                         )}
                       />
                       {job.state === 'queued' && visibleEvents.length === 0 ? (
-                        <div className="flex items-center gap-2.5 py-3 text-[13px] text-gray-500 dark:text-gray-400">
+                        <div className="flex items-center gap-2 py-1 text-[13px] text-gray-500 dark:text-gray-400">
                           <span className="h-2 w-2 animate-pulse rounded-full bg-gray-400 dark:bg-gray-600" />
                           Waiting to start
                         </div>
@@ -2241,7 +2243,7 @@ export function JobDetail({
                     />
                     {selectedAttemptIsCurrent ? <RunNotices job={job} /> : null}
                     {usageFooter && lastVisibleMessageIndex < 0 && currentReplyId === undefined ? (
-                      <div className="mt-4">{usageFooter}</div>
+                      <div className="mt-2">{usageFooter}</div>
                     ) : null}
                   </section>
                 </div>
@@ -2250,7 +2252,7 @@ export function JobDetail({
               {/* Keep the sticky controls opaque while the transcript scrolls behind them. */}
               <div
                 ref={scroll.composerRef}
-                className="sticky bottom-0 z-10 -mx-2 mt-4 bg-gray-50 px-2 pb-2 pt-3 dark:bg-gray-950"
+                className="sticky bottom-0 z-10 -mx-1 mt-3 bg-gray-50 px-1 pb-1 pt-2 dark:bg-gray-950"
               >
                 <LiveAgentStatus job={job} />
                 {/* `/goal` on its own is not an objective. It is consumed
@@ -2417,14 +2419,14 @@ export function JobDetail({
                             : 'Message or run a task, / commands, @ files or sessions'
                         }
                         aria-label="Add a follow-up"
-                        className="block max-h-[30vh] min-h-16 w-full resize-y rounded-t-2xl border-0 bg-transparent px-4 py-3 text-sm leading-6 text-foreground placeholder:text-muted focus:outline-none focus:ring-0"
+                        className="block max-h-[30vh] min-h-14 w-full resize-y rounded-t-2xl border-0 bg-transparent px-3 py-2 text-sm leading-5 text-foreground placeholder:text-muted focus:outline-none focus:ring-0"
                       />
                       <AttachmentStrip
                         entries={attachments.entries}
                         onRemove={attachments.remove}
                         disabled={contextLost || submitting}
                       />
-                      <div className="flex flex-wrap items-center gap-1 border-t border-border px-3 py-2">
+                      <div className="flex flex-wrap items-center gap-1 border-t border-border px-2 py-1">
                         <ComposerPlusMenu
                           onFiles={attachments.add}
                           onOpenSkills={() => setSkillsOpen(true)}
@@ -2447,12 +2449,14 @@ export function JobDetail({
                           native-resumes it in the same retained workspace; it
                           does not replace or clone the sandbox. */}
                             <Picker
+                              compact
                               label="Model for this turn"
                               value={model}
                               options={modelOptions}
                               onChange={setModel}
                             />
                             <Picker
+                              compact
                               label="Reasoning for this turn"
                               value={effort}
                               options={efforts}
@@ -2498,7 +2502,7 @@ export function JobDetail({
                           busy={submitting || goalCommand.busy}
                         />
                       </div>
-                      <p className="px-4 pb-3 text-[11px] leading-4 text-muted">
+                      <p className="px-3 pb-2 text-[11px] leading-4 text-muted">
                         {contextLost
                           ? `Start a new chat · ${job.runtime}`
                           : job.state === 'cancelled'
