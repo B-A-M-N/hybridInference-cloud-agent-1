@@ -136,7 +136,7 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe('memory settings', () => {
-  it('automatically loads recent work, source-linked memory, and actionable suggestions without an avatar', async () => {
+  it('automatically loads recent work and source-linked memory while user suggestions live on the homepage', async () => {
     render(panel());
     expect(screen.getByRole('status')).toHaveTextContent('Loading your memory');
     await screen.findByRole('switch');
@@ -159,9 +159,12 @@ describe('memory settings', () => {
       'href',
       '/job%2Fone',
     );
-    expect(screen.getByText(populated.suggestions[0].title)).toBeInTheDocument();
-    expect(screen.getByText(populated.suggestions[0].reason)).toBeInTheDocument();
-    expect(screen.getByText(populated.suggestions[0].action)).toBeInTheDocument();
+    expect(
+      screen.queryByRole('heading', { name: 'Suggestions for future tasks' }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(populated.suggestions[0].title)).not.toBeInTheDocument();
+    expect(screen.queryByText(populated.suggestions[0].reason)).not.toBeInTheDocument();
+    expect(screen.queryByText(populated.suggestions[0].action)).not.toBeInTheDocument();
     expect(screen.getByText(/Memory updated/)).toBeInTheDocument();
   });
 
@@ -171,7 +174,7 @@ describe('memory settings', () => {
     await screen.findByRole('switch');
     expect(screen.getByText(/Recent work will appear/)).toBeInTheDocument();
     expect(screen.getByText('No saved memory yet.')).toBeInTheDocument();
-    expect(screen.getByText(/Suggestions will appear/)).toBeInTheDocument();
+    expect(screen.queryByText(/Suggestions will appear/)).not.toBeInTheDocument();
   });
 
   it('refreshes manually and applies enable or disable only after the server responds', async () => {
@@ -300,7 +303,7 @@ describe('memory settings', () => {
     expect(screen.getByRole('heading', { name: '用户记忆' })).toBeInTheDocument();
     expect(screen.getByText(/用户偏好适用于所有项目/)).toBeInTheDocument();
     expect(screen.getByRole('switch', { name: '自动建立记忆' })).toBeChecked();
-    expect(screen.getByRole('heading', { name: '未来任务建议' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '未来任务建议' })).not.toBeInTheDocument();
     expect(screen.queryByRole('img')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '清除记忆' }));
     expect(screen.getByRole('button', { name: '确认清除记忆' })).toBeInTheDocument();

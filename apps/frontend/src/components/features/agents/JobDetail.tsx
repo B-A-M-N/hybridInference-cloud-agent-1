@@ -1831,7 +1831,7 @@ export function JobDetail({
               onRename={setTitle}
             />
           </div>
-          <div className="agent-conversation-controls flex flex-wrap items-center gap-x-2 gap-y-1 pb-1.5">
+          <div className="agent-conversation-controls flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 pb-1.5">
             <nav
               aria-label="Run views"
               className="flex shrink-0 items-center gap-0.5 rounded-md bg-surface-muted p-0.5 text-xs"
@@ -2073,14 +2073,16 @@ export function JobDetail({
                     {job.historyIncludesPrompt ? null : (
                       <div
                         data-block-key={`${job.id}:prompt`}
-                        className="group my-4 rounded-xl border border-gray-200/90 dark:border-white/10 bg-white dark:bg-gray-900 px-4 py-3 shadow-subtle"
+                        className="group my-2 flex items-start gap-2 rounded-xl border border-gray-200/90 dark:border-white/10 bg-white dark:bg-gray-900 px-3 py-2.5 shadow-subtle"
                       >
-                        <MessageContent
-                          text={job.prompt || job.title}
-                          presentation={presentation}
-                        />
+                        <div className="min-w-0 flex-1">
+                          <MessageContent
+                            text={job.prompt || job.title}
+                            presentation={presentation}
+                          />
+                        </div>
                         {presentation !== 'compact' || (currentRewindAnchor && canForkWorkspace) ? (
-                          <MessageActions align="end">
+                          <MessageActions align="end" className="!mt-0 max-w-[45%] shrink-0">
                             {presentation !== 'compact' ? (
                               <MessageActionButton
                                 label="Copy message"
@@ -2190,7 +2192,7 @@ export function JobDetail({
                         )}
                       />
                       {job.state === 'queued' && visibleEvents.length === 0 ? (
-                        <div className="flex items-center gap-2.5 py-3 text-[13px] text-gray-500 dark:text-gray-400">
+                        <div className="flex items-center gap-2 py-1 text-[13px] text-gray-500 dark:text-gray-400">
                           <span className="h-2 w-2 animate-pulse rounded-full bg-gray-400 dark:bg-gray-600" />
                           Waiting to start
                         </div>
@@ -2227,7 +2229,7 @@ export function JobDetail({
                     />
                     {selectedAttemptIsCurrent ? <RunNotices job={job} /> : null}
                     {usageFooter && lastVisibleMessageIndex < 0 && currentReplyId === undefined ? (
-                      <div className="mt-4">{usageFooter}</div>
+                      <div className="mt-2">{usageFooter}</div>
                     ) : null}
                   </section>
                 </div>
@@ -2236,7 +2238,7 @@ export function JobDetail({
               {/* Keep the sticky controls opaque while the transcript scrolls behind them. */}
               <div
                 ref={scroll.composerRef}
-                className="sticky bottom-0 z-10 -mx-1 mt-3 bg-gray-50 px-1 pb-1.5 pt-2 dark:bg-gray-950"
+                className="sticky bottom-0 z-10 -mx-1 mt-3 bg-gray-50 px-1 pb-1 pt-2 dark:bg-gray-950"
               >
                 <LiveAgentStatus job={job} />
                 {/* `/goal` on its own is not an objective. It is consumed
@@ -2410,7 +2412,7 @@ export function JobDetail({
                         onRemove={attachments.remove}
                         disabled={contextLost || submitting}
                       />
-                      <div className="flex flex-wrap items-center gap-1 border-t border-border px-2 py-1.5">
+                      <div className="flex flex-wrap items-center gap-1 border-t border-border px-2 py-1">
                         <ComposerPlusMenu
                           onFiles={attachments.add}
                           onOpenSkills={() => setSkillsOpen(true)}
@@ -2433,12 +2435,14 @@ export function JobDetail({
                           native-resumes it in the same retained workspace; it
                           does not replace or clone the sandbox. */}
                             <Picker
+                              compact
                               label="Model for this turn"
                               value={model}
                               options={modelOptions}
                               onChange={setModel}
                             />
                             <Picker
+                              compact
                               label="Reasoning for this turn"
                               value={effort}
                               options={efforts}

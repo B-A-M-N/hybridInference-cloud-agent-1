@@ -42,6 +42,8 @@ import type { SelectedSkillApi } from '@/lib/api/skills';
 import { readDraftPlugins, validPluginForRuntime } from '@/lib/pluginConfiguration';
 import { PluginSelectionDialog } from './plugins/PluginSelectionDialog';
 import { UserAvatar } from './UserAvatar';
+import { UserHomeInsights } from './UserHomeInsights';
+import { useUserHomeProfile } from './useUserHomeProfile';
 
 // New-task composer (the /agents index state). Runtime × model are first-class
 // controls — BYOA × BYOM is the product, not an advanced option.
@@ -89,6 +91,7 @@ function readNewTaskDraft(value: string): NewTaskDraft | null {
 function TaskComposerContent({ initialRepo, userId }: { initialRepo?: string; userId?: string }) {
   const router = useRouter();
   const t = useT();
+  const userProfile = useUserHomeProfile(userId);
   const draftStore = useComposerDraft({ userId, threadId: 'new-task' });
   const mounted = useRef(true);
   useEffect(() => {
@@ -572,7 +575,7 @@ function TaskComposerContent({ initialRepo, userId }: { initialRepo?: string; us
       >
         <div
           aria-hidden="true"
-          className="mx-auto h-10 w-10 rounded-lg bg-surface-hover motion-safe:animate-pulse"
+          className="mx-auto h-[152px] w-[152px] rounded-[32px] bg-surface-hover motion-safe:animate-pulse"
         />
         <p aria-live="polite" className="mt-4 text-center text-sm text-muted">
           {t('common.loading')}
@@ -588,7 +591,7 @@ function TaskComposerContent({ initialRepo, userId }: { initialRepo?: string; us
   return (
     <section className="ui-enter mx-auto w-full max-w-3xl px-4 pb-8 pt-6 sm:px-6 md:pt-10">
       <div className="ui-welcome-enter">
-        <UserAvatar />
+        <UserAvatar view={userProfile.view} />
         <h1
           id={headingId}
           className="text-balance text-center text-xl font-semibold leading-tight tracking-tight text-foreground sm:text-2xl"
@@ -849,6 +852,15 @@ function TaskComposerContent({ initialRepo, userId }: { initialRepo?: string; us
       <p id={keyboardHintId} className="mt-3 text-center text-xs leading-5 text-muted">
         {t('composer.keyboardHint')}
       </p>
+
+      {userId ? (
+        <UserHomeInsights
+          view={userProfile.view}
+          loading={userProfile.loading}
+          error={userProfile.error}
+          onRetry={userProfile.retry}
+        />
+      ) : null}
 
       {pluginsOpen ? (
         <PluginSelectionDialog

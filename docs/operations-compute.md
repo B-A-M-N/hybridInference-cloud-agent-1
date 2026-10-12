@@ -86,7 +86,9 @@ Preflight does not query or start these daemons, and bootstrap never deletes or
 moves existing sandbox data to a different disk. Docker and containerd must use
 their default `/var/lib/docker`
 and `/var/lib/containerd` data directories. Setup rejects custom daemon storage
-configuration before restarting services.
+configuration before restarting services. A host installed by hand uses the
+same binds, `/etc/fstab` lines and systemd drop-ins; see
+[Retained Docker storage on a host](operations.md#retained-docker-storage-on-a-host).
 Daemon startup requires the configured disk and bind mount after
 a reboot. Older API clients that omit `sandbox_storage_path` continue to
 use the operator profile's `data_mount` configuration.

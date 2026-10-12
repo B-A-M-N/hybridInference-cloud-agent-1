@@ -284,14 +284,19 @@
   container: conversation-header / inline-size;
 }
 
-@container conversation-header (max-width: 900px) {
+@container conversation-header (min-width: 900px) {
   .agent-conversation-toolbar {
-    flex-direction: column;
-    align-items: stretch;
+    flex-direction: row;
+    align-items: center;
+    gap: 1rem;
   }
-  .agent-conversation-context,
+
+  .agent-conversation-context {
+    flex: 0 1 20rem;
+  }
+
   .agent-conversation-controls {
-    width: 100%;
+    flex: 1 1 0%;
   }
 }
 

@@ -909,10 +909,12 @@ function UserMessage({
 }) {
   return (
     <div data-block-key={blockKey} className="group my-2 ml-auto w-fit max-w-[88%]">
-      <div className="rounded-xl bg-gray-100 px-3 py-2 text-sm leading-6 text-gray-800 dark:bg-white/5 dark:text-gray-200">
-        <MessageContent text={text} presentation={presentation} />
+      <div className="flex min-w-0 items-start gap-2 rounded-xl bg-gray-100 px-3 py-2 text-sm leading-6 text-gray-800 dark:bg-white/5 dark:text-gray-200">
+        <div className="min-w-0 flex-1">
+          <MessageContent text={text} presentation={presentation} />
+        </div>
         {presentation !== 'compact' ? (
-          <MessageActions align="end" className="mt-0">
+          <MessageActions align="end" className="!mt-0 shrink-0">
             <MessageActionButton label="Copy message" onClick={() => void copyMessage(text)}>
               <CopyIcon />
               Copy
