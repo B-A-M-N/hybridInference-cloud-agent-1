@@ -1575,6 +1575,9 @@ class WorkerClaimAttestation(BaseModel):
     sandbox_archive_settings_applied_revision: StrictInt | None = Field(None, ge=0)
     host_kernel: str | None = Field(None, max_length=256)
     guest_kernel: str | None = Field(None, max_length=256)
+    #: The writable-layer quota, in MiB, a group this claim creates would get;
+    #: 0 is none. ``None`` is a runner from before it was reported.
+    sandbox_disk_limit_mib: StrictInt | None = Field(None, ge=0, le=16777216)
 
 
 class WorkerClaimRequest(BaseModel):
@@ -2718,6 +2721,16 @@ class AgentRunnerHost(BaseModel):
         description=(
             "Archive-policy revision this host's broker confirmed applying. Null means "
             "the host predates database-backed archive settings or has not synchronized yet."
+        ),
+    )
+    untrusted_without_disk_quota: bool = Field(
+        False,
+        description=(
+            "True when this host can be given untrusted (Kata) work and reports "
+            "applying no container disk quota (sandbox_disk_mib 0), so a new "
+            "untrusted sandbox's writable layer is unbounded on a disk every other "
+            "sandbox on the host shares. A recommendation only: nothing is refused "
+            "or rescheduled. False when the host has not reported the setting."
         ),
     )
 

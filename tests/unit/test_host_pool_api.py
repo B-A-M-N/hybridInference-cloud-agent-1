@@ -15,6 +15,7 @@ honest about *this* surface while saying nothing about the gate.
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock
@@ -1093,6 +1094,31 @@ async def test_a_heartbeat_stores_the_settings_report_reduced_to_known_numbers(c
     assert row["settings_local"] == {"agent_timeout_s": 3600, "chat_idle_timeout_s": 15.5}
 
 
+@pytest.mark.parametrize(
+    ("sandbox_runtime", "applied", "warned"),
+    [
+        ("io.containerd.kata.v2", {"sandbox_disk_mib": 0}, True),
+        ("io.containerd.kata.v2", {"sandbox_disk_mib": 20480}, False),
+        # Not reported: a runner that predates the setting is not guessed about.
+        ("io.containerd.kata.v2", {"agent_timeout_s": 900}, False),
+        ("io.containerd.kata.v2", None, False),
+        # Only a Kata host is handed untrusted work.
+        ("", {"sandbox_disk_mib": 0}, False),
+    ],
+)
+async def test_a_host_serving_untrusted_work_without_a_disk_quota_is_flagged(
+    client, sandbox_runtime, applied, warned
+):
+    async_client, store = client
+    await _enroll(async_client, store)
+    store.rows["runner-a"]["sandbox_runtime"] = sandbox_runtime
+    store.rows["runner-a"]["settings_applied"] = applied
+
+    listed = (await async_client.get("/admin/agent/runner-hosts", headers=ADMIN)).json()
+
+    assert listed["hosts"][0]["untrusted_without_disk_quota"] is warned
+
+
 async def test_a_heartbeat_delivers_archive_policy_and_tracks_exact_broker_revision(client):
     async_client, store = client
     credential = await _enroll(async_client, store)
@@ -1322,9 +1348,47 @@ async def test_a_host_credential_names_the_claiming_machine(claim_client):
                 "sandbox_archive_settings_applied_revision": None,
                 "host_kernel": "host",
                 "guest_kernel": "guest",
+                # Absent from the request: a runner from before the report.
+                "sandbox_disk_limit_mib": None,
             },
         }
     ]
+
+
+@pytest.mark.parametrize(
+    ("disk_limit_mib", "profile", "thread_sandbox", "warned"),
+    [
+        (0, "untrusted-kata-v1", None, True),
+        (20480, "untrusted-kata-v1", None, False),
+        # A runner from before the report attests nothing.
+        (None, "untrusted-kata-v1", None, False),
+        (0, "trusted-v1", None, False),
+        # An existing group keeps the quota it was created with.
+        (0, "untrusted-kata-v1", {"sandbox_id": "asbx_existing"}, False),
+    ],
+)
+def test_a_claim_warns_about_a_new_untrusted_group_without_a_disk_quota(
+    caplog, disk_limit_mib, profile, thread_sandbox, warned
+):
+    """A warning only: the claim itself is never changed by the quota."""
+    from cloud_agent.api.worker import _warn_on_unbounded_untrusted_group
+    from cloud_agent.schemas import WorkerClaimAttestation
+
+    claim = {"id": "ajob_1", "execution_profile": profile, "thread_sandbox": thread_sandbox}
+    attestation = WorkerClaimAttestation(sandbox_disk_limit_mib=disk_limit_mib)
+
+    with caplog.at_level(logging.WARNING):
+        _warn_on_unbounded_untrusted_group(claim, attestation, host="runner-a")
+
+    events = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "agent_untrusted_sandbox_without_disk_quota"
+    ]
+    assert len(events) == (1 if warned else 0)
+    if warned:
+        assert events[0].host == "runner-a"  # type: ignore[attr-defined]
+        assert events[0].job_id == "ajob_1"  # type: ignore[attr-defined]
 
 
 async def test_request_body_host_identity_is_rejected(claim_client):

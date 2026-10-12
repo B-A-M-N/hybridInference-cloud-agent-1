@@ -6024,6 +6024,12 @@
             "description": "Pool lifecycle state: enrolling, online, draining, disabled or offline. Only an online host takes new claims.",
             "title": "Status",
             "type": "string"
+          },
+          "untrusted_without_disk_quota": {
+            "default": false,
+            "description": "True when this host can be given untrusted (Kata) work and reports applying no container disk quota (sandbox_disk_mib 0), so a new untrusted sandbox's writable layer is unbounded on a disk every other sandbox on the host shares. A recommendation only: nothing is refused or rescheduled. False when the host has not reported the setting.",
+            "title": "Untrusted Without Disk Quota",
+            "type": "boolean"
           }
         },
         "required": [
@@ -15591,6 +15597,19 @@
               }
             ],
             "title": "Sandbox Archive Settings Applied Revision"
+          },
+          "sandbox_disk_limit_mib": {
+            "anyOf": [
+              {
+                "maximum": 16777216.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sandbox Disk Limit Mib"
           },
           "sandbox_image_digest": {
             "anyOf": [

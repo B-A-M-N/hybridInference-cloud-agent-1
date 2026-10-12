@@ -1598,6 +1598,21 @@ requires `overlay2` on XFS mounted with project quotas (`pquota` or
 keep their original limits through follow-ups, restarts, snapshots and Fork.
 See `ENVIRONMENT.md` for bootstrap variables and storage requirements.
 
+**Recommended for servers that run untrusted work.** An `untrusted-kata-v1`
+sandbox's writable layer holds its workspace and every installed file, survives
+`docker stop`, and shares one disk with every other sandbox on the server, so
+without a disk limit one tenant can fill that disk for all of them. Set
+**Container disk** above 0 on each Kata server once its Docker data root is on
+XFS with project quotas. This is a recommendation, not a requirement: scheduling
+and admission do not change, and a server left at 0 keeps taking untrusted
+work. Each claim reports the limit a new group would get (the claim
+attestation's `sandbox_disk_limit_mib`). The control plane logs
+`agent_untrusted_sandbox_without_disk_quota` when it hands such a server a new
+untrusted group, the runner logs the same event as it starts that group, and
+the Servers page shows **No container disk quota** under that server's
+Storage. Existing groups keep the limit they were created with and are not
+flagged.
+
 #### Sandbox archives
 
 This policy captures automatic initial and final lifecycle archives. The

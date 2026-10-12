@@ -345,6 +345,11 @@ read-only image and memory-backed temporary files. This requires Docker
 or `prjquota`). Docker refuses container creation when the storage backend does
 not support the requested quota. Set the disk value to 0 to create groups with
 no disk quota; resetting an override inherits the global value or default.
+A positive disk limit is recommended on every server that runs the untrusted
+profile (`untrusted-kata-v1`), whose sandboxes otherwise share one unbounded
+disk. It is not required: a server at 0 still takes untrusted work, and the
+control plane and runner log a warning and the Servers page shows **No
+container disk quota** for it.
 The runner's existing storage attestation continues to measure the host
 filesystem rather than each sandbox's quota.
 
