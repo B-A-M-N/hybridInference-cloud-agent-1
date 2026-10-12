@@ -218,6 +218,17 @@ async def test_wrong_token_is_refused(client):
     assert response.status_code == 401
 
 
+async def test_a_non_ascii_token_is_refused_not_a_server_error(client, monkeypatch):
+    """Both comparisons take bytes, so a latin-1 header value is a plain 401."""
+    monkeypatch.setenv("ADMIN_TOKEN", _ADMIN_TOKEN)
+    response = await client.post(
+        "/v1/agent/service/oncall/jobs",
+        json=_create_body(),
+        headers={"Authorization": b"Bearer oncall-dispatch-secret-\xe9"},
+    )
+    assert response.status_code == 401
+
+
 async def test_unset_dispatch_token_opens_nothing(client, monkeypatch):
     """An unset token never matches, even an empty presented one."""
     monkeypatch.delenv("AGENT_ONCALL_DISPATCH_TOKEN")

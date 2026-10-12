@@ -135,7 +135,8 @@ async def verify_oncall_dispatch(
     presented = (
         authorization[7:].strip() if authorization and authorization.startswith("Bearer ") else ""
     )
-    if configured and presented and secrets.compare_digest(presented, configured):
+    # Compared as bytes, as the admin token is: a non-ASCII header is a refusal.
+    if configured and presented and secrets.compare_digest(presented.encode(), configured.encode()):
         return "oncall-dispatch"
     return await verify_admin_access(request, authorization, gateway)
 

@@ -46,9 +46,18 @@ class Setting:
     secret: bool = False
     url: bool = False
     minimum_bytes: int = 0
+    #: The floor arrived after deployments had already saved this value. A
+    #: shorter saved or imported value still loads, and startup warns about
+    #: it: refusing it would stop the control plane before the settings page
+    #: that replaces it could open. Every new value is held to the floor.
+    minimum_bytes_new_values_only: bool = False
 
-    def validate(self, value: Any) -> SettingValue:
-        """Return a checked value, raising a message that contains no supplied data."""
+    def validate(self, value: Any, *, saved: bool = False) -> SettingValue:
+        """Return a checked value, raising a message that contains no supplied data.
+
+        ``saved`` marks a value already stored or imported from the
+        environment rather than one an administrator is submitting now.
+        """
         valid = True
         if self.kind == "boolean":
             valid = isinstance(value, bool)
@@ -70,7 +79,12 @@ class Setting:
             valid = isinstance(value, str) and "\x00" not in value
             if valid:
                 valid = len(value) <= (131072 if self.secret else 4096)
-            if valid and value and self.minimum_bytes:
+            if (
+                valid
+                and value
+                and self.minimum_bytes
+                and not (saved and self.minimum_bytes_new_values_only)
+            ):
                 valid = len(value.encode()) >= self.minimum_bytes
             if valid and self.key == "gateway_issuer" and value:
                 valid = value == value.strip() and not any(ord(char) < 32 for char in value)
@@ -184,6 +198,12 @@ def _numeric(
         description=description,
     )
 
+
+#: RFC 7518 §3.2's floor for an HS256 key, which the session key has always
+#: been held to. Below it a signing key is brute-forceable offline from any one
+#: value it signed, and every sandbox holds a worker token the control signing
+#: key signed; a bearer secret that short is guessable outright.
+MINIMUM_CREDENTIAL_BYTES = 32
 
 SETTINGS: tuple[Setting, ...] = (
     Setting(
@@ -857,6 +877,8 @@ MIGRATED_SETTINGS: tuple[Setting, ...] = (
         "",
         env="AGENT_CONTROL_TOKEN_SECRET",
         secret=True,
+        minimum_bytes=MINIMUM_CREDENTIAL_BYTES,
+        minimum_bytes_new_values_only=True,
         description="Use a random key of at least 32 bytes. Replacing it invalidates existing host and worker credentials; re-enroll hosts before resuming work.",
     ),
     Setting(
@@ -1017,7 +1039,7 @@ def _decode(encoded: Mapping[str, Any]) -> dict[str, SettingValue]:
             value = _cipher(setting.key).decrypt(value["ciphertext"])
         elif setting.secret and value:
             raise ValueError(f"Unencrypted stored secret for {setting.label}")
-        values[setting.key] = setting.validate(value)
+        values[setting.key] = setting.validate(value, saved=True)
     _validate_relations(values)
     return values
 
@@ -1100,7 +1122,7 @@ def initial_settings(*, keys: set[str] | None = None) -> dict[str, Any]:
                 elif setting.key == "log_format":
                     normalized = raw.strip().lower()
                     value = normalized if normalized in {"text", "json"} else "text"
-                value = setting.validate(value)
+                value = setting.validate(value, saved=True)
             except (ValueError, OverflowError):
                 raise ValueError(f"Invalid initial configuration for {setting.label}") from None
         values[setting.key] = value
@@ -1307,6 +1329,25 @@ def settings_environment() -> dict[str, str]:
     return result
 
 
+def weak_credentials() -> list[str]:
+    """Name each configured credential shorter than :data:`MINIMUM_CREDENTIAL_BYTES`.
+
+    Names only; no value leaves this function. The control signing key is read
+    from the adopted snapshot, where a value saved before its floor existed may
+    still be short. ``ADMIN_TOKEN`` is read from the process environment, the
+    only place it lives: it is not refused, because a deployment's recovery
+    door closing on upgrade would be a silent lock-out, but it is reported.
+    """
+    weak = []
+    control = text_setting("control_signing_secret")
+    if control and len(control.encode()) < MINIMUM_CREDENTIAL_BYTES:
+        weak.append("AGENT_CONTROL_TOKEN_SECRET")
+    admin = (os.environ.get("ADMIN_TOKEN") or "").strip()
+    if admin and len(admin.encode()) < MINIMUM_CREDENTIAL_BYTES:
+        weak.append("ADMIN_TOKEN")
+    return weak
+
+
 async def initialize_settings(repository: SettingsRepository, *, seed: bool = True) -> None:
     """Seed once, then adopt the database rather than reimporting the environment."""
     revision, encoded = await repository.read_settings()
@@ -1329,6 +1370,16 @@ async def initialize_settings(repository: SettingsRepository, *, seed: bool = Tr
                     "The main control plane must initialize admin settings before the relay starts"
                 )
     apply_settings(revision, encoded)
+    from cloud_agent.logging_utils import get_logger
+
+    for name in weak_credentials():
+        get_logger(__name__).warning(
+            "agent_weak_credential %s is shorter than %d bytes; "
+            "replace it with a value from `openssl rand -base64 32`",
+            name,
+            MINIMUM_CREDENTIAL_BYTES,
+            extra={"event": "agent_weak_credential", "credential": name},
+        )
 
 
 async def synchronize_settings(repository: SettingsRepository) -> None:

@@ -234,7 +234,7 @@ def test_complete_required_setup_and_unused_optional_features_do_not_prompt():
                 "gateway_authorize_url": "https://gateway.example/authorize",
                 "session_redirect_uri": "https://agents.example/callback",
                 "web_base_url": "https://agents.example",
-                "control_signing_secret": "test-control-key",
+                "control_signing_secret": "test-control-key-longer-than-thirty-two-bytes",
                 "workspace_broker_token": "test-broker-key",
                 "source_control_encryption_key": "test-user-credential-key",
             }
@@ -295,3 +295,48 @@ def test_saved_grant_prefix_can_be_loaded_by_a_gateway_client(prefix):
     settings.apply_settings(1, settings.encode_changes({"gateway_grant_base_path": prefix}))
     client = GrantClient("https://gateway.example", "test-credential")
     assert client._base_path == prefix.rstrip("/")
+
+
+def test_a_new_control_signing_key_must_be_at_least_32_bytes():
+    """Every sandbox holds a worker token this key signed: a short one is guessable."""
+    definition = settings.SETTINGS_BY_KEY["control_signing_secret"].definition()
+    assert definition["minimum_bytes"] == settings.MINIMUM_CREDENTIAL_BYTES == 32
+    with pytest.raises(ValueError, match="Invalid value for") as cause:
+        settings.encode_changes({"control_signing_secret": "short-host-signing-key"})
+    assert "short-host-signing-key" not in str(cause.value)
+    assert settings.encode_changes({"control_signing_secret": "x" * 32})
+    # Clearing it is still a supported answer: hosts then cannot enroll at all.
+    assert settings.encode_changes({"control_signing_secret": None}) == {
+        "control_signing_secret": ""
+    }
+
+
+async def test_a_short_control_signing_key_saved_before_the_floor_still_loads_and_warns(
+    monkeypatch, caplog
+):
+    """An upgrade must not lock a deployment out of the page that would replace it."""
+    monkeypatch.setenv("AGENT_CONTROL_TOKEN_SECRET", "legacy-host-signing-key")
+    monkeypatch.setenv("ADMIN_TOKEN", "legacy-admin-token")
+    repository = Repository()
+    with caplog.at_level("WARNING", logger="cloud_agent.settings"):
+        await settings.initialize_settings(repository)
+    assert settings.setting_env("AGENT_CONTROL_TOKEN_SECRET") == "legacy-host-signing-key"
+    # The saved value is decoded again on every synchronization.
+    settings.apply_settings(repository.revision + 1, repository.values)
+    warned = {
+        getattr(record, "credential", None)
+        for record in caplog.records
+        if getattr(record, "event", None) == "agent_weak_credential"
+    }
+    assert warned == {"AGENT_CONTROL_TOKEN_SECRET", "ADMIN_TOKEN"}
+    assert "legacy-host-signing-key" not in caplog.text
+    assert "legacy-admin-token" not in caplog.text
+
+
+async def test_credentials_at_the_floor_are_not_reported(monkeypatch, caplog):
+    monkeypatch.setenv("AGENT_CONTROL_TOKEN_SECRET", "c" * 32)
+    monkeypatch.setenv("ADMIN_TOKEN", "a" * 32)
+    with caplog.at_level("WARNING", logger="cloud_agent.settings"):
+        await settings.initialize_settings(Repository())
+    assert settings.weak_credentials() == []
+    assert "agent_weak_credential" not in caplog.text

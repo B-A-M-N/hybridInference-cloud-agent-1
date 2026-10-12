@@ -403,7 +403,8 @@ def state_matches(presented: str, expected: str) -> bool:
 
     Constant-time: the comparison is of a secret this service minted, and a
     timing oracle on it would let a caller discover a valid ``state`` a
-    character at a time.
+    character at a time. Bytes rather than text, because ``compare_digest``
+    raises on a non-ASCII ``str`` and the presented value is any query text.
 
     Args:
         presented: The ``state`` the callback arrived with.
@@ -414,4 +415,4 @@ def state_matches(presented: str, expected: str) -> bool:
     """
     if not presented or not expected:
         return False
-    return hmac.compare_digest(presented, expected)
+    return hmac.compare_digest(presented.encode(), expected.encode())
