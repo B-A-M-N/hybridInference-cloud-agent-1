@@ -42,6 +42,8 @@ import type { SelectedSkillApi } from '@/lib/api/skills';
 import { readDraftPlugins, validPluginForRuntime } from '@/lib/pluginConfiguration';
 import { PluginSelectionDialog } from './plugins/PluginSelectionDialog';
 import { UserAvatar } from './UserAvatar';
+import { UserHomeInsights } from './UserHomeInsights';
+import { useUserHomeProfile } from './useUserHomeProfile';
 
 // New-task composer (the /agents index state). Runtime × model are first-class
 // controls — BYOA × BYOM is the product, not an advanced option.
@@ -89,6 +91,7 @@ function readNewTaskDraft(value: string): NewTaskDraft | null {
 function TaskComposerContent({ initialRepo, userId }: { initialRepo?: string; userId?: string }) {
   const router = useRouter();
   const t = useT();
+  const userProfile = useUserHomeProfile(userId);
   const draftStore = useComposerDraft({ userId, threadId: 'new-task' });
   const mounted = useRef(true);
   useEffect(() => {
@@ -588,7 +591,7 @@ function TaskComposerContent({ initialRepo, userId }: { initialRepo?: string; us
   return (
     <section className="ui-enter mx-auto w-full max-w-3xl px-4 pb-10 pt-8 sm:px-8 md:pt-14 lg:pt-16">
       <div className="ui-welcome-enter">
-        <UserAvatar />
+        <UserAvatar view={userProfile.view} />
         <h1
           id={headingId}
           className="text-balance text-center text-[28px] font-semibold leading-tight tracking-[-0.035em] text-foreground sm:text-[34px] lg:text-[36px]"
@@ -859,6 +862,15 @@ function TaskComposerContent({ initialRepo, userId }: { initialRepo?: string; us
       <p id={keyboardHintId} className="mt-4 text-center text-xs leading-relaxed text-muted">
         {t('composer.keyboardHint')}
       </p>
+
+      {userId ? (
+        <UserHomeInsights
+          view={userProfile.view}
+          loading={userProfile.loading}
+          error={userProfile.error}
+          onRetry={userProfile.retry}
+        />
+      ) : null}
 
       {pluginsOpen ? (
         <PluginSelectionDialog

@@ -234,6 +234,42 @@ export const en = {
   'sidebar.dateThisYear': '{month}/{day}',
   'sidebar.dateOtherYear': '{month}/{day}/{year}',
 
+  // ── Homepage profile ────────────────────────────────────────────────────
+  'home.suggestions.title': 'Suggestions for your next request',
+  'home.suggestions.description':
+    'Practical ways to improve your requests, based on your recent activity across projects.',
+  'home.suggestions.loading': 'Loading your suggestions…',
+  'home.suggestions.error': 'Could not load your suggestions. You can still start a task.',
+  'home.suggestions.retry': 'Retry suggestions',
+  'home.memorySettings': 'Manage user memory',
+  'home.memoryPaused':
+    'Automatic user memory is paused. Existing suggestions and your avatar theme are kept until you enable updates or clear memory in settings.',
+  'home.avatar.title': 'How your avatar is generated',
+  'home.avatar.generation':
+    'Your avatar is automatically assembled from illustrated shapes, without a photo or an image-generation model. Its work theme comes from English keywords in up to your 50 most recent eligible requests across projects.',
+  'home.avatar.character': 'Face, hair, skin tone, and glasses',
+  'home.avatar.characterDescription':
+    'Assigned to your account and kept consistent. These features do not represent your real appearance or ability.',
+  'home.avatar.theme': 'Colors and the top-right badge',
+  'home.avatar.themeDescription':
+    'The backdrop, clothing colors, and largest badge reflect your most frequently detected work area.',
+  'home.avatar.badges': 'Left badge and clothing badges',
+  'home.avatar.badgesDescription':
+    'The left badge shows your second work area. Small clothing badges show other recent areas. They describe topics, not skill levels or achievements.',
+  'home.avatar.default': 'Default theme',
+  'home.avatar.defaultDescription':
+    'When no work area is recognized, your account gets a consistent default palette and decorative circles instead of work badges.',
+  'home.avatar.legend': 'Work area colors and badges',
+  'home.avatar.legend.backend': 'Code brackets · Blue · Backend and APIs',
+  'home.avatar.legend.frontend': 'Window · Rose · Frontend and UI',
+  'home.avatar.legend.testing': 'Checkmark · Green · Testing',
+  'home.avatar.legend.debugging': 'Bug · Gold · Reliability and debugging',
+  'home.avatar.legend.security': 'Shield · Violet · Security',
+  'home.avatar.legend.data': 'Database · Teal · Data and storage',
+  'home.avatar.legend.deployment': 'Cloud · Peach · Deployment and infrastructure',
+  'home.avatar.controls':
+    'Turning off automatic user memory pauses theme updates. Clearing user memory resets the work theme while keeping the same base character. You can manage both in user memory settings.',
+
   // ── Settings ────────────────────────────────────────────────────────────
   'settings.title': 'Setting',
   'settings.description': 'Manage your connections, skills, memory, and notifications.',
