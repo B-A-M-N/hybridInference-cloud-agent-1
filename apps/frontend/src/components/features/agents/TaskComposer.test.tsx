@@ -259,7 +259,7 @@ describe('TaskComposer source-control onboarding', () => {
     vi.mocked(getUserMemory).mockResolvedValueOnce(profile);
     const rendered = render(<TaskComposer />);
     const image = await screen.findByRole('img', {
-      name: 'Your automatically generated illustrated avatar',
+      name: 'Your Pokémon companion avatar',
     });
     const heading = screen.getByRole('heading', { name: 'What should the agent do?' });
     expect(image.compareDocumentPosition(heading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();

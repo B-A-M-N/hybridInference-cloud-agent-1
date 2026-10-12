@@ -246,19 +246,19 @@ export const en = {
     'Automatic user memory is paused. Existing suggestions and your avatar theme are kept until you enable updates or clear memory in settings.',
   'home.avatar.title': 'How your avatar is generated',
   'home.avatar.generation':
-    'Your avatar is automatically assembled from illustrated shapes, without a photo or an image-generation model. Its work theme comes from English keywords in up to your 50 most recent eligible requests across projects.',
-  'home.avatar.character': 'Face, hair, skin tone, and glasses',
+    'Your Pokémon avatar is assembled from layered illustrated shapes, without a photo or an image-generation model. Its habitat and work badges come from English keywords in up to your 50 most recent eligible requests across projects.',
+  'home.avatar.character': 'Your Pokémon companion',
   'home.avatar.characterDescription':
-    'Assigned to your account and kept consistent. These features do not represent your real appearance or ability.',
-  'home.avatar.theme': 'Colors and the top-right badge',
+    'Your account gets Pikachu, Bulbasaur, Charmander, Squirtle, Eevee, Gengar, or Jigglypuff with a consistent pose and expression. Silhouette, ears, tail, and face are layered together; familiar Pokémon colors stay the same.',
+  'home.avatar.theme': 'Habitat palette',
   'home.avatar.themeDescription':
-    'The backdrop, clothing colors, and largest badge reflect your most frequently detected work area.',
-  'home.avatar.badges': 'Left badge and clothing badges',
+    'The backdrop, halo, and platform take their colors from your most frequently detected work area, creating a little habitat around your companion.',
+  'home.avatar.badges': 'Work orbit',
   'home.avatar.badgesDescription':
-    'The left badge shows your second work area. Small clothing badges show other recent areas. They describe topics, not skill levels or achievements.',
-  'home.avatar.default': 'Default theme',
+    'The largest badge at the top right shows your leading work area; the left badge shows the second. Smaller badges below show the rest of your recent mix. They describe topics, not skill levels or achievements.',
+  'home.avatar.default': 'Default habitat',
   'home.avatar.defaultDescription':
-    'When no work area is recognized, your account gets a consistent default palette and decorative circles instead of work badges.',
+    'When no work area is recognized, your companion keeps an account-specific default habitat with decorative details instead of work badges.',
   'home.avatar.legend': 'Work area colors and badges',
   'home.avatar.legend.backend': 'Code brackets · Blue · Backend and APIs',
   'home.avatar.legend.frontend': 'Window · Rose · Frontend and UI',
@@ -268,7 +268,7 @@ export const en = {
   'home.avatar.legend.data': 'Database · Teal · Data and storage',
   'home.avatar.legend.deployment': 'Cloud · Peach · Deployment and infrastructure',
   'home.avatar.controls':
-    'Turning off automatic user memory pauses theme updates. Clearing user memory resets the work theme while keeping the same base character. You can manage both in user memory settings.',
+    'Turning off automatic user memory pauses habitat and badge updates. Clearing user memory restores the default habitat. Both keep the same Pokémon, pose, and expression. You can manage both in user memory settings.',
 
   // ── Settings ────────────────────────────────────────────────────────────
   'settings.title': 'Setting',
@@ -550,9 +550,9 @@ export const en = {
   'archive.order': 'Recently archived first',
 
   // ── Composer ────────────────────────────────────────────────────────────
-  'composer.avatarAlt': 'Your automatically generated illustrated avatar',
+  'composer.avatarAlt': 'Your Pokémon companion avatar',
   'composer.avatarDescription':
-    'Your base character stays the same while colors and details reflect your recent work.',
+    'Your Pokémon stays the same while its habitat and orbiting badges reflect your recent work.',
   'composer.heading': 'What should the agent do?',
   'composer.subheading': 'Runs in an isolated sandbox.',
   'composer.subheadingFirstVisit':
