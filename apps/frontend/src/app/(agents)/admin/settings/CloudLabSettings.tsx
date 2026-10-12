@@ -207,6 +207,7 @@ function CloudLabSettingsForm({ onAccessDenied }: { onAccessDenied?: (cause: unk
                   <label className="space-y-2 text-sm">
                     <span className="font-medium">CloudLab project</span>
                     <input
+                      id="cloudlab-setting-project"
                       aria-label="CloudLab project"
                       className={inputClass}
                       maxLength={128}
@@ -220,6 +221,7 @@ function CloudLabSettingsForm({ onAccessDenied }: { onAccessDenied?: (cause: unk
                   <label className="space-y-2 text-sm">
                     <span className="font-medium">Initial duration (hours)</span>
                     <input
+                      id="cloudlab-setting-duration"
                       aria-label="Initial duration (hours)"
                       className={inputClass}
                       type="number"
@@ -258,6 +260,7 @@ function CloudLabSettingsForm({ onAccessDenied }: { onAccessDenied?: (cause: unk
                   <label className="space-y-2 text-sm">
                     <span className="font-medium">Template project</span>
                     <input
+                      id="cloudlab-setting-profile_project"
                       aria-label="Template project"
                       className={inputClass}
                       maxLength={128}
@@ -271,6 +274,7 @@ function CloudLabSettingsForm({ onAccessDenied }: { onAccessDenied?: (cause: unk
                   <label className="space-y-2 text-sm">
                     <span className="font-medium">Template name</span>
                     <input
+                      id="cloudlab-setting-profile_name"
                       aria-label="Template name"
                       className={inputClass}
                       maxLength={128}
@@ -285,6 +289,7 @@ function CloudLabSettingsForm({ onAccessDenied }: { onAccessDenied?: (cause: unk
                 <label className="block max-w-xl space-y-2 text-sm">
                   <span className="font-medium">CloudLab SSH user</span>
                   <input
+                    id="cloudlab-setting-ssh_username"
                     aria-label="CloudLab SSH user"
                     className={inputClass}
                     maxLength={128}
@@ -296,6 +301,7 @@ function CloudLabSettingsForm({ onAccessDenied }: { onAccessDenied?: (cause: unk
                 <label className="block space-y-2 text-sm">
                   <span className="font-medium">SSH public key</span>
                   <textarea
+                    id="cloudlab-setting-ssh_public_key"
                     aria-label="CloudLab SSH public key"
                     className={`${inputClass} font-mono`}
                     rows={3}
