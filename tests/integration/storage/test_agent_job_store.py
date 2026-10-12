@@ -4526,7 +4526,7 @@ async def test_stopped_observation_normalizes_a_reported_restarting_member(
                 }
             ],
         )
-        == "stopped"
+        is None
     )
     durable = await store.sandbox.thread_sandbox(thread_id=job["thread_id"])
     assert durable is not None

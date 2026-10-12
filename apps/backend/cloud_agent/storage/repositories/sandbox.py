@@ -2424,7 +2424,9 @@ class PostgresSandboxRepository:
                 """,
                 sandbox_id,
             )
-            return None if row is None else str(row["state"])
+            # A repeated stopped observation may still repair stale member
+            # state, but it does not ask the host to perform another stop.
+            return None if group["state"] == "stopped" else str(row["state"])
 
     @staticmethod
     async def _record_terminal_observation(
