@@ -334,14 +334,12 @@ export function IntegrationsView({
   const providersByName = new Map(providers.map((provider) => [provider.provider, provider]));
 
   return (
-    <section className="mx-auto w-full max-w-5xl px-4 py-8 sm:px-6 lg:px-10 lg:py-10">
-      <header className="border-b border-border pb-6">
-        <h1 className="text-2xl font-semibold tracking-tight text-foreground sm:text-3xl">
+    <section className="mx-auto w-full max-w-5xl px-4 py-4 sm:px-5 lg:px-6">
+      <header className="border-b border-border pb-3">
+        <h1 className="text-lg font-semibold tracking-tight text-foreground">
           {t('settings.title')}
         </h1>
-        <p className="mt-2 max-w-xl text-sm leading-6 text-muted sm:text-base">
-          {t('settings.description')}
-        </p>
+        <p className="mt-1 max-w-xl text-sm leading-5 text-muted">{t('settings.description')}</p>
       </header>
 
       {notice ? (
@@ -370,11 +368,11 @@ export function IntegrationsView({
 
       <section
         aria-labelledby="source-control-heading"
-        className="ui-card mt-6 rounded-2xl bg-surface px-4 sm:px-6"
+        className="ui-card mt-4 bg-surface px-3 sm:px-4"
       >
         <h2
           id="source-control-heading"
-          className="border-b border-border py-5 text-base font-semibold text-foreground"
+          className="border-b border-border py-3 text-sm font-semibold text-foreground"
         >
           Source Control
         </h2>
@@ -387,7 +385,7 @@ export function IntegrationsView({
             return (
               <div
                 key={provider}
-                className={`flex min-h-24 flex-col justify-center gap-4 py-5 lg:flex-row lg:items-center ${
+                className={`flex flex-col justify-center gap-3 py-3 lg:flex-row lg:items-center ${
                   index > 0 ? 'border-t border-border' : ''
                 }`}
               >
@@ -433,7 +431,7 @@ export function IntegrationsView({
         </div>
       </section>
 
-      <div className="ui-card mt-6 rounded-2xl bg-surface p-4 sm:p-6">
+      <div className="ui-card mt-4 bg-surface p-3 sm:p-4">
         <McpConnectionsSection authorizationResult={mcpAuthorization} />
       </div>
       <SkillsSection />

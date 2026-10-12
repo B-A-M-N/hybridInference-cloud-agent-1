@@ -34,9 +34,9 @@ function AccountAvatar({ userId }: { userId?: string }) {
         src={dataUrl}
         alt={t('composer.avatarAlt')}
         title={t('composer.avatarDescription')}
-        width={64}
-        height={64}
-        className="mx-auto mb-6 h-16 w-16 rounded-2xl border border-border object-cover"
+        width={40}
+        height={40}
+        className="mx-auto mb-3 h-10 w-10 rounded-lg border border-border object-cover"
       />
     );
   }
@@ -44,10 +44,10 @@ function AccountAvatar({ userId }: { userId?: string }) {
   return (
     <div
       aria-hidden="true"
-      className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-2xl border border-border bg-surface-muted text-accent"
+      className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-lg border border-border bg-surface-muted text-accent"
     >
       <svg
-        className="h-6 w-6"
+        className="h-4 w-4"
         fill="none"
         viewBox="0 0 24 24"
         stroke="currentColor"
