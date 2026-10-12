@@ -125,7 +125,10 @@ async def test_proxy_streams_form_body_query_and_csrf_without_agent_credentials(
         f"{ROOT}/query_tool/run?sid=7&query=a%2Bb",
         headers={
             **ADMIN,
-            "Cookie": "cloud_agent_session=agent-secret; pga4_session=pgadmin-session; other=secret",
+            "Cookie": (
+                "cloud_agent_session=agent-secret; __Host-cloud_agent_session=agent-secret; "
+                "pga4_session=pgadmin-session; other=secret"
+            ),
             "X-pgA-CSRFToken": "csrf-proof",
             "X-Forwarded-User": "spoofed-admin",
             "X-Script-Name": "/spoofed",
