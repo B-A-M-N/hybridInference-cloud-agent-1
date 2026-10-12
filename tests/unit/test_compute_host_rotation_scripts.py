@@ -797,3 +797,64 @@ async def test_reenrollment_requires_a_token():
     bootstrap = SshHostBootstrap(transport=AsyncMock(), resolver=AsyncMock())
     with pytest.raises(ProviderError, match="fresh token"):
         await bootstrap.deploy(SOURCE, PROFILE, INTENT, None, reenroll=True)
+
+
+HOSTILE_REASON = "<!channel> rotate now: <https://evil.example|runbook>\nreason=ok"
+
+
+async def test_hostile_remote_reasons_never_become_failure_codes():
+    """A node prints what it likes; only our vocabulary reaches records and alerts."""
+    transport = AsyncMock()
+    bootstrap = SshHostBootstrap(transport=transport, resolver=AsyncMock())
+    transport.run.return_value = json.dumps({"stopped": False, "reason": HOSTILE_REASON})
+    with pytest.raises(ProviderError) as stopped:
+        await bootstrap.stop(SOURCE, PROFILE, INTENT)
+    assert stopped.value.code == "host_stop_failed" and not stopped.value.retryable
+
+    transport.run.return_value = json.dumps({"wiped": False, "reason": HOSTILE_REASON})
+    with pytest.raises(ProviderError) as wiped:
+        await bootstrap.wipe(SOURCE, PROFILE, INTENT)
+    assert wiped.value.code == "wipe_failed"
+
+    transport.run.return_value = None
+    transport.run.side_effect = [
+        "ssh-ed25519 AAAA ca-transfer",
+        json.dumps({"authorized": False, "reason": HOSTILE_REASON}),
+    ]
+    with pytest.raises(ProviderError) as refused:
+        await bootstrap.transfer(SOURCE, TARGET, PROFILE, INTENT, final=False)
+    assert refused.value.code == "transfer_failed"
+
+
+async def test_remote_blocked_reasons_keep_only_our_vocabulary():
+    """The takeover rolls back with the first blocked reason as its alert code."""
+    transport = AsyncMock()
+    bootstrap = SshHostBootstrap(transport=transport, resolver=AsyncMock())
+    transport.run.return_value = json.dumps(
+        {"ready": False, "blocked_reasons": [HOSTILE_REASON, "host_readiness_failed", 7]}
+    )
+    checked = await bootstrap.readiness(SOURCE, PROFILE, INTENT)
+    assert checked.blocked_reasons == ("host_readiness_failed",)
+
+    transport.run.return_value = json.dumps({"ready": False, "blocked_reasons": HOSTILE_REASON})
+    assert (await bootstrap.readiness(SOURCE, PROFILE, INTENT)).blocked_reasons == ()
+
+
+def test_every_reason_the_remote_scripts_print_is_in_the_vocabulary():
+    """A code added to a script but not to the vocabulary would silently vanish."""
+    import re
+
+    from cloud_agent.providers.compute import host_bootstrap
+
+    scripts = "\n".join(
+        value
+        for name, value in vars(host_bootstrap).items()
+        if name.startswith("_") and name.isupper() and isinstance(value, str)
+    )
+    printed = set(
+        re.findall(r"(?:refuse|blocked|run)\('([a-z_]+)'", scripts)
+        + re.findall(r"'reason': (?:None if ok else )?'([a-z_]+)'", scripts)
+        + re.findall(r"'blocked_reasons': (?:\[\] if ready else )?\['([a-z_]+)'\]", scripts)
+    )
+    assert {"deployment_identity_conflict", "host_stop_failed", "transfer_failed"} <= printed
+    assert printed <= host_bootstrap._REMOTE_REASONS
