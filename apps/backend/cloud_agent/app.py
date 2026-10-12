@@ -165,6 +165,7 @@ def create_app() -> FastAPI:
     configure_process_logging()
 
     from cloud_agent.api import (
+        _cross_site,
         admin_audit,
         admin_compute,
         admin_conversations,
@@ -200,6 +201,10 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
         **_api_docs(),
     )
+    # Every browser-facing write carries the session cookie, and SameSite=Lax
+    # admits it from any page on the same site. Machine callers send bearers
+    # and pass untouched; see the module for the exact rule.
+    app.add_middleware(_cross_site.CrossSiteWriteGuard)
     app.include_router(routes.router)
     app.include_router(usage.router)
     # Owner-facing, and never on the relay's own listener: adding a connection
