@@ -26,6 +26,7 @@ from cloud_agent.execution_profiles import (
     RESERVED_EXECUTION_METADATA_KEYS,
     default_execution_profile,
 )
+from cloud_agent.github_app import CommitNotOnBranch
 from cloud_agent.logging_utils import get_logger
 from cloud_agent.mcp.binding_aliases import binding_aliases
 from cloud_agent.mcp.models import ALIAS_PATTERN, ToolPolicy
@@ -397,6 +398,44 @@ async def _resolve_attachment_selection(
         ) from exc
 
 
+async def _require_base_on_branch(
+    app_credentials: Any, *, repo: str, base_sha: str, base_ref: str | None
+) -> None:
+    """Refuse a base commit outside the history of the branch it starts from.
+
+    The branch is ``base_ref`` when that names one, else the repository's
+    default branch (see ``GitHubAppCredentials.require_commit_on_branch``).
+    A refusal is the caller's to fix and says how; any other failure to check
+    answers like an unresolvable ``base_ref`` does.
+    """
+    try:
+        await app_credentials.require_commit_on_branch(repo, base_sha, branch=base_ref)
+    except CommitNotOnBranch as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "type": "invalid_request",
+                    "message": (
+                        f"{exc}. A job can only start from a commit in one of the "
+                        "repository's branches: name the branch as base_ref, alone to "
+                        "start from its tip or with a base_sha it contains."
+                    ),
+                }
+            },
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "type": "invalid_request",
+                    "message": f"could not verify base commit {base_sha[:12]} in {repo}: {exc}",
+                }
+            },
+        ) from exc
+
+
 async def _create_job_as(
     body: AgentJobCreate,
     user: dict[str, Any],
@@ -502,6 +541,17 @@ async def _create_job_as(
                     }
                 },
             ) from exc
+    # The publisher fetches the base by hash and pushes a branch built on it.
+    # GitHub serves any object of the repository's network by hash, a fork's
+    # pull request head included, and a ref resolves to whatever commit it
+    # names — so neither a named commit nor a resolved ref is, by itself, part
+    # of the repository's history. Checked once here: a job's base is fixed at
+    # creation (a host fills only an absent one, from its own checkout), and a
+    # follow-up builds on the branch the platform published.
+    if base_sha is not None and app_credentials is not None:
+        await _require_base_on_branch(
+            app_credentials, repo=body.repo, base_sha=base_sha, base_ref=body.base_ref
+        )
 
     metadata = dict(body.metadata or {})
     # Reserved display fact: caller metadata must not be able to claim the

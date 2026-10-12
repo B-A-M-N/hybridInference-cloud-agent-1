@@ -136,6 +136,11 @@ class _FakeAppCredentials:
     async def resolve_ref(self, repo: str, ref: str) -> str:
         return "a" * 40
 
+    async def require_commit_on_branch(
+        self, repo: str, sha: str, *, branch: str | None = None
+    ) -> str:
+        return branch or "main"
+
 
 @pytest.fixture(autouse=True)
 def _oncall_env(monkeypatch):
