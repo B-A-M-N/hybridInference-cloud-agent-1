@@ -1796,9 +1796,9 @@ export function JobDetail({
   const panelOpen = workspaceOpen || inspector !== null;
   const content = (
     <section className="flex h-full min-h-0 flex-col bg-surface">
-      <header className="agent-conversation-header relative z-20 shrink-0 border-b border-border bg-surface px-4">
+      <header className="agent-conversation-header relative z-20 shrink-0 border-b border-border bg-surface px-3 sm:px-4">
         {isArchived ? (
-          <div className="flex items-center gap-2 pt-3 text-xs text-gray-500 dark:text-gray-400">
+          <div className="flex items-center gap-2 pt-2 text-xs text-gray-500 dark:text-gray-400">
             <Link
               href="/archived"
               className="hover:text-crimson hover:underline dark:hover:text-crimson-light"
@@ -1809,32 +1809,18 @@ export function JobDetail({
             <span>{t('sessionArchive.badge')}</span>
           </div>
         ) : null}
-        <div className="agent-conversation-toolbar flex flex-col gap-1.5 py-2">
-          <div className="agent-conversation-context flex min-w-0 items-center gap-2">
-            <div className="min-w-0 flex-1">
+        <div className="agent-conversation-toolbar flex flex-col">
+          <div className="agent-conversation-context flex min-w-0 items-center gap-2 py-1.5">
+            <div className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-2">
               <h1
                 title={title}
-                className="truncate text-base font-semibold tracking-[-0.01em] text-foreground"
+                className="max-w-full truncate text-sm font-semibold tracking-tight text-foreground"
               >
                 {title}
               </h1>
-              <div className="mt-0.5 flex items-center gap-1.5 text-xs text-muted">
-                <svg
-                  aria-hidden="true"
-                  className="h-3.5 w-3.5 shrink-0"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                  strokeWidth={2}
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"
-                  />
-                </svg>
-                <span className="truncate">{job.repo}</span>
-              </div>
+              <span className="min-w-0 truncate text-xs text-muted" title={job.repo}>
+                {job.repo}
+              </span>
             </div>
             <ThreadActions
               key={job.threadId ?? job.id}
@@ -1845,10 +1831,10 @@ export function JobDetail({
               onRename={setTitle}
             />
           </div>
-          <div className="agent-conversation-controls flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1.5">
+          <div className="agent-conversation-controls flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 pb-1.5">
             <nav
               aria-label="Run views"
-              className="flex shrink-0 items-center gap-1 rounded-xl bg-surface-muted p-1 text-xs"
+              className="flex shrink-0 items-center gap-0.5 rounded-md bg-surface-muted p-0.5 text-xs"
             >
               {(['chat', 'trajectory'] as const).map((view) => (
                 <button
@@ -1856,7 +1842,7 @@ export function JobDetail({
                   type="button"
                   onClick={() => setTab(view)}
                   aria-current={tab === view ? 'page' : undefined}
-                  className={`ui-focus-ring min-h-9 rounded-lg px-3 py-1.5 capitalize transition-colors [@media(pointer:coarse)]:min-h-11 ${
+                  className={`ui-focus-ring min-h-7 rounded-md px-2.5 py-1 capitalize transition-colors [@media(pointer:coarse)]:min-h-11 ${
                     tab === view
                       ? 'bg-surface font-semibold text-foreground shadow-sm ring-1 ring-border'
                       : 'text-muted hover:bg-surface-hover hover:text-foreground'
@@ -1986,10 +1972,10 @@ export function JobDetail({
                 trajectory is a wide table of steps, so it keeps the width the
                 inspector is not holding instead of a reading column. */}
             <div
-              className={`flex w-full flex-1 flex-col pb-3 pt-4 ${
+              className={`flex w-full flex-1 flex-col pb-4 pt-4 ${
                 tab === 'trajectory'
-                  ? 'px-4 sm:px-5'
-                  : `mx-auto max-w-5xl ${showRail ? 'pl-4 pr-10 sm:pl-5' : 'px-4 sm:px-5'}`
+                  ? 'px-4'
+                  : `mx-auto max-w-4xl ${showRail ? 'pl-4 pr-10' : 'px-4'}`
               }`}
             >
               {tab === 'trajectory' ? (
@@ -2419,7 +2405,7 @@ export function JobDetail({
                             : 'Message or run a task, / commands, @ files or sessions'
                         }
                         aria-label="Add a follow-up"
-                        className="block max-h-[30vh] min-h-14 w-full resize-y rounded-t-2xl border-0 bg-transparent px-3 py-2 text-sm leading-5 text-foreground placeholder:text-muted focus:outline-none focus:ring-0"
+                        className="block max-h-[30vh] min-h-12 w-full resize-y rounded-t-xl border-0 bg-transparent px-3 py-2 text-sm leading-6 text-foreground placeholder:text-muted focus:outline-none focus:ring-0"
                       />
                       <AttachmentStrip
                         entries={attachments.entries}
@@ -2604,7 +2590,7 @@ export function JobDetail({
               }}
             >
               <div
-                className={`mx-auto flex w-full max-w-4xl flex-col items-end gap-2 ${showRail ? 'pl-6 pr-12' : 'px-6'}`}
+                className={`mx-auto flex w-full max-w-4xl flex-col items-end gap-2 ${showRail ? 'pl-4 pr-10' : 'px-4'}`}
               >
                 {/* One live region for both answers: where a jump landed, and
                   when it could not land at all. It is always in the DOM, since

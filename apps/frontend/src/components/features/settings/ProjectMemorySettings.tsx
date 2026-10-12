@@ -67,7 +67,7 @@ function ProjectMemorySelector({ userId }: { userId: string | undefined }) {
   return (
     <section
       aria-labelledby="settings-project-memory"
-      className="ui-card mt-6 rounded-2xl bg-surface p-4 sm:p-6"
+      className="ui-card mt-4 bg-surface p-3 sm:p-4"
     >
       <h2 id="settings-project-memory" className="text-base font-semibold text-foreground">
         {t('settings.projectMemory.title')}
