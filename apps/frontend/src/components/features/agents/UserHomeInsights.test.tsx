@@ -123,7 +123,9 @@ describe('homepage user insights', () => {
 
     const summary = screen.getByText('How your avatar is generated');
     const guide = summary.closest('details')!;
-    const generation = within(guide).getByText(/automatically assembled from illustrated shapes/);
+    const generation = within(guide).getByText(
+      /Pokémon avatar is assembled from layered illustrated shapes/,
+    );
     expect(summary.tagName).toBe('SUMMARY');
     expect(guide).not.toHaveAttribute('open');
     expect(generation).not.toBeVisible();
@@ -134,22 +136,29 @@ describe('homepage user insights', () => {
     expect(generation).toHaveTextContent(
       'English keywords in up to your 50 most recent eligible requests across projects.',
     );
-    expect(within(guide).getByText('Face, hair, skin tone, and glasses')).toBeVisible();
-    expect(within(guide).getByText(/Assigned to your account and kept consistent/)).toBeVisible();
-    expect(within(guide).getByText('Colors and the top-right badge')).toBeVisible();
+    expect(within(guide).getByText('Your Pokémon companion')).toBeVisible();
     expect(
-      within(guide).getByText(/largest badge reflect your most frequently detected work area/),
-    ).toBeVisible();
-    expect(within(guide).getByText('Left badge and clothing badges')).toBeVisible();
-    expect(within(guide).getByText(/The left badge shows your second work area/)).toHaveTextContent(
+      within(guide).getByText(
+        /Pikachu, Bulbasaur, Charmander, Squirtle, Eevee, Gengar, or Jigglypuff/,
+      ),
+    ).toHaveTextContent(
+      'Silhouette, ears, tail, and face are layered together; familiar Pokémon colors stay the same.',
+    );
+    expect(within(guide).getByText('Habitat palette')).toBeVisible();
+    expect(within(guide).getByText(/backdrop, halo, and platform take their colors/)).toBeVisible();
+    expect(within(guide).getByText('Work orbit')).toBeVisible();
+    expect(within(guide).getByText(/The largest badge at the top right/)).toHaveTextContent(
       'They describe topics, not skill levels or achievements.',
     );
-    expect(
-      within(guide).getByText(/consistent default palette and decorative circles/),
-    ).toBeVisible();
-    expect(within(guide).getByText(/Clearing user memory resets the work theme/)).toHaveTextContent(
-      'keeping the same base character',
+    expect(within(guide).getByText(/The largest badge at the top right/)).toHaveTextContent(
+      'the left badge shows the second. Smaller badges below show the rest of your recent mix.',
     );
+    expect(
+      within(guide).getByText(/account-specific default habitat with decorative details/),
+    ).toBeVisible();
+    expect(
+      within(guide).getByText(/Clearing user memory restores the default habitat/),
+    ).toHaveTextContent('Both keep the same Pokémon, pose, and expression.');
 
     const legend = within(guide).getByRole('list');
     expect(
@@ -188,10 +197,16 @@ describe('homepage user insights', () => {
     const guide = summary.closest('details')!;
     expect(guide).toHaveAttribute('open');
     expect(within(guide).getByText(/最近最多 50 条符合条件的请求进行英文关键词匹配/)).toBeVisible();
-    expect(within(guide).getByText('面容、发型、肤色与眼镜')).toBeVisible();
-    expect(within(guide).getByText('配色与右上角徽章')).toBeVisible();
-    expect(within(guide).getByText('左侧徽章与服装徽章')).toBeVisible();
-    expect(within(guide).getByText('默认主题')).toBeVisible();
+    expect(within(guide).getByText('你的宝可梦伙伴')).toBeVisible();
+    expect(
+      within(guide).getByText(/皮卡丘、妙蛙种子、小火龙、杰尼龟、伊布、耿鬼或胖丁/),
+    ).toHaveTextContent('轮廓、耳朵、尾巴与面容逐层组合，保留宝可梦熟悉的配色。');
+    expect(within(guide).getByText('栖息地配色')).toBeVisible();
+    expect(within(guide).getByText('工作徽章轨道')).toBeVisible();
+    expect(within(guide).getByText('默认栖息地')).toBeVisible();
+    expect(within(guide).getByText(/清除用户记忆会恢复默认栖息地/)).toHaveTextContent(
+      '两项操作都会保留同一只宝可梦及其姿态与表情',
+    );
     expect(within(guide).getByRole('heading', { name: '工作领域的配色与徽章' })).toBeVisible();
     expect(
       within(guide)

@@ -15162,7 +15162,7 @@
         "type": "object"
       },
       "UserAvatar": {
-        "description": "An illustrated portrait that can be displayed directly by an image element.",
+        "description": "An illustrated companion displayed directly by an image element.",
         "properties": {
           "data_url": {
             "title": "Data Url",

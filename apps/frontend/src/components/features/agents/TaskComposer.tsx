@@ -575,7 +575,7 @@ function TaskComposerContent({ initialRepo, userId }: { initialRepo?: string; us
       >
         <div
           aria-hidden="true"
-          className="mx-auto h-16 w-16 rounded-2xl bg-surface-hover motion-safe:animate-pulse"
+          className="mx-auto h-[152px] w-[152px] rounded-[32px] bg-surface-hover motion-safe:animate-pulse"
         />
         <p aria-live="polite" className="mt-6 text-center text-sm text-muted">
           {t('common.loading')}
