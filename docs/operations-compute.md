@@ -58,6 +58,33 @@ CloudLab experiments can be observed, but automatic deployment refuses them
 rather than selecting one node. Failed or unsupported installation leaves the
 resource visible and does not destroy it.
 
+### Preferred CloudLab node types
+
+New CloudLab allocations try the following default list from top to bottom.
+These general-purpose families were introduced in 2021 or later, have at least
+16 physical cores and 128 GiB RAM, and each has more than 20 total nodes.
+Hardware and totals were checked against the [CloudLab hardware catalog](https://docs.cloudlab.us/hardware.html)
+and [public inventory](https://www.cloudlab.us/portal-hardware.php) on October 12, 2026.
+
+| Preference | Type | Introduced | Total nodes | Physical cores | RAM (GiB) |
+|---|---|---|---|---|---|
+| 1 | `r6615` | 2025 | 80 | 32 | 192 |
+| 2 | `c6620` | 2025 | 132 | 28 | 128 |
+| 3 | `r650` | 2022 | 32 | 72 | 256 |
+| 4 | `r6525` | 2022 | 32 | 64 | 256 |
+| 5 | `c6525-100g` | 2021 | 36 | 24 | 128 |
+| 6 | `c6525-25g` | 2021 | 144 | 16 | 128 |
+
+Change the ordered list in **Admin → Settings → CloudLab**, or override it for
+a particular server or autoscaling policy. The list is saved with each new
+allocation. Currently free counts are shown separately and do not change the
+preference order. A confirmed capacity rejection advances to the next type;
+an uncertain response pauses acquisition for review. If all types lack
+capacity, the operation waits and retries from the top. An explicit nonempty
+`phystype` profile parameter selects only that type; clear it to resume ordered
+selection. Profiles with a different hardware parameter can use
+`node_type_binding`; an empty list uses the profile's own choice.
+
 ### Sandbox storage path
 
 When adding or creating a server, enter **Sandbox storage path**, for example

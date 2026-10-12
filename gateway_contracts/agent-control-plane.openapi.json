@@ -8247,6 +8247,21 @@
             "title": "Duration",
             "type": "integer"
           },
+          "node_type_binding": {
+            "default": "phystype",
+            "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$",
+            "title": "Node Type Binding",
+            "type": "string"
+          },
+          "node_types": {
+            "items": {
+              "pattern": "^[A-Za-z0-9_-]{1,32}$",
+              "type": "string"
+            },
+            "maxItems": 20,
+            "title": "Node Types",
+            "type": "array"
+          },
           "profile_name": {
             "default": "",
             "maxLength": 128,
@@ -18247,7 +18262,7 @@
     },
     "/admin/agent/compute-availability/cloudlab": {
       "get": {
-        "description": "List fresh, plentiful CloudLab node types from the public inventory.",
+        "description": "List newer CloudLab node types with more than 20 total nodes, in order.",
         "operationId": "cloudlab_preferred_nodes_admin_agent_compute_availability_cloudlab_get",
         "parameters": [
           {

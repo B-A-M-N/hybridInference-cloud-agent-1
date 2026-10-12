@@ -965,7 +965,7 @@ class ComputeCommands:
                 if field.get("deployment_only") and not deploy:
                     continue
                 value = defaults.get(key)
-                if key not in effective and value not in {"", None}:
+                if key not in effective and value is not None and value != "":
                     effective[key] = value
         config = entry.configuration(effective, connection_id, ssh_connection_id)
         return entry, entry.provider.validate_config(mode, config)

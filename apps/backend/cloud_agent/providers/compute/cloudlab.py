@@ -7,14 +7,15 @@ must supply its verified HTTPS endpoint; credentials never follow redirects.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 from urllib.parse import urlencode, urlsplit
 from uuid import UUID
 from xml.etree import ElementTree
 
 import httpx
-from pydantic import Field, ValidationError, field_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
 
 from cloud_agent.domain.compute import normalize_user_public_key
 from cloud_agent.ports.external.compute_provider import (
@@ -52,6 +53,13 @@ class CloudLabConfig(ComputeValue):
     group: str | None = None
     duration: int = Field(default=4, ge=1, le=168)
     bindings: dict[str, Any] = Field(default_factory=dict)
+    # Empty preserves the profile's hardware choice for existing allocations.
+    node_types: list[
+        Annotated[str, Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9_-]{1,32}$")]
+    ] = Field(default_factory=list, max_length=20)
+    node_type_binding: str = Field(
+        default="phystype", min_length=1, max_length=64, pattern=r"^[A-Za-z][A-Za-z0-9_]{0,63}$"
+    )
     ssh_username: str | None = Field(default=None, pattern=r"^[a-zA-Z_][a-zA-Z0-9_.-]*$")
     # Extra public key CloudLab installs for this experiment's SSH user.
     ssh_public_key: str | None = Field(default=None, max_length=8192)
@@ -62,6 +70,13 @@ class CloudLabConfig(ComputeValue):
     # with a reserved reference for explicitly unchecked CloudLab SSH.
     # "registration" pins the key supplied by the node's first-boot script.
     host_key_source: Literal["known_hosts", "registration"] = "known_hosts"
+
+    @model_validator(mode="after")
+    def validate_node_types(self) -> CloudLabConfig:
+        """Reject ambiguous preference orders before any allocation request."""
+        if len(self.node_types) != len(set(self.node_types)):
+            raise ValueError("CloudLab preferred node types must be distinct")
+        return self
 
     @field_validator("ssh_public_key")
     @classmethod
@@ -111,6 +126,19 @@ def _wire_bindings(bindings: dict[str, Any]) -> dict[str, Any]:
         key: ("True" if value else "False") if isinstance(value, bool) else value
         for key, value in bindings.items()
     }
+
+
+def _capacity_rejection(diagnostic: str) -> bool:
+    """Recognize only explicit node/resource shortages in a completed rejection."""
+    return bool(
+        re.search(
+            r"\b(?:insufficient|not enough)\s+"
+            r"(?:(?:available|free|physical|matching)\s+)*(?:nodes?|resources?)\b"
+            r"|\b(?:node|resource) capacity (?:is )?(?:unavailable|exhausted|insufficient)\b",
+            diagnostic,
+            re.IGNORECASE,
+        )
+    )
 
 
 class CloudLabProvider(ComputeProvider):
@@ -258,8 +286,13 @@ class CloudLabProvider(ComputeProvider):
         if status == 404:
             raise ProviderError("not_found", "CloudLab experiment was not found")
         if status == 429:
+            capacity = _capacity_rejection(_error_text(response))
             raise ProviderError(
-                "capacity_unavailable", "CloudLab capacity or request limit reached", retryable=True
+                "capacity_unavailable" if capacity else "rate_limited",
+                "CloudLab has no matching node capacity"
+                if capacity
+                else "CloudLab request limit reached",
+                retryable=True,
             )
         if status >= 500:
             # A finished HTTP 500 on create is not a lost request: the portal
@@ -382,37 +415,69 @@ class CloudLabProvider(ComputeProvider):
         if config.ssh_public_key:
             payload["sshpubkey"] = config.ssh_public_key
         await self._require_profile(config)
-        try:
-            response = await self._request(
-                "POST", "/experiments/", config.credential_ref, payload=payload
-            )
-            data = self._json(response)
-            external_id = str(UUID(str(data["id"])))
-        except ProviderError as exc:
-            if exc.code == "server_error":
-                try:
-                    created = await self._created_experiment(name, config)
-                except ProviderError:
-                    return ProviderReceipt(outcome="unknown")
-                if created is None:
-                    raise ProviderError(
-                        "request_rejected",
-                        "CloudLab did not create the experiment. "
-                        "Check the profile name and its parameters.",
-                    ) from None
-                external_id = created
-            elif exc.code in {"result_unknown", "invalid_response"}:
-                return ProviderReceipt(outcome="unknown")
-            else:
-                raise
-        except (KeyError, ValueError):
-            return ProviderReceipt(outcome="unknown")
-        ref = ResourceRef(
-            external_id=external_id, config={**validated, "name": name, "external_id": external_id}
+        explicit_type = config.bindings.get(config.node_type_binding)
+        pinned = explicit_type is not None and (
+            not isinstance(explicit_type, str) or bool(explicit_type.strip())
         )
-        # Save the immutable resource ID immediately, even if its subsequent
-        # status request fails. Its presence makes crash recovery unambiguous.
-        return ProviderReceipt(outcome="pending", resource=ref)
+        candidates: list[str | None] = list(config.node_types) if not pinned else []
+        if not candidates:
+            candidates = [None]
+        for index, node_type in enumerate(candidates):
+            selected_bindings = dict(config.bindings)
+            if node_type is not None:
+                selected_bindings[config.node_type_binding] = node_type
+                payload["bindings"] = _wire_bindings(
+                    {**bindings, config.node_type_binding: node_type}
+                )
+            try:
+                response = await self._request(
+                    "POST", "/experiments/", config.credential_ref, payload=payload
+                )
+                data = self._json(response)
+                external_id = str(UUID(str(data["id"])))
+            except ProviderError as exc:
+                if exc.code == "server_error":
+                    try:
+                        created = await self._created_experiment(name, config)
+                    except ProviderError:
+                        return ProviderReceipt(outcome="unknown")
+                    if created is None:
+                        if not _capacity_rejection(str(exc)):
+                            raise ProviderError(
+                                "request_rejected",
+                                "CloudLab did not create the experiment. "
+                                "Check the profile name and its parameters.",
+                            ) from None
+                        exc = ProviderError(
+                            "capacity_unavailable",
+                            "CloudLab has no matching node capacity",
+                            retryable=True,
+                        )
+                    else:
+                        external_id = created
+                elif exc.code in {"result_unknown", "invalid_response"}:
+                    return ProviderReceipt(outcome="unknown")
+                if exc.code == "capacity_unavailable":
+                    if index + 1 < len(candidates):
+                        continue
+                    raise exc from None
+                if exc.code != "server_error":
+                    raise
+            except (KeyError, ValueError):
+                return ProviderReceipt(outcome="unknown")
+            ref = ResourceRef(
+                external_id=external_id,
+                config={
+                    **validated,
+                    "bindings": selected_bindings,
+                    "name": name,
+                    "external_id": external_id,
+                },
+            )
+            # Save the immutable resource ID and selected type immediately,
+            # even if its subsequent status request fails.
+            return ProviderReceipt(outcome="pending", resource=ref)
+        raise AssertionError("CloudLab acquisition has no hardware candidates")
 
     async def recover_acquire(self, intent: OperationIntent) -> AcquisitionResolution:
         """Resolve a previous acquisition without blindly creating another resource."""
