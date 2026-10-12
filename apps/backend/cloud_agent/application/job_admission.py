@@ -32,6 +32,7 @@ from cloud_agent.mcp.models import ALIAS_PATTERN, ToolPolicy
 from cloud_agent.mcp.registry import resolve_connection
 from cloud_agent.schemas import (
     BASE_REF_METADATA_KEY,
+    ONCALL_METADATA_KEY,
     PLATFORM_REASONING_EFFORTS,
     RESET_REASONING_EFFORT,
 )
@@ -506,6 +507,10 @@ async def _create_job_as(
     # Reserved display fact: caller metadata must not be able to claim the
     # job was pinned from a different branch than the one the API resolved.
     metadata.pop(BASE_REF_METADATA_KEY, None)
+    # Reserved provenance mark: only the on-call door stamps it, below through
+    # ``reserved_metadata``. An owner's copy would let their job pass for one
+    # the platform dispatched to whatever reads the mark.
+    metadata.pop(ONCALL_METADATA_KEY, None)
     # Execution policy and its evidence are server-owned facts. Opaque
     # metadata must not be able to manufacture a contradictory audit trail.
     for key in RESERVED_EXECUTION_METADATA_KEYS:

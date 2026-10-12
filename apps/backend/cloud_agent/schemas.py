@@ -144,6 +144,14 @@ _HostLabelValue = Annotated[str, Field(max_length=HOST_LABEL_VALUE_MAX_CHARS)]
 # publisher targets the PR at it, so a caller must not be able to forge one.
 BASE_REF_METADATA_KEY = "_agent_base_ref"
 
+#: Reserved metadata mark for jobs the on-call service door created. Stamped by
+#: the platform after caller metadata so a body cannot un-mark itself, and read
+#: by anything that wants to tell an on-call analysis from an owner's thread
+#: (the web UI, spend reports). Reserved in the same sense as the base ref: the
+#: creation path drops a caller-supplied copy, so an owner's job cannot claim
+#: to be one the platform dispatched.
+ONCALL_METADATA_KEY = "oncall"
+
 #: What a follow-up sends to clear an inherited effort. A plain null cannot
 #: mean this: null is what "no override, inherit" already sends, and the two
 #: have to be distinguishable or a thread that once chose an effort could never

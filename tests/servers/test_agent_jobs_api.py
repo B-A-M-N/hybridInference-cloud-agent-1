@@ -6709,6 +6709,25 @@ async def test_reserved_base_ref_metadata_cannot_invent_a_branch(client: AsyncCl
     assert created.json()["metadata"] is None
 
 
+async def test_reserved_oncall_mark_cannot_be_claimed_by_an_owner(
+    client: AsyncClient, store: FakeStorage
+):
+    """Only the on-call door stamps the mark; an owner's copy is dropped."""
+    created = await client.post(
+        "/v1/agent/jobs",
+        json={
+            "repo": "owner/name",
+            "task_prompt": "fix it",
+            "model": "m",
+            "metadata": {"oncall": True, "ticket": "ABC-1"},
+        },
+    )
+
+    assert created.status_code == 201
+    assert created.json()["metadata"] == {"ticket": "ABC-1"}
+    assert store.jobs[created.json()["id"]]["metadata"] == {"ticket": "ABC-1"}
+
+
 async def test_an_unresolvable_branch_is_refused_at_creation(store: FakeStorage, monkeypatch):
     """Better a clear 400 than a job queued against a ref that does not exist."""
     monkeypatch.setenv("AGENT_REPO_ALLOWLIST", "owner/name")
