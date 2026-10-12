@@ -893,7 +893,7 @@ MIGRATED_SETTINGS: tuple[Setting, ...] = (
         "Execution",
         "",
         env="AGENT_BROKER_URL_ALLOWED_HOSTS",
-        description="Comma-separated exact hostnames allowed to receive the workspace broker credential. Empty retains unrestricted host selection.",
+        description="Comma-separated hostnames, or scheme://host:port origins that also pin the scheme and port, allowed to receive the workspace broker credential. Empty retains unrestricted host selection.",
     ),
     Setting(
         "default_execution_profile",

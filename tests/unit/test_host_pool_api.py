@@ -27,11 +27,13 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from tests.support.storage import AllCapabilities
 
+from cloud_agent import broker_routing
 from cloud_agent.api import admin_hosts, hosts
 from cloud_agent.api.deps import get_grant_client, get_storage, verify_admin_access
 from cloud_agent.application import residency
 from cloud_agent.broker_routing import (
     ENV_BROKER_HOSTS,
+    PROBE_FAILED_FOR_HOST,
     BrokerUrlRefused,
     validate_broker_url,
 )
@@ -586,6 +588,51 @@ async def _enroll(client, store, name="runner-a", **body) -> str:
 
 
 # ── Enrollment ─────────────────────────────────────────────────────────
+
+
+async def test_a_failed_broker_probe_tells_the_host_only_that_it_failed(
+    client, monkeypatch, caplog
+):
+    """The host chose the address; what answered there stays in the server log."""
+    async_client, _store = client
+    broker_routing._PROBE_CACHE.clear()
+
+    async def health(self, *, timeout: float = 3) -> None:
+        raise broker_routing.WorkspaceBrokerError(403, "internal-admin-console says hello")
+
+    monkeypatch.setattr(broker_routing.WorkspaceBrokerClient, "health", health)
+    issued = await async_client.post(
+        "/admin/agent/runner-hosts/enroll-token", json={"host": "runner-a"}, headers=ADMIN
+    )
+    with caplog.at_level("WARNING"):
+        response = await async_client.post(
+            "/v1/agent/host/register",
+            json=_registration_body(
+                issued.json()["enroll_token"], "runner-a", broker_url="http://10.0.0.5:8080"
+            ),
+        )
+    try:
+        assert response.status_code == 200, response.text
+        assert response.json()["broker_error"] == PROBE_FAILED_FOR_HOST
+        assert "hello" not in response.text and "10.0.0.5" not in response.text
+        [record] = [r for r in caplog.records if r.getMessage() == "agent_host_broker_unreachable"]
+        assert "hello" in record.broker_error and "10.0.0.5" in record.broker_error
+    finally:
+        broker_routing._PROBE_CACHE.clear()
+        await broker_routing.close_broker_clients()
+
+
+async def test_a_configuration_probe_answer_still_reaches_the_host(client, monkeypatch):
+    async_client, _store = client
+    monkeypatch.delenv("AGENT_WORKSPACE_BROKER_TOKEN")
+    issued = await async_client.post(
+        "/admin/agent/runner-hosts/enroll-token", json={"host": "runner-a"}, headers=ADMIN
+    )
+    response = await async_client.post(
+        "/v1/agent/host/register",
+        json=_registration_body(issued.json()["enroll_token"], "runner-a"),
+    )
+    assert response.json()["broker_error"] == broker_routing.PROBE_NO_CREDENTIAL
 
 
 async def test_enrollment_returns_a_credential_and_starts_the_host_enrolling(client):
@@ -2145,6 +2192,53 @@ def test_an_allowlist_confines_the_pool_to_named_machines(monkeypatch) -> None:
 
     monkeypatch.delenv(ENV_BROKER_HOSTS)
     assert validate_broker_url("http://anything:8081") == "http://anything:8081"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://broker:8092/admin",
+        "http://broker:8092?next=",
+        "http://broker:8092/?",
+        "http://broker:8092#/workspaces",
+        "http://user:secret@broker:8092",
+        "http://other@broker:8092",
+        "http://broker:99999",
+        "http://broker:8092\\@elsewhere",
+        "http://bro ker:8092",
+    ],
+)
+def test_a_broker_url_must_be_a_bare_origin(monkeypatch, url: str) -> None:
+    """Requests append ``/workspaces/...`` to the address; nothing may redirect that."""
+    monkeypatch.delenv(ENV_BROKER_HOSTS, raising=False)
+    with pytest.raises(BrokerUrlRefused):
+        validate_broker_url(url)
+
+
+def test_a_broker_origin_keeps_its_trailing_slash_and_default_port(monkeypatch) -> None:
+    monkeypatch.delenv(ENV_BROKER_HOSTS, raising=False)
+    assert validate_broker_url("http://broker:8092/") == "http://broker:8092/"
+    assert validate_broker_url("https://[2001:db8::1]") == "https://[2001:db8::1]"
+
+
+def test_an_origin_allowlist_entry_pins_the_scheme_and_port(monkeypatch) -> None:
+    """Brokers behind one tunnel address differ only by port."""
+    monkeypatch.setenv(ENV_BROKER_HOSTS, "http://172.30.0.1:19092,https://broker.example")
+    assert validate_broker_url("http://172.30.0.1:19092") == "http://172.30.0.1:19092"
+    assert validate_broker_url("https://broker.example:443/") == "https://broker.example:443/"
+    for refused in (
+        "http://172.30.0.1:19093",
+        "https://172.30.0.1:19092",
+        "http://broker.example",
+        "https://broker.example:8443",
+    ):
+        with pytest.raises(BrokerUrlRefused):
+            validate_broker_url(refused)
+
+    # A bare name still admits that host on any port, as it always did.
+    monkeypatch.setenv(ENV_BROKER_HOSTS, "workspace-broker, http://172.30.0.1:19092")
+    assert validate_broker_url("http://workspace-broker:8092") == "http://workspace-broker:8092"
+    assert validate_broker_url("https://Workspace-Broker:1") == "https://Workspace-Broker:1"
 
 
 # ── removed host-level residency control plane ─────────────────────────
