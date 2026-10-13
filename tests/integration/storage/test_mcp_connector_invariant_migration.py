@@ -19,7 +19,7 @@ pytestmark = pytest.mark.dbtest
 _BEFORE = "0057_admin_sandbox_trajectory"
 _THIS = "0058_mcp_connector_invariant"
 _NEXT = "0059_counter_constraints"
-_HEAD = "0082_team_environments"
+_HEAD = "0083_repository_direct_write"
 _OWNER = "user-owner"
 _OTHER = "user-other"
 _PRESERVED_AUTHORIZED_AT = datetime(2001, 2, 3, 4, 5, 6, tzinfo=timezone.utc)
@@ -45,14 +45,17 @@ def test_mcp_connector_invariant_revision_follows_trajectory_merge() -> None:
     assert (
         script.get_revision("0064_mcp_remembered_approvals").down_revision == "0063_user_profiles"
     )
-    assert script.get_revision("0065_environments").down_revision == "0064_mcp_remembered_approvals"
+    assert script.get_revision("0065_environments").down_revision == (
+        "0064_mcp_remembered_approvals"
+    )
     assert script.get_revision("0066_admin_job_listing_index").down_revision == "0065_environments"
     assert (
         script.get_revision("0067_failed_snapshot_wake").down_revision
         == "0066_admin_job_listing_index"
     )
     assert (
-        script.get_revision("0068_sandbox_checkpoints").down_revision == "0067_failed_snapshot_wake"
+        script.get_revision("0068_sandbox_checkpoints").down_revision
+        == "0067_failed_snapshot_wake"
     )
     assert script.get_revision("0069_agent_memories").down_revision == "0068_sandbox_checkpoints"
     assert script.get_revision("0070_memory_cutover").down_revision == "0069_agent_memories"
@@ -78,7 +81,8 @@ def test_mcp_connector_invariant_revision_follows_trajectory_merge() -> None:
     assert (
         script.get_revision("0081_snapshot_pushed_commit").down_revision == "0080_user_ssh_servers"
     )
-    assert script.get_revision(_HEAD).down_revision == "0081_snapshot_pushed_commit"
+    assert script.get_revision("0082_team_environments").down_revision == "0081_snapshot_pushed_commit"
+    assert script.get_revision(_HEAD).down_revision == "0082_team_environments"
 
 
 async def _local_connection(
