@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
 from cloud_agent.entitlement import REPO_PATTERN
 from cloud_agent.schemas.mcp import (
@@ -49,6 +50,27 @@ class CreateGitHubRepositoryResponse(BaseModel):
     web_url: str = Field(..., pattern=r"^https?://[^/]+/", max_length=2048)
     default_branch: str = Field(..., min_length=1, max_length=1024)
     accessible: bool
+
+
+class RepositoryDirectWriteUpdate(BaseModel):
+    """An explicit repo owner decision, guarded by the revision they read."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: StrictBool
+    expected_revision: StrictInt = Field(..., ge=0)
+
+
+class RepositoryDirectWritePolicyResponse(BaseModel):
+    """Persisted direct-write state without any credential material."""
+
+    github_repository_id: int = Field(..., gt=0)
+    repository: str = Field(..., pattern=REPO_PATTERN, max_length=140)
+    enabled: bool
+    revision: int = Field(..., ge=0)
+    updated_by: str | None = None
+    updated_at: datetime | None = None
+    revocation_pending: int = Field(0, ge=0)
 
 
 class SourceControlAccount(BaseModel):

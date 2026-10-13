@@ -101,6 +101,8 @@ from cloud_agent.schemas.integrations import (
     GitHubConnectRequest,
     OAuthConnectRequest,
     RepoBranchesResponse,
+    RepositoryDirectWritePolicyResponse,
+    RepositoryDirectWriteUpdate,
     SourceControlAccount,
     SourceControlIntegrationsResponse,
     SourceControlProviderResponse,
