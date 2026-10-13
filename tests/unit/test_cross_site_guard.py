@@ -118,6 +118,29 @@ async def test_without_fetch_metadata_the_origin_decides(client, monkeypatch, or
     assert response.status_code == status
 
 
+@pytest.mark.parametrize(
+    ("secure", "origin", "status"),
+    [
+        (None, "http://agents.example.org", 403),
+        (None, "https://agents.example.org:443", 200),
+        (None, "https://agents.example.org:8443", 403),
+        ("false", "http://agents.example.org", 200),
+        ("false", "https://agents.example.org", 200),
+    ],
+)
+async def test_without_fetch_metadata_the_scheme_and_port_count(
+    client, monkeypatch, secure, origin, status
+):
+    """An older browser treats http and https of one host as one site."""
+    monkeypatch.setenv("AGENT_WEB_BASE_URL", "https://web.example.org")
+    if secure is None:
+        monkeypatch.delenv("AGENT_SESSION_COOKIE_SECURE", raising=False)
+    else:
+        monkeypatch.setenv("AGENT_SESSION_COOKIE_SECURE", secure)
+    response = await client.post("/write", headers={**_session(), "Origin": origin})
+    assert response.status_code == status
+
+
 async def test_a_request_with_no_browser_behind_it_passes(client):
     """Neither header: a script, a test client or a CLI holding the cookie."""
     assert (await client.post("/write", headers=_session())).status_code == 200

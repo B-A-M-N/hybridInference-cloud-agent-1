@@ -14,8 +14,8 @@ order Go's ``net/http.CrossOriginProtection`` uses:
   user started themselves. Any other value is refused unless ``Origin`` is one
   this deployment serves its web app or pgAdmin from.
 - Without ``Sec-Fetch-Site`` (an older browser, or plain HTTP away from
-  localhost), ``Origin`` must name the request's own ``Host`` or one of those
-  origins.
+  localhost), ``Origin`` must be one of those origins or the request's own
+  ``Host`` over HTTPS (or over HTTP too where the cookie is not ``Secure``).
 - With neither header the request did not come from a page — browsers send
   ``Origin`` on every cross-origin POST — and passes, as scripts and tests must.
 
@@ -57,6 +57,10 @@ _FIRST_PARTY = frozenset({"same-origin", "none"})
 _TRUSTED_ORIGIN_SETTINGS = ("AGENT_WEB_BASE_URL", "AGENT_PGADMIN_PUBLIC_URL")
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+#: ``api.session.ENV_COOKIE_SECURE``, named here to keep this module free of
+#: the session routes' imports.
+_COOKIE_SECURE_SETTING = "AGENT_SESSION_COOKIE_SECURE"
 
 
 def _origin(url: str) -> str | None:
@@ -106,11 +110,24 @@ def first_party(headers: Headers) -> bool:
         return True
     if site or not origin:
         return False
-    host = headers.get("host", "").strip().lower()
-    try:
-        return bool(host) and urlsplit(origin).netloc.lower() == host
-    except ValueError:
+    host = headers.get("host", "").strip()
+    presented = _origin(origin)
+    if not host or presented is None:
         return False
+    # The whole origin, not just its authority: a browser that sends no
+    # ``Sec-Fetch-Site`` also treats ``http://`` and ``https://`` of one host
+    # as one site, and would attach the HTTPS session to a write from the
+    # plain-HTTP page. The request's own scheme is not trustworthy behind a
+    # TLS-terminating proxy, so a ``Secure`` cookie, which only an HTTPS
+    # deployment holds, is what says the page must be HTTPS.
+    schemes = ("https",) if _session_cookie_is_secure() else ("https", "http")
+    return presented in {_origin(f"{scheme}://{host}") for scheme in schemes}
+
+
+def _session_cookie_is_secure() -> bool:
+    """Whether the session cookie carries ``Secure``, as ``api.session`` sets it."""
+    raw = (setting_env(_COOKIE_SECURE_SETTING) or "").strip().lower()
+    return raw not in ("0", "false", "no")
 
 
 def _carries_session(headers: Headers) -> bool:
