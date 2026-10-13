@@ -1679,6 +1679,29 @@ class SharedChatSessionSupervisor:
         with self._lock:
             return thread_id in self._members
 
+    def admin_deletion_target_absent(
+        self,
+        thread_id: str,
+        *,
+        sandbox_id: str,
+        container_id: str,
+    ) -> bool:
+        """Prove a stale durable sandbox has no corresponding Docker object.
+
+        This is only the idempotent terminal case for an already-fenced admin
+        discard. A known membership, the original container under another
+        name, or any object occupying the group's stable name all mean the
+        target is not absent. Docker/protocol failures propagate and therefore
+        cannot be mistaken for successful deletion.
+        """
+        with self._lock:
+            if thread_id in self._members or sandbox_id in self._groups:
+                return False
+            container_name = ChatSandboxSpec.container_name_for(thread_id, sandbox_id)
+            if self._manager.inspect(container_name) is not None:
+                return False
+            return self._manager.inspect(container_id) is None
+
     def acquire(
         self,
         spec: ChatSandboxSpec,

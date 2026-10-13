@@ -166,8 +166,12 @@ services:
       AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
 ```
 
-Load this override with the normal Compose deployment and keep it private.
-For shared profiles, mount the credentials and configuration files read-only
+Keep the override outside the checkout and set its absolute path as
+`AGENT_CONTROL_PLANE_COMPOSE_OVERRIDE_FILE` in the deployment root's private
+`.env`. The deployer validates that it is a readable regular file and appends
+it after release-owned overlays for every stack operation in both source and
+artifact modes. Leaving the setting empty uses only the reviewed deployment
+files. For shared profiles, mount the credentials and configuration files read-only
 in this service and set `AWS_SHARED_CREDENTIALS_FILE`, `AWS_CONFIG_FILE` and
 `AWS_PROFILE` to their container paths and selected profile. Use the saved
 archive region setting or provision `AWS_DEFAULT_REGION` in the same override.
