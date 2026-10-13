@@ -5,8 +5,7 @@ import { useT } from '@/components/providers';
 import { GettingStartedSettings } from '@/components/features/settings/GettingStartedSettings';
 import { ProfileSettings } from '@/components/features/settings/ProfileSettings';
 import { NotificationSettings } from '@/components/features/settings/NotificationSettings';
-import { UserMemorySettings } from '@/components/features/settings/UserMemorySettings';
-import { ProjectMemorySettings } from '@/components/features/settings/ProjectMemorySettings';
+import { MemorySettings } from '@/components/features/settings/MemorySettings';
 import {
   disconnectAgentIntegration,
   disconnectGitHubAccount,
@@ -442,8 +441,7 @@ export function IntegrationsView({
         <McpConnectionsSection authorizationResult={mcpAuthorization} />
       </div>
       <SkillsSection />
-      <UserMemorySettings onAvatarChange={updateCompanion} />
-      <ProjectMemorySettings />
+      <MemorySettings onAvatarChange={updateCompanion} />
       <NotificationSettings />
       <GettingStartedSettings />
     </section>

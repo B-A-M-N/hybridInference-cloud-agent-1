@@ -91,9 +91,7 @@ export function UserHomeInsights({
           ))}
         </ul>
       ) : (
-        <p className="mt-3 text-sm leading-relaxed text-muted">
-          {t('settings.memory.emptySuggestions')}
-        </p>
+        <p className="mt-3 text-sm leading-relaxed text-muted">{t('home.suggestions.empty')}</p>
       )}
       {view && !view.enabled ? (
         <p className="mt-3 text-xs leading-relaxed text-muted">{t('home.memoryPaused')}</p>
