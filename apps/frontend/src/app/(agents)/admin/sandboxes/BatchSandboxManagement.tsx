@@ -74,7 +74,7 @@ function confirmation(kind: SandboxAction, items: ReviewedSandbox[]): string {
     return `${scope}This makes the selected entries visible in the admin inventory again.`;
   const running = items.some((item) => item.detail?.sandbox.state === 'running');
   const verification = running
-    ? 'For entries recorded as running, the server must verify that the exact container is already stopped and idle. This does not stop a running container. '
+    ? 'For entries recorded as running, the server must verify that the exact container is already stopped or dead, and idle. This does not stop a running container. '
     : '';
   return (
     scope +

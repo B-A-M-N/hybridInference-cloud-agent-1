@@ -28,16 +28,17 @@ class SandboxRepository(Protocol):
         actor_id: str,
         admin_ip: str,
         sandbox_manager_confirmed_stopped: bool = False,
+        confirmed_docker_status: str | None = None,
         discard: bool = False,
     ) -> str:
         """Fence an idle stopped sandbox for deletion.
 
         A durable request closes admission before the host removes Docker. The
         default path exports and verifies an S3 archive first. ``discard``
-        removes the exact stopped container without uploading it. No native
+        removes the exact stopped or dead container without uploading it. No native
         state or ledger row is removed until the host confirms that removal.
         An admin recovery may also repair a stale RUNNING row, but only after
-        the API independently proves the exact host container is stopped and idle.
+        the API independently proves the exact host container is stopped or dead, and idle.
         """
         ...
 

@@ -119,8 +119,8 @@ def _terminal_activity_needs_refresh(detail: AdminSandboxDetail) -> bool:
 
 async def _confirm_force_delete_stopped(
     detail: AdminSandboxDetail, storage: _AdminSandboxesStorage
-) -> None:
-    """Require fresh host proof that the exact retained container is stopped and idle."""
+) -> str:
+    """Require fresh host proof that the exact retained container is stopped or dead, and idle."""
     sandbox = detail.sandbox
     host = await storage.host_pool.get_host(host=sandbox.host)
     try:
@@ -204,10 +204,11 @@ async def _confirm_force_delete_stopped(
             status_code=409,
             detail="The host still reports this sandbox as running. Stop it before deleting it.",
         )
-    if row.get("running") is not False or row.get("docker_status") != "stopped":
+    docker_status = row.get("docker_status")
+    if row.get("running") is not False or docker_status not in {"stopped", "dead"}:
         raise HTTPException(
             status_code=409,
-            detail="The host cannot prove that this container is cleanly stopped.",
+            detail="The host cannot prove that this container is stopped or dead.",
         )
     terminal_count = row.get("terminal_count")
     operation_count = row.get("operation_count")
@@ -229,6 +230,7 @@ async def _confirm_force_delete_stopped(
             status_code=409,
             detail="The host reports active or unknown sandbox work. Wait until it is idle.",
         )
+    return str(docker_status)
 
 
 def get_admin_sandbox_queries(
@@ -474,9 +476,9 @@ async def delete_admin_sandbox(
     archive_available: bool = Depends(admin_sandbox_deletion_available),
     store: _AdminSandboxesStorage | None = Depends(get_storage),
 ) -> AdminSandboxDetail:
-    """Queue deletion, with fail-closed recovery for stale running state.
+    """Queue deletion, with fail-closed recovery for a stale running or dead container.
 
-    The discard query removes the exact stopped container without an S3 upload.
+    The discard query removes the exact stopped or dead container without an S3 upload.
     The default path still requires a configured archive bucket.
     """
     if not archive_available and not discard:
@@ -486,6 +488,7 @@ async def delete_admin_sandbox(
         )
     storage = require_store(store)
     sandbox_manager_confirmed_stopped = False
+    confirmed_docker_status: str | None = None
     if force:
         current = await storage.admin_sandboxes.detail(sandbox_id)
         if current is None:
@@ -502,7 +505,7 @@ async def delete_admin_sandbox(
                 detail="Sandbox activity or container changed. Refresh before deleting it.",
             )
         if sandbox.state == "running":
-            await _confirm_force_delete_stopped(reviewed, storage)
+            confirmed_docker_status = await _confirm_force_delete_stopped(reviewed, storage)
             sandbox_manager_confirmed_stopped = True
         elif sandbox.state != "stopped":
             raise HTTPException(
@@ -517,6 +520,7 @@ async def delete_admin_sandbox(
         actor_id=admin,
         admin_ip=get_client_ip(request),
         sandbox_manager_confirmed_stopped=sandbox_manager_confirmed_stopped,
+        confirmed_docker_status=confirmed_docker_status,
         discard=discard,
     )
     errors = {

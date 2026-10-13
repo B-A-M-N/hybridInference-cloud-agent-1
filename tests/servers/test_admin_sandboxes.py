@@ -1104,6 +1104,7 @@ async def test_reviewed_delete_queues_authenticated_atomic_request(setup, result
         actor_id="admin-token",
         admin_ip="127.0.0.1",
         sandbox_manager_confirmed_stopped=False,
+        confirmed_docker_status=None,
         discard=False,
     )
     if result == "accepted":
@@ -1113,14 +1114,16 @@ async def test_reviewed_delete_queues_authenticated_atomic_request(setup, result
         queries.detail.assert_not_awaited()
 
 
+@pytest.mark.parametrize("docker_status", ["stopped", "dead"])
+@pytest.mark.parametrize("discard", [False, True])
 async def test_force_delete_repairs_only_an_exact_host_confirmed_stopped_container(
-    terminal_probe,
+    terminal_probe, docker_status, discard
 ):
     app, queries, commands, host_pool, sandbox_manager, sandbox_manager_factory = terminal_probe
     sandbox_manager.shared_chat_sandbox_status.return_value.update(
         {
             "running": False,
-            "docker_status": "stopped",
+            "docker_status": docker_status,
             "group_busy": False,
             "terminal_count": 0,
             "operation_count": 0,
@@ -1131,10 +1134,10 @@ async def test_force_delete_repairs_only_an_exact_host_confirmed_stopped_contain
         sandbox_detail(),
         sandbox_detail(state="stopped", deletion_state="pending"),
     ]
-    app.dependency_overrides[admin_sandboxes.admin_sandbox_deletion_available] = lambda: True
+    app.dependency_overrides[admin_sandboxes.admin_sandbox_deletion_available] = lambda: not discard
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post(
-            f"{PREFIX}/asbx_other/delete?force=true",
+            f"{PREFIX}/asbx_other/delete?force=true&discard={str(discard).lower()}",
             headers=ADMIN,
             json={
                 "generation": 1,
@@ -1157,7 +1160,8 @@ async def test_force_delete_repairs_only_an_exact_host_confirmed_stopped_contain
         actor_id="admin-token",
         admin_ip="127.0.0.1",
         sandbox_manager_confirmed_stopped=True,
-        discard=False,
+        confirmed_docker_status=docker_status,
+        discard=discard,
     )
 
 
@@ -1170,7 +1174,9 @@ async def test_force_delete_repairs_only_an_exact_host_confirmed_stopped_contain
         {"generation": 2},
         {"origin_thread_id": "athr_replaced"},
         {"running": True, "docker_status": "running"},
+        {"running": True, "docker_status": "dead"},
         {"docker_status": "created"},
+        {"docker_status": "paused"},
         {"busy": True},
         {"group_busy": True},
         {"terminal_count": 1},
@@ -1180,8 +1186,9 @@ async def test_force_delete_repairs_only_an_exact_host_confirmed_stopped_contain
         {"snapshotting": True},
     ],
 )
+@pytest.mark.parametrize("discard", [False, True])
 async def test_force_delete_rejects_changed_running_or_non_quiescent_host_proof(
-    terminal_probe, changes
+    terminal_probe, changes, discard
 ):
     app, queries, commands, _, sandbox_manager, _ = terminal_probe
     sandbox_manager.shared_chat_sandbox_status.return_value.update(
@@ -1196,10 +1203,10 @@ async def test_force_delete_rejects_changed_running_or_non_quiescent_host_proof(
         | changes
     )
     queries.detail.return_value = sandbox_detail()
-    app.dependency_overrides[admin_sandboxes.admin_sandbox_deletion_available] = lambda: True
+    app.dependency_overrides[admin_sandboxes.admin_sandbox_deletion_available] = lambda: not discard
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post(
-            f"{PREFIX}/asbx_other/delete?force=true",
+            f"{PREFIX}/asbx_other/delete?force=true&discard={str(discard).lower()}",
             headers=ADMIN,
             json={
                 "generation": 1,
@@ -1486,6 +1493,7 @@ async def test_discard_deletion_does_not_require_archive_configuration(setup):
         actor_id="admin-token",
         admin_ip="127.0.0.1",
         sandbox_manager_confirmed_stopped=False,
+        confirmed_docker_status=None,
         discard=True,
     )
 

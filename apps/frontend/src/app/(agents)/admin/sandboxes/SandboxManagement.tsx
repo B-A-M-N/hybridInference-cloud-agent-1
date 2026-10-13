@@ -123,10 +123,10 @@ export function SandboxManagement({
       const confirmation =
         kind === 'discard'
           ? sandbox.state === 'running'
-            ? `Verify the exact retained container shared by ${sessions} is stopped and idle, then delete it without an S3 archive? The server refuses if that exact container is still running or has activity; this action does not stop a running container. Workspace files and native session history on the host will be destroyed and will not be uploaded. Live native resume will no longer be available. Chat history remains.`
+            ? `Verify the exact retained container shared by ${sessions} is stopped or dead, and idle, then delete it without an S3 archive? The server refuses if that exact container is still running or has activity; this action does not stop a running container. Workspace files and native session history on the host will be destroyed and will not be uploaded. Live native resume will no longer be available. Chat history remains.`
             : `Permanently delete the stopped sandbox shared by ${sessions} without uploading it to S3? Workspace files and native session history on the host will be destroyed and cannot be restored. Live native resume will no longer be available. Chat history remains.`
           : sandbox.state === 'running'
-            ? `Verify the exact retained container shared by ${sessions} is stopped and idle, then permanently delete it? ` +
+            ? `Verify the exact retained container shared by ${sessions} is stopped or dead, and idle, then permanently delete it? ` +
               'The server refuses if that exact container is still running or has activity; this action does not stop a running container. ' +
               'Workspace files and native session history are still uploaded to S3 and verified before deletion. Live native resume will no longer be available. Chat history remains.'
             : `Archive to S3 and permanently delete the stopped sandbox shared by ${sessions}? ` +
@@ -378,7 +378,7 @@ export function SandboxManagement({
               <p className="text-xs text-gray-500 dark:text-gray-400">
                 {deleteBlocked ??
                   (forceDelete
-                    ? 'Asks the server to verify that this exact container is already stopped and idle. It will not stop a running container, and S3 archival is still required before deletion.'
+                    ? 'Asks the server to verify that this exact container is already stopped or dead, and idle. It will not stop a running container, and S3 archival is still required before deletion.'
                     : 'Uploads and verifies files and native session history in S3 before deleting the retained container. Live native resume will no longer be available.')}
               </p>
             )}

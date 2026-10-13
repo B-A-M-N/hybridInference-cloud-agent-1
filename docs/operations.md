@@ -518,7 +518,7 @@ The page shows the pending request until a host observation confirms the stop;
 an offline host cannot complete it. New turns wait while the stop is pending.
 This action does not delete the container or reclaim its retained disk space.
 
-**Archive to S3 and delete** removes a cleanly stopped container after its
+**Archive to S3 and delete** removes a stopped or dead, idle container after its
 complete retained filesystem has been uploaded and verified in S3. Configure
 the bucket, region, optional S3 endpoint, and object prefix under **Admin →
 Settings → Application → Sandbox archives**. [S3 storage setup](#sandbox-archive-storage)
@@ -535,7 +535,7 @@ deletion acknowledgements keep admission blocked and retry the same request.
 The sandbox manager stores its deletion receipts on its own persistent volume so an
 acknowledgement can survive a sandbox manager restart.
 
-**Delete without archive** removes the same exact stopped container without
+**Delete without archive** removes the same exact stopped or dead, idle container without
 uploading workspace files or native session history. It does not require an S3
 bucket. The host still refuses a running, busy, or changed container, and the
 control plane marks native resume lost only after the host confirms removal.
@@ -545,7 +545,7 @@ wait for it to finish or fail before choosing this action.
 
 **Verify stopped and force delete** recovers a sandbox still recorded as running
 only when the owning sandbox manager confirms that the exact reviewed container is
-stopped and idle. It does not stop a running container or bypass unavailable
+stopped or dead, and idle. It does not stop a running container or bypass unavailable
 host proof. If verification fails, the error identifies missing host registration,
 an absent or refused advertised URL, a missing or rejected sandbox manager credential,
 a connection failure, a timeout, or unavailable sandbox status. Check the
