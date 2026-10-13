@@ -19,6 +19,7 @@ const profile: UserProfile = {
   image_data_url: null,
   revision: 3,
 };
+const companion = { userId: 'alice', dataUrl: 'data:image/svg+xml,<svg id="companion"></svg>' };
 
 beforeEach(() => {
   auth.user = { id: 'alice' };
@@ -35,12 +36,22 @@ afterEach(() => {
 });
 
 async function openProfile() {
-  const view = render(<ProfileSettings />);
+  const view = render(<ProfileSettings companion={companion} />);
   await screen.findByDisplayValue('Alice');
   return view;
 }
 
 describe('Profile settings', () => {
+  it('shows the same Pokémon companion as the homepage when no photo is saved', async () => {
+    await openProfile();
+    expect(screen.getByRole('img', { name: 'Your Pokémon companion avatar' })).toHaveAttribute(
+      'src',
+      companion.dataUrl,
+    );
+    expect(screen.queryByRole('button', { name: 'Remove image' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
+    expect(saveUserProfile).not.toHaveBeenCalled();
+  });
   it('shows read-only email and persists editable names with the current revision', async () => {
     await openProfile();
     expect(screen.getByText('alice@example.com')).toBeInTheDocument();
@@ -80,7 +91,11 @@ describe('Profile settings', () => {
     });
     await openProfile();
     fireEvent.click(screen.getByRole('button', { name: 'Remove image' }));
-    expect(screen.queryByRole('img')).not.toBeInTheDocument();
+    expect(screen.queryByRole('img', { name: 'Your profile image' })).not.toBeInTheDocument();
+    expect(screen.getByRole('img', { name: 'Your Pokémon companion avatar' })).toHaveAttribute(
+      'src',
+      companion.dataUrl,
+    );
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
     await screen.findByText('Profile saved.');
     expect(saveUserProfile).toHaveBeenCalledWith(
@@ -102,7 +117,11 @@ describe('Profile settings', () => {
     await openProfile();
     fireEvent.change(screen.getByLabelText('Upload image'), { target: { files: [file] } });
     expect(await screen.findByRole('alert')).toHaveTextContent(message);
-    expect(screen.queryByRole('img')).not.toBeInTheDocument();
+    expect(screen.queryByRole('img', { name: 'Your profile image' })).not.toBeInTheDocument();
+    expect(screen.getByRole('img', { name: 'Your Pokémon companion avatar' })).toHaveAttribute(
+      'src',
+      companion.dataUrl,
+    );
     expect(saveUserProfile).not.toHaveBeenCalled();
   });
 
@@ -160,11 +179,12 @@ describe('Profile settings', () => {
       email: 'bob@example.com',
       first_name: 'Bob',
     });
-    view.rerender(<ProfileSettings />);
+    view.rerender(<ProfileSettings companion={companion} />);
     await screen.findByDisplayValue('Bob');
     expect(signal?.aborted).toBe(true);
     await act(async () => resolveOld?.({ ...profile, first_name: 'Private draft' }));
     expect(screen.getByLabelText('First Name')).toHaveValue('Bob');
     expect(screen.queryByText('alice@example.com')).not.toBeInTheDocument();
+    expect(screen.queryByRole('img')).not.toBeInTheDocument();
   });
 });

@@ -28,23 +28,31 @@ export interface MemoryView {
 }
 
 /** One memory's endpoints, already bound to its owner and, for a project, its repository. */
-export interface MemoryApi {
-  read: (signal: AbortSignal) => Promise<MemoryView>;
-  toggle: (enabled: boolean, signal: AbortSignal) => Promise<MemoryView>;
-  clear: (signal: AbortSignal) => Promise<MemoryView>;
-  edit: (id: string, content: string, revision: number, signal: AbortSignal) => Promise<MemoryView>;
-  remove: (id: string, revision: number, signal: AbortSignal) => Promise<MemoryView>;
-  save: (revision: number, memories: UserMemoryEdit[], signal: AbortSignal) => Promise<MemoryView>;
-  consolidate: (revision: number, model: string, signal: AbortSignal) => Promise<MemoryView>;
+export interface MemoryApi<TView extends MemoryView = MemoryView> {
+  read: (signal: AbortSignal) => Promise<TView>;
+  toggle: (enabled: boolean, signal: AbortSignal) => Promise<TView>;
+  clear: (signal: AbortSignal) => Promise<TView>;
+  edit: (id: string, content: string, revision: number, signal: AbortSignal) => Promise<TView>;
+  remove: (id: string, revision: number, signal: AbortSignal) => Promise<TView>;
+  save: (revision: number, memories: UserMemoryEdit[], signal: AbortSignal) => Promise<TView>;
+  consolidate: (revision: number, model: string, signal: AbortSignal) => Promise<TView>;
 }
 
 type Operation = 'refresh' | 'toggle' | 'clear' | 'edit' | 'delete' | 'consolidate';
 type Dialog = 'clear' | 'consolidate' | null;
 
 /** User memory when `repo` is absent, otherwise that repository's project memory. */
-export function MemoryPanel({ api, repo }: { api: MemoryApi; repo?: string }) {
+export function MemoryPanel<TView extends MemoryView>({
+  api,
+  repo,
+  onViewChange,
+}: {
+  api: MemoryApi<TView>;
+  repo?: string;
+  onViewChange?: (view: TView | null) => void;
+}) {
   const { t, locale } = useLocale();
-  const [view, setView] = useState<MemoryView | null>(null);
+  const [view, setView] = useState<TView | null>(null);
   const [pending, setPending] = useState<Operation | null>(null);
   const [error, setError] = useState(false);
   const [dialog, setDialog] = useState<Dialog>(null);
@@ -66,6 +74,10 @@ export function MemoryPanel({ api, repo }: { api: MemoryApi; repo?: string }) {
   const [modelLoadAttempt, setModelLoadAttempt] = useState(0);
   const [modelChoice, setModelChoice] = useState('');
   const modelSelectId = useId();
+
+  useEffect(() => {
+    onViewChange?.(view);
+  }, [view, onViewChange]);
 
   useEffect(() => {
     if (!modelLoadAttempt) return;
@@ -100,7 +112,7 @@ export function MemoryPanel({ api, repo }: { api: MemoryApi; repo?: string }) {
   const run = useCallback(
     async (
       operation: Operation,
-      perform: (signal: AbortSignal) => Promise<MemoryView>,
+      perform: (signal: AbortSignal) => Promise<TView>,
       showGlobalError = true,
       refreshedEntryId?: string,
     ): Promise<UserMemoryRequestResult> => {

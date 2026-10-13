@@ -233,6 +233,10 @@ export function IntegrationsView({
   mcpAuthorization?: McpAuthorizationResult;
 }) {
   const t = useT();
+  const [companion, setCompanion] = useState<{ userId: string; dataUrl?: string } | null>(null);
+  const updateCompanion = useCallback((userId: string, dataUrl?: string) => {
+    setCompanion({ userId, dataUrl });
+  }, []);
   const [providers, setProviders] = useState<AgentIntegrationProviderApi[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -366,7 +370,7 @@ export function IntegrationsView({
         </div>
       ) : null}
 
-      <ProfileSettings />
+      <ProfileSettings companion={companion} />
 
       <section
         aria-labelledby="source-control-heading"
@@ -437,7 +441,7 @@ export function IntegrationsView({
         <McpConnectionsSection authorizationResult={mcpAuthorization} />
       </div>
       <SkillsSection />
-      <MemorySettings />
+      <MemorySettings onAvatarChange={updateCompanion} />
       <NotificationSettings />
       <GettingStartedSettings />
     </section>

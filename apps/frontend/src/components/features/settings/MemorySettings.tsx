@@ -3,7 +3,7 @@
 import { useRef, useState } from 'react';
 import { useLocale } from '@/components/providers';
 import { ProjectMemorySettings } from './ProjectMemorySettings';
-import { UserMemorySettings } from './UserMemorySettings';
+import { UserMemorySettings, type AvatarChange } from './UserMemorySettings';
 
 const TABS = [
   { id: 'user', label: 'settings.memory.userTab' },
@@ -12,7 +12,7 @@ const TABS = [
 type Tab = (typeof TABS)[number]['id'];
 
 /** User and project memory in one card. Both stay mounted, so switching tabs keeps drafts. */
-export function MemorySettings() {
+export function MemorySettings({ onAvatarChange }: { onAvatarChange?: AvatarChange }) {
   const { t } = useLocale();
   const [selected, setSelected] = useState<Tab>('user');
   const tabButtons = useRef<(HTMLButtonElement | null)[]>([]);
@@ -75,7 +75,11 @@ export function MemorySettings() {
           hidden={selected !== id}
           className="mt-4"
         >
-          {id === 'user' ? <UserMemorySettings /> : <ProjectMemorySettings />}
+          {id === 'user' ? (
+            <UserMemorySettings onAvatarChange={onAvatarChange} />
+          ) : (
+            <ProjectMemorySettings />
+          )}
         </div>
       ))}
     </section>

@@ -697,6 +697,32 @@ describe('memory settings', () => {
   });
 });
 
+describe('owner-scoped companion updates', () => {
+  it('does not publish a previous account companion when its lookup finishes late', async () => {
+    const pendingAlice = deferred<UserMemoryView>();
+    const bob = { ...empty, avatar: illustratedAvatar('#abcdef') };
+    vi.mocked(getUserMemory).mockReturnValueOnce(pendingAlice.promise);
+    const onAvatarChange = vi.fn();
+    const settings = () => (
+      <LocaleProvider>
+        <UserMemorySettings onAvatarChange={onAvatarChange} />
+      </LocaleProvider>
+    );
+    const rendered = render(settings());
+    const signal = vi.mocked(getUserMemory).mock.calls[0][0]!;
+    auth.userId = 'bob';
+    vi.mocked(getUserMemory).mockResolvedValueOnce(bob);
+    rendered.rerender(settings());
+    await waitFor(() =>
+      expect(onAvatarChange).toHaveBeenLastCalledWith('bob', bob.avatar.data_url),
+    );
+    expect(signal.aborted).toBe(true);
+    await act(async () => pendingAlice.resolve(populated));
+    expect(onAvatarChange).not.toHaveBeenCalledWith('alice', populated.avatar.data_url);
+    expect(onAvatarChange).toHaveBeenLastCalledWith('bob', bob.avatar.data_url);
+  });
+});
+
 describe('bounded scoped memory', () => {
   it('loads models only when consolidation opens, and returns focus when it closes', async () => {
     render(panel());

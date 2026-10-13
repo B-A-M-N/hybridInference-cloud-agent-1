@@ -239,6 +239,8 @@ export const zhCN: Record<TranslationKey, string> = {
   'home.memoryPaused':
     '已暂停自动建立用户记忆。现有建议与头像主题会保留，直到你在设置中启用更新或清除记忆。',
   'home.avatar.title': '头像是如何生成的',
+  'home.avatar.choice':
+    '上传的个人图片优先作为头像；没有上传图片时，使用你的宝可梦伙伴。你可以在“我的设置”中更换或移除图片。',
   'home.avatar.generation':
     '宝可梦头像由多层插画图形组合而成，无需照片或图像生成模型。栖息地与工作徽章来自对你在各项目中最近最多 50 条符合条件的请求进行英文关键词匹配。',
   'home.avatar.character': '你的宝可梦伙伴',
@@ -273,6 +275,7 @@ export const zhCN: Record<TranslationKey, string> = {
   'settings.profile.upload': '上传图片',
   'settings.profile.remove': '移除头像',
   'settings.profile.imageHelp': '支持 PNG、JPEG 或 WebP，最大 2 MB',
+  'settings.profile.defaultImageHelp': '没有上传图片时，使用你的宝可梦伙伴作为头像。',
   'settings.profile.firstName': '名',
   'settings.profile.lastName': '姓',
   'settings.profile.save': '保存',
