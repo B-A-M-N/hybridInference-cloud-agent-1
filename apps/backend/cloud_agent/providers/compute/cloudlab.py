@@ -98,6 +98,8 @@ class CloudLabConfig(ComputeValue):
 #: The largest Portal API body this adapter keeps — the ceiling it always had,
 #: now applied while the body arrives instead of after all of it has.
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+#: An error body is read only for its short ``error`` diagnostic.
+_MAX_ERROR_BYTES = 16 * 1024
 #: One request from connect to its last body byte. httpx's own timeout bounds
 #: each read, so an endpoint that drips a byte at a time is bounded only here.
 _REQUEST_DEADLINE_S = 180.0
@@ -331,9 +333,10 @@ class CloudLabProvider(ComputeProvider):
         A buffered request reads the whole body before anything can look at
         its size, so the endpoint, not this process, would decide how much is
         held in memory. The body is streamed instead and refused once it
-        passes the ceiling. Only a success body is read at all: nothing here
-        looks at an error body, and an unread one is never buffered. The
-        returned response holds just the status and the bytes that were kept.
+        passes the ceiling. An error body is read only for its short portal
+        diagnostic: past :data:`_MAX_ERROR_BYTES` it is dropped, never
+        refused, so the status still decides the outcome. The returned
+        response holds just the status and the bytes that were kept.
         """
         async with client.stream(
             method,
@@ -350,6 +353,12 @@ class CloudLabProvider(ComputeProvider):
                         raise ProviderError(
                             "invalid_response", "CloudLab response exceeds the size limit"
                         )
+                    body.extend(chunk)
+            elif streamed.status_code == 429 or streamed.status_code >= 500:
+                async for chunk in iter_response_bytes(streamed):
+                    if len(body) + len(chunk) > _MAX_ERROR_BYTES:
+                        body.clear()
+                        break
                     body.extend(chunk)
         return httpx.Response(streamed.status_code, content=bytes(body), request=streamed.request)
 

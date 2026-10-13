@@ -1137,6 +1137,31 @@ async def test_cloudlab_stops_reading_an_oversized_body_at_the_limit():
 
 
 @pytest.mark.asyncio
+async def test_cloudlab_drops_an_oversized_error_body_and_keeps_its_status():
+    pulled = 0
+
+    async def endless():
+        nonlocal pulled
+        for _ in range(256):
+            pulled += 1
+            yield b" " * (4 * 1024)
+
+    def respond(request):
+        if request.method == "GET":
+            return _profile_list()
+        return httpx.Response(429, content=endless())
+
+    with pytest.raises(ProviderError) as refused:
+        await provider(respond).acquire(
+            AcquireRequest(mode="provision", config=_provision()), intent()
+        )
+    # The capacity diagnostic is unreadable, so the 429 stays a rate limit.
+    assert (refused.value.code, refused.value.retryable) == ("rate_limited", True)
+    # 16 KiB is 4 such chunks; reading stops at the next one.
+    assert pulled == 5
+
+
+@pytest.mark.asyncio
 async def test_cloudlab_refuses_a_compressed_body_it_did_not_ask_for():
     def respond(request):
         return httpx.Response(
