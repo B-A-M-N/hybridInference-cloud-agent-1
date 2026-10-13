@@ -116,13 +116,21 @@ def storage_mount_units_compatible():
         return True
     except OSError:
         return False
+def deployment_identity_matches(stored, identity):
+    # The release stamp may advance for this same owner. Every other field,
+    # including an optional namespace or storage path, still has to match.
+    if not isinstance(stored, dict) or not isinstance(identity, dict) or not stored or not identity:
+        return False
+    def owner(value):
+        return {key: value[key] for key in value if key != 'deployment_sha'}
+    return owner(stored) == owner(identity)
 def deployment_storage_owned(deployment):
     if not isinstance(deployment, dict) or not isinstance(deployment.get('identity'), dict):
         return False
     try:
         root = Path(deployment['root'])
         marker = root / '.compute-identity.json'
-        return root.is_dir() and root.resolve() == root and not root.is_symlink() and marker.is_file() and not marker.is_symlink() and marker.resolve() == marker and json.loads(marker.read_text()) == deployment['identity']
+        return root.is_dir() and root.resolve() == root and not root.is_symlink() and marker.is_file() and not marker.is_symlink() and marker.resolve() == marker and deployment_identity_matches(json.loads(marker.read_text()), deployment['identity'])
     except (KeyError, TypeError, OSError, ValueError):
         return False
 def storage_state_compatible(base, owned):
@@ -368,7 +376,10 @@ print(json.dumps({'machine_identity': hashlib.sha256(machine.encode()).hexdigest
 
 # Executed with sudo and a tar stream on stdin, never a secret command argument.
 # Existing installations require our persisted identity marker. A retry uses
-# the same identity and flock; it cannot overwrite or enroll a different Host.
+# the same owner and flock; it cannot overwrite or enroll a different Host.
+# deployment_sha is the release stamp and may advance for that same owner. The
+# marker records the new stamp only after the host recipe succeeds, so a failed
+# rollout leaves the previous owner record in place.
 _DEPLOY = (
     _DAEMON_STORAGE_GUARD
     + r"""
@@ -411,13 +422,25 @@ with open(lock_path, 'a') as lock:
     if params.get('data_mount') and not storage_state_compatible(Path(params['data_mount']), owned_storage):
         print(json.dumps({'ready': False, 'blocked_reasons': ['data_mount_conflict']}))
         raise SystemExit(0)
+    advancing = False
     if root.exists() and any(root.iterdir()):
-        if not marker.is_file() or marker.is_symlink() or json.loads(marker.read_text()) != identity:
+        if not marker.is_file() or marker.is_symlink():
             raise SystemExit('existing deployment identity conflict')
+        try:
+            current_identity = json.loads(marker.read_text())
+        except ValueError:
+            raise SystemExit('existing deployment identity conflict')
+        if not deployment_identity_matches(current_identity, identity):
+            raise SystemExit('existing deployment identity conflict')
+        advancing = current_identity.get('deployment_sha') != identity.get('deployment_sha')
     root.mkdir(mode=0o700, exist_ok=True)
     root.chmod(0o700)
-    marker.write_text(json.dumps(identity))
-    marker.chmod(0o600)
+    def commit_identity():
+        marker.write_text(json.dumps(identity))
+        marker.chmod(0o600)
+    # A release change keeps the previous stamp until the recipe succeeds.
+    if not advancing:
+        commit_identity()
     with tarfile.open(fileobj=io.BytesIO(sys.stdin.buffer.read()), mode='r:gz') as archive:
         for member in archive.getmembers():
             parts = Path(member.name).parts
@@ -433,8 +456,20 @@ with open(lock_path, 'a') as lock:
     for name in ('DOCKER_TLS', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH'):
         environment.pop(name, None)
     quiet = {'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL}
+    def advertises_generation():
+        ready_file = root / '.shared-live-ready'
+        try:
+            if not ready_file.is_file() or ready_file.is_symlink():
+                return False
+            current = ready_file.read_text().strip()
+        except OSError:
+            return False
+        return bool(current) and not current.startswith('pending:')
     def blocked(step):
-        print(json.dumps({'ready': False, 'blocked_reasons': [step]}))
+        body = {'ready': False, 'blocked_reasons': [step]}
+        if step in ('host_deployment_failed', 'host_readiness_failed'):
+            body['advertising'] = advertises_generation()
+        print(json.dumps(body))
         raise SystemExit(0)
     def run(step, args):
         if subprocess.run(args, cwd=root, env=environment, **quiet).returncode:
@@ -515,6 +550,7 @@ with open(lock_path, 'a') as lock:
         run('kata_install_failed', ['bash', 'deploy/host/setup_kata_runtime.sh'])
     if not params.get('activate', True):
         # Staged to take a Host over: the recipe is in place, nothing runs or enrolls.
+        commit_identity()
         print(json.dumps({'ready': True, 'blocked_reasons': []}))
         raise SystemExit(0)
     # A node that received another node's state starts with its daemons stopped.
@@ -535,6 +571,7 @@ with open(lock_path, 'a') as lock:
     # spent bootstrap token from .env; it never leaves through command output.
     envfile = root / '.env'
     envfile.write_text('\n'.join(line for line in envfile.read_text().splitlines() if not line.startswith('AGENT_ENROLL_TOKEN=')) + '\n')
+    commit_identity()
     print(json.dumps({'ready': True, 'blocked_reasons': []}))
 """
 )
@@ -965,11 +1002,13 @@ class SshHostBootstrap:
                 self._connection(node), command, stdin=archive, timeout=profile.timeout_seconds
             )
         )
+        advertising = result.get("advertising")
         return BootstrapResult(
             ready=result.get("ready") is True,
             host=intent.host,
             deployment_sha=profile.deployment_sha,
             blocked_reasons=_remote_reasons(result.get("blocked_reasons")),
+            advertising=advertising if isinstance(advertising, bool) else None,
         )
 
     async def readiness(
@@ -1009,9 +1048,11 @@ class SshHostBootstrap:
         self, node: NodeObservation, profile: DeploymentProfile, intent: BootstrapIntent
     ) -> None:
         """Stop the Host stack, its sandboxes and the container daemons, keeping all state."""
-        params = self._params(profile, intent)
+        params = {**self._params(profile, intent), "broker_drain_seconds": _BROKER_DRAIN_SECONDS}
         script = "sudo -n python3 -c " + shlex.quote(_STOP) + " " + shlex.quote(json.dumps(params))
-        result = self._json(await self._transport.run(self._connection(node), script, timeout=900))
+        result = self._json(
+            await self._transport.run(self._connection(node), script, timeout=_STOP_TIMEOUT_SECONDS)
+        )
         if result.get("stopped") is not True:
             reason = _remote_reason(result.get("reason"))
             raise ProviderError(
@@ -1131,6 +1172,11 @@ class SshHostBootstrap:
 _TRANSFER_STREAMS = 6
 _TRANSFER_TIMEOUT_SECONDS = 4 * 3600
 
+# The broker's drain must end early enough inside the stop's SSH deadline to
+# leave time for the runner, the remaining containers and the daemons.
+_STOP_TIMEOUT_SECONDS = 900
+_BROKER_DRAIN_SECONDS = 600
+
 _STOP = r"""
 import json, subprocess, sys
 from pathlib import Path
@@ -1143,12 +1189,21 @@ quiet = {'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL}
 def running(*filters):
     result = subprocess.run(['docker', 'ps', '-q', *filters], capture_output=True, text=True)
     return result.stdout.split() if result.returncode == 0 else []
+def service(name):
+    return running('--filter', 'label=com.docker.compose.project=' + params['project'],
+                   '--filter', 'label=com.docker.compose.service=' + name)
 if subprocess.run(['systemctl', 'is-active', '--quiet', 'docker'], **quiet).returncode == 0:
     # The runner first: nothing may claim or resume while the state is moving.
-    runner = running('--filter', 'label=com.docker.compose.project=' + params['project'],
-                     '--filter', 'label=com.docker.compose.service=runner')
+    runner = service('runner')
     if runner:
         subprocess.run(['docker', 'stop', '-t', '60', *runner], **quiet)
+    # Then the broker, alone: its shutdown stops each running sandbox cleanly.
+    # While lifecycle archives are enabled, the next node's broker quarantines
+    # a sandbox that Docker stopped behind the broker's back.
+    broker = service('workspace-broker')
+    if broker:
+        drain = str(params['broker_drain_seconds'])
+        subprocess.run(['docker', 'stop', '-t', drain, *broker], **quiet)
     # Explicitly stopped containers stay stopped when a daemon starts again,
     # including on the node that receives this state. The CLI stops them in
     # parallel, each with its own configured grace period.

@@ -209,7 +209,7 @@ describe('IntegrationsView', () => {
     expect(screen.queryByRole('combobox', { name: 'Display language' })).not.toBeInTheDocument();
   });
 
-  it('keeps source-linked memory, suggestions, and privacy controls on the Setting page without an avatar', async () => {
+  it('keeps source-linked memory and privacy controls on the Setting page while user suggestions live on the homepage', async () => {
     mockedGetIntegrations.mockResolvedValue(integrations);
     render(<IntegrationsView />);
 
@@ -225,7 +225,12 @@ describe('IntegrationsView', () => {
       'href',
       '/job_memory_source',
     );
-    expect(within(section).getByText(memory.suggestions[0].action)).toBeInTheDocument();
+    expect(
+      within(section).queryByRole('heading', { name: 'Suggestions for future tasks' }),
+    ).not.toBeInTheDocument();
+    expect(within(section).queryByText(memory.suggestions[0].title)).not.toBeInTheDocument();
+    expect(within(section).queryByText(memory.suggestions[0].reason)).not.toBeInTheDocument();
+    expect(within(section).queryByText(memory.suggestions[0].action)).not.toBeInTheDocument();
     const toggle = within(section).getByRole('switch', { name: 'Automatically build memory' });
     fireEvent.click(toggle);
     await waitFor(() => expect(toggle).not.toBeChecked());
@@ -256,6 +261,9 @@ describe('IntegrationsView', () => {
     await within(section).findByRole('switch', { name: '自动建立记忆' });
     expect(within(section).queryByRole('img')).not.toBeInTheDocument();
     expect(within(section).getByRole('switch', { name: '自动建立记忆' })).toBeChecked();
+    expect(
+      within(section).queryByRole('heading', { name: '未来任务建议' }),
+    ).not.toBeInTheDocument();
     expect(screen.getByRole('region', { name: '项目记忆' })).toBeInTheDocument();
     expect(screen.getByText('管理你的连接、技能、记忆和通知。')).toBeInTheDocument();
   });

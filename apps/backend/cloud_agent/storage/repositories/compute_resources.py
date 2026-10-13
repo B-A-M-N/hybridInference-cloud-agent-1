@@ -99,7 +99,7 @@ class PostgresComputeResourceRepository:
         source_sha256: str,
         secret_ciphertext: str,
     ) -> dict[str, Any]:
-        """Create one immutable profile; active allocations retain exact inputs."""
+        """Create one profile. A host release may later advance its commit and bundle."""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 """INSERT INTO agent_compute_deployment_profiles
@@ -116,6 +116,100 @@ class PostgresComputeResourceRepository:
         if row is None:
             raise ValueError("deployment_profile_exists")
         return _row(row)
+
+    async def advance_host_release(
+        self,
+        *,
+        allocation_id: str,
+        previous_sha: str,
+        previous_digest: str,
+        deployment_sha: str,
+        source_sha256: str,
+        source_bundle: bytes,
+        release_bundle_path: str,
+        operation_id: str,
+        generation: int,
+        worker_id: str,
+    ) -> None:
+        """Move every stored profile of one release, and the live hosts using it.
+
+        A profile another deployment is currently installing is left unchanged.
+        The calling allocation must end on the new revision.
+        """
+        if previous_sha == deployment_sha and previous_digest == source_sha256:
+            return
+        async with self._pool.acquire() as conn, conn.transaction():
+            await lock_compute_entry(conn, exclusive=True)
+            await self._fence(conn, operation_id, generation, worker_id, allocation_id)
+            await conn.execute(
+                """UPDATE agent_compute_deployment_profiles AS profile
+                SET source_bundle=$3,
+                    source_sha256=$4,
+                    configuration=jsonb_set(
+                        configuration, '{deployment_sha}', to_jsonb($5::text), true
+                    ),
+                    revision=revision+1,
+                    updated_at=NOW()
+                WHERE configuration->>'deployment_sha'=$1
+                  AND source_sha256=$2
+                  AND NOT EXISTS (
+                    SELECT 1 FROM agent_compute_allocations AS allocation
+                    JOIN agent_compute_operations AS operation
+                      ON operation.allocation_id=allocation.id
+                    WHERE allocation.deployment_profile->>'id'=profile.id
+                      AND operation.id<>$6
+                      AND operation.kind IN ('acquire','upgrade','rotate')
+                      AND operation.state IN ('pending','running','waiting','unknown')
+                  )""",
+                previous_sha,
+                previous_digest,
+                source_bundle,
+                source_sha256,
+                deployment_sha,
+                operation_id,
+            )
+            await conn.execute(
+                """UPDATE agent_compute_allocations AS allocation
+                SET deployment_profile=allocation.deployment_profile
+                      || jsonb_build_object(
+                           'deployment_sha',$3::text,'source_sha256',$4::text
+                         )
+                      || CASE
+                           WHEN allocation.deployment_profile->>'source_bundle'
+                                LIKE 'stored-profile:%'
+                           THEN '{}'::jsonb
+                           ELSE jsonb_build_object('source_bundle',$5::text)
+                         END,
+                    revision=revision+1,
+                    updated_at=NOW()
+                WHERE allocation.deployment_profile->>'deployment_sha'=$1
+                  AND allocation.deployment_profile->>'source_sha256'=$2
+                  AND allocation.release_committed_at IS NULL
+                  AND COALESCE(allocation.observed_state,'') NOT IN ('terminated','absent')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM agent_compute_operations AS operation
+                    WHERE operation.allocation_id=allocation.id
+                      AND operation.id<>$6
+                      AND operation.kind IN ('acquire','upgrade','rotate')
+                      AND operation.state IN ('pending','running','waiting','unknown')
+                  )""",
+                previous_sha,
+                previous_digest,
+                deployment_sha,
+                source_sha256,
+                release_bundle_path,
+                operation_id,
+            )
+            recorded = await conn.fetchval(
+                """SELECT deployment_profile->>'deployment_sha'=$2
+                      AND deployment_profile->>'source_sha256'=$3
+                FROM agent_compute_allocations WHERE id=$1""",
+                allocation_id,
+                deployment_sha,
+                source_sha256,
+            )
+            if recorded is not True:
+                raise ValueError("host_release_not_recorded")
 
     async def activate_automatic_profiles(
         self,
@@ -2977,7 +3071,10 @@ class PostgresComputeResourceRepository:
             return _row(
                 await conn.fetchrow(
                     """UPDATE agent_compute_operations
-                SET state='pending',next_attempt_at=NOW(),completed_at=NULL,updated_at=NOW()
+                SET state='pending',next_attempt_at=NOW(),completed_at=NULL,updated_at=NOW(),
+                    result=CASE WHEN kind='upgrade'
+                           THEN result - 'release_attempts' - 'restore_attempted'
+                           ELSE result END
                 WHERE id=$1 RETURNING *""",
                     operation_id,
                 )

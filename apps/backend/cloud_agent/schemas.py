@@ -1962,6 +1962,14 @@ class WorkerSandboxSettleRequest(BaseModel):
     base_sha: str | None = Field(None, min_length=7, max_length=64)
     idle_timeout_seconds: float = Field(1800.0, gt=0, le=7 * 24 * 60 * 60)
 
+    @field_validator("native_session_id")
+    @classmethod
+    def normalize_native_session_id(cls, value: str | None) -> str | None:
+        """Repeat the host's locator canonicalization at the API trust boundary."""
+        if value is None:
+            return None
+        return value.strip() or None
+
 
 class WorkerSandboxAbandonRequest(BaseModel):
     """Release a failed activation, explicitly marking ambiguous context LOST."""

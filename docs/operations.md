@@ -75,7 +75,13 @@ preservation rule.
 
 Later deployments keep the saved admin values, and resetting a field never
 restores an old `.env` value. Listeners synchronize saved changes every five
-seconds. The web server reads saved public appearance fields on every request.
+seconds. The web server reads saved public appearance fields on every request,
+with a 400 ms budget for the response and its body. A timeout, unavailable
+backend, or invalid response uses the last valid public appearance read by that
+web process for the same control-plane URL; before its first successful read,
+it uses neutral display defaults. Successful reads show saved edits on the next
+page request. This fallback contains no session or access decisions and does
+not survive a web-process restart.
 Apply changes to subsequent operations as described beside each setting.
 
 Automatic session archiving after a verified GitHub PR merge is enabled by
@@ -559,6 +565,20 @@ automatic recovery from S3. **Remove from inventory** is a separate reversible
 visibility control for stopped sandboxes. Use **Include removed sandboxes**
 with **All states**, then **Restore to inventory**, to inspect retained entries.
 Resuming a sandbox removed only from inventory makes it visible again.
+
+For batch operations, select individual inventory rows or **Select all visible
+sandboxes**, choose an action, then **Review selected sandboxes**. Selection
+applies only to the current state, search, host, and activity filters; hidden
+rows are excluded. The review reads current details for each selected sandbox
+and lists any blockers before a single confirmation applies the action to
+eligible entries. Stop, archive-and-delete, deletion without an archive,
+inventory removal, and inventory restoration use the same checks as individual
+controls. Up to four requests run at once, and each result is reported
+separately. A stop or deletion result means the request was accepted; host
+completion is still asynchronous. Failed or skipped entries remain selected
+for a new explicit review. Expired reviews and changed containers are refused,
+without automatically retrying a new container identity. No batch feature flag
+or additional migration is required.
 
 CPU is measured in occupied cores over the interval between Docker samples;
 memory is current usage with inactive file cache removed. Network and block
@@ -1243,7 +1263,7 @@ with no leader and no sharding.
 | `AGENT_RUNNER_HOST` | host name | Enrolled execution environment, shared by every turn it runs — the unit the admin placement switch picks between. `deploy/host/sandbox_host.sh` fills it from the host's own name. Never derived inside the container, where the hostname is a container id. After enrolment the persisted credential is authoritative, so editing this renames nothing. Unset keeps the environment out of the pool and changes nothing else. Distinct from `AGENT_PHYSICAL_HOST`, which is the display-only inventory name grouping environments that share one server |
 | `AGENT_PHYSICAL_HOST` | host name | Physical server this environment runs on, reported at enrolment as the `physical_host` label and used to group the admin inventory. `sandbox_host.sh` defaults it to `hostname -s`; set it explicitly when invoking Compose directly. Never a container hostname or a runtime suffix |
 | `AGENT_HOST_SLOTS` | `3` | Turns at once until an admin sets a number on the Servers page; at least two, at most 128. `AGENT_RUNNER_REPLICAS` is no longer read |
-| `AGENT_RETAINED_DOCKER_DATA_ROOT` | `/var/lib/docker` | Expected daemon `DockerRootDir`; provision this root on durable storage. It is verified by the host and broker and is never mounted into a chat container |
+| `AGENT_RETAINED_DOCKER_DATA_ROOT` | `/var/lib/docker` | Expected daemon `DockerRootDir`. Keep this default. Put the durable disk under it by bind-mounting `<disk>/docker` and `<disk>/containerd` onto `/var/lib/docker` and `/var/lib/containerd`. A custom daemon data root is rejected. Verified by the host and broker, and never mounted into a chat container |
 | `AGENT_HOST_STORAGE_PROBE` | `overlay_root` | Which probe measures the filesystem holding the sandbox writable layers, shown as the Servers page's Storage column. `off` stops measuring storage on that host and is the rollback; an unrecognized name reports `unsupported` rather than measuring something else. A reading is published only for a topology the host deployment has attested; see _How full is the sandbox storage?_ |
 | `AGENT_STORAGE_MIN_AVAILABLE_MIB` | `1024` | Bootstrap value for **Storage reserve for new sandboxes**; the admin runtime setting replaces it after the host's first settings heartbeat. Fresh verified available space below this reserve declines a new sandbox allocation without spending the turn. Existing sandboxes may resume; unknown capacity does not establish a pressure verdict. This is an admission guard, not a disk quota |
 | `AGENT_SANDBOX_UID` / `_GID` | `10001` | Only for a custom sandbox image; must match its user |
@@ -2325,50 +2345,73 @@ leaves the database with no writer.
 
 ### Retained Docker storage on a host
 
-Retained chat state is the Docker container writable layer, so durable
-same-host operation attaches storage to the Docker daemon, not to each
-sandbox. A Linux host can use this shape (device and filesystem choices remain
-operator-specific):
+Retained chat state is the Docker container writable layer. On a daemon that
+uses the containerd image store, the images live beside it under containerd.
+Durable same-host operation puts both stores on a mounted data disk and leaves
+the daemon paths at their defaults. `docker info` must keep reporting
+`DockerRootDir=/var/lib/docker`, and `AGENT_RETAINED_DOCKER_DATA_ROOT` stays
+`/var/lib/docker`. A custom `data-root`, `graph`, or containerd `root` is
+rejected before the host starts.
 
-```bash
-# Mount the durable block volume before Docker starts.
-findmnt --target /mnt/agent-docker
+Automatic SSH bootstrap does this from the server's sandbox storage path. See
+[Sandbox storage path](operations-compute.md#sandbox-storage-path). It refuses
+to move a nonempty store that is not already this bind.
+
+A manual host uses the same layout. `<disk>` is an existing writable mount,
+for example `/scratch/hybridInference-cloud-agent/sandbox`:
+
+```text
+<disk>/docker      bind -> /var/lib/docker
+<disk>/containerd  bind -> /var/lib/containerd
 ```
 
-Configure `/etc/docker/daemon.json` with this data root:
+Persist the binds in `/etc/fstab`:
 
-```json
-{"data-root":"/mnt/agent-docker"}
+```text
+<disk>/docker /var/lib/docker none bind,nofail,x-systemd.requires-mounts-for=<disk> 0 0
+<disk>/containerd /var/lib/containerd none bind,nofail,x-systemd.requires-mounts-for=<disk> 0 0
 ```
 
-Restart Docker and verify the reported path:
+Give each daemon a drop-in, `/etc/systemd/system/docker.service.d/cloud-agent-storage.conf`
+and `/etc/systemd/system/containerd.service.d/cloud-agent-storage.conf`:
 
-```bash
-sudo systemctl restart docker
-docker info --format '{{.DockerRootDir}}'
-# /mnt/agent-docker
+```ini
+[Unit]
+RequiresMountsFor=<disk> /var/lib/docker
 ```
 
-Then set `AGENT_RETAINED_DOCKER_DATA_ROOT=/mnt/agent-docker`. The workspace
-broker compares that exact daemon-reported value during startup and refuses a
-mismatch. It deliberately cannot prove `findmnt` itself: giving the broker a
-host-root mount just to inspect storage would violate the Docker-only boundary.
-Put the mount check in host provisioning/systemd (`RequiresMountsFor=` is a
-reasonable additional guard) before Docker and the agent stack start.
+The containerd file names `/var/lib/containerd` instead of `/var/lib/docker`.
+Run `systemctl daemon-reload`. A missing disk then keeps that daemon stopped
+instead of opening an empty store at the bare path.
 
-Do not bind `/mnt/agent-docker`, `/var/lib/docker`, `/workspace`, or
-`/agent-state` into the broker or sandbox. Do not use generic `docker system
+To move a store that already has data, copy it while the daemons are running,
+stop Docker and containerd, and copy again with `--delete` until that copy
+exits 0. Move the old directories aside, create empty mount points, bind-mount,
+then start the daemons. Do not point `daemon.json` at the new path. Containers
+with `restart=no` stay stopped across that restart and must be started by
+hand. Delete the copies left aside only after a reboot has come back on these
+binds and the host is serving.
+
+The workspace broker compares `AGENT_RETAINED_DOCKER_DATA_ROOT` with the
+daemon-reported `DockerRootDir` and refuses a mismatch. It deliberately cannot
+prove `findmnt` itself: giving the broker a host-root mount just to inspect
+storage would violate the Docker-only boundary. The mount check belongs in
+host provisioning, as the `RequiresMountsFor=` drop-ins above.
+
+Do not bind `<disk>`, `/var/lib/docker`, `/var/lib/containerd`, `/workspace`,
+or `/agent-state` into the broker or sandbox. Do not use generic `docker system
 prune`, container TTL cleanup, `docker rm`, or image garbage collection against
 `org.freeinference.chat-sandbox=true` objects. Inspect and operate them through
 Docker (`docker inspect`, `docker exec`, `docker cp`, and the broker RPC), not by
-walking overlay directories. Backup or move the whole Docker data-root only
-with the daemon stopped and using Docker/storage-driver-supported procedures.
+walking overlay directories. Back up or move both graphs only with Docker and
+containerd stopped, preserving ownership, hard links, extended attributes and
+sparse files.
 
 This makes `docker stop`/`docker start` survive runner, broker, Docker daemon,
-and host reboots as long as the same Docker data-root returns. It does **not**
+and host reboots as long as the same binds return. It does **not**
 make a missing container recoverable on another host: export to object/cold
 storage and cross-host restore remain the explicitly deferred persistent
-checkpoint phase. Until that lands, loss of the Docker data-root is context
+checkpoint phase. Until that lands, loss of these graphs is context
 `LOST`, and the control-plane database still supplies the authoritative
 thread→host→container identity needed to locate it.
 

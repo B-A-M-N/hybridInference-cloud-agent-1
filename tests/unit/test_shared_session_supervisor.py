@@ -52,6 +52,7 @@ from cloud_agent_host.shared_session_supervisor import (
     SharedMemberManifest,
     SharedSessionDescriptor,
     SharedSessionLease,
+    archive_failure_http_detail,
 )
 from cloud_agent_host.tool_windows import ToolMark
 from cloud_agent_host.workspace_broker import SharedSandboxIdentityRequest, create_app
@@ -446,6 +447,31 @@ def _pending_question() -> dict[str, Any]:
             }
         ],
     }
+
+
+def test_abandon_before_first_native_locator_keeps_member_stopped():
+    manager = _Manager()
+    supervisor = SharedChatSessionSupervisor(manager)
+    fresh_members = [
+        SharedMemberManifest(
+            thread_id="athr_source",
+            context_status="new",
+            resident_slot_id=0,
+        )
+    ]
+    lease = supervisor.acquire(
+        _spec(),
+        thread_id="athr_source",
+        owner="attempt:1",
+        activation_generation=1,
+        has_settled_context=False,
+        manifest=fresh_members,
+    )
+
+    descriptor = supervisor.abandon("athr_source", lease.token, lost=False)
+
+    assert descriptor.native_session_id is None
+    assert descriptor.resident_state == "stopped"
 
 
 def test_native_questions_require_the_active_owner_and_running_turn():
@@ -1524,6 +1550,43 @@ def test_a_host_that_cannot_show_its_rules_stops_every_running_group():
     # Stopped, not lost: the native session wakes once the rules are back.
     assert [descriptor.resident_state for descriptor in stopped] == ["stopped"]
     assert supervisor.status("athr_source").context_status != "lost"
+
+
+def test_network_fail_stop_final_archive_log_omits_provider_details(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class ProviderError(RuntimeError):
+        def __init__(self, unsafe: str) -> None:
+            super().__init__(unsafe)
+            self.response = {
+                "Error": {"Code": "AccessDenied", "Message": unsafe},
+                "ResponseMetadata": {
+                    "HTTPStatusCode": 403,
+                    "HTTPHeaders": {"authorization": unsafe},
+                },
+            }
+
+    unsafe = "https://archive.invalid/object?credential=network-fail-stop-secret"
+
+    def archive(*_args) -> None:
+        try:
+            raise ProviderError(unsafe)
+        except ProviderError as exc:
+            raise SandboxError("final archive could not be stored") from exc
+
+    manager, supervisor = _running_group(stopped_archive_hook=archive)
+    manager.host_rule_failures = 2
+
+    assert supervisor.guard_network() == []
+
+    assert unsafe not in caplog.text
+    assert any(
+        getattr(record, "event", None) == "shared_chat_network_final_archive_failed"
+        and getattr(record, "detail", None)
+        == "archive failure (phase=fail_stop_final, type=ProviderError, "
+        "code=AccessDenied, status=403)"
+        for record in caplog.records
+    )
 
 
 def test_guest_network_fail_stop_archives_once_and_does_not_duplicate_on_listing():
@@ -4063,6 +4126,9 @@ def test_failed_marked_initial_archive_stops_and_completes_the_final_archive() -
 
     status = supervisor.status("athr_source")
     assert raised.value is initial_failure
+    assert archive_failure_http_detail(raised.value) == (
+        "archive failure (phase=initial, type=RuntimeError)"
+    )
     assert prepared == [True]
     assert archived == [(False, ("agent-net",))]
     assert manager.stop_count == 2
@@ -4177,10 +4243,32 @@ def test_failed_marked_initial_archive_waits_for_concurrent_guard_stop() -> None
     assert all(event[0] != "thaw" for event in manager.events)
 
 
-def test_failed_final_upload_keeps_the_stopped_bridge_and_never_thaws() -> None:
+def test_failed_final_upload_keeps_the_stopped_bridge_and_never_thaws(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     manager = _Manager()
     prepared: list[bool] = []
+
+    class ProviderError(RuntimeError):
+        def __init__(self, *, code: str, status: int, unsafe: str) -> None:
+            super().__init__(unsafe)
+            self.response = {
+                "Error": {"Code": code, "Message": unsafe},
+                "ResponseMetadata": {
+                    "HTTPStatusCode": status,
+                    "HTTPHeaders": {"authorization": unsafe},
+                },
+                "Body": unsafe,
+            }
+
+    initial_unsafe = "https://initial.invalid/private-key?credential=initial-secret"
+    final_unsafe = "https://final.invalid/object-key?credential=final-secret"
     final_failure = RuntimeError("final upload failed")
+    final_failure.__cause__ = ProviderError(
+        code="SlowDown",
+        status=503,
+        unsafe=final_unsafe,
+    )
 
     def archive(*_args) -> None:
         raise final_failure
@@ -4199,6 +4287,11 @@ def test_failed_final_upload_keeps_the_stopped_bridge_and_never_thaws() -> None:
         manifest=_members(),
     )
     initial_failure = RuntimeError("initial upload failed")
+    initial_failure.__cause__ = ProviderError(
+        code="AccessDenied",
+        status=403,
+        unsafe=initial_unsafe,
+    )
 
     def capture(*_args):
         manager.initial_archive_marker = b"prepared-initial-marker"
@@ -4214,6 +4307,23 @@ def test_failed_final_upload_keeps_the_stopped_bridge_and_never_thaws() -> None:
     status = supervisor.status("athr_source")
     assert raised.value is final_failure
     assert raised.value.__cause__ is initial_failure
+    safe_detail = archive_failure_http_detail(raised.value)
+    assert safe_detail == (
+        "archive failure (phase=initial, type=ProviderError, code=AccessDenied, status=403); "
+        "archive failure (phase=fail_stop_final, type=ProviderError, code=SlowDown, status=503)"
+    )
+    assert initial_unsafe not in safe_detail
+    assert final_unsafe not in safe_detail
+    assert initial_unsafe not in caplog.text
+    assert final_unsafe not in caplog.text
+    assert initial_unsafe not in " ".join(getattr(raised.value, "__notes__", ()))
+    assert final_unsafe not in " ".join(getattr(raised.value, "__notes__", ()))
+    assert any(
+        getattr(record, "detail", None)
+        == "archive failure (phase=fail_stop_final, type=ProviderError, "
+        "code=SlowDown, status=503)"
+        for record in caplog.records
+    )
     assert prepared == [True]
     assert manager.stop_count == 1
     assert manager.items[_spec().container_name].networks == ("agent-net",)
@@ -4415,10 +4525,21 @@ def test_pending_final_archive_retries_after_external_bridge_removal() -> None:
     assert stopped.running is False
     assert stopped.networks == ("agent-net",)
     manager.items[_spec().container_name] = replace(stopped, networks=())
+    supervisor.register_manifest(
+        _spec(),
+        [
+            replace(_members()[0], resident_state="restarting"),
+            replace(_members()[1], context_status="lost", resident_state="lost"),
+        ],
+    )
+    assert supervisor.status("athr_source").resident_state == "restarting"
+    assert supervisor.status("athr_peer").resident_state == "lost"
 
     descriptor = supervisor.stop_if_idle("athr_source", generation=1)
 
     assert descriptor.running is False
+    assert descriptor.resident_state == "stopped"
+    assert supervisor.status("athr_peer").resident_state == "lost"
     assert archive_calls == 2
     assert manager.items[_spec().container_name].networks == ()
 
