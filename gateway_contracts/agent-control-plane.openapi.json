@@ -23340,7 +23340,7 @@
     },
     "/v1/agent/changes": {
       "get": {
-        "description": "Stream the caller's changed jobs and conversations as SSE.\n\nEvents: ``hello`` and ``resync`` carry ``{\"live\": bool}``; ``job`` and\n``thread`` carry the row's current values and its ``revision``, or\n``{\"id\": ..., \"deleted\": true}`` once it is gone; ``usage`` carries the\njob's ``{\"id\": ..., \"usage\": ...}`` as ``GET /v1/agent/jobs/{id}/usage``\nreturns it; ``mcp`` (a job) and ``queue``, ``publication`` (a\nconversation) carry only ``{\"id\": ...}``: read that again. 404 where this\nprocess pushes nothing, which a tab treats as \"keep reading on a clock\".",
+        "description": "Stream the caller's changed jobs and conversations as SSE.\n\nEvents: ``hello`` and ``resync`` carry ``{\"live\": bool}``; ``job`` and\n``thread`` carry the row's current values and its ``revision``, or\n``{\"id\": ..., \"deleted\": true}`` once it is gone; ``usage`` carries the\njob's ``{\"id\": ..., \"usage\": ...}`` as ``GET /v1/agent/jobs/{id}/usage``\nreturns it; ``mcp`` (a job) and ``queue``, ``publication`` (a\nconversation) carry only ``{\"id\": ...}``: read that again. 404 where this\nprocess pushes nothing, which a tab treats as \"keep reading on a clock\".\n429 when the account already holds as many streams as this process allows\none account (:mod:`cloud_agent.api._stream_slots`).",
         "operationId": "stream_owner_changes_v1_agent_changes_get",
         "parameters": [
           {
@@ -25181,7 +25181,7 @@
     },
     "/v1/agent/jobs/{job_id}/stream": {
       "get": {
-        "description": "Stream a job's events as SSE, resumable via ``Last-Event-ID``.\n\nEach SSE frame carries the event's global id, so a client that reconnects\nwith ``Last-Event-ID`` resumes exactly where it left off — which is what\nmakes the finite stream cap (applied by the timeout middleware to\n``text/event-stream``) safe for jobs that outlive one connection.",
+        "description": "Stream a job's events as SSE, resumable via ``Last-Event-ID``.\n\nEach SSE frame carries the event's global id, so a client that reconnects\nwith ``Last-Event-ID`` resumes exactly where it left off — which is what\nmakes the finite stream cap (applied by the timeout middleware to\n``text/event-stream``) safe for jobs that outlive one connection. 429 when\nthe account already holds as many streams as this process allows one\naccount (:mod:`cloud_agent.api._stream_slots`).",
         "operationId": "stream_agent_job_events_v1_agent_jobs__job_id__stream_get",
         "parameters": [
           {
@@ -32288,7 +32288,7 @@
     },
     "/v1/session/logout": {
       "post": {
-        "description": "Clear the session cookie.\n\nUnauthenticated on purpose: signing out must work when the session is\nalready expired or malformed, which is exactly when a browser most wants\nit. There is nothing to protect — the only effect is deleting a cookie the\ncaller already holds.\n\nThe attributes must match the ones the cookie was set with, or the browser\nkeeps the original and the user stays signed in.",
+        "description": "Clear the session cookie.\n\nUnauthenticated on purpose: signing out must work when the session is\nalready expired or malformed, which is exactly when a browser most wants\nit. There is nothing to protect — the only effect is deleting a cookie the\ncaller already holds.\n\nWhere the cookie is ``Secure`` both of its names are expired: a browser\nsigned in before the ``__Host-`` rename holds only the plain one. Without\n``Secure`` the prefixed name cannot exist.",
         "operationId": "session_logout_v1_session_logout_post",
         "responses": {
           "200": {
