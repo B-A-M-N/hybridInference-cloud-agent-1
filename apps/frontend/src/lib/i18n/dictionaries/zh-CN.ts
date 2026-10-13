@@ -442,6 +442,8 @@ export const zhCN: Record<TranslationKey, string> = {
   'conversation.executionHistory': '执行记录（{count}）',
   'conversation.viewingExecution': '正在查看第 {number} 次执行',
   'conversation.executionHistoryHint': '选择一次历史执行，查看当时的活动记录。',
+  'conversation.markdownImage': '图片：{alt}',
+  'conversation.markdownImageUntitled': '图片',
 
   // ── Archived sessions ───────────────────────────────────────────────────
   'archive.title': '已归档会话',

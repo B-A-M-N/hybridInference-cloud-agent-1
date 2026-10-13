@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import sys
+import time
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import httpx
@@ -952,12 +956,25 @@ async def test_release_rejects_forbidden_and_undocumented_success_responses():
     assert TOKEN not in receipt.model_dump_json()
 
 
+def _ssh_process(output: bytes, returncode: int = 0) -> SimpleNamespace:
+    """A finished ssh client whose stdout already holds ``output``."""
+    stdout = asyncio.StreamReader()
+    stdout.feed_data(output)
+    stdout.feed_eof()
+    return SimpleNamespace(
+        stdin=MagicMock(drain=AsyncMock()),
+        stdout=stdout,
+        returncode=returncode,
+        wait=AsyncMock(return_value=returncode),
+        kill=MagicMock(),
+    )
+
+
 @pytest.mark.asyncio
 async def test_openssh_uses_pinned_host_keys_and_does_not_place_key_in_arguments(monkeypatch):
     resolver = AsyncMock()
     resolver.resolve.side_effect = ["PRIVATE KEY\n", "node.example.org ssh-ed25519 VERIFIED\n"]
-    process = AsyncMock(returncode=0)
-    process.communicate.return_value = (b"identity", b"")
+    process = _ssh_process(b"identity")
     captured = {}
 
     async def launch(*args, **kwargs):
@@ -987,8 +1004,7 @@ async def test_openssh_uses_pinned_host_keys_and_does_not_place_key_in_arguments
 async def test_openssh_explicitly_unchecked_mode_uses_no_host_key_files(monkeypatch):
     resolver = AsyncMock()
     resolver.resolve.return_value = "PRIVATE KEY\n"
-    process = AsyncMock(returncode=0)
-    process.communicate.return_value = (b"identity", b"")
+    process = _ssh_process(b"identity")
     captured = {}
 
     async def launch(*args, **_kwargs):
@@ -1035,6 +1051,127 @@ async def test_openssh_strict_mode_refuses_missing_host_material_before_launch(m
 
     assert refused.value.code == "ssh_configuration"
     launch.assert_not_awaited()
+
+
+def _unchecked_connection() -> SshConnection:
+    return SshConnection(
+        address="node.example.org",
+        username="agent",
+        credential_ref="ssh-1",
+        known_hosts_ref=UNCHECKED_CLOUDLAB_HOST_KEY_REF,
+    )
+
+
+def _remote(monkeypatch, program: str) -> list[dict]:
+    """Run ``program`` in place of ssh, with the pipes the transport asked for."""
+    real = asyncio.create_subprocess_exec
+    launched: list[dict] = []
+
+    async def launch(*_args, **kwargs):
+        launched.append(kwargs)
+        return await real(sys.executable, "-c", program, **kwargs)
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", launch)
+    return launched
+
+
+@pytest.mark.asyncio
+async def test_openssh_refuses_a_remote_that_keeps_writing_without_waiting_for_eof(monkeypatch):
+    """The cap acts while the bytes arrive, not after the remote decides to stop."""
+    resolver = AsyncMock()
+    resolver.resolve.return_value = "PRIVATE KEY\n"
+    # A node whose machine-id became an endless stream: past the cap, then the
+    # connection stays open. Reading to EOF would wait out the whole timeout.
+    launched = _remote(
+        monkeypatch,
+        "import sys, time\n"
+        "sys.stdout.buffer.write(b'0' * (5 * 1024 * 1024))\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(60)\n",
+    )
+    started = time.monotonic()
+    with pytest.raises(ProviderError) as refused:
+        await OpenSshTransport(resolver).run(
+            _unchecked_connection(), "cat /etc/machine-id", timeout=20
+        )
+    assert refused.value.code == "invalid_response"
+    assert time.monotonic() - started < 15
+    # Remote diagnostics are never read, so they cannot be made to pile up.
+    assert launched[0]["stderr"] == asyncio.subprocess.DEVNULL
+
+
+@pytest.mark.asyncio
+async def test_openssh_delivers_a_large_stdin_while_reading_the_answer(monkeypatch):
+    resolver = AsyncMock()
+    resolver.resolve.return_value = "PRIVATE KEY\n"
+    _remote(
+        monkeypatch,
+        "import sys\nsys.stdout.write(str(len(sys.stdin.buffer.read())))\n",
+    )
+    archive = b"x" * (8 * 1024 * 1024)
+    answer = await OpenSshTransport(resolver).run(
+        _unchecked_connection(), "deploy", stdin=archive, timeout=20
+    )
+    assert answer == str(len(archive))
+
+
+@pytest.mark.asyncio
+async def test_cloudlab_stops_reading_an_oversized_body_at_the_limit():
+    pulled = 0
+
+    async def endless():
+        nonlocal pulled
+        for _ in range(256):
+            pulled += 1
+            yield b" " * (64 * 1024)
+
+    def respond(request):
+        assert request.headers["accept-encoding"] == "identity"
+        return httpx.Response(200, content=endless())
+
+    with pytest.raises(ProviderError) as refused:
+        await provider(respond).validate_connection("account-1")
+    assert refused.value.code == "invalid_response"
+    # 4 MiB is 64 such chunks; the next one is refused instead of buffered.
+    assert pulled == 65
+
+
+@pytest.mark.asyncio
+async def test_cloudlab_drops_an_oversized_error_body_and_keeps_its_status():
+    pulled = 0
+
+    async def endless():
+        nonlocal pulled
+        for _ in range(256):
+            pulled += 1
+            yield b" " * (4 * 1024)
+
+    def respond(request):
+        if request.method == "GET":
+            return _profile_list()
+        return httpx.Response(429, content=endless())
+
+    with pytest.raises(ProviderError) as refused:
+        await provider(respond).acquire(
+            AcquireRequest(mode="provision", config=_provision()), intent()
+        )
+    # The capacity diagnostic is unreadable, so the 429 stays a rate limit.
+    assert (refused.value.code, refused.value.retryable) == ("rate_limited", True)
+    # 16 KiB is 4 such chunks; reading stops at the next one.
+    assert pulled == 5
+
+
+@pytest.mark.asyncio
+async def test_cloudlab_refuses_a_compressed_body_it_did_not_ask_for():
+    def respond(request):
+        return httpx.Response(
+            200, content=b"\x1f\x8b compressed", headers={"Content-Encoding": "gzip"}
+        )
+
+    with pytest.raises(ProviderError) as refused:
+        await provider(respond).validate_connection("account-1")
+    assert refused.value.code == "temporarily_unavailable"
+    assert TOKEN not in str(refused.value)
 
 
 @pytest.mark.asyncio

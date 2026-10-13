@@ -4385,11 +4385,11 @@ class SharedChatSessionSupervisor:
     def guard_network(self) -> builtins.list[SharedSessionDescriptor]:
         """Stop every running group when the host can no longer show its rules.
 
-        The guard re-reads the host at most once a minute and reinstalls what
-        it finds missing, so this only acts when that repair fails twice: a
-        running group would otherwise go on without the boundary it was
-        started behind, and anything a repository left running in it with
-        it. Fail closed — stop them all, which releases their bridges and
+        Every pass reads the host's tables back and reinstalls what it finds
+        missing, so this only acts when that repair fails twice: a running
+        group would otherwise go on without the boundary it was started
+        behind, and anything a repository left running in it with it. Fail
+        closed — stop them all, which releases their bridges and
         keeps their workspaces. Waking one reinstalls and verifies the rules
         before it runs again, and refuses while they cannot be.
         """

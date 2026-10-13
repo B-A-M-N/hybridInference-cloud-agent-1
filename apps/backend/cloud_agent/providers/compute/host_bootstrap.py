@@ -632,6 +632,42 @@ _FORBIDDEN_ENV = {
 }
 
 
+#: Every failure code the remote scripts in this module print. A node runs
+#: them, as root, and can print anything in their place; and a code travels on
+#: verbatim — as a ProviderError code or a blocked reason, into the operation
+#: record, the log, the admin view and the text of the ops webhook. So only
+#: this vocabulary is believed. Anything else is treated as no reason at all,
+#: which every caller already answers with its own generic code.
+_REMOTE_REASONS = frozenset(
+    {
+        "data_mount_unavailable",
+        "data_mount_conflict",
+        "data_mount_failed",
+        "prerequisites_update_failed",
+        "prerequisites_install_failed",
+        "docker_start_failed",
+        "kata_install_failed",
+        "host_deployment_failed",
+        "host_readiness_failed",
+        "deployment_identity_conflict",
+        "host_stop_failed",
+        "transfer_failed",
+    }
+)
+
+
+def _remote_reason(value: object) -> str | None:
+    """Return a remote failure code if it is one of ours, else ``None``."""
+    return value if isinstance(value, str) and value in _REMOTE_REASONS else None
+
+
+def _remote_reasons(value: object) -> tuple[str, ...]:
+    """Keep only the remote blocked reasons that belong to our vocabulary."""
+    if not isinstance(value, list):
+        return ()
+    return tuple(reason for reason in value if _remote_reason(reason) is not None)
+
+
 class SshHostBootstrap:
     """Install and verify the existing host deployment recipe through SSH."""
 
@@ -971,7 +1007,7 @@ class SshHostBootstrap:
             ready=result.get("ready") is True,
             host=intent.host,
             deployment_sha=profile.deployment_sha,
-            blocked_reasons=tuple(result.get("blocked_reasons", ())),
+            blocked_reasons=_remote_reasons(result.get("blocked_reasons")),
             advertising=advertising if isinstance(advertising, bool) else None,
         )
 
@@ -994,7 +1030,7 @@ class SshHostBootstrap:
             ready=result.get("ready") is True,
             host=intent.host,
             deployment_sha=profile.deployment_sha,
-            blocked_reasons=tuple(result.get("blocked_reasons", ())),
+            blocked_reasons=_remote_reasons(result.get("blocked_reasons")),
         )
 
     async def inventory(
@@ -1018,10 +1054,11 @@ class SshHostBootstrap:
             await self._transport.run(self._connection(node), script, timeout=_STOP_TIMEOUT_SECONDS)
         )
         if result.get("stopped") is not True:
+            reason = _remote_reason(result.get("reason"))
             raise ProviderError(
-                str(result.get("reason") or "host_stop_failed"),
+                reason or "host_stop_failed",
                 "The Host could not be stopped",
-                retryable=result.get("reason") == "host_stop_failed",
+                retryable=reason == "host_stop_failed",
             )
 
     async def transfer(
@@ -1061,6 +1098,7 @@ class SshHostBootstrap:
         target_params = self._params(target_profile, target_intent)
         authorize = {
             "key": public_key,
+            "source": source_connection.address,
             "first": first,
             "root": target_params["root"],
             "identity": target_params["identity"],
@@ -1077,7 +1115,7 @@ class SshHostBootstrap:
         )
         if authorized.get("authorized") is not True:
             raise ProviderError(
-                str(authorized.get("reason") or "transfer_failed"),
+                _remote_reason(authorized.get("reason")) or "transfer_failed",
                 "The target node cannot receive the Host's state",
             )
         push = {
@@ -1121,9 +1159,9 @@ class SshHostBootstrap:
         script = "sudo -n python3 -c " + shlex.quote(_WIPE) + " " + shlex.quote(json.dumps(params))
         result = self._json(await self._transport.run(self._connection(node), script, timeout=1800))
         if result.get("wiped") is not True:
-            reason = result.get("reason")
+            reason = _remote_reason(result.get("reason"))
             raise ProviderError(
-                str(reason or "wipe_failed"),
+                reason or "wipe_failed",
                 "The node's container state could not be removed",
                 retryable=reason is None,
             )
@@ -1187,9 +1225,45 @@ _TRANSFER_KEY = (
     "[ -f $d/key ] || ssh-keygen -q -t ed25519 -N '' -C ca-transfer -f $d/key; cat $d/key.pub"
 )
 
+# The forced command of the transfer key on the target. The copy in _PUSH sends
+# only rsync's receiving server, through sudo, into the directories it copies;
+# anything else — a shell, another program, rsync --sender reading the target's
+# files back, another destination — is refused before it runs. Receiving into
+# /var/lib as root still trusts the source with the target's container state,
+# which is what the copy is for, but no longer with an interactive root shell.
+# Server arguments are what rsync 3.2.7 (Ubuntu 22.04 and 24.04) sends for the
+# _PUSH options: one short-option cluster ending in its capability string, a
+# few long options, then "." and the destination.
+_TRANSFER_RECEIVE = r"""
+import os, re, shlex, sys
+destinations = {
+    '/var/lib/',
+    '/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/',
+    '/var/lib/containerd/io.containerd.content.v1.content/blobs/sha256/',
+}
+options = {'--stats', '--numeric-ids', '--delete', '--no-r'}
+try:
+    argv = shlex.split(os.environ.get('SSH_ORIGINAL_COMMAND', ''))
+except ValueError:
+    argv = []
+if not (
+    len(argv) >= 7
+    and argv[:4] == ['sudo', '-n', 'rsync', '--server']
+    and argv[-2] == '.'
+    and argv[-1] in destinations
+    and all(
+        re.fullmatch(r'-[ldHogDtpAXrRxS]+(?:e\.[A-Za-z]+)?', flag) or flag in options
+        for flag in argv[4:-2]
+    )
+):
+    sys.stderr.write('this key only receives the Host state transfer\n')
+    raise SystemExit(1)
+os.execvp('sudo', argv)
+"""
+
 # Runs as the management user on the target; sudo only for daemon and state steps.
 _AUTHORIZE_TRANSFER = r"""
-import json, subprocess, sys
+import ipaddress, json, re, socket, subprocess, sys
 from pathlib import Path
 params = json.loads(sys.argv[1])
 def refuse(reason):
@@ -1201,6 +1275,21 @@ try:
         refuse('deployment_identity_conflict')
 except ValueError:
     refuse('deployment_identity_conflict')
+# Checked before anything here changes. The key works only from the source, as
+# this machine resolves the address the control plane reaches it at; sshd
+# matches from= against the peer's address.
+try:
+    sources = sorted({
+        str(ipaddress.ip_address(info[4][0].split('%')[0]))
+        for info in socket.getaddrinfo(params['source'], None, type=socket.SOCK_STREAM)
+    })
+except (OSError, UnicodeError, ValueError):
+    sources = []
+if not sources:
+    refuse('transfer_failed')
+receive = Path.home() / '.ssh' / 'ca-transfer-receive'
+if not all(re.fullmatch(r'[A-Za-z0-9_./+-]+', path) for path in (sys.executable, str(receive))):
+    refuse('transfer_failed')
 quiet = {'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL}
 if subprocess.run(['sudo', '-n', 'systemctl', 'stop', 'docker.socket', 'docker', 'containerd'], **quiet).returncode:
     refuse('transfer_failed')
@@ -1212,16 +1301,25 @@ if params['first']:
             refuse('transfer_failed')
 ssh = Path.home() / '.ssh'
 ssh.mkdir(mode=0o700, exist_ok=True)
+receive.unlink(missing_ok=True)
+receive.write_text(RECEIVE_PROGRAM)
+receive.chmod(0o700)
 keys = ssh / 'authorized_keys'
 current = keys.read_text() if keys.exists() else ''
-entry = 'restrict ' + params['key']
-if entry not in current.splitlines():
-    keys.write_text(current.rstrip('\n') + ('\n' if current.strip() else '') + entry + '\n')
+entry = (
+    'restrict,from="' + ','.join(sources) + '",command="' + sys.executable + ' -I '
+    + str(receive) + '" ' + params['key']
+)
+# One transfer key at a time: an entry from an earlier attempt, or from a
+# control plane that authorized it without these restrictions, is replaced.
+kept = [line for line in current.splitlines() if not line.endswith(' ca-transfer')]
+keys.write_text(''.join(line + '\n' for line in [*kept, entry]))
 keys.chmod(0o600)
 print(json.dumps({'authorized': True}))
-"""
+""".replace("RECEIVE_PROGRAM", repr(_TRANSFER_RECEIVE))
 
 _REVOKE_TRANSFER_TARGET = (
+    "rm -f ~/.ssh/ca-transfer-receive; "
     'f=~/.ssh/authorized_keys; [ -f "$f" ] || exit 0; '
     '{ grep -v \' ca-transfer$\' "$f" || true; } > "$f.ca"; '
     'mv "$f.ca" "$f"; chmod 600 "$f"'

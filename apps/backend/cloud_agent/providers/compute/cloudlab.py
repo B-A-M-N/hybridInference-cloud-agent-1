@@ -7,6 +7,7 @@ must supply its verified HTTPS endpoint; credentials never follow redirects.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Annotated, Any, Literal
@@ -18,6 +19,7 @@ import httpx
 from pydantic import Field, ValidationError, field_validator, model_validator
 
 from cloud_agent.domain.compute import normalize_user_public_key
+from cloud_agent.mcp.http_body import IDENTITY_ENCODING_HEADERS, iter_response_bytes
 from cloud_agent.ports.external.compute_provider import (
     AcquireRequest,
     AcquisitionResolution,
@@ -91,6 +93,16 @@ class CloudLabConfig(ComputeValue):
     def validate_external_id(cls, value: str | None) -> str | None:
         """Canonicalize an experiment UUID before constructing a request URL."""
         return str(UUID(value)) if value else None
+
+
+#: The largest Portal API body this adapter keeps — the ceiling it always had,
+#: now applied while the body arrives instead of after all of it has.
+_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+#: An error body is read only for its short ``error`` diagnostic.
+_MAX_ERROR_BYTES = 16 * 1024
+#: One request from connect to its last body byte. httpx's own timeout bounds
+#: each read, so an endpoint that drips a byte at a time is bounded only here.
+_REQUEST_DEADLINE_S = 180.0
 
 
 # Parameters of deploy/cloudlab/cloud-agent-node.py the boot script reads.
@@ -241,26 +253,18 @@ class CloudLabProvider(ComputeProvider):
         token = (await self._resolver.resolve(credential_ref)).strip()
         if not token or "\n" in token or "\r" in token:
             raise ProviderError("credential_invalid", "CloudLab credential is missing or malformed")
+        headers = {"X-Api-Token": token, "X-Api-Elaborate": "true", **IDENTITY_ENCODING_HEADERS}
         try:
-            if self._client is not None:
-                response = await self._client.request(
-                    method,
-                    api_url + path,
-                    headers={"X-Api-Token": token, "X-Api-Elaborate": "true"},
-                    json=payload,
-                    follow_redirects=False,
-                    timeout=60,
-                )
-            else:
-                async with httpx.AsyncClient() as client:
-                    response = await client.request(
-                        method,
-                        api_url + path,
-                        headers={"X-Api-Token": token, "X-Api-Elaborate": "true"},
-                        json=payload,
-                        follow_redirects=False,
-                        timeout=60,
+            async with asyncio.timeout(_REQUEST_DEADLINE_S):
+                if self._client is not None:
+                    response = await self._exchange(
+                        self._client, method, api_url + path, headers, payload
                     )
+                else:
+                    async with httpx.AsyncClient() as client:
+                        response = await self._exchange(
+                            client, method, api_url + path, headers, payload
+                        )
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
             # No byte of the request left this process: the TCP or TLS
             # handshake failed (the API host has intermittently served an
@@ -268,7 +272,7 @@ class CloudLabProvider(ComputeProvider):
             raise ProviderError(
                 "temporarily_unavailable", "CloudLab could not be reached", retryable=True
             ) from None
-        except httpx.RequestError:
+        except (httpx.RequestError, TimeoutError):
             mutation = method != "GET"
             raise ProviderError(
                 "result_unknown" if mutation else "temporarily_unavailable",
@@ -317,9 +321,49 @@ class CloudLabProvider(ComputeProvider):
         return response
 
     @staticmethod
+    async def _exchange(
+        client: httpx.AsyncClient,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, Any] | None,
+    ) -> httpx.Response:
+        """Send one request and keep at most :data:`_MAX_RESPONSE_BYTES` of its body.
+
+        A buffered request reads the whole body before anything can look at
+        its size, so the endpoint, not this process, would decide how much is
+        held in memory. The body is streamed instead and refused once it
+        passes the ceiling. An error body is read only for its short portal
+        diagnostic: past :data:`_MAX_ERROR_BYTES` it is dropped, never
+        refused, so the status still decides the outcome. The returned
+        response holds just the status and the bytes that were kept.
+        """
+        async with client.stream(
+            method,
+            url,
+            headers=headers,
+            json=payload,
+            follow_redirects=False,
+            timeout=60,
+        ) as streamed:
+            body = bytearray()
+            if streamed.status_code < 300:
+                async for chunk in iter_response_bytes(streamed):
+                    if len(body) + len(chunk) > _MAX_RESPONSE_BYTES:
+                        raise ProviderError(
+                            "invalid_response", "CloudLab response exceeds the size limit"
+                        )
+                    body.extend(chunk)
+            elif streamed.status_code == 429 or streamed.status_code >= 500:
+                async for chunk in iter_response_bytes(streamed):
+                    if len(body) + len(chunk) > _MAX_ERROR_BYTES:
+                        body.clear()
+                        break
+                    body.extend(chunk)
+        return httpx.Response(streamed.status_code, content=bytes(body), request=streamed.request)
+
+    @staticmethod
     def _json(response: httpx.Response) -> dict[str, Any]:
-        if len(response.content) > 4 * 1024 * 1024:
-            raise ProviderError("invalid_response", "CloudLab response exceeds the size limit")
         try:
             value = response.json()
         except (ValueError, UnicodeError):

@@ -150,6 +150,24 @@ describe('MCP authorization return', () => {
     expect(screen.queryByText(/Team wiki authorized/)).not.toBeInTheDocument();
   });
 
+  it('shows text the link carried only as quoted, unverified detail', async () => {
+    // Anyone can write this URL; the page must not speak the sentence as its own.
+    navigation.search = new URLSearchParams({
+      mcp_authorized: '0',
+      mcp_connection: '3',
+      mcp_message: 'Your workspace was suspended. Email billing@evil.example to restore it.',
+    }).toString();
+    vi.mocked(listMcpConnections).mockResolvedValue({
+      connections: [{ ...connection, has_credential: false }],
+      templates: [],
+    });
+    render(<IntegrationsPage />);
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Sign-in did not complete. Try again. Unverified detail from the redirect: ' +
+        '“Your workspace was suspended. Email billing@evil.example to restore it.”',
+    );
+  });
+
   it('verifies the stored credential before announcing authorization success', async () => {
     navigation.search = 'mcp_authorized=1&mcp_connection=3';
     vi.mocked(listMcpConnections).mockResolvedValue({

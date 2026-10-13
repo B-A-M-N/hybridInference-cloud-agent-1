@@ -275,8 +275,13 @@ and its health state. Before setup, a waiting container is healthy and logs
 `Waiting for first-time setup in Admin -> Database.` After setup, unreadable
 bootstrap storage or unavailable PostgreSQL prevent startup. Setup records
 `agent.database.pgadmin.setup`; opening pgAdmin records
-`agent.database.pgadmin.open` in the Agent audit log; pgAdmin manages SQL
-activity itself. Resetting **Private pgAdmin URL** in Admin Settings disables
+`agent.database.pgadmin.open` in the Agent audit log, both for the launch link
+and for the first request of a new pgAdmin session at any URL. The Agent audit
+log does not record SQL: pgAdmin connects as the database owner, which can
+change any table, the audit log included, so treat pgAdmin access as full
+database access. The proxy adds `frame-ancestors 'self'`, `nosniff` and
+`X-Frame-Options: SAMEORIGIN` to pgAdmin's responses; pgAdmin's own policy still
+allows its inline scripts. Resetting **Private pgAdmin URL** in Admin Settings disables
 access after the listeners synchronize; removing the profile and stopping
 pgAdmin preserves its volume.
 
@@ -1641,6 +1646,21 @@ requires `overlay2` on XFS mounted with project quotas (`pquota` or
 keep their original limits through follow-ups, restarts, snapshots and Fork.
 See `ENVIRONMENT.md` for bootstrap variables and storage requirements.
 
+**Recommended for servers that run untrusted work.** An `untrusted-kata-v1`
+sandbox's writable layer holds its workspace and every installed file, survives
+`docker stop`, and shares one disk with every other sandbox on the server, so
+without a disk limit one tenant can fill that disk for all of them. Set
+**Container disk** above 0 on each Kata server once its Docker data root is on
+XFS with project quotas. This is a recommendation, not a requirement: scheduling
+and admission do not change, and a server left at 0 keeps taking untrusted
+work. Each claim reports the limit a new group would get (the claim
+attestation's `sandbox_disk_limit_mib`). The control plane logs
+`agent_untrusted_sandbox_without_disk_quota` when it hands such a server a new
+untrusted group, the runner logs the same event as it starts that group, and
+the Servers page shows **No container disk quota** under that server's
+Storage. Existing groups keep the limit they were created with and are not
+flagged.
+
 #### Sandbox archives
 
 This policy captures automatic initial and final lifecycle archives. The
@@ -2887,8 +2907,9 @@ Refused:
   `127.0.0.0/8`, `169.254.0.0/16` (cloud metadata among them), `172.16.0.0/12`,
   `192.0.0.0/24`, `192.0.2.0/24`, `192.88.99.0/24`, `192.168.0.0/16`,
   `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`, `224.0.0.0/4` and
-  `240.0.0.0/4` — and whatever `AGENT_EGRESS_PROTECTED_CIDRS` adds, on any
-  port;
+  `240.0.0.0/4` — plus Azure's WireServer, `168.63.129.16`, a platform
+  service on a public address, and whatever `AGENT_EGRESS_PROTECTED_CIDRS`
+  adds, on any port;
 - other groups, this deployment's or another's;
 - every other port and protocol: UDP 443 (QUIC), ping, all IPv6;
 - connections started from outside. A reply is accepted only for a connection
@@ -2971,8 +2992,9 @@ rules, not the host's.
   removed with the bridge. The relay's own default route stays on its stack
   network, because it joins every group bridge at gateway priority -1.
 - **Watched while groups run.** While any group of this deployment is
-  running, the broker re-reads the tables at most once a minute and reinstalls
-  whatever is missing. If that fails twice in a row, it logs
+  running, the broker reads the tables back on every five-second sweep, logs
+  `network_guard_rules_changed` when they differ from what it installed, and
+  reinstalls whatever is missing. If that fails twice in a row, it logs
   `shared_chat_network_unguarded` and stops every running group — workspaces
   and native sessions kept — rather than let one go on without the boundary it
   was started behind. Waking a group reinstalls and verifies the rules first,
@@ -3119,9 +3141,10 @@ network; the workspace is kept:
   - `relay host:port unreachable: …`;
   - `the host at …:9/udp was refused by ECONNREFUSED, not by the network
     rules`, `the metadata address 169.254.169.254:80 answered; the network
-    rules are not in this guest's path`, or `… was not refused within 2s` —
-    the host and the metadata address must be refused at once by the rules'
-    own ICMP answer, and were not: the guest's traffic is not passing this
+    rules are not in this guest's path` (or the same for `the platform
+    address 168.63.129.16:80`), or `… was not refused within 2s` — the host
+    and both platform addresses must be refused at once by the rules' own
+    ICMP answer, and were not: the guest's traffic is not passing this
     deployment's tables.
 
   The sandbox is stopped, not deleted. Reaching the public internet is not

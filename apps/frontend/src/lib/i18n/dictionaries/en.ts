@@ -467,6 +467,8 @@ export const en = {
   'conversation.executionHistory': 'Execution history ({count})',
   'conversation.viewingExecution': 'Viewing execution {number}',
   'conversation.executionHistoryHint': 'Select a past execution to view its recorded activity.',
+  'conversation.markdownImage': 'Image: {alt}',
+  'conversation.markdownImageUntitled': 'Image',
 
   // ── Archived sessions ───────────────────────────────────────────────────
   'archive.title': 'Archived sessions',
