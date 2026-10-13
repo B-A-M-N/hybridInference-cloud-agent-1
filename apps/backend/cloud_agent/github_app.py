@@ -303,6 +303,7 @@ class GitHubAppCredentials:
         #: read, and the repositories it named.
         self._user_repositories: dict[tuple[str, tuple[int, ...]], tuple[float, list[str]]] = {}
         self._cipher: SourceControlCipher | None = None
+        self._direct_write_cipher: SourceControlCipher | None = None
         self._client = client
         self._owned: httpx.AsyncClient | None = None
         self._active_http = 0
@@ -392,6 +393,15 @@ class GitHubAppCredentials:
         return self._cipher
 
     @property
+    def direct_write_cipher(self) -> SourceControlCipher:
+        """Encryption key isolated to revocable, short-lived write tokens."""
+        if self._direct_write_cipher is None:
+            self._direct_write_cipher = SourceControlCipher(
+                domain=b"hybridinference/direct-write-token/v1"
+            )
+        return self._direct_write_cipher
+
+    @property
     def user_authorization_configured(self) -> bool:
         """Whether the App can exchange a browser authorization code."""
         return bool(self._config.client_id and self._config.client_secret)
@@ -472,6 +482,7 @@ class GitHubAppCredentials:
         permissions: dict[str, str] | None = None,
         repository_scoped: bool = False,
         min_ttl_s: float = 0.0,
+        cache_tag: str | None = None,
     ) -> str:
         """Return a live installation token for one repository.
 
@@ -490,12 +501,20 @@ class GitHubAppCredentials:
         ``min_ttl_s`` is how long the token must still live, for a caller whose
         work outlasts the usual refresh margin: a cached token closer to its
         expiry is replaced rather than handed out to fail midway.
+
+        ``cache_tag`` separates otherwise equal scopes whose authorization
+        revision differs, so a newly enabled policy cannot reuse an earlier
+        token cache entry.
         """
         installation_id = await self.installation_id_for(repo)
         scope = repo if repository_scoped else None
         try:
             token, minted = await self._token_in_scope(
-                installation_id, permissions=permissions, repository=scope, min_ttl_s=min_ttl_s
+                installation_id,
+                permissions=permissions,
+                repository=scope,
+                min_ttl_s=min_ttl_s,
+                cache_tag=cache_tag,
             )
         except GitHubAppError as exc:
             if exc.status not in _STALE_INSTALLATION_STATUSES:
@@ -508,6 +527,7 @@ class GitHubAppCredentials:
                     permissions=permissions,
                     repository=scope,
                     min_ttl_s=min_ttl_s,
+                    cache_tag=cache_tag,
                 )
             except GitHubAppError as retry_exc:
                 if retry_exc.status == 404:
@@ -534,6 +554,7 @@ class GitHubAppCredentials:
         permissions: dict[str, str] | None = None,
         repository: str | None = None,
         min_ttl_s: float = 0.0,
+        cache_tag: str | None = None,
     ) -> tuple[str, bool]:
         """Return a token for one installation and scope, and whether it is new.
 
@@ -547,7 +568,9 @@ class GitHubAppCredentials:
         apart, and it is derived from the same two values that shape the
         request — so a slot cannot describe a scope the token does not have.
         """
-        scope_key = json_module.dumps({"p": permissions, "r": repository}, sort_keys=True)
+        scope_key = json_module.dumps(
+            {"p": permissions, "r": repository, "tag": cache_tag}, sort_keys=True
+        )
         cached = self._tokens.get((installation_id, scope_key))
         margin = max(_TOKEN_REFRESH_MARGIN_S, min_ttl_s)
         if cached and cached.expires_at - margin > time.time():
@@ -572,8 +595,94 @@ class GitHubAppCredentials:
         expires_at = time.time() + 3600
         if raw_expiry := body.get("expires_at"):
             expires_at = _parse_expiry(raw_expiry, default=expires_at)
-        self._tokens[installation_id, scope_key] = _CachedToken(token=token, expires_at=expires_at)
+        if cache:
+            self._tokens[installation_id, scope_key] = _CachedToken(
+                token=token, expires_at=expires_at
+            )
         return token, True
+
+    async def repository_identity(self, repo: str) -> dict[str, Any]:
+        """Resolve a repository's immutable GitHub ID and current canonical name.
+
+        The lookup uses an installation-scoped read token. It establishes the
+        repository identity only; it does not authorize sandbox writes.
+        """
+        owner, separator, name = repo.partition("/")
+        if not separator or not owner or not name:
+            raise GitHubAppError("repo must be 'owner/name'")
+        token = await self.token_for(repo, permissions={"contents": "read"}, repository_scoped=True)
+        body = await self._request(
+            "GET", f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}", token=token
+        )
+        repository_id = body.get("id")
+        full_name = body.get("full_name")
+        if (
+            not isinstance(repository_id, int)
+            or repository_id <= 0
+            or not isinstance(full_name, str)
+            or full_name.count("/") != 1
+        ):
+            raise GitHubAppError("GitHub returned an invalid repository identity")
+        return {"repository_id": repository_id, "full_name": full_name}
+
+    async def repositories_for_user(
+        self, user_token: str, installation_id: int
+    ) -> list[dict[str, Any]]:
+        """List repositories and permissions visible to this linked GitHub user."""
+        repositories: list[dict[str, Any]] = []
+        page = 1
+        async with self._http() as client:
+            while page <= 10:
+                response = await client.get(
+                    f"{self._config.api_base}/user/installations/{installation_id}/repositories",
+                    params={"per_page": 100, "page": page},
+                    headers={
+                        "Authorization": f"Bearer {user_token}",
+                        "Accept": "application/vnd.github+json",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                )
+                if response.status_code == 401:
+                    raise UserAuthorizationRevoked("GitHub refused the user's token")
+                if response.status_code in (403, 404):
+                    return []
+                if response.status_code >= 400:
+                    raise GitHubAppError(
+                        f"could not list the user's repositories in installation "
+                        f"{installation_id} ({response.status_code})",
+                        status=response.status_code,
+                    )
+                entries = response.json().get("repositories", [])
+                repositories.extend(
+                    {
+                        "id": entry.get("id"),
+                        "full_name": entry.get("full_name"),
+                        "permissions": dict(entry.get("permissions") or {}),
+                    }
+                    for entry in entries
+                    if isinstance(entry, dict)
+                )
+                if len(entries) < 100:
+                    break
+                page += 1
+        return repositories
+
+    async def revoke_installation_token(self, token: str) -> None:
+        """Revoke the installation token used for this call at GitHub."""
+        async with self._http() as client:
+            response = await client.delete(
+                f"{self._config.api_base}/installation/token",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+        if response.status_code not in (204, 401):
+            raise GitHubAppError(
+                f"GitHub installation token revocation failed ({response.status_code})",
+                status=response.status_code,
+            )
 
     async def exchange_user_code(self, code: str) -> UserTokens:
         """Trade the callback's code for a token that speaks *as the user*.

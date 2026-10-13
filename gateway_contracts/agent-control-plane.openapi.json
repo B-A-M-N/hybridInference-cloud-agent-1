@@ -18894,6 +18894,20 @@
             "description": "Short-lived read-only credential for this one repository, for the runner to check it out with. Stays in the runner; never enters the sandbox. Null when no GitHub App is configured, which is enough for a public repository.",
             "title": "Clone Token"
           },
+          "direct_write_repo": {
+            "anyOf": [
+              {
+                "maxLength": 140,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,38}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Canonical GitHub push target, present only with an authorized write token.",
+            "title": "Direct Write Repo"
+          },
           "environment": {
             "anyOf": [
               {
@@ -18931,7 +18945,7 @@
                 "type": "null"
               }
             ],
-            "description": "Short-lived GitHub App token scoped to this repository with contents and pull_requests write permissions. Injected as GH_TOKEN in the owning sandbox member for pushing branches and creating pull requests. Null when no GitHub App installation covers the repository.",
+            "description": "Short-lived GitHub App token scoped to this repository with contents and pull_requests write permissions. Injected as GH_TOKEN only after the repository's persisted direct-write policy is verified.",
             "title": "Github Token"
           },
           "job_id": {

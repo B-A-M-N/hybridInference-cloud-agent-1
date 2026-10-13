@@ -328,10 +328,15 @@ class WorkerClaimResponse(BaseModel):
         repr=False,
         description=(
             "Short-lived GitHub App token scoped to this repository with contents and "
-            "pull_requests write permissions. Injected as GH_TOKEN in the owning sandbox "
-            "member for pushing branches and creating pull requests. Null when no GitHub "
-            "App installation covers the repository."
+            "pull_requests write permissions. Injected as GH_TOKEN only after the "
+            "repository's persisted direct-write policy is verified."
         ),
+    )
+    direct_write_repo: str | None = Field(
+        None,
+        pattern=REPO_PATTERN,
+        max_length=140,
+        description="Canonical GitHub push target, present only with an authorized write token.",
     )
     mcp_bindings: list[str] = Field(
         default_factory=list,

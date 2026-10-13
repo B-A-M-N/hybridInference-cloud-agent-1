@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import os
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Protocol
@@ -304,6 +305,104 @@ def _require_store(store: _WorkerStorage | None) -> _WorkerStorage:
 # delivered to the sandbox for branch and pull-request publication.
 _CLONE_SCOPE = {"contents": "read"}
 _SANDBOX_GITHUB_SCOPE = {"contents": "write", "pull_requests": "write"}
+
+
+class DirectWritePolicyUnavailable(Exception):
+    """The policy or its current repository identity could not be verified."""
+
+
+async def _direct_write_token_for_claim(
+    repo: str,
+    *,
+    store: SourceControlPort,
+    app_credentials: Any,
+    job_id: str,
+) -> tuple[str | None, str | None]:
+    """Issue only against the current opt-in revision and track for revocation."""
+    token: str | None = None
+    token_hash: str | None = None
+    registered = False
+    try:
+        identity = await app_credentials.repository_identity(repo)
+        policy = await store.get_direct_write_policy(
+            github_repository_id=identity["repository_id"],
+            repository_full_name=identity["full_name"],
+        )
+    except AppNotInstalled:
+        # Public repositories can still run without this App, but cannot get
+        # a sandbox write credential.
+        return None, None
+    except Exception as exc:
+        logger.warning(
+            "agent_direct_write_policy_unavailable",
+            extra={"event": "agent_direct_write_policy_unavailable", "job_id": job_id},
+        )
+        raise DirectWritePolicyUnavailable from exc
+    if not policy.get("enabled"):
+        return None, None
+
+    revision = int(policy["revision"])
+    minted_at = datetime.now(UTC)
+
+    async def revoke_candidate() -> None:
+        """Revoke this undisclosed token and clear its record only on success."""
+        if token is None:
+            return
+        try:
+            await app_credentials.revoke_installation_token(token)
+        except Exception:
+            logger.warning(
+                "agent_direct_write_token_revoke_pending",
+                extra={"event": "agent_direct_write_token_revoke_pending", "job_id": job_id},
+            )
+            return
+        if registered and token_hash is not None:
+            try:
+                await store.forget_direct_write_token(token_hash=token_hash)
+            except Exception:
+                logger.warning(
+                    "agent_direct_write_token_record_cleanup_failed",
+                    extra={"event": "agent_direct_write_token_record_cleanup_failed"},
+                )
+
+    try:
+        token = await app_credentials.token_for(
+            repo,
+            permissions=_SANDBOX_GITHUB_SCOPE,
+            repository_scoped=True,
+            cache_tag=f"direct-write-policy:{revision}",
+        )
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        registered = await store.register_direct_write_token(
+            github_repository_id=identity["repository_id"],
+            policy_revision=revision,
+            token_hash=token_hash,
+            token_ciphertext=app_credentials.direct_write_cipher.encrypt(token),
+            # GitHub installation tokens expire one hour after issuance. Using
+            # the request start produces an early cleanup bound, never a later
+            # one, even when the API call takes measurable time.
+            expires_at=minted_at + timedelta(hours=1),
+        )
+        if not registered:
+            raise RuntimeError("write token could not be registered for revocation")
+        current = await store.get_direct_write_policy(
+            github_repository_id=identity["repository_id"],
+            repository_full_name=identity["full_name"],
+        )
+        if current.get("enabled") and int(current["revision"]) == revision:
+            return token, identity["full_name"]
+    except Exception as exc:
+        logger.warning(
+            "agent_direct_write_token_unavailable",
+            extra={"event": "agent_direct_write_token_unavailable", "job_id": job_id},
+        )
+        await revoke_candidate()
+        raise DirectWritePolicyUnavailable from exc
+    # A concurrent disable/revision never returns the token. Revoke it now;
+    # if GitHub is temporarily unavailable, its encrypted record remains until
+    # the next disable retry or its one-hour expiry.
+    await revoke_candidate()
+    return None, None
 
 
 #: Cheap structural check before touching the signing key: host credentials
@@ -947,18 +1046,10 @@ async def _hand_over_claim(
         "attempt_id": claim["attempt_id"],
         "lease_generation": claim["lease_generation"],
     }
-    # Whether the owner may still use Agent at all comes first: it is the one
-    # check every turn passes here, including the ones no request admitted.
+    # Re-check both owner access and repository entitlement at claim time.
+    # These checks precede all credential minting, so a stale queued job cannot
+    # receive credentials after either authorization has changed.
     await _require_owner_agent_access(job_store, gateway, claim)
-    # Re-checked at claim time, not just at create time. A row written before
-    # this check existed — or while the allowlist was wider — must not be able
-    # to produce a credential now.
-    #
-    # **And before any credential is minted.** A refusal here used to arrive
-    # after the gateway had already issued this attempt a grant, so every
-    # claim of a job whose repository its owner can no longer reach cost a
-    # mint and, later, a revocation, for a turn that was never going to run.
-    # Nothing below is asked for until the job is known to be runnable.
     try:
         # The same check create used. The allowlist-only variant here meant a
         # job entitled by its owner's own GitHub connection passed creation and
@@ -1114,15 +1205,12 @@ async def _hand_over_claim(
     # public repository clones without any credential at all.
     clone_token: str | None = None
     github_token: str | None = None
-    # A temporary workspace has no repository, so there is nothing to clone and
-    # nothing a repository-scoped token could be scoped to: it gets neither.
+    direct_write_repo: str | None = None
+    # Temporary workspaces have no repository to authorize or clone.
     if app_credentials is not None and claim["repo"] is not None:
         try:
             clone_token = await app_credentials.token_for(
                 claim["repo"], permissions=_CLONE_SCOPE, repository_scoped=True
-            )
-            github_token = await app_credentials.token_for(
-                claim["repo"], permissions=_SANDBOX_GITHUB_SCOPE, repository_scoped=True
             )
         except AppNotInstalled:
             # A settled answer: the App does not cover this repository. Hand
@@ -1167,6 +1255,37 @@ async def _hand_over_claim(
                     }
                 },
             ) from exc
+
+        # App coverage and job entitlement never imply write authority. The
+        # direct-write policy is looked up by GitHub's immutable repository ID
+        # and read again after minting to close the claim/mint race.
+        if clone_token is not None:
+            try:
+                github_token, direct_write_repo = await _direct_write_token_for_claim(
+                    claim["repo"],
+                    store=job_store.source_control,
+                    app_credentials=app_credentials,
+                    job_id=claim["id"],
+                )
+            except DirectWritePolicyUnavailable as exc:
+                await job_store.attempt_commands.release_claim(
+                    job_id=claim["id"],
+                    attempt_id=claim["attempt_id"],
+                    lease_generation=claim["lease_generation"],
+                    retry_after_seconds=30,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": {
+                            "type": "direct_write_policy_unavailable",
+                            "message": (
+                                "Repository write access could not be verified; the job was "
+                                "returned to the queue without a write credential."
+                            ),
+                        }
+                    },
+                ) from exc
 
     # Resolve at every claim, including existing conversations and native
     # resumes. Loading the bindings adds newly connected servers while retaining
@@ -1251,6 +1370,7 @@ async def _hand_over_claim(
         mcp_token=mcp_token,
         clone_token=clone_token,
         github_token=github_token,
+        direct_write_repo=direct_write_repo,
         # Aliases, because that is what the runtime config addresses: the relay
         # path segment is the binding alias, and the runner learns nothing about
         # where the connection points.

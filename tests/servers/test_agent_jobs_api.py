@@ -5511,7 +5511,7 @@ async def test_event_type_guard_rejects_a_trailing_newline(client: AsyncClient):
 
 
 async def test_the_claim_carries_a_read_only_clone_credential(store: FakeStorage):
-    """Checkout stays read-only; sandbox publication uses a separate scoped token."""
+    """App coverage alone cannot cross the direct-write trust gate."""
     from cloud_agent.api.deps import get_agent_app_credentials
 
     asked: list[dict[str, Any]] = []
@@ -5519,11 +5519,13 @@ async def test_the_claim_carries_a_read_only_clone_credential(store: FakeStorage
     class FakeApp:
         async def token_for(self, repo: str, **kwargs: Any) -> str:
             asked.append({"repo": repo, **kwargs})
-            return (
-                "ghs_clone_only"
-                if kwargs["permissions"] == {"contents": "read"}
-                else "sandbox-write-token"
-            )
+
+            return "ghs_clone_only"
+
+        async def repository_identity(self, repo: str) -> dict[str, Any]:
+            return {"repository_id": 9001, "full_name": repo}
+
+    store.get_direct_write_policy = AsyncMock(return_value={"enabled": False, "revision": 0})
 
     app = _build_app(store)
     app.dependency_overrides[get_agent_app_credentials] = lambda: FakeApp()
@@ -5535,13 +5537,65 @@ async def test_the_claim_carries_a_read_only_clone_credential(store: FakeStorage
     assert claim.json()["clone_token"] == "ghs_clone_only"
     assert asked[0]["permissions"] == {"contents": "read"}
     assert asked[0]["repository_scoped"] is True
-    assert claim.json()["github_token"] == "sandbox-write-token"
-    assert asked[1] == {
-        "repo": claim.json()["repo"],
-        "permissions": {"contents": "write", "pull_requests": "write"},
-        "repository_scoped": True,
-    }
-    assert len(asked) == 2
+    assert claim.json()["github_token"] is None
+    assert len(asked) == 1, "disabled-by-default policy must stop the write-token request"
+
+
+async def test_a_direct_write_disable_during_mint_revokes_and_withholds_the_token(
+    store: FakeStorage,
+):
+    from cloud_agent.api.worker import _direct_write_token_for_claim
+
+    policies = [
+        {"enabled": True, "revision": 4},
+        {"enabled": False, "revision": 5},
+    ]
+    store.get_direct_write_policy = AsyncMock(side_effect=policies)
+    store.register_direct_write_token = AsyncMock(return_value=True)
+    store.forget_direct_write_token = AsyncMock()
+
+    class Cipher:
+        @staticmethod
+        def encrypt(value: str) -> str:
+            return f"encrypted:{value}"
+
+    class FakeApp:
+        direct_write_cipher = Cipher()
+        revoke_installation_token = AsyncMock()
+
+        async def repository_identity(self, repo: str) -> dict[str, Any]:
+            return {"repository_id": 9001, "full_name": repo}
+
+        async def token_for(self, repo: str, **kwargs: Any) -> str:
+            assert kwargs["cache_tag"] == "direct-write-policy:4"
+            return "sandbox-write-token"
+
+    app = FakeApp()
+    result = await _direct_write_token_for_claim(
+        "owner/repo", store=store, app_credentials=app, job_id="job-1"
+    )
+
+    assert result == (None, None)
+    app.revoke_installation_token.assert_awaited_once_with("sandbox-write-token")
+    store.forget_direct_write_token.assert_awaited_once()
+
+
+async def test_an_unavailable_direct_write_policy_does_not_issue_a_token(store: FakeStorage):
+    from cloud_agent.api.worker import (
+        DirectWritePolicyUnavailable,
+        _direct_write_token_for_claim,
+    )
+
+    store.get_direct_write_policy = AsyncMock(side_effect=TimeoutError("database unavailable"))
+    app = AsyncMock()
+    app.repository_identity.return_value = {"repository_id": 9001, "full_name": "owner/repo"}
+
+    with pytest.raises(DirectWritePolicyUnavailable):
+        await _direct_write_token_for_claim(
+            "owner/repo", store=store, app_credentials=app, job_id="job-1"
+        )
+
+    app.token_for.assert_not_awaited()
 
 
 async def test_a_deployment_without_a_github_app_still_claims_jobs(client: AsyncClient):
@@ -5582,12 +5636,8 @@ async def test_an_uninstalled_app_hands_the_job_over_without_a_credential(
     assert claim.json()["github_token"] is None
 
 
-@pytest.mark.parametrize(
-    "failure_scope", [{"contents": "read"}, {"contents": "write", "pull_requests": "write"}]
-)
 async def test_a_transient_credential_error_is_retryable_not_terminal(
     store: FakeStorage,
-    failure_scope: dict[str, str],
 ):
     """GitHub having a bad minute must not permanently fail someone's job.
 
@@ -5600,9 +5650,7 @@ async def test_a_transient_credential_error_is_retryable_not_terminal(
 
     class FlakyApp:
         async def token_for(self, repo: str, **kwargs: Any) -> str:
-            if kwargs["permissions"] == failure_scope:
-                raise TimeoutError("api.github.com timed out")
-            return "host-clone-token"
+            raise TimeoutError("api.github.com timed out")
 
     app = _build_app(store)
     app.dependency_overrides[get_agent_app_credentials] = lambda: FlakyApp()
@@ -6787,6 +6835,10 @@ async def test_a_claim_while_the_app_is_unloaded_leaves_the_job_queued(
     key = tmp_path / "github-app.pem"
     clock = _StepClock()
     minter = _FakeGitHubApp(installations=[], repos_by_installation={})
+    minter.repository_identity = AsyncMock(
+        side_effect=lambda repo: {"repository_id": 9001, "full_name": repo}
+    )
+    store.get_direct_write_policy = AsyncMock(return_value={"enabled": False, "revision": 0})
     app = _app_with_unloaded_github(store, key, clock, minter)
     grants = _FakeGrants()
     from cloud_agent.api.deps import get_grant_client
@@ -6809,6 +6861,7 @@ async def test_a_claim_while_the_app_is_unloaded_leaves_the_job_queued(
     assert claimed.status_code == 200
     assert claimed.json()["job_id"] == job_id
     assert claimed.json()["clone_token"] == "ghs_x"
+    assert claimed.json()["github_token"] is None
 
 
 async def test_a_turn_finishes_while_the_app_is_unloaded_and_its_wakeup_waits(

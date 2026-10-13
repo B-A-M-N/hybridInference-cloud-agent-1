@@ -235,6 +235,132 @@ async def test_a_long_lived_token_is_reused(config):
     assert calls["n"] == 1
 
 
+async def test_uncached_installation_tokens_are_minted_for_each_claim(config):
+    """A policy revision needs its own revocable credential, not a shared cache entry."""
+    calls = {"tokens": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/installation"):
+            return httpx.Response(200, json={"id": 1})
+        calls["tokens"] += 1
+        return httpx.Response(
+            201,
+            json={"token": f"ghs_{calls['tokens']}", "expires_at": "2099-01-01T00:00:00Z"},
+        )
+
+    original, patched = _client_returning(handler)
+    httpx.AsyncClient = patched
+    try:
+        credentials = GitHubAppCredentials(config)
+        first = await credentials.token_for("o/n", cache=False)
+        second = await credentials.token_for("o/n", cache=False)
+        assert not credentials._tokens
+    finally:
+        httpx.AsyncClient = original
+
+    assert (first, second) == ("ghs_1", "ghs_2")
+    assert calls["tokens"] == 2
+
+
+async def test_policy_cache_tag_reuses_native_session_token_but_rotates_on_revision(config):
+    calls = {"tokens": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/installation"):
+            return httpx.Response(200, json={"id": 1})
+        calls["tokens"] += 1
+        return httpx.Response(
+            201,
+            json={"token": f"ghs_{calls['tokens']}", "expires_at": "2099-01-01T00:00:00Z"},
+        )
+
+    original, patched = _client_returning(handler)
+    httpx.AsyncClient = patched
+    try:
+        credentials = GitHubAppCredentials(config)
+        first = await credentials.token_for("o/n", cache_tag="direct-write-policy:3")
+        same_revision = await credentials.token_for("o/n", cache_tag="direct-write-policy:3")
+        next_revision = await credentials.token_for("o/n", cache_tag="direct-write-policy:4")
+    finally:
+        httpx.AsyncClient = original
+
+    assert (first, same_revision, next_revision) == ("ghs_1", "ghs_1", "ghs_2")
+    assert calls["tokens"] == 2
+
+
+async def test_repository_identity_is_read_from_the_installed_repository(config):
+    """The write gate is keyed by GitHub's numeric identity, not the request slug."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/installation"):
+            return httpx.Response(200, json={"id": 7})
+        if request.url.path.endswith("/access_tokens"):
+            return httpx.Response(
+                201, json={"token": "ghs_read", "expires_at": "2099-01-01T00:00:00Z"}
+            )
+        assert request.url.path == "/repos/o/n"
+        assert request.headers["Authorization"] == "Bearer ghs_read"
+        return httpx.Response(200, json={"id": 55, "full_name": "O/N"})
+
+    original, patched = _client_returning(handler)
+    httpx.AsyncClient = patched
+    try:
+        result = await GitHubAppCredentials(config).repository_identity("o/n")
+    finally:
+        httpx.AsyncClient = original
+
+    assert result == {"repository_id": 55, "full_name": "O/N"}
+
+
+async def test_linked_user_repository_permissions_are_preserved(config):
+    """The UI toggle checks GitHub's current per-user admin bit."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/user/installations/7/repositories"
+        assert request.headers["Authorization"] == "Bearer user-token"
+        return httpx.Response(
+            200,
+            json={
+                "repositories": [
+                    {
+                        "id": 55,
+                        "full_name": "O/N",
+                        "permissions": {"admin": True, "push": True},
+                    }
+                ]
+            },
+        )
+
+    original, patched = _client_returning(handler)
+    httpx.AsyncClient = patched
+    try:
+        result = await GitHubAppCredentials(config).repositories_for_user("user-token", 7)
+    finally:
+        httpx.AsyncClient = original
+
+    assert result == [{"id": 55, "full_name": "O/N", "permissions": {"admin": True, "push": True}}]
+
+
+async def test_installation_token_revocation_uses_the_presented_token(config):
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    original, patched = _client_returning(handler)
+    httpx.AsyncClient = patched
+    try:
+        await GitHubAppCredentials(config).revoke_installation_token("ghs_revoked")
+    finally:
+        httpx.AsyncClient = original
+
+    assert len(requests) == 1
+    assert requests[0].method == "DELETE"
+    assert requests[0].url.path == "/installation/token"
+    assert requests[0].headers["Authorization"] == "Bearer ghs_revoked"
+
+
 async def test_uninstalled_repository_says_so(config):
     """A repo without an installation is a clear message, not a retry loop."""
 
