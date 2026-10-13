@@ -579,7 +579,12 @@ class ChatSandboxSpec:
     @property
     def container_name(self) -> str:
         """A stable Docker-safe name without exposing a user-controlled id."""
-        digest = hashlib.sha256(f"{self.thread_id}\0{self.sandbox_id}".encode()).hexdigest()[:32]
+        return self.container_name_for(self.thread_id, self.sandbox_id)
+
+    @staticmethod
+    def container_name_for(thread_id: str, sandbox_id: str) -> str:
+        """Derive the stable container name from its two durable identities."""
+        digest = hashlib.sha256(f"{thread_id}\0{sandbox_id}".encode()).hexdigest()[:32]
         return f"{CHAT_CONTAINER_PREFIX}-{digest}"
 
     def docker_labels(self) -> dict[str, str]:

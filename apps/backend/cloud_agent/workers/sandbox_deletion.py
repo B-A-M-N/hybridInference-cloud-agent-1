@@ -130,6 +130,7 @@ async def delete_one_archived_sandbox(
                 "request_id": fence["request_id"],
                 "generation": fence["generation"],
                 "expected_container_id": fence["container_id"],
+                "sandbox_id": fence["sandbox_id"],
             }
             request_phase = "discard"
             deleted = await broker.discard_sandbox_deletion(str(claim["origin_thread_id"]), payload)

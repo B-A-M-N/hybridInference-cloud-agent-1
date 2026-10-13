@@ -225,6 +225,53 @@ def test_deletion_retry_checks_absence_after_status_marks_container_lost(
     assert manager.removals == 1
 
 
+def test_discard_completes_stale_membership_after_proving_container_absent(archive_setup):
+    manager, _supervisor, service, identity, spec, _members = archive_setup
+    manager.current = None
+    restarted = SandboxArchiveService(
+        SharedChatSessionSupervisor(manager), state_dir=service._state_dir
+    )
+    discard = replace(identity, request_id="discard-absent", archive_key="")
+
+    result = restarted.discard(discard, sandbox_id=spec.sandbox_id)
+
+    assert result == {
+        "request_id": "discard-absent",
+        "container_id": "container-1",
+        "deleted": True,
+    }
+    directory = restarted._directory(discard)
+    assert json.loads((directory / "discard.json").read_text())["target_absent"] is True
+    assert (directory / "discarded.json").exists()
+    assert manager.removals == 0
+    # Replay from the authorization record after a crash before the final
+    # acknowledgement; absence is proved again before completing.
+    (directory / "discarded.json").unlink()
+    with pytest.raises(SessionLeaseLost, match="identity changed"):
+        restarted.discard(discard, sandbox_id="another-sandbox")
+    assert not (directory / "discarded.json").exists()
+    # An older control-plane retry uses the identity in the durable record.
+    assert restarted.discard(discard) == result
+    assert json.loads((directory / "discarded.json").read_text())["sandbox_id"] == spec.sandbox_id
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+def test_discard_does_not_mistake_an_unregistered_container_for_absence(archive_setup, replacement):
+    manager, _supervisor, service, identity, spec, _members = archive_setup
+    restarted = SandboxArchiveService(
+        SharedChatSessionSupervisor(manager), state_dir=service._state_dir
+    )
+    discard = replace(identity, request_id="discard-unregistered", archive_key="")
+    if replacement:
+        manager.current = replace(manager.current, container_id="replacement-container")
+
+    with pytest.raises(SandboxError, match="no shared sandbox membership"):
+        restarted.discard(discard, sandbox_id=spec.sandbox_id)
+
+    assert not restarted._directory(discard).joinpath("discard.json").exists()
+    assert manager.removals == 0
+
+
 def test_complete_native_backup_keeps_container_until_verified_commit(archive_setup, monkeypatch):
     manager, supervisor, service, identity, spec, members = archive_setup
     receipt = service.prepare(identity)

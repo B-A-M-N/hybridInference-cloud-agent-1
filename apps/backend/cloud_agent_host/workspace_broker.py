@@ -364,6 +364,9 @@ class SandboxArchiveDiscardRequest(BaseModel):
     request_id: str = Field(..., min_length=1, max_length=128)
     generation: int = Field(..., ge=1)
     expected_container_id: str = Field(..., min_length=1, max_length=256)
+    # Optional during a rolling deployment. New control planes include this
+    # durable identity so the broker can safely prove an already-absent target.
+    sandbox_id: str | None = Field(None, min_length=1, max_length=256)
 
 
 class SandboxArchiveCommitRequest(SandboxArchivePrepareRequest):
@@ -2741,6 +2744,7 @@ def create_app(
                     expected_container_id=body.expected_container_id,
                     archive_key="",
                 ),
+                sandbox_id=body.sandbox_id,
             )
         except (SandboxError, ValueError) as exc:
             raise supervisor_error(exc) from exc

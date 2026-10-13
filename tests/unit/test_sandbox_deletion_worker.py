@@ -120,6 +120,15 @@ async def test_discard_removes_the_container_without_an_archive(monkeypatch):
     store.sandbox.record_admin_sandbox_archive.assert_not_awaited()
     store.sandbox.complete_admin_sandbox_deletion.assert_not_awaited()
     store.sandbox.complete_admin_sandbox_discard.assert_awaited_once()
+    broker.discard_sandbox_deletion.assert_awaited_once_with(
+        "origin",
+        {
+            "request_id": "request",
+            "generation": 4,
+            "expected_container_id": "container-one",
+            "sandbox_id": "group",
+        },
+    )
 
 
 @pytest.mark.asyncio
