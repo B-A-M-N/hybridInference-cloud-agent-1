@@ -164,8 +164,12 @@ finish. If a request fails or the browser closes, reopen Server setup and retry
 the pending setup to reuse its exact credentials and routes. Infrastructure
 defaults are saved for future setups. **Start new setup** retains those inputs
 and creates a new request on submission; it leaves an unfinished setup
-unavailable. Profiles are immutable so later deployment operations keep their
-exact inputs.
+unavailable. Tunnel credentials, the install directory, and enrollment stay
+fixed. A control-plane release rolls managed hosts forward: stored profiles
+that share the previous commit and bundle, and the live allocations using
+them, advance together so a later node replacement still sees one revision.
+A rollout that takes the running generation down and then fails restores the
+previous stored bundle. File-backed profile files are not rewritten.
 
 Automatic setup requires a control-plane image built with its full release
 revision, the compute encryption key and the existing broker token. The form
@@ -180,7 +184,9 @@ Host environment, and provide the three tunnel keys and verified known-hosts
 files. The control plane validates the archive, encrypts all environment and
 credential values, and stores them in Postgres. Profile read APIs expose only
 IDs and labels, never generated credentials. Create a new profile to replace
-immutable inputs.
+tunnel credentials, the install directory, or the Host environment. A
+control-plane release moves the commit of stored profiles that still pin the
+previous bundle; it does not rewrite a file-backed profile.
 
 File-backed configuration remains supported for existing deployments and
 recovery. Start with these operator templates:
@@ -463,6 +469,10 @@ Before enabling replacement:
 2. Prepare two alternating deployment profiles with distinct tunnel keys and
    reverse broker ports. Both must pin the same `deployment_sha` and
    `source_sha256`; replacement never selects a profile from another release.
+   A control-plane host rollout advances every stored profile and live
+   snapshot that still pin that pair, including the spare, so the two slots
+   stay on one revision. A profile another deployment is installing is left
+   until its own rollout.
    Keep Docker/containerd versions compatible. Set `data_mount` to the
    profile's local disk, for example `/mydata`; both daemons use it through
    bind mounts.
