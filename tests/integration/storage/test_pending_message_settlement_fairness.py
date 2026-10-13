@@ -21,9 +21,19 @@ class _UnavailableGitHubApp:
 
 
 class _SweepStorage:
-    def __init__(self, store: Storage, visited: list[str]) -> None:
+    def __init__(
+        self,
+        store: Storage,
+        visited: list[str],
+        *,
+        blocked_threads: set[str] | None = None,
+        query_barrier: asyncio.Barrier | None = None,
+    ) -> None:
         self.pending_messages = _SweepRepository(
-            store.pending_messages, visited
+            store.pending_messages,
+            visited,
+            blocked_threads=blocked_threads,
+            query_barrier=query_barrier,
         )
         self.conversation_queries = store.conversation_queries
         self.attachments = store.attachments
@@ -32,19 +42,31 @@ class _SweepStorage:
 
 
 class _SweepRepository:
-    def __init__(self, repository, visited: list[str]) -> None:
+    def __init__(
+        self,
+        repository,
+        visited: list[str],
+        *,
+        blocked_threads: set[str] | None = None,
+        query_barrier: asyncio.Barrier | None = None,
+    ) -> None:
         self.repository = repository
-        self.blocked_threads: set[str] = set()
+        self.blocked_threads = set(blocked_threads or ())
+        self.discover_blocked_threads = blocked_threads is None
+        self.query_barrier = query_barrier
         self.first_page: list[str] | None = None
         self.visited = visited
 
     async def threads_to_settle(
         self, *, limit: int = 50, scan_interval_seconds: float = 30.0
     ) -> list[str]:
+        if self.query_barrier is not None:
+            await self.query_barrier.wait()
         page = await self.repository.threads_to_settle(limit=limit)
         if self.first_page is None:
             self.first_page = page
-            self.blocked_threads.update(page)
+            if self.discover_blocked_threads:
+                self.blocked_threads.update(page)
         return page
 
     async def settle_queue(self, *, thread_id: str, prepared=None):
@@ -99,20 +121,42 @@ async def test_repeated_bounded_sweeps_rotate_past_unsettled_threads(store, pool
     healthy_later_thread = next(iter(thread_ids.difference(blocked_threads)))
     assert set(visited) == blocked_threads
 
-    # A later bounded sweep must rotate its starting point and reach the
-    # healthy thread through the same application code path.
-    visited.clear()
+    # Concurrent sweepers use independent repository/application objects. They
+    # may inspect the same blocked page, but must not prevent a later sweep from
+    # rotating to the healthy thread.
+    concurrent_visited: list[str] = []
+    query_barrier = asyncio.Barrier(2)
+    concurrent_sweepers = [
+        _SweepStorage(
+            Storage(pool),
+            concurrent_visited,
+            blocked_threads=blocked_threads,
+            query_barrier=query_barrier,
+        )
+        for _ in range(2)
+    ]
+    await asyncio.gather(
+        *(
+            settle_waiting_queues(
+                concurrent_store,
+                gateway=None,
+                github_app=_UnavailableGitHubApp(),
+                limit=50,
+            )
+            for concurrent_store in concurrent_sweepers
+        )
+    )
+    assert all(
+        concurrent_store.pending_messages.first_page is not None
+        and len(concurrent_store.pending_messages.first_page) == 50
+        for concurrent_store in concurrent_sweepers
+    )
+
+    # A fresh repository object models restart: page progression is derived
+    # from database time, not process-local cursor state.
     await asyncio.sleep(30.05)
+    restarted_store = _SweepStorage(Storage(pool), visited, blocked_threads=blocked_threads)
     await settle_waiting_queues(
-        sweep_store, gateway=None, github_app=_UnavailableGitHubApp(), limit=50
+        restarted_store, gateway=None, github_app=_UnavailableGitHubApp(), limit=50
     )
     assert healthy_later_thread in visited
-
-    # Selection is derived from shared database time, not process-local cursor
-    # state, so another worker/restarted process sees the same current page.
-    restarted_repo = Storage(pool).pending_messages
-    concurrent_pages = await asyncio.gather(
-        repo.threads_to_settle(limit=50),
-        restarted_repo.threads_to_settle(limit=50),
-    )
-    assert healthy_later_thread in set(concurrent_pages[0]) | set(concurrent_pages[1])
