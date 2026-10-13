@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from typing import Any
@@ -58,19 +59,19 @@ async def store(pool):
     return PostgresSourceControlRepository(pool)
 
 
-async def test_direct_write_token_cache_is_reused_only_for_the_same_policy_revision(
+async def test_concurrent_direct_write_claims_get_unique_tokens_that_rotate_on_policy_revision(
     store: PostgresSourceControlRepository,
     pool,
 ) -> None:
-    """Postgres tracks one cached token per live revision, including reenablement."""
+    """Concurrent claims get separate revocable tokens; revisions revoke and rotate them."""
     repository_id = uuid.uuid4().int & ((1 << 62) - 1)
-    repository_name = "octocat/cached-project"
+    repository_name = "octocat/concurrent-project"
 
-    class CachedCredentials:
+    class PerClaimCredentials:
         def __init__(self) -> None:
             self.direct_write_cipher = SourceControlCipher("test-direct-write-cache-key")
-            self.cache: dict[str, str] = {}
-            self.cache_tags: list[str] = []
+            self.minted: list[str] = []
+            self.revoked: list[str] = []
 
         async def repository_identity(self, repo: str) -> dict[str, Any]:
             assert repo == repository_name
@@ -78,16 +79,19 @@ async def test_direct_write_token_cache_is_reused_only_for_the_same_policy_revis
 
         async def token_for(self, repo: str, **kwargs: Any) -> str:
             assert repo == repository_name
-            tag = str(kwargs["cache_tag"])
-            self.cache_tags.append(tag)
-            if tag not in self.cache:
-                self.cache[tag] = f"installation-token-{len(self.cache) + 1}"
-            return self.cache[tag]
+            assert kwargs == {
+                "permissions": {"contents": "write", "pull_requests": "write"},
+                "repository_scoped": True,
+                "cache": False,
+            }
+            token = f"installation-token-{len(self.minted) + 1}"
+            self.minted.append(token)
+            return token
 
         async def revoke_installation_token(self, token: str) -> None:
-            return None
+            self.revoked.append(token)
 
-    credentials = CachedCredentials()
+    credentials = PerClaimCredentials()
     try:
         await store.get_direct_write_policy(
             github_repository_id=repository_id,
@@ -101,26 +105,30 @@ async def test_direct_write_token_cache_is_reused_only_for_the_same_policy_revis
             actor_id="github-user-42",
             admin_ip="203.0.113.42",
         )
-        assert enabled is not None
+        assert enabled is not None and enabled["policy"]["revision"] == 1
 
-        first = await _direct_write_token_for_claim(
-            repository_name,
-            store=store,
-            app_credentials=credentials,
-            job_id="cache-first",
+        first, second = await asyncio.gather(
+            _direct_write_token_for_claim(
+                repository_name,
+                store=store,
+                app_credentials=credentials,
+                job_id="concurrent-claim-1",
+            ),
+            _direct_write_token_for_claim(
+                repository_name,
+                store=store,
+                app_credentials=credentials,
+                job_id="concurrent-claim-2",
+            ),
         )
-        reused = await _direct_write_token_for_claim(
-            repository_name,
-            store=store,
-            app_credentials=credentials,
-            job_id="cache-follow-up",
-        )
-        assert first == reused == ("installation-token-1", repository_name)
-        assert credentials.cache_tags == [
-            "direct-write-policy:1",
-            "direct-write-policy:1",
-        ]
-        assert len(await store.list_direct_write_tokens(github_repository_id=repository_id)) == 1
+        assert first[1] == second[1] == repository_name
+        assert first[0] and second[0] and first[0] != second[0]
+        registered = await store.list_direct_write_tokens(github_repository_id=repository_id)
+        assert len(registered) == 2
+        assert {
+            credentials.direct_write_cipher.decrypt(token["token_ciphertext"])
+            for token in registered
+        } == {first[0], second[0]}
 
         disabled = await store.set_direct_write_policy(
             github_repository_id=repository_id,
@@ -130,11 +138,15 @@ async def test_direct_write_token_cache_is_reused_only_for_the_same_policy_revis
             actor_id="github-user-42",
             admin_ip="203.0.113.42",
         )
-        assert disabled is not None and disabled["policy"]["revision"] == 2
+        assert disabled is not None
+        assert disabled["policy"]["revision"] == 2
+        assert len(disabled["tokens"]) == 2
         for token in disabled["tokens"]:
             plaintext = credentials.direct_write_cipher.decrypt(token["token_ciphertext"])
             await credentials.revoke_installation_token(plaintext)
             await store.forget_direct_write_token(token_hash=token["token_hash"])
+        assert set(credentials.revoked) == {first[0], second[0]}
+        assert await store.list_direct_write_tokens(github_repository_id=repository_id) == []
 
         reenabled = await store.set_direct_write_policy(
             github_repository_id=repository_id,
@@ -145,20 +157,110 @@ async def test_direct_write_token_cache_is_reused_only_for_the_same_policy_revis
             admin_ip="203.0.113.42",
         )
         assert reenabled is not None and reenabled["policy"]["revision"] == 3
-        rotated = await _direct_write_token_for_claim(
+        rotated, rotated_repo = await _direct_write_token_for_claim(
             repository_name,
             store=store,
             app_credentials=credentials,
-            job_id="cache-reenabled",
+            job_id="reenabled-claim",
         )
-        assert rotated == ("installation-token-2", repository_name)
-        assert credentials.cache_tags[-1] == "direct-write-policy:3"
+        assert (rotated, rotated_repo) == ("installation-token-3", repository_name)
         rows = await store.list_direct_write_tokens(github_repository_id=repository_id)
         assert len(rows) == 1
-        assert credentials.direct_write_cipher.decrypt(rows[0]["token_ciphertext"]) == (
-            "installation-token-2"
-        )
+        assert credentials.direct_write_cipher.decrypt(rows[0]["token_ciphertext"]) == rotated
+        async with pool.acquire() as conn:
+            revision = await conn.fetchval(
+                """
+                SELECT policy_revision FROM agent_repository_direct_write_tokens
+                WHERE token_hash = $1
+                """,
+                rows[0]["token_hash"],
+            )
+        assert revision == 3
     finally:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM agent_repository_direct_write_policy WHERE github_repository_id = $1",
+                repository_id,
+            )
+            await conn.execute(
+                "DELETE FROM agent_admin_audit_log WHERE details->>'github_repository_id' = $1",
+                str(repository_id),
+            )
+
+
+async def test_direct_write_mint_is_revoked_when_postgres_policy_changes_mid_mint(
+    store: PostgresSourceControlRepository,
+    pool,
+) -> None:
+    """A real policy revision race cannot register or return the stale token."""
+    from cloud_agent.api.worker import DirectWritePolicyUnavailable
+
+    repository_id = uuid.uuid4().int & ((1 << 62) - 1)
+    repository_name = "octocat/revision-race-project"
+    mint_started = asyncio.Event()
+    release_mint = asyncio.Event()
+
+    class RacingCredentials:
+        def __init__(self) -> None:
+            self.direct_write_cipher = SourceControlCipher("test-direct-write-race-key")
+            self.revoked: list[str] = []
+
+        async def repository_identity(self, repo: str) -> dict[str, Any]:
+            assert repo == repository_name
+            return {"repository_id": repository_id, "full_name": repository_name}
+
+        async def token_for(self, repo: str, **kwargs: Any) -> str:
+            assert repo == repository_name
+            assert kwargs["cache"] is False
+            mint_started.set()
+            await release_mint.wait()
+            return "stale-installation-token"
+
+        async def revoke_installation_token(self, token: str) -> None:
+            self.revoked.append(token)
+
+    credentials = RacingCredentials()
+    try:
+        await store.get_direct_write_policy(
+            github_repository_id=repository_id,
+            repository_full_name=repository_name,
+        )
+        enabled = await store.set_direct_write_policy(
+            github_repository_id=repository_id,
+            repository_full_name=repository_name,
+            enabled=True,
+            expected_revision=0,
+            actor_id="github-user-42",
+            admin_ip="203.0.113.42",
+        )
+        assert enabled is not None and enabled["policy"]["revision"] == 1
+
+        claim = asyncio.create_task(
+            _direct_write_token_for_claim(
+                repository_name,
+                store=store,
+                app_credentials=credentials,
+                job_id="revision-race-claim",
+            )
+        )
+        await asyncio.wait_for(mint_started.wait(), timeout=5)
+        disabled = await store.set_direct_write_policy(
+            github_repository_id=repository_id,
+            repository_full_name=repository_name,
+            enabled=False,
+            expected_revision=1,
+            actor_id="github-user-42",
+            admin_ip="203.0.113.42",
+        )
+        assert disabled is not None and disabled["policy"]["revision"] == 2
+        release_mint.set()
+
+        with pytest.raises(DirectWritePolicyUnavailable):
+            await asyncio.wait_for(claim, timeout=5)
+        assert credentials.revoked == ["stale-installation-token"]
+        assert await store.list_direct_write_tokens(github_repository_id=repository_id) == []
+    finally:
+        release_mint.set()
         async with pool.acquire() as conn:
             await conn.execute(
                 "DELETE FROM agent_repository_direct_write_policy WHERE github_repository_id = $1",
