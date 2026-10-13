@@ -370,7 +370,7 @@ async def _direct_write_token_for_claim(
             repo,
             permissions=_SANDBOX_GITHUB_SCOPE,
             repository_scoped=True,
-            cache_tag=f"direct-write-policy:{revision}",
+            cache=False,
         )
         token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
         registered = await store.register_direct_write_token(

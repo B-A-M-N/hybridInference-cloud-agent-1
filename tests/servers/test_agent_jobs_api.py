@@ -5567,7 +5567,8 @@ async def test_a_direct_write_disable_during_mint_revokes_and_withholds_the_toke
             return {"repository_id": 9001, "full_name": repo}
 
         async def token_for(self, repo: str, **kwargs: Any) -> str:
-            assert kwargs["cache_tag"] == "direct-write-policy:4"
+            assert kwargs["cache"] is False
+            assert "cache_tag" not in kwargs
             return "sandbox-write-token"
 
     app = FakeApp()
