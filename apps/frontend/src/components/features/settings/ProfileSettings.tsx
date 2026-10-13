@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useAuth, useT } from '@/components/providers';
 import { getUserProfile, saveUserProfile, type UserProfile } from '@/lib/api/userProfile';
 import { APIError } from '@/lib/utils/errors';
+import { AvatarImage } from '@/components/features/profile/AvatarImage';
 
 const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
 const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp']);
@@ -12,7 +13,11 @@ const ROW =
 const INPUT =
   'ui-focus-ring w-full min-w-0 rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground disabled:opacity-50';
 
-export function ProfileSettings() {
+export function ProfileSettings({
+  companion,
+}: {
+  companion?: { userId: string; dataUrl?: string } | null;
+}) {
   const { state } = useAuth();
   const t = useT();
   return (
@@ -21,7 +26,10 @@ export function ProfileSettings() {
         {t('settings.profile.title')}
       </h2>
       {state.user?.id ? (
-        <ProfileEditor key={state.user.id} />
+        <ProfileEditor
+          key={state.user.id}
+          companionDataUrl={companion?.userId === state.user.id ? companion.dataUrl : undefined}
+        />
       ) : (
         <p className="text-sm text-muted">{t('settings.profile.signIn')}</p>
       )}
@@ -29,7 +37,7 @@ export function ProfileSettings() {
   );
 }
 
-function ProfileEditor() {
+function ProfileEditor({ companionDataUrl }: { companionDataUrl?: string }) {
   const t = useT();
   const [saved, setSaved] = useState<UserProfile | null>(null);
   const [firstName, setFirstName] = useState('');
@@ -121,7 +129,6 @@ function ProfileEditor() {
       lastName.trim() !== saved.last_name ||
       image !== saved.image_data_url);
   const disabled = loading || saving || !saved;
-  const initials = [...firstName.trim()][0] ?? [...lastName.trim()][0] ?? '';
 
   const save = async () => {
     if (
@@ -193,29 +200,7 @@ function ProfileEditor() {
         <span className="text-sm text-foreground">{t('settings.profile.image')}</span>
         <div className="flex min-w-0 flex-wrap items-center gap-3">
           <div className="flex h-14 w-14 shrink-0 items-center justify-center overflow-hidden rounded-full bg-surface-muted text-lg text-foreground">
-            {image ? (
-              // Only selected raster files and server-sanitized data URLs are displayed.
-              // eslint-disable-next-line @next/next/no-img-element
-              <img
-                src={image}
-                alt={t('settings.profile.imageAlt')}
-                className="h-full w-full object-cover"
-              />
-            ) : initials ? (
-              <span aria-hidden="true">{initials}</span>
-            ) : (
-              <svg
-                aria-hidden="true"
-                className="h-6 w-6 text-muted"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-                strokeWidth={1.5}
-              >
-                <circle cx="12" cy="8" r="4" />
-                <path d="M4 21v-2a8 8 0 0 1 16 0v2" />
-              </svg>
-            )}
+            <AvatarImage imageDataUrl={image} companionDataUrl={companionDataUrl} />
           </div>
           <input
             ref={input}
@@ -253,9 +238,10 @@ function ProfileEditor() {
               {t('settings.profile.remove')}
             </button>
           ) : null}
-          <p id="profile-image-help" className="text-xs leading-5 text-muted">
-            {t('settings.profile.imageHelp')}
-          </p>
+          <div id="profile-image-help" className="text-xs leading-5 text-muted">
+            <p>{t('settings.profile.imageHelp')}</p>
+            <p>{t('settings.profile.defaultImageHelp')}</p>
+          </div>
           {imageError ? (
             <p role="alert" className="w-full text-sm text-red-600 dark:text-red-400">
               {t(`settings.profile.imageError.${imageError}`)}

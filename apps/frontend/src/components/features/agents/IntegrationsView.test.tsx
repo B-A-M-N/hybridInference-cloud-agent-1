@@ -219,6 +219,59 @@ describe('IntegrationsView', () => {
     expect(screen.queryByRole('combobox', { name: 'Display language' })).not.toBeInTheDocument();
   });
 
+  it('shares the companion with Profile and updates it after a memory refresh', async () => {
+    mockedGetIntegrations.mockResolvedValue(integrations);
+    render(<IntegrationsView />);
+    const profileSection = screen.getByRole('region', { name: 'Profile' });
+    const image = await within(profileSection).findByRole('img', {
+      name: 'Your Pokémon companion avatar',
+    });
+    expect(image).toHaveAttribute('src', memory.avatar.data_url);
+    const refreshed = 'data:image/svg+xml,<svg id="refreshed"></svg>';
+    vi.mocked(getUserMemory).mockResolvedValueOnce({
+      ...memory,
+      avatar: { ...memory.avatar, data_url: refreshed },
+    });
+    fireEvent.click(
+      within(screen.getByRole('region', { name: 'User memory' })).getByRole('button', {
+        name: /^Refresh$/,
+      }),
+    );
+    await waitFor(() => expect(image).toHaveAttribute('src', refreshed));
+    expect(getUserMemory).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the uploaded photo when the companion theme changes', async () => {
+    const photo = 'data:image/png;base64,cGhvdG8=';
+    vi.mocked(getUserProfile).mockResolvedValue({
+      email: 'owner@example.com',
+      first_name: '',
+      last_name: '',
+      image_data_url: photo,
+      revision: 1,
+    });
+    mockedGetIntegrations.mockResolvedValue(integrations);
+    render(<IntegrationsView />);
+    const profileSection = screen.getByRole('region', { name: 'Profile' });
+    const image = await within(profileSection).findByRole('img', { name: 'Your profile image' });
+    expect(image).toHaveAttribute('src', photo);
+    const refreshed = 'data:image/svg+xml,<svg id="refreshed"></svg>';
+    vi.mocked(getUserMemory).mockResolvedValueOnce({
+      ...memory,
+      avatar: { ...memory.avatar, data_url: refreshed },
+    });
+    fireEvent.click(
+      within(screen.getByRole('region', { name: 'User memory' })).getByRole('button', {
+        name: /^Refresh$/,
+      }),
+    );
+    await waitFor(() => expect(getUserMemory).toHaveBeenCalledTimes(2));
+    expect(image).toHaveAttribute('src', photo);
+    expect(
+      within(profileSection).queryByRole('img', { name: 'Your Pokémon companion avatar' }),
+    ).not.toBeInTheDocument();
+  });
+
   it('keeps source-linked memory and privacy controls on the Setting page while user suggestions live on the homepage', async () => {
     mockedGetIntegrations.mockResolvedValue(integrations);
     render(<IntegrationsView />);

@@ -104,6 +104,7 @@ export function UserHomeInsights({
           {t('home.avatar.title')}
         </summary>
         <div className="border-t border-border p-4">
+          <p className="mb-3 text-sm leading-relaxed text-muted">{t('home.avatar.choice')}</p>
           <p className="text-sm leading-relaxed text-muted">{t('home.avatar.generation')}</p>
           <dl className="mt-4 grid gap-4 text-sm sm:grid-cols-2">
             {(['character', 'theme', 'badges', 'default'] as const).map((aspect) => (

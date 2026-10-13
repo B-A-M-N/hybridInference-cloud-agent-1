@@ -34,6 +34,11 @@ Agent permissions; current admission is still checked through `agent-access`.
 
 The names and picture are owner-authored Cloud Agent display data, separate
 from Gateway login identity and the automatically generated homepage companion.
+The homepage and Profile editor prefer an uploaded profile picture. When none
+is saved, they use the owner's Pokémon companion. Removing a picture restores
+the companion; memory refreshes and clears continue to update only its habitat
+and badges, and do not change the saved picture. The Profile editor reuses the
+memory panel's current companion, including after a refresh or clear.
 `GET` and revision-checked `PATCH /v1/agent/profile` require current Agent admission
 and return `Cache-Control: no-store`. Names allow up to 100 characters each.
 PNG, JPEG, and WebP uploads are limited to 2 MiB and 16 million pixels; the server

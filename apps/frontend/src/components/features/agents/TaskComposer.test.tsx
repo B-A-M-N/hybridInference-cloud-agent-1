@@ -23,6 +23,8 @@ import {
 import type { AgentConfigApi, AgentConversationApi, AgentJobApi } from '@/lib/api/agents';
 import { getUserMemory, type UserMemoryView } from '@/lib/api/userMemory';
 vi.mock('@/lib/api/userMemory', () => ({ getUserMemory: vi.fn() }));
+import { getUserProfile } from '@/lib/api/userProfile';
+vi.mock('@/lib/api/userProfile', () => ({ getUserProfile: vi.fn() }));
 
 import { rewritePrompt, type RewritePromptResult } from '@/lib/api/promptRewrite';
 
@@ -41,6 +43,14 @@ beforeEach(() => {
   account.id = undefined;
   vi.mocked(getUserMemory).mockReset();
   vi.mocked(getUserMemory).mockRejectedValue(new Error('Avatar unavailable'));
+  vi.mocked(getUserProfile).mockReset();
+  vi.mocked(getUserProfile).mockResolvedValue({
+    email: 'owner@example.com',
+    first_name: '',
+    last_name: '',
+    image_data_url: null,
+    revision: 0,
+  });
   localStorage.clear();
 });
 

@@ -245,6 +245,8 @@ export const en = {
   'home.memoryPaused':
     'Automatic user memory is paused. Existing suggestions and your avatar theme are kept until you enable updates or clear memory in settings.',
   'home.avatar.title': 'How your avatar is generated',
+  'home.avatar.choice':
+    'Your uploaded profile image is your avatar. When you have no uploaded image, your Pokémon companion is used instead. You can change or remove your image in My Settings.',
   'home.avatar.generation':
     'Your Pokémon avatar is assembled from layered illustrated shapes, without a photo or an image-generation model. Its habitat and work badges come from English keywords in up to your 50 most recent eligible requests across projects.',
   'home.avatar.character': 'Your Pokémon companion',
@@ -280,6 +282,8 @@ export const en = {
   'settings.profile.upload': 'Upload image',
   'settings.profile.remove': 'Remove image',
   'settings.profile.imageHelp': 'PNG, JPEG, or WebP up to 2 MB',
+  'settings.profile.defaultImageHelp':
+    'Your Pokémon companion is used when you have no uploaded image.',
   'settings.profile.firstName': 'First Name',
   'settings.profile.lastName': 'Last Name',
   'settings.profile.save': 'Save',

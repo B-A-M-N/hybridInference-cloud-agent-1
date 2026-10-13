@@ -20,14 +20,28 @@ import { UserMemoryEntryCard, type UserMemoryRequestResult } from './UserMemoryE
 
 type Operation = 'refresh' | 'toggle' | 'clear' | 'edit' | 'delete' | 'consolidate';
 
-export function UserMemorySettings() {
+type AvatarChange = (userId: string, dataUrl?: string) => void;
+
+export function UserMemorySettings({ onAvatarChange }: { onAvatarChange?: AvatarChange }) {
   const { state } = useAuth();
   const userId = state.user?.id;
   // A new account gets a fresh panel immediately, including before effects run.
-  return <UserMemoryPanel key={userId ? `user:${userId}` : 'signed-out'} userId={userId} />;
+  return (
+    <UserMemoryPanel
+      key={userId ? `user:${userId}` : 'signed-out'}
+      userId={userId}
+      onAvatarChange={onAvatarChange}
+    />
+  );
 }
 
-function UserMemoryPanel({ userId }: { userId: string | undefined }) {
+function UserMemoryPanel({
+  userId,
+  onAvatarChange,
+}: {
+  userId: string | undefined;
+  onAvatarChange?: AvatarChange;
+}) {
   const { t, locale } = useLocale();
   const [view, setView] = useState<UserMemoryView | null>(null);
   const [pending, setPending] = useState<Operation | null>(null);
@@ -48,6 +62,10 @@ function UserMemoryPanel({ userId }: { userId: string | undefined }) {
   const [modelLoadAttempt, setModelLoadAttempt] = useState(0);
   const [modelChoice, setModelChoice] = useState('');
   const modelSelectId = useId();
+
+  useEffect(() => {
+    if (userId) onAvatarChange?.(userId, view?.avatar?.data_url);
+  }, [userId, view, onAvatarChange]);
 
   useEffect(() => {
     if (!userId) return;
