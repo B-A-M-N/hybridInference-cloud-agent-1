@@ -206,6 +206,7 @@ vi.mock('@/lib/api/agents', () => ({
 }));
 
 const AGENT_CONFIG = {
+  environment_limits: {},
   repos: ['owner/repository'],
   runtimes: ['claude-code'],
   models: ['qwen-test', 'glm-test'],
@@ -1583,14 +1584,15 @@ describe('JobDetail', () => {
   it('keeps Side Chat in the existing workspace without handling its Escape as a main stop', async () => {
     render(<JobDetail job={makeJob()} />);
     openWorkspace();
+    await screen.findByRole('tab', { name: 'Environment' });
     const workspace = screen.getByRole('region', { name: 'Job workspace' });
     const names = () =>
       within(within(workspace).getByRole('tablist', { name: 'Workspace views' }))
         .getAllByRole('tab')
         .map((tab) => tab.textContent?.replace(/\d+$/, '').trim());
-    expect(names()).toEqual(['Git', 'Terminal', 'Files']);
+    expect(names()).toEqual(['Git', 'Terminal', 'Files', 'Environment']);
     addSideChat();
-    expect(names()).toEqual(['Git', 'Terminal', 'Files', 'Side Chat']);
+    expect(names()).toEqual(['Git', 'Terminal', 'Files', 'Environment', 'Side Chat']);
     expect(screen.getByRole('textbox', { name: 'Message side chat' })).toBeVisible();
     fireEvent.keyDown(screen.getByRole('region', { name: 'Side chat messages' }), {
       key: 'Escape',
@@ -2102,8 +2104,9 @@ describe('JobDetail', () => {
     expect(screen.getByRole('button', { name: /^(Send|Queue)$/ })).toBeEnabled();
   });
 
-  it('replaces duplicate header metadata with a keyboard-accessible task menu', () => {
+  it('replaces duplicate header metadata with a keyboard-accessible task menu', async () => {
     render(<JobDetail job={makeJob({ turnNo: 3 })} />);
+    await screen.findByLabelText('Model for this turn');
     const header = screen.getByRole('heading', { level: 1 }).closest('header')!;
     expect(within(header).queryByText(/turn 3/)).not.toBeInTheDocument();
     expect(within(header).queryByText('Run details')).not.toBeInTheDocument();
@@ -2111,6 +2114,8 @@ describe('JobDetail', () => {
     fireEvent.click(trigger);
     expect(screen.queryByRole('menuitem', { name: 'Run details' })).not.toBeInTheDocument();
     expect(screen.getByRole('menuitem', { name: 'Rename' })).toHaveFocus();
+    fireEvent.keyDown(document.activeElement!, { key: 'ArrowDown' });
+    expect(screen.getByRole('menuitem', { name: 'Edit saved configuration' })).toHaveFocus();
     fireEvent.keyDown(document.activeElement!, { key: 'ArrowDown' });
     expect(screen.getByRole('menuitem', { name: 'Pin' })).toHaveFocus();
     expect(screen.getByRole('menuitem', { name: 'Fork' })).toBeDisabled();

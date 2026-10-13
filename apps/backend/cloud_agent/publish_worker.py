@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 import httpx
 
 from cloud_agent.entitlement import RepoAccessUnavailable, RepoNotAllowed, require_entitled_repo
+from cloud_agent.environments import EnvironmentEncryptionError
 from cloud_agent.logging_utils import get_logger
 from cloud_agent.pr_titles import generate_pr_title, is_generic_pr_summary
 from cloud_agent.publisher import (
@@ -67,6 +68,7 @@ if TYPE_CHECKING:
         SnapshotRepository,
         SourceControlRepository,
     )
+    from cloud_agent.ports.environments import EnvironmentRepository
     from cloud_agent.source_control_runtime import GitHubAppSource
     from cloud_agent.workers.background_wake import BackgroundWake
 
@@ -82,6 +84,7 @@ class PublishStorage(Protocol):
     snapshot: SnapshotRepository
     host_pool: HostPoolRepository
     source_control: SourceControlRepository
+    environments: EnvironmentRepository
 
 
 logger = get_logger(__name__)
@@ -578,7 +581,7 @@ def _is_retryable_publication_failure(exc: BaseException) -> bool:
     same HTTP statuses from the remote. Patch, content, and other HTTP
     rejections are permanent.
     """
-    if isinstance(exc, TransientPublishError):
+    if isinstance(exc, (TransientPublishError, EnvironmentEncryptionError)):
         return True
     status = _http_status(exc)
     if _retryable_github_status(status):
@@ -762,6 +765,7 @@ async def _publish_claimed_owned(
     # allowlist) has to be able to stop it. The read side already refuses at
     # claim; without this the same deployment would block the read-only token
     # and still hand out the push token.
+    environment = None
     try:
         await require_entitled_repo(
             job["repo"],
@@ -808,6 +812,11 @@ async def _publish_claimed_owned(
     try:
         # Blocking git work: keep it off the event loop so a slow clone cannot
         # stall the gateway's request handling.
+        environment = (
+            await store.environments.get_job_environment(job_id)
+            if getattr(store, "environments", None)
+            else None
+        )
         result = await asyncio.to_thread(
             publish_patch,
             job_id=job_id,
@@ -818,6 +827,7 @@ async def _publish_claimed_owned(
             commit_message=f"agent: {job['task_prompt'][:60]}".strip(),
             allow_workflow_changes=allow_workflow_changes,
             include_base_bundle=True,
+            **({"known_secrets": environment.secrets()} if environment else {}),
         )
         title = await generate_pr_title(job, result.changed_files, grants=grants)
         pr_url = await ensure_draft_pull_request(
@@ -830,6 +840,10 @@ async def _publish_claimed_owned(
         )
     except Exception as exc:
         detail = str(exc) if isinstance(exc, PublishError) else f"publish failed: {exc}"
+        if environment is not None:
+            from cloud_agent_shared.secret_redaction import SecretRedactor
+
+            detail = SecretRedactor(environment.secrets()).text(detail)
         if _is_retryable_publication_failure(exc):
             await retry(detail)
             return None
@@ -839,7 +853,10 @@ async def _publish_claimed_owned(
                 extra={"event": "agent_job_publish_rejected", "job_id": job_id},
             )
         else:
-            logger.exception("agent job publish failed unexpectedly")
+            if environment is not None and environment.secrets():
+                logger.error("agent job publish failed unexpectedly (%s)", type(exc).__name__)
+            else:
+                logger.exception("agent job publish failed unexpectedly")
         await fail(detail)
         return None
 

@@ -281,6 +281,40 @@ class SandboxManagerClient:
             invalid="The shared chat supervisor returned invalid data.",
         )
 
+    async def require_environment_capability(self) -> None:
+        """Require the capability from the actual authenticated broker replica."""
+        try:
+            async with self._http(5) as client:
+                response = await client.get(
+                    f"{self._base_url}/health", headers=self._headers, timeout=5
+                )
+                response.raise_for_status()
+                if "environment-v1" not in response.json().get("capabilities", []):
+                    raise SandboxManagerError(
+                        503, "Sandbox manager must be upgraded for environment configuration"
+                    )
+        except (httpx.HTTPError, ValueError, AttributeError):
+            raise SandboxManagerError(
+                503, "Sandbox manager environment capability is unavailable"
+            ) from None
+
+    async def prepare_environment(self, workspace_id: str, environment: Any) -> dict[str, Any]:
+        """Require actual broker support before sending value-bearing configuration."""
+        await self.require_environment_capability()
+        return await self._request(
+            "POST",
+            workspace_id,
+            "environment/prepare",
+            json={"environment": environment.model_dump(mode="json")},
+            timeout=1050,
+        )
+
+    async def environment_status(self, workspace_id: str, binding_id: str) -> dict[str, Any]:
+        """Read only masked steps from an already materialized workspace."""
+        return await self._request(
+            "GET", workspace_id, "environment/status", params={"binding_id": binding_id}, timeout=5
+        )
+
     async def health(self, *, timeout: float = 3) -> None:
         """Reach the sandbox manager and be recognised by it, or raise.
 
@@ -385,26 +419,66 @@ class SandboxManagerClient:
         )
 
     async def terminal(
-        self, workspace_id: str, *, command: str, cwd: str, timeout_seconds: float
+        self,
+        workspace_id: str,
+        *,
+        command: str,
+        cwd: str,
+        timeout_seconds: float,
+        environment: Any = None,
     ) -> dict[str, Any]:
         """Execute one bounded command in an isolated workspace sandbox."""
+        if environment is not None and environment.required:
+            await self.require_environment_capability()
+        else:
+            environment = None
         return await self._request(
             "POST",
             workspace_id,
             "terminal",
-            json={"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds},
+            json={
+                "command": command,
+                "cwd": cwd,
+                "timeout_seconds": timeout_seconds,
+                **(
+                    {"environment": environment.model_dump(mode="json")}
+                    if environment is not None
+                    else {}
+                ),
+            },
             timeout=timeout_seconds + 10,
         )
 
     async def create_terminal(
-        self, workspace_id: str, *, rows: int, cols: int, profiling: Mapping[str, Any] | None = None
+        self,
+        workspace_id: str,
+        *,
+        rows: int,
+        cols: int,
+        profiling: Mapping[str, Any] | None = None,
+        environment: Any = None,
+        action_id: str | None = None,
+        run_id: str | None = None,
     ) -> dict[str, Any]:
         """Open one interactive terminal in a durable workspace."""
+        if environment is not None and environment.required:
+            await self.require_environment_capability()
+        else:
+            environment = None
         return await self._request(
             "POST",
             workspace_id,
             "terminals",
-            json={"rows": rows, "cols": cols},
+            json={
+                "rows": rows,
+                "cols": cols,
+                **(
+                    {"environment": environment.model_dump(mode="json")}
+                    if environment is not None
+                    else {}
+                ),
+                **({"action_id": action_id, "run_id": run_id} if action_id else {}),
+            },
             headers=self._profiling_headers(profiling),
         )
 
@@ -515,6 +589,12 @@ class SandboxManagerClient:
         """Resize an interactive terminal."""
         suffix = f"terminals/{quote(terminal_id, safe='')}/resize"
         return await self._request("POST", workspace_id, suffix, json={"rows": rows, "cols": cols})
+
+    async def terminal_output(self, workspace_id: str, terminal_id: str) -> dict[str, Any]:
+        """Read bounded private terminal output for a redacted operation summary."""
+        return await self._request(
+            "GET", workspace_id, f"terminals/{quote(terminal_id, safe='')}/output"
+        )
 
     async def delete_terminal(self, workspace_id: str, terminal_id: str) -> dict[str, Any]:
         """Kill an interactive terminal; the private operation is idempotent."""
@@ -764,7 +844,10 @@ class SandboxManagerClient:
             "snapshot_id": snapshot["snapshot_id"],
             "workspace_epoch": snapshot["workspace_epoch"],
             "base_sha": snapshot["base_sha"],
+            **({"environment": snapshot["environment"]} if snapshot.get("environment") else {}),
         }
+        if snapshot.get("environment"):
+            await self.require_environment_capability()
         return await self._shared_sandbox_request(
             "POST",
             str(snapshot["origin_thread_id"]),

@@ -10,8 +10,10 @@ import {
   disconnectAgentIntegration,
   disconnectGitHubAccount,
   getAgentIntegrations,
+  getAgentConfig,
 } from '@/lib/api/agents';
 import type { AgentIntegrationProvider, AgentIntegrationProviderApi } from '@/lib/api/agents';
+import { EnvironmentManager } from './environment/EnvironmentManager';
 import { SkillsSection } from './skills/SkillsSection';
 import { McpConnectionsSection, type McpAuthorizationResult } from './mcp/McpConnectionsSection';
 import { SOURCE_CONTROL_RECHECK_MS } from './sourceControlRecovery';
@@ -239,6 +241,18 @@ export function IntegrationsView({
   }, []);
   const [providers, setProviders] = useState<AgentIntegrationProviderApi[]>([]);
   const [loading, setLoading] = useState(true);
+  const [environmentsEnabled, setEnvironmentsEnabled] = useState(false);
+  useEffect(() => {
+    let active = true;
+    void getAgentConfig()
+      .then((value) => {
+        if (active) setEnvironmentsEnabled(Boolean(value.environment_limits));
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [disconnecting, setDisconnecting] = useState<string | null>(null);
@@ -440,6 +454,7 @@ export function IntegrationsView({
       <div className="ui-card mt-4 bg-surface p-3 sm:p-4">
         <McpConnectionsSection authorizationResult={mcpAuthorization} />
       </div>
+      {environmentsEnabled && <EnvironmentManager />}
       <SkillsSection />
       <MemorySettings onAvatarChange={updateCompanion} />
       <NotificationSettings />

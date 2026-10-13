@@ -37,6 +37,7 @@ from cloud_agent.schemas import (
     PLATFORM_REASONING_EFFORTS,
     RESET_REASONING_EFFORT,
 )
+from cloud_agent.settings import setting_env
 from cloud_agent.skills.models import SkillError
 from cloud_agent.skills.selection import resolve_skills
 from cloud_agent.visible_models import (
@@ -463,7 +464,15 @@ async def _create_job_as(
     fingerprint = (
         request_fingerprint(
             "create",
-            body.model_dump(mode="json"),
+            {
+                **body.model_dump(mode="json"),
+                **(
+                    {"environment_id_provided": True}
+                    if "environment_id" in body.model_fields_set
+                    else {}
+                ),
+            },
+            sensitive=bool(body.environment_overrides),
         )
         if client_request_id is not None
         else None
@@ -588,6 +597,13 @@ async def _create_job_as(
     attachments = await _resolve_attachment_selection(
         job_store.attachments, user_id=user["user_id"], attachment_ids=body.attachment_ids
     )
+    if setting_env("AGENT_REPOSITORY_ENVIRONMENTS_ENABLED", "false") != "true" and (
+        body.environment_id
+        or body.environment_overrides
+        or body.environment_revision
+        or body.global_revision
+    ):
+        raise HTTPException(503, "Repository environments are disabled for new workspaces")
     job = await job_store.conversation_commands.create_job(
         user_id=user["user_id"],
         repo=body.repo,
@@ -598,6 +614,17 @@ async def _create_job_as(
         reasoning_effort=reasoning_effort,
         base_sha=base_sha,
         setup_script=body.setup_script,
+        environment_selection={
+            "environment_id": body.environment_id,
+            "environment_id_provided": "environment_id" in body.model_fields_set,
+            "environment_revision": body.environment_revision,
+            "global_revision": body.global_revision,
+            "overrides": [v.model_dump() for v in body.environment_overrides],
+            "has_setup_override": "setup_script" in body.model_fields_set,
+            "setup_override": body.setup_script,
+        }
+        if setting_env("AGENT_REPOSITORY_ENVIRONMENTS_ENABLED", "false") == "true"
+        else None,
         plugins=plugins,
         metadata=metadata or None,
         mcp_bindings=mcp_bindings,

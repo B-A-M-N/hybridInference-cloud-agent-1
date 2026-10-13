@@ -66,6 +66,7 @@ import { LiveAgentStatus } from './LiveAgentStatus';
 import { ActivityIcon, ActivityWindow } from './ActivityWindow';
 import { FloatingActivityWindow } from './FloatingActivityWindow';
 import { buildActivityOverview, hasActivityOverview } from './activityOverview';
+import { WorkspaceEnvironment } from './environment/WorkspaceEnvironment';
 import { ThreadActions } from './ThreadActions';
 import { McpSessionPanel } from './mcp/McpSessionPanel';
 import { NativeQuestionPrompt } from './NativeQuestionPrompt';
@@ -1843,6 +1844,9 @@ export function JobDetail({
               forking={forking}
               onFork={() => void forkFrom(job.id)}
               onRename={setTitle}
+              onEnvironment={
+                config?.environment_limits ? () => openWorkspace('environment') : undefined
+              }
             />
           </div>
           <div className="agent-conversation-controls flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 pb-1.5">
@@ -2654,6 +2658,7 @@ export function JobDetail({
             <>
               <WorkspaceTabBar
                 key={`${userId}:${job.threadId ?? job.id}`}
+                environmentEnabled={Boolean(config?.environment_limits)}
                 selected={workspaceTab}
                 chats={workspaceTabs.chats}
                 diffCount={job.diffFiles.length}
@@ -2662,6 +2667,22 @@ export function JobDetail({
                 onClose={workspaceTabs.close}
                 onBack={toggleWorkspace}
               />
+              <div
+                id="workspace-panel-environment"
+                role="tabpanel"
+                aria-labelledby="workspace-tab-environment"
+                hidden={workspaceTab !== 'environment'}
+                className="min-h-0 flex-1 overflow-y-auto"
+              >
+                {config?.environment_limits && workspaceTab === 'environment' && (
+                  <WorkspaceEnvironment
+                    key={job.threadId ?? job.id}
+                    jobId={job.id}
+                    repo={job.repo}
+                    onTerminal={() => openWorkspace('terminal')}
+                  />
+                )}
+              </div>
               <div
                 id="workspace-panel-git"
                 role="tabpanel"

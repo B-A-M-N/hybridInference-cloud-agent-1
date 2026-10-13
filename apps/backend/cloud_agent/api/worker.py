@@ -21,6 +21,7 @@ import os
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol
 
+import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -51,6 +52,7 @@ from cloud_agent.attachments.models import AttachmentLeaseLost, AttachmentView
 from cloud_agent.attachments.selection import prompt_with_attachments
 from cloud_agent.domain.execution import FAILED, QUEUED, RUNNING, TERMINAL_STATES
 from cloud_agent.entitlement import RepoAccessUnavailable, RepoNotAllowed, require_entitled_repo
+from cloud_agent.environments import EnvironmentEncryptionError
 from cloud_agent.execution_profiles import ExecutionProfile
 from cloud_agent.gateway import GatewayError
 from cloud_agent.github_app import AppNotInstalled
@@ -111,6 +113,7 @@ from cloud_agent.schemas import (
     WorkerWaitResponse,
 )
 from cloud_agent.skills.selection import prompt_with_skills
+from cloud_agent.source_control import SourceControlError
 from cloud_agent.source_control_runtime import (
     SourceControlRuntime,  # noqa: TC001 — FastAPI resolves it.
 )
@@ -128,6 +131,7 @@ from cloud_agent.user_memory import prompt_with_user_memory
 from cloud_agent.workers.work_signal import WorkSignal  # noqa: TC001 — FastAPI resolves it.
 from cloud_agent.workspace_errors import _sandbox_manager_http_error
 from cloud_agent_host.runtimes import runtimes_supporting_mcp
+from cloud_agent_shared.environment import ENVIRONMENT_CAPABILITY
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
@@ -151,6 +155,7 @@ if TYPE_CHECKING:
         SourceControlRepository as SourceControlPort,
         UserMemoryRepository,
     )
+    from cloud_agent.ports.environments import EnvironmentRepository
     from cloud_agent.sandbox_manager_client import SandboxManagerClient
 
 
@@ -265,6 +270,7 @@ class _WorkerStorage(Protocol):
     skills: SkillRepository
     source_control: SourceControlPort
     user_memory: UserMemoryRepository
+    environments: EnvironmentRepository
 
 
 def _require_store(store: _WorkerStorage | None) -> _WorkerStorage:
@@ -890,6 +896,34 @@ async def worker_claim(
             detail={"error": {"type": "repo_not_allowed", "message": str(exc)}},
         ) from exc
 
+    environment = None
+    if claim.get("environment_binding_id"):
+        try:
+            environment = await job_store.environments.environment_for_claim(
+                claim["user_id"], claim["environment_binding_id"], claim["id"]
+            )
+            capabilities = body.attestation.runner_capabilities if body.attestation else []
+            if environment.required:
+                if ENVIRONMENT_CAPABILITY not in capabilities:
+                    raise SourceControlError("Host cannot execute environment configuration")
+                from cloud_agent.sandbox_manager_client import SandboxManagerError
+                from cloud_agent.sandbox_manager_routing import sandbox_manager_for_job
+
+                try:
+                    broker = await sandbox_manager_for_job(job_store.host_pool, claim["id"])
+                    if broker is None:
+                        raise SourceControlError("Sandbox manager is unavailable")
+                    await broker.require_environment_capability()
+                except (SandboxManagerError, httpx.HTTPError):
+                    raise SourceControlError("Sandbox manager must be upgraded") from None
+            else:
+                environment = None
+        except (SourceControlError, EnvironmentEncryptionError):
+            await job_store.attempt_commands.release_claim(**fence, retry_after_seconds=30)
+            raise HTTPException(
+                503, "Waiting for environment-capable host or available encryption"
+            ) from None
+
     # Two credentials with different powers. The runner keeps the full one and
     # passes only the sandbox one inside, so a credential that leaks from inside
     # the agent can make model calls the gateway already meters but cannot touch
@@ -1035,6 +1069,7 @@ async def worker_claim(
             claim.get("goal"),
         ),
         setup_script=claim.get("setup_script"),
+        environment=environment,
         plugins=claim.get("plugins") or [],
         runtime=claim["runtime"],
         model=claim["model"],
@@ -1141,6 +1176,14 @@ async def worker_append_event(
     )
     if event_id is None:
         raise _lease_lost()
+    if (
+        body.event_type == "lifecycle"
+        and body.payload
+        and body.payload.get("phase") == "environment_prepared"
+    ):
+        await job_store.environments.record_worker_environment_preparation(
+            job_id, claims["attempt_id"], claims["lease_generation"], body.payload
+        )
     return WorkerEventResponse(event_id=event_id)
 
 

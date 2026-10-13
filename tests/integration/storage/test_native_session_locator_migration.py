@@ -23,9 +23,11 @@ async def test_migration_repairs_blank_locator_state_and_enforces_invariant(
     store,
 ) -> None:
     config = _db_config()
+    # The current repository reads columns introduced after this migration.
+    # Seed at head, then downgrade before injecting the historical bad locator.
+    job, _, _ = await _reserve_retained_chat(store)
     downgrade_to(config, _PREVIOUS)
     try:
-        job, _, _ = await _reserve_retained_chat(store)
         async with pool.acquire() as conn:
             await conn.execute(
                 """

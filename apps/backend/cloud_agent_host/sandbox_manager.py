@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import base64
 import binascii
+import codecs
 import contextlib
 import functools
 import hashlib
@@ -32,7 +33,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from cloud_agent_host import sandbox_manager_profiling_policy
 from cloud_agent_host.bounded_output import OutputPump
@@ -240,6 +241,22 @@ def _chat_idle_timeout_from_env() -> float:
     return float(raw) if raw else DEFAULT_CHAT_IDLE_TIMEOUT_S
 
 
+from cloud_agent_host.action_receipts import ActionReceipts
+from cloud_agent_host.environment_preparation import EnvironmentPreparation
+from cloud_agent_host.environment_process import tool_environment
+from cloud_agent_host.environment_snapshot import check_snapshot_secrets
+from cloud_agent_shared.environment import ENVIRONMENT_CAPABILITY, BoundEnvironment
+from cloud_agent_shared.secret_redaction import SecretRedactor
+
+
+class EnvironmentPrepareRequest(BaseModel):
+    """Immutable binding supplied only by an authenticated control plane."""
+
+    model_config = ConfigDict(extra="forbid")
+    environment: BoundEnvironment = Field(repr=False)
+    activation_owner: str | None = Field(None, max_length=128)
+
+
 class FileWriteRequest(BaseModel):
     """One bounded UTF-8 file replacement."""
 
@@ -249,13 +266,20 @@ class FileWriteRequest(BaseModel):
 class TerminalRequest(BaseModel):
     """One interactive-shell command inside the retained workspace."""
 
+    environment: BoundEnvironment | None = Field(None, repr=False)
+    model_config = ConfigDict(extra="forbid")
     command: str = Field(..., min_length=1, max_length=8000)
     cwd: str = Field("/workspace", min_length=1, max_length=4096)
     timeout_seconds: float = Field(DEFAULT_COMMAND_TIMEOUT_S, gt=0, le=120)
 
 
 class TerminalCreateRequest(BaseModel):
-    """Dimensions for one persistent interactive terminal."""
+    """Dimensions and fixed environment for one interactive terminal."""
+
+    model_config = ConfigDict(extra="forbid")
+    environment: BoundEnvironment | None = Field(None, repr=False)
+    action_id: str | None = Field(None, max_length=80)
+    run_id: str | None = Field(None, max_length=80)
 
     rows: int = Field(24, ge=2, le=200)
     cols: int = Field(80, ge=20, le=500)
@@ -437,6 +461,10 @@ class SharedSandboxAcquireRequest(SharedSandboxIdentityRequest):
 class SharedResidentLaunchConfig(BaseModel):
     """Process-fixed configuration and renewable residency credential."""
 
+    model_config = ConfigDict(extra="forbid")
+    environment: BoundEnvironment | None = Field(None, repr=False)
+    thread_id: str | None = Field(None, max_length=128)
+
     runtime_id: str = Field(..., min_length=1, max_length=128)
     runtime_version: str | None = Field(None, max_length=128)
     native_session_id: str | None = Field(None, max_length=512)
@@ -495,6 +523,8 @@ class SharedForkRequest(SharedSandboxIdentityRequest):
 
 class SharedSnapshotCaptureRequest(SharedSandboxIdentityRequest):
     """Exact ordered workspace epoch requested by the coordinator."""
+
+    environment: BoundEnvironment | None = Field(None, repr=False)
 
     snapshot_id: int = Field(..., ge=1)
     workspace_epoch: int = Field(..., ge=1)
@@ -638,6 +668,8 @@ class _TerminalSession:
         idle_ttl_s: float | None = None,
         on_closed: Callable[[float], None] | None = None,
         limits: _TerminalLimits | None = None,
+        secrets: dict[str, str] | None = None,
+        on_result: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.id = terminal_id
         self.shell = getattr(process, "shell", "sh")
@@ -650,8 +682,14 @@ class _TerminalSession:
         self._limits = limits or _TerminalLimits()
         self.state = "running"
         self._process = process
+        self.operation_uid: int | None = None
+        self._summary_redactor = SecretRedactor(secrets or {})
+        self._summary_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._safe_output = ""
+        self._exit_code: int | None = None
         self._workdir = workdir
         self._on_closed = on_closed
+        self._on_result = on_result
         self._activity_released = False
         self._events: deque[_TerminalEvent] = deque()
         self._buffer_bytes = 0
@@ -685,6 +723,11 @@ class _TerminalSession:
                 "cols": self.cols,
                 "last_seq": self._last_seq,
             }
+
+    def safe_output(self) -> dict[str, Any]:
+        """Read an already masked bounded summary, separate from owner PTY replay."""
+        with self._condition:
+            return {**self.descriptor(), "output": self._safe_output, "exit_code": self._exit_code}
 
     @property
     def is_closed(self) -> bool:
@@ -739,6 +782,14 @@ class _TerminalSession:
                 os.utime(self._workdir, None)
 
     def _release_activity(self) -> None:
+        if self._on_result is not None:
+            try:
+                self._on_result(self.safe_output())
+            except Exception:
+                # The durable launch tombstone still prevents a replay. A
+                # failed result write must not retain the workspace activity
+                # token after the process has already exited.
+                logger.warning("workspace_action_result_persist_failed")
         callback: Callable[[float], None] | None = None
         last_activity_at = 0.0
         with self._condition:
@@ -895,6 +946,9 @@ class _TerminalSession:
         if not data:
             return
         with self._condition:
+            self._safe_output = (
+                self._safe_output + self._summary_redactor.feed(self._summary_decoder.decode(data))
+            )[-65536:]
             chunk_truncated = len(data) > self._limits.buffer_bytes
             if chunk_truncated:
                 data = data[-self._limits.buffer_bytes :]
@@ -922,6 +976,13 @@ class _TerminalSession:
 
     def _append_exit(self, exit_code: int) -> None:
         with self._condition:
+            self._exit_code = exit_code
+            self._safe_output = (
+                self._safe_output
+                + self._summary_redactor.feed(
+                    self._summary_decoder.decode(b"", final=True), final=True
+                )
+            )[-65536:]
             self._last_seq += 1
             self._events.append(_TerminalEvent(self._last_seq, "exit", exit_code=exit_code))
             self._trim_events_locked()
@@ -982,6 +1043,11 @@ class _TerminalSession:
         except Exception:
             logger.exception("workspace_terminal_wait_failed")
             exit_code = 1
+        if self.operation_uid is not None:
+            try:
+                self._process.kill()
+            except (SandboxError, OSError):
+                exit_code = 1
         self._append_exit(exit_code)
         self._release_activity()
 
@@ -997,7 +1063,9 @@ class _TerminalManager:
         max_sessions: int,
         max_sessions_per_workspace: int = MAX_TERMINAL_SESSIONS_PER_WORKSPACE,
         limits: _TerminalLimits | None = None,
+        action_receipts: ActionReceipts | None = None,
     ) -> None:
+        self._action_receipts = action_receipts or ActionReceipts()
         self._idle_ttl_s = idle_ttl_s
         self._hard_ttl_s = hard_ttl_s
         self._max_sessions = max_sessions
@@ -1091,10 +1159,13 @@ class _TerminalManager:
         backend: SandboxBackend,
         idle_ttl_s: float | None = None,
         on_closed: Callable[[float], None] | None = None,
+        environment: BoundEnvironment | None = None,
+        action_id: str | None = None,
+        run_id: str | None = None,
     ) -> dict[str, Any]:
         """Create one PTY while atomically enforcing the per-workspace cap."""
         self.reap()
-        terminal_id = "term_" + secrets.token_urlsafe(18)
+        terminal_id = "term_" + (run_id or secrets.token_urlsafe(18))
         now = time.monotonic()
         evicted: list[_TerminalSession] = []
         try:
@@ -1102,6 +1173,10 @@ class _TerminalManager:
                 if workspace_id in self._suspended_workspaces:
                     raise HTTPException(status_code=409, detail="terminal workspace is not ready")
                 group = self._sessions.setdefault(workspace_id, {})
+                if terminal_id in group:
+                    if on_closed is not None:
+                        on_closed(now)
+                    return group[terminal_id].descriptor()
                 global_active = sum(
                     session.holds_process
                     for sessions in self._sessions.values()
@@ -1116,15 +1191,65 @@ class _TerminalManager:
                 active = sum(session.holds_process for session in group.values())
                 if active >= self._max_sessions_per_workspace:
                     raise HTTPException(status_code=409, detail="workspace terminal limit reached")
+                action = (
+                    next((a for a in environment.actions if a.id == action_id), None)
+                    if environment and action_id
+                    else None
+                )
+                if action_id and action is None:
+                    raise HTTPException(404, "Action not found in workspace binding")
+                if action is not None:
+                    workdir = "/workspace/" + action.cwd
+                    if isinstance(backend, RetainedChatBackend):
+                        resolved = backend.manager.exec_capture(
+                            backend.spec,
+                            ["realpath", "-e", "--", str(workdir)],
+                            workdir="/workspace",
+                            timeout_s=10,
+                        )
+                        normalized = resolved.stdout.decode().strip()
+                        if resolved.returncode or not (
+                            normalized == "/workspace" or normalized.startswith("/workspace/")
+                        ):
+                            raise HTTPException(422, "Action directory escapes workspace")
+                        workdir = normalized
                 spec = SandboxSpec(
-                    argv=["/bin/sh"],
+                    argv=["/bin/sh", "-lc", action.command] if action else ["/bin/sh"],
                     workdir=str(workdir),
                     env={
                         **backend.base_env(),
                         "GIT_CONFIG_NOSYSTEM": "1",
                         "TERM": "xterm-256color",
+                        **(tool_environment() if environment else {}),
+                        **(environment.values("runtime") if environment else {}),
+                        **(
+                            {
+                                "AGENT_ACTION_UID": str(
+                                    31000
+                                    + next(
+                                        i
+                                        for i in range(64)
+                                        if 31000 + i
+                                        not in {
+                                            getattr(s, "operation_uid", None)
+                                            for s in group.values()
+                                        }
+                                    )
+                                )
+                            }
+                            if action
+                            else {}
+                        ),
                     },
                 )
+                if action is not None and environment is not None:
+                    previous = self._action_receipts.reserve(
+                        workspace_id, terminal_id, environment.binding_id, action.id
+                    )
+                    if previous is not None:
+                        if on_closed is not None:
+                            on_closed(now)
+                        return previous
                 try:
                     process = backend.spawn_terminal(spec, rows=rows, cols=cols)
                 except TerminalNotSupportedError as exc:
@@ -1147,9 +1272,18 @@ class _TerminalManager:
                     now=now,
                     idle_ttl_s=idle_ttl_s,
                     on_closed=on_closed,
+                    secrets=environment.secrets() if environment else {},
                     limits=self._limits,
+                    on_result=(
+                        lambda result: self._action_receipts.finish(
+                            workspace_id, terminal_id, result
+                        )
+                    )
+                    if action
+                    else None,
                 )
                 evicted.extend(self._unlist_exited_locked(workspace_id))
+                session.operation_uid = int(spec.env["AGENT_ACTION_UID"]) if action else None
                 group[terminal_id] = session
         finally:
             for stale in evicted:
@@ -1324,6 +1458,22 @@ class _TerminalManager:
             raise HTTPException(status_code=404, detail="terminal does not exist")
         return session
 
+    def output(self, workspace_id: str, terminal_id: str) -> dict[str, Any]:
+        """Read a live summary or the action's durable terminal result."""
+        try:
+            session = self.get(workspace_id, terminal_id)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            receipt = self._action_receipts.read(workspace_id, terminal_id)
+            if receipt is None:
+                raise
+            return receipt
+        output = session.safe_output()
+        if session._suspended:
+            output["state"] = "paused"
+        return output
+
     def get_for_control(self, workspace_id: str, terminal_id: str) -> _TerminalSession:
         """Resolve a terminal only while its workspace-level fence is open."""
         self.reap()
@@ -1341,6 +1491,11 @@ class _TerminalManager:
             group = self._sessions.get(workspace_id, {})
             session = group.get(terminal_id)
         if session is None:
+            # Action run ids are UUIDs; ephemeral interactive terminal ids are not.
+            if re.fullmatch(
+                r"term_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", terminal_id
+            ):
+                self._action_receipts.stop(workspace_id, terminal_id)
             return {
                 "id": terminal_id,
                 "shell": "sh",
@@ -1475,6 +1630,8 @@ def _run_terminal(
     default_timeout_s: float = DEFAULT_COMMAND_TIMEOUT_S,
     max_output_bytes: int = MAX_COMMAND_OUTPUT_BYTES,
 ) -> dict[str, Any]:
+    from cloud_agent_host.environment_process import tool_environment
+
     marker = secrets.token_hex(16)
     script = (
         "umask 0002; "
@@ -1487,7 +1644,12 @@ def _run_terminal(
         backend,
         workdir=workdir,
         script=script,
-        env={"WORKSPACE_COMMAND": request.command, "WORKSPACE_CWD": request.cwd},
+        env={
+            **(tool_environment() if request.environment else {}),
+            **(request.environment.values("runtime") if request.environment else {}),
+            "WORKSPACE_COMMAND": request.command,
+            "WORKSPACE_CWD": request.cwd,
+        },
         timeout_s=(
             request.timeout_seconds
             if "timeout_seconds" in request.model_fields_set
@@ -1647,6 +1809,7 @@ def create_app(
 ) -> FastAPI:
     """Create the internal sandbox manager app with injectable dependencies for tests."""
     sandbox = backend or build_backend_from_env()
+    environment_preparation = EnvironmentPreparation()
     expected_token = token if token is not None else manager_env("AGENT_SANDBOX_MANAGER_TOKEN", "")
     idle_ttl_s = (
         terminal_idle_ttl_s
@@ -1855,6 +2018,25 @@ def create_app(
                 raise RuntimeError("sandbox manager shutdown cleanup failed") from safe_cause
 
     app = FastAPI(title="Agent sandbox manager", docs_url=None, redoc_url=None, lifespan=lifespan)
+    from fastapi.exceptions import RequestValidationError
+    from fastapi.responses import JSONResponse
+
+    @app.exception_handler(RequestValidationError)
+    async def safe_environment_validation(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": [
+                    {"loc": error["loc"], "msg": error["msg"], "type": error["type"]}
+                    for error in exc.errors()
+                    if error["type"] != "value_error"
+                ]
+                or "Invalid sandbox manager request fields or environment limits"
+            },
+        )
+
     app.state.terminal_manager = terminals
     app.state.shared_session_supervisor = shared_supervisor
     app.state.sandbox_archive_service = archive_boundary
@@ -2038,6 +2220,7 @@ def create_app(
     def health(_: None = Depends(authenticate)) -> dict[str, Any]:
         return {
             "ok": True,
+            "capabilities": [ENVIRONMENT_CAPABILITY],
             "sandbox_archives": (
                 {
                     **archive_service.status(),
@@ -2210,6 +2393,7 @@ def create_app(
             mcp_credential=body.mcp_credential,
             github_token=body.github_token,
             github_repo=body.github_repo,
+            environment=body.environment,
             slot_id=body.slot_id,
             residency_generation=body.residency_generation,
         )
@@ -2801,6 +2985,31 @@ def create_app(
             raise supervisor_error(exc) from exc
         return asdict(result)
 
+    def _capture_environment_snapshot(
+        backend: RetainedChatBackend, body: SharedSnapshotCaptureRequest
+    ) -> dict[str, Any]:
+        result = _run_git(
+            backend,
+            CHAT_WORKDIR,
+            body.base_sha,
+            timeout_s=applied_settings["workspace_command_timeout_s"],
+            max_output_bytes=int(applied_settings["workspace_command_output_max_mib"])
+            * 1024
+            * 1024,
+        )
+        if body.environment is not None:
+            check_snapshot_secrets(backend, body.base_sha, body.environment)
+        return result
+
+    def capture_environment_snapshot(
+        backend: RetainedChatBackend, body: SharedSnapshotCaptureRequest
+    ) -> dict[str, Any]:
+        try:
+            return _capture_environment_snapshot(backend, body)
+        except Exception as exc:
+            redactor = SecretRedactor(body.environment.secrets() if body.environment else {})
+            raise SandboxError(redactor.text(str(exc))) from None
+
     @app.post("/shared-sandboxes/{thread_id}/snapshot")
     async def capture_shared_workspace_snapshot(
         thread_id: str,
@@ -2819,15 +3028,7 @@ def create_app(
             result = await endpoint_calls.run(
                 owner.capture_snapshot,
                 thread_id,
-                capture=lambda backend: _run_git(
-                    backend,
-                    CHAT_WORKDIR,
-                    body.base_sha,
-                    timeout_s=applied_settings["workspace_command_timeout_s"],
-                    max_output_bytes=int(applied_settings["workspace_command_output_max_mib"])
-                    * 1024
-                    * 1024,
-                ),
+                capture=lambda backend: capture_environment_snapshot(backend, body),
             )
         except (SandboxError, ValueError) as exc:
             raise supervisor_error(exc) from exc
@@ -3012,12 +3213,52 @@ def create_app(
             ),
         )
 
+    @app.get("/workspaces/{workspace_id}/environment/status")
+    async def environment_status(
+        workspace_id: str, binding_id: str, _: None = Depends(authenticate)
+    ) -> dict[str, Any]:
+        def read_status() -> dict[str, Any]:
+            return environment_preparation.status(
+                retained_owner(workspace_id).backend(workspace_id), binding_id
+            )
+
+        return await endpoint_calls.run(read_status)
+
+    @app.post("/workspaces/{workspace_id}/environment/cancel")
+    async def environment_cancel(
+        workspace_id: str, activation_owner: str, _: None = Depends(authenticate)
+    ) -> dict[str, bool]:
+        retained_owner(workspace_id).cancel_environment(workspace_id, activation_owner)
+        return {"cancelled": True}
+
+    @app.post("/workspaces/{workspace_id}/environment/prepare")
+    async def prepare_environment(
+        workspace_id: str, body: EnvironmentPrepareRequest, _: None = Depends(authenticate)
+    ) -> dict[str, Any]:
+        owner = retained_owner(workspace_id)
+        retained = owner.backend(workspace_id)
+        retained.manager.require_network(retained.spec)
+        return await endpoint_calls.run(
+            owner.prepare_environment,
+            workspace_id,
+            body.environment,
+            environment_preparation,
+            activation_owner=body.activation_owner,
+        )
+
     @app.post("/workspaces/{workspace_id}/terminal")
     async def terminal(
         workspace_id: str,
         body: TerminalRequest,
         _: None = Depends(authenticate),
     ) -> dict[str, Any]:
+        if body.environment is not None and body.environment.required:
+            await endpoint_calls.run(
+                retained_owner(workspace_id).prepare_environment,
+                workspace_id,
+                body.environment,
+                environment_preparation,
+            )
         return await endpoint_calls.run(
             retained_operation,
             workspace_id,
@@ -3045,6 +3286,13 @@ def create_app(
         owner = retained_owner(workspace_id)
         terminal_token: str | None = None
         try:
+            if body.environment is not None and body.environment.required:
+                await endpoint_calls.run(
+                    owner.prepare_environment,
+                    workspace_id,
+                    body.environment,
+                    environment_preparation,
+                )
             with call.stage("admission"):
                 token, descriptor = await endpoint_calls.run(owner.terminal_opened, workspace_id)
             terminal_token = token
@@ -3069,6 +3317,9 @@ def create_app(
                     backend=retained,
                     idle_ttl_s=owner.idle_timeout_s,
                     on_closed=on_terminal_closed,
+                    environment=body.environment,
+                    action_id=body.action_id,
+                    run_id=body.run_id,
                 )
             return call.answer(body_out)
         except (HTTPException, SandboxError, ValueError) as exc:
@@ -3078,6 +3329,18 @@ def create_app(
             if isinstance(exc, HTTPException):
                 raise
             raise supervisor_error(exc) from exc
+
+    @app.get("/workspaces/{workspace_id}/terminals/{terminal_id}/output")
+    async def terminal_output(
+        workspace_id: str, terminal_id: str, _: None = Depends(authenticate)
+    ) -> dict[str, Any]:
+        output = terminals.output(terminal_scope(workspace_id), terminal_id)
+        if (
+            output["state"] == "running"
+            and retained_owner(workspace_id).status(workspace_id).snapshotting
+        ):
+            output["state"] = "paused"
+        return output
 
     @app.post("/workspaces/{workspace_id}/terminals/suspend")
     async def suspend_terminals(

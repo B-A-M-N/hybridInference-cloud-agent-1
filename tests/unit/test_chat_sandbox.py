@@ -1663,6 +1663,7 @@ def test_shared_writer_freeze_runs_as_each_owner_without_cap_kill(monkeypatch):
         resident_slot_capacity=3,
     )
     manager = ChatSandboxManager(ContainerBackend(image="img"))
+    monkeypatch.setattr(manager, "_operation_writer_uids", lambda _spec: [])
     calls: list[tuple[list[str], dict]] = []
     receipts = {
         manager.backend.uid: b"31 10001 300\n",
@@ -1708,6 +1709,7 @@ def test_shared_writer_freeze_replacement_runs_exact_id_cleanup(monkeypatch):
         resident_slot_capacity=2,
     )
     manager = ChatSandboxManager(ContainerBackend(image="img"))
+    monkeypatch.setattr(manager, "_operation_writer_uids", lambda _spec: [])
     exact_id = "sha256:original"
     exact_checks = 0
     calls: list[tuple[list[str], dict]] = []
@@ -1760,6 +1762,7 @@ def test_shared_writer_thaw_reads_manifest_and_resumes_as_each_owner(monkeypatch
         resident_slot_capacity=2,
     )
     manager = ChatSandboxManager(ContainerBackend(image="img"))
+    monkeypatch.setattr(manager, "_operation_writer_uids", lambda _spec: [])
     calls: list[tuple[list[str], dict]] = []
     manifest = f"{ACTIVATION_TMPFS}/snapshot-{'b' * 32}.pids"
 
@@ -1838,6 +1841,7 @@ def _local_shared_writer_manager(monkeypatch, tmp_path, owned_processes):
             check=False,
         )
 
+    monkeypatch.setattr(manager, "_operation_writer_uids", lambda _spec: [])
     monkeypatch.setattr(manager, "exec_capture", local_exec)
     return manager
 
@@ -2067,6 +2071,7 @@ def test_shared_writer_thaw_detects_replacement_after_exact_id_cleanup(monkeypat
         resident_slot_capacity=2,
     )
     manager = ChatSandboxManager(ContainerBackend(image="img"))
+    monkeypatch.setattr(manager, "_operation_writer_uids", lambda _spec: [])
     exact_id = "sha256:original"
     exact_checks = 0
     calls: list[tuple[list[str], dict]] = []

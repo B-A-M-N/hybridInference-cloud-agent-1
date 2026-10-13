@@ -257,7 +257,7 @@ accounts, sessions, and saved connections persist in `agent-pgadmin`.
 | Variable | New? | Value / who provisions |
 |---|---|---|
 | `AGENT_SETTINGS_ENCRYPTION_KEY` | **NEW** | Optional dedicated key of at least 32 bytes for encrypted admin setting secrets. If absent, `AGENT_SESSION_SECRET` supplies the key. Keep the same effective key on the main API and MCP-only listener, and preserve it with database backups. Changing the effective key requires re-encrypting existing settings first; session-key rotation also changes it when the fallback is in use. |
-| `AGENT_SOURCE_CONTROL_ENCRYPTION_KEY` | **NEW** | Encrypts stored source-control and per-user MCP credentials under separate domain separators. Generate random 32 bytes, unique per environment. Without a key, neither stores plaintext; MCP offers an empty picker. Credentials from the pre-extraction gateway key require re-wrapping, not copying. |
+| `AGENT_SOURCE_CONTROL_ENCRYPTION_KEY` | **NEW** | Encrypts stored source-control credentials, per-user MCP credentials, and reusable cloud-environment variables/overrides under separate domain separators. Generate random 32 bytes, unique per environment. Without a key, none store plaintext; MCP offers an empty picker and value-bearing environment operations fail closed. Credentials from the pre-extraction gateway key require re-wrapping, not copying. |
 | `AGENT_CONTROL_TOKEN_SECRET` | **NEW** | Signs host/worker control tokens. Generate random 32 bytes, unique per environment and independent of gateway secrets. A new value saved in Admin → Settings must be at least 32 bytes; a shorter value saved earlier still loads, and startup logs `agent_weak_credential` until it is replaced. |
 | `AGENT_SESSION_SECRET` | **NEW** | Signs the web session cookie. Generate random 32 bytes, unique per environment. |
 | `AGENT_DEFAULT_EXECUTION_PROFILE` | **NEW** | Server-owned policy for new root threads. Application default: `trusted-v1`; supported production Compose default: `untrusted-kata-v1`; local Compose uses `trusted-v1`. The untrusted profile requires the current enrolled Host credential and the exact claiming replica's attestation of `io.containerd.kata.v2` with a guest kernel different from the host. The trusted profile permits runc for trusted internal/dev repositories. Follow-ups and Fork inherit the stored policy; callers cannot select it. |
@@ -811,3 +811,7 @@ Recorded here as *what has to be decided*, not as anyone's actual answer.
 2. Note who provisions it and whether it differs per environment.
 3. If it is a secret, say where it is stored — never the value itself.
 4. The PR checklist enforces this; a new variable without a row is a review stop.
+
+### Repository environments rollout
+
+Admin → Settings → Repository environments (`repository_environments_enabled`) defaults to false. `AGENT_REPOSITORY_ENVIRONMENTS_ENABLED=true` imports the initial value; saved settings take precedence. Enable only after every control-plane and host/broker replica is upgraded and deployment acceptance is complete. Disabling hides the UI and blocks new nonempty bindings and test runs; existing workspace bindings keep executing with their configuration.

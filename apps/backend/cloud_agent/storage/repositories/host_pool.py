@@ -1076,6 +1076,11 @@ class PostgresHostPoolRepository:
                 ORDER BY j.created_at, j.id
                 """
             )
+            job_rows.extend(
+                await conn.fetch(
+                    "SELECT execution_profile, '[\"environment-v1\"]'::jsonb AS requires FROM agent_environment_runs WHERE state='queued'",
+                )
+            )
             rows = await conn.fetch(
                 f"""
                 SELECT {HOST_COLUMNS}, {HOST_CAPACITY_COLUMNS}, n.allocation_id,
@@ -1119,6 +1124,19 @@ class PostgresHostPoolRepository:
             matching_hosts: list[_HostCapacity] = []
             templates: list[tuple[str, _HostShape]] = []
             free_slots = 0
+            active_tests = {
+                row["host"]: int(row["count"])
+                for row in await conn.fetch(
+                    "SELECT host,COUNT(*) AS count FROM agent_environment_runs WHERE host IS NOT NULL AND NOT cleanup_complete AND lease_expires_at>NOW() AND started_at>NOW()-INTERVAL '30 minutes' GROUP BY host"
+                )
+            }
+            cleanup_blocked_hosts = {
+                row["host"]
+                for row in await conn.fetch(
+                    "SELECT DISTINCT host FROM agent_environment_runs WHERE host IS NOT NULL AND NOT cleanup_complete "
+                    "AND (lease_expires_at<=NOW() OR started_at<=NOW()-INTERVAL '30 minutes')"
+                )
+            }
             for raw in rows:
                 host = self._host_row_to_dict(raw)
                 host["allocation_id"] = raw["allocation_id"]
@@ -1146,9 +1164,12 @@ class PostgresHostPoolRepository:
                         )
                     )
                 )
-                fresh = bool(
-                    heartbeat is not None
-                    and (observed_at - heartbeat).total_seconds() <= FRESH_AFTER_SECONDS
+                fresh = (
+                    bool(
+                        heartbeat is not None
+                        and (observed_at - heartbeat).total_seconds() <= FRESH_AFTER_SECONDS
+                    )
+                    and host["host"] not in cleanup_blocked_hosts
                 )
                 if not (
                     host.get("status") == HOST_ONLINE
@@ -1178,7 +1199,12 @@ class PostgresHostPoolRepository:
                 ceilings = [value for value in (total, desired) if isinstance(value, int)]
                 if not ceilings:
                     continue
-                free = max(0, min(ceilings) - int(host.get("slots_used") or 0))
+                free = max(
+                    0,
+                    min(ceilings)
+                    - int(host.get("slots_used") or 0)
+                    - active_tests.get(host["host"], 0),
+                )
                 free_slots += free
                 if free:
                     matching_hosts.append((shape, free))
