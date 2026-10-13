@@ -673,6 +673,11 @@ def _run_shared_boundary_case(
     retained = Mock()
     retained.sandbox_metadata.return_value = {}
     retained.has_binary.return_value = True
+    # The claim path now reconciles a credential-free Git remote before every
+    # retained turn. These lifecycle tests are not about Git, so give that step
+    # a successful empty ``git remote`` result; the worktree tests exercise
+    # remote addition, replacement, and removal directly.
+    retained.spawn.return_value = SimpleNamespace(chunks=lambda: iter(()), wait=lambda: 0)
     monkeypatch.setattr(runner_mod, "ChatSandboxManager", lambda _backend: manager)
     monkeypatch.setattr(runner_mod, "RetainedChatBackend", lambda *_args, **_kwargs: retained)
     monkeypatch.setattr(runner_mod, "_resident_base_ready", lambda *_args: True)
@@ -1876,6 +1881,7 @@ def test_startup_measurement_records_every_runner_stage(monkeypatch, caplog, tmp
         "sandbox_running",
         "terminal_suspend",
         "native_workspace_resume",
+        "direct_write_remote",
         "runtime_preflight",
         "agent_network",
         "terminal_resume",

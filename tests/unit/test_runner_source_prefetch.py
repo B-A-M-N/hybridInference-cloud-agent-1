@@ -93,6 +93,7 @@ def _run_turn(
     retained = Mock()
     retained.sandbox_metadata.return_value = {}
     retained.has_binary.return_value = True
+    retained.spawn.return_value = SimpleNamespace(chunks=lambda: iter(()), wait=lambda: 0)
     monkeypatch.setattr(runner_mod, "ChatSandboxManager", lambda _backend: manager)
     monkeypatch.setattr(runner_mod, "RetainedChatBackend", lambda *_args, **_kwargs: retained)
     monkeypatch.setattr(runner_mod, "_resident_base_ready", lambda *_args: True)

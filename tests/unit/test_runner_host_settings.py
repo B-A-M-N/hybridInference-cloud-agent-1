@@ -163,6 +163,7 @@ def test_claimed_github_write_token_reaches_only_the_resident_launch(monkeypatch
             **_PAYLOAD,
             "clone_token": "host-clone-token",
             "github_token": "sandbox-write-token",
+            "direct_write_repo": "o/n",
             "runtime_version": _JOB.runtime_version,
         }
     )
@@ -194,6 +195,40 @@ def _run_new_chat(
     retained = Mock()
     retained.sandbox_metadata.return_value = {}
     retained.has_binary.return_value = True
+    retained_origin: str | None = None
+
+    class Process:
+        def __init__(self, output: str = "") -> None:
+            self.output = output
+
+        def chunks(self):
+            yield self.output
+
+        def wait(self) -> int:
+            return 0
+
+        def kill(self) -> None:
+            return None
+
+        def stderr_text(self) -> str:
+            return ""
+
+    def retained_spawn(spec):
+        nonlocal retained_origin
+        if spec.argv == ["git", "remote"]:
+            return Process("origin\n" if retained_origin else "")
+        if spec.argv[:4] == ["git", "remote", "add", "origin"]:
+            retained_origin = spec.argv[4]
+            return Process()
+        if spec.argv[:4] == ["git", "remote", "set-url", "origin"]:
+            retained_origin = spec.argv[4]
+            return Process()
+        if spec.argv == ["git", "remote", "remove", "origin"]:
+            retained_origin = None
+            return Process()
+        raise AssertionError(spec.argv)
+
+    retained.spawn.side_effect = retained_spawn
     manager = Mock()
     monkeypatch.setattr(runner_mod, "ChatSandboxManager", lambda _backend: manager)
     monkeypatch.setattr(runner_mod, "RetainedChatBackend", lambda *_args, **_kwargs: retained)
