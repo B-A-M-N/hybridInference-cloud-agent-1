@@ -56,6 +56,10 @@
 //  13. stalled settings headers or bodies cannot delay pages for seconds:
 //      cold processes render neutral branding and warmed processes retain the
 //      last valid appearance, with successful edits still visible on recovery.
+//  14. every document carries the security headers, its mount point included,
+//      and every script in it is one its Content-Security-Policy allows: the
+//      policy comes from middleware whose matcher is relative to `basePath`,
+//      so a page the matcher misses is only visible in a served build.
 //
 // Run from `apps/frontend/`.
 // Use --saved-config-only to check request-scoped caching against an existing
@@ -816,6 +820,92 @@ async function assertSavedConfigRequestScope(variant) {
   }
 }
 
+/** The headers every response carries, documents and build assets alike. */
+const STATIC_SECURITY_HEADERS = [
+  ['x-content-type-options', 'nosniff'],
+  ['referrer-policy', 'strict-origin-when-cross-origin'],
+  ['x-frame-options', 'DENY'],
+];
+
+function assertStaticSecurityHeaders(where, headers) {
+  for (const [name, value] of STATIC_SECURITY_HEADERS) {
+    if (headers.get(name) !== value) {
+      fail(`${where}: ${name} is ${JSON.stringify(headers.get(name))}, expected ${value}`);
+    }
+  }
+}
+
+/**
+ * The documents' Content-Security-Policy, read off the served build.
+ *
+ * Each script in a document must be allowed by that document's policy — by the
+ * request's nonce, or, for an inline script without one, by its hash — and
+ * nothing may fall back to `'unsafe-inline'`, which would also allow the
+ * script the policy is there to refuse. The mount point is checked as well as
+ * a page under it, because that is the path a `basePath`-relative matcher can
+ * miss while every other one matches.
+ */
+async function assertSecurityHeaders(variant) {
+  const port = nextPort++;
+  const server = startServer(DEPLOYMENTS[0].env, port);
+  const origin = `http://127.0.0.1:${port}`;
+  try {
+    const nonces = new Set();
+    let asset = null;
+    for (const path of [variant.basePath || '/', `${variant.basePath}/login`]) {
+      const where = `${variant.name} / security headers of ${path}`;
+      const response = await waitForResponse(`${origin}${path}`);
+      const html = await response.text();
+      if (response.status !== 200) {
+        fail(`${where}: answered ${response.status}\n${server.logs.join('')}`);
+      }
+      assertStaticSecurityHeaders(where, response.headers);
+
+      const policy = response.headers.get('content-security-policy');
+      if (!policy) fail(`${where}: the document has no Content-Security-Policy`);
+      const directives = new Map(
+        policy.split(';').map((directive) => {
+          const [name, ...sources] = directive.trim().split(/\s+/);
+          return [name, sources];
+        }),
+      );
+      for (const name of ['frame-ancestors', 'object-src', 'base-uri']) {
+        if (directives.get(name)?.join(' ') !== "'none'") {
+          fail(`${where}: ${name} is not 'none' in ${JSON.stringify(policy)}`);
+        }
+      }
+      const scriptSources = directives.get('script-src') ?? [];
+      if (scriptSources.includes("'unsafe-inline'") || scriptSources.includes("'unsafe-eval'")) {
+        fail(`${where}: script-src allows inline or evaluated code: ${JSON.stringify(policy)}`);
+      }
+      const nonce = scriptSources.map((source) => /^'nonce-(.+)'$/.exec(source)?.[1]).find(Boolean);
+      if (!nonce) fail(`${where}: script-src carries no nonce: ${JSON.stringify(policy)}`);
+      nonces.add(nonce);
+
+      const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)];
+      if (scripts.length === 0) {
+        fail(`${where}: the document has no scripts, so this check would pass vacuously`);
+      }
+      for (const [, attributes, body] of scripts) {
+        if (attributes.includes(`nonce="${nonce}"`)) continue;
+        const hash = `'sha256-${createHash('sha256').update(body).digest('base64')}'`;
+        if (attributes.includes('src=') || !scriptSources.includes(hash)) {
+          fail(`${where}: the policy does not allow <script${attributes}>`);
+        }
+      }
+      asset ??= firstMatch(html, /src="([^"]*\/_next\/static\/[^"]*\.js)"/);
+    }
+    if (nonces.size !== 2) fail(`${variant.name}: two documents were given the same nonce`);
+
+    if (!asset) fail(`${variant.name}: no script asset to read the static headers from`);
+    const response = await fetch(`${origin}${asset}`);
+    await response.arrayBuffer();
+    assertStaticSecurityHeaders(`${variant.name} / security headers of ${asset}`, response.headers);
+  } finally {
+    await server.stop();
+  }
+}
+
 async function main() {
   for (const variant of VARIANTS) {
     buildVariant(variant);
@@ -828,6 +918,7 @@ async function main() {
     await assertReturnTo(variant);
     await assertNeutralDeployment(variant);
     await assertSavedConfigRequestScope(variant);
+    await assertSecurityHeaders(variant);
 
     // One artifact, two environments, and the two documents must differ — the
     // core assertion. Equal documents mean the value was resolved at build
