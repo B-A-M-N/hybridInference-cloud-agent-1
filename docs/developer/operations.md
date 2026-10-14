@@ -84,15 +84,17 @@ that URL to another origin is refused while the token is kept. Clear the token,
 save the URL, then enter the token again.
 
 For the first deployment of this release, run `alembic upgrade head` through
-`0082_team_environments`. 0079 and 0080 only add tables and change no
+`0083_repository_direct_write`. 0079 and 0080 only add tables and change no
 existing row. 0081 adds `agent_sandbox_snapshots.pushed_commit_sha` and copies
 into it the commit of every snapshot that was never published. It leaves
 `published_commit_sha` as it was, so the API it replaces keeps working until
 then, and no notice fires. 0082 adds nullable team columns to environments and
 their bindings, and lets a repository default name any environment; it changes
 no existing row, and refuses to downgrade while a team environment exists.
-Existing hosts begin without a deployment drain owner or release receipt, and
-0051 backfills each one with a non-null fence
+owner or release receipt, and 0051 backfills each one with a non-null fence
+0083 adds the repository direct-write policy and token tables. Existing hosts
+begin without a deployment drain owner or release receipt, and 0051 backfills
+each one with a non-null fence
 epoch. 0066 builds an index on `agent_jobs` concurrently: on a long job history
 it takes a while without blocking the running API, and an interrupted run can
 simply be repeated. 0067 only replaces a trigger function. Once this release
