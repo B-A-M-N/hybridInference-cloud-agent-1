@@ -54,8 +54,7 @@ def test_mcp_connector_invariant_revision_follows_trajectory_merge() -> None:
         == "0066_admin_job_listing_index"
     )
     assert (
-        script.get_revision("0068_sandbox_checkpoints").down_revision
-        == "0067_failed_snapshot_wake"
+        script.get_revision("0068_sandbox_checkpoints").down_revision == "0067_failed_snapshot_wake"
     )
     assert script.get_revision("0069_agent_memories").down_revision == "0068_sandbox_checkpoints"
     assert script.get_revision("0070_memory_cutover").down_revision == "0069_agent_memories"
