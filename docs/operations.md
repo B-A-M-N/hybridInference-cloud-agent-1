@@ -62,12 +62,28 @@ field is missing or an optional integration is only partly configured, the
 **Administrator setup required** prompt links to the fields that still need
 attention.
 
+Admin Settings is operator access, and `agent.admin` should be granted only to
+people trusted to operate the deployment. It edits the session and host
+signing keys and the Gateway public-key URL, so an administrator can sign in as
+any user, and the GitHub API URL that the App's, the publication token's and
+users' own GitHub credentials are sent to. Saved credentials stay write-only,
+and the Gateway dispatch token is bound to the Gateway API URL's origin: moving
+that URL to another origin is refused while the token is kept. Reset the token,
+save the URL, then enter the token again.
+
 For the first deployment of this release, run `alembic upgrade head` through
-`0051_host_drain_fence_epoch`. Existing hosts begin without a deployment drain
+`0067_failed_snapshot_wake`. Existing hosts begin without a deployment drain
 owner or release receipt, and 0051 backfills each one with a non-null fence
-epoch. Rebuild the sandbox image for explicit plugin loading. Then start the
-main control-plane listener with its existing complete environment. It
-imports registered environment settings once,
+epoch. 0066 builds an index on `agent_jobs` concurrently: on a long job history
+it takes a while without blocking the running API, and an interrupted run can
+simply be repeated. 0067 only replaces a trigger function. Once this release
+runs, a shared workspace that a failed snapshot left `dirty` publishes again:
+a snapshot already pending behind the failure is captured, otherwise the
+group's next settled turn is (see
+[Resume, Fork, and publication](#resume-fork-and-publication)). Rebuild the
+sandbox image for explicit plugin loading.
+Then start the main control-plane listener with its existing complete
+environment. It imports registered environment settings once,
 while the MCP-only listener waits for initialization and then reads the same
 settings. Newly migrated runtime identity, service keys, sandbox manager credentials,
 and policy fields are imported only when absent, under the same atomic
@@ -83,6 +99,29 @@ it uses neutral display defaults. Successful reads show saved edits on the next
 page request. This fallback contains no session or access decisions and does
 not survive a web-process restart.
 Apply changes to subsequent operations as described beside each setting.
+
+The import of registered environment settings refuses a
+`GATEWAY_GRANT_DISPATCH_TOKEN`, `AGENT_ONCALL_DISPATCH_TOKEN`,
+`AGENT_CONTROL_TOKEN_SECRET` or `AGENT_SOURCE_CONTROL_ENCRYPTION_KEY` shorter
+than 32 bytes: the listener stops with an error naming the variable before
+anything is written, so rolling back is safe. Check their lengths before the
+first deployment of this release. Replacing one has its usual cost: the
+dispatch token changes on both sides, a new control key needs hosts
+re-enrolled, and a new encryption key orphans saved user connections. Values
+already saved in Admin Settings keep working. The same import refuses an
+`AGENT_GITHUB_APP_INSTALL_URL` that is not an `https://github.com` URL and an
+`AGENT_GITLAB_OAUTH_REDIRECT_URI` that is not HTTPS (or HTTP on localhost),
+which their connect flows could never use.
+
+A release can narrow what a setting accepts. A value saved earlier that it
+refuses does not stop the listeners: each logs
+`saved setting not applied as stored: …`, naming the key but never the value,
+once per settings revision, and uses the built-in default in its place. The
+exception is a signing key, encryption key or service token shorter than a
+newly required minimum, which stays in use until it is replaced. The editor
+shows the value in effect; save a valid value or **Reset** to clear the
+warning. Undecryptable or unencrypted stored credentials still stop the
+listener.
 
 Automatic session archiving after a verified GitHub PR merge is enabled by
 default. Configure it under **Publication**; see
@@ -229,6 +268,24 @@ gateway and standalone edge need no new public route or port. Every request
 requires current `agent.admin` permission. pgAdmin retains its own login and
 CSRF checks; Agent cookies and bearer credentials are never sent upstream.
 
+pgAdmin's pages run on the Agent's own origin, where the administrator's Agent
+session authorizes every admin route. The proxy therefore adds a second
+`Content-Security-Policy` to each pgAdmin response, enforced alongside
+pgAdmin's own: pgAdmin may fetch, submit forms, open frames and start workers
+only under the public pgAdmin path. It also sends
+`Cross-Origin-Opener-Policy: same-origin`, so a pgAdmin page holds no handle on
+another Agent page it opens, and the proxy's own error answers are sandboxed.
+This narrows what a script injected into pgAdmin could do with the session; it
+is not an origin boundary. pgAdmin still shares the origin's browser storage,
+and an error page that an edge in front of the control plane serves under the
+pgAdmin path without these headers is outside the policy. Only a separate
+origin, with its own hostname, TLS and edge route and a proxy credential other
+than the Agent session cookie, would remove the shared session; this release
+does not provide one. Until then, keep the pinned pgAdmin image and its default
+security headers (its own policy refuses inline scripts without its per-request
+nonce), enable the profile only where it is used, and grant `agent.admin` only
+to operators.
+
 Enable the optional service in the control-plane deployment's `.env`:
 
 ```dotenv
@@ -255,6 +312,19 @@ before setup if the API has a different public prefix. Later changes use
 Existing `AGENT_PGADMIN_URL` and
 `AGENT_PGADMIN_PUBLIC_URL` values are imported once along with other runtime settings.
 
+**Private pgAdmin URL** selects a pgAdmin service the deployment names; it
+cannot name any other address. The bundled `http://pgadmin:5050` is always
+allowed, and so are the scheme, host and port of `AGENT_PGADMIN_URL` and
+`AGENT_PGADMIN_BOOTSTRAP_URL` in the control plane's environment. Any other
+saved URL makes the dashboard, the launch link and the proxy answer 503 without
+contacting it: the proxy forwards every method, path and body and returns the
+reply, so an address an administrator could choose freely would reach a cloud
+metadata endpoint or any other private service the control plane can reach.
+To run pgAdmin elsewhere, set its address as `AGENT_PGADMIN_URL` in the
+control plane's environment, restart the control plane, and select the same
+address in **Private pgAdmin URL**. Keep the variable set after it has been
+imported.
+
 Open **Admin → Database** and choose an administrator email and a password of
 at least 12 characters. Only a current Agent administrator can complete setup.
 The service waits for that first setup; the page then checks readiness and
@@ -278,14 +348,16 @@ If the dashboard reports unavailable, inspect `docker compose logs pgadmin`
 and its health state. Before setup, a waiting container is healthy and logs
 `Waiting for first-time setup in Admin -> Database.` After setup, unreadable
 bootstrap storage or unavailable PostgreSQL prevent startup. Setup records
-`agent.database.pgadmin.setup`; opening pgAdmin records
-`agent.database.pgadmin.open` in the Agent audit log, both for the launch link
-and for the first request of a new pgAdmin session at any URL. The Agent audit
-log does not record SQL: pgAdmin connects as the database owner, which can
-change any table, the audit log included, so treat pgAdmin access as full
-database access. The proxy adds `frame-ancestors 'self'`, `nosniff` and
-`X-Frame-Options: SAMEORIGIN` to pgAdmin's responses; pgAdmin's own policy still
-allows its inline scripts. Resetting **Private pgAdmin URL** in Admin Settings disables
+`agent.database.pgadmin.setup`. A setup that cannot write the bootstrap volume
+is recorded as failed; fix the volume and set up again from the same page.
+Opening pgAdmin records `agent.database.pgadmin.open` in the Agent audit log,
+both for the launch link and for the first request of a new pgAdmin session at
+any URL. The Agent audit log does not record SQL: pgAdmin connects as the
+database owner, which can change any table, the audit log included, so treat
+pgAdmin access as full database access. The proxy adds `frame-ancestors
+'self'`, `nosniff` and `X-Frame-Options: SAMEORIGIN` to pgAdmin's responses;
+pgAdmin's own policy still allows its inline scripts. Resetting **Private
+pgAdmin URL** in Admin Settings disables
 access after the listeners synchronize; removing the profile and stopping
 pgAdmin preserves its volume.
 
@@ -474,7 +546,10 @@ OAuth. **Configure repositories** in Integrations and **Configure repository
 access** in the composer open the same page.
 
 **Deployment allowlist.** `AGENT_REPO_ALLOWLIST` supports single-tenant use
-against the operator's repositories. When the App's OAuth credentials and
+against the operator's repositories. It is not per user: every user admitted to
+Cloud Agent may have the platform clone and publish to every listed repository
+with the deployment's GitHub credentials, so list only repositories all of them
+may work on. When the App's OAuth credentials and
 `AGENT_GITHUB_APP_INSTALL_URL` are configured, the composer still requires a
 connection before repository selection, including allowlisted repositories.
 The create endpoint independently honors the allowlist.
@@ -888,7 +963,7 @@ not establish that boundary.
 | `claude-code` | 2.1.220 | `--mcp-config` with the platform's servers | `--strict-mcp-config`, verified against the CLI: without it a committed `.mcp.json` is loaded alongside ours with no approval step |
 | `opencode` | 1.18.9 | the reviewed `opencode-freeinference` wrapper merges the relay endpoints into the `OPENCODE_CONFIG` it writes | the wrapper exports `OPENCODE_DISABLE_PROJECT_CONFIG`, which covers both `opencode.json` and `.opencode/` |
 | `kilo` | 7.4.17 | the reviewed wrapper configures the authenticated merged relay for run and serve; the live bridge verifies connection before reporting ready | the pinned build patches the legacy MCP loader to honor `KILO_DISABLE_PROJECT_CONFIG`, covering `.kilo/mcp.json` and `.kilocode/mcp.json` alongside the regular project configuration |
-| `codex` | 0.145.0 | exec and app-server share the merged relay URL and token environment reference; app-server verifies MCP startup | trusted guest-root bootstrap atomically installs the deployment's exact relay URL as the sole server identity in `/etc/codex/requirements.toml` before launch; repository and user configuration cannot expand that system allowlist |
+| `codex` | 0.145.0 | exec and app-server share the merged relay URL and token environment reference; app-server verifies MCP startup | trusted guest-root bootstrap atomically installs the deployment's exact relay URL as the sole server identity in `/etc/codex/requirements.toml` before launch; repository and user configuration cannot expand that system allowlist. After `AGENT_SANDBOX_MCP_URL` changes, a retained container's next Codex launch replaces that one-relay policy with the new URL, unless another Codex member of the group is still running; any other policy shape is refused, never replaced |
 | `pi` | 0.73.1 | the reviewed `pi-mcp-bridge.ts` shipped at `/usr/local/libexec/`, loaded with an explicit `-e` | `--no-extensions` disables every other extension source — the project's `.pi/extensions/`, the global directory, and anything a settings file names — so the explicit path is the only way in. Verified against the pinned binary: a repository's own extension does not load, the relay's tools are registered as `<alias>__<tool>`, and a call reaches the upstream |
 
 A job naming connections on a runtime that has not declared them is refused at
@@ -1299,7 +1374,7 @@ with no leader and no sharding.
 | `AGENT_HOST_STORAGE_PROBE` | `overlay_root` | Which probe measures the filesystem holding the sandbox writable layers, shown as the Servers page's Storage column. `off` stops measuring storage on that host and is the rollback; an unrecognized name reports `unsupported` rather than measuring something else. A reading is published only for a topology the host deployment has attested; see _How full is the sandbox storage?_ |
 | `AGENT_STORAGE_MIN_AVAILABLE_MIB` | `1024` | Bootstrap value for **Storage reserve for new sandboxes**; the admin runtime setting replaces it after the host's first settings heartbeat. Fresh verified available space below this reserve declines a new sandbox allocation without spending the turn. Existing sandboxes may resume; unknown capacity does not establish a pressure verdict. This is an admission guard, not a disk quota |
 | `AGENT_SANDBOX_UID` / `_GID` | `10001` | Only for a custom sandbox image; must match its user |
-| `AGENT_REPO_ALLOWLIST` | — | Comma-separated `owner/name`, or `owner/*`, for the single-tenant dogfood. Users who connect the App themselves do not need it; unset simply means the only entitlement is a user's own connection |
+| `AGENT_REPO_ALLOWLIST` | — | Comma-separated `owner/name`, or `owner/*`, for the single-tenant dogfood. Every admitted user may have the platform clone and publish to the listed repositories. Users who connect the App themselves do not need it; unset simply means the only entitlement is a user's own connection |
 | `AGENT_GITHUB_APP_CLIENT_ID` / `_CLIENT_SECRET` | — | The App's OAuth half. Only the user-facing connect flow needs it; minting installation tokens uses the private key alone |
 | `AGENT_GITHUB_APP_INSTALL_URL` | — | GitHub App installation URL, `https://github.com/apps/<slug>/installations/new`. Offered after connecting whenever the App is not on the user's own account, and behind _Configure repositories_. The control plane adds a short-lived, user-bound `state`; set the App's Callback URL to the agent web's own origin, `<origin>/connected?provider=github` (see _2. Credentials_) |
 | `AGENT_GITLAB_OAUTH_CLIENT_ID` / `_CLIENT_SECRET` | — | GitLab.com OAuth application credentials, kept on the control plane. Configure only `read_user` and `read_api` scopes |
@@ -1908,6 +1983,17 @@ asynchronously. The detail view and recent-task list poll only while that
 publication state is pending/capturing/captured/publishing, and stop at
 published/failed; other terminal jobs do not acquire a background
 polling loop.
+
+A snapshot whose patch the publisher refuses, whose capture the host refuses,
+or whose five publication retries run out stays `failed` with its reason, and
+its group is marked `dirty`. It is not retried. The group's next snapshot,
+captured when a later turn settles, supersedes it: every snapshot is the whole
+diff from the last published commit, so it carries the failed changes too, and
+is refused in turn if it still holds what was refused. Snapshots still publish
+in epoch order; only a failed one stops holding the later ones back. If the
+failed attempt had already pushed its commit to the `agent/<thread>` branch, a
+later snapshot with different changes is refused as a moved branch until that
+branch is deleted; the platform never force-pushes.
 
 Disk-pressure admission and alerting and a non-mutating pre-prompt context
 fingerprint remain deferred. Local functional checks do not establish production

@@ -1,7 +1,8 @@
 """The import boundary between the shared packages and the two implementations.
 
 ``cloud_agent_shared`` and ``cloud_agent_shared.git`` are the packages both images
-ship, so neither may import an implementation package. The control plane and
+ship, so neither may import an implementation package, and only the files
+``IO_EXEMPTIONS`` names may reach outside the process. The control plane and
 host do not import one another: shared runtime discovery facts live in the
 shared catalog, and host command builders and output parsers remain on the
 host. Each deployment can therefore load its own package independently.
@@ -25,12 +26,60 @@ HOST_ROOT = REPO_ROOT / "apps" / "backend" / "cloud_agent_host"
 #: thing that made it separate from spreading.
 SHARED_ROOTS = {"cloud_agent_shared": SHARED_ROOT}
 
-#: The only subpackage of the shared package allowed to touch the outside
-#: world, and the two modules that do it: Git drives ``subprocess`` and the
-#: source archives are ``tarfile``. Everything else there is vocabulary two
-#: images agree on, and a parser or a network client in it would ride into both.
-IO_SUBPACKAGE = "git"
-IO_MODULES = frozenset({"subprocess", "tarfile"})
+#: Imports that reach outside the process: other programs, the network, and
+#: work that outlives the call that started it. "I/O" in the shared package
+#: means importing one of these. A module covers its submodules, and
+#: ``from urllib import request`` counts as ``urllib.request``. Builtin file
+#: access needs no import, so this scan does not see it. Everything else in the
+#: shared package is vocabulary the two images agree on, and a network client
+#: or a background thread in it would ship in both.
+IO_MODULES = frozenset(
+    {
+        # Other programs, and the source archives built from their output.
+        "subprocess",
+        "multiprocessing",
+        "tarfile",
+        # The network: standard-library modules, and third-party clients and
+        # database drivers.
+        "socket",
+        "ssl",
+        "http.client",
+        "urllib.request",
+        "httpx",
+        "requests",
+        "aiohttp",
+        "websockets",
+        "asyncpg",
+        "psycopg",
+        "boto3",
+        "botocore",
+        # Work that outlives the call that started it. ``threading`` counts
+        # whole, locks included: the scan sees a module, not what is done with
+        # it, and vocabulary has no shared state to lock.
+        "threading",
+        "concurrent.futures",
+        "atexit",
+    }
+)
+
+#: The only places in the shared package that may import those, by path
+#: relative to the package, and which of them each may import. A directory
+#: covers every file under it. The check is two-sided: an import outside an
+#: entry fails, and so does an entry whose code no longer imports something it
+#: names. An exemption therefore goes when its reason does, instead of
+#: quietly covering an empty set.
+IO_EXEMPTIONS: dict[str, frozenset[str]] = {
+    # Git drives ``subprocess`` and the source archives are ``tarfile``.
+    "git": frozenset({"subprocess", "tarfile"}),
+    # The operation-profiling collector both images run (AGENTS.md, repo map):
+    # ``socket`` only for ``gethostname()``, ``threading`` for its locks and
+    # its daemon exporter thread, and ``atexit`` to flush that exporter. It
+    # opens no connection. It writes to a file the deployment names.
+    "profiling": frozenset({"socket", "threading", "atexit"}),
+    # The collector's stable facade starts no thread; it re-exports
+    # ``threading`` for callers that patch the collector through it.
+    "operation_profiling.py": frozenset({"threading"}),
+}
 
 #: The control-plane package, which the runner image does not ship. This is the
 #: one direction of the boundary no compatibility shim can bridge.
@@ -42,6 +91,58 @@ HOST_PACKAGE = "cloud_agent_host"
 #: Top-level packages that depend on the host side of the deployment; a shared
 #: package can never import one of these.
 IMPLEMENTATION_PACKAGES = frozenset({"cloud_agent", "cloud_agent_host"})
+
+
+#: The host's re-exports of modules that moved to ``cloud_agent_shared``. Each
+#: stays only while something still imports it, and is deleted after.
+HOST_SHIMS = frozenset(
+    {
+        "cloud_agent_host.patch_gate",
+        "cloud_agent_host.shared_protocol",
+        "cloud_agent_host.source_archive",
+    }
+)
+
+#: Where a shim may still be imported from: every tree a Python import can
+#: start in, the ``cloud_agent_host`` package included.
+SHIM_SCAN_ROOTS = ("apps/backend", "scripts", "tests")
+
+#: Who still imports a shim, as ``(file, shim)``. Another transition allowlist
+#: that may only shrink: new code imports the shared module, and an importer
+#: that moves deletes its entry here. No ``cloud_agent_host`` module is on it.
+SHIM_IMPORT_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("scripts/bench_operation_overhead.py", "cloud_agent_host.shared_protocol"),
+        (
+            "tests/integration/servers/test_agent_jobs_lifecycle.py",
+            "cloud_agent_host.shared_protocol",
+        ),
+        (
+            "tests/integration/servers/test_measurement_acceptance_db.py",
+            "cloud_agent_host.shared_protocol",
+        ),
+        (
+            "tests/integration/servers/test_pending_message_queue.py",
+            "cloud_agent_host.shared_protocol",
+        ),
+        (
+            "tests/integration/storage/test_agent_grant_store.py",
+            "cloud_agent_host.shared_protocol",
+        ),
+        ("tests/integration/storage/test_agent_job_store.py", "cloud_agent_host.shared_protocol"),
+        (
+            "tests/integration/storage/test_host_pool_store.py",
+            "cloud_agent_host.shared_protocol",
+        ),
+        ("tests/integration/test_agent_publisher.py", "cloud_agent_host.patch_gate"),
+        ("tests/unit/test_agent_patch_gate.py", "cloud_agent_host.patch_gate"),
+        ("tests/unit/test_candidate_check.py", "cloud_agent_host.shared_protocol"),
+        ("tests/unit/test_cross_artifact_contracts.py", "cloud_agent_host.shared_protocol"),
+        ("tests/unit/test_deploy_readiness.py", "cloud_agent_host.shared_protocol"),
+        ("tests/unit/test_execution_profiles.py", "cloud_agent_host.shared_protocol"),
+        ("tests/unit/test_source_archive.py", "cloud_agent_host.source_archive"),
+    }
+)
 
 
 def _parse(path: Path) -> ast.Module:
@@ -114,36 +215,6 @@ def test_control_plane_imports_no_host_package() -> None:
     assert scanned == set(), f"the control plane imports host symbols: {sorted(scanned)}"
 
 
-def test_only_the_git_subpackage_reaches_outside_the_process() -> None:
-    """I/O lives in one subpackage, and it is still there to be found.
-
-    The exemption has two halves and both are asserted: nothing outside
-    ``git/`` imports the I/O modules, and ``git/`` still does — so the day the
-    algorithms stop needing ``subprocess``, this fails and the exemption goes
-    rather than quietly covering an empty set.
-    """
-
-    def _io_imports(path: Path) -> set[str]:
-        return _imported_modules(path) & IO_MODULES
-
-    offenders: dict[str, set[str]] = {}
-    doing_io: set[str] = set()
-    for path in sorted(SHARED_ROOT.rglob("*.py")):
-        found = _io_imports(path)
-        if not found:
-            continue
-        if path.parent.name == IO_SUBPACKAGE:
-            doing_io |= found
-        else:
-            offenders[str(path.relative_to(REPO_ROOT))] = found
-
-    assert not offenders, f"only {IO_SUBPACKAGE}/ may do I/O in the shared package: {offenders}"
-    assert doing_io == IO_MODULES, (
-        f"{IO_SUBPACKAGE}/ no longer imports {sorted(IO_MODULES - doing_io)}; "
-        "the exemption above now covers nothing and should go"
-    )
-
-
 @pytest.mark.parametrize(
     ("source", "pairs", "modules"),
     [
@@ -168,6 +239,101 @@ def test_the_scanner_sees_both_host_import_forms(
 
     assert _host_import_pairs(offender) == pairs
     assert _host_module_imports(offender) == modules
+
+
+def _io_imports(path: Path) -> set[str]:
+    """The ``IO_MODULES`` entries one file imports, in any import form.
+
+    A module counts under the entry that contains it, so ``asyncpg.pool`` is
+    ``asyncpg``. A ``from`` import also counts each name it takes as a possible
+    submodule, so ``from urllib import request`` is ``urllib.request``, as
+    ``import urllib.request`` is.
+    """
+    names: set[str] = set()
+    for node in ast.walk(_parse(path)):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module)
+            names.update(f"{node.module}.{alias.name}" for alias in node.names)
+    return {
+        entry
+        for entry in IO_MODULES
+        if any(name == entry or name.startswith(f"{entry}.") for name in names)
+    }
+
+
+def _io_exemption(relative: Path) -> str | None:
+    """The ``IO_EXEMPTIONS`` entry covering one file of the shared package."""
+    for entry in IO_EXEMPTIONS:
+        if relative == Path(entry) or Path(entry) in relative.parents:
+            return entry
+    return None
+
+
+def test_only_the_exempted_shared_modules_reach_outside_the_process() -> None:
+    """I/O lives where ``IO_EXEMPTIONS`` says, and is still there to be found.
+
+    Both halves are asserted. Nothing outside an entry imports an I/O module,
+    and nothing inside one imports a module its entry does not name. Every
+    entry also still imports everything it names. If the Git algorithms stop
+    needing ``subprocess``, or the profiling collector stops starting a
+    thread, this fails, and the exemption shrinks instead of quietly covering
+    an empty set.
+    """
+    offenders: dict[str, set[str]] = {}
+    used: dict[str, set[str]] = {entry: set() for entry in IO_EXEMPTIONS}
+    for path in sorted(SHARED_ROOT.rglob("*.py")):
+        found = _io_imports(path)
+        if not found:
+            continue
+        entry = _io_exemption(path.relative_to(SHARED_ROOT))
+        allowed = IO_EXEMPTIONS[entry] if entry is not None else frozenset()
+        if entry is not None:
+            used[entry] |= found & allowed
+        if found - allowed:
+            offenders[str(path.relative_to(REPO_ROOT))] = found - allowed
+
+    assert not offenders, (
+        "only IO_EXEMPTIONS may reach outside the process in the shared package, "
+        f"and only through the modules each entry names: {offenders}"
+    )
+    unused = {
+        entry: sorted(modules - used[entry])
+        for entry, modules in IO_EXEMPTIONS.items()
+        if modules - used[entry]
+    }
+    assert not unused, (
+        f"these exemptions name modules their code no longer imports; narrow or delete them: "
+        f"{unused}"
+    )
+
+
+def test_the_io_scanner_sees_every_import_form(tmp_path: Path) -> None:
+    """The negative case for the check above, one line per form.
+
+    The set this replaced held two names and compared them exactly. So
+    ``import asyncpg.pool``, ``from urllib import request``, and any client not
+    on that list all passed as vocabulary. Parsing a URL is not I/O.
+    """
+    offender = tmp_path / "offender.py"
+    offender.write_text(
+        "import asyncpg.pool\n"
+        "from urllib import request\n"
+        "from http import client as http_client\n"
+        "from httpx import AsyncClient\n"
+        "import threading as _threading\n"
+        "from urllib.parse import urlsplit\n",
+        encoding="utf-8",
+    )
+
+    assert _io_imports(offender) == {
+        "asyncpg",
+        "urllib.request",
+        "http.client",
+        "httpx",
+        "threading",
+    }
 
 
 @pytest.mark.parametrize("package", sorted(SHARED_ROOTS))
@@ -223,3 +389,70 @@ def test_host_package_imports_no_control_plane_package() -> None:
     assert offenders == set(), "cloud_agent_host imports the control plane:\n" + "\n".join(
         sorted(offenders)
     )
+
+
+def _shim_imports(path: Path) -> set[str]:
+    """The host shims one file imports, in every form an import can take."""
+    shims: set[str] = set()
+    for node in ast.walk(_parse(path)):
+        if isinstance(node, ast.Import):
+            shims.update(alias.name for alias in node.names if alias.name in HOST_SHIMS)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            if node.module in HOST_SHIMS:
+                shims.add(node.module)
+            elif node.module == HOST_PACKAGE:
+                # ``from cloud_agent_host import shared_protocol``
+                shims.update(
+                    f"{HOST_PACKAGE}.{alias.name}"
+                    for alias in node.names
+                    if f"{HOST_PACKAGE}.{alias.name}" in HOST_SHIMS
+                )
+    return shims
+
+
+def test_host_shim_importers_are_the_transition_allowlist() -> None:
+    """The host's re-exports of moved modules may only lose importers.
+
+    Each shim's docstring used to list its callers by hand, and those lists
+    went stale as new tests imported the old path -- the shims were gaining
+    importers instead of losing them, and ``runner.py`` imported one module
+    through both paths. Equality, not a subset check: a new importer fails,
+    and so does an entry left behind by one that moved.
+    """
+    names = {shim.rsplit(".", 1)[1] for shim in HOST_SHIMS}
+    scanned: set[tuple[str, str]] = set()
+    for root in SHIM_SCAN_ROOTS:
+        for path in sorted((REPO_ROOT / root).rglob("*.py")):
+            text = path.read_text(encoding="utf-8")
+            # Parsing every file is most of this test's time; a file that never
+            # spells a shim's name cannot import it in any form.
+            if HOST_PACKAGE not in text or not any(name in text for name in names):
+                continue
+            relative = path.relative_to(REPO_ROOT).as_posix()
+            scanned.update((relative, shim) for shim in _shim_imports(path))
+
+    allowlist = set(SHIM_IMPORT_ALLOWLIST)
+    assert scanned == allowlist, (
+        "import the cloud_agent_shared module instead of the host shim:\n"
+        f"new shim imports: {sorted(scanned - allowlist)}\n"
+        f"stale allowlist entries to delete: {sorted(allowlist - scanned)}"
+    )
+    shimmed = {shim for _path, shim in allowlist}
+    assert shimmed == set(HOST_SHIMS), (
+        f"nothing imports {sorted(set(HOST_SHIMS) - shimmed)} any more: delete the module "
+        "and its entry in HOST_SHIMS"
+    )
+
+
+def test_the_shim_scanner_sees_every_import_form(tmp_path: Path) -> None:
+    """The negative case for the check above, one line per import form."""
+    importer = tmp_path / "importer.py"
+    importer.write_text(
+        "import cloud_agent_host.patch_gate\n"
+        "from cloud_agent_host import shared_protocol, sandbox\n"
+        "from cloud_agent_host.source_archive import build_source_archive\n"
+        "from cloud_agent_shared.shared_protocol import FORK_HELPER\n",
+        encoding="utf-8",
+    )
+
+    assert _shim_imports(importer) == set(HOST_SHIMS)

@@ -59,7 +59,9 @@
 //  14. every document carries the security headers, its mount point included,
 //      and every script in it is one its Content-Security-Policy allows: the
 //      policy comes from middleware whose matcher is relative to `basePath`,
-//      so a page the matcher misses is only visible in a served build.
+//      so a page the matcher misses is only visible in a served build. A
+//      static script is served with the `next.config.js` headers too, and no
+//      response sends `X-Powered-By`.
 //
 // Run from `apps/frontend/`.
 // Use --saved-config-only to check request-scoped caching against an existing
@@ -833,6 +835,8 @@ function assertStaticSecurityHeaders(where, headers) {
       fail(`${where}: ${name} is ${JSON.stringify(headers.get(name))}, expected ${value}`);
     }
   }
+  // `poweredByHeader: false` in `next.config.js`.
+  if (headers.has('x-powered-by')) fail(`${where}: the response still sends X-Powered-By`);
 }
 
 /**
@@ -900,6 +904,10 @@ async function assertSecurityHeaders(variant) {
     if (!asset) fail(`${variant.name}: no script asset to read the static headers from`);
     const response = await fetch(`${origin}${asset}`);
     await response.arrayBuffer();
+    // Headers on a 404 would say nothing about the handler that serves assets.
+    if (response.status !== 200) {
+      fail(`${variant.name}: GET ${asset} answered ${response.status}\n${server.logs.join('')}`);
+    }
     assertStaticSecurityHeaders(`${variant.name} / security headers of ${asset}`, response.headers);
   } finally {
     await server.stop();

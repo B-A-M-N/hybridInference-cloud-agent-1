@@ -1,5 +1,7 @@
 // Authenticated streams use fetchWithAuth and ReadableStream. Global event
 // IDs let reconnects resume after the last received event without losing history.
+// The control plane ends each owner SSE stream after a fixed time (15 minutes),
+// so a job that outlives one connection is normal, not exceptional.
 import { fetchWithAuth, jsonOrThrow } from '../client';
 import { config } from '@/config/env';
 
@@ -63,6 +65,8 @@ export interface StreamAgentJobOptions {
   onEvent: (event: AgentJobEventApi) => void;
   onFinished?: (info: { state: string; published_pr_url: string | null }) => void;
   onError?: (error: unknown) => void;
+  /** Each connection the server accepts, before any of its frames. */
+  onOpen?: () => void;
   /** Resume point; frames with an id at or below this are not re-sent. */
   lastEventId?: number;
   signal?: AbortSignal;
@@ -96,9 +100,10 @@ export function parseFrame(raw: string): ParsedFrame | null {
 /**
  * Stream a job's events, reconnecting from the last id until it finishes.
  *
- * Reconnection is expected behaviour rather than error handling: the gateway
- * caps long-lived streams, so a job running longer than that cap will drop a
- * connection through no fault of anyone's. The cursor makes that invisible.
+ * Reconnection is expected behaviour rather than error handling: the control
+ * plane caps each stream's lifetime, so a job running longer than that cap
+ * ends a connection, without `job_finished`, through no fault of anyone's. The
+ * cursor makes that invisible.
  */
 export async function streamAgentJob(jobId: string, opts: StreamAgentJobOptions): Promise<void> {
   let cursor = opts.lastEventId ?? 0;
@@ -144,6 +149,7 @@ export async function streamAgentJob(jobId: string, opts: StreamAgentJobOptions)
       await jsonOrThrow(resp).catch((err) => opts.onError?.(err));
       return;
     }
+    opts.onOpen?.();
 
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
@@ -189,8 +195,9 @@ export async function streamAgentJob(jobId: string, opts: StreamAgentJobOptions)
       }
     } catch (err) {
       if (opts.signal?.aborted) return;
-      // A mid-stream drop is the expected shape when the server's stream cap
-      // fires. Reconnect from the cursor instead of surfacing an error.
+      // A connection dropped mid-stream: report it, then reconnect from the
+      // cursor below. The server's stream cap ends a stream cleanly instead,
+      // through `done` above.
       opts.onError?.(err);
     } finally {
       try {

@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import json
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from cloud_agent.attachments.models import (
     AttachmentRef,  # noqa: TC001 — Pydantic resolves annotations at runtime.
 )
 from cloud_agent.entitlement import REPO_PATTERN
 from cloud_agent.execution_profiles import ExecutionProfile
+from cloud_agent.github_app import is_ref_name
 from cloud_agent.goals.models import (  # noqa: TC001 — Pydantic resolves annotations at runtime.
     GoalInput,
     GoalRoundKind,
@@ -20,6 +22,7 @@ from cloud_agent.goals.report import (  # noqa: TC001 — Pydantic resolves anno
     GoalReportOutcome,
     GoalReportParse,
 )
+from cloud_agent.schemas._prompts import _visible_prompt
 from cloud_agent.schemas.mcp import (  # noqa: TC001 — Pydantic resolves annotations at runtime.
     McpBindingInput,
     McpBindingSummary,
@@ -72,7 +75,17 @@ RESET_REASONING_EFFORT = "auto"
 #: `high` without complaint.
 PLATFORM_REASONING_EFFORTS = ("low", "medium", "high", "max")
 
+#: Caller metadata is stored on the first turn, copied onto every later turn of
+#: the conversation and returned with every job read, so it is bounded by key
+#: count and by its serialized size rather than left to the proxy in front.
+MAX_JOB_METADATA_KEYS = 64
+MAX_JOB_METADATA_BYTES = 16 * 1024
 
+
+# Unknown fields are still ignored here rather than refused, unlike a message's
+# body: the on-call relay posts this same model to its own door, and what it
+# sends has included a field this model never declared (``mcp_servers``), so
+# refusing unknown fields is a change to coordinate with that caller first.
 class AgentJobCreate(BaseModel):
     """Request body for creating an agent job."""
 
@@ -85,9 +98,13 @@ class AgentJobCreate(BaseModel):
         max_length=140,
         description="Target repository, e.g. 'owner/name'.",
     )
-    task_prompt: str = Field(..., description="What the agent should do.")
-    runtime: str = Field("claude-code", description="Agent runtime id.")
-    model: str = Field(..., description="Gateway model id the runtime should use.")
+    # The same bounds and blank check a message to the conversation has: this
+    # is that conversation's first message.
+    task_prompt: str = Field(
+        ..., min_length=1, max_length=100_000, description="What the agent should do."
+    )
+    runtime: str = Field("claude-code", max_length=64, description="Agent runtime id.")
+    model: str = Field(..., max_length=255, description="Gateway model id the runtime should use.")
     reasoning_effort: str | None = Field(
         None,
         max_length=32,
@@ -172,7 +189,21 @@ class AgentJobCreate(BaseModel):
             "means no goal: nothing continues without the owner asking again."
         ),
     )
-    metadata: dict[str, Any] | None = Field(None, description="Opaque caller metadata.")
+    metadata: dict[str, Any] | None = Field(
+        None,
+        description=(
+            f"Opaque caller metadata: at most {MAX_JOB_METADATA_KEYS} keys and "
+            f"{MAX_JOB_METADATA_BYTES // 1024} KiB as JSON."
+        ),
+    )
+
+    @field_validator("base_ref")
+    @classmethod
+    def base_ref_is_a_git_ref_name(cls, value: str | None) -> str | None:
+        """Refuse a name git would refuse: it is sent to GitHub inside an API path."""
+        if value and not is_ref_name(value):
+            raise ValueError("base_ref must be a valid Git branch or tag name")
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -182,6 +213,25 @@ class AgentJobCreate(BaseModel):
             raise ValueError(
                 "execution_profile is server-owned; callers cannot select or downgrade it"
             )
+        return value
+
+    @field_validator("task_prompt")
+    @classmethod
+    def validate_task_prompt(cls, value: str) -> str:
+        """Reject a visually empty task and persist the user's trimmed text."""
+        return _visible_prompt(value)
+
+    @field_validator("metadata")
+    @classmethod
+    def bound_metadata(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Keep caller metadata small; every turn of the conversation repeats it."""
+        if value is None:
+            return None
+        if len(value) > MAX_JOB_METADATA_KEYS:
+            raise ValueError(f"metadata may have at most {MAX_JOB_METADATA_KEYS} keys")
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+        if len(encoded.encode("utf-8")) > MAX_JOB_METADATA_BYTES:
+            raise ValueError(f"metadata may be at most {MAX_JOB_METADATA_BYTES} bytes as JSON")
         return value
 
 

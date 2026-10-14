@@ -1168,6 +1168,15 @@ class PostgresSandboxRepository:
         """
         async with self._pool.acquire() as conn, conn.transaction():
             await lock_compute_entry(conn)
+            # The attempt, then the conversation, then the turn. A first
+            # reservation creates the group and membership, whose foreign keys
+            # share-lock the conversation: taken only then, after the turn, it
+            # crossed a cancel, which holds the conversation and waits for the
+            # turn.
+            await conn.execute("SELECT id FROM agent_attempts WHERE id = $1 FOR SHARE", attempt_id)
+            await conn.execute(
+                "SELECT id FROM agent_threads WHERE id = $1 FOR KEY SHARE", thread_id
+            )
             earns = await conn.fetchrow(
                 """
                 SELECT j.id, j.thread_id, j.user_id
@@ -1720,6 +1729,11 @@ class PostgresSandboxRepository:
                     "SELECT base_sha FROM agent_jobs WHERE id = $1",
                     job_id,
                 )
+            # A capture or a base import in progress keeps its state, and finds
+            # this turn's pending snapshot when it ends. A dirty group goes
+            # back to pending: the snapshot this turn opens or extends is cut
+            # from the published base the failure left, so it supersedes the
+            # snapshot that failed.
             group = await conn.fetchrow(
                 """
                     UPDATE agent_sandboxes g
@@ -1739,7 +1753,7 @@ class PostgresSandboxRepository:
                         workspace_epoch = workspace_epoch + 1,
                         published_base_sha = COALESCE(g.published_base_sha, $3),
                         snapshot_state = CASE
-                            WHEN g.snapshot_state IN ('snapshotting', 'importing', 'dirty')
+                            WHEN g.snapshot_state IN ('snapshotting', 'importing')
                                 THEN g.snapshot_state
                             ELSE 'pending'
                         END,
@@ -1904,6 +1918,13 @@ class PostgresSandboxRepository:
     ) -> dict[str, Any] | None:
         """Release a failed shared-member activation without replaying it."""
         async with self._pool.acquire() as conn, conn.transaction():
+            if lost:
+                # Marking the attempt's context lost writes the attempt, so it
+                # is taken before its membership and group, as the reaper,
+                # reservation and residency take it.
+                await conn.execute(
+                    "SELECT id FROM agent_attempts WHERE id = $1 FOR NO KEY UPDATE", attempt_id
+                )
             shared = await conn.fetchrow(
                 """
                 UPDATE agent_thread_sandbox_memberships m

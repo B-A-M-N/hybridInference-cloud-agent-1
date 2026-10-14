@@ -1,7 +1,7 @@
 'use client';
 
 import { useT } from '@/components/providers';
-import type { ReactNode } from 'react';
+import { memo, useCallback, useRef, type ComponentProps, type ReactNode } from 'react';
 import { AttemptTurnFooter } from '../AttemptTurnFooter';
 import {
   CopyIcon,
@@ -17,12 +17,39 @@ import {
 } from '../ChatMessages';
 import { ownerRunNote } from '../conversationJob';
 import { messageBlockKey, type ConversationTurnDescription } from '../conversationTurnNavigation';
-import type { RecordedTurnOutputs } from '../recordedTurnOutputs';
+import type { RecordedFileSelection, RecordedTurnOutputs } from '../recordedTurnOutputs';
 import type { TranscriptPresentation } from '../transcriptPresentation';
 import { TurnDeliverables } from '../TurnDeliverables';
-import type { AgentJob } from '../types';
+import type { AgentEvent, AgentJob } from '../types';
 import { OutcomeCard, RunNotices } from './RunOutcome';
 import type { JobDetailPanels } from './useJobDetailPanels';
+
+/** A stored turn of the transcript, with the results it recorded. */
+function StoredTurnView({
+  outputs,
+  onOpenFile,
+  ...props
+}: Omit<ComponentProps<typeof HistoryTurn>, 'results'> & {
+  outputs?: RecordedTurnOutputs | null;
+  onOpenFile: (selection: RecordedFileSelection) => void;
+}) {
+  return (
+    <HistoryTurn
+      {...props}
+      results={
+        <TurnDeliverables
+          job={{ id: props.turn.jobId, state: props.turn.state }}
+          outputs={outputs}
+          onOpenFile={onOpenFile}
+        />
+      }
+    />
+  );
+}
+
+// A stored turn does not change while the current one streams or the owner
+// types, so it is drawn again only when its own description or actions do.
+const StoredTurn = memo(StoredTurnView);
 
 /** Renders conversation turns; navigation and mutations remain with the page. */
 export function JobTranscript({
@@ -72,6 +99,28 @@ export function JobTranscript({
 }) {
   const t = useT();
   const { inspectTranscriptEvent, openRecordedFile, openRun, openWorkspace } = panels;
+  // Stored turns are memoized, so their actions keep one identity and reach
+  // the latest state through this ref instead of changing with every render.
+  const storedTurnActions = useRef({ forkFrom, inspectTranscriptEvent, openRecordedFile });
+  storedTurnActions.current = { forkFrom, inspectTranscriptEvent, openRecordedFile };
+  const forkStoredTurn = useCallback(
+    (anchorJobId: string) => void storedTurnActions.current.forkFrom(anchorJobId),
+    [],
+  );
+  const rewindStoredTurn = useCallback(
+    (anchorJobId: string, prompt: string) =>
+      void storedTurnActions.current.forkFrom(anchorJobId, prompt),
+    [],
+  );
+  const inspectStoredEvent = useCallback(
+    (event: AgentEvent, eventJobId: string) =>
+      storedTurnActions.current.inspectTranscriptEvent(event, eventJobId),
+    [],
+  );
+  const openStoredFile = useCallback(
+    (selection: RecordedFileSelection) => storedTurnActions.current.openRecordedFile(selection),
+    [],
+  );
   const threadMessages = currentTurn.messages;
   const visibleEvents = currentTurn.events;
   const selectedAttempt = job.attempts.find((attempt) => attempt.no === attemptNo);
@@ -92,31 +141,18 @@ export function JobTranscript({
       {historyTurns.map((turn, index) => {
         const rewindAnchorJobId = rewindAnchors[index];
         return (
-          <HistoryTurn
+          <StoredTurn
             key={turn.key}
             turn={turn}
             presentation={presentation}
-            onInspectEvent={hasStoredEvents ? inspectTranscriptEvent : undefined}
-            results={
-              <TurnDeliverables
-                job={{ id: turn.jobId, state: turn.state }}
-                outputs={recordedOutputs.get(turn.jobId)}
-                onOpenFile={openRecordedFile}
-              />
-            }
+            onInspectEvent={hasStoredEvents ? inspectStoredEvent : undefined}
+            outputs={recordedOutputs.get(turn.jobId)}
+            onOpenFile={openStoredFile}
             showActivityDetails={false}
             rewindAnchorJobId={rewindAnchorJobId}
             busy={forking}
-            onFork={
-              turn.forkable && canForkWorkspace
-                ? (anchorJobId) => void forkFrom(anchorJobId)
-                : undefined
-            }
-            onRewind={
-              rewindAnchorJobId && canForkWorkspace
-                ? (anchorJobId, prompt) => void forkFrom(anchorJobId, prompt)
-                : undefined
-            }
+            onFork={turn.forkable && canForkWorkspace ? forkStoredTurn : undefined}
+            onRewind={rewindAnchorJobId && canForkWorkspace ? rewindStoredTurn : undefined}
             onOpenRun={openRun}
           />
         );

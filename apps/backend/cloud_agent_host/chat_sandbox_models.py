@@ -187,6 +187,9 @@ class ChatSandboxInspection:
     networks: tuple[str, ...]
     network_ids: tuple[tuple[str, str], ...] = ()
     sandbox_runtime: str = ""
+    #: ``--tmpfs`` destinations, which Docker lists in ``HostConfig`` rather
+    #: than with the other mounts.
+    tmpfs: tuple[str, ...] = ()
     started_at: str = ""
 
 

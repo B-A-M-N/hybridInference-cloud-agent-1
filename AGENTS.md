@@ -131,11 +131,15 @@ requirement, and rules 4 and 5 remain permanent service boundaries.
   execution of it on one host. Attempts carry a lease with a fencing
   generation — a superseded attempt's writes are rejected by the store, which
   is what makes retries safe and stops duplicate pull requests.
-- **Grant.** A short-lived, per-attempt capability token minted by the gateway,
-  scoped to a user, a job, and a model allowlist. It authorizes inference and is
-  revoked when the attempt is superseded. MCP servers are resolved per user by
-  the control plane and reached through its MCP-only relay with a separate
-  scoped credential; they are no longer named in the inference grant.
+- **Grant.** A short-lived capability token minted by the gateway, scoped to a
+  user, a job or chat, and a model allowlist; it authorizes inference. Each
+  claim mints a per-attempt grant, revoked when the attempt is superseded or
+  ends. The sandbox CLI does not run on that grant: each chat member's CLI runs
+  on its own residency grant, minted before the CLI starts, renewed by host
+  heartbeats while the member stays resident (so it can outlive one turn), and
+  revoked with the residency. MCP servers are resolved per user by the control
+  plane and reached through its MCP-only relay with a separate scoped
+  credential; no inference grant names them.
   **There is no per-task dollar budget** — that design was considered and
   rejected. All inference spend stays subject to the gateway's existing
   per-user quota; a grant narrows *what* can be called, never re-implements
@@ -188,9 +192,14 @@ requirement, and rules 4 and 5 remain permanent service boundaries.
   neither that entry nor a host credential-substitution relay is required.
   See the [decision and remaining boundaries](docs/specs/2026-09-23-agent-public-egress-design.zh-CN.md).
 - Platform-held long-lived account and service credentials never enter the sandbox. Each
-  member receives its own scoped inference and MCP credentials; sibling
-  members cannot read or reuse them. Spend remains governed by the gateway's
-  per-user quota. The runner also injects a separate short-lived GitHub App
+  member receives its own scoped inference and MCP credentials, which a
+  sibling member cannot read: members have distinct UIDs, private provider
+  homes and tmpfs, and no credential is passed as a process argument. That
+  stops reading, not writing: siblings share one writable workspace, `.git`
+  included, so code a member plants there — a Git hook or `core.fsmonitor`,
+  a build or test script — runs with the credentials of whichever member
+  executes it next. Spend remains governed by the gateway's per-user quota.
+  The runner also injects a separate short-lived GitHub App
   token as `GH_TOKEN` in the owning member's environment, restricted to
   `contents: write` and `pull_requests: write` on the job's repository. Account
   tokens, refresh tokens, and the App's private key remain outside. Direct
@@ -211,3 +220,8 @@ requirement, and rules 4 and 5 remain permanent service boundaries.
 - Public multi-tenant use requires Kata isolation, non-root, dropped
   capabilities, seccomp, and resource limits — plain Docker containers are for
   trusted internal repositories only.
+- The Docker socket is the host's authority. Only the runner and the workspace
+  broker mount it, and `:ro` on that mount does not narrow the Docker API:
+  either can start a privileged container, so a flaw in either is a host
+  compromise. No other service may mount it; the deployment tests and CI's
+  Compose check pin the holders.

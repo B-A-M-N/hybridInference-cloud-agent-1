@@ -143,22 +143,25 @@ export function JobDetail({
   const [goalHint, setGoalHint] = useState<string | null>(null);
   const followUpBox = useRef<HTMLTextAreaElement>(null);
   const [readingFiles, setReadingFiles] = useState(false);
-  // Follow-ups append to the thread's latest turn, even from an older URL.
-  const inheritedSkills = threadJobs.reduce(
-    (latest, turn) =>
-      (turn.turn_no ?? 1) > latest.turnNo
-        ? { turnNo: turn.turn_no ?? 1, skills: turn.skills ?? [] }
-        : latest,
-    { turnNo: job.turnNo ?? 1, skills: job.skills ?? [] },
-  ).skills;
+  // Follow-ups append to the thread's latest turn, even from an older URL, and
+  // an omitted skill set, model or effort is inherited from that turn.
+  const newestTurn = latestJob(threadJobs);
+  const parentTurn =
+    newestTurn && (newestTurn.turn_no ?? 1) > (job.turnNo ?? 1) ? newestTurn : undefined;
+  const inheritedSkills = parentTurn ? (parentTurn.skills ?? []) : (job.skills ?? []);
+  const inherited = {
+    model: parentTurn ? parentTurn.model : job.model,
+    reasoningEffort: parentTurn ? (parentTurn.reasoning_effort ?? undefined) : job.reasoningEffort,
+  };
   // Unsent composer choices belong to the conversation, including when a PR
   // action advances it to another turn without sending the owner's draft.
+  // The composer settings reset the chosen model and effort by the same rule.
   useEffect(() => setChosenSkills(null), [threadId]);
   // The same rule for the goal guidance. This component is deliberately not
   // remounted when the conversation moves to its next turn, so anything that
   // belongs to *one* message has to be reset explicitly when that turn does.
   useEffect(() => setGoalHint(null), [job.id]);
-  const settings = useJobComposerSettings(job);
+  const settings = useJobComposerSettings(job, inherited);
   const { config, model, effort } = settings;
   const attachments = useAttachments(t, config?.attachment_limits);
   const mcp = useThreadComposerMcp(job.threadId);
@@ -344,7 +347,8 @@ export function JobDetail({
         ...(chosenSkills !== null ? { skill_ids: chosenSkills.map((skill) => skill.id) } : {}),
         ...(attachments.ids.length ? { attachment_ids: attachments.ids } : {}),
         // Omitted controls inherit the parent's validated model and effort.
-        ...composerOverrides(job, model, effort),
+        // The parent is the latest turn, which need not be the one on screen.
+        ...composerOverrides(inherited, model, effort),
       });
       draft.acknowledge(snapshot);
       if (!composerMounted.current || currentDraftScope.current !== snapshot.scope) return result;

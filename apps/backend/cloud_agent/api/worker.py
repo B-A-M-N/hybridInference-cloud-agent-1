@@ -18,7 +18,7 @@ import asyncio
 import base64
 import contextlib
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
@@ -597,17 +597,23 @@ async def _mint_sandbox_grant(
     grants: Any,
     claim: dict[str, Any],
 ) -> str:
-    """Ask the gateway for the capability this attempt's sandbox runs with.
+    """Ask the gateway for this attempt's inference grant.
 
-    Scoped to exactly the model the job named and exactly the MCP servers it
-    was created with — not to everything the owner's role could reach. The
-    gateway may narrow that further, and what comes back is what is handed
-    over; the runner never sees what was asked for.
+    Scoped to exactly the model the job named — not to everything the owner's
+    role could reach. The gateway may narrow that further, and what comes back
+    is what is handed over; the runner never sees what was asked for.
 
-    **Transient failure hands the job back.** A grant that could not be minted means the
-    sandbox has no way to call a model, so starting the attempt would burn one
-    of the job's three tries producing an agent that fails at its first
-    request. Releasing the claim costs nothing — a released claim is not a
+    The sandbox CLI does not run on this grant. Each member's CLI runs on its
+    own residency grant, which ``worker_establish_shared_sandbox_residency``
+    mints before the CLI starts and host heartbeats renew. This one stays with
+    the attempt: the claim returns it as ``sandbox_token``, and the control
+    plane may spend it on the conversation's title.
+
+    **Transient failure hands the job back.** A grant that could not be minted
+    means the gateway is not minting for this owner and model right now, and the
+    member's residency grant comes from the same mint. Starting the attempt
+    would likely burn one of the job's three tries producing an agent that
+    cannot call a model. Releasing the claim costs nothing — a released claim is not a
     spent attempt — and its next claim waits briefly while later jobs can run.
     A definitive refusal of the subject or requested model ends this job with
     an actionable reason instead of retrying the same oldest row indefinitely.
@@ -630,7 +636,7 @@ async def _mint_sandbox_grant(
         claim: The row ``claim_job`` returned.
 
     Returns:
-        The grant's bearer token — the only credential that enters the sandbox.
+        The grant's bearer token. It does not enter the sandbox.
 
     Raises:
         HTTPException: 503, after releasing the claim, if no grant could be got
@@ -748,11 +754,19 @@ async def _mint_sandbox_grant(
             },
         )
 
-    linked = bool(grant_id) and await job_store.grants.record_attempt_grant(
-        attempt_id=claim["attempt_id"],
-        lease_generation=claim["lease_generation"],
-        grant_id=grant_id,
-    )
+    try:
+        linked = bool(grant_id) and await job_store.grants.record_attempt_grant(
+            attempt_id=claim["attempt_id"],
+            lease_generation=claim["lease_generation"],
+            grant_id=grant_id,
+        )
+    except Exception:
+        # Not recorded, so nothing would ever renew or revoke it: withdraw it
+        # here, and let the claim's own failure path hand the job back.
+        if grant_id:
+            with contextlib.suppress(Exception):
+                await grants.revoke(grant_id)
+        raise
     if not linked:
         # Withdraw it before anything else. This is the one moment the grant id
         # is known to a process that is about to forget it, and after that only
@@ -840,7 +854,75 @@ async def worker_claim(
     )
     if claim is None:
         return None
-    _warn_on_unbounded_untrusted_group(claim, body.attestation, host=claiming_host["host"])
+    try:
+        return await _hand_over_claim(
+            job_store,
+            claim,
+            background_tasks=background_tasks,
+            app_credentials=app_credentials,
+            grants=grants,
+            gateway=gateway,
+            attestation=body.attestation,
+            host=claiming_host["host"],
+        )
+    except HTTPException:
+        # Every refusal below has already released or ended its claim.
+        raise
+    except Exception as exc:
+        # Anything else that fails between the claim and the answer — a store
+        # read, a malformed MCP binding, a grant link that raised — would
+        # otherwise escape as a 500 with the claim still held: the job would
+        # wait out a lease nothing is using, and the reaper would charge it a
+        # retry for a turn no agent ever started. A grant already linked to
+        # this attempt is revoked by the revocation pass once it is aborted.
+        logger.warning(
+            "agent_job_claim_failed",
+            exc_info=True,
+            extra={"event": "agent_job_claim_failed", "job_id": claim["id"]},
+        )
+        released = False
+        with contextlib.suppress(Exception):
+            released = await job_store.attempt_commands.release_claim(
+                job_id=claim["id"],
+                attempt_id=claim["attempt_id"],
+                lease_generation=claim["lease_generation"],
+                reason="claim_failed",
+                retry_after_seconds=30,
+            )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "type": "claim_failed",
+                    "message": (
+                        "This job's claim could not be prepared; it has been returned "
+                        "to the queue and no attempt was spent."
+                        if released
+                        else "This job's claim could not be prepared or returned to the "
+                        "queue; its lease decides what happens next."
+                    ),
+                }
+            },
+        ) from exc
+
+
+async def _hand_over_claim(
+    job_store: _WorkerStorage,
+    claim: dict[str, Any],
+    *,
+    background_tasks: BackgroundTasks,
+    app_credentials: Any | None,
+    grants: Any,
+    gateway: Any,
+    attestation: WorkerClaimAttestation | None,
+    host: str,
+) -> WorkerClaimResponse:
+    """Check, credential and describe one claimed turn for the host that took it.
+
+    Every refusal it raises has already released or ended the claim; any other
+    exception is handed back by ``worker_claim``.
+    """
+    _warn_on_unbounded_untrusted_group(claim, attestation, host=host)
     fence = {
         "job_id": claim["id"],
         "attempt_id": claim["attempt_id"],
@@ -902,7 +984,7 @@ async def worker_claim(
             environment = await job_store.environments.environment_for_claim(
                 claim["user_id"], claim["environment_binding_id"], claim["id"]
             )
-            capabilities = body.attestation.runner_capabilities if body.attestation else []
+            capabilities = attestation.runner_capabilities if attestation else []
             if environment.required:
                 if ENVIRONMENT_CAPABILITY not in capabilities:
                     raise SourceControlError("Host cannot execute environment configuration")
@@ -924,16 +1006,18 @@ async def worker_claim(
                 503, "Waiting for environment-capable host or available encryption"
             ) from None
 
-    # Two credentials with different powers. The runner keeps the full one and
-    # passes only the sandbox one inside, so a credential that leaks from inside
-    # the agent can make model calls the gateway already meters but cannot touch
-    # this job's event log, lifecycle, or terminal state.
+    # Two credentials with different powers. The runner keeps the full one. The
+    # sandbox gets neither: its CLI runs on the member's own residency grant
+    # (``worker_establish_shared_sandbox_residency``), so a credential that
+    # leaks from inside the agent can make model calls the gateway already
+    # meters but cannot touch this job's event log, lifecycle, or terminal
+    # state.
     #
     # Only the first is ours to mint. ``SCOPE_FULL`` is this service's own
     # control credential, signed with this service's own secret and verified by
-    # this service — correctly local. The sandbox's credential is not: it buys
-    # inference, which is the gateway's to authorize and the gateway's to meter,
-    # so it is asked for rather than minted. Before this, the claim minted
+    # this service — correctly local. A grant is not: it buys inference, which
+    # is the gateway's to authorize and the gateway's to meter, so it is asked
+    # for rather than minted. Before this, the claim minted
     # a ``SCOPE_MODEL`` token signed with a root the gateway does not know —
     # which bought nothing, and failed at the sandbox's first model call.)
     token = mint_worker_token(**fence, scope=SCOPE_FULL)
@@ -1187,6 +1271,29 @@ async def worker_append_event(
     return WorkerEventResponse(event_id=event_id)
 
 
+#: How long after its attempt ends a startup measurement is still accepted.
+#: The runner sends the record from a background thread as soon as the startup
+#: window closes, retrying for seconds; a short turn can end before it lands,
+#: which is why no live lease is asked for. An hour is far past any delivery,
+#: and still a bound: a worker token carries no expiry of its own.
+MEASUREMENT_GRACE_S = 3600.0
+
+
+def _measurement_window_open(attempt: dict[str, Any], *, now: datetime) -> bool:
+    """Whether a measurement may still be filed against this attempt.
+
+    While it runs, always. Once it has ended, only within
+    :data:`MEASUREMENT_GRACE_S` of the end the store recorded — an ended
+    attempt without one says nothing about when it ended, so it is closed.
+    """
+    if attempt.get("status") == "running":
+        return True
+    finished_at = attempt.get("finished_at")
+    return isinstance(finished_at, datetime) and now - finished_at <= timedelta(
+        seconds=MEASUREMENT_GRACE_S
+    )
+
+
 @router.post(
     "/worker/jobs/{job_id}/measurements",
     response_model=WorkerMeasurementResponse,
@@ -1224,6 +1331,9 @@ async def worker_record_measurement(
         job_id=job_id, attempt_id=int(attempt_id)
     )
     if attempt is None or int(attempt["lease_generation"]) != int(generation):
+        raise _lease_lost()
+    now = datetime.now(UTC)
+    if not _measurement_window_open(attempt, now=now):
         raise _lease_lost()
     job = await job_store.conversation_queries.get_job(job_id)
     if job is None:
@@ -1263,7 +1373,7 @@ async def worker_record_measurement(
         record=body.record,
         owner=owner,
         run=body.run,
-        now=datetime.now(UTC),
+        now=now,
     )
     if result in {"conflict", "run_conflict"}:
         return WorkerMeasurementResponse(
@@ -1291,11 +1401,12 @@ async def worker_list_attachments(
     authorization: str | None = Header(None),
     store: _WorkerStorage | None = Depends(get_storage),
 ) -> WorkerAttachmentListResponse:
-    """List every upload in this conversation, so /uploads can be rebuilt.
+    """List what this conversation's /uploads holds, so it can be rebuilt.
 
     Scoped to the thread rather than the claimed turn: a retry on a fresh
     container has to restore all of them, and re-importing into a retained one
-    simply overwrites the same paths.
+    simply overwrites the same paths. A file attached again by a later turn is
+    listed once, as its newest upload.
     """
     job_store = _require_store(store)
     claims = _worker_claims(authorization)
@@ -1935,8 +2046,8 @@ async def _goal_envelope_for_turn(
     rather than being quietly treated as silence.
 
     A *clipped* message is the case that distinction exists for. The report
-    block sits at the end of a final message, so a runtime that bound its text
-    — Pi cuts at 4,000 characters — removes exactly the part a reader needs.
+    block sits at the end of a final message, so a bound on its text — the
+    shared 256 KiB event payload limit — removes exactly the part a reader needs.
     Reading the clipped text as "no report" would keep a goal working forever
     on a turn that may well have reported completion, so the completeness
     marker the runtime recorded travels back with the text.
@@ -2093,10 +2204,13 @@ async def worker_finish(
     # While the GitHub App is unavailable this drains nothing: the wakeup stays
     # pending, unclaimed, for the reaper to consume once the App is back. The
     # page keeps polling an active goal, so the round still appears there.
+    # Only this turn's conversation is drained; other conversations' wakeups
+    # are the reaper's, and must not hold this runner's request.
     try:
         await continue_after_finish(
             store=job_store,
             job_id=job_id,
+            thread_id=job.get("thread_id"),
             github_app=github_app,
             gateway=gateway,
         )

@@ -6,12 +6,30 @@ import { composerModels } from '../ConversationComposer';
 import { highestEffort, offeredEfforts } from '../effort';
 import type { AgentJob } from '../types';
 
-/** Load deployment options while retaining the turn's inherited model and effort. */
-export function useJobComposerSettings(job: AgentJob) {
+/**
+ * Load deployment options, and the model and effort the next message runs on.
+ *
+ * `inherited` holds the model and effort of the turn a follow-up inherits
+ * from: the thread's latest, which need not be the one on screen. A model or
+ * effort the owner has not picked is that turn's.
+ */
+export function useJobComposerSettings(
+  job: AgentJob,
+  inherited: Pick<AgentJob, 'model' | 'reasoningEffort'>,
+) {
+  const threadId = job.threadId ?? job.id;
   const [config, setConfig] = useState<AgentConfigApi | null>(null);
   const [models, setModels] = useState<string[]>([]);
-  const [model, setModel] = useState(job.model);
-  const [effort, setEffort] = useState(job.reasoningEffort ?? '');
+  // The model and effort the owner picked; `null` inherits the latest turn's.
+  const [chosenModel, setChosenModel] = useState<string | null>(null);
+  const [chosenEffort, setChosenEffort] = useState<string | null>(null);
+  // Unsent composer choices belong to the conversation, including when a PR
+  // action advances it to another turn without sending the owner's draft.
+  useEffect(() => {
+    setChosenModel(null);
+    setChosenEffort(null);
+  }, [threadId]);
+  const model = chosenModel ?? inherited.model;
   // The model remains a per-turn choice. A retained live chat reuses its CLI
   // when the process-fixed settings match; changing the model makes only that
   // member process restart and native-resume inside the same sandbox.
@@ -41,25 +59,32 @@ export function useJobComposerSettings(job: AgentJob) {
   // it, so the control cannot show one model while the turn would run another.
   const modelOptions = useMemo(() => {
     if (models.length === 0) return [];
-    return composerModels(models, job.model);
-  }, [job.model, models]);
+    return composerModels(models, inherited.model);
+  }, [inherited.model, models]);
 
   // Against the model this turn would run — the switched-to one, or the
   // inherited one — because a pair offered last turn need not be offered now.
   const efforts = useMemo(
-    () => offeredEfforts(config, job.runtime, model || job.model),
-    [config, job.runtime, job.model, model],
+    () => offeredEfforts(config, job.runtime, model),
+    [config, job.runtime, model],
   );
-  useEffect(() => {
-    // Only once the config has arrived. Before that the offered set is empty
-    // because nothing is *known*, not because nothing is offered — and acting
-    // on it would wipe the inherited level a moment before the answer lands.
-    if (!config) return;
-    // The inherited level leads; a turn that inherited nothing, or one whose
-    // switched-to model does not offer what it inherited, falls to the deepest
-    // the new pair has.
-    if (!efforts.includes(effort)) setEffort(highestEffort(efforts));
-  }, [config, efforts, effort]);
+  // The chosen level leads, then the inherited one; a turn that inherited
+  // nothing, or one whose switched-to model does not offer that level, falls to
+  // the deepest the new pair has. Only once the config has arrived. Before that
+  // the offered set is empty because nothing is *known*, not because nothing is
+  // offered — and acting on it would wipe the inherited level a moment before
+  // the answer lands.
+  const wantedEffort = chosenEffort ?? inherited.reasoningEffort ?? '';
+  const effort = !config || efforts.includes(wantedEffort) ? wantedEffort : highestEffort(efforts);
 
-  return { config, model, setModel, effort, setEffort, modelOptions, efforts };
+  return {
+    config,
+    inherited,
+    model,
+    setChosenModel,
+    effort,
+    setChosenEffort,
+    modelOptions,
+    efforts,
+  };
 }

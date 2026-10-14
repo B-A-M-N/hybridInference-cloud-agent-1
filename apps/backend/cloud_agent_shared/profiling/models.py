@@ -62,9 +62,11 @@ class ControlState:
 
     It is deliberately not the run's own ``config_version`` (that one says which
     immutable manifest this is) and not a lease counter: there is no lease here.
-    A process that loses contact with the control source keeps the last
-    configuration it was given and stops selecting when that experiment's own
-    ``expires_at`` passes.
+    A host that cannot reach the control plane keeps the last configuration it
+    was given and stops selecting when that experiment's own ``expires_at``
+    passes. A process whose own read of the control source fails -- the control
+    plane's loop, or an installed provider that raises -- withdraws the run
+    instead, through :meth:`RuntimePolicyStore.suspend`.
     """
 
     mode: str = MODE_DISABLED

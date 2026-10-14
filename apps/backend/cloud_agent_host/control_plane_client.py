@@ -8,11 +8,13 @@ lease renewal and turn scheduling remain in the runner.
 from __future__ import annotations
 
 import base64
+import time
 from typing import Any
 
 import httpx
 
 from cloud_agent_host.claimed_job import LeaseLost
+from cloud_agent_host.logging_utils import get_logger
 from cloud_agent_host.measurement_delivery import DELIVERY_TIMEOUT_S
 from cloud_agent_host.runtimes import NormalizedEvent  # noqa: TC001 — Public method introspection.
 from cloud_agent_shared.secret_redaction import SecretRedactor
@@ -21,6 +23,31 @@ from cloud_agent_shared.secret_redaction import SecretRedactor
 _HEARTBEAT_TIMEOUT_S = 10.0
 # Attachments may need longer than the client's default deadline for transfer.
 _ATTACHMENT_TIMEOUT_S = 120.0
+#: How long one event upload keeps retrying an unreachable control plane, and
+#: the backoff ceiling between tries. Half the default lease: long enough to
+#: ride out a control-plane container being recreated, short enough that a
+#: turn the platform cannot record is not left running unseen.
+_EVENT_RETRY_BUDGET_S = 60.0
+_EVENT_RETRY_MAX_DELAY_S = 8.0
+_EVENT_RETRY_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+logger = get_logger(__name__)
+
+
+def _log_control_failure(operation: str, job_id: str, exc: Exception) -> None:
+    """Keep a diagnosable failure without logging tokens or arbitrary response bodies.
+
+    The same ``agent_control_failure`` record the runner writes for its own
+    control calls, for the retries this client makes itself.
+    """
+    status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+    logger.warning(
+        "agent_control_failure operation=%s job_id=%s error_type=%s status_code=%s",
+        operation,
+        job_id,
+        type(exc).__name__,
+        status,
+    )
 
 
 class ControlPlane:
@@ -80,14 +107,21 @@ class ControlPlane:
         return response.status_code, parsed if isinstance(parsed, dict) else {}
 
     def append_event(self, event: NormalizedEvent) -> None:
-        """Report one normalized event, retrying once now that replay is safe.
+        """Report one normalized event, retrying with backoff since replay is safe.
 
         The retry exists *because of* ``event_seq``: before it, a response
         lost on the wire left the runner unable to tell "never stored" from
         "stored, answer dropped", and re-sending risked a duplicate row in the
         owner's stream. With the number attached, the server answers a replay
-        with the already-stored id, so one transport error no longer kills an
-        otherwise healthy turn.
+        with the already-stored id.
+
+        One immediate retry was not enough: a control plane being recreated by
+        a deploy refuses connections, or its proxy answers 502, for longer
+        than that, and the escaping error ended an otherwise healthy turn and
+        marked its native context lost. Transport errors and transient statuses
+        are retried for a bounded time instead, well inside the lease the
+        heartbeat keeps renewing meanwhile; a lost lease (409) still ends the
+        turn at once.
         """
         payload = self._redactor.payload(event.payload)
         if isinstance(event.payload, dict) and isinstance(event.payload.get("delta"), str):
@@ -107,10 +141,22 @@ class ControlPlane:
             "payload": payload,
             "event_seq": self._event_seq,
         }
-        try:
-            self._post(f"/v1/agent/worker/jobs/{self.job_id}/events", body, already_redacted=True)
-        except httpx.TransportError:
-            self._post(f"/v1/agent/worker/jobs/{self.job_id}/events", body, already_redacted=True)
+        path = f"/v1/agent/worker/jobs/{self.job_id}/events"
+        give_up_at = time.monotonic() + _EVENT_RETRY_BUDGET_S
+        delay = 1.0
+        while True:
+            try:
+                self._post(path, body, already_redacted=True)
+                return
+            except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+                if (
+                    isinstance(exc, httpx.HTTPStatusError)
+                    and exc.response.status_code not in _EVENT_RETRY_STATUSES
+                ) or time.monotonic() + delay > give_up_at:
+                    raise
+                _log_control_failure("event_retry", self.job_id, exc)
+            time.sleep(delay)
+            delay = min(delay * 2, _EVENT_RETRY_MAX_DELAY_S)
 
     def _get(self, path: str, *, timeout: float | None = None) -> dict[str, Any]:
         """Read from the worker surface, with the same fencing as a write."""

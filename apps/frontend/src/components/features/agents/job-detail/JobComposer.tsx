@@ -94,7 +94,16 @@ export function JobComposer({
   const isArchived = Boolean(job.archivedAt);
   const isActive = job.state === 'running' || job.state === 'queued';
   const contextLost = hasLostContext(job);
-  const { config, model, setModel, effort, setEffort, modelOptions, efforts } = settings;
+  const {
+    config,
+    inherited,
+    model,
+    setChosenModel,
+    effort,
+    setChosenEffort,
+    modelOptions,
+    efforts,
+  } = settings;
   const { restoring, unarchive } = runActions;
   const { value: followUp, setValue: setFollowUp } = draft;
   const [skillsOpen, setSkillsOpen] = useState(false);
@@ -298,14 +307,14 @@ export function JobComposer({
                       label="Model for this turn"
                       value={model}
                       options={modelOptions}
-                      onChange={setModel}
+                      onChange={setChosenModel}
                     />
                     <Picker
                       compact
                       label="Reasoning for this turn"
                       value={effort}
                       options={efforts}
-                      onChange={setEffort}
+                      onChange={setChosenEffort}
                     />
                   </>
                 ) : null}
@@ -353,7 +362,7 @@ export function JobComposer({
                   : job.state === 'cancelled'
                     ? `Restores any saved changes · ${job.runtime}`
                     : `Inherits ${job.runtime}`}
-                {modelOptions.length === 0 ? ` · ${job.model}` : ''}
+                {modelOptions.length === 0 ? ` · ${inherited.model}` : ''}
                 {isActive ? ` · ${t('queue.afterThisTurn')}` : ''}
                 {queue.canSendNow ? ` · ${t('queue.steerHint')}` : ''}
               </p>

@@ -6,6 +6,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from cloud_agent.schemas._prompts import _visible_prompt
 from cloud_agent.schemas.jobs import RESET_REASONING_EFFORT, AgentJobResponse
 
 
@@ -29,14 +30,6 @@ class AgentThreadMessageResponse(BaseModel):
 
 PendingMessageState = Literal["queued", "held", "sending"]
 QueuePausedReason = Literal["stopped", "failed", "archived"]
-
-
-def _visible_prompt(value: str) -> str:
-    """Reject a visually empty message and keep the trimmed text."""
-    prompt = value.strip()
-    if not prompt:
-        raise ValueError("prompt must not be blank")
-    return prompt
 
 
 class AgentThreadMessageCreate(BaseModel):

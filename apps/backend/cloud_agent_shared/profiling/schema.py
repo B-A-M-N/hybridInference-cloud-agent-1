@@ -190,6 +190,9 @@ STOP_REASON_EXPIRED = "expired"
 
 #: Why a configuration is not collecting, when it is not. Shown by the page.
 STOP_REASON_STOPPED = "stopped"
+#: Why a process stopped selecting without being told to: it could not read its
+#: control source. The source's next answer replaces it.
+STOP_REASON_UNAVAILABLE = "control_unavailable"
 
 
 #: Per-measurement span ceiling; the design budgets 128 spans per attempt.

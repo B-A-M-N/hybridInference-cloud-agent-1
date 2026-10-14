@@ -69,7 +69,7 @@ relative to `apps/backend/`.
 
 | Change | Start here |
 |---|---|
-| Job or conversation HTTP behavior | `cloud_agent/api/jobs.py`, `catalog.py`, `turns.py`, or `threads.py`. `api/routes.py` mounts the ten agent surfaces. |
+| Job or conversation HTTP behavior | `cloud_agent/api/jobs.py`, `catalog.py`, `turns.py`, or `threads.py`. `api/routes.py` mounts every agent surface listed in `SURFACE_ROUTERS`. |
 | Request or response validation | The owning module in `cloud_agent/schemas/`; public imports use `cloud_agent.schemas`. |
 | A new caller of task creation | `cloud_agent/application/job_admission.py`; `api/service_jobs.py` is an existing caller. |
 | Workspace files, terminals, or Git views | `cloud_agent/api/workspace.py` and `sandbox_manager_client.py`; host handling is in `cloud_agent_host/sandbox_manager.py`. |
@@ -99,7 +99,10 @@ checkout can still fail in production. Follow these boundaries:
   `store.host_pool`. Repository methods belong to those capabilities.
 - The host must not import the control plane, and the shared package must
   import neither implementation package. Shared Git subprocess and archive I/O
-  belongs in `cloud_agent_shared/git/`.
+  belongs in `cloud_agent_shared/git/`. The only other shared code that may
+  import a process, network or background-thread module is the
+  operation-profiling collector. The import-boundary tests list each
+  exemption and the modules it covers.
 - The control plane must not import the host implementation. Runtime discovery
   facts live in `cloud_agent_shared/runtime_catalog.py`; host adapters and the
   control plane both consume them. The
@@ -160,10 +163,12 @@ make ci-frontend
 
 Install `uv` and Python 3.12 before running backend or database checks. Frontend
 checks require Node.js 22 and npm; database checks require a running Docker
-daemon. The launcher synchronizes locked dependencies with `uv sync --frozen`
-and `npm ci`, and uses the installed runtimes. Direct invocation works from any
-directory: `./scripts/ci-local.sh [all|backend|database|frontend]` from the
-checkout, or its absolute path elsewhere. The default tier is `all`.
+daemon. The launcher synchronizes locked dependencies with `uv sync --locked`
+and `npm ci`, and uses the installed runtimes. Like CI, it fails when `uv.lock`
+no longer matches `pyproject.toml`; run `uv lock` and commit the result. Direct
+invocation works from any directory:
+`./scripts/ci-local.sh [all|backend|database|frontend]` from the checkout, or
+its absolute path elsewhere. The default tier is `all`.
 
 Backend checks run Ruff formatting and lint checks, pydocstyle, mypy, and pytest
 with four workers and `--dist loadfile`, excluding `external` and `dbtest`.
@@ -317,7 +322,7 @@ uv run pytest -q tests/unit/test_api_surface_contract.py tests/unit/test_contrac
 
 Review the generated diff and explain any compatibility implications. The
 surface tests also reject duplicate registrations and overlaps between the
-ten agent routers. A snapshot update records a change; the behavioral tests
+agent surface routers. A snapshot update records a change; the behavioral tests
 and review establish whether it is compatible. The
 [contract guide](../gateway_contracts/README.md) explains what these checks can
 verify and what still needs comparison with Gateway source.
