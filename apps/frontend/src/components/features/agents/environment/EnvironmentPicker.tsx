@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useT } from '@/components/providers';
 import { useModalDialog } from '@/components/ui/useModalDialog';
-import { listEnvironments } from '@/lib/api/environments';
+import { getGlobalEnvironment, listEnvironments } from '@/lib/api/environments';
 import type { EnvironmentConfig, EnvironmentVariable, VariableEdit } from '@/lib/api/environments';
 import { EnvironmentManager } from './EnvironmentManager';
 import { VariableEditor } from './VariableEditor';
@@ -17,6 +17,7 @@ export interface EnvironmentSelection {
 }
 export function EnvironmentPicker({
   repo,
+  temporary = false,
   open,
   onClose,
   onChange,
@@ -24,6 +25,12 @@ export function EnvironmentPicker({
   onSummaryChange,
 }: {
   repo: string;
+  /**
+   * A temporary workspace: environments belong to one repository, so it runs
+   * on the platform's base with the owner's global variables and this task's
+   * own overrides.
+   */
+  temporary?: boolean;
   open: boolean;
   onClose: () => void;
   onChange: (selection: EnvironmentSelection | null) => void;
@@ -40,18 +47,45 @@ export function EnvironmentPicker({
   const [reload, setReload] = useState(0);
   const previousRepo = useRef<string | null>(null);
   const initializedRepo = useRef<string | null>(null);
+  // One scope key, so switching between a repository and a temporary
+  // workspace clears overrides typed for the other.
+  const scope = temporary ? ':temporary' : repo;
   const panel = useRef<HTMLDivElement>(null);
-  useModalDialog(panel, { open: open && !!repo, onClose, initialFocus: 'select' });
+  useModalDialog(panel, {
+    open: open && !!scope,
+    onClose,
+    initialFocus: temporary ? '[data-environment-done]' : 'select',
+  });
   useEffect(() => {
     let active = true;
     onChange(null);
-    onStatusChange?.(repo ? 'loading' : 'ready');
+    onStatusChange?.(scope ? 'loading' : 'ready');
     setError('');
     setGlobals(null);
-    const changedRepo = previousRepo.current !== repo;
-    previousRepo.current = repo;
+    const changedRepo = previousRepo.current !== scope;
+    previousRepo.current = scope;
     if (changedRepo) setOverrides([]);
-    if (!repo) return;
+    if (!scope) return;
+    if (temporary) {
+      void getGlobalEnvironment()
+        .then((result) => {
+          if (!active) return;
+          initializedRepo.current = scope;
+          onStatusChange?.('ready');
+          setItems([]);
+          setSelected('');
+          setGlobals(result);
+        })
+        .catch((e) => {
+          if (active) {
+            onStatusChange?.('error');
+            setError(e instanceof Error ? e.message : String(e));
+          }
+        });
+      return () => {
+        active = false;
+      };
+    }
     void listEnvironments(repo)
       .then((result) => {
         if (!active) return;
@@ -77,7 +111,7 @@ export function EnvironmentPicker({
     return () => {
       active = false;
     };
-  }, [repo, reload, onChange, onStatusChange]);
+  }, [repo, scope, temporary, reload, onChange, onStatusChange]);
   useEffect(() => {
     if (!globals) return;
     const env = items.find((e) => e.id === selected);
@@ -127,7 +161,7 @@ export function EnvironmentPicker({
       </button>
     </p>
   ) : null;
-  if (!repo) return null;
+  if (!scope) return null;
   if (!open) return errorNotice ? <div className="px-3 py-2">{errorNotice}</div> : null;
   if (typeof document === 'undefined') return null;
   return createPortal(
@@ -148,40 +182,49 @@ export function EnvironmentPicker({
       >
         <div className="shrink-0 px-6 pb-4 pt-5">
           <h2 className="text-lg font-semibold text-foreground">{t('environment.title')}</h2>
-          <p className="mt-1 truncate text-sm text-muted" title={repo}>
-            {repo}
+          <p
+            className="mt-1 truncate text-sm text-muted"
+            title={temporary ? t('temporaryWorkspace.name') : repo}
+          >
+            {temporary ? t('temporaryWorkspace.name') : repo}
           </p>
-          <p className="mt-3 text-sm text-muted">{t('environment.automaticHint')}</p>
+          {temporary ? null : (
+            <p className="mt-3 text-sm text-muted">{t('environment.automaticHint')}</p>
+          )}
         </div>
         <div className="min-h-0 space-y-4 overflow-y-auto px-6 pb-5 text-sm">
           {errorNotice}
-          <div className="flex flex-wrap items-end gap-2">
-            <label className="min-w-0 flex-1 space-y-2">
-              <span className="block font-medium">{t('environment.choose')}</span>
-              <select
-                className="ui-input w-full"
-                value={selected}
-                disabled={!globals}
-                onChange={(e) => setSelected(e.target.value)}
+          {temporary ? (
+            <p className="text-muted">{t('environment.platformBase')}</p>
+          ) : (
+            <div className="flex flex-wrap items-end gap-2">
+              <label className="min-w-0 flex-1 space-y-2">
+                <span className="block font-medium">{t('environment.choose')}</span>
+                <select
+                  className="ui-input w-full"
+                  value={selected}
+                  disabled={!globals}
+                  onChange={(e) => setSelected(e.target.value)}
+                >
+                  <option value="">{t('environment.platformBase')}</option>
+                  {items.map((item) => (
+                    <option key={item.id} value={item.id!}>
+                      {item.name} · v{item.revision}
+                      {item.is_default ? ` · ${t('environment.default')}` : ''}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                className="ui-button ui-button-secondary"
+                aria-expanded={managing}
+                onClick={() => setManaging(!managing)}
               >
-                <option value="">{t('environment.platformBase')}</option>
-                {items.map((item) => (
-                  <option key={item.id} value={item.id!}>
-                    {item.name} · v{item.revision}
-                    {item.is_default ? ` · ${t('environment.default')}` : ''}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <button
-              type="button"
-              className="ui-button ui-button-secondary"
-              aria-expanded={managing}
-              onClick={() => setManaging(!managing)}
-            >
-              {t('environment.manage')}
-            </button>
-          </div>
+                {t('environment.manage')}
+              </button>
+            </div>
+          )}
           {!globals && !error ? (
             <p role="status" className="text-muted">
               {t('environment.loading')}
@@ -238,14 +281,19 @@ export function EnvironmentPicker({
               <VariableEditor values={overrides} onChange={setOverrides} />
             </div>
           </details>
-          {managing && (
+          {managing && !temporary && (
             <div className="border-t border-border pt-4">
               <EnvironmentManager repo={repo} onChanged={() => setReload((v) => v + 1)} />
             </div>
           )}
         </div>
         <div className="flex shrink-0 justify-end border-t border-border px-6 py-4">
-          <button type="button" onClick={onClose} className="ui-button ui-button-primary">
+          <button
+            type="button"
+            data-environment-done
+            onClick={onClose}
+            className="ui-button ui-button-primary"
+          >
             {t('environment.done')}
           </button>
         </div>

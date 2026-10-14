@@ -22,6 +22,7 @@ import os
 import queue
 import re
 import secrets
+import tempfile
 import threading
 import time
 from collections import deque
@@ -40,6 +41,7 @@ from cloud_agent_host import sandbox_manager_profiling_policy
 from cloud_agent_host.bounded_output import OutputPump
 from cloud_agent_host.chat_sandbox import (
     CHAT_WORKDIR,
+    ArchiveExportTooLarge,
     ChatSandboxManager,
     ChatSandboxSpec,
     RetainedChatBackend,
@@ -101,6 +103,7 @@ from cloud_agent_host.shared_session_supervisor import (
     archive_failure_http_detail,
 )
 from cloud_agent_host.tool_windows import ToolWindowTracker, attribute, tool_time_ms
+from cloud_agent_host.workspace_download import write_workspace_download
 from cloud_agent_shared.git.source_archive import DEFAULT_MAX_BASE_BUNDLE_BYTES
 from cloud_agent_shared.host_settings import (
     HOST_SETTINGS_BY_KEY,
@@ -3439,6 +3442,64 @@ def create_app(
                 max_preview_bytes=int(applied_settings["workspace_file_preview_max_kib"]) * 1024,
                 max_directory_entries=int(applied_settings["workspace_directory_max_entries"]),
             ),
+        )
+
+    @app.get("/workspaces/{workspace_id}/archive")
+    async def workspace_archive(
+        workspace_id: str,
+        _: None = Depends(authenticate),
+    ) -> StreamingResponse:
+        """Send workspace files without Git metadata, or refuse the download whole.
+
+        Docker's archive boundary reads ``/workspace`` without running anything
+        inside the sandbox. Git metadata is filtered from the download only,
+        and the archive is spooled before the first byte is sent: a workspace over the download limit is
+        refused with 413 rather than arriving as a truncated file. The open
+        operation keeps the sandbox from being stopped or deleted underneath
+        the copy, and the command slots bound how many copies run at once.
+        """
+        limit_mib = int(applied_settings["workspace_download_max_mib"])
+        spool = tempfile.TemporaryFile(  # noqa: SIM115 — handed to the response body.
+            prefix="freeinference-workspace-download-"
+        )
+
+        def export(retained: RetainedChatBackend, _call: SandboxManagerCall) -> dict[str, Any]:
+            try:
+                with tempfile.TemporaryFile(prefix="freeinference-workspace-export-") as source:
+                    retained.manager.export_archive(
+                        retained.spec, CHAT_WORKDIR, source, max_bytes=limit_mib * 1024 * 1024
+                    )
+                    source.seek(0)
+                    write_workspace_download(source, spool)
+            except ArchiveExportTooLarge as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"The workspace is larger than this server's {limit_mib} MiB "
+                        "download limit."
+                    ),
+                ) from exc
+            return {}
+
+        try:
+            await owner_command(workspace_id, export)
+        except BaseException:
+            spool.close()
+            raise
+        size = spool.tell()
+        spool.seek(0)
+
+        async def body() -> AsyncIterator[bytes]:
+            try:
+                while chunk := await asyncio.to_thread(spool.read, 1024 * 1024):
+                    yield chunk
+            finally:
+                spool.close()
+
+        return StreamingResponse(
+            body(),
+            media_type="application/gzip",
+            headers={"Content-Length": str(size), "Cache-Control": "no-store"},
         )
 
     @app.get("/workspaces/{workspace_id}/environment/status")

@@ -60,8 +60,34 @@ vi.mock('next/navigation', () => ({
   usePathname: () => '/',
 }));
 
-import { listEnvironments } from '@/lib/api/environments';
-vi.mock('@/lib/api/environments', () => ({ listEnvironments: vi.fn() }));
+import { getGlobalEnvironment, listEnvironments } from '@/lib/api/environments';
+import type { EnvironmentConfig } from '@/lib/api/environments';
+vi.mock('@/lib/api/environments', () => ({
+  listEnvironments: vi.fn(),
+  getGlobalEnvironment: vi.fn(),
+}));
+
+function globalEnvironment(overrides: Partial<EnvironmentConfig> = {}): EnvironmentConfig {
+  return {
+    id: null,
+    name: 'Global',
+    repo: null,
+    revision: 0,
+    variables: [],
+    setup_script: '',
+    start_script: '',
+    verify_script: '',
+    actions: [],
+    ...overrides,
+  };
+}
+
+// A temporary workspace has no repository, so its environment is the owner's
+// global variables alone.
+beforeEach(() => {
+  vi.mocked(getGlobalEnvironment).mockReset();
+  vi.mocked(getGlobalEnvironment).mockResolvedValue(globalEnvironment({ revision: 3 }));
+});
 
 import { listSkills } from '@/lib/api/skills';
 vi.mock('@/lib/api/skills', () => ({ listSkills: vi.fn() }));
@@ -225,6 +251,32 @@ function repositoryButton() {
   return screen.findByRole('button', { name: /^Repository:/ });
 }
 
+function repositoryOptions(dialog: HTMLElement) {
+  return within(dialog)
+    .getAllByRole('button')
+    .filter((button) => button.hasAttribute('data-repository-option'))
+    .map((button) => button.getAttribute('aria-label'));
+}
+
+const TEMPORARY_OPTION = 'Start from scratch';
+const ACKNOWLEDGED = 'agents.temporaryWorkspace.acknowledged.alice';
+
+// Nobody connected, and a deployment App to connect to.
+function disconnected(overrides: Partial<AgentConfigApi> = {}): AgentConfigApi {
+  return config({
+    repos: [],
+    github_connected: false,
+    github_install_url: '/agents/integrations',
+    ...overrides,
+  });
+}
+
+async function runWhenReady() {
+  const run = screen.getByRole('button', { name: /^Run/ });
+  await waitFor(() => expect(run).toBeEnabled());
+  fireEvent.click(run);
+}
+
 // Nothing is chosen for the owner, so every test that runs a task picks where
 // first — through the control a person would use.
 async function chooseRepository(name = 'owner/repository') {
@@ -321,6 +373,97 @@ describe('TaskComposer source-control onboarding', () => {
           environment_overrides: [
             { name: 'APP_ENV', value: 'testing', secret: true, phase: 'both' },
           ],
+        }),
+      ),
+    );
+  });
+
+  it('edits and submits scratch workspace variables from the plus menu without GitHub', async () => {
+    account.id = 'alice';
+    localStorage.setItem(ACKNOWLEDGED, '1');
+    vi.mocked(getAgentConfig).mockResolvedValue(disconnected());
+    vi.mocked(createAgentJob).mockResolvedValue({ id: 'new-job' } as AgentJobApi);
+    render(<TaskComposer />);
+    expect(await repositoryButton()).toHaveAccessibleName('Repository: Start from scratch');
+    await openAttachMenu();
+    fireEvent.click(await screen.findByRole('menuitem', { name: /Environment/ }));
+    const dialog = screen.getByRole('dialog', { name: 'Environment' });
+    expect(dialog).toHaveTextContent('Start from scratch');
+    expect(dialog).not.toHaveTextContent('Your repository default');
+    expect(
+      within(dialog).queryByRole('combobox', { name: 'Choose environment' }),
+    ).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole('button', { name: 'Manage' })).not.toBeInTheDocument();
+    expect(within(dialog).getByRole('button', { name: 'Done' })).toHaveFocus();
+    fireEvent.click(within(dialog).getByText('Variables for this workspace only'));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Add variable' }));
+    fireEvent.change(within(dialog).getByLabelText('Variable name'), {
+      target: { value: 'APP_ENV' },
+    });
+    fireEvent.change(within(dialog).getByLabelText('Value APP_ENV'), {
+      target: { value: 'scratch-env' },
+    });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Done' }));
+    await openAttachMenu();
+    const item = screen.getByRole('menuitem', { name: /Environment/ });
+    expect(item).toHaveTextContent('1 overrides');
+    fireEvent.click(item);
+    expect(screen.getByLabelText('Value APP_ENV')).toHaveValue('scratch-env');
+    fireEvent.keyDown(window, { key: 'Escape' });
+    fireEvent.change(screen.getByRole('textbox', { name: 'What should the agent do?' }), {
+      target: { value: 'Write hello.py' },
+    });
+    await runWhenReady();
+    await waitFor(() =>
+      expect(createAgentJob).toHaveBeenCalledWith(
+        expect.objectContaining({
+          repo: null,
+          environment_id: null,
+          global_revision: 3,
+          environment_overrides: [
+            { name: 'APP_ENV', value: 'scratch-env', secret: true, phase: 'both' },
+          ],
+        }),
+      ),
+    );
+    expect(getGlobalEnvironment).toHaveBeenCalledOnce();
+    expect(listEnvironments).not.toHaveBeenCalled();
+  });
+
+  it('clears scratch task variables when switching to a repository', async () => {
+    vi.mocked(getAgentConfig).mockResolvedValue(config());
+    vi.mocked(createAgentJob).mockResolvedValue({ id: 'new-job' } as AgentJobApi);
+    render(<TaskComposer initialRepo=":temporary" />);
+    expect(await repositoryButton()).toHaveAccessibleName('Repository: Start from scratch');
+    await openAttachMenu();
+    fireEvent.click(await screen.findByRole('menuitem', { name: /Environment/ }));
+    const dialog = screen.getByRole('dialog', { name: 'Environment' });
+    fireEvent.click(within(dialog).getByText('Variables for this workspace only'));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Add variable' }));
+    fireEvent.change(within(dialog).getByLabelText('Variable name'), {
+      target: { value: 'SCRATCH_ONLY' },
+    });
+    fireEvent.change(within(dialog).getByLabelText('Value SCRATCH_ONLY'), {
+      target: { value: 'scratch-env' },
+    });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Done' }));
+    await chooseRepository();
+    await openAttachMenu();
+    fireEvent.click(await screen.findByRole('menuitem', { name: /Environment/ }));
+    expect(screen.getByRole('combobox', { name: 'Choose environment' })).toBeInTheDocument();
+    expect(screen.queryByLabelText('Value SCRATCH_ONLY')).not.toBeInTheDocument();
+    fireEvent.keyDown(window, { key: 'Escape' });
+    fireEvent.change(screen.getByRole('textbox', { name: 'What should the agent do?' }), {
+      target: { value: 'Fix tests' },
+    });
+    await runWhenReady();
+    await waitFor(() =>
+      expect(createAgentJob).toHaveBeenCalledWith(
+        expect.objectContaining({
+          repo: 'owner/repository',
+          environment_id: null,
+          global_revision: 0,
+          environment_overrides: [],
         }),
       ),
     );
@@ -582,40 +725,106 @@ describe('TaskComposer source-control onboarding', () => {
     expect(screen.getByRole('button', { name: 'Create repository' })).toBeEnabled();
   });
 
-  // Someone arriving for the first time writes the task before they have
-  // connected anything: the box takes it, the connect card is the next step,
-  // and the trip to GitHub keeps what they wrote.
-  it('takes a task written before GitHub is connected, and points at connecting to run it', async () => {
-    vi.mocked(getAgentConfig).mockResolvedValue(
-      config({
-        github_connected: false,
-        github_install_url: '/agents/integrations',
-      }),
-    );
-    vi.mocked(githubAccessUrl).mockResolvedValue('https://github.test/login/oauth/authorize');
+  // Someone arriving for the first time has nothing connected, and needs
+  // nothing: the task runs in a temporary workspace, and connecting GitHub is
+  // one optional line beside the box.
+  it('runs a task in a temporary workspace before GitHub is connected', async () => {
+    account.id = 'alice';
+    vi.mocked(getAgentConfig).mockResolvedValue(disconnected());
+    vi.mocked(createAgentJob).mockResolvedValue({ id: 'ajob_1' } as never);
 
-    render(<TaskComposer initialRepo="owner/repository" />);
+    render(<TaskComposer />);
 
-    expect(await screen.findByText('Connect GitHub to start')).toBeInTheDocument();
+    expect(await repositoryButton()).toHaveAccessibleName('Repository: Start from scratch');
+    // No branch to pin, and no repository to ask for one.
+    expect(screen.queryByLabelText('Branch')).not.toBeInTheDocument();
+    expect(listRepoBranches).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole('button', { name: 'Connect GitHub to use a repository' }),
+    ).toBeInTheDocument();
     // Named by the question above it, with no example task in it.
     const box = screen.getByRole('textbox', { name: 'What should the agent do?' });
     expect(box).toBeEnabled();
     expect(box).not.toHaveAttribute('placeholder');
-    fireEvent.change(box, { target: { value: 'Fix the flaky test' } });
-    expect(screen.getByRole('button', { name: /Run/ })).toBeDisabled();
+    fireEvent.change(box, { target: { value: 'Plot the survey results' } });
+    await waitFor(() => expect(screen.getByRole('button', { name: /^Run/ })).toBeEnabled());
 
-    // Enter cannot run it yet, so it points at the step that is missing.
+    // The first one waits for its owner to read what a temporary workspace
+    // keeps; the draft stays where it is meanwhile.
     fireEvent.keyDown(box, { key: 'Enter' });
-    expect(
-      await screen.findByText('Connect GitHub to run it. What you wrote is kept.'),
-    ).toBeInTheDocument();
-    expect(screen.getByRole('status')).toHaveAttribute('data-highlighted', 'true');
+    const notice = await screen.findByRole('alertdialog', { name: 'Before you start' });
+    expect(notice).toHaveTextContent('not automatically saved to GitHub');
+    expect(within(notice).getByRole('button', { name: 'Got it' })).toHaveFocus();
     expect(createAgentJob).not.toHaveBeenCalled();
-    expect(box).toHaveValue('Fix the flaky test');
+    expect(box).toHaveValue('Plot the survey results');
 
-    // Straight to GitHub, noting where to come back to — the Integrations page
-    // used to be where the trip ended — and what was written.
-    fireEvent.click(screen.getByRole('button', { name: /Connect GitHub/ }));
+    fireEvent.click(within(notice).getByRole('button', { name: 'Got it' }));
+    await waitFor(() => expect(navigation.push).toHaveBeenCalledWith('/ajob_1'));
+    const request = vi.mocked(createAgentJob).mock.calls[0][0];
+    expect(request).toMatchObject({
+      repo: null,
+      task_prompt: 'Plot the survey results',
+      // The owner's global variables, and no repository environment.
+      environment_id: null,
+      global_revision: 3,
+    });
+    expect(request).not.toHaveProperty('base_ref');
+    expect(listEnvironments).not.toHaveBeenCalled();
+    expect(localStorage.getItem(ACKNOWLEDGED)).toBe('1');
+  });
+
+  it('asks only once, then starts a temporary workspace straight away', async () => {
+    account.id = 'alice';
+    localStorage.setItem(ACKNOWLEDGED, '1');
+    vi.mocked(getAgentConfig).mockResolvedValue(disconnected());
+    vi.mocked(createAgentJob).mockResolvedValue({ id: 'ajob_2' } as never);
+
+    render(<TaskComposer />);
+    fireEvent.change(await screen.findByRole('textbox', { name: 'What should the agent do?' }), {
+      target: { value: 'Draft a README' },
+    });
+    await runWhenReady();
+
+    await waitFor(() =>
+      expect(createAgentJob).toHaveBeenCalledWith(expect.objectContaining({ repo: null })),
+    );
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+  });
+
+  it('sends nothing when the notice is cancelled, and hands the caret back to the draft', async () => {
+    account.id = 'alice';
+    vi.mocked(getAgentConfig).mockResolvedValue(disconnected());
+
+    render(<TaskComposer />);
+    const box = await screen.findByRole('textbox', { name: 'What should the agent do?' });
+    fireEvent.change(box, { target: { value: 'Draft a README' } });
+    await runWhenReady();
+    const notice = await screen.findByRole('alertdialog', { name: 'Before you start' });
+
+    fireEvent.click(within(notice).getByRole('button', { name: 'Cancel' }));
+
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+    expect(createAgentJob).not.toHaveBeenCalled();
+    expect(box).toHaveValue('Draft a README');
+    expect(box).toHaveFocus();
+    // Not read, so asked again next time.
+    expect(localStorage.getItem(ACKNOWLEDGED)).toBeNull();
+  });
+
+  // Connecting is for a repository, so the trip back asks where to run the
+  // task instead of keeping the temporary workspace it was leaving.
+  it('connects GitHub from beside the box, and comes back asking where to run the task', async () => {
+    account.id = 'alice';
+    vi.mocked(getAgentConfig).mockResolvedValue(disconnected());
+    vi.mocked(githubAccessUrl).mockResolvedValue('https://github.test/login/oauth/authorize');
+    const view = render(<TaskComposer initialRepo="owner/repository" />);
+    fireEvent.change(await screen.findByRole('textbox', { name: 'What should the agent do?' }), {
+      target: { value: 'Fix the flaky test' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Connect GitHub to use a repository' }));
+
+    // Straight to GitHub, noting where to come back to and what was written.
     await waitFor(() =>
       expect(leaveFor).toHaveBeenCalledWith('https://github.test/login/oauth/authorize'),
     );
@@ -623,13 +832,20 @@ describe('TaskComposer source-control onboarding', () => {
     expect(JSON.parse(sessionStorage.getItem('agents.github.return')!).value).toBe(
       '/?repo=owner%2Frepository',
     );
-    expect(JSON.parse(sessionStorage.getItem('agents.composer.draft')!).value).toMatchObject({
+    expect(JSON.parse(sessionStorage.getItem('agents.composer.draft:alice')!).value).toMatchObject({
       task: 'Fix the flaky test',
+      repo: '',
     });
-    expect(screen.queryByLabelText('Repository')).not.toBeInTheDocument();
-    expect(screen.queryByLabelText('Agent')).not.toBeInTheDocument();
-    expect(screen.queryByLabelText('Model')).not.toBeInTheDocument();
-    expect(listRepoBranches).not.toHaveBeenCalled();
+
+    view.unmount();
+    vi.mocked(getAgentConfig).mockResolvedValue(config({ repos: ['owner/other'] }));
+    render(<TaskComposer />);
+
+    const dialog = await screen.findByRole('dialog', { name: 'Repository' });
+    expect(within(dialog).getByRole('searchbox')).toHaveFocus();
+    expect(screen.getByRole('textbox', { name: 'What should the agent do?' })).toHaveValue(
+      'Fix the flaky test',
+    );
   });
 
   it('asks where to run a task written before connecting, once back from GitHub', async () => {
@@ -667,9 +883,7 @@ describe('TaskComposer source-control onboarding', () => {
   });
 
   it('takes a trip to GitHub asked for elsewhere on the page, draft and all', async () => {
-    vi.mocked(getAgentConfig).mockResolvedValue(
-      config({ github_connected: false, github_install_url: '/agents/integrations' }),
-    );
+    vi.mocked(getAgentConfig).mockResolvedValue(disconnected());
     vi.mocked(githubAccessUrl).mockResolvedValue('https://github.test/login/oauth/authorize');
 
     render(<TaskComposer />);
@@ -686,9 +900,27 @@ describe('TaskComposer source-control onboarding', () => {
     await waitFor(() =>
       expect(leaveFor).toHaveBeenCalledWith('https://github.test/login/oauth/authorize'),
     );
+    // Connecting is for a repository: the temporary workspace is not kept.
     expect(JSON.parse(sessionStorage.getItem('agents.composer.draft')!).value).toMatchObject({
       task: 'Fix the flaky test',
+      repo: '',
     });
+  });
+
+  // Where the App is configured, choosing a repository waits for the owner's
+  // own connection, allowlisted ones included, though `/config` lists them.
+  it('offers no repository before GitHub is connected, allowlisted ones included', async () => {
+    vi.mocked(getAgentConfig).mockResolvedValue(disconnected({ repos: ['owner/allowlisted'] }));
+
+    render(<TaskComposer />);
+
+    expect(await repositoryButton()).toHaveAccessibleName('Repository: Start from scratch');
+    fireEvent.click(await repositoryButton());
+    const dialog = await screen.findByRole('dialog', { name: 'Repository' });
+    expect(repositoryOptions(dialog)).toEqual([TEMPORARY_OPTION]);
+    expect(
+      within(dialog).getByRole('button', { name: 'Connect GitHub to use a repository' }),
+    ).toBeInTheDocument();
   });
 
   // The app's first-run answer, as the layout provides it.
@@ -712,6 +944,20 @@ describe('TaskComposer source-control onboarding', () => {
       ),
     ).toBeInTheDocument();
     expect(screen.queryByText('Runs in an isolated sandbox.')).not.toBeInTheDocument();
+  });
+
+  it('tells a newcomer without a repository where the task runs', async () => {
+    vi.mocked(listAgentConversations).mockResolvedValue({ conversations: [], next_cursor: null });
+    vi.mocked(getAgentConfig).mockResolvedValue(disconnected());
+
+    composerInApp();
+
+    expect(
+      await screen.findByText(
+        'Describe a task. The agent works in an isolated sandbox that starts empty.',
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/opens a draft pull request/)).not.toBeInTheDocument();
   });
 
   it('keeps the usual line for someone who has had a task, even an archived one', async () => {
@@ -738,7 +984,8 @@ describe('TaskComposer source-control onboarding', () => {
   });
 
   // Connected, and the App reaches no repository: the next step is repository
-  // access, not connecting again, and the task typed so far survives the trip.
+  // access, not connecting again. The task can run in a temporary workspace
+  // meanwhile, and the trip to GitHub keeps what was typed.
   it('asks for repository access, not a second connection, when none came with it', async () => {
     vi.mocked(getAgentConfig).mockResolvedValue(
       config({ repos: [], github_install_url: '/agents/integrations' }),
@@ -753,11 +1000,13 @@ describe('TaskComposer source-control onboarding', () => {
       await screen.findByText('Give the GitHub App access to a repository'),
     ).toBeInTheDocument();
     expect(screen.getByText(/GitHub is connected/)).toBeInTheDocument();
-    expect(screen.queryByText('Connect GitHub to start')).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Connect GitHub to use a repository' }),
+    ).not.toBeInTheDocument();
+    expect(await repositoryButton()).toHaveAccessibleName('Repository: Start from scratch');
     const box = screen.getByRole('textbox');
-    expect(box).toBeEnabled();
     fireEvent.change(box, { target: { value: 'Tidy the README' } });
-    expect(screen.getByRole('button', { name: /Run/ })).toBeDisabled();
+    await waitFor(() => expect(screen.getByRole('button', { name: /^Run/ })).toBeEnabled());
 
     fireEvent.click(screen.getByRole('button', { name: /Configure repository access/ }));
     await waitFor(() =>
@@ -766,6 +1015,7 @@ describe('TaskComposer source-control onboarding', () => {
     expect(githubAccessUrl).toHaveBeenCalledWith('manage');
     expect(JSON.parse(sessionStorage.getItem('agents.composer.draft')!).value).toMatchObject({
       task: 'Tidy the README',
+      repo: '',
     });
   });
 
@@ -881,27 +1131,38 @@ describe('TaskComposer source-control onboarding', () => {
     );
   });
 
-  it('uses friendly administrator copy when GitHub installation is unavailable', async () => {
-    vi.mocked(getAgentConfig).mockResolvedValue(
-      config({ github_connected: false, github_install_url: null }),
-    );
+  // A deployment without a GitHub App has nothing to connect: tasks run in
+  // temporary workspaces, and nothing points at a setup nobody here can do.
+  it('runs in a temporary workspace where the deployment has no GitHub App', async () => {
+    vi.mocked(getAgentConfig).mockResolvedValue(disconnected({ github_install_url: null }));
 
     render(<TaskComposer />);
 
-    expect(await screen.findByText('GitHub setup is not available yet')).toBeInTheDocument();
-    expect(screen.getByText(/Contact your administrator/)).toBeInTheDocument();
-    expect(screen.queryByRole('link', { name: /Connect GitHub/ })).not.toBeInTheDocument();
-    expect(screen.getByRole('link', { name: /View integrations/ })).toHaveAttribute(
-      'href',
-      '/integrations',
-    );
-    expect(screen.queryByText(/AGENT_/)).not.toBeInTheDocument();
-    expect(screen.getByRole('textbox')).toBeDisabled();
-    expect(screen.getByRole('button', { name: /Run/ })).toBeDisabled();
+    expect(await repositoryButton()).toHaveAccessibleName('Repository: Start from scratch');
+    expect(
+      screen.queryByRole('button', { name: 'Connect GitHub to use a repository' }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    const box = screen.getByRole('textbox');
+    expect(box).toBeEnabled();
+    fireEvent.change(box, { target: { value: 'Plot the survey results' } });
+    await waitFor(() => expect(screen.getByRole('button', { name: /^Run/ })).toBeEnabled());
+
+    // The one place a task can run, and no repository to manage.
+    fireEvent.click(await repositoryButton());
+    const dialog = await screen.findByRole('dialog', { name: 'Repository' });
+    expect(repositoryOptions(dialog)).toEqual([TEMPORARY_OPTION]);
+    expect(within(dialog).queryByRole('link')).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByRole('button', { name: /GitHub|Refresh|Create/ }),
+    ).not.toBeInTheDocument();
+    expect(dialog).not.toHaveTextContent('No repositories yet.');
   });
 
   // Issue #47: the deployment's App failed to load and the service is retrying.
   // Nobody has anything to connect or configure, so the notice says to wait.
+  // A temporary workspace waits too: the create endpoint answers 503 for every
+  // task until the App is back.
   it('says GitHub is temporarily unavailable instead of sending anyone to set it up', async () => {
     vi.mocked(getAgentConfig).mockResolvedValue(
       config({
@@ -917,7 +1178,9 @@ describe('TaskComposer source-control onboarding', () => {
     expect(screen.getByText(/come back on its own/)).toBeInTheDocument();
     expect(screen.queryByText('GitHub setup is not available yet')).not.toBeInTheDocument();
     expect(screen.queryByText(/Contact your administrator/)).not.toBeInTheDocument();
-    expect(screen.queryByRole('link', { name: /View integrations/ })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Connect GitHub to use a repository' }),
+    ).not.toBeInTheDocument();
     expect(screen.getByRole('textbox')).toBeDisabled();
     expect(screen.getByRole('button', { name: /Run/ })).toBeDisabled();
   });
@@ -1253,15 +1516,44 @@ describe('TaskComposer source-control onboarding', () => {
     },
   );
 
-  it('does not upload pasted images before GitHub is connected', async () => {
+  it('takes pasted images for a temporary workspace before GitHub is connected', async () => {
+    account.id = 'alice';
+    localStorage.setItem(ACKNOWLEDGED, '1');
+    vi.mocked(getAgentConfig).mockResolvedValue(disconnected());
+    vi.mocked(uploadAttachment).mockImplementation(async (file, path) => ({
+      id: 7,
+      path: path!,
+      size_bytes: file.size,
+      content_type: file.type,
+    }));
+    vi.mocked(createAgentJob).mockResolvedValue({ id: 'ajob_1' } as never);
+    render(<TaskComposer />);
+    const box = await screen.findByRole('textbox', { name: 'What should the agent do?' });
+    fireEvent.change(box, { target: { value: 'Describe this chart' } });
+
+    fireEvent.paste(box, {
+      clipboardData: {
+        items: [],
+        files: [new File(['pixels'], 'image.png', { type: 'image/png' })],
+      },
+    });
+
+    await waitFor(() => expect(uploadAttachment).toHaveBeenCalledOnce());
+    await runWhenReady();
+    await waitFor(() =>
+      expect(createAgentJob).toHaveBeenCalledWith(
+        expect.objectContaining({ repo: null, attachment_ids: [7] }),
+      ),
+    );
+  });
+
+  it('does not upload pasted images while GitHub is unavailable', async () => {
     vi.mocked(getAgentConfig).mockResolvedValue(
-      config({ github_connected: false, github_install_url: '/agents/integrations' }),
+      disconnected({ github_install_url: null, github_load_status: 'unavailable' }),
     );
     render(<TaskComposer />);
-    await screen.findByText('Connect GitHub to start');
-    const box = screen.getByRole('textbox');
-    expect(box).toBeEnabled();
-    fireEvent.paste(box, {
+    await screen.findByText('GitHub is temporarily unavailable');
+    fireEvent.paste(screen.getByRole('textbox'), {
       clipboardData: {
         items: [],
         files: [new File(['pixels'], 'image.png', { type: 'image/png' })],
@@ -1666,13 +1958,14 @@ describe('TaskComposer source-control onboarding', () => {
     fireEvent.click(await repositoryButton());
     const dialog = await screen.findByRole('dialog', { name: 'Repository' });
     // Sorted without regard to case, so one owner's capitals do not float it
-    // above everyone else's.
-    expect(
-      within(dialog)
-        .getAllByRole('button')
-        .filter((button) => button.hasAttribute('data-repository-option'))
-        .map((button) => button.getAttribute('aria-label')),
-    ).toEqual(['alice/site', 'HarvardMadSys/hybridInference', 'Zeta/tools']);
+    // above everyone else's; the temporary workspace is not a repository and
+    // heads the list.
+    expect(repositoryOptions(dialog)).toEqual([
+      TEMPORARY_OPTION,
+      'alice/site',
+      'HarvardMadSys/hybridInference',
+      'Zeta/tools',
+    ]);
 
     const search = within(dialog).getByRole('searchbox');
     fireEvent.change(search, { target: { value: 'nobody' } });
@@ -1697,6 +1990,76 @@ describe('TaskComposer source-control onboarding', () => {
     expect(
       await screen.findByRole('button', { name: 'Repository: HarvardMadSys/hybridInference' }),
     ).toHaveFocus();
+  });
+
+  // "(no repository)" would answer every search for a repository, so the
+  // temporary workspace is found by its name alone, and after the matches.
+  it('finds the temporary workspace by its name, after any repository that matches', async () => {
+    vi.mocked(getAgentConfig).mockResolvedValue(
+      config({ repos: ['owner/repository', 'owner/scratchpad'] }),
+    );
+
+    render(<TaskComposer />);
+    fireEvent.click(await repositoryButton());
+    const dialog = await screen.findByRole('dialog', { name: 'Repository' });
+    const search = within(dialog).getByRole('searchbox');
+
+    fireEvent.change(search, { target: { value: 'repo' } });
+    expect(repositoryOptions(dialog)).toEqual(['owner/repository']);
+    fireEvent.change(search, { target: { value: 'scratch' } });
+    expect(repositoryOptions(dialog)).toEqual(['owner/scratchpad', TEMPORARY_OPTION]);
+    fireEvent.change(search, { target: { value: 'start' } });
+    expect(repositoryOptions(dialog)).toEqual([TEMPORARY_OPTION]);
+    expect(dialog).not.toHaveTextContent('Nothing matches');
+
+    fireEvent.keyDown(search, { key: 'Enter' });
+    expect(
+      await screen.findByRole('button', { name: 'Repository: Start from scratch' }),
+    ).toHaveFocus();
+    expect(screen.queryByLabelText('Branch')).not.toBeInTheDocument();
+  });
+
+  it('runs a connected owner’s task in a temporary workspace chosen from the list', async () => {
+    account.id = 'alice';
+    vi.mocked(getAgentConfig).mockResolvedValue(config());
+    vi.mocked(createAgentJob).mockResolvedValue({ id: 'ajob_1' } as never);
+
+    render(<TaskComposer />);
+    // Connected: nothing is chosen for the owner, the temporary workspace included.
+    expect(await repositoryButton()).toHaveAccessibleName('Repository: Select repository');
+    await chooseRepository();
+    fireEvent.click(await repositoryButton());
+    fireEvent.click(
+      within(await screen.findByRole('dialog', { name: 'Repository' })).getByRole('button', {
+        name: TEMPORARY_OPTION,
+      }),
+    );
+
+    expect(await repositoryButton()).toHaveAccessibleName('Repository: Start from scratch');
+    // The repository's branch goes with the repository.
+    expect(screen.queryByLabelText('Branch')).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Try an idea' } });
+    await runWhenReady();
+    fireEvent.click(
+      within(await screen.findByRole('alertdialog', { name: 'Before you start' })).getByRole(
+        'button',
+        { name: 'Got it' },
+      ),
+    );
+
+    await waitFor(() => expect(createAgentJob).toHaveBeenCalledOnce());
+    const request = vi.mocked(createAgentJob).mock.calls[0][0];
+    expect(request).toMatchObject({ repo: null, environment_id: null, global_revision: 3 });
+    expect(request).not.toHaveProperty('base_ref');
+  });
+
+  it('starts in a temporary workspace when the link asks for one', async () => {
+    vi.mocked(getAgentConfig).mockResolvedValue(config());
+
+    render(<TaskComposer initialRepo=":temporary" />);
+
+    expect(await repositoryButton()).toHaveAccessibleName('Repository: Start from scratch');
+    expect(screen.queryByText(/is not available to you/)).not.toBeInTheDocument();
   });
 
   it('closes on Escape without choosing anything', async () => {
@@ -2070,7 +2433,7 @@ describe('TaskComposer plugins', () => {
   it('omits plugins when none are selected', async () => {
     render(<TaskComposer initialRepo="owner/repository" />);
     fireEvent.change(await screen.findByRole('textbox'), { target: { value: 'Review' } });
-    fireEvent.click(screen.getByRole('button', { name: /Run/ }));
+    await runWhenReady();
     await waitFor(() => expect(createAgentJob).toHaveBeenCalledTimes(1));
     expect(vi.mocked(createAgentJob).mock.calls[0][0]).not.toHaveProperty('plugins');
   });
