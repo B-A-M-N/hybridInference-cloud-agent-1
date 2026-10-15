@@ -8,6 +8,7 @@ they were, and only the class holding them changed.
 from __future__ import annotations
 
 import hashlib
+import math
 import secrets
 from typing import TYPE_CHECKING, Any
 
@@ -34,6 +35,16 @@ PUBLISH_RETRY_S = 30.0
 #: How many transient failures may return a publication to the durable queue.
 #: The next failure fails the snapshot, and the group's next capture supersedes it.
 PUBLISH_MAX_ATTEMPTS = 5
+#: The longest a retry waits for GitHub's rate limit to lift. The primary limit
+#: resets within the hour; a longer wait it names is not believed.
+PROVIDER_MAX_WAIT_S = 3600.0
+
+
+def _retry_wait_s(delay_s: float | None, *, floor: float) -> float:
+    """Wait at least ``floor`` before a retry, and as long as GitHub asked, up to the cap."""
+    if delay_s is None or not math.isfinite(delay_s):
+        return floor
+    return min(max(delay_s, floor), PROVIDER_MAX_WAIT_S)
 
 
 async def _fold_into_pending_snapshot(
@@ -823,15 +834,19 @@ class PostgresSnapshotRepository:
                        j.thread_id, j.parent_job_id, j.user_id, t.repo,
                        j.task_prompt, j.metadata, j.model,
                        prior.published_pr_url AS parent_pr_url,
+                       -- The release before 0081 recorded its pushes in
+                       -- published_commit_sha, and keeps doing so until it is
+                       -- replaced, after the migration ran: read both.
                        COALESCE((
-                           SELECT jsonb_agg(
-                               pushed.published_commit_sha ORDER BY pushed.workspace_epoch
-                           )
+                           SELECT jsonb_agg(DISTINCT own.sha)
                            FROM agent_sandbox_snapshots pushed
+                           CROSS JOIN LATERAL (
+                               VALUES (pushed.pushed_commit_sha), (pushed.published_commit_sha)
+                           ) AS own (sha)
                            WHERE pushed.sandbox_id = s.sandbox_id
                              AND pushed.base_sha = s.base_sha
                              AND pushed.state <> 'published'
-                             AND pushed.published_commit_sha IS NOT NULL
+                             AND own.sha IS NOT NULL
                        ), '[]'::jsonb) AS own_pushes
                 FROM agent_sandbox_snapshots s
                 JOIN agent_sandboxes g ON g.id = s.sandbox_id
@@ -945,14 +960,23 @@ class PostgresSnapshotRepository:
         return renewed is not None
 
     async def defer_snapshot_publish(
-        self, *, snapshot_id: int, expected_publish_attempt_count: int, detail: str
+        self,
+        *,
+        snapshot_id: int,
+        expected_publish_attempt_count: int,
+        detail: str,
+        delay_s: float | None = None,
     ) -> bool:
-        """Retry a transient publication under this exact fenced claim."""
+        """Retry a transient publication under this exact fenced claim.
+
+        ``delay_s`` is how long GitHub asked to wait, for a rate limit.
+        """
         return await self._defer_snapshot_publish(
             snapshot_id=snapshot_id,
             expected_publish_attempt_count=expected_publish_attempt_count,
             detail=detail,
             stall_seconds=None,
+            delay_s=delay_s,
         )
 
     async def _defer_snapshot_publish(
@@ -962,6 +986,7 @@ class PostgresSnapshotRepository:
         expected_publish_attempt_count: int,
         detail: str,
         stall_seconds: float | None,
+        delay_s: float | None = None,
     ) -> bool:
         """Retry a transient publication, or stop after the durable budget.
 
@@ -1011,7 +1036,7 @@ class PostgresSnapshotRepository:
                 snapshot_id,
                 expected_publish_attempt_count,
                 retry_detail,
-                PUBLISH_RETRY_S,
+                _retry_wait_s(delay_s, floor=PUBLISH_RETRY_S),
                 PUBLISH_MAX_ATTEMPTS,
                 exhausted_detail,
                 stall_seconds,
@@ -1060,22 +1085,24 @@ class PostgresSnapshotRepository:
     async def record_snapshot_push(
         self, *, snapshot_id: int, expected_publish_attempt_count: int, commit_sha: str
     ) -> bool:
-        """Remember the commit this claim pushed, before its pull request exists.
+        """Remember the commit this claim is about to push, before the push.
 
-        The push is a remote effect the pull request step cannot undo. If that
-        step then fails, the snapshot fails or waits with its commit on the
-        branch while the group's published base stays where it was, and the
-        next capture is cut from that base again. Recorded here, the commit is
-        handed to that next publication as the platform's own (``own_pushes``
+        The push is a remote effect no later step can undo, and it can land
+        unseen: a timeout after the remote accepted it, a crash. If the
+        publication then fails, the snapshot fails or waits with its commit on
+        the branch while the group's published base stays where it was, and
+        the next capture is cut from that base again. Recorded here, the commit
+        is handed to that next publication as the platform's own (``own_pushes``
         on its claim), which may build on it instead of reading it as somebody
-        else's push. ``published_commit_sha`` holds it; only ``published``
-        makes it the group's base.
+        else's push. A commit recorded and never pushed is harmless: nobody
+        else holds its object. ``pushed_commit_sha`` holds it, apart from
+        ``published_commit_sha``, which only publication sets.
         """
         async with self._pool.acquire() as conn:
             recorded = await conn.fetchval(
                 """
                 UPDATE agent_sandbox_snapshots
-                SET published_commit_sha = $3, updated_at = NOW()
+                SET pushed_commit_sha = $3, updated_at = NOW()
                 WHERE id = $1 AND state = 'publishing'
                   AND publish_attempt_count = $2
                 RETURNING id
@@ -1350,10 +1377,14 @@ class PostgresSnapshotRepository:
                 )
         return updated is not None
 
-    async def record_snapshot_base_import_failure(self, *, snapshot_id: int, detail: str) -> None:
+    async def record_snapshot_base_import_failure(
+        self, *, snapshot_id: int, detail: str, delay_s: float | None = None
+    ) -> None:
         """Keep an idempotent import retry visible without losing the commit.
 
-        The import is not retried before the snapshot's ``retry_at``.
+        The import is not retried before the snapshot's ``retry_at``: the usual
+        interval, or longer when GitHub asked to wait out a rate limit
+        (``delay_s``).
         """
         async with self._pool.acquire() as conn:
             await conn.execute(
@@ -1365,7 +1396,7 @@ class PostgresSnapshotRepository:
                 """,
                 snapshot_id,
                 detail[:2000],
-                BASE_IMPORT_RETRY_S,
+                _retry_wait_s(delay_s, floor=BASE_IMPORT_RETRY_S),
             )
 
     async def next_snapshot_retry_due(self) -> datetime | None:
