@@ -72,7 +72,7 @@ that URL to another origin is refused while the token is kept. Reset the token,
 save the URL, then enter the token again.
 
 For the first deployment of this release, run `alembic upgrade head` through
-`0075_runtime_upgrades`. Existing hosts begin without a deployment drain
+`0076_mcp_residency_fence`. Existing hosts begin without a deployment drain
 owner or release receipt, and 0051 backfills each one with a non-null fence
 epoch. 0066 builds an index on `agent_jobs` concurrently: on a long job history
 it takes a while without blocking the running API, and an interrupted run can
@@ -96,6 +96,8 @@ refuses while any group is cold or restoring. 0074 adds
 downgrade drops it and leaves a host that was waiting to be removed draining.
 0075 only adds two empty JSON columns for agent updates from the admin
 Settings page.
+0076 adds a nullable residency generation to MCP approval records; existing
+approvals keep it empty.
 Rebuild the sandbox image for explicit plugin loading.
 Then start the main control-plane listener with its existing complete
 environment. It imports registered environment settings once,
@@ -816,11 +818,32 @@ by user id only, because identity tokens carry no display name.
 ## MCP servers
 
 MCP calls pass through the control plane. The sandbox holds a scoped relay
-token; upstream credentials stay outside it:
+credential; upstream credentials stay outside it:
 
 ```text
-sandbox ──[attempt-fenced mcp token]──▶ MCP-only relay ──[owner credential]──▶ MCP server
+sandbox ──[residency or attempt mcp credential]──▶ MCP-only relay ──[owner credential]──▶ MCP server
 ```
+
+A chat member's CLI process serves several turns, so it holds its residency's
+credential (`amr.…`), returned when the residency is established. On every
+call the relay resolves it to the attempt of that chat running under that
+residency, then applies the same fence as a turn's own token: the attempt must
+be current and leased, its job running and not stopped, its host enrolled.
+Between turns, or once the residency rotates, expires or is released, the
+credential authorizes nothing. A follow-up whose MCP servers did not change
+therefore keeps the live process; adding or removing a connection still
+restarts it, because a CLI reads its servers once at start. A process started
+with a turn's own token (from a control plane that predates residency
+credentials) restarts at the next turn, as before.
+
+Each request keeps the attempt and residency generation captured at authentication.
+After waiting for OAuth, an approval or an upstream session, the relay checks
+both again; it never moves an in-flight request to a later turn. Memory writes,
+Web Search admission and approval claims also check the residency inside their
+database transactions. Migration `0076_mcp_residency_fence` adds the nullable
+residency generation to approval records, so another residency or an attempt
+token cannot consume that approval. Existing attempt-token approvals keep a
+null generation.
 
 ### Listeners and connections
 

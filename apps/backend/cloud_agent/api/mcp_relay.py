@@ -12,6 +12,13 @@ this whole surface across.
 A leaked grant buys no tools; a leaked MCP token buys no inference, no event
 log, no patch and no terminal state.
 
+**A resident process carries a residency credential instead.** A chat's
+process outlives the turn it was started for and serves the next ones, which
+are other jobs, so a per-attempt token would force a restart at every message.
+Its ``amr.`` credential names the chat's residency, and the fence resolves it on
+every call to the turn that residency is running; with none running it buys
+nothing. From there it is fenced exactly like a turn's own token.
+
 **The scope check is positive.** ``parse_worker_token`` reads a token minted
 before scopes existed as ``full`` — the conservative reading for signing, and
 exactly the wrong one here: a check written as "not full" would admit every
@@ -100,7 +107,13 @@ from cloud_agent.mcp_proxy import (
 )
 from cloud_agent.settings import number_setting
 from cloud_agent.source_control import SourceControlError
-from cloud_agent.tokens import SCOPE_MCP, InvalidAgentToken, parse_worker_token
+from cloud_agent.tokens import (
+    SCOPE_MCP,
+    InvalidAgentToken,
+    parse_residency_mcp_token,
+    parse_worker_token,
+)
+from cloud_agent_shared.shared_protocol import is_residency_mcp_credential
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -205,6 +218,11 @@ class Authorized:
     #: dials the upstream itself; the per-connection route builds its header set
     #: from the same value one field over and never reads this.
     secret: str | None = None
+    #: The attempt the credential was resolved to, and its lease: what every
+    #: invocation record and fenced write of this request belongs to.
+    attempt_id: int | None = None
+    lease_generation: int = 0
+    residency_generation: int | None = None
     dispatches: list[tuple[int, int]] = field(default_factory=list, compare=False)
 
 
@@ -310,6 +328,15 @@ def _bounded_batch(document: Any) -> Any:
     return document
 
 
+def _require_relay_store(store: _McpRelayStorage | None) -> _McpRelayStorage:
+    """The relay's store, or the refusal a deployment without a database gets."""
+    if store is None:
+        raise _refused(
+            503, "invalid_request_error", "MCP is unavailable without a configured database."
+        )
+    return store
+
+
 async def _authorize_fence(
     authorization: str | None,
     store: _McpRelayStorage | None,
@@ -324,41 +351,94 @@ async def _authorize_fence(
 
     """
     token = _bearer(authorization)
+    residency_generation = None
 
-    try:
-        claims = parse_worker_token(token)
-    except InvalidAgentToken as exc:
-        raise _refused(401, "invalid_request_error", str(exc)) from exc
-
-    # **Positive, and it has to be.** `parse_worker_token` reads a token minted
-    # before scopes existed as `full`, which is the conservative reading when
-    # deciding whether a signature is trustworthy and precisely the wrong one
-    # here -- a check written as "not full" would admit every such token. A
-    # runner's full-scope token is refused too: reporting events and driving
-    # terminal transitions is not a reason to be able to call somebody's tools.
-    if claims.get("scope") != SCOPE_MCP:
-        raise _refused(403, "insufficient_scope", "This endpoint requires an MCP-scoped token.")
-
-    if store is None:
-        raise _refused(
-            503, "invalid_request_error", "MCP is unavailable without a configured database."
+    if is_residency_mcp_credential(token):
+        # A resident process's credential: it names the chat's residency, not
+        # an attempt, because the process serves turn after turn. It parses
+        # only as that, so it is MCP-only by construction, like the scope
+        # check below.
+        try:
+            residency = parse_residency_mcp_token(token)
+            residency_generation = residency["residency_generation"]
+        except InvalidAgentToken as exc:
+            raise _refused(401, "invalid_request_error", str(exc)) from exc
+        store = _require_relay_store(store)
+        # Which turn it speaks for is decided now, on every call: the one the
+        # residency is serving. Between turns, or once the residency rotated,
+        # expired or was released, there is none and nothing is authorized.
+        claims = await store.credential_queries.resolve_residency_attempt(
+            thread_id=residency["thread_id"],
+            residency_generation=residency["residency_generation"],
         )
+        if claims is None:
+            raise _refused(
+                401, "invalid_request_error", "This chat has no running turn for tool calls."
+            )
+    else:
+        try:
+            claims = parse_worker_token(token)
+        except InvalidAgentToken as exc:
+            raise _refused(401, "invalid_request_error", str(exc)) from exc
 
-    # The fence, read fresh on every call. The token names an attempt; this
+        # **Positive, and it has to be.** `parse_worker_token` reads a token
+        # minted before scopes existed as `full`, which is the conservative
+        # reading when deciding whether a signature is trustworthy and
+        # precisely the wrong one here -- a check written as "not full" would
+        # admit every such token. A runner's full-scope token is refused too:
+        # reporting events and driving terminal transitions is not a reason to
+        # be able to call somebody's tools.
+        if claims.get("scope") != SCOPE_MCP:
+            raise _refused(403, "insufficient_scope", "This endpoint requires an MCP-scoped token.")
+        store = _require_relay_store(store)
+
+    # The fence, read fresh on every call. The claims name an attempt; this
     # asks whether that attempt is still the job's current one, still running,
     # with an unexpired lease. So revocation is automatic -- the instant the
-    # reaper supersedes the attempt or the owner cancels, the same token stops
-    # buying tools, with no key to remember to revoke.
+    # reaper supersedes the attempt or the owner cancels, the same credential
+    # stops buying tools, with no key to remember to revoke.
+    return await _recheck_fence({**claims, "residency_generation": residency_generation}, store)
+
+
+def _residency_fence(identity: dict[str, Any]) -> dict[str, int]:
+    """Pass the additional fence only for a residency credential."""
+    generation = identity.get("residency_generation")
+    return {} if generation is None else {"residency_generation": int(generation)}
+
+
+async def _recheck_fence(captured: dict[str, Any], store: _McpRelayStorage) -> dict[str, Any]:
+    """Revalidate the original attempt and residency, never resolve another turn."""
     identity = await store.credential_queries.resolve_model_credential(
-        job_id=claims["job_id"],
-        attempt_id=claims["attempt_id"],
-        lease_generation=claims["lease_generation"],
+        job_id=captured["job_id"],
+        attempt_id=captured["attempt_id"],
+        lease_generation=captured["lease_generation"],
+        **_residency_fence(captured),
     )
     if identity is None:
         raise _refused(
             401, "invalid_request_error", "This job token is no longer valid for tool calls."
         )
-    return identity
+    # The attempt travels with the identity, so every record and write below
+    # is fenced to the turn resolved here rather than re-read from the token.
+    return {
+        **identity,
+        "attempt_id": int(captured["attempt_id"]),
+        "lease_generation": int(captured["lease_generation"]),
+        **_residency_fence(captured),
+    }
+
+
+async def _recheck_authorized(authorized: Authorized, store: _McpRelayStorage) -> None:
+    """Check a selected connection's captured caller after an asynchronous wait."""
+    await _recheck_fence(
+        {
+            "job_id": authorized.job_id,
+            "attempt_id": authorized.attempt_id,
+            "lease_generation": authorized.lease_generation,
+            "residency_generation": authorized.residency_generation,
+        },
+        store,
+    )
 
 
 async def _resolve_binding(
@@ -505,6 +585,9 @@ async def _resolve_binding(
         connection=resolved.connection,
         snapshot=resolved.snapshot,
         secret=resolved.credential.get("secret"),
+        attempt_id=identity.get("attempt_id"),
+        lease_generation=int(identity.get("lease_generation") or 0),
+        residency_generation=identity.get("residency_generation"),
     )
 
 
@@ -523,8 +606,8 @@ async def _authorize(
         identity,
         alias,
         store,
-        attempt_id=_attempt_id_of(authorization),
-        lease_generation=_lease_of(authorization),
+        attempt_id=identity["attempt_id"],
+        lease_generation=identity["lease_generation"],
     )
 
 
@@ -542,16 +625,15 @@ async def _resolve_live_binding(
     that wait cannot authorize dispatch after the user changes or revokes them.
     The second resolution reads current rows without another network refresh.
     """
-    previous = await _resolve_binding(identity, alias, store)
-    current_identity = (
-        await store.credential_queries.resolve_model_credential(
-            job_id=previous.job_id, attempt_id=attempt_id, lease_generation=lease_generation
-        )
-        if attempt_id is not None
-        else None
-    )
-    if current_identity is None:
+    if attempt_id is None:
         raise _refused(401, "permission_error", "This MCP session is no longer authorized.")
+    captured = {
+        **identity,
+        "attempt_id": attempt_id,
+        "lease_generation": lease_generation,
+    }
+    previous = await _resolve_binding(await _recheck_fence(captured, store), alias, store)
+    current_identity = await _recheck_fence(captured, store)
     current = await _resolve_binding(current_identity, alias, store, refresh_credentials=False)
     if (
         current.connection_id != previous.connection_id
@@ -567,11 +649,17 @@ async def _resolve_live_binding(
 
 
 async def _refresh_catalogue_entry(
-    entry: tuple[Authorized, Any], authorization: str | None, store: _McpRelayStorage
+    entry: tuple[Authorized, Any], identity: dict[str, Any], store: _McpRelayStorage
 ) -> tuple[Authorized, Any]:
     """Refresh the chosen tool or prompt and use its current capability record."""
     previous, capability = entry
-    current = await _authorize(previous.alias, authorization, store)
+    current = await _resolve_live_binding(
+        identity,
+        previous.alias,
+        store,
+        attempt_id=identity["attempt_id"],
+        lease_generation=identity["lease_generation"],
+    )
     if current.connection_id != previous.connection_id:
         raise _refused(403, "permission_error", "The selected MCP connection changed.")
     latest = (
@@ -656,6 +744,7 @@ async def _decide_call(
         "policy_revision": authorized.binding.policy_revision,
         "attempt_id": attempt_id,
         "lease_generation": lease_generation or None,
+        **_residency_fence({"residency_generation": authorized.residency_generation}),
     }
     approved = await store.mcp.find_approved_mcp_invocation(
         job_id=authorized.job_id,
@@ -704,6 +793,7 @@ async def _decide_call(
         capability_revision=authorized.connection.capability_revision,
         policy_revision=authorized.binding.policy_revision,
         expires_at=deadline_for(created_at=datetime.now(timezone.utc)).expires_at,
+        **_residency_fence({"residency_generation": authorized.residency_generation}),
     )
     logger.info(
         "agent_mcp_call_held",
@@ -768,9 +858,11 @@ async def _wait_for_approval(
                     job_id=authorized.job_id,
                     attempt_id=attempt_id,
                     lease_generation=int(fence["lease_generation"] or 0),
+                    **_residency_fence(fence),
                 )
                 if identity is None:
                     break
+                identity = {**identity, **_residency_fence(fence)}
                 try:
                     current = await _resolve_live_binding(
                         identity,
@@ -1054,8 +1146,8 @@ def build_upstream_client(request_timeout_s: float | None = None) -> httpx.Async
 async def _proxy(
     request: Request,
     *,
-    server: McpServer,
-    job_id: str,
+    authorized: Authorized,
+    store: _McpRelayStorage,
     method: str,
     body: bytes = b"",
 ) -> Any:
@@ -1067,6 +1159,7 @@ async def _proxy(
     check that lives only in the save path is a check the call path does not
     have.
     """
+    server, job_id = authorized.server, authorized.job_id
     try:
         await guard_target(server.url or "", policy_from_environment())
     except TransportError as exc:
@@ -1084,6 +1177,13 @@ async def _proxy(
             "server_error",
             f"The {server.name!r} MCP connection could not be reached: {exc}",
         ) from exc
+    # DNS validation can wait too. Recheck before sending any caller-selected
+    # method, and record a claimed approval as unsent if the caller lost it.
+    try:
+        await _recheck_authorized(authorized, store)
+    except HTTPException:
+        await _finish_dispatches(authorized, store, status="failed")
+        raise
     assert server.url is not None
     headers = _upstream_headers(request, server)
     if body:
@@ -1347,8 +1447,8 @@ async def _host_session(authorized: Authorized, authorization: str | None) -> An
     """
     key = SessionKey(
         connection_id=str(authorized.connection_id),
-        member=f"{authorized.job_id}:{_attempt_id_of(authorization) or 0}",
-        owner_lease_generation=_lease_of(authorization),
+        member=f"{authorized.job_id}:{authorized.attempt_id or 0}",
+        owner_lease_generation=authorized.lease_generation,
     )
     return await _host().open(authorized.connection, secret=authorized.secret, key=key)
 
@@ -1541,6 +1641,9 @@ async def _host_document(
         if not isinstance(payload, dict):
             replies.append(_error_reply(None, "every message must be an object", INVALID_REQUEST))
             continue
+        # Reading the body or an earlier call in this batch may have outlived
+        # either fence. Keep the attempt captured at authentication throughout.
+        identity = await _recheck_fence(identity, store)
         params = payload.get("params")
         meta = params.get("_meta") if isinstance(params, dict) else None
         stateless = stateless or isinstance(meta, dict)
@@ -1727,7 +1830,13 @@ async def _host_fetch(
                 raise ResourceResolutionError(
                     "That resource connection is not bound to this session."
                 )
-            authorized = await _authorize(str(binding.get("alias") or ""), authorization, store)
+            authorized = await _resolve_live_binding(
+                identity,
+                str(binding.get("alias") or ""),
+                store,
+                attempt_id=identity["attempt_id"],
+                lease_generation=identity["lease_generation"],
+            )
             if str(authorized.connection_id) != connection_id:
                 raise ResourceResolutionError("The selected resource connection changed.")
             capability = resource_capability(authorized.snapshot, authorized.binding, original_uri)
@@ -1754,7 +1863,7 @@ async def _host_fetch(
             # tools are a tool surface, so this catalogue holds nothing that is
             # not a resolved connection.
             authorized, capability = await _refresh_catalogue_entry(
-                cast("tuple[Authorized, Any]", entry), authorization, store
+                cast("tuple[Authorized, Any]", entry), identity, store
             )
         except HTTPException as exc:
             return _binding_error(request_id, exc)
@@ -1766,8 +1875,8 @@ async def _host_fetch(
         if not reading
         else {"uri": original_uri, "method": method},
         capability=capability,
-        attempt_id=_attempt_id_of(authorization),
-        lease_generation=_lease_of(authorization),
+        attempt_id=identity["attempt_id"],
+        lease_generation=identity["lease_generation"],
         request_id=request_id,
         request=request,
         kind=kind,
@@ -1777,6 +1886,7 @@ async def _host_fetch(
 
     try:
         session = await _host_session(authorized, authorization)
+        await _recheck_authorized(authorized, store)
         if reading:
             result = await _host().read_resource(session, uri=original_uri)
         else:
@@ -1786,6 +1896,9 @@ async def _host_fetch(
                 name=capability.name,
                 arguments=arguments if isinstance(arguments, dict) else None,
             )
+    except HTTPException as exc:
+        await _finish_dispatches(authorized, store, status="failed")
+        return _binding_error(request_id, exc)
     except asyncio.CancelledError:
         await asyncio.shield(_finish_dispatches(authorized, store, status="outcome_unknown"))
         raise
@@ -1846,8 +1959,8 @@ async def _host_web_search(
     except web_search.WebSearchInputError as exc:
         return _error_reply(request_id, str(exc), INVALID_PARAMS)
 
-    attempt_id = _attempt_id_of(authorization)
-    lease_generation = _lease_of(authorization)
+    attempt_id = identity["attempt_id"]
+    lease_generation = identity["lease_generation"]
     if attempt_id is None or lease_generation <= 0:
         return _result_reply(
             request_id,
@@ -1868,6 +1981,7 @@ async def _host_web_search(
             job_id=str(identity["job_id"]),
             attempt_id=attempt_id,
             lease_generation=lease_generation,
+            **_residency_fence(identity),
         )
     except Exception:
         logger.exception(
@@ -1914,7 +2028,10 @@ async def _host_web_search(
         )
 
     try:
+        await _recheck_fence(identity, store)
         result = await web_search.search(search_arguments)
+    except HTTPException as exc:
+        return _binding_error(request_id, exc)
     except web_search.WebSearchError as exc:
         logger.warning(
             "agent_web_search_failed",
@@ -1969,8 +2086,8 @@ async def _host_call(
         # The owner and task come from the fence, never from the arguments. The
         # attempt goes along so the write re-checks it in its own transaction:
         # this request may have been accepted before the task was stopped.
-        attempt_id = _attempt_id_of(authorization)
-        lease_generation = _lease_of(authorization)
+        attempt_id = identity["attempt_id"]
+        lease_generation = identity["lease_generation"]
         if attempt_id is None or lease_generation <= 0:
             result: dict[str, Any] = {
                 "content": [{"type": "text", "text": "Memory authorization expired."}],
@@ -1985,6 +2102,7 @@ async def _host_call(
                     job_id=str(identity["job_id"]),
                     attempt_id=attempt_id,
                     lease_generation=lease_generation,
+                    residency_generation=identity.get("residency_generation"),
                 ),
                 repository=store.agent_memory,
             )
@@ -2007,7 +2125,7 @@ async def _host_call(
         )
     try:
         authorized, capability = await _refresh_catalogue_entry(
-            cast("tuple[Authorized, Any]", entry), authorization, store
+            cast("tuple[Authorized, Any]", entry), identity, store
         )
     except HTTPException as exc:
         return _binding_error(request_id, exc)
@@ -2017,8 +2135,8 @@ async def _host_call(
         name=capability.name,
         arguments=arguments,
         capability=capability,
-        attempt_id=_attempt_id_of(authorization),
-        lease_generation=_lease_of(authorization),
+        attempt_id=identity["attempt_id"],
+        lease_generation=identity["lease_generation"],
         request_id=request_id,
         request=request,
     )
@@ -2031,6 +2149,7 @@ async def _host_call(
     # new owner the old one's upstream state.
     try:
         session = await _host_session(authorized, authorization)
+        await _recheck_authorized(authorized, store)
         schema = getattr(capability, "input_schema", None)
         outcome = await _host().call_tool(
             session,
@@ -2038,6 +2157,9 @@ async def _host_call(
             arguments=arguments if isinstance(arguments, dict) else {},
             input_schema=schema if isinstance(schema, dict) else None,
         )
+    except HTTPException as exc:
+        await _finish_dispatches(authorized, store, status="failed")
+        return _binding_error(request_id, exc)
     except asyncio.CancelledError:
         await asyncio.shield(_finish_dispatches(authorized, store, status="outcome_unknown"))
         raise
@@ -2141,12 +2263,14 @@ async def mcp_post(
     # From here on the request *is* the parsed document: the decision, the
     # allowlist and the upstream all read this one encoding of it.
 
+    await _recheck_authorized(authorized, store)
+
     held = await _capability_decision(
         authorized,
         store,
         body,
-        attempt_id=_attempt_id_of(authorization),
-        lease_generation=_lease_of(authorization),
+        attempt_id=authorized.attempt_id,
+        lease_generation=authorized.lease_generation,
         request=request,
     )
     if held is not None:
@@ -2174,7 +2298,7 @@ async def mcp_post(
 
     try:
         response = await _proxy(
-            request, server=server, job_id=authorized.job_id, method="POST", body=body
+            request, authorized=authorized, store=store, method="POST", body=body
         )
     except BaseException:
         await asyncio.shield(_finish_dispatches(authorized, store, status="outcome_unknown"))
@@ -2211,7 +2335,8 @@ async def mcp_get(
 ) -> Any:
     """Open the server-to-client stream for an established session."""
     authorized = await _authorize(server_name, authorization, store)
-    return await _proxy(request, server=authorized.server, job_id=authorized.job_id, method="GET")
+    assert store is not None
+    return await _proxy(request, authorized=authorized, store=store, method="GET")
 
 
 @router.delete("/{server_name}")
@@ -2223,28 +2348,8 @@ async def mcp_delete(
 ) -> Any:
     """Terminate an MCP session."""
     authorized = await _authorize(server_name, authorization, store)
-    return await _proxy(
-        request, server=authorized.server, job_id=authorized.job_id, method="DELETE"
-    )
-
-
-def _attempt_id_of(authorization: str | None) -> int | None:
-    """The attempt a relayed request belongs to, for the invocation record."""
-    try:
-        claims = parse_worker_token(_bearer(authorization))
-    except (InvalidAgentToken, HTTPException):
-        return None
-    attempt = claims.get("attempt_id")
-    return int(attempt) if attempt is not None else None
-
-
-def _lease_of(authorization: str | None) -> int:
-    """The lease generation a relayed request was minted under."""
-    try:
-        claims = parse_worker_token(_bearer(authorization))
-    except (InvalidAgentToken, HTTPException):
-        return 0
-    return int(claims.get("lease_generation") or 0)
+    assert store is not None
+    return await _proxy(request, authorized=authorized, store=store, method="DELETE")
 
 
 __all__ = ["router"]

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from cloud_agent.storage._sql.hosts import LIVE_ATTEMPT_HOST
 from cloud_agent.storage._sql.mcp import mcp_binding_row
+from cloud_agent.storage._sql.mcp_residency import residency_fence_sql
 
 if TYPE_CHECKING:
     from typing import Any
@@ -25,12 +26,49 @@ class PostgresCredentialQueries:
         """Wrap the pool the control plane already owns."""
         self._pool = pool
 
+    async def resolve_residency_attempt(
+        self, *, thread_id: str, residency_generation: int
+    ) -> dict[str, Any] | None:
+        """Name the attempt a resident process is serving right now.
+
+        The membership is the residency's record: its generation and lease say
+        whether the process that holds the credential is still the chat's, and
+        its ``active_attempt_id`` is the turn admitted to it. That attempt must
+        be its job's current one and run on the membership's own host, so a
+        credential copied out of one sandbox cannot speak for a turn the chat
+        runs anywhere else.
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT j.id AS job_id, a.id AS attempt_id, a.lease_generation
+                FROM agent_thread_sandbox_memberships m
+                JOIN agent_threads t ON t.id = m.thread_id
+                JOIN agent_sandboxes g ON g.id = m.sandbox_id
+                JOIN agent_attempts a ON a.id = m.active_attempt_id
+                JOIN agent_jobs j ON j.id = a.job_id
+                WHERE m.thread_id = $1
+                  AND m.residency_generation = $2
+                  AND m.residency_status = 'hot'
+                  AND m.residency_lease_expires_at > clock_timestamp()
+                  AND t.deleted_at IS NULL
+                  AND a.host_id = g.host
+                  AND a.status = 'running'
+                  AND j.thread_id = m.thread_id
+                  AND j.current_attempt_id = a.id
+                """,
+                thread_id,
+                residency_generation,
+            )
+        return dict(row) if row is not None else None
+
     async def resolve_model_credential(
         self,
         *,
         job_id: str,
         attempt_id: int,
         lease_generation: int,
+        residency_generation: int | None = None,
     ) -> dict[str, Any] | None:
         """Resolve Agent-owned job metadata for the MCP relay's live fence.
 
@@ -77,10 +115,12 @@ class PostgresCredentialQueries:
                   AND j.state = 'running'
                   AND NOT j.cancel_requested
                   AND {LIVE_ATTEMPT_HOST}
+                  AND {residency_fence_sql("$4")}
                 """,
                 attempt_id,
                 lease_generation,
                 job_id,
+                residency_generation,
             )
             if row is None:
                 return None
