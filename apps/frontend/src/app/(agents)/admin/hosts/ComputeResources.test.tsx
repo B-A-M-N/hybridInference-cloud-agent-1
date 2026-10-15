@@ -1186,6 +1186,42 @@ describe('resource dashboard', () => {
     expect(api.createComputeServer).not.toHaveBeenCalled();
   });
 
+  it('shows maintenance for fenced hosts even when the resource is ready and no operation is running', async () => {
+    vi.mocked(api.getComputeServers).mockResolvedValue({
+      allocations: [allocation()],
+      hosts: [
+        {
+          host: 'host-a',
+          status: 'draining',
+          drain_fence_active: true,
+          retained_groups: 2,
+          allocation_id: 'resource-a',
+          compute_node_id: 'node-a',
+        },
+        {
+          host: 'old-host',
+          status: 'draining',
+          drain_fence_active: true,
+          retained_groups: 0,
+          allocation_id: null,
+          compute_node_id: null,
+        },
+      ],
+      active_host: null,
+      observed_at: '2026-10-04T08:00:00Z',
+    });
+    render(<ComputeResources onHostsChanged={vi.fn()} />);
+
+    const cloudRow = await screen.findByRole('listitem', { name: 'CloudLab experiment' });
+    const existingRow = screen.getByRole('listitem', { name: 'old-host' });
+    expect(within(cloudRow).getByText('maintenance')).toBeInTheDocument();
+    expect(within(existingRow).getByText('maintenance')).toBeInTheDocument();
+    expect(screen.queryByText('updating')).not.toBeInTheDocument();
+    expect(screen.queryByText('Online')).not.toBeInTheDocument();
+    fireEvent.click(within(cloudRow).getByRole('button', { name: 'Manage CloudLab experiment' }));
+    expect(within(screen.getByRole('dialog')).getByText('ready')).toBeInTheDocument();
+  });
+
   it('keeps one resource row and its retained count when the global target changes', async () => {
     vi.mocked(api.getComputeServers).mockResolvedValue({
       allocations: [allocation()],

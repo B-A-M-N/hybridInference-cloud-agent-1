@@ -2301,6 +2301,19 @@ previous snapshot rather than recreating a token-only ABA state. An older V1
 control plane does not compare the epoch and is therefore not operationally
 compatible, even though its writes still cause rotation.
 
+The Servers page calls an active fenced drain **Maintenance**. This means the
+host is held out of new work; it does not confirm that an update is running.
+The fence can remain after a cancelled rollout or an operator deliberately
+isolates an old host. Fresh heartbeats, zero occupied slots, and a compute
+resource marked `ready` do not release it. A successful deployment to another
+host does not recover this host either.
+
+For a host left in maintenance, identify its exact fence owner in the deployment
+records and check whether that owner still has an active rollout. Verify or
+upgrade this host to the intended release and complete its readiness checks
+before using the recovery procedure below. Do not automatically resume it based
+on elapsed time or an idle slot counter.
+
 Inspect fence state before rollback or recovery:
 
 ```sql

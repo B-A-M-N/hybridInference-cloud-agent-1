@@ -12,10 +12,9 @@ import type { AgentRunnerHost } from '@/lib/api/admin';
 /**
  * A host's status as an operator reads it.
  *
- * `draining` is never something an operator chooses on this page: it is the
- * step a Remove or a deployment takes while running turns finish. So it is
- * named by what it is on the way to — a removal, an update — and only a drain
- * started outside the page, through the API, reads as plainly paused.
+ * A drain fence proves maintenance ownership, not deployment progress. It can
+ * survive a cancelled rollout or deliberately keep an old host out of service.
+ * Only an explicit removal request describes what is happening next.
  */
 export function hostStatusLabel(host: {
   status: string;
@@ -24,7 +23,7 @@ export function hostStatusLabel(host: {
 }): string {
   if (host.status !== 'draining') return host.status;
   if (host.removal_pending) return 'removing';
-  if (host.drain_fence_active) return 'updating';
+  if (host.drain_fence_active) return 'maintenance';
   return 'paused';
 }
 

@@ -507,15 +507,31 @@ describe('AdminHostsPage', () => {
     expect(await screen.findByRole('button', { name: 'Remove from pool' })).toBeInTheDocument();
   });
 
-  it('names a deployment drain as an update and offers no way to undo it', async () => {
-    mocked.list.mockResolvedValue(
-      pool([host({ status: 'draining', drain_fence_active: true, slots_used: 1 })]),
-    );
+  it.each([0, 1])(
+    'explains a maintenance hold with %i running turns without claiming update progress',
+    async (slots) => {
+      mocked.list.mockResolvedValue(
+        pool([host({ status: 'draining', drain_fence_active: true, slots_used: slots })]),
+      );
+      renderPage();
+
+      expect(await screen.findByText('maintenance')).toBeInTheDocument();
+      expect(screen.getByText(/New work is paused for maintenance/)).toHaveTextContent(
+        'This does not confirm an update is running. If maintenance has finished, the deployment operator must verify the host and resume work.',
+      );
+      expect(screen.queryByText('updating')).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Resume new work' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Cancel removal' })).not.toBeInTheDocument();
+    },
+  );
+
+  it('offers normal resume for a manual pause without a maintenance warning', async () => {
+    mocked.list.mockResolvedValue(pool([host({ status: 'draining', drain_fence_active: false })]));
     renderPage();
 
-    expect(await screen.findByText('updating')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Resume new work' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Cancel removal' })).not.toBeInTheDocument();
+    expect(await screen.findByText('paused')).toBeInTheDocument();
+    expect(screen.queryByText(/New work is paused for maintenance/)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Resume new work' })).toBeInTheDocument();
   });
 
   it('forgets only a disabled Host record after explaining the scope', async () => {

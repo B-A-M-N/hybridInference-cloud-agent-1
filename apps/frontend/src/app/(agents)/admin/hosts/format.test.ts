@@ -16,10 +16,16 @@ function host(name: string, status = 'online'): AgentRunnerHost {
 }
 
 describe('host status label', () => {
-  it('names a drain by what it leads to, never as draining', () => {
+  it('distinguishes maintenance holds, removal requests and manual pauses', () => {
     expect(hostStatusLabel({ status: 'draining', removal_pending: true })).toBe('removing');
-    expect(hostStatusLabel({ status: 'draining', drain_fence_active: true })).toBe('updating');
+    expect(hostStatusLabel({ status: 'draining', drain_fence_active: true })).toBe('maintenance');
     expect(hostStatusLabel({ status: 'draining' })).toBe('paused');
+  });
+
+  it('keeps a removal request explicit even when a maintenance fence exists', () => {
+    expect(
+      hostStatusLabel({ status: 'draining', removal_pending: true, drain_fence_active: true }),
+    ).toBe('removing');
   });
 
   it('passes every other status through', () => {

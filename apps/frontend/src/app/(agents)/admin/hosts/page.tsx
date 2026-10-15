@@ -805,6 +805,13 @@ function HostsView() {
                         </th>
                         <td data-label="Status" className="px-3 py-4">
                           <StatusBadge host={host} />
+                          {hostStatusLabel(host) === 'maintenance' && (
+                            <p className="mt-2 max-w-xs text-xs leading-relaxed text-amber-800 dark:text-amber-300">
+                              New work is paused for maintenance. This does not confirm an update is
+                              running. If maintenance has finished, the deployment operator must
+                              verify the host and resume work.
+                            </p>
+                          )}
                           {host.removal_pending && (
                             <span className="mt-1 block whitespace-nowrap text-[11px] text-gray-500 dark:text-gray-400">
                               {host.slots_used} running turn(s) left
