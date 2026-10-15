@@ -12,6 +12,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState } f
 import { clearSideChatDrafts } from '@/components/features/agents/sideChatStorage';
 import { clearAccountResources } from '@/components/features/profile/accountResource';
 import { AUTH_EXPIRED_EVENT } from '@/lib/api/client';
+import { announceSession, listenForSession } from '@/lib/auth/sessionSync';
 import { APIError } from '@/lib/utils/errors';
 import {
   endSession,
@@ -36,6 +37,15 @@ interface AuthContextValue {
   state: AuthState;
   logout: () => Promise<void>;
   refreshUser: () => Promise<void>;
+  /**
+   * True once this tab finds its session now belongs to a different account
+   * than the one it was showing — another tab switched the browser's Agents
+   * session — until `acknowledgeSessionSwitch` says the tab has dealt with it.
+   * State rather than an event: the switch passes through the loading state,
+   * which unmounts the pages that would hear an event.
+   */
+  sessionSwitched: boolean;
+  acknowledgeSessionSwitch: () => void;
 }
 
 export function hasAgentPermission(
@@ -56,6 +66,9 @@ export function hasAgentPermission(
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
+/** How often looking at a tab again may re-check its session. */
+const RECHECK_INTERVAL_MS = 5_000;
+
 const SIGNED_OUT: AuthState = { isAuthenticated: false, loading: false, user: null };
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
@@ -65,6 +78,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     loading: true,
     user: null,
   });
+  const [sessionSwitched, setSessionSwitched] = useState(false);
+  const acknowledgeSessionSwitch = useCallback(() => setSessionSwitched(false), []);
 
   const refreshUser = useCallback(async () => {
     setState((previous) => ({ ...previous, loading: true, error: null }));
@@ -76,7 +91,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setState(SIGNED_OUT);
         return;
       }
-      if (accountId.current !== me.id) clearAccountResources();
+      const previous = accountId.current;
+      if (previous !== me.id) {
+        clearAccountResources();
+        announceSession(me.id);
+        if (previous !== undefined) setSessionSwitched(true);
+      }
       accountId.current = me.id;
       setState({
         isAuthenticated: true,
@@ -107,6 +127,41 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
   }, [refreshUser]);
 
+  // Whether the cookie still names the account this tab shows, asked without
+  // the loading state a full refresh shows, and acted on only when it does not.
+  const lastCheck = useRef(0);
+  const checkSession = useCallback(async () => {
+    lastCheck.current = Date.now();
+    try {
+      const me = await getSessionUser();
+      if ((me?.id ?? undefined) !== accountId.current) await refreshUser();
+    } catch {
+      // An outage is not a different account; the next request will say so.
+    }
+  }, [refreshUser]);
+
+  useEffect(
+    () =>
+      listenForSession(({ userId }) => {
+        if ((userId ?? undefined) !== accountId.current) void checkSession();
+      }),
+    [checkSession],
+  );
+
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (Date.now() - lastCheck.current < RECHECK_INTERVAL_MS) return;
+      void checkSession();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', onVisible);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onVisible);
+    };
+  }, [checkSession]);
+
   useEffect(() => {
     const handleAuthExpired = () => {
       clearSideChatDrafts(state.user?.id);
@@ -128,9 +183,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     clearAccountResources();
     accountId.current = undefined;
     setState(SIGNED_OUT);
+    announceSession(null);
   }, [state.user?.id]);
 
-  const value: AuthContextValue = { state, logout, refreshUser };
+  const value: AuthContextValue = {
+    state,
+    logout,
+    refreshUser,
+    sessionSwitched,
+    acknowledgeSessionSwitch,
+  };
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

@@ -3,7 +3,9 @@
 import Link from 'next/link';
 import { usePathname, useSearchParams } from 'next/navigation';
 import { useCallback, useEffect, useState } from 'react';
+import { GatewayAccountBanner } from '@/components/features/auth/GatewayAccountBanner';
 import { ProtectedRoute } from '@/components/features/auth/ProtectedRoute';
+import { SessionSwitchWatcher } from '@/components/features/auth/SessionSwitchWatcher';
 import { AgentsSidebar } from '@/components/features/agents/AgentsSidebar';
 import { useAgentChangeStream } from '@/components/features/agents/agentPush';
 import { AgentNotifications } from '@/components/features/agents/AgentNotifications';
@@ -413,60 +415,63 @@ export default function AgentsLayout({ children }: { children: React.ReactNode }
   }, [toggleSidebar, shortcuts.sidebar]);
 
   return (
-    <ProtectedRoute>
-      <McpApprovalsProvider
-        ownerId={state.user?.id}
-        enabled={hasAgentPermission(state.user?.agent_access, 'agent.use')}
-      >
-        <div className="fixed inset-0 z-50 flex flex-col bg-surface-muted">
-          <a
-            href="#agents-workspace"
-            onClick={closeMobileSidebar}
-            className="ui-focus-ring sr-only z-[60] rounded-lg bg-surface px-4 py-3 font-medium text-accent shadow-card focus:not-sr-only focus:absolute focus:left-3 focus:top-3"
-          >
-            {t('nav.skipToWorkspace')}
-          </a>
-          <AgentsHeader
-            accountMenu={
-              !hasAgentPermission(state.user?.agent_access, 'agent.use') ||
-              (mobile ? !mobileSidebarOpen : sidebarCollapsed)
-            }
-            sidebarToggle={
-              mobile || sidebarCollapsed ? (
-                <SidebarToggleButton
-                  shortcut={shortcuts.sidebar}
-                  settings={onSettings}
-                  sidebarCollapsed={mobile ? !mobileSidebarOpen : sidebarCollapsed}
-                  onToggleSidebar={toggleSidebar}
-                />
-              ) : undefined
-            }
-          />
-          <AgentsShell
-            settingsNavigation={
-              onSettings
-                ? { backHref: chatReturn.userId === state.user?.id ? chatReturn.href : '/' }
-                : undefined
-            }
-            sidebarCollapsed={mobile ? !mobileSidebarOpen : sidebarCollapsed}
-            sidebarToggle={
-              !mobile && !sidebarCollapsed ? (
-                <SidebarToggleButton
-                  shortcut={shortcuts.sidebar}
-                  settings={onSettings}
-                  sidebarCollapsed={false}
-                  onToggleSidebar={toggleSidebar}
-                />
-              ) : undefined
-            }
-            mobileSidebarOpen={mobileSidebarOpen}
-            onSidebarNavigate={closeMobileSidebar}
-          >
-            {children}
-          </AgentsShell>
-          <DeploymentFooter />
-        </div>
-      </McpApprovalsProvider>
-    </ProtectedRoute>
+    <SessionSwitchWatcher>
+      <ProtectedRoute>
+        <McpApprovalsProvider
+          ownerId={state.user?.id}
+          enabled={hasAgentPermission(state.user?.agent_access, 'agent.use')}
+        >
+          <div className="fixed inset-0 z-50 flex flex-col bg-surface-muted">
+            <a
+              href="#agents-workspace"
+              onClick={closeMobileSidebar}
+              className="ui-focus-ring sr-only z-[60] rounded-lg bg-surface px-4 py-3 font-medium text-accent shadow-card focus:not-sr-only focus:absolute focus:left-3 focus:top-3"
+            >
+              {t('nav.skipToWorkspace')}
+            </a>
+            <AgentsHeader
+              accountMenu={
+                !hasAgentPermission(state.user?.agent_access, 'agent.use') ||
+                (mobile ? !mobileSidebarOpen : sidebarCollapsed)
+              }
+              sidebarToggle={
+                mobile || sidebarCollapsed ? (
+                  <SidebarToggleButton
+                    shortcut={shortcuts.sidebar}
+                    settings={onSettings}
+                    sidebarCollapsed={mobile ? !mobileSidebarOpen : sidebarCollapsed}
+                    onToggleSidebar={toggleSidebar}
+                  />
+                ) : undefined
+              }
+            />
+            <GatewayAccountBanner />
+            <AgentsShell
+              settingsNavigation={
+                onSettings
+                  ? { backHref: chatReturn.userId === state.user?.id ? chatReturn.href : '/' }
+                  : undefined
+              }
+              sidebarCollapsed={mobile ? !mobileSidebarOpen : sidebarCollapsed}
+              sidebarToggle={
+                !mobile && !sidebarCollapsed ? (
+                  <SidebarToggleButton
+                    shortcut={shortcuts.sidebar}
+                    settings={onSettings}
+                    sidebarCollapsed={false}
+                    onToggleSidebar={toggleSidebar}
+                  />
+                ) : undefined
+              }
+              mobileSidebarOpen={mobileSidebarOpen}
+              onSidebarNavigate={closeMobileSidebar}
+            >
+              {children}
+            </AgentsShell>
+            <DeploymentFooter />
+          </div>
+        </McpApprovalsProvider>
+      </ProtectedRoute>
+    </SessionSwitchWatcher>
   );
 }
