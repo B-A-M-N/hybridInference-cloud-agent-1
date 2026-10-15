@@ -62,6 +62,7 @@ from cloud_agent_shared.sandbox_archive_settings import (
     SandboxArchivePolicyError,
 )
 from cloud_agent_shared.sandbox_restore import MAX_RESTORE_ATTEMPTS, SANDBOX_RESTORE_CAPABILITY
+from cloud_agent_shared.shared_protocol import WORKSPACE_CHAT_CAPABILITY
 
 if TYPE_CHECKING:
     from cloud_agent.goals.report import GoalReportEnvelope
@@ -259,6 +260,11 @@ class PostgresAttemptCommands:
                 and SANDBOX_RESTORE_CAPABILITY in capabilities
                 and SANDBOX_RESTORE_CAPABILITY in runner_capabilities
             )
+            # A chat created into an existing workspace starts its first session
+            # there and prepares nothing. An earlier replica would prepare it as
+            # a new workspace and reset the files its other chats are using, so
+            # only this replica's own word admits that first turn.
+            workspace_chat_capable = WORKSPACE_CHAT_CAPABILITY in runner_capabilities
             credential_matches = bool(host_row["credential_matches"])
             secure_attestation = bool(
                 credential_matches
@@ -333,6 +339,11 @@ class PostgresAttemptCommands:
                                 'provisioning', 'starting', 'running', 'stopped'
                             )
                             AND s.shared_live
+                            AND (
+                                s.last_settled_job_id IS NOT NULL
+                                OR s.thread_id = s.origin_thread_id
+                                OR $8::boolean
+                            )
                         )
                         OR (
                             -- A group whose host is gone, held by its
@@ -351,6 +362,11 @@ class PostgresAttemptCommands:
                             AND s.context_status <> 'lost'
                             AND s.native_state <> 'lost'
                             AND s.shared_live
+                            AND (
+                                s.last_settled_job_id IS NOT NULL
+                                OR s.thread_id = s.origin_thread_id
+                                OR $8::boolean
+                            )
                         )
                   )
                 ORDER BY j.created_at
@@ -364,6 +380,7 @@ class PostgresAttemptCommands:
                 pin_allows_new_sandbox,
                 followup_attestation,
                 restore_capable,
+                workspace_chat_capable,
             )
             if job_row is None:
                 return None

@@ -366,6 +366,7 @@ async def _reserve_shared_chat(
     environment_selection: dict | None = None,
     repo: str | None = "example-org/example-repo",
     base_sha: str = "a" * 40,
+    resident_slot_capacity: int = 8,
 ) -> tuple[dict, dict, dict]:
     """Create, claim, and reserve one capability-gated shared-live chat."""
     await store.host_pool.register_host(
@@ -411,6 +412,7 @@ async def _reserve_shared_chat(
         execution_profile=job["execution_profile"],
         fork_helper_version=fork_helper_version,
         disk_limit_mib=disk_limit_mib,
+        resident_slot_capacity=resident_slot_capacity,
     )
     assert sandbox is not None and sandbox["shared_live"] is True
     residency = await store.residency.establish_residency(

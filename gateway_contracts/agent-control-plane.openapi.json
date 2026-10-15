@@ -5308,6 +5308,12 @@
             ],
             "title": "Updated At"
           },
+          "workspace_chat_available": {
+            "default": false,
+            "description": "Whether a new chat can be started in this chat's workspace now (POST /jobs/{job_id}/workspace-chats): it shares the container and files and starts with no history. A free resident slot is checked only when the chat is created.",
+            "title": "Workspace Chat Available",
+            "type": "boolean"
+          },
           "workspace_epoch": {
             "anyOf": [
               {
@@ -7644,6 +7650,135 @@
           "timing_source"
         ],
         "title": "AgentThreadStatsResponse",
+        "type": "object"
+      },
+      "AgentWorkspaceChatCreate": {
+        "additionalProperties": false,
+        "description": "Request body for a new chat in the workspace another chat uses.\n\nThe workspace decides where the chat runs: its repository, base, runtime,\nprofile, environment and plugins are the source chat's, so none of them is\na field here, and naming one is refused rather than ignored. What is\nchosen is the conversation's own — its first message, model, effort,\ntools, skills, uploads and goal — with the same meaning as on a new task.",
+        "properties": {
+          "attachment_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "exclusiveMinimum": 0.0,
+                  "type": "integer"
+                },
+                "maxItems": 50,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Staged uploads to place under /uploads in the shared sandbox.",
+            "title": "Attachment Ids"
+          },
+          "goal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GoalInput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A completion condition for the new chat, as on a new task."
+          },
+          "mcp_bindings": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/McpBindingInput"
+                },
+                "maxItems": 16,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "MCP connections this chat may use. Omitted means none.",
+            "title": "Mcp Bindings"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque caller metadata: at most 64 keys and 16 KiB as JSON.",
+            "title": "Metadata"
+          },
+          "model": {
+            "description": "Gateway model id the runtime should use.",
+            "maxLength": 255,
+            "title": "Model",
+            "type": "string"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "As on a new task: null is Auto, a value must be offered for the model.",
+            "title": "Reasoning Effort"
+          },
+          "skill_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "exclusiveMinimum": 0.0,
+                  "type": "integer"
+                },
+                "maxItems": 16,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Owned skills for this chat. Omitted uses library defaults; [] selects none.",
+            "title": "Skill Ids"
+          },
+          "ssh_server_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                  "type": "string"
+                },
+                "maxItems": 1024,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "SSH servers this chat can reach: the owner's servers that passed their check. Omitted means none.",
+            "title": "Ssh Server Ids"
+          },
+          "task_prompt": {
+            "description": "The new chat's first message.",
+            "maxLength": 100000,
+            "minLength": 1,
+            "title": "Task Prompt",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_prompt",
+          "model"
+        ],
+        "title": "AgentWorkspaceChatCreate",
         "type": "object"
       },
       "AgentWorkspaceEntry": {
@@ -31618,6 +31753,89 @@
         "tags": [
           "agent"
         ]
+      }
+    },
+    "/v1/agent/jobs/{job_id}/workspace-chats": {
+      "post": {
+        "description": "Start a new chat in the workspace ``job_id``'s chat uses.\n\nThe new chat shares that chat's container and files and starts with no\nhistory: its first turn opens a new Agent CLI session beside the others.\n``body.task_prompt`` is that first turn. An ``Idempotency-Key`` works as on\n``POST /jobs``.",
+        "operationId": "create_workspace_chat_v1_agent_jobs__job_id__workspace_chats_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentWorkspaceChatCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentJobResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Workspace Chat"
       }
     },
     "/v1/agent/jobs/{job_id}/workspace/archive": {

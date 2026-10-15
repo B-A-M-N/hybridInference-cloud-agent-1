@@ -354,8 +354,16 @@ class SessionSupervisorClient:
         start_seq: int | None = None,
         restore: dict[str, Any] | None = None,
         environment_snapshot: dict[str, Any] | None = None,
+        joins_workspace: bool = False,
     ) -> dict[str, Any]:
-        """Lease one member without excluding turns on sibling members."""
+        """Lease one member without excluding turns on sibling members.
+
+        ``joins_workspace`` asks for a chat created into an existing group: a
+        member that is not the group's origin and has no native session yet.
+        Sent only when set. A sandbox manager that predates it ignores the field
+        and leaves that member out of its manifest, so the acquire fails for
+        want of a membership; nothing is started or prepared.
+        """
         return self._shared_request(
             "POST",
             thread_id,
@@ -385,6 +393,7 @@ class SessionSupervisorClient:
                     if environment_snapshot is not None
                     else {}
                 ),
+                **({"joins_workspace": True} if joins_workspace else {}),
             },
         )
 

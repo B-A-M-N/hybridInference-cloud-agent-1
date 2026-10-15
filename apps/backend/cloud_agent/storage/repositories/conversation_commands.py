@@ -19,6 +19,7 @@ from cloud_agent.domain.requests import check_client_request
 from cloud_agent.execution_profiles import default_execution_profile
 from cloud_agent.goals.models import GOAL_REPORT_PROTOCOL
 from cloud_agent.storage._sql.attachments import claim_attachments
+from cloud_agent.storage._sql.compute_admission import host_compute_admission, lock_compute_entry
 from cloud_agent.storage._sql.goals import (
     CANCEL_QUEUED_GOAL_ROUNDS_SQL,
     EDITED_WHILE_PAUSED_DETAIL,
@@ -30,6 +31,10 @@ from cloud_agent.storage._sql.jobs import JOB_SELECT, SESSION_DELETE_BLOCK_SQL
 from cloud_agent.storage._sql.mcp import write_mcp_bindings
 from cloud_agent.storage._sql.pending_messages import PAUSE_QUEUE_SQL
 from cloud_agent.storage._sql.rows import job_row_to_dict, load_json
+from cloud_agent.storage._sql.sandbox import (
+    WORKSPACE_CHAT_CAPABILITY_JSON,
+    allocate_resident_slot,
+)
 from cloud_agent.storage._sql.ssh import enable_ssh_servers
 from cloud_agent.storage.repositories.conversation_queries import PostgresConversationQueries
 from cloud_agent.storage.repositories.environments import PostgresEnvironmentRepository
@@ -142,12 +147,6 @@ class PostgresConversationCommands:
                 return replayed
         job_id = new_job_id()
         thread_id = new_thread_id()
-        # How many person-authored messages this conversation has accepted. The
-        # first one is the task itself, so a conversation created with a goal
-        # starts at one and one created with a plain task starts at zero; the
-        # first turn stamps whatever this is, and the goal's completion check
-        # compares against it.
-        user_input_seq = 1 if goal is not None else 0
         try:
             async with self._pool.acquire() as conn, conn.transaction():
                 binding_id = None
@@ -155,131 +154,259 @@ class PostgresConversationCommands:
                     binding_id, setup_script = await PostgresEnvironmentRepository(
                         self._pool
                     )._bind_environment(conn, user_id, repo, environment_selection)
-                # What every turn of this conversation shares is written once,
-                # here, on the thread; the turns below carry only their own.
-                await conn.execute(
-                    """
-                    INSERT INTO agent_threads
-                        (id, user_id, repo, title, title_source,
-                         setup_script, execution_profile,
-                         goal_id, goal_objective, goal_state, goal_max_rounds,
-                         goal_revision, goal_created_at, goal_updated_at,
-                         user_input_seq, plugins)
-                    VALUES ($1, $2, $3, $4, 'fallback', $5, $6,
-                            CASE WHEN $7::text IS NULL THEN NULL ELSE $9 END,
-                            $7, CASE WHEN $7::text IS NULL THEN NULL ELSE 'active' END,
-                            $8,
-                            CASE WHEN $7::text IS NULL THEN 0 ELSE 1 END,
-                            CASE WHEN $7::text IS NULL THEN NULL ELSE NOW() END,
-                            CASE WHEN $7::text IS NULL THEN NULL ELSE NOW() END,
-                            -- The same counter the first turn below stamps
-                            -- itself with: a thread that says one while its own
-                            -- first turn says zero makes that turn look older
-                            -- than the message that created it.
-                            $10, $11::jsonb)
-                    """,
-                    thread_id,
-                    user_id,
-                    repo,
-                    fallback_title(task_prompt),
-                    setup_script,
-                    execution_profile,
-                    goal.objective if goal is not None else None,
-                    goal.max_rounds if goal is not None else None,
-                    new_goal_id(),
-                    user_input_seq,
-                    json.dumps(plugins or []),
-                )
-                if binding_id is not None:
-                    await conn.execute(
-                        "UPDATE agent_threads SET environment_binding_id=$2 WHERE id=$1",
-                        thread_id,
-                        binding_id,
-                    )
-                await write_mcp_bindings(conn, thread_id=thread_id, bindings=mcp_bindings)
-                if ssh_server_ids:
-                    await enable_ssh_servers(
-                        conn, user_id=user_id, thread_id=thread_id, server_ids=ssh_server_ids
-                    )
-                await conn.execute(
-                    """
-                    INSERT INTO agent_jobs
-                        (id, thread_id, turn_no, user_id, base_sha, task_prompt,
-                         runtime, model, reasoning_effort, metadata,
-                         client_request_id, client_request_fingerprint, skills,
-                         attachments, input_seq_at_create)
-                    VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12::jsonb,
-                            $13::jsonb, $14)
-                    """,
-                    job_id,
-                    thread_id,
-                    user_id,
-                    base_sha,
-                    task_prompt,
-                    runtime,
-                    model,
-                    reasoning_effort,
-                    json.dumps(metadata) if metadata is not None else None,
-                    client_request_id,
-                    client_request_fingerprint,
-                    # No earlier skill instructions exist in a new conversation.
-                    # An empty selection needs no clearing context in its prompt.
-                    json.dumps(skills) if skills else None,
-                    json.dumps(attachments) if attachments else None,
-                    # The conversation's counter as this first turn saw it. Zero
-                    # here while the thread says one would make the very first
-                    # turn look older than its own message: a completion it
-                    # reported would be refused as "the owner has spoken since",
-                    # and no goal on a fresh conversation could ever complete.
-                    user_input_seq,
-                )
-                await claim_attachments(
+                row = await _insert_conversation(
                     conn,
-                    user_id=user_id,
                     job_id=job_id,
                     thread_id=thread_id,
+                    user_id=user_id,
+                    repo=repo,
+                    task_prompt=task_prompt,
+                    runtime=runtime,
+                    model=model,
+                    execution_profile=execution_profile,
+                    reasoning_effort=reasoning_effort,
+                    base_sha=base_sha,
+                    setup_script=setup_script,
+                    environment_binding_id=binding_id,
+                    plugins=plugins,
+                    metadata=metadata,
+                    mcp_bindings=mcp_bindings,
+                    skills=skills,
                     attachments=attachments,
+                    goal=goal,
+                    client_request_id=client_request_id,
+                    client_request_fingerprint=client_request_fingerprint,
+                    ssh_server_ids=ssh_server_ids,
                 )
-                row = await conn.fetchrow(f"{JOB_SELECT} WHERE j.id = $1", job_id)
-                await conn.execute(
-                    """
-                    INSERT INTO agent_thread_messages (thread_id, job_id, role, content)
-                    VALUES ($1, $2, 'user', $3)
-                    """,
-                    thread_id,
-                    job_id,
-                    task_prompt,
-                )
-                if goal is not None:
-                    # A conversation created with a goal already owes a
-                    # decision, and it is recorded in the transaction that
-                    # created it: the first turn does the work, and this
-                    # obligation is what queues the round after it. Without it
-                    # the goal would wait for a finish that owes it nothing,
-                    # and the only repair would be the recovery sweep.
-                    await arm_goal_wakeup(
-                        conn,
-                        thread_id=thread_id,
-                        trigger="owner",
-                        trigger_ref="set:1",
-                    )
         except asyncpg.UniqueViolationError as exc:
-            # Two sends of one submission racing: the loser reads the winner.
-            if exc.constraint_name != "uq_agent_jobs_client_request":
-                raise
-            # The violated constraint is on client_request_id, so the winner has one.
-            assert client_request_id is not None
+            return await self._replay_lost_race(
+                exc,
+                user_id=user_id,
+                client_request_id=client_request_id,
+                client_request_fingerprint=client_request_fingerprint,
+            )
+        result = job_row_to_dict(row)
+        result["title"] = fallback_title(task_prompt)
+        result["title_source"] = "fallback"
+        return result
+
+    async def create_workspace_chat(
+        self,
+        *,
+        source_job_id: str,
+        user_id: str,
+        task_prompt: str,
+        model: str,
+        reasoning_effort: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        mcp_bindings: list[dict[str, Any]] | None = None,
+        skills: list[dict[str, Any]] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+        goal: GoalInput | None = None,
+        client_request_id: str | None = None,
+        client_request_fingerprint: str | None = None,
+        ssh_server_ids: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Create a conversation inside the workspace ``source_job_id``'s chat uses.
+
+        The new chat is a member of that chat's sandbox group from the start:
+        it shares the one container and ``/workspace``, and its first turn
+        starts a new native session there. Nothing of the source's history is
+        copied; that is Fork. What belongs to the workspace is inherited —
+        repository, base, runtime, profile, environment, setup and plugins — and
+        what belongs to the conversation is this request's: the message, model,
+        effort, tools, SSH servers, skills, uploads and goal.
+
+        Answers ``None`` when the owner has no such chat, and
+        ``{"error": reason}`` when its workspace cannot take another chat now:
+
+        - ``session_archived``: the source chat is archived;
+        - ``workspace_unavailable``: it has no retained workspace, or that
+          workspace is lost, being deleted or stopped by an administrator;
+        - ``workspace_not_ready``: the source's first turn has not created the
+          workspace yet or is still preparing it, or only a checkpoint holds it;
+        - ``workspace_chat_unavailable``: its host cannot start a chat there;
+        - ``resource_admission_blocked``: its host takes no new work now;
+        - ``resident_capacity_exhausted``: every resident slot is taken.
+
+        ``WORKSPACE_CHAT_CAPABLE`` is the same decision for the page to read.
+        Idempotency works as for :meth:`create_job`.
+        """
+        check_client_request(client_request_id, client_request_fingerprint)
+        if client_request_id is not None:
             replayed = await self.replayed_submission(
                 user_id=user_id,
                 client_request_id=client_request_id,
                 fingerprint=client_request_fingerprint,
             )
-            assert replayed is not None
-            return replayed
+            if replayed is not None:
+                return replayed
+        job_id = new_job_id()
+        thread_id = new_thread_id()
+        try:
+            async with self._pool.acquire() as conn, conn.transaction():
+                # The order a Fork takes: policy and topology, the source
+                # conversation, its membership, then the group.
+                await lock_compute_entry(conn)
+                source_thread_id = await conn.fetchval(
+                    "SELECT thread_id FROM agent_jobs WHERE id = $1 AND user_id = $2",
+                    source_job_id,
+                    user_id,
+                )
+                source = await conn.fetchrow(
+                    """
+                    SELECT id, repo, setup_script, execution_profile, plugins,
+                           environment_binding_id, archived_at
+                    FROM agent_threads
+                    WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+                    FOR UPDATE
+                    """,
+                    source_thread_id,
+                    user_id,
+                )
+                if source is None:
+                    return None
+                if source["archived_at"] is not None:
+                    return {"error": "session_archived"}
+                await conn.fetchval(
+                    "SELECT thread_id FROM agent_thread_sandbox_memberships "
+                    "WHERE thread_id = $1 FOR UPDATE",
+                    source["id"],
+                )
+                group = await conn.fetchrow(
+                    """
+                    SELECT g.*,
+                           EXISTS (
+                               SELECT 1 FROM agent_thread_sandbox_memberships origin
+                               WHERE origin.thread_id = g.origin_thread_id
+                                 AND origin.sandbox_id = g.id
+                                 AND origin.last_settled_job_id IS NOT NULL
+                           ) AS prepared,
+                           EXISTS (
+                               SELECT 1 FROM agent_runner_hosts h
+                               WHERE h.host = g.host AND h.status = 'online'
+                                 AND h.capabilities @> $2::jsonb
+                           ) AS host_capable
+                    FROM agent_thread_sandbox_memberships m
+                    JOIN agent_sandboxes g ON g.id = m.sandbox_id
+                    WHERE m.thread_id = $1
+                    FOR UPDATE OF g
+                    """,
+                    source["id"],
+                    WORKSPACE_CHAT_CAPABILITY_JSON,
+                )
+                if group is None and await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM agent_jobs WHERE thread_id = $1 "
+                    "AND state IN ('queued', 'running'))",
+                    source["id"],
+                ):
+                    # Its first turn has not reached the sandbox it will create.
+                    return {"error": "workspace_not_ready"}
+                if (
+                    group is None
+                    or group["state"] in {"lost", "stopped_dirty"}
+                    or group["stop_requested_at"] is not None
+                    or group["deletion_state"] in {"pending", "archived", "deleted"}
+                ):
+                    return {"error": "workspace_unavailable"}
+                if (
+                    group["state"] not in {"starting", "running", "stopped"}
+                    or not group["container_id"]
+                    # Only the chat that created the group prepares it, on its
+                    # first turn, and a retry of that turn prepares it again.
+                    # A member admitted before it settles would see its files
+                    # reset under it.
+                    or not group["prepared"]
+                ):
+                    return {"error": "workspace_not_ready"}
+                if not group["host_capable"]:
+                    return {"error": "workspace_chat_unavailable"}
+                may_add, _ = await host_compute_admission(conn, str(group["host"]))
+                if not may_add:
+                    return {"error": "resource_admission_blocked"}
+                slot = await allocate_resident_slot(
+                    conn,
+                    sandbox_id=str(group["id"]),
+                    capacity=int(group["resident_slot_capacity"]),
+                )
+                if slot is None:
+                    return {"error": "resident_capacity_exhausted"}
+                # The workspace's tree, as the source's next turn would see it:
+                # the branch the platform last published, or the base it began on.
+                tip = await conn.fetchrow(
+                    "SELECT base_sha, published_commit_sha FROM agent_jobs "
+                    "WHERE thread_id = $1 ORDER BY turn_no DESC LIMIT 1",
+                    source["id"],
+                )
+                row = await _insert_conversation(
+                    conn,
+                    job_id=job_id,
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    repo=source["repo"],
+                    task_prompt=task_prompt,
+                    runtime=str(group["runtime_id"]),
+                    model=model,
+                    execution_profile=str(source["execution_profile"]),
+                    reasoning_effort=reasoning_effort,
+                    base_sha=(
+                        None if tip is None else tip["published_commit_sha"] or tip["base_sha"]
+                    ),
+                    setup_script=source["setup_script"],
+                    environment_binding_id=source["environment_binding_id"],
+                    plugins=load_json(source["plugins"]) or [],
+                    metadata=metadata,
+                    mcp_bindings=mcp_bindings,
+                    skills=skills,
+                    attachments=attachments,
+                    goal=goal,
+                    client_request_id=client_request_id,
+                    client_request_fingerprint=client_request_fingerprint,
+                    ssh_server_ids=ssh_server_ids,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO agent_thread_sandbox_memberships (
+                        thread_id, user_id, sandbox_id, resident_slot_id
+                    ) VALUES ($1, $2, $3, $4)
+                    """,
+                    thread_id,
+                    user_id,
+                    group["id"],
+                    slot,
+                )
+        except asyncpg.UniqueViolationError as exc:
+            return await self._replay_lost_race(
+                exc,
+                user_id=user_id,
+                client_request_id=client_request_id,
+                client_request_fingerprint=client_request_fingerprint,
+            )
         result = job_row_to_dict(row)
         result["title"] = fallback_title(task_prompt)
         result["title_source"] = "fallback"
         return result
+
+    async def _replay_lost_race(
+        self,
+        exc: asyncpg.UniqueViolationError,
+        *,
+        user_id: str,
+        client_request_id: str | None,
+        client_request_fingerprint: str | None,
+    ) -> dict[str, Any]:
+        """Two sends of one submission racing: the loser reads the winner."""
+        if exc.constraint_name != "uq_agent_jobs_client_request":
+            raise exc
+        # The violated constraint is on client_request_id, so the winner has one.
+        assert client_request_id is not None
+        replayed = await self.replayed_submission(
+            user_id=user_id,
+            client_request_id=client_request_id,
+            fingerprint=client_request_fingerprint,
+        )
+        assert replayed is not None
+        return replayed
 
     async def create_follow_up(
         self,
@@ -959,6 +1086,155 @@ class PostgresConversationCommands:
                 client_request_id=client_request_id,
                 client_request_fingerprint=client_request_fingerprint,
             )
+
+
+async def _insert_conversation(
+    conn: Any,
+    *,
+    job_id: str,
+    thread_id: str,
+    user_id: str,
+    repo: str | None,
+    task_prompt: str,
+    runtime: str,
+    model: str,
+    execution_profile: str,
+    reasoning_effort: str | None,
+    base_sha: str | None,
+    setup_script: str | None,
+    environment_binding_id: str | None,
+    plugins: list[dict[str, Any]] | None,
+    metadata: dict[str, Any] | None,
+    mcp_bindings: list[dict[str, Any]] | None,
+    skills: list[dict[str, Any]] | None,
+    attachments: list[dict[str, Any]] | None,
+    goal: GoalInput | None,
+    client_request_id: str | None,
+    client_request_fingerprint: str | None,
+    ssh_server_ids: list[str] | None,
+) -> Any:
+    """Write a new conversation and its first turn inside the caller's transaction.
+
+    Shared by a conversation in a workspace of its own (:meth:`create_job`) and
+    one created into an existing workspace (:meth:`create_workspace_chat`): the
+    thread, its tools, the first turn and its message are the same rows either
+    way. Returns the first turn's row.
+    """
+    # How many person-authored messages this conversation has accepted. The
+    # first one is the task itself, so a conversation created with a goal
+    # starts at one and one created with a plain task starts at zero; the
+    # first turn stamps whatever this is, and the goal's completion check
+    # compares against it.
+    user_input_seq = 1 if goal is not None else 0
+    # What every turn of this conversation shares is written once,
+    # here, on the thread; the turns below carry only their own.
+    await conn.execute(
+        """
+        INSERT INTO agent_threads
+            (id, user_id, repo, title, title_source,
+             setup_script, execution_profile,
+             goal_id, goal_objective, goal_state, goal_max_rounds,
+             goal_revision, goal_created_at, goal_updated_at,
+             user_input_seq, plugins)
+        VALUES ($1, $2, $3, $4, 'fallback', $5, $6,
+                CASE WHEN $7::text IS NULL THEN NULL ELSE $9 END,
+                $7, CASE WHEN $7::text IS NULL THEN NULL ELSE 'active' END,
+                $8,
+                CASE WHEN $7::text IS NULL THEN 0 ELSE 1 END,
+                CASE WHEN $7::text IS NULL THEN NULL ELSE NOW() END,
+                CASE WHEN $7::text IS NULL THEN NULL ELSE NOW() END,
+                -- The same counter the first turn below stamps
+                -- itself with: a thread that says one while its own
+                -- first turn says zero makes that turn look older
+                -- than the message that created it.
+                $10, $11::jsonb)
+        """,
+        thread_id,
+        user_id,
+        repo,
+        fallback_title(task_prompt),
+        setup_script,
+        execution_profile,
+        goal.objective if goal is not None else None,
+        goal.max_rounds if goal is not None else None,
+        new_goal_id(),
+        user_input_seq,
+        json.dumps(plugins or []),
+    )
+    if environment_binding_id is not None:
+        await conn.execute(
+            "UPDATE agent_threads SET environment_binding_id=$2 WHERE id=$1",
+            thread_id,
+            environment_binding_id,
+        )
+    await write_mcp_bindings(conn, thread_id=thread_id, bindings=mcp_bindings)
+    if ssh_server_ids:
+        await enable_ssh_servers(
+            conn, user_id=user_id, thread_id=thread_id, server_ids=ssh_server_ids
+        )
+    await conn.execute(
+        """
+        INSERT INTO agent_jobs
+            (id, thread_id, turn_no, user_id, base_sha, task_prompt,
+             runtime, model, reasoning_effort, metadata,
+             client_request_id, client_request_fingerprint, skills,
+             attachments, input_seq_at_create)
+        VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12::jsonb,
+                $13::jsonb, $14)
+        """,
+        job_id,
+        thread_id,
+        user_id,
+        base_sha,
+        task_prompt,
+        runtime,
+        model,
+        reasoning_effort,
+        json.dumps(metadata) if metadata is not None else None,
+        client_request_id,
+        client_request_fingerprint,
+        # No earlier skill instructions exist in a new conversation.
+        # An empty selection needs no clearing context in its prompt.
+        json.dumps(skills) if skills else None,
+        json.dumps(attachments) if attachments else None,
+        # The conversation's counter as this first turn saw it. Zero
+        # here while the thread says one would make the very first
+        # turn look older than its own message: a completion it
+        # reported would be refused as "the owner has spoken since",
+        # and no goal on a fresh conversation could ever complete.
+        user_input_seq,
+    )
+    await claim_attachments(
+        conn,
+        user_id=user_id,
+        job_id=job_id,
+        thread_id=thread_id,
+        attachments=attachments,
+    )
+    row = await conn.fetchrow(f"{JOB_SELECT} WHERE j.id = $1", job_id)
+    await conn.execute(
+        """
+        INSERT INTO agent_thread_messages (thread_id, job_id, role, content)
+        VALUES ($1, $2, 'user', $3)
+        """,
+        thread_id,
+        job_id,
+        task_prompt,
+    )
+    if goal is not None:
+        # A conversation created with a goal already owes a
+        # decision, and it is recorded in the transaction that
+        # created it: the first turn does the work, and this
+        # obligation is what queues the round after it. Without it
+        # the goal would wait for a finish that owes it nothing,
+        # and the only repair would be the recovery sweep.
+        await arm_goal_wakeup(
+            conn,
+            thread_id=thread_id,
+            trigger="owner",
+            trigger_ref="set:1",
+        )
+    return row
 
 
 async def insert_follow_up(

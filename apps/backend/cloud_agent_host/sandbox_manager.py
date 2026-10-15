@@ -561,6 +561,10 @@ class SharedSandboxAcquireRequest(SharedSandboxIdentityRequest):
     owner: str = Field(..., min_length=1, max_length=256)
     activation_generation: int = Field(..., ge=1)
     has_settled_context: bool = False
+    #: The addressed chat was created into this existing group: it is not the
+    #: origin and starts its first native session here. See
+    #: ``SharedSessionSupervisor.acquire``.
+    joins_workspace: bool = False
     #: An installation snapshot a new group may start from; ignored for a
     #: group that already has a container here.
     environment_snapshot: EnvironmentSnapshotRef | None = None
@@ -2750,6 +2754,7 @@ def create_app(
                     if body.environment_snapshot is not None
                     else {}
                 ),
+                **({"joins_workspace": True} if body.joins_workspace else {}),
             )
         except (SandboxError, ValueError) as exc:
             raise supervisor_error(exc) from exc

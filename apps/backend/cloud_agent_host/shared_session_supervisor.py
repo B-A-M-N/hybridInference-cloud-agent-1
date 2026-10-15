@@ -1775,6 +1775,7 @@ class SharedChatSessionSupervisor:
         start_seq: int | None = None,
         restore: CheckpointRestore | None = None,
         environment_snapshot: EnvironmentSnapshotRef | None = None,
+        joining_thread_id: str | None = None,
     ) -> builtins.list[SharedSessionDescriptor]:
         """Install the control plane's authoritative member aliases.
 
@@ -1783,9 +1784,15 @@ class SharedChatSessionSupervisor:
         ``restore``, its checkpoint, and never empty. A new group with an
         ``environment_snapshot`` starts from it when it can, and from the
         sandbox image otherwise.
+
+        ``joining_thread_id`` names a chat created into this existing group,
+        installed although it has no native session yet. Its group already
+        has a container: one is never created for it.
         """
         if not members:
             raise ValueError("a shared sandbox manifest cannot be empty")
+        if joining_thread_id is not None and not expected_container_id and restore is None:
+            raise SandboxError("a chat joining a workspace needs that workspace's container")
         seen_slots: set[int] = set()
         # The validation pass rejects a manifest with no resident slot before
         # anything is mutated, so the install pass below reads the slot from
@@ -1830,6 +1837,7 @@ class SharedChatSessionSupervisor:
                     members,
                     validated_members,
                     expected_container_id=expected_container_id,
+                    joining_thread_id=joining_thread_id,
                 )
             if not expected_container_id and restore is None and spec.generation > 1:
                 raise SandboxError(
@@ -1871,6 +1879,7 @@ class SharedChatSessionSupervisor:
                 members,
                 validated_members,
                 expected_container_id=expected_container_id,
+                joining_thread_id=joining_thread_id,
             )
 
     def _restore_group(
@@ -1996,6 +2005,7 @@ class SharedChatSessionSupervisor:
         validated_members: builtins.list[tuple[SharedMemberManifest, int]],
         *,
         expected_container_id: str | None,
+        joining_thread_id: str | None = None,
     ) -> builtins.list[SharedSessionDescriptor]:
         """Apply one validated manifest to its registered group, under the lock."""
         if group.spec != spec:
@@ -2012,10 +2022,15 @@ class SharedChatSessionSupervisor:
             other_group = self._members.get(manifest.thread_id)
             if other_group is not None and other_group is not group:
                 raise SandboxError("chat membership points at two sandbox groups")
-            if manifest.thread_id != spec.thread_id and manifest.native_session_id is None:
+            if (
+                manifest.thread_id != spec.thread_id
+                and manifest.native_session_id is None
+                and manifest.thread_id != joining_thread_id
+            ):
                 # Fork reserves a database membership before creating its
-                # native child. Only the origin can start without native
-                # context; installing the reservation here would make
+                # native child. Only the origin, and a chat joining the
+                # workspace for the turn it is acquired for, can start without
+                # native context; installing the reservation here would make
                 # fork_native reject its own target as already occupied.
                 # A stale pending manifest must also preserve a child the
                 # host has materialized but the database has not finalized.
@@ -2139,8 +2154,25 @@ class SharedChatSessionSupervisor:
         start_seq: int | None = None,
         restore: CheckpointRestore | None = None,
         environment_snapshot: EnvironmentSnapshotRef | None = None,
+        joins_workspace: bool = False,
     ) -> SharedSessionLease:
-        """Start one group if needed and lease only the addressed member."""
+        """Start one group if needed and lease only the addressed member.
+
+        ``joins_workspace`` leases a chat created into this existing group for
+        its first turn: not the origin, with no native session and no settled
+        turn. It gets its own new session in the container the group already
+        has; the workspace is the runner's to leave alone.
+        """
+        if joins_workspace:
+            joining = next((item for item in manifest if item.thread_id == thread_id), None)
+            if (
+                joining is None
+                or thread_id == spec.thread_id
+                or joining.native_session_id is not None
+                or joining.last_settled_job_id is not None
+                or has_settled_context
+            ):
+                raise ValueError("only a new non-origin member can join a shared workspace")
         # Container actions are always reported: they are a couple of string
         # assignments, and the runner needs them whenever it is profiling.
         # Durations are collected only for a selection this process can honour:
@@ -2157,6 +2189,7 @@ class SharedChatSessionSupervisor:
             start_seq=start_seq,
             restore=restore,
             environment_snapshot=environment_snapshot,
+            joining_thread_id=thread_id if joins_workspace else None,
         )
         with self._lock:
             group, member = self._member(thread_id)

@@ -189,6 +189,7 @@ from cloud_agent_shared.shared_protocol import (
     SHARED_SANDBOX_CAPABILITY,
     SHARED_SANDBOX_HELPER_PINS,
     SHARED_SANDBOX_RUNTIME_PINS,
+    WORKSPACE_CHAT_CAPABILITY,
     mid_turn_input_capability,
     shared_deployment_capability,
 )
@@ -1240,6 +1241,10 @@ def _shared_live_host_capabilities(
         # ... and recreates a group another host left behind from its
         # checkpoint, so a claim may hand this replica a cold group.
         SANDBOX_RESTORE_CAPABILITY,
+        # A chat created into an existing workspace starts its first session
+        # there without preparing the workspace again (``joining`` below), and
+        # the same-deployment sandbox manager admits such a member.
+        WORKSPACE_CHAT_CAPABILITY,
     ]
     deployment_sha = (os.environ.get("AGENT_DEPLOYMENT_SHA") or "").strip()
     ready_file = _shared_live_ready_file()
@@ -2376,6 +2381,11 @@ def _run_shared_live_attempt(
         finish_attempt("failed", "the control plane moved this chat without its checkpoint")
         return 2
     has_context = bool(reservation.get("last_settled_job_id"))
+    # A chat created into a workspace another chat prepared: its first turn
+    # starts a new native session in that container and prepares nothing. Only
+    # the chat that created the group ever prepares it. Resetting, cloning or
+    # running setup again would rewrite the files every other member is using.
+    joining = not has_context and spec.thread_id != job.thread_id
     native_session_id = str(reservation.get("native_session_id") or "").strip() or None
     manifest = _shared_group_manifest(reservation, thread_id=job.thread_id)
     supervisor: SessionSupervisorClient | None = None
@@ -2466,7 +2476,7 @@ def _run_shared_live_attempt(
         return True
 
     try:
-        if not has_context:
+        if not has_context and not joining:
             # Clone into a host-local temporary archive while the activation
             # below creates and boots the guest. This cannot mutate the
             # sandbox whose durable initial marker still has to be probed. If
@@ -2483,7 +2493,12 @@ def _run_shared_live_attempt(
             job,
             spec,
             source,
-            new_group=not has_context and restore is None and not reservation.get("container_id"),
+            new_group=(
+                not has_context
+                and not joining
+                and restore is None
+                and not reservation.get("container_id")
+            ),
         )
         supervisor = _session_supervisor_from_env()
         try:
@@ -2499,6 +2514,7 @@ def _run_shared_live_attempt(
                 activation_generation=activation_generation,
                 owner=f"attempt:{job.attempt_id}",
                 has_settled_context=has_context,
+                joins_workspace=joining,
                 members=manifest,
                 expected_container_id=reservation.get("container_id"),
                 profiling=operation_profiling.measurement_context(measurement, acquire_call),
@@ -2580,7 +2596,7 @@ def _run_shared_live_attempt(
 
         imported_base: str | None = None
         recovered_initial = False
-        if not has_context:
+        if not has_context and not joining:
             # A previous activation may have committed the immutable S3
             # baseline and then died before returning its receipt. Resolve
             # that durable marker before reset, setup, permissions, or uploads
@@ -2615,7 +2631,7 @@ def _run_shared_live_attempt(
                 source.discard()
                 source = None
 
-        if not has_context:
+        if not has_context and not joining:
             if not recovered_initial:
                 # The marker probe above proved there is no prepared baseline.
                 # Only now may the prefetched source mutate the sandbox.
@@ -2664,8 +2680,10 @@ def _run_shared_live_attempt(
                 stage = _stage(measurement, "workspace_permissions")
                 manager.prepare_shared_workspace(spec)
         else:
+            # A follow-up resumes its session; a joining chat has none yet. Both
+            # take the workspace as the group left it.
             stage = _stage(measurement, "native_workspace_resume")
-            if not native_session_id:
+            if has_context and not native_session_id:
                 context_invalid = True
                 raise SandboxError("shared chat has no native Agent CLI session locator")
             if not _resident_base_ready(CHAT_WORKDIR, job, retained):
@@ -2700,8 +2718,9 @@ def _run_shared_live_attempt(
             # A recovered baseline belongs to the same retained container, so
             # its earlier thread uploads are already present. A replacement
             # first-turn job can still add files of its own and must import the
-            # thread's current attachment set before prompt admission.
-            fresh_container=not has_context and not recovered_initial,
+            # thread's current attachment set before prompt admission. A joining
+            # chat's container is not fresh: its own files arrive with its turn.
+            fresh_container=not has_context and not recovered_initial and not joining,
         )
         if imported_uploads:
             control.append_event(
@@ -2714,7 +2733,7 @@ def _run_shared_live_attempt(
                     },
                 )
             )
-        if not has_context and not recovered_initial:
+        if not has_context and not recovered_initial and not joining:
             # Source, setup, permissions, and uploaded files are complete, and
             # no resident CLI or prompt exists yet. Capture this point-in-time
             # boundary before admitting either. The sandbox manager owns S3 access; the
@@ -2770,6 +2789,8 @@ def _run_shared_live_attempt(
                     # Nothing was cloned: the tree is the one empty commit, and
                     # the owner is told so instead of "repository ready".
                     **({"temporary": True} if job.repo is None else {}),
+                    # Another chat's workspace, taken as that chat left it.
+                    **({"joined": True} if joining else {}),
                 },
             )
         )
@@ -2922,7 +2943,9 @@ def _run_shared_live_attempt(
                 process_generation=process_generation,
                 container_id=str(lease["container_id"]),
                 workspace_action=(
-                    "prepare" if not has_context else ("base_import" if imported_base else "reuse")
+                    "prepare"
+                    if not has_context and not joining
+                    else ("base_import" if imported_base else "reuse")
                 ),
             )
         control.record_chat_process(

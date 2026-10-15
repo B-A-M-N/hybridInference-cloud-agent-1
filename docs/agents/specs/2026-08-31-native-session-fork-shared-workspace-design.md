@@ -50,7 +50,8 @@ The required invariants are:
 3. A healthy, active member has its own supervisor-owned Agent CLI process.
    A settled turn leaves that process alive for the next message.
 4. Fork creates another chat, native session, resident slot, and process in
-   the same group. It does not copy the container or repository.
+   the same group. It does not copy the container or repository. A chat can
+   also be created into the group with no history at all (§4a).
 5. Parent and child may run turns simultaneously against the same workspace.
    There is no group-wide turn lock.
 6. Each member admits at most one unresolved turn into its own session.
@@ -232,6 +233,62 @@ nearest preceding forkable assistant boundary, skipping failed or unsettled
 turns; the child opens with only that prefix, and the selected user prompt is
 placed in the child composer as a one-shot draft. Submitting the edit is a new
 native turn; the original prompt is never replayed automatically.
+
+## 4a. A new chat in an existing workspace
+
+A chat can be started beside an existing one without copying anything of its
+conversation: `POST /v1/agent/jobs/{job_id}/workspace-chats` creates an
+ordinary conversation whose first turn opens a new native session in the
+group's container. This is a platform capability with no product entry yet.
+Owners are never asked to pick a "workspace" to join; the shared-team design
+decides where a new chat lands in a shared environment and calls this path
+behind that choice.
+
+```text
+chat A -> native session A -> process PA --+
+                                         +-> container C -> /workspace
+chat N -> native session N -> process PN --+   (N starts with no history)
+```
+
+What the workspace fixed is inherited from the chat it joins: repository,
+base (that chat's last published commit, or its base), runtime, execution
+profile, environment binding, setup script and plugins. What belongs to the
+conversation is the request's: the first message, model, reasoning effort, MCP
+bindings, skills, uploads and goal. The request names none of the inherited
+fields, and naming one is refused.
+
+Creation is one transaction under the order Fork takes (compute fence, source
+conversation, its membership, the group). It writes the thread and first turn
+the way a new task does, then a membership in the source's group holding a
+free resident slot (the same allocation Fork uses, including the release of a
+stopped deleted member's slot) and no native session. Nothing is started; the
+first turn does that. The group must be one a turn can be claimed into —
+`starting`, `running` or `stopped`, with a container, no administrative stop or
+deletion — and its host must advertise `workspace-chat-v1`.
+
+**Only the origin prepares a group.** A first turn of the chat that created the
+group resets the unsettled workspace, imports the source, runs setup, fixes
+permissions and captures the initial archive, and a retry of that turn does it
+again. A joining chat's first turn would otherwise take the same path, because
+it too has no settled turn. Three fences keep it off:
+
+1. The control plane admits a joining chat only after the origin's membership
+   has a settled turn, so no preparation can follow it.
+2. The runner treats a first turn whose thread is not the group's origin as
+   *joining*: no prefetch, reset, checkout, setup, permission pass or initial
+   archive; the workspace is taken as the group left it, with the same base
+   import a follow-up does. It asks the sandbox manager for the member with
+   `joins_workspace`, records the native session the CLI reports at
+   settlement, and marks its `checked_out` lifecycle event `joined`.
+3. The claim admits a joining chat's first turn only to a replica whose own
+   attestation lists `workspace-chat-v1`. A replica of an earlier release
+   would prepare the workspace as new; it keeps claiming everything else,
+   including the joined chat's later turns.
+
+The supervisor installs a non-origin member without a native session only for
+the acquire that names it as joining; a Fork's pending child stays out of the
+manifest as before. A joining member never creates a container: with neither
+the group's container id nor a restore checkpoint the acquire is refused.
 
 ## 5. Shared workspace consequences
 
@@ -553,7 +610,9 @@ The implementation is ready only when these properties hold:
 5. Parent and child can run simultaneously and edit the same workspace without
    a group busy error or cross-routed events/cancellation.
 6. Repeated forks support multiple members within configured slot/resource
-   capacity.
+   capacity. A chat created into the workspace takes a slot the same way,
+   starts with no native history, and its first turn neither prepares nor
+   resets the workspace.
 7. Group latest activity prevents idle stop while any member/operation is
    active; either member restarts the same stopped container.
 8. Missing container/native state, mismatched image/runtime pins, ambiguous

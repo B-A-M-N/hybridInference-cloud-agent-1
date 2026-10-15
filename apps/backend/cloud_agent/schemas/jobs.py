@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cloud_agent.attachments.models import (
     AttachmentRef,  # noqa: TC001 — Pydantic resolves annotations at runtime.
@@ -270,14 +270,86 @@ class AgentJobCreate(BaseModel):
     @classmethod
     def bound_metadata(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
         """Keep caller metadata small; every turn of the conversation repeats it."""
-        if value is None:
-            return None
-        if len(value) > MAX_JOB_METADATA_KEYS:
-            raise ValueError(f"metadata may have at most {MAX_JOB_METADATA_KEYS} keys")
-        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
-        if len(encoded.encode("utf-8")) > MAX_JOB_METADATA_BYTES:
-            raise ValueError(f"metadata may be at most {MAX_JOB_METADATA_BYTES} bytes as JSON")
-        return value
+        return _bounded_metadata(value)
+
+
+def _bounded_metadata(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if len(value) > MAX_JOB_METADATA_KEYS:
+        raise ValueError(f"metadata may have at most {MAX_JOB_METADATA_KEYS} keys")
+    encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+    if len(encoded.encode("utf-8")) > MAX_JOB_METADATA_BYTES:
+        raise ValueError(f"metadata may be at most {MAX_JOB_METADATA_BYTES} bytes as JSON")
+    return value
+
+
+class AgentWorkspaceChatCreate(BaseModel):
+    """Request body for a new chat in the workspace another chat uses.
+
+    The workspace decides where the chat runs: its repository, base, runtime,
+    profile, environment and plugins are the source chat's, so none of them is
+    a field here, and naming one is refused rather than ignored. What is
+    chosen is the conversation's own — its first message, model, effort,
+    tools, skills, uploads and goal — with the same meaning as on a new task.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    task_prompt: str = Field(
+        ..., min_length=1, max_length=100_000, description="The new chat's first message."
+    )
+    model: str = Field(..., max_length=255, description="Gateway model id the runtime should use.")
+    reasoning_effort: str | None = Field(
+        None,
+        max_length=32,
+        description="As on a new task: null is Auto, a value must be offered for the model.",
+    )
+    skill_ids: list[Annotated[int, Field(gt=0, strict=True)]] | None = Field(
+        None,
+        max_length=16,
+        description="Owned skills for this chat. Omitted uses library defaults; [] selects none.",
+    )
+    mcp_bindings: list[McpBindingInput] | None = Field(
+        None,
+        max_length=16,
+        description="MCP connections this chat may use. Omitted means none.",
+    )
+    ssh_server_ids: list[Annotated[str, Field(pattern=_UUID_PATTERN)]] | None = Field(
+        None,
+        max_length=1024,
+        description=(
+            "SSH servers this chat can reach: the owner's servers that passed their check. "
+            "Omitted means none."
+        ),
+    )
+    attachment_ids: list[Annotated[int, Field(gt=0, strict=True)]] | None = Field(
+        None,
+        max_length=50,
+        description="Staged uploads to place under /uploads in the shared sandbox.",
+    )
+    goal: GoalInput | None = Field(
+        None, description="A completion condition for the new chat, as on a new task."
+    )
+    metadata: dict[str, Any] | None = Field(
+        None,
+        description=(
+            f"Opaque caller metadata: at most {MAX_JOB_METADATA_KEYS} keys and "
+            f"{MAX_JOB_METADATA_BYTES // 1024} KiB as JSON."
+        ),
+    )
+
+    @field_validator("task_prompt")
+    @classmethod
+    def validate_task_prompt(cls, value: str) -> str:
+        """Reject a visually empty message and persist the user's trimmed text."""
+        return _visible_prompt(value)
+
+    @field_validator("metadata")
+    @classmethod
+    def bound_metadata(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Keep caller metadata small, as on a new task."""
+        return _bounded_metadata(value)
 
 
 class AgentJobResponse(BaseModel):
@@ -383,6 +455,15 @@ class AgentJobResponse(BaseModel):
     native_state: Literal["new", "ready", "fork_preparing", "lost"] | None = None
     fork_anchor_job_id: str | None = None
     native_fork_available: bool = False
+    workspace_chat_available: bool = Field(
+        False,
+        description=(
+            "Whether a new chat can be started in this chat's workspace now "
+            "(POST /jobs/{job_id}/workspace-chats): it shares the container and "
+            "files and starts with no history. A free resident slot is checked "
+            "only when the chat is created."
+        ),
+    )
     mid_turn_input_supported: bool = Field(
         False,
         description=(

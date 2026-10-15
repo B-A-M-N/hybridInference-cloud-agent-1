@@ -1744,6 +1744,23 @@ advertise it from the exact process that claims the job. A host's limit is at
 least two, because a fork's sibling runs beside its parent; `AGENT_HOST_SLOTS`
 (default three) is that limit until an admin sets one on the Servers page.
 
+#### New chats in an existing workspace
+
+`POST /v1/agent/jobs/{job_id}/workspace-chats` adds a member with no history to
+a retained group; its first turn opens a new native session in the group's
+container and prepares nothing
+([design](../agents/specs/2026-08-31-native-session-fork-shared-workspace-design.md#4a-a-new-chat-in-an-existing-workspace)).
+The web app has no entry for it yet. It is accepted once the group's first turn
+has settled and its host advertises `workspace-chat-v1`, which job responses
+report as `workspace_chat_available`. During a rolling deployment that first turn
+waits in the queue until a replica of this release claims it: the claim checks
+the polling replica's own attestation, because an earlier runner would prepare
+the workspace as new and reset its files. Later turns of the chat, and every
+other turn, are claimed as before. A group's slot capacity
+(`shared_resident_capacity`, default eight) counts these chats as it counts
+Fork children; a full group refuses the next one with
+`resident_capacity_exhausted`.
+
 #### Fork compatibility and turn ordering
 
 Historical Fork additionally requires `native-fork-at-anchor-v1`, and for the

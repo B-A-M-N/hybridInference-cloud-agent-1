@@ -66,6 +66,33 @@ class ConversationCommands(Protocol):
         """
         ...
 
+    async def create_workspace_chat(
+        self,
+        *,
+        source_job_id: str,
+        user_id: str,
+        task_prompt: str,
+        model: str,
+        reasoning_effort: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        mcp_bindings: list[dict[str, Any]] | None = None,
+        skills: list[dict[str, Any]] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+        goal: GoalInput | None = None,
+        client_request_id: str | None = None,
+        client_request_fingerprint: str | None = None,
+        ssh_server_ids: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Create a conversation inside the workspace ``source_job_id``'s chat uses.
+
+        It shares that chat's container and ``/workspace`` and starts with no
+        history; its first turn opens a new native session there. ``None``
+        when the owner has no such chat; ``{"error": reason}`` when the
+        workspace cannot take another chat now. Idempotency works as for
+        :meth:`create_job`.
+        """
+        ...
+
     async def create_follow_up(
         self,
         *,

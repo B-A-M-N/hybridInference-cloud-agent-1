@@ -16,9 +16,11 @@ from cloud_agent_shared.shared_protocol import (
     MID_TURN_INPUT_CAPABILITY_PREFIX,
     NATIVE_FORK_AT_ANCHOR_CAPABILITY,
     SHARED_SANDBOX_HELPER_PINS,
+    WORKSPACE_CHAT_CAPABILITY,
 )
 
 NATIVE_FORK_CAPABILITY_JSON = json.dumps([NATIVE_FORK_AT_ANCHOR_CAPABILITY], separators=(",", ":"))
+WORKSPACE_CHAT_CAPABILITY_JSON = json.dumps([WORKSPACE_CHAT_CAPABILITY], separators=(",", ":"))
 
 # Host ``h`` ships the exact Agent CLI version group ``g``'s container runs:
 # the version its drivers were built and tested against. A release that only
@@ -47,6 +49,32 @@ NATIVE_FORK_CAPABLE = f"""EXISTS (
               AND {HOST_SHIPS_GROUP_CLI}
           )
       )
+)"""
+
+# Whether a new chat can be created into group ``g`` now. Its host starts a
+# chat's first session in a container another chat prepared, and that
+# preparation is over: the chat that created the group has settled a turn, so
+# it never prepares (and resets) the workspace again. The group must also be one
+# a turn can be claimed into — its container exists, and nothing is stopping,
+# deleting or moving it. ``create_workspace_chat`` refuses each of these with
+# its own reason; this is the same answer for the page to read.
+WORKSPACE_CHAT_CAPABLE = f"""(
+    g.state IN ('starting', 'running', 'stopped')
+    AND g.container_id IS NOT NULL
+    AND g.stop_requested_at IS NULL
+    AND g.deletion_state NOT IN ('pending', 'archived', 'deleted')
+    AND EXISTS (
+        SELECT 1 FROM agent_thread_sandbox_memberships origin
+        WHERE origin.thread_id = g.origin_thread_id
+          AND origin.sandbox_id = g.id
+          AND origin.last_settled_job_id IS NOT NULL
+    )
+    AND EXISTS (
+        SELECT 1 FROM agent_runner_hosts h
+        WHERE h.host = g.host
+          AND h.status = 'online'
+          AND h.capabilities @> '{WORKSPACE_CHAT_CAPABILITY_JSON}'::jsonb
+    )
 )"""
 
 # Every runnable chat is a member of a retained shared-live group: one
@@ -122,6 +150,7 @@ THREAD_SANDBOX_SOURCE = f"""
         ) AS workspace_unpublished_changes,
         g.workspace_epoch,
         {NATIVE_FORK_CAPABLE} AS native_fork_capable,
+        {WORKSPACE_CHAT_CAPABLE} AS workspace_chat_capable,
         -- The host holding this group can hand a message to a running turn of
         -- the group's runtime: its sandbox_manager and driver say so, per runtime, and
         -- the driver speaks the CLI version this container runs. No helper in
@@ -259,3 +288,57 @@ async def release_failed_restore(conn: Any, attempt_id: int, detail: str) -> str
         attempt_id,
         detail,
     )
+
+
+async def allocate_resident_slot(conn: Any, *, sandbox_id: str, capacity: int) -> int | None:
+    """Choose a free resident slot in a group the caller holds locked.
+
+    For a new member of an existing group: a Fork's child or a chat created
+    into the workspace. Returns ``None`` when every slot is taken. The caller
+    holds the group row, so two new members cannot be handed the same slot.
+
+    A deleted chat keeps its membership as an audit row, so without the
+    release below its slot stays occupied forever. The slot is a fixed member
+    UID: it may serve a new member only once the old member can no longer act.
+    Stopped/lost is the durable observation that its process is gone, and
+    nothing restarts a deleted chat; a released residency means no grant still
+    speaks for it. SKIP LOCKED keeps this transaction, which already holds the
+    sandbox row, from waiting on a membership and inverting the membership ->
+    sandbox order every other writer takes. A member skipped now is reclaimed
+    by a later allocation.
+    """
+    await conn.execute(
+        """
+        UPDATE agent_thread_sandbox_memberships
+        SET resident_slot_id = NULL, updated_at = NOW()
+        WHERE thread_id IN (
+            SELECT m.thread_id
+            FROM agent_thread_sandbox_memberships m
+            JOIN agent_threads t ON t.id = m.thread_id
+            WHERE m.sandbox_id = $1
+              AND m.resident_slot_id IS NOT NULL
+              AND t.deleted_at IS NOT NULL
+              AND m.resident_state IN ('stopped', 'lost')
+              AND m.residency_status = 'none'
+              AND m.active_attempt_id IS NULL
+              AND m.fork_operation_id IS NULL
+            FOR UPDATE OF m SKIP LOCKED
+        )
+        """,
+        sandbox_id,
+    )
+    occupied_rows = await conn.fetch(
+        """
+        SELECT resident_slot_id AS slot
+        FROM agent_thread_sandbox_memberships
+        WHERE sandbox_id = $1 AND resident_slot_id IS NOT NULL
+        UNION ALL
+        SELECT target_resident_slot_id AS slot
+        FROM agent_session_forks
+        WHERE sandbox_id = $1 AND state IN ('preparing', 'materialized')
+          AND target_resident_slot_id IS NOT NULL
+        """,
+        sandbox_id,
+    )
+    occupied = {int(item["slot"]) for item in occupied_rows}
+    return next((slot for slot in range(capacity) if slot not in occupied), None)

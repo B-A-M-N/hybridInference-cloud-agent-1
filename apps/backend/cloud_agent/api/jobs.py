@@ -37,6 +37,7 @@ from cloud_agent.api.deps import (
 )
 from cloud_agent.application.job_admission import _create_job_as
 from cloud_agent.application.pending_messages import settle_queue_when_possible
+from cloud_agent.application.workspace_chats import create_workspace_chat_as
 from cloud_agent.domain.execution import TERMINAL_STATES
 from cloud_agent.entitlement import REPO_PATTERN
 from cloud_agent.goals.models import GoalConflict
@@ -52,6 +53,7 @@ from cloud_agent.schemas import (
     AgentThreadPublicationResponse,
     AgentThreadRenameRequest,
     AgentThreadRenameResponse,
+    AgentWorkspaceChatCreate,
     GoalClearedResponse,
     GoalRequest,
     GoalResponse,
@@ -170,6 +172,37 @@ async def create_agent_job(
         body,
         user,
         job_store=job_store,
+        app_credentials=app_credentials,
+        gateway=gateway,
+        client_request_id=idempotency_key,
+    )
+    return _job_response(job)
+
+
+@router.post("/jobs/{job_id}/workspace-chats", response_model=AgentJobResponse, status_code=201)
+async def create_workspace_chat(
+    job_id: str,
+    body: AgentWorkspaceChatCreate,
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key", max_length=256),
+    user: dict[str, Any] = Depends(require_agent_owner),
+    store: _JobsStorage | None = Depends(get_storage),
+    app_credentials: Any | None = Depends(get_agent_app_credentials),
+    gateway: Any = Depends(get_gateway_client),
+) -> AgentJobResponse:
+    """Start a new chat in the workspace ``job_id``'s chat uses.
+
+    The new chat shares that chat's container and files and starts with no
+    history: its first turn opens a new Agent CLI session beside the others.
+    ``body.task_prompt`` is that first turn. An ``Idempotency-Key`` works as on
+    ``POST /jobs``.
+    """
+    job_store = _require_store(store)
+    source = await _owned_job(job_store.conversation_queries, job_id, user)
+    job = await create_workspace_chat_as(
+        source,
+        body,
+        user,
+        store=job_store,
         app_credentials=app_credentials,
         gateway=gateway,
         client_request_id=idempotency_key,

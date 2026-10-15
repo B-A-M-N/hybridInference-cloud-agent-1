@@ -115,6 +115,7 @@ from cloud_agent.schemas.jobs import (
     AgentJobCreate,
     AgentJobListResponse,
     AgentJobResponse,
+    AgentWorkspaceChatCreate,
 )
 from cloud_agent.schemas.mcp import (
     McpBindingInput,
@@ -325,6 +326,7 @@ __all__ = [
     "AgentThreadRenameResponse",
     "AgentThreadResponse",
     "AgentThreadStatsResponse",
+    "AgentWorkspaceChatCreate",
     "AgentWorkspaceEntry",
     "AgentWorkspaceResponse",
     "AgentWorkspaceWriteRequest",

@@ -147,6 +147,13 @@ def _job_response(
         and not isinstance(job.get("native_turn_no"), bool)
         and int(job["native_turn_no"]) > 0
     )
+    # Any chat of the workspace can start another one in it, whatever its own
+    # turn is doing: the new chat runs beside it, as a Fork's child does.
+    workspace_chat_available = bool(
+        sandbox.get("shared_live") is True
+        and sandbox.get("workspace_chat_capable") is True
+        and job.get("archived_at") is None
+    )
     return AgentJobResponse(
         id=job["id"],
         thread_id=job.get("thread_id"),
@@ -215,6 +222,7 @@ def _job_response(
         native_state=sandbox.get("native_state"),
         fork_anchor_job_id=sandbox.get("fork_anchor_job_id"),
         native_fork_available=native_fork_available,
+        workspace_chat_available=workspace_chat_available,
         mid_turn_input_supported=mid_turn_input_supported(job),
         workspace_publication_state=sandbox.get("workspace_publication_state"),
         workspace_publication_unchanged=bool(sandbox.get("workspace_publication_unchanged")),

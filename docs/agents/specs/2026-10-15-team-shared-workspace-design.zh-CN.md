@@ -62,7 +62,7 @@ flowchart TD
 
 工作区页面展示成员活动、各人的 Chat、共享文件、服务和当前绑定的配置版本。“创建我的 Chat”启动新的原生 session，不复制其他人的历史或 provider home。第一版保留本人 Chat 的 Fork，跨用户 Fork 暂不开放。
 
-“创建我的 Chat”是新的 host 能力。当前一个新成员只能通过 Fork 进入已有 group；第二步需要让 supervisor 在已运行的容器里分配一个空闲 resident slot，并在不重跑 setup 的前提下启动一个全新的原生 session。
+“创建我的 Chat”所需的 host 能力已经实现（`workspace-chat-v1`，见[共享工作区设计](2026-08-31-native-session-fork-shared-workspace-design.md)第 4a 节）：在已有 group 里分配一个空闲 resident slot，第一条消息时在同一容器中启动一个全新的原生 session，不重跑 setup，也不复制任何历史。目前只有 API（`POST /v1/agent/jobs/{job_id}/workspace-chats`），没有产品入口：用户不应感知“加入某个工作区”这件事。第二步设计团队项目里“新对话”自然落入共享环境的方式，并在这条路径前加上团队成员与仓库授权检查。
 
 ## 3 角色与权限
 
@@ -310,7 +310,7 @@ Team ID 是不透明稳定标识（`ateam_` 前缀），名称可以修改且不
 | `ports/teams.py`、`storage/repositories/teams.py` | 成员关系、邀请消费、Owner 不变量和审计写入（第一步） |
 | `workers/team_operations.py`、集中授权策略 | 可重试撤权、清理和删除；团队资源鉴权（第二步） |
 | admission、follow-ups、goals、residency、MCP 与发布 | 保持实际 actor，覆盖执行前和续期时的团队检查（第二步） |
-| sandbox manager、supervisor、共享协议 | 在已有 group 中新建空白 session；团队 generation、撤权通知、进程清理和能力声明（第二步） |
+| sandbox manager、supervisor、共享协议 | 在已有 group 中新建空白 session（已实现，`workspace-chat-v1`）；团队 generation、撤权通知、进程清理和能力声明（第二步） |
 | 环境、附件、memory、profile 与会话读取 | scope 验证及个人内容分享边界（第二步） |
 | 前端 | 第一步：设置里的团队页、`/teams/join` 加入页；第二步：空间导航、共享工作区、隔离缓存、实时状态和清理进度 |
 
@@ -321,7 +321,7 @@ Team ID 是不透明稳定标识（`ateam_` 前缀），名称可以修改且不
 分步交付：
 
 1. **第一步（已实现）**：Team 创建、改名、删除；一次性邀请链接、领取、批准/拒绝、撤销；管理员任免、退出、移除、转让；Owner 审计；设置里的团队页和加入页。只有成员关系，不触碰 thread、sandbox、环境或 host。迁移只新增表，回滚即删表，不影响任何已有数据。
-2. **第二步**：配置和共享工作区接入上述权限链，交付完整的双用户协作流程。包括第 8.2 节的 scope 约束、在已有 group 中新建空白 Chat 的 host 能力、撤权清理任务与 worker、host 撤权机制、归档/恢复、团队变更推送、安全模型与 accepted risk 的更新，以及 Owner 失去准入时的管理面恢复操作。第二步上线必须连同凭证隔离、清理、旧 API 防绕过和数据库约束一起验收。
+2. **第二步**：配置和共享工作区接入上述权限链，交付完整的双用户协作流程。包括第 8.2 节的 scope 约束、让团队成员使用已实现的“在已有 group 中新建空白 Chat”能力、撤权清理任务与 worker、host 撤权机制、归档/恢复、团队变更推送、安全模型与 accepted risk 的更新，以及 Owner 失去准入时的管理面恢复操作。第二步上线必须连同凭证隔离、清理、旧 API 防绕过和数据库约束一起验收。
 3. **第三步**：presence、活动提示和发布体验。
 
 第一版不包含全平台团队账单、团队 API Key、SSO、SCIM、团队记忆、访客角色、按工作区的私有 ACL，或个人运行中容器迁入团队。这些功能不会成为完成当前协作流程的前置条件。
