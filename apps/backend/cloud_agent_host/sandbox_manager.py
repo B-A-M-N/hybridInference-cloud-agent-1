@@ -315,7 +315,11 @@ from cloud_agent_host.action_receipts import ActionReceipts
 from cloud_agent_host.environment_preparation import EnvironmentPreparation
 from cloud_agent_host.environment_process import tool_environment
 from cloud_agent_host.environment_snapshot import check_snapshot_secrets
-from cloud_agent_shared.environment import ENVIRONMENT_CAPABILITY, BoundEnvironment
+from cloud_agent_shared.environment import (
+    ENVIRONMENT_CAPABILITY,
+    ENVIRONMENT_INFERENCE_CAPABILITY,
+    BoundEnvironment,
+)
 from cloud_agent_shared.environment_snapshots import (
     ENVIRONMENT_SNAPSHOT_CAPABILITY,
     EnvironmentSnapshotRef,
@@ -2496,6 +2500,7 @@ def create_app(
             "ok": True,
             "capabilities": [
                 ENVIRONMENT_CAPABILITY,
+                ENVIRONMENT_INFERENCE_CAPABILITY,
                 *(
                     [ENVIRONMENT_SNAPSHOT_CAPABILITY]
                     if getattr(archive_controller, "snapshots_available", False)

@@ -12,7 +12,12 @@ from urllib.parse import quote
 import httpx
 
 from cloud_agent.mcp.http_body import IDENTITY_ENCODING_HEADERS, iter_response_bytes
-from cloud_agent_shared.environment import ENVIRONMENT_CAPABILITY, environment_payload
+from cloud_agent_shared.environment import (
+    ENVIRONMENT_CAPABILITY,
+    ENVIRONMENT_INFERENCE_CAPABILITY,
+    environment_payload,
+    uses_inference_names,
+)
 from cloud_agent_shared.operation_profiling import (
     MAX_CONTEXT_CHARS,
     PROFILING_CONTEXT_HEADER,
@@ -284,12 +289,15 @@ class SandboxManagerClient:
             invalid="The shared chat supervisor returned invalid data.",
         )
 
-    async def require_environment_capability(self) -> list[str]:
-        """Require the capability from the actual authenticated broker replica.
+    async def require_environment_capability(self, environment: Any = None) -> list[str]:
+        """Require the capabilities from the actual authenticated broker replica.
 
-        Returns everything the replica declares, so a binding can be sent
-        with only the fields it reads.
+        Owner inference credentials need a broker that keeps them from the CLI.
+        Return all declared capabilities so callers only send supported fields.
         """
+        required = {ENVIRONMENT_CAPABILITY}
+        if environment is not None and uses_inference_names(environment):
+            required.add(ENVIRONMENT_INFERENCE_CAPABILITY)
         try:
             async with self._http(5) as client:
                 response = await client.get(
@@ -301,7 +309,7 @@ class SandboxManagerClient:
             raise SandboxManagerError(
                 503, "Sandbox manager environment capability is unavailable"
             ) from None
-        if ENVIRONMENT_CAPABILITY not in capabilities:
+        if not required <= set(capabilities):
             raise SandboxManagerError(
                 503, "Sandbox manager must be upgraded for environment configuration"
             )
@@ -309,7 +317,7 @@ class SandboxManagerClient:
 
     async def prepare_environment(self, workspace_id: str, environment: Any) -> dict[str, Any]:
         """Require actual broker support before sending value-bearing configuration."""
-        capabilities = await self.require_environment_capability()
+        capabilities = await self.require_environment_capability(environment)
         return await self._request(
             "POST",
             workspace_id,
@@ -438,7 +446,7 @@ class SandboxManagerClient:
     ) -> dict[str, Any]:
         """Execute one bounded command in an isolated workspace sandbox."""
         if environment is not None and environment.required:
-            await self.require_environment_capability()
+            await self.require_environment_capability(environment)
         else:
             environment = None
         return await self._request(
@@ -473,7 +481,7 @@ class SandboxManagerClient:
     ) -> dict[str, Any]:
         """Open one interactive terminal in a durable workspace."""
         if environment is not None and environment.required:
-            await self.require_environment_capability()
+            await self.require_environment_capability(environment)
         else:
             environment = None
         return await self._request(
@@ -906,7 +914,7 @@ class SandboxManagerClient:
             **({"environment": snapshot["environment"]} if snapshot.get("environment") else {}),
         }
         if snapshot.get("environment"):
-            await self.require_environment_capability()
+            await self.require_environment_capability(snapshot["environment"])
         return await self._shared_sandbox_request(
             "POST",
             str(snapshot["origin_thread_id"]),

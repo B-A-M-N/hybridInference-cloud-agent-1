@@ -141,7 +141,10 @@ from cloud_agent_host.session_supervisor_client import (
 from cloud_agent_host.setup import run_setup
 from cloud_agent_host.storage_admission import new_sandbox_storage_error
 from cloud_agent_shared import operation_profiling
-from cloud_agent_shared.environment import ENVIRONMENT_CAPABILITY
+from cloud_agent_shared.environment import (
+    ENVIRONMENT_CAPABILITY,
+    ENVIRONMENT_INFERENCE_CAPABILITY,
+)
 from cloud_agent_shared.environment_snapshots import (
     ENVIRONMENT_SNAPSHOT_CAPABILITY,
     MAX_LOCKFILES,
@@ -1254,7 +1257,12 @@ def _environment_host_capabilities(backend: SandboxBackend, stamp: dict[str, Any
     capabilities = _shared_live_host_capabilities(backend, stamp)
     if not capabilities:
         return []
-    return [*capabilities, ENVIRONMENT_CAPABILITY, ENVIRONMENT_SNAPSHOT_CAPABILITY]
+    return [
+        *capabilities,
+        ENVIRONMENT_CAPABILITY,
+        ENVIRONMENT_INFERENCE_CAPABILITY,
+        ENVIRONMENT_SNAPSHOT_CAPABILITY,
+    ]
 
 
 def _shared_live_deployment_ready(
