@@ -198,6 +198,7 @@ describe('IntegrationsView', () => {
     mockedGetIntegrations.mockResolvedValue(integrations);
     render(<IntegrationsView connectedProvider="github" />);
     expect(screen.getByRole('heading', { level: 1, name: 'Integrations' })).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Keyboard shortcuts' })).not.toBeInTheDocument();
     expect(
       await screen.findByText('Connected as HarvardMadSys · 2 repositories'),
     ).toBeInTheDocument();
@@ -209,12 +210,13 @@ describe('IntegrationsView', () => {
     expect(listSkills).not.toHaveBeenCalled();
     expect(listMcpConnections).not.toHaveBeenCalled();
   });
-  it('keeps profile, notifications, and memory in My Settings', async () => {
+  it('keeps profile, notifications, keyboard shortcuts, and memory in My Settings', async () => {
     render(<MySettingsView />);
     expect(screen.getByRole('heading', { level: 1, name: 'My Settings' })).toBeInTheDocument();
     expect(screen.getByRole('region', { name: 'Profile' })).toBeInTheDocument();
     expect(screen.queryByText('Integrations & MCP')).not.toBeInTheDocument();
     expect(screen.getByRole('region', { name: 'Notifications' })).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'Keyboard shortcuts' })).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: 'Agent questions' })).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: 'Turn completions' })).toBeInTheDocument();
     expect(screen.getByRole('region', { name: 'Memory' })).toBeInTheDocument();
@@ -345,7 +347,8 @@ describe('IntegrationsView', () => {
     expect(within(section).getByRole('switch', { name: '启用记忆' })).toBeChecked();
     expect(within(section).queryByRole('heading', { name: '建议' })).not.toBeInTheDocument();
     expect(screen.getByRole('tab', { name: '项目记忆' })).toBeInTheDocument();
-    expect(screen.getByText('管理你的个人资料、通知和记忆。')).toBeInTheDocument();
+    expect(screen.getByText('管理你的个人资料、通知、键盘快捷键和记忆。')).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: '键盘快捷键' })).toBeInTheDocument();
   });
 
   it('marks providers that need operator configuration', async () => {

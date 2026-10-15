@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { listMcpInvocations, type McpInvocationsApi } from '@/lib/api/mcp';
 import type { AgentAccessApi } from '@/lib/api/session';
 import { SkillDialog } from '@/components/features/agents/skills/SkillDialog';
+import { KeyboardShortcutsSettings } from '@/components/features/settings/KeyboardShortcutsSettings';
 
 let access: AgentAccessApi | undefined;
 let role = 'internal';
@@ -205,6 +206,39 @@ describe('AgentsLayout sidebar collapse', () => {
     expect(screen.getByTestId('sidebar-stub')).toBeInTheDocument();
     expect(localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY)).toBe('0');
   });
+
+  it.each([
+    ['/', 'sidebar-stub', /(Collapse|Expand) task list/],
+    ['/settings/my-settings', 'settings-sidebar-stub', /(Collapse|Expand) settings navigation/],
+  ])(
+    'applies shortcut changes immediately on %s and keeps the mouse toggle after disabling',
+    (route, sidebar, name) => {
+      pathname = route;
+      const sidebarToggle = () => screen.getByRole('button', { name });
+      userId = 'layout-keyboard-settings-user';
+      render(
+        <AgentsLayout>
+          <KeyboardShortcutsSettings />
+        </AgentsLayout>,
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'Change shortcut for Toggle task list' }));
+      const input = screen.getByRole('textbox', { name: 'New shortcut for Toggle task list' });
+      fireEvent.keyDown(input, { key: 'B', ctrlKey: true, shiftKey: true });
+      expect(sidebarToggle()).toHaveAttribute('aria-keyshortcuts', 'Meta+Shift+B Control+Shift+B');
+      expect(fireEvent.keyDown(window, { key: 'b', ctrlKey: true })).toBe(true);
+      expect(screen.getByTestId(sidebar)).toBeInTheDocument();
+      fireEvent.keyDown(window, { key: 'B', metaKey: true, shiftKey: true });
+      expect(screen.queryByTestId(sidebar)).not.toBeInTheDocument();
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Disable shortcut for Toggle task list' }),
+      );
+      expect(sidebarToggle()).not.toHaveAttribute('aria-keyshortcuts');
+      expect(fireEvent.keyDown(window, { key: 'B', ctrlKey: true, shiftKey: true })).toBe(true);
+      expect(screen.queryByTestId(sidebar)).not.toBeInTheDocument();
+      fireEvent.click(sidebarToggle());
+      expect(screen.getByTestId(sidebar)).toBeInTheDocument();
+    },
+  );
 
   it('ignores repeated or additionally modified shortcut variants', () => {
     render(
