@@ -72,7 +72,7 @@ that URL to another origin is refused while the token is kept. Reset the token,
 save the URL, then enter the token again.
 
 For the first deployment of this release, run `alembic upgrade head` through
-`0073_sandbox_restore`. Existing hosts begin without a deployment drain
+`0074_host_removal_pending`. Existing hosts begin without a deployment drain
 owner or release receipt, and 0051 backfills each one with a non-null fence
 epoch. 0066 builds an index on `agent_jobs` concurrently: on a long job history
 it takes a while without blocking the running API, and an interrupted run can
@@ -91,7 +91,9 @@ and `restoring` sandbox states and the start fence that binds a checkpoint to
 the run it ends (see
 [Restoring a removed host's sandboxes](#restoring-a-removed-hosts-sandboxes));
 existing checkpoints carry no fence and never move a group, and its downgrade
-refuses while any group is cold or restoring.
+refuses while any group is cold or restoring. 0074 adds
+`agent_runner_hosts.removal_requested_at`, empty for every existing host; a
+downgrade drops it and leaves a host that was waiting to be removed draining.
 Rebuild the sandbox image for explicit plugin loading.
 Then start the main control-plane listener with its existing complete
 environment. It imports registered environment settings once,
