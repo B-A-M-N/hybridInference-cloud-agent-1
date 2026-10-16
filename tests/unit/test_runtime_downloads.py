@@ -686,6 +686,44 @@ def test_a_version_an_answer_names_while_cleanup_runs_is_kept(docker, monkeypatc
     assert docker.ran("rmi") == []
 
 
+@pytest.mark.parametrize("named_during", ["a_cleanup", "a_download"])
+def test_a_version_named_again_waits_a_whole_grace_period_once_dropped(
+    docker, monkeypatch, named_during
+):
+    """A chat claimed on it while an answer named it may not run it yet.
+
+    The answer naming it can land while a cleanup decides, or while the worker
+    downloads another version and runs no cleanup at all.
+    """
+    clock = Clock()
+    downloads = _downloads(clock=clock)
+    selected = _held(docker, "2.1.200")
+    downloads.apply([_target()])
+    downloads._clean_up()
+    clock.now += runtime_downloads.UNNEEDED_GRACE_S
+    naming = [_target("2.1.200", nonce="b" * 32), _target()]
+    if named_during == "a_cleanup":
+        read_chats = runtime_downloads.chat_versions
+
+        def answered_meanwhile(*args: Any, **kwargs: Any) -> Any:
+            downloads.apply(naming)
+            return read_chats(*args, **kwargs)
+
+        monkeypatch.setattr(runtime_downloads, "chat_versions", answered_meanwhile)
+        downloads._clean_up()
+        monkeypatch.setattr(runtime_downloads, "chat_versions", read_chats)
+    else:
+        downloads.apply(naming)
+    # A later answer drops it again before the next cleanup.
+    downloads.apply([_target()])
+
+    downloads._clean_up()
+    assert selected in docker.images
+    clock.now += runtime_downloads.UNNEEDED_GRACE_S
+    downloads._clean_up()
+    assert selected not in docker.images
+
+
 def test_nothing_is_removed_until_an_answer_says_what_to_hold(docker):
     """An answer without targets comes from a control plane that does not send them."""
     clock = Clock()

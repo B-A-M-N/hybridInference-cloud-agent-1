@@ -182,6 +182,10 @@ class RuntimeDownloads:
         #: carries the list, and after one without it. Nothing is removed
         #: while it is ``None``.
         self._named: frozenset[_Key] | None = None
+        #: Every version an answer named since a cleanup pass last looked,
+        #: though a later answer may have dropped it again. A chat claimed on
+        #: it meanwhile may not run it yet, so its grace period starts afresh.
+        self._named_meanwhile: set[_Key] = set()
         #: Whether a cleanup is owed though there is nothing to download: the
         #: list changed, a version is still waiting out its grace period, or a
         #: chat still runs a version no answer names.
@@ -229,6 +233,7 @@ class RuntimeDownloads:
             self._targets = adopted
             if named != self._named:
                 self._named = named
+                self._named_meanwhile |= named
                 self._cleanup_due = True
                 changed = True
             for key in list(self._reports):
@@ -632,13 +637,17 @@ class RuntimeDownloads:
 
         A version is needed while the latest answer names it, or a chat
         container or checkpoint image of this deployment runs it, and for
-        :data:`UNNEEDED_GRACE_S` after. Builds on older sandbox images go by
+        :data:`UNNEEDED_GRACE_S` after. That time starts afresh whenever an
+        answer names the version again. Builds on older sandbox images go by
         the same rule: the version a chat ran at a release stays on the old
         image, and would be offered for good once that chat is gone.
         """
         with self._lock:
             self._cleanup_due = False
             named = self._named
+            named_meanwhile, self._named_meanwhile = self._named_meanwhile, set()
+        for key in named_meanwhile:
+            self._unneeded_since.pop(key, None)
         if named is None:
             # Time unneeded counts only while answers say what is needed.
             self._unneeded_since.clear()
@@ -674,9 +683,10 @@ class RuntimeDownloads:
                 continue
             # An answer may have named it since this pass read the list: an
             # admin can select a version this host still offers, and the
-            # control plane takes it on that word.
+            # control plane takes it on that word. Even if a later answer
+            # dropped it again, the next pass gives it a fresh grace period.
             with self._lock:
-                if self._named is None or key in self._named:
+                if self._named is None or key in self._named or key in self._named_meanwhile:
                     continue
             # Never forced: Docker refuses an image a container still uses,
             # such as the source a chat is copying this version from, and the
