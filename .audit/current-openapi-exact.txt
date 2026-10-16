@@ -1,3 +1,0 @@
-paths_equal True
-schemas_equal True
-path_diff_count 0
