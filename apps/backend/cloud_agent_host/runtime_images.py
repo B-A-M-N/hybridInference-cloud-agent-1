@@ -22,12 +22,19 @@ new release downloads and checks its targets again.
 
 from __future__ import annotations
 
+import contextlib
+import json
 import re
 import subprocess
 import threading
 import time
 from dataclasses import dataclass
 
+from cloud_agent_host.chat_sandbox_models import (
+    CHAT_NAMESPACE_LABEL,
+    CHAT_RUNTIME_LABEL,
+    CHAT_RUNTIME_VERSION_LABEL,
+)
 from cloud_agent_shared.runtime_catalog import downloadable_runtimes
 from cloud_agent_shared.runtime_downloads import is_exact_version
 
@@ -116,6 +123,65 @@ def discover(docker: str, namespace: str, *, timeout: float = 15) -> list[Runtim
         return []
     found = (_parse(line.strip(), namespace) for line in listed.stdout.splitlines())
     return [image for image in found if image is not None]
+
+
+def _read(docker: str, args: list[str], timeout: float) -> str | None:
+    """What one Docker command prints, or None if it fails."""
+    try:
+        done = subprocess.run(
+            [docker, *args], capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def chat_versions(
+    docker: str, namespace: str, *, timeout: float = 15
+) -> set[tuple[str, str]] | None:
+    """The (runtime, version) each chat container and checkpoint image of ``namespace`` runs.
+
+    Containers count in any state. So do checkpoint images: ``docker commit``
+    keeps a container's labels, so a checkpoint carries its chat's. ``None``
+    when Docker cannot say, which a caller removing images must read as every
+    version being in use.
+    """
+    owned = [
+        "--filter",
+        f"label={CHAT_NAMESPACE_LABEL}={namespace}",
+        "--filter",
+        f"label={CHAT_RUNTIME_VERSION_LABEL}",
+    ]
+    fields = "\t".join(
+        '{{.Label "' + label + '"}}' for label in (CHAT_RUNTIME_LABEL, CHAT_RUNTIME_VERSION_LABEL)
+    )
+    containers = _read(docker, ["ps", "--all", *owned, "--format", fields], timeout)
+    images = _read(docker, ["image", "ls", "--quiet", "--no-trunc", *owned], timeout)
+    if containers is None or images is None:
+        return None
+    found: set[tuple[str, str]] = set()
+    for line in containers.splitlines():
+        runtime, _, version = line.partition("\t")
+        found.add((runtime, version))
+    ids = sorted(set(images.split()))
+    if ids:
+        # ``image ls`` cannot print labels; one inspect reads them all.
+        inspected = _read(
+            docker, ["image", "inspect", "--format", "{{json .Config.Labels}}", *ids], timeout
+        )
+        if inspected is None:
+            return None
+        for line in inspected.splitlines():
+            with contextlib.suppress(ValueError):
+                labels = json.loads(line)
+                if isinstance(labels, dict):
+                    found.add(
+                        (
+                            str(labels.get(CHAT_RUNTIME_LABEL) or ""),
+                            str(labels.get(CHAT_RUNTIME_VERSION_LABEL) or ""),
+                        )
+                    )
+    return {pair for pair in found if all(pair)}
 
 
 def image_id(docker: str, ref: str, *, timeout: float = 30) -> str | None:

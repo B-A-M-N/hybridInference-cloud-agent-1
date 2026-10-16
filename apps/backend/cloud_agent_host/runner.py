@@ -4212,7 +4212,8 @@ def run_forever(
 
         def downloaded() -> None:
             # Offered on the next beat, not an interval later, and not from a
-            # menu read before the download finished.
+            # menu read before the download finished; a version removed is
+            # withdrawn the same way.
             offered.invalidate()
             pool.wake()
 

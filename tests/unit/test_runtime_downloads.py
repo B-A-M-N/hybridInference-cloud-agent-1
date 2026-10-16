@@ -8,13 +8,22 @@ hosts look for it. ``tests/external`` runs the same steps against real Docker.
 
 from __future__ import annotations
 
+import json
+import logging
+import re
 import subprocess
+import time
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from cloud_agent_host import runtime_images, runtime_install
+from cloud_agent_host import runtime_downloads, runtime_images, runtime_install
+from cloud_agent_host.chat_sandbox_models import (
+    CHAT_NAMESPACE_LABEL,
+    CHAT_RUNTIME_LABEL,
+    CHAT_RUNTIME_VERSION_LABEL,
+)
 from cloud_agent_host.runtime_downloads import RuntimeDownloads, _Job
 from cloud_agent_host.runtime_images import (
     by_runtime,
@@ -24,6 +33,7 @@ from cloud_agent_host.runtime_images import (
     short_id,
 )
 from cloud_agent_host.runtime_probe import ProbeResult
+from cloud_agent_host.sandbox_checkpoints import checkpoint_image_reference
 from cloud_agent_shared.errors import SandboxError
 
 NAMESPACE = "freeinference-cloud-agent-sandbox-staging"
@@ -60,15 +70,32 @@ class FakeDocker:
         #: takes the container's, under its ``--change LABEL``.
         self.labels: dict[str, dict[str, str]] = {}
         self.removed: set[str] = set()
+        #: Refs ``rmi`` refuses, as Docker does an image a container uses…
+        self.refuse_rmi: set[str] = set()
+        #: …and refs it never answers for.
+        self.hang_rmi: set[str] = set()
+        #: What ``ps`` exits with; not 0 is a daemon that cannot answer.
+        self.ps_exit = 0
 
     def __call__(self, argv: list[str], **_kwargs: Any) -> SimpleNamespace:
         args = argv[1:]
         self.calls.append(args)
         verb = args[0]
+        if args[:3] == ["image", "inspect", "--format"]:
+            # ``{{json .Config.Labels}}`` of each image named.
+            return self._done("\n".join(json.dumps(self.labels.get(i)) for i in args[4:]))
         if args[:2] == ["image", "inspect"]:
             found = self.images.get(args[2])
             return self._done(found or "", 0 if found else 1)
         if args[:2] == ["image", "ls"]:
+            if "--quiet" in args:
+                wanted = self._wanted(args)
+                found = {
+                    image
+                    for image in self.images.values()
+                    if all(self._matches(self.labels.get(image, {}), label) for label in wanted)
+                }
+                return self._done("\n".join(sorted(found)))
             if args[2] == "--filter":
                 refs = [ref for ref in self.images if ref.startswith(repository(NAMESPACE) + ":")]
             else:
@@ -105,21 +132,44 @@ class FakeDocker:
             self.images[args[2]] = self.images[args[1]]
             return self._done("")
         if verb == "rmi":
+            if args[1] in self.hang_rmi:
+                raise subprocess.TimeoutExpired(argv, 120)
+            if args[1] in self.refuse_rmi:
+                return self._done("", 1, "conflict: unable to remove repository reference")
             self.images.pop(args[1], None)
             return self._done("")
         if verb == "rm":
             self.removed.add(args[-1])
             return self._done("")
         if verb == "ps":
-            wanted = [arg.removeprefix("label=") for arg in args if arg.startswith("label=")]
+            if self.ps_exit:
+                return self._done("", self.ps_exit, "Cannot connect to the Docker daemon")
+            wanted = self._wanted(args)
             live = [
                 container
                 for container in self.containers
                 if container not in self.removed
                 and all(self._matches(self.labels[container], label) for label in wanted)
             ]
+            if "--format" in args:
+                template = args[args.index("--format") + 1]
+                return self._done(
+                    "\n".join(self._render(template, self.labels[container]) for container in live)
+                )
             return self._done("\n".join([*self.leftover_containers, *live]))
         return self._done("")
+
+    @staticmethod
+    def _wanted(args: list[str]) -> list[str]:
+        """The ``label=`` filters a call names."""
+        return [arg.removeprefix("label=") for arg in args if arg.startswith("label=")]
+
+    @staticmethod
+    def _render(template: str, labels: dict[str, str]) -> str:
+        """One ``ps --format`` line: each ``{{.Label "KEY"}}`` is that label's value."""
+        return re.sub(
+            r'\{\{\.Label "([^"]+)"\}\}', lambda found: labels.get(found[1], ""), template
+        )
 
     @staticmethod
     def _pairs(args: list[str], flag: str, prefix: str = "") -> dict[str, str]:
@@ -415,7 +465,8 @@ def test_the_version_in_use_is_held_beside_the_update_in_the_order_sent(docker):
     ]
 
     # The update switched new chats: the held version is no longer sent, and
-    # its report goes, but the image stays for any chat or rollback that needs it.
+    # its report goes, but the image stays for any chat that may still need
+    # it. It goes only once nothing has needed it for a while (see below).
     downloads.apply([_target()])
     assert [report["version"] for report in downloads.report()] == ["2.1.300"]
     assert "2.1.235" in {image.version for image in discover("docker", NAMESPACE)}
@@ -461,6 +512,244 @@ def test_with_nothing_to_hold_the_worker_only_cleans_up(docker):
     assert downloads._thread is not None and not downloads._thread.is_alive()
     asked = {tuple(call[:2]) for call in docker.calls if isinstance(call, list)}
     assert asked == {("ps", "--all"), ("image", "ls")}
+
+
+# ── removing what nothing needs ───────────────────────────────────────────
+
+
+class Clock:
+    """``time.monotonic`` for the worker, moved by hand."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _held(docker: FakeDocker, version: str, base: str = BASE) -> str:
+    """This host holds claude-code ``version``, built on sandbox image ``base``."""
+    ref = image_ref(NAMESPACE, "claude-code", version, base)
+    docker.images[ref] = "sha256:" + f"{len(docker.images):064x}"
+    return ref
+
+
+def _chat_labels(version: str, namespace: str = NAMESPACE) -> dict[str, str]:
+    """What a retained chat container on claude-code ``version`` is labelled."""
+    return {
+        CHAT_NAMESPACE_LABEL: namespace,
+        CHAT_RUNTIME_LABEL: "claude-code",
+        CHAT_RUNTIME_VERSION_LABEL: version,
+    }
+
+
+def _chat(docker: FakeDocker, version: str, namespace: str = NAMESPACE) -> str:
+    """A chat container on ``version``; ``ps --all`` lists it in any state."""
+    container = f"chat{len(docker.containers)}"
+    docker.containers[container] = []
+    docker.labels[container] = _chat_labels(version, namespace)
+    return container
+
+
+def _cleaned_up(downloads: RuntimeDownloads, clock: Clock) -> None:
+    """Two passes, the grace period apart: the first only notes what is unneeded."""
+    downloads._clean_up()
+    clock.now += runtime_downloads.UNNEEDED_GRACE_S
+    downloads._clean_up()
+
+
+def _held_versions() -> list[str]:
+    return sorted(image.version for image in discover("docker", NAMESPACE))
+
+
+def test_cleanup_keeps_targets_and_what_chats_run_and_removes_the_rest(docker):
+    clock = Clock()
+    downloads = _downloads(clock=clock)
+    for version in ("2.1.200", "2.1.235", "2.1.240", "2.1.250", "2.1.300"):
+        _held(docker, version)
+    # A version a chat was using when a new sandbox image came: its build on
+    # the old image stays after that chat is gone, and must go too.
+    _held(docker, "2.1.210", OLD_BASE)
+    _chat(docker, "2.1.235")
+    # A checkpoint image carries its chat's labels (``docker commit`` keeps them).
+    checkpoint = checkpoint_image_reference("asbx_moved", "c" * 32)
+    docker.images[checkpoint] = "sha256:" + "c4" * 32
+    docker.labels[docker.images[checkpoint]] = _chat_labels("2.1.240")
+    # Another deployment sharing this Docker daemon never runs this one's downloads.
+    _chat(docker, "2.1.250", namespace="another-deployment")
+    downloads.apply([_target()])
+
+    _cleaned_up(downloads, clock)
+
+    assert _held_versions() == ["2.1.235", "2.1.240", "2.1.300"]
+    # Never forced: Docker refuses, and so keeps, an image a container still uses.
+    assert sorted(call[1].split("_")[1] for call in docker.ran("rmi")) == [
+        "2.1.200",
+        "2.1.210",
+        "2.1.250",
+    ]
+    assert all(len(call) == 2 for call in docker.ran("rmi"))
+
+
+def test_a_version_goes_only_after_nothing_has_needed_it_for_a_while(docker):
+    """A switch can replace the version a new chat was just claimed on.
+
+    That chat holds the version only once its container exists, and loading
+    an environment snapshot can make that a while after the claim.
+    """
+    clock = Clock()
+    downloads = _downloads(clock=clock)
+    previous = _held(docker, "2.1.235")
+    _held(docker, "2.1.300")
+    downloads.apply([_target("2.1.235", nonce="a" * 32), _target()])
+    downloads._clean_up()
+
+    # The switch: the answer names only the update now.
+    downloads.apply([_target()])
+    downloads._clean_up()
+    clock.now += runtime_downloads.UNNEEDED_GRACE_S - 1
+    downloads._clean_up()
+    assert previous in docker.images
+
+    # The chat claimed just before the switch has made its container.
+    chat = _chat(docker, "2.1.235")
+    clock.now += runtime_downloads.UNNEEDED_GRACE_S
+    downloads._clean_up()
+    assert previous in docker.images
+
+    # Deleted, the chat takes nothing with it until a whole grace period passes.
+    docker.removed.add(chat)
+    downloads._clean_up()
+    clock.now += runtime_downloads.UNNEEDED_GRACE_S - 1
+    downloads._clean_up()
+    assert previous in docker.images
+    clock.now += 1
+    downloads._clean_up()
+    assert previous not in docker.images
+    assert _held_versions() == ["2.1.300"]
+
+
+def test_nothing_is_removed_until_an_answer_says_what_to_hold(docker):
+    """An answer without targets comes from a control plane that does not send them."""
+    clock = Clock()
+    downloads = _downloads(clock=clock)
+    stale = _held(docker, "2.1.200")
+
+    _cleaned_up(downloads, clock)
+    assert stale in docker.images
+
+    downloads.apply([_target()])
+    downloads._clean_up()
+    downloads.apply(None)
+    clock.now += runtime_downloads.UNNEEDED_GRACE_S
+    downloads._clean_up()
+    assert stale in docker.images
+    # It still holds what it was asked to; it only stops removing.
+    assert list(downloads._targets) == [("claude-code", "2.1.300")]
+
+    # Removing starts over: the time before is not counted.
+    downloads.apply([_target()])
+    downloads._clean_up()
+    assert stale in docker.images
+    clock.now += runtime_downloads.UNNEEDED_GRACE_S
+    downloads._clean_up()
+    assert stale not in docker.images
+
+
+def test_a_target_this_host_cannot_use_still_keeps_its_version(docker):
+    """A control plane from another release may send more, or another shape."""
+    clock = Clock()
+    downloads = _downloads(clock=clock)
+    for version in ("2.1.200", "2.1.298", "2.1.299"):
+        _held(docker, version)
+    downloads.apply(
+        [
+            _target("2.1.235", nonce="a" * 32),
+            _target(),
+            # More than this release holds for one runtime…
+            _target("2.1.299", nonce="b" * 32),
+            # …and a shape it cannot read.
+            {"runtime": "claude-code", "version": "2.1.298"},
+        ]
+    )
+
+    _cleaned_up(downloads, clock)
+
+    assert _held_versions() == ["2.1.298", "2.1.299"]
+
+
+def test_a_version_docker_will_not_remove_stays_and_the_rest_go(docker):
+    """Docker refuses an image a container uses, such as a chat's copy source."""
+    clock = Clock()
+    downloads = _downloads(clock=clock)
+    copying = _held(docker, "2.1.200")
+    stale = _held(docker, "2.1.210")
+    docker.refuse_rmi = {copying}
+    downloads.apply([])
+
+    _cleaned_up(downloads, clock)
+
+    assert _held_versions() == ["2.1.200"]
+    assert stale not in docker.images
+
+
+def test_nothing_is_removed_when_docker_cannot_say_what_chats_run(docker):
+    clock = Clock()
+    downloads = _downloads(clock=clock)
+    stale = _held(docker, "2.1.200")
+    docker.ps_exit = 1
+    downloads.apply([])
+
+    _cleaned_up(downloads, clock)
+
+    assert stale in docker.images
+    assert docker.ran("rmi") == []
+
+
+def _wait_for(condition, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+def test_the_worker_removes_what_nothing_needs_once_it_has_downloaded(docker, monkeypatch):
+    monkeypatch.setattr(runtime_downloads, "UNNEEDED_GRACE_S", 0.0, raising=False)
+    stale = _held(docker, "2.1.200")
+    # Whether the stale version was still there each time the beat was nudged.
+    nudged: list[bool] = []
+    downloads = _downloads(on_change=lambda: nudged.append(stale in docker.images))
+    downloads.apply([_target()])
+
+    downloads.start()
+    try:
+        _wait_for(lambda: stale not in docker.images)
+    finally:
+        downloads.stop()
+
+    assert _held_versions() == ["2.1.300"]
+    assert _reported(downloads)["state"] == "ready"
+    # Removing it nudges the beat too, so the menu is read again now.
+    assert nudged[-1] is False
+
+
+def test_a_failed_cleanup_never_stops_the_worker(docker, monkeypatch, caplog):
+    monkeypatch.setattr(runtime_downloads, "UNNEEDED_GRACE_S", 0.0, raising=False)
+    stale = _held(docker, "2.1.200")
+    docker.hang_rmi = {stale}
+    downloads = _downloads()
+    downloads.apply([_target(), _target("0.162.1", runtime="codex")])
+
+    with caplog.at_level(logging.ERROR):
+        downloads.start()
+        try:
+            _wait_for(lambda: len(downloads.report()) == 2)
+        finally:
+            downloads.stop()
+
+    # The cleanup after the first download hung on Docker; the next one still ran.
+    assert ["rmi", stale] in docker.calls
+    assert {report["runtime"] for report in downloads.report()} == {"claude-code", "codex"}
+    assert "runtime download cleanup failed" in caplog.text
 
 
 # ── naming the images ─────────────────────────────────────────────────────
