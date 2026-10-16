@@ -132,6 +132,64 @@ async def test_deletion_requires_verified_archive_and_retains_native_and_job_led
     assert "PRIVATE" not in detail.model_dump_json()
 
 
+async def test_lost_stopped_sandbox_can_be_archived_without_becoming_recoverable(db, store):
+    origin = await seed(db, store, "asbx_lost_archive", state="stopped")
+    await member(db, "asbx_lost_archive", origin, 0)
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE agent_thread_sandbox_memberships
+            SET resident_slot_id = NULL, resident_state = 'lost',
+                native_state = 'lost', context_status = 'lost'
+            WHERE sandbox_id = $1
+            """,
+            "asbx_lost_archive",
+        )
+
+    assert not await store.sandbox.thread_workspace_ready(thread_id=origin["thread_id"])
+    assert await request_delete(store, "asbx_lost_archive") == "accepted"
+    claim = await store.sandbox.claim_due_admin_sandbox_deletion(ttl_seconds=3600)
+    assert claim is not None
+    assert not await store.sandbox.complete_admin_sandbox_deletion(**worker_fence(claim))
+
+    # A stale busy census cannot reopen lost context while deletion owns the fence.
+    assert await store.sandbox.reconcile_thread_sandbox_observation(
+        thread_id=origin["thread_id"],
+        host=claim["host"],
+        sandbox_id=claim["id"],
+        container_id=claim["container_id"],
+        sandbox_generation=claim["generation"],
+        running=True,
+        activity_active=True,
+        members=[
+            {
+                "thread_id": origin["thread_id"],
+                "activation_generation": 0,
+                "process_generation": 0,
+                "residency_generation": 0,
+                "resident_state": "live",
+            }
+        ],
+        terminal_count=0,
+    ) is None
+    during_archive = await store.sandbox.thread_sandbox(thread_id=origin["thread_id"])
+    assert during_archive is not None
+    assert during_archive["state"] == "stopped"
+    assert during_archive["context_status"] == "lost"
+    assert during_archive["native_state"] == "lost"
+    assert during_archive["resident_state"] == "lost"
+    assert not await store.sandbox.thread_workspace_ready(thread_id=origin["thread_id"])
+
+    assert await checkpoint_archive(store, claim, archive_version_id="lost-context-version")
+    assert await store.sandbox.complete_admin_sandbox_deletion(**worker_fence(claim))
+    detail = await store.admin_sandboxes.detail("asbx_lost_archive")
+    assert detail is not None
+    assert detail.sandbox.deletion_state == "deleted"
+    assert detail.sandbox.state == "lost"
+    assert detail.sandbox.archived_at is not None
+    assert not await store.sandbox.thread_workspace_ready(thread_id=origin["thread_id"])
+
+
 @pytest.mark.parametrize(
     ("change", "result"),
     [

@@ -358,11 +358,17 @@ async def test_deletion_waits_for_verified_s3_object_and_committed_receipt(monke
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("status_code", "retain_pending", "outcome"),
-    [(410, False, "failed"), (503, True, "retrying")],
+    ("status_code", "retain_pending", "outcome", "failure_code", "retry_class"),
+    [
+        (410, False, "failed", "sandbox_manager_precondition", "operator_action"),
+        (503, True, "retrying", "sandbox_manager_unavailable", "transient"),
+        (429, True, "retrying", "sandbox_manager_unavailable", "transient"),
+        (422, False, "failed", "sandbox_manager_rejected", "permanent"),
+        (403, False, "failed", "sandbox_manager_precondition", "operator_action"),
+    ],
 )
 async def test_preflight_failure_never_starts_archive_preparation(
-    monkeypatch, status_code, retain_pending, outcome
+    monkeypatch, status_code, retain_pending, outcome, failure_code, retry_class
 ):
     store, sandbox_manager, archives, _events = setup(monkeypatch)
     sandbox_manager.shared_chat_sandbox_status.side_effect = SandboxManagerError(
@@ -372,13 +378,17 @@ async def test_preflight_failure_never_starts_archive_preparation(
     assert await run(store, archives)
 
     sandbox_manager.prepare_sandbox_deletion.assert_not_awaited()
+    sandbox_manager.commit_sandbox_deletion.assert_not_awaited()
     sandbox_manager.abort_sandbox_deletion.assert_not_awaited()
+    store.sandbox.complete_admin_sandbox_deletion.assert_not_awaited()
     archives.prepare_upload.assert_not_awaited()
     failure = store.sandbox.fail_admin_sandbox_deletion.call_args.kwargs
     assert failure["retain_pending"] is retain_pending
     attempt = store.sandbox.finish_admin_sandbox_deletion_attempt.call_args.kwargs
     assert attempt["outcome"] == outcome
+    assert attempt["failure_code"] == failure_code
     assert attempt["sandbox_manager_status"] == status_code
+    assert attempt["retry_class"] == retry_class
     assert attempt["retry_scheduled"] is retain_pending
     assert attempt["cleanup_outcome"] == "not_required"
     stages = [
