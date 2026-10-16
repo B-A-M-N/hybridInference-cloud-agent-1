@@ -1,0 +1,19 @@
+['DELETE'] /v1/agent/mcp/connections/{connection_id} delete_connection
+['GET'] /v1/agent/mcp/catalog list_catalog
+['GET'] /v1/agent/mcp/connections list_connections
+['GET'] /v1/agent/mcp/connections/{connection_id} get_connection
+['GET'] /v1/agent/mcp/connections/{connection_id}/capabilities get_capabilities
+['GET'] /v1/agent/mcp/invocations list_invocations
+['GET'] /v1/agent/mcp/oauth/callback/{provider} oauth_callback
+['GET'] /v1/agent/mcp/templates list_templates
+['PATCH'] /v1/agent/mcp/connections/{connection_id} update_connection
+['POST'] /v1/agent/mcp/connections create_connection
+['POST'] /v1/agent/mcp/connections/import import_connections
+['POST'] /v1/agent/mcp/connections/{connection_id}/authorize authorize_connection
+['POST'] /v1/agent/mcp/connections/{connection_id}/discover discover_connection
+['POST'] /v1/agent/mcp/connections/{connection_id}/secret set_connection_secret
+['POST'] /v1/agent/mcp/connections/{connection_id}/test test_connection
+['POST'] /v1/agent/mcp/invocations/{invocation_id}/decision decide_invocation
+['PUT'] /v1/agent/mcp/connections/{connection_id}/enabled set_connection_enabled
+[]  
+[]  
