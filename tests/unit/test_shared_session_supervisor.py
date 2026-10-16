@@ -1269,6 +1269,29 @@ def test_targeted_listing_refreshes_all_members_without_host_reconciliation(monk
         supervisor.list()
 
 
+def test_a_restarted_supervisor_knows_a_group_by_its_origin_until_a_manifest_names_the_rest():
+    """The chats a group-level request, such as an SSH push, can be addressed to.
+
+    After a restart the container's labels name only the origin chat. A
+    manifest then names the chats that hold slots, and drops an origin that
+    gave its slot up, as a deleted origin chat does.
+    """
+    manager = _Manager()
+    SharedChatSessionSupervisor(manager).register_manifest(_spec(), _members())
+    manager.items[_spec().container_name] = manager._inspection(_spec(), running=False)
+
+    restarted = SharedChatSessionSupervisor(manager)
+    restarted.reconcile()
+
+    assert restarted.owns("athr_source")
+    assert not restarted.owns("athr_peer")
+
+    restarted.register_manifest(_spec(), [_members()[1]])
+
+    assert restarted.owns("athr_peer")
+    assert not restarted.owns("athr_source")
+
+
 def test_targeted_listing_unknown_member_does_not_discover_or_inspect_containers(monkeypatch):
     manager = _Manager()
     supervisor = SharedChatSessionSupervisor(manager)

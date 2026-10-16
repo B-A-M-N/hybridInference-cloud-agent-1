@@ -3991,8 +3991,12 @@ and the owner SSH servers entry in [AGENTS.md](../../AGENTS.md) §7.
   whose chats ever selected a server costs nothing: no state is sent.
 - **Taking access away is immediate; granting it waits for the next turn.**
   Turning a server on or off for a chat, editing, checking, rekeying or
-  deleting a server pushes the new state to every running group it reaches. A
-  push only removes: deleting an element cuts a live SSH session on its next
+  deleting a server pushes the new state to every running group it reaches,
+  on the host the group is on. A push names the group by its origin chat,
+  which a restarted sandbox manager re-learns from the container; if the
+  manager does not know it, as after the origin chat was deleted and gave up
+  its slot, the push is retried through another chat of the group that holds
+  a slot. A push only removes: deleting an element cuts a live SSH session on its next
   packet, and a member's directory for a server it may no longer use, or whose
   key changed, is deleted. A server turned on, or a new key, arrives with the
   chat's next turn, whose runner masks the key. If a newest state fails after
