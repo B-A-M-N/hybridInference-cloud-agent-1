@@ -344,9 +344,15 @@ class PostgresAttemptCommands:
                         OR (
                             -- A group whose host is gone, held by its
                             -- checkpoint: any restore-capable host may take
-                            -- it, and the claim below rehomes it. After a
-                            -- failed restore it waits before the next try.
+                            -- it, and the claim below rehomes it. Never the
+                            -- host it left while that one still names its
+                            -- container: a Host moving out, or the same name
+                            -- enrolled again, holds it under the group's
+                            -- stable name. A failed restore has no container
+                            -- and may be retried where it ran, after the wait
+                            -- that follows each failed try.
                             s.state = 'cold'
+                            AND (s.container_id IS NULL OR s.host IS DISTINCT FROM $2)
                             AND $7::boolean
                             AND $6::boolean
                             AND s.restore_attempts < {MAX_RESTORE_ATTEMPTS}
