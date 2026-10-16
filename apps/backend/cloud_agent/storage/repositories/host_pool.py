@@ -21,11 +21,14 @@ from cloud_agent.capacity_protocol import (
 from cloud_agent.domain.runtimes import KIND_SELECTION, KIND_UPDATE
 from cloud_agent.execution_profiles import KATA_RUNTIME
 from cloud_agent.host_pool import (
+    HEARTBEAT_INTERVAL_S,
     HOST_DISABLED,
     HOST_DRAINING,
     HOST_ENROLLING,
     HOST_OFFLINE,
     HOST_ONLINE,
+    HOST_REMOVAL_STOP_WAIT_S,
+    MISSED_HEARTBEATS_BEFORE_OFFLINE,
     normalize_capabilities,
     transition_allowed,
 )
@@ -44,7 +47,9 @@ from cloud_agent.storage._sql.compute_admission import (
 from cloud_agent.storage._sql.hosts import (
     HOST_CAPACITY_COLUMNS,
     HOST_COLUMNS,
+    LIVE_GROUP_STATES,
     QUALIFIED_HOST_COLUMNS,
+    release_late_covered_sandboxes,
     revoke_host_credentials,
 )
 from cloud_agent.storage._sql.rows import load_json
@@ -229,6 +234,74 @@ def _selection_record(earlier: object, version: str, stamp: datetime) -> dict[st
         "previous_download": None,
         "activated_at": stamp.isoformat(),
     }
+
+
+#: A host whose last heartbeat is older than this is not delivering stops.
+#: The same allowance the offline reaper gives an enrolled host.
+_REMOVAL_HEARTBEAT_STALE_S = HEARTBEAT_INTERVAL_S * MISSED_HEARTBEATS_BEFORE_OFFLINE
+
+
+async def _groups_left_by_removal(conn: Any, host: str) -> tuple[list[str], str | None]:
+    """The host's live groups, and why a removal need not wait for them.
+
+    A removal waits while the host may still be running a group's container:
+    the stop each heartbeat now offers is what lets the group's checkpoint
+    carry it to another host. It does not wait for a host whose heartbeat has
+    stopped, since only a heartbeat delivers that stop, nor longer than
+    ``HOST_REMOVAL_STOP_WAIT_S`` after the later of the request and the end
+    of the host's last turn: before that turn ended, its own group could not
+    stop. The second value is ``"host_not_heartbeating"`` or
+    ``"stop_wait_exceeded"`` when the removal goes ahead regardless, and
+    ``None`` while it still waits or when no group is live.
+
+    Read under the caller's host-row lock, and taking no lock of its own.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT ARRAY(
+                   SELECT g.id FROM agent_sandboxes g
+                   WHERE g.host = h.host AND g.deletion_state = 'none'
+                     AND g.container_id IS NOT NULL
+                     AND g.state = ANY($2::text[])
+                   ORDER BY g.id
+               ) AS live,
+               (h.credential_hash IS NOT NULL
+                AND h.status IN ('online', 'draining')
+                AND h.last_heartbeat_at IS NOT NULL
+                AND h.last_heartbeat_at >= NOW() - make_interval(secs => $3)) AS heartbeating,
+               GREATEST(
+                   COALESCE(h.removal_requested_at, NOW()),
+                   (SELECT MAX(a.finished_at) FROM agent_attempts a WHERE a.host_id = h.host)
+               ) < NOW() - make_interval(secs => $4) AS waited_out
+        FROM agent_runner_hosts h
+        WHERE h.host = $1
+        """,
+        host,
+        list(LIVE_GROUP_STATES),
+        _REMOVAL_HEARTBEAT_STALE_S,
+        HOST_REMOVAL_STOP_WAIT_S,
+    )
+    if row is None or not row["live"]:
+        return [], None
+    live = [str(sandbox_id) for sandbox_id in row["live"]]
+    if not row["heartbeating"]:
+        return live, "host_not_heartbeating"
+    if row["waited_out"]:
+        return live, "stop_wait_exceeded"
+    return live, None
+
+
+def _log_groups_left_by_removal(host: str, sandbox_ids: list[str], reason: str | None) -> None:
+    """Name the groups a removal left bound to the revoked host, and why."""
+    logger.warning(
+        "agent_host_removed_with_live_sandboxes",
+        extra={
+            "event": "agent_host_removed_with_live_sandboxes",
+            "host": host,
+            "reason": reason,
+            "sandbox_ids": sandbox_ids,
+        },
+    )
 
 
 class PostgresHostPoolRepository:
@@ -865,6 +938,16 @@ class PostgresHostPoolRepository:
         its last slot comes back. ``"busy"`` is left for the busy host that
         cannot drain at all.
 
+        A host still running a sandbox group waits the same way, even with no
+        turn running. An idle running group holds no slot, and revoking its
+        host would leave it bound to a machine that is gone: its chats' next
+        turns would wait forever. While the removal waits, each heartbeat
+        offers that group's stop (``SandboxRepository.due_thread_sandbox_stop``),
+        and a clean stop leaves the checkpoint that turns it ``cold`` when the
+        host is revoked. A host that is not heartbeating cannot be sent the
+        stop, so its groups do not hold its removal, as before;
+        :meth:`finish_host_removals` says how long the wait lasts otherwise.
+
         ``force`` ends that work now instead of waiting for it — lease expiry
         *is* the recovery path, and the revocation brings it forward to now
         (see ``revoke_host_credentials``): the attempts' worker tokens name no
@@ -899,28 +982,45 @@ class PostgresHostPoolRepository:
                 return "unknown"
             if row["drain_fence_active"] and not force:
                 return "fenced"
-            if row["slots_used"] > 0 and not force:
-                if not transition_allowed(row["status"], HOST_DRAINING):
-                    return "busy"
-                await conn.execute(
-                    "UPDATE agent_runner_hosts SET status = $2, "
-                    "removal_requested_at = COALESCE(removal_requested_at, NOW()) "
-                    "WHERE host = $1",
-                    host,
-                    HOST_DRAINING,
-                )
-                return "draining"
+            left: list[str] = []
+            reason: str | None = None
+            if not force:
+                left, reason = await _groups_left_by_removal(conn, host)
+                if row["slots_used"] > 0 or (left and reason is None):
+                    if not transition_allowed(row["status"], HOST_DRAINING):
+                        return "busy"
+                    await conn.execute(
+                        "UPDATE agent_runner_hosts SET status = $2, "
+                        "removal_requested_at = COALESCE(removal_requested_at, NOW()) "
+                        "WHERE host = $1",
+                        host,
+                        HOST_DRAINING,
+                    )
+                    return "draining"
             await revoke_host_credentials(conn, [host])
+        if left:
+            _log_groups_left_by_removal(host, left, reason)
         return "ok"
 
     async def finish_host_removals(self) -> list[str]:
-        """Revoke every host whose requested removal has no running work left.
+        """Revoke every host whose requested removal has nothing left to wait for.
 
         The second half of a deferred :meth:`remove_host`. Each host is
         decided in its own transaction, with the locks taken in the order
         ``remove_host`` takes them, and its count read again under the row
         lock: an attempt the reaper is ending at this moment must either be
         finished first or keep the host for the next pass.
+
+        A host with no running turn still waits while one of its sandbox
+        groups may be running: its heartbeats are stopping them. The wait
+        ends when no group is live, when the host stops heartbeating, or
+        ``HOST_REMOVAL_STOP_WAIT_S`` after the later of the request and the
+        host's last turn. The last two revoke the host anyway, as before the
+        wait existed, and log the groups left bound to it.
+
+        Each pass then hands on any group of an already revoked host whose
+        checkpoint arrived with a beat still in flight at the revocation
+        (``release_late_covered_sandboxes``).
 
         Returns the hosts it revoked.
         """
@@ -945,8 +1045,23 @@ class PostgresHostPoolRepository:
                     )
                     if row is None or row["removal_requested_at"] is None or row["slots_used"]:
                         continue
+                    left, reason = await _groups_left_by_removal(conn, host)
+                    if left and reason is None:
+                        continue
                     await revoke_host_credentials(conn, [host])
+                if left:
+                    _log_groups_left_by_removal(host, left, reason)
                 removed.append(host)
+            async with conn.transaction():
+                released = await release_late_covered_sandboxes(conn)
+        if released:
+            logger.info(
+                "agent_sandboxes_released_after_revocation",
+                extra={
+                    "event": "agent_sandboxes_released_after_revocation",
+                    "sandbox_ids": released,
+                },
+            )
         return removed
 
     async def reap_offline_hosts(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -15,6 +16,7 @@ from tests.integration.storage.test_agent_job_store import (
     store as store,
 )
 
+from cloud_agent.host_pool import HOST_REMOVAL_STOP_WAIT_S
 from cloud_agent.storage._sql.compute_admission import host_compute_admission
 from cloud_agent_shared.sandbox_archive_settings import SANDBOX_ARCHIVE_CAPABILITY
 from cloud_agent_shared.sandbox_restore import MAX_RESTORE_ATTEMPTS, SANDBOX_RESTORE_CAPABILITY
@@ -106,6 +108,19 @@ async def _reserve(store: Storage, job: dict, claim: dict, host: str) -> dict:
 
 async def _settled_stopped_group(pool, store: Storage) -> tuple[dict, dict]:
     """One chat that ran a turn on ``runner-a`` and whose container stopped."""
+    job, _ = await _settled_group(store, idle_timeout_seconds=15)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_sandboxes SET state = 'stopped', idle_deadline = NULL WHERE id = $1",
+            "asbx_restore",
+        )
+    group = await store.sandbox.thread_sandbox(thread_id=job["thread_id"])
+    assert group is not None and group["state"] == "stopped"
+    return job, group
+
+
+async def _settled_group(store: Storage, *, idle_timeout_seconds: float) -> tuple[dict, dict]:
+    """One chat that ran a turn on ``runner-a``; its container is still up, idle."""
     await _enable_archives(store)
     await _host(store, "runner-a", _ARCHIVE_HOST)
     job = await _create_job(store)
@@ -136,7 +151,7 @@ async def _settled_stopped_group(pool, store: Storage) -> tuple[dict, dict]:
         job_id=job["id"],
         context_status="live",
         native_session_id="native-restore",
-        idle_timeout_seconds=15,
+        idle_timeout_seconds=idle_timeout_seconds,
         base_sha=job["base_sha"],
     )
     assert await store.attempt_commands.transition(
@@ -146,13 +161,8 @@ async def _settled_stopped_group(pool, store: Storage) -> tuple[dict, dict]:
         from_states=("running",),
         to_state="succeeded",
     )
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE agent_sandboxes SET state = 'stopped', idle_deadline = NULL WHERE id = $1",
-            "asbx_restore",
-        )
     group = await store.sandbox.thread_sandbox(thread_id=job["thread_id"])
-    assert group is not None and group["state"] == "stopped"
+    assert group is not None and group["state"] == "running"
     return job, group
 
 
@@ -703,3 +713,209 @@ async def test_workspace_requests_wait_for_a_cold_group(pool, store: Storage):
     assert await store.sandbox.fence_workspace_start(thread_id=job["thread_id"]) == "cold"
     # The fence never discards the checkpoint a cold group is restored from.
     assert (await _state(pool))["restore_checkpoint_id"] == "c" * 32
+
+
+# ── Removing a host that still runs a group ─────────────────────────────
+
+
+def _observed(job: dict, group: dict) -> dict[str, Any]:
+    """The group as its host reports it on a heartbeat."""
+    return {
+        "thread_id": job["thread_id"],
+        "host": "runner-a",
+        "sandbox_id": group["sandbox_id"],
+        "container_id": "container-a",
+        "sandbox_generation": group["generation"],
+    }
+
+
+def _left_bound(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "agent_host_removed_with_live_sandboxes"
+    ]
+
+
+async def test_removing_a_host_waits_for_its_idle_running_group(pool, store: Storage):
+    """No turn holds a slot, but the group's container is up: revoking now would strand it."""
+    _, group = await _settled_group(store, idle_timeout_seconds=1800)
+    assert (await store.host_pool.get_host(host="runner-a"))["slots_used"] == 0
+
+    assert await store.host_pool.remove_host(host="runner-a") == "draining"
+
+    host = await store.host_pool.get_host(host="runner-a")
+    assert host["status"] == "draining"
+    assert host["removal_requested_at"] is not None
+    assert host["enrolled"] is True
+    assert await store.host_pool.finish_host_removals() == []
+    assert (await _state(pool, group["sandbox_id"]))["state"] == "running"
+
+
+async def test_a_removing_hosts_idle_group_is_stopped_on_its_next_beat(pool, store: Storage):
+    job, group = await _settled_group(store, idle_timeout_seconds=1800)
+    observed = _observed(job, group)
+    # Idle, with half an hour left before its own deadline.
+    assert await store.sandbox.due_thread_sandbox_stop(**observed) is None
+
+    assert await store.host_pool.remove_host(host="runner-a") == "draining"
+
+    due = await store.sandbox.due_thread_sandbox_stop(**observed)
+    assert due is not None
+    assert due["reason"] == "idle"
+    assert due["generation"] == group["generation"]
+    # Only an idle group: one with a workspace operation open keeps running.
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_sandboxes SET active_operation_count = 1 WHERE id = $1",
+            group["sandbox_id"],
+        )
+    assert await store.sandbox.due_thread_sandbox_stop(**observed) is None
+
+
+async def test_a_removal_finishes_once_its_group_stopped_under_a_checkpoint(pool, store: Storage):
+    job, group = await _settled_group(store, idle_timeout_seconds=1800)
+    follow_up = await store.conversation_commands.create_follow_up(
+        parent_job_id=job["id"], user_id="user-1", prompt="continue"
+    )
+    assert follow_up is not None
+    assert await store.host_pool.remove_host(host="runner-a") == "draining"
+
+    # The container is down, but the host is still archiving it and taking
+    # the checkpoint: the removal must not go ahead in between.
+    await store.sandbox.reconcile_thread_sandbox_observation(
+        **_observed(job, group), running=False, activity_active=True
+    )
+    assert (await _state(pool))["state"] == "running"
+    assert await store.host_pool.finish_host_removals() == []
+
+    # The beat after the stop finished carries the checkpoint of that stop.
+    await store.sandbox.reconcile_thread_sandbox_observation(
+        **_observed(job, group), running=False, activity_active=False
+    )
+    assert await store.sandbox.record_sandbox_checkpoint(
+        host="runner-a", thread_id=job["thread_id"], checkpoint=_receipt(group, job)
+    )
+    stopped = await _state(pool)
+    assert stopped["state"] == "stopped"
+    assert stopped["restore_checkpoint_id"] == "c" * 32
+
+    assert await store.host_pool.finish_host_removals() == ["runner-a"]
+    assert (await store.host_pool.get_host(host="runner-a"))["status"] == "disabled"
+    assert (await _state(pool))["state"] == "cold"
+
+    await _host(store, "runner-c", _RESTORE_HOST)
+    claim = await _claim(store, "runner-c", _RESTORE_HOST)
+    assert claim is not None and claim["id"] == follow_up["id"]
+    assert claim["thread_sandbox"]["state"] == "restoring"
+    assert claim["thread_sandbox"]["host"] == "runner-c"
+
+
+async def test_a_checkpoint_landing_after_the_revocation_still_moves_the_group(
+    pool, store: Storage
+):
+    """A beat authenticated before the revocation may finish writing after it."""
+    job, group = await _settled_group(store, idle_timeout_seconds=1800)
+    assert await store.host_pool.remove_host(host="runner-a") == "draining"
+    await store.sandbox.reconcile_thread_sandbox_observation(
+        **_observed(job, group), running=False, activity_active=False
+    )
+    # The pass lands between that beat's stop and the checkpoint it carries.
+    assert await store.host_pool.finish_host_removals() == ["runner-a"]
+    assert (await _state(pool))["state"] == "stopped"
+    assert await store.sandbox.record_sandbox_checkpoint(
+        host="runner-a", thread_id=job["thread_id"], checkpoint=_receipt(group, job)
+    )
+
+    assert await store.host_pool.finish_host_removals() == []
+
+    assert (await _state(pool))["state"] == "cold"
+
+
+async def test_a_removal_does_not_wait_for_a_host_that_stopped_beating(
+    pool, store: Storage, caplog: pytest.LogCaptureFixture
+):
+    """Only a heartbeat delivers the stop, so there is nothing to wait for."""
+    _, group = await _settled_group(store, idle_timeout_seconds=1800)
+    assert await store.host_pool.remove_host(host="runner-a") == "draining"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_runner_hosts SET last_heartbeat_at = NOW() - INTERVAL '10 minutes' "
+            "WHERE host = 'runner-a'"
+        )
+
+    with caplog.at_level(logging.WARNING):
+        assert await store.host_pool.finish_host_removals() == ["runner-a"]
+
+    assert (await store.host_pool.get_host(host="runner-a"))["status"] == "disabled"
+    # As before the wait: the group stays bound to the removed host, and says so.
+    state = await _state(pool)
+    assert state["state"] == "running" and state["host"] == "runner-a"
+    (left,) = _left_bound(caplog)
+    assert left.host == "runner-a"
+    assert left.reason == "host_not_heartbeating"
+    assert left.sandbox_ids == [group["sandbox_id"]]
+
+
+async def test_removing_a_host_that_stopped_beating_revokes_it_at_once(
+    pool, store: Storage, caplog: pytest.LogCaptureFixture
+):
+    _, group = await _settled_group(store, idle_timeout_seconds=1800)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_runner_hosts SET last_heartbeat_at = NOW() - INTERVAL '10 minutes' "
+            "WHERE host = 'runner-a'"
+        )
+
+    with caplog.at_level(logging.WARNING):
+        assert await store.host_pool.remove_host(host="runner-a") == "ok"
+
+    assert (await store.host_pool.get_host(host="runner-a"))["status"] == "disabled"
+    (left,) = _left_bound(caplog)
+    assert left.sandbox_ids == [group["sandbox_id"]]
+
+
+async def test_a_removal_stops_waiting_once_its_limit_has_passed(
+    pool, store: Storage, caplog: pytest.LogCaptureFixture
+):
+    _, group = await _settled_group(store, idle_timeout_seconds=1800)
+    assert await store.host_pool.remove_host(host="runner-a") == "draining"
+    overdue = timedelta(seconds=HOST_REMOVAL_STOP_WAIT_S + 60)
+
+    # Asked for long ago, but the host's last turn ended just now: that
+    # turn's group has had no time to stop, so the wait counts from there.
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_runner_hosts "
+            "SET removal_requested_at = removal_requested_at - $1::interval "
+            "WHERE host = 'runner-a'",
+            overdue,
+        )
+    assert await store.host_pool.finish_host_removals() == []
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_attempts SET finished_at = finished_at - $1::interval "
+            "WHERE host_id = 'runner-a'",
+            overdue,
+        )
+    with caplog.at_level(logging.WARNING):
+        assert await store.host_pool.finish_host_removals() == ["runner-a"]
+
+    assert (await store.host_pool.get_host(host="runner-a"))["status"] == "disabled"
+    assert (await _state(pool))["state"] == "running"
+    (left,) = _left_bound(caplog)
+    assert left.reason == "stop_wait_exceeded"
+    assert left.sandbox_ids == [group["sandbox_id"]]
+
+
+async def test_a_forced_removal_of_a_host_running_a_group_revokes_at_once(pool, store: Storage):
+    await _settled_group(store, idle_timeout_seconds=1800)
+
+    assert await store.host_pool.remove_host(host="runner-a", force=True) == "ok"
+
+    host = await store.host_pool.get_host(host="runner-a")
+    assert host["status"] == "disabled"
+    assert host["removal_requested_at"] is None
+    state = await _state(pool)
+    assert state["state"] == "running" and state["host"] == "runner-a"

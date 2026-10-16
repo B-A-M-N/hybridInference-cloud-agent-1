@@ -187,7 +187,10 @@ export interface AgentRunnerHost {
   drain_fence_active?: boolean;
   /** Required V2 CAS generation, rotated whenever drain-relevant host state changes. */
   drain_fence_epoch: string;
-  /** True while a Remove waits for this draining host's running attempts to end. */
+  /**
+   * True while a Remove waits for this draining host's running attempts to end
+   * and its running sandboxes to stop.
+   */
   removal_pending?: boolean;
   /**
    * True when the host redeemed an enrollment token, which is the difference
@@ -541,12 +544,13 @@ export async function setAgentRunnerHostSettings(
  *
  * Unforced, a busy host is not revoked yet: it stops taking new work, reports
  * `removal_pending`, and the control plane revokes it once its running
- * attempts end.
+ * attempts end and its running sandboxes have stopped, so their chats can
+ * continue on another host.
  *
  * `force` is off by default for a reason worth repeating at the call site:
  * attempts still running on that host are ended. Their leases expire at once,
  * and the work is requeued exactly once, or a chat whose turn may already have
- * run is marked lost.
+ * run is marked lost. A sandbox still running stays on the removed host.
  */
 export async function removeAgentRunnerHost(
   host: string,
