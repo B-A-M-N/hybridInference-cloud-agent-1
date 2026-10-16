@@ -1,0 +1,398 @@
+bringing up nodes...
+bringing up nodes...
+
+........................................................................ [  0%]
+........................................................................ [  1%]
+........................................................................ [  1%]
+........................................................................ [  2%]
+..........................................ssssss........................ [  3%]
+........................................................................ [  3%]
+........................................................................ [  4%]
+........................................................................ [  5%]
+........................................................................ [  5%]
+........................................................................ [  6%]
+........................................................................ [  7%]
+........................................................................ [  7%]
+........................................................................ [  8%]
+........................................................................ [  9%]
+........................................................................ [  9%]
+........................................................................ [ 10%]
+........................................................................ [ 11%]
+........................................................................ [ 11%]
+........................................................................ [ 12%]
+........................................................................ [ 13%]
+........................................................................ [ 13%]
+........................................................................ [ 14%]
+........................................................................ [ 15%]
+........................................................................ [ 15%]
+........................................................................ [ 16%]
+........................................................................ [ 17%]
+........................................................................ [ 17%]
+........................................................................ [ 18%]
+........................................................................ [ 19%]
+........................................................................ [ 19%]
+........................................................................ [ 20%]
+........................................................................ [ 21%]
+........................................................................ [ 21%]
+........................................................................ [ 22%]
+........................................................................ [ 23%]
+........................................................................ [ 23%]
+........................................................................ [ 24%]
+........................................................................ [ 25%]
+........................................................................ [ 25%]
+........................................................................ [ 26%]
+........................................................................ [ 27%]
+........................................................................ [ 27%]
+........................................................................ [ 28%]
+........................................................................ [ 29%]
+........................................................................ [ 29%]
+........................................................................ [ 30%]
+........................................................................ [ 31%]
+........................................................................ [ 31%]
+........................................................................ [ 32%]
+........................................................................ [ 33%]
+..............................................F......................... [ 33%]
+........................................................................ [ 34%]
+........................................................................ [ 35%]
+........................................................................ [ 35%]
+........................................................................ [ 36%]
+........................................................................ [ 37%]
+........................................................................ [ 37%]
+........................................................................ [ 38%]
+........................................................................ [ 39%]
+........................................................................ [ 39%]
+........................................................................ [ 40%]
+........................................................................ [ 41%]
+........................................................................ [ 41%]
+........................................................................ [ 42%]
+........................................................................ [ 43%]
+........................................................................ [ 43%]
+........................................................................ [ 44%]
+........................................................................ [ 45%]
+........................................................................ [ 45%]
+........................................................................ [ 46%]
+........................................................................ [ 47%]
+........................................................................ [ 47%]
+........................................................................ [ 48%]
+........................................................................ [ 48%]
+........................................................................ [ 49%]
+........................................................................ [ 50%]
+........................................................................ [ 50%]
+........................................................................ [ 51%]
+........................................................................ [ 52%]
+........................................................................ [ 52%]
+........................................................................ [ 53%]
+........................................................................ [ 54%]
+........................................................................ [ 54%]
+........................................................................ [ 55%]
+........................................................................ [ 56%]
+........................................................................ [ 56%]
+........................................................................ [ 57%]
+........................................................................ [ 58%]
+........................................................................ [ 58%]
+........................................................................ [ 59%]
+........................................................................ [ 60%]
+........................................................................ [ 60%]
+........................................................................ [ 61%]
+........................................................................ [ 62%]
+........................................................................ [ 62%]
+........................................................................ [ 63%]
+........................................................................ [ 64%]
+........................................................................ [ 64%]
+........................................................................ [ 65%]
+........................................................................ [ 66%]
+........................................................................ [ 66%]
+........................................................................ [ 67%]
+........................................................................ [ 68%]
+........................................................................ [ 68%]
+........................................................................ [ 69%]
+........................................................................ [ 70%]
+........................................................................ [ 70%]
+........................................................................ [ 71%]
+........................................................................ [ 72%]
+........................................................................ [ 72%]
+........................................................................ [ 73%]
+........................................................................ [ 74%]
+........................................................................ [ 74%]
+........................................................................ [ 75%]
+........................................................................ [ 76%]
+........................................................................ [ 76%]
+........................................................................ [ 77%]
+........................................................................ [ 78%]
+........................................................................ [ 78%]
+........................................................................ [ 79%]
+........................................................................ [ 80%]
+........................................................................ [ 80%]
+........................................................................ [ 81%]
+........................................................................ [ 82%]
+........................................................................ [ 82%]
+........................................................................ [ 83%]
+........................................................................ [ 84%]
+........................................................................ [ 84%]
+........................................................................ [ 85%]
+........................................................................ [ 86%]
+........................................................................ [ 86%]
+........................................................................ [ 87%]
+........................................................................ [ 88%]
+........................................................................ [ 88%]
+........................................................................ [ 89%]
+........................................................................ [ 90%]
+........................................................................ [ 90%]
+........................................................................ [ 91%]
+........................................................................ [ 92%]
+........................................................................ [ 92%]
+........................................................................ [ 93%]
+........................................................................ [ 94%]
+........................................................................ [ 94%]
+........................................................................ [ 95%]
+........................................................................ [ 95%]
+........................................................................ [ 96%]
+........................................................................ [ 97%]
+........................................................................ [ 97%]
+........................................................................ [ 98%]
+........................................................................ [ 99%]
+E.EEE............................................................F...... [ 99%]
+....                                                                     [100%]
+==================================== ERRORS ====================================
+___________ ERROR at setup of test_mypy_rejects_the_miswired_fixture ___________
+[gw3] linux -- Python 3.13.13 /tmp/hica-mcp-current-9e5ea9c6/.venv/bin/python
+
+pytestconfig = <_pytest.config.Config object at 0x6fff0bc00590>
+worker_id = 'gw3'
+
+    @pytest.fixture(scope="module")
+    def mypy_run(pytestconfig: pytest.Config, worker_id: str) -> subprocess.CompletedProcess[str]:
+        """Run mypy once over the fixture, with the project's own configuration."""
+        # Mypy invalidates changed source/configuration itself. Reuse its import
+        # cache across runs without sharing the production gate's cache, and keep
+        # concurrent pytest workers from writing the same cache files.
+>       cache = pytestconfig.cache.mkdir("mypy-negative") / worker_id
+                ^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'Config' object has no attribute 'cache'
+
+tests/unit/test_storage_ports_gate.py:51: AttributeError
+____ ERROR at setup of test_each_negative_case_is_reported[missing member] _____
+[gw3] linux -- Python 3.13.13 /tmp/hica-mcp-current-9e5ea9c6/.venv/bin/python
+
+pytestconfig = <_pytest.config.Config object at 0x6fff0bc00590>
+worker_id = 'gw3'
+
+    @pytest.fixture(scope="module")
+    def mypy_run(pytestconfig: pytest.Config, worker_id: str) -> subprocess.CompletedProcess[str]:
+        """Run mypy once over the fixture, with the project's own configuration."""
+        # Mypy invalidates changed source/configuration itself. Reuse its import
+        # cache across runs without sharing the production gate's cache, and keep
+        # concurrent pytest workers from writing the same cache files.
+>       cache = pytestconfig.cache.mkdir("mypy-negative") / worker_id
+                ^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'Config' object has no attribute 'cache'
+
+tests/unit/test_storage_ports_gate.py:51: AttributeError
+_ ERROR at setup of test_each_negative_case_is_reported[wrong keyword, every member present] _
+[gw3] linux -- Python 3.13.13 /tmp/hica-mcp-current-9e5ea9c6/.venv/bin/python
+
+pytestconfig = <_pytest.config.Config object at 0x6fff0bc00590>
+worker_id = 'gw3'
+
+    @pytest.fixture(scope="module")
+    def mypy_run(pytestconfig: pytest.Config, worker_id: str) -> subprocess.CompletedProcess[str]:
+        """Run mypy once over the fixture, with the project's own configuration."""
+        # Mypy invalidates changed source/configuration itself. Reuse its import
+        # cache across runs without sharing the production gate's cache, and keep
+        # concurrent pytest workers from writing the same cache files.
+>       cache = pytestconfig.cache.mkdir("mypy-negative") / worker_id
+                ^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'Config' object has no attribute 'cache'
+
+tests/unit/test_storage_ports_gate.py:51: AttributeError
+_ ERROR at setup of test_each_negative_case_is_reported[row offered where a capability was required] _
+[gw3] linux -- Python 3.13.13 /tmp/hica-mcp-current-9e5ea9c6/.venv/bin/python
+
+pytestconfig = <_pytest.config.Config object at 0x6fff0bc00590>
+worker_id = 'gw3'
+
+    @pytest.fixture(scope="module")
+    def mypy_run(pytestconfig: pytest.Config, worker_id: str) -> subprocess.CompletedProcess[str]:
+        """Run mypy once over the fixture, with the project's own configuration."""
+        # Mypy invalidates changed source/configuration itself. Reuse its import
+        # cache across runs without sharing the production gate's cache, and keep
+        # concurrent pytest workers from writing the same cache files.
+>       cache = pytestconfig.cache.mkdir("mypy-negative") / worker_id
+                ^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'Config' object has no attribute 'cache'
+
+tests/unit/test_storage_ports_gate.py:51: AttributeError
+=================================== FAILURES ===================================
+_______________ test_a_partly_spent_fence_shrinks_the_call_bound _______________
+[gw2] linux -- Python 3.13.13 /tmp/hica-mcp-current-9e5ea9c6/.venv/bin/python
+
+tmp_path = PosixPath('/tmp/hica-mcp-current-9e5ea9c6/.pytest-full-nohooks/popen-gw2/test_a_partly_spent_fence_shri0')
+
+    def test_a_partly_spent_fence_shrinks_the_call_bound(tmp_path: Path) -> None:
+        """The per-call bound is what is left of the fence, not a flat eight seconds.
+    
+        A rollout with a few seconds of fence left cannot afford an eight-second
+        call, and making one is how the fence is missed even though every single
+        call is "bounded". This is the case the first version of the fix got wrong:
+        it bounded each call at eight seconds and only checked the budget between
+        phases, so a two-second fence still cost eight.
+    
+        The fence is wide enough that the checks running before the attestation
+        cannot consume all of it. At four seconds this test asserted nothing
+        whenever the machine was loaded: the script would correctly skip the
+        attestation, and the assertions would be about calls that never happened.
+        """
+        env = _storage_host(tmp_path, storage_hang=True)
+        _add_required_host_paths(env, tmp_path)
+        with (Path(env["APP_DIR"]) / ".env").open("a") as dotenv:
+            dotenv.write("SHARED_READY_TIMEOUT=6\n")
+    
+        started = time.monotonic()
+        result = _run(env, "up")
+        elapsed = time.monotonic() - started
+    
+        assert result.returncode == 0, result.stderr
+        assert _verdict(env)["entries"] == {}
+        budgets = [int(line.split()[0]) for line in _budgets_the_script_asked_for(tmp_path)]
+        assert budgets, "the attestation made no call, so this asserts nothing"
+        assert max(budgets) < 8, f"a call was handed the flat bound: {budgets}"
+>       assert elapsed < 10, f"the attestation took {elapsed:.1f}s inside a six-second fence"
+E       AssertionError: the attestation took 10.1s inside a six-second fence
+E       assert 10.119767609023256 < 10
+
+tests/unit/test_retained_deploy.py:1989: AssertionError
+________ test_interpreter_exit_drains_a_record_still_waiting_to_publish ________
+[gw0] linux -- Python 3.13.13 /tmp/hica-mcp-current-9e5ea9c6/.venv/bin/python
+
+tmp_path = PosixPath('/tmp/hica-mcp-current-9e5ea9c6/.pytest-full-nohooks/popen-gw0/test_interpreter_exit_drains_a0')
+
+    def test_interpreter_exit_drains_a_record_still_waiting_to_publish(tmp_path):
+        """Normal process exit delivers a finished sample without a caller flushing."""
+        sink = tmp_path / "shutdown-records.jsonl"
+        run_id = "interpreter-exit-run"
+        descriptor = {
+            "run_id": run_id,
+            "operations": [profiling.STARTUP_OPERATION],
+            "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+            "max_operations": 1,
+            "target": {"host": "shutdown-host"},
+        }
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONPATH": os.pathsep.join(
+                filter(
+                    None,
+                    [
+                        str(Path(profiling.__file__).resolve().parents[1]),
+                        os.environ.get("PYTHONPATH", ""),
+                    ],
+                )
+            ),
+            profiling.ENV_PROFILING_MODE: profiling.MODE_ENVIRONMENT,
+            profiling.ENV_PROFILING_ENABLED: "true",
+            profiling.ENV_PROFILING_RUN: json.dumps(descriptor),
+            profiling.ENV_PROFILING_SINK: str(sink),
+        }
+    
+        completed = subprocess.run(
+            [sys.executable, "-c", _CHILD_SCRIPT],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    
+>       assert completed.returncode == 0, completed.stderr
+E       AssertionError: Exception in thread operation-profile-sink:
+E         Traceback (most recent call last):
+E           File "/home/bamn/miniconda3/lib/python3.13/threading.py", line 1044, in _bootstrap_inner
+E             self.run()
+E             ~~~~~~~~^^
+E           File "/home/bamn/miniconda3/lib/python3.13/threading.py", line 995, in run
+E             self._target(*self._args, **self._kwargs)
+E             ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           File "/tmp/hica-mcp-current-9e5ea9c6/apps/backend/cloud_agent_shared/profiling/export.py", line 92, in _run
+E             self._publish(line, sink)
+E             ~~~~~~~~~~~~~^^^^^^^^^^^^
+E           File "/tmp/hica-mcp-current-9e5ea9c6/apps/backend/cloud_agent_shared/profiling/export.py", line 99, in _publish
+E             logger.info("agent_operation_profile %s", line)
+E             ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           File "/home/bamn/miniconda3/lib/python3.13/logging/__init__.py", line 1520, in info
+E             self._log(INFO, msg, args, **kwargs)
+E             ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           File "/home/bamn/miniconda3/lib/python3.13/logging/__init__.py", line 1665, in _log
+E             self.handle(record)
+E             ~~~~~~~~~~~^^^^^^^^
+E           File "/home/bamn/miniconda3/lib/python3.13/logging/__init__.py", line 1681, in handle
+E             self.callHandlers(record)
+E             ~~~~~~~~~~~~~~~~~^^^^^^^^
+E           File "/home/bamn/miniconda3/lib/python3.13/logging/__init__.py", line 1737, in callHandlers
+E             hdlr.handle(record)
+E             ~~~~~~~~~~~^^^^^^^^
+E           File "/home/bamn/miniconda3/lib/python3.13/logging/__init__.py", line 1026, in handle
+E             with self.lock:
+E                  ^^^^^^^^^
+E         TypeError: 'NoneType' object does not support the context manager protocol
+E         Traceback (most recent call last):
+E           File "<string>", line 39, in <module>
+E             assert publishing.wait(5), "the finished record never reached publication"
+E                    ~~~~~~~~~~~~~~~^^^
+E         AssertionError: the finished record never reached publication
+E         
+E       assert 1 == 0
+E        +  where 1 = CompletedProcess(args=['/tmp/hica-mcp-current-9e5ea9c6/.venv/bin/python', '-c', '\nimport atexit\nimport logging\nimpo... reached publication"\n           ~~~~~~~~~~~~~~~^^^\nAssertionError: the finished record never reached publication\n').returncode
+
+tests/unit/test_operation_profiling_shutdown.py:99: AssertionError
+=============================== warnings summary ===============================
+.venv/lib/python3.13/site-packages/fastapi/testclient.py:1
+.venv/lib/python3.13/site-packages/fastapi/testclient.py:1
+.venv/lib/python3.13/site-packages/fastapi/testclient.py:1
+.venv/lib/python3.13/site-packages/fastapi/testclient.py:1
+  /tmp/hica-mcp-current-9e5ea9c6/.venv/lib/python3.13/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+tests/unit/test_compute_reconcile.py::test_a_finished_upgrade_lets_an_old_node_rotate
+  /tmp/hica-mcp-current-9e5ea9c6/apps/backend/cloud_agent/application/compute_rotation.py:228: RuntimeWarning: coroutine 'AsyncMockMixin._execute_mock_call' was never awaited
+    if operation.get("state") in {"succeeded", "failed", "cancelled"}:
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/unit/deploy/test_release_manifest.py::test_the_database_revision_is_alembics_head
+tests/unit/deploy/test_release_manifest.py::test_the_upgrade_instructions_name_the_revision_this_release_migrates_to[ENVIRONMENT.md-Run `alembic upgrade head` \\(through `([^`]+)`\\)]
+tests/unit/deploy/test_release_manifest.py::test_the_upgrade_instructions_name_the_revision_this_release_migrates_to[docs/developer/upgrade-notes.md-run `alembic upgrade head` through\\s+`([^`]+)`]
+tests/unit/deploy/test_release_manifest.py::test_the_cli_writes_a_manifest
+tests/unit/deploy/test_release_manifest.py::test_the_cli_writes_a_manifest
+tests/unit/deploy/test_release_manifest.py::test_a_schema_invalid_manifest_is_never_written
+  /tmp/hica-mcp-current-9e5ea9c6/.venv/lib/python3.13/site-packages/alembic/config.py:612: DeprecationWarning: No path_separator found in configuration; falling back to legacy splitting on spaces, commas, and colons for prepend_sys_path.  Consider adding path_separator=os to Alembic config.
+    util.warn_deprecated(
+
+tests/unit/test_source_control_runtime.py::test_the_lifespan_hands_the_loops_the_provider_not_a_snapshot
+  /tmp/hica-mcp-current-9e5ea9c6/apps/backend/cloud_agent/storage/repositories/sandbox.py:1133: RuntimeWarning: coroutine 'AsyncMockMixin._execute_mock_call' was never awaited
+    async with self._pool.acquire() as conn, conn.transaction():
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/unit/test_retained_terminal_shell.py::test_bash_runs_every_command_in_the_group_the_pidfile_names
+tests/unit/test_retained_terminal_shell.py::test_bash_has_history_and_completion
+tests/unit/test_retained_terminal_shell.py::test_ctrl_z_cannot_freeze_the_terminal
+tests/unit/test_retained_terminal_shell.py::test_exit_reports_the_shells_status_even_after_ctrl_c
+tests/unit/test_retained_terminal_shell.py::test_without_bash_the_sh_wrapper_survives_ctrl_c
+  /home/bamn/miniconda3/lib/python3.13/pty.py:95: DeprecationWarning: This process (pid=4066318) is multi-threaded, use of forkpty() may lead to deadlocks in the child.
+    pid, fd = os.forkpty()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] tests/unit/test_shared_session_supervisor.py:2565: switching to the sandbox and member UIDs needs root and setpriv
+SKIPPED [2] tests/unit/test_shared_session_supervisor.py:2599: switching to the sandbox and member UIDs needs root and setpriv
+SKIPPED [1] tests/unit/test_shared_session_supervisor.py:2667: switching to the sandbox and member UIDs needs root and setpriv
+SKIPPED [1] tests/unit/test_shared_session_supervisor.py:2706: switching to the sandbox and member UIDs needs root and setpriv
+SKIPPED [1] tests/unit/test_shared_session_supervisor.py:2736: switching to the sandbox and member UIDs needs root and setpriv
+ERROR tests/unit/test_storage_ports_gate.py::test_mypy_rejects_the_miswired_fixture
+ERROR tests/unit/test_storage_ports_gate.py::test_each_negative_case_is_reported[missing member]
+ERROR tests/unit/test_storage_ports_gate.py::test_each_negative_case_is_reported[wrong keyword, every member present]
+ERROR tests/unit/test_storage_ports_gate.py::test_each_negative_case_is_reported[row offered where a capability was required]
+FAILED tests/unit/test_retained_deploy.py::test_a_partly_spent_fence_shrinks_the_call_bound
+FAILED tests/unit/test_operation_profiling_shutdown.py::test_interpreter_exit_drains_a_record_still_waiting_to_publish
+2 failed, 10864 passed, 6 skipped, 17 warnings, 4 errors in 719.44s (0:11:59)
