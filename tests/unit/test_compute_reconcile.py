@@ -1679,6 +1679,8 @@ async def test_unknown_acquisition_receipt_keeps_safe_provider_diagnostics(monke
     await h.reconciler.execute(h.operation)
     h.provider.acquire.assert_awaited_once()
     assert h.operation["state"] == "unknown"
+
+
 def _move_out_hold(h):
     h.repository.set_move_out_hold.assert_awaited_once()
     return h.repository.set_move_out_hold.await_args.kwargs
