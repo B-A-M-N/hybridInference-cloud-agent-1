@@ -854,8 +854,18 @@ async def test_a_group_its_checkpoint_does_not_cover_stays_on_its_host(
     if spoil == "started_after":
         # Opening the workspace starts the container after the checkpoint.
         assert await store.sandbox.fence_workspace_start(thread_id=job["thread_id"]) == "stopped"
-
-    assert await store.host_pool.remove_host(host="runner-a") == "ok"
+        # The removal waits for the host to report that start. No report
+        # comes, and once the window has passed it goes ahead.
+        assert await store.host_pool.remove_host(host="runner-a") == "draining"
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE agent_sandboxes "
+                "SET last_activity_at = last_activity_at - INTERVAL '10 minutes' WHERE id = $1",
+                group["sandbox_id"],
+            )
+        assert await store.host_pool.finish_host_removals() == ["runner-a"]
+    else:
+        assert await store.host_pool.remove_host(host="runner-a") == "ok"
 
     state = await _state(pool)
     assert state["state"] == "stopped"

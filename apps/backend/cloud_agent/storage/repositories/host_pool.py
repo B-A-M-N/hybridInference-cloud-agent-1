@@ -266,10 +266,12 @@ async def _groups_left_by_removal(conn: Any, host: str) -> tuple[list[str], str 
     A stopped group counts as live while something may be starting its
     container, which the host reports only on a later beat: a capture or a
     Fork while it runs, and for a while after a workspace request fenced the
-    checkpoint that covered the group (the fence stamps its activity). Revoked
-    then, the group would be left without the checkpoint that carries it to
-    another host, and its container would start on a host that can no longer
-    report it. A group no checkpoint covered stays on this host either way.
+    checkpoint that covered the group. The fence stamps the group's activity,
+    so that is activity after the checkpoint arrived, with the start sequence
+    past it. Revoked then, the group would be left without the checkpoint that
+    carries it to another host, and its container would start on a host that
+    can no longer report it. A group no checkpoint covered stays on this host
+    either way.
 
     Read under the caller's host-row lock, and taking no lock of its own.
     """
@@ -293,6 +295,7 @@ async def _groups_left_by_removal(conn: Any, host: str) -> tuple[list[str], str 
                                        AND c.generation = g.generation
                                        AND c.container_id = g.container_id
                                        AND c.start_seq < g.start_seq
+                                       AND c.recorded_at < g.last_activity_at
                                  )
                              )
                          ))
