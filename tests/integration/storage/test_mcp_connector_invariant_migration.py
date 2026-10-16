@@ -83,8 +83,7 @@ def test_mcp_connector_invariant_revision_follows_trajectory_merge() -> None:
         script.get_revision("0081_snapshot_pushed_commit").down_revision == "0080_user_ssh_servers"
     )
     assert (
-        script.get_revision("0082_team_environments").down_revision
-        == "0081_snapshot_pushed_commit"
+        script.get_revision("0082_team_environments").down_revision == "0081_snapshot_pushed_commit"
     )
     assert script.get_revision(_UPSTREAM_HEAD).down_revision == "0082_team_environments"
     assert script.get_revision(_DIRECT_WRITE).down_revision == _UPSTREAM_HEAD
