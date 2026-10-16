@@ -742,6 +742,10 @@ observation or new admitted work makes the entry visible again. Restore the
 sandbox manager connection to complete S3 archival and physical deletion.
 
 The details show progress, archive location, checksum, size, and any failure.
+They also show up to 50 durable worker attempts with a correlation ID, attempt
+number, stage, outcome, safe failure code, and retry class. Use the correlation
+ID to match an attempt to control-plane logs. The attempt record excludes raw
+sandbox-manager responses, exception text, upload URLs, and host credentials.
 Chat history, memberships, execution records, and audit receipts remain in the
 database. Deleted native sessions cannot resume; this operation does not add
 automatic recovery from S3. **Remove from inventory** is a separate reversible
