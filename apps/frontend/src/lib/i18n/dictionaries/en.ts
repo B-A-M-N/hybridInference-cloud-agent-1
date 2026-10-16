@@ -314,7 +314,7 @@ export const en = {
   'composer.queue': 'Queue',
   'composer.queueHint': 'Send after the current turn finishes',
   'composer.steer': 'Steer now',
-  'composer.steerHint': 'Send into the current turn — ⌘Enter / Ctrl+Enter',
+  'composer.steerHint': 'Send into the current turn — {keys}',
   'deployment.version': 'Version',
   'deployment.date': 'Deployed',
   'deployment.unavailable': 'Not available',
@@ -541,7 +541,7 @@ export const en = {
   'settings.shortcuts.description':
     'Customize navigation shortcuts. Changes apply immediately and are saved for your account in this browser.',
   'settings.shortcuts.recordingHelp':
-    'Click a shortcut and press Command or Ctrl with a letter, optionally with Shift. Press Esc to cancel.',
+    'Click a shortcut and press {modifier} with a letter, optionally with Shift. Press Esc to cancel.',
   'settings.shortcuts.search': 'Search chats',
   'settings.shortcuts.searchHelp': 'Focus search while the task list is expanded.',
   'settings.shortcuts.sidebar': 'Toggle task list',
@@ -555,7 +555,7 @@ export const en = {
   'settings.shortcuts.disable': 'Disable',
   'settings.shortcuts.disableAction': 'Disable shortcut for {action}',
   'settings.shortcuts.reset': 'Reset to defaults',
-  'settings.shortcuts.invalid': 'Use Command or Ctrl with a letter, optionally with Shift.',
+  'settings.shortcuts.invalid': 'Use {modifier} with a letter, optionally with Shift.',
   'settings.shortcuts.reserved':
     'This combination is reserved for editing or browser controls. Choose another.',
   'settings.shortcuts.conflict': 'Already used by “{action}”. Choose another shortcut.',
@@ -1147,7 +1147,7 @@ export const en = {
   'queue.countOne': '1 pending',
   'queue.countMany': '{count} pending',
   'queue.afterThisTurn': 'sent after this turn',
-  'queue.steerHint': '⌘/Ctrl+↵ to add to this turn',
+  'queue.steerHint': '{keys} to add to this turn',
   'queue.state.editing': 'Editing',
   'queue.state.refused': 'Not sent',
   'queue.state.sending': 'Adding',

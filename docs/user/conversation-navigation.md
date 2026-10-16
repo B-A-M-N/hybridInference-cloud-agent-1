@@ -121,9 +121,10 @@ the page's reading position; reloading opens at the end again.
 
 ## Workspace navigation
 
-Open the workspace from the header or with Ctrl/Command+J. On smaller screens,
-**Back to conversation** returns to Chat and preserves the selected workspace
-view. The task title and controls adapt to the space left by the sidebar.
+Open the workspace from the header, or with Command+J on a Mac and Ctrl+J
+elsewhere. On smaller screens, **Back to conversation** returns to Chat and
+preserves the selected workspace view. The task title and controls adapt to the
+space left by the sidebar.
 
 Workspace, Git, file-list, and terminal tabs use Left/Right arrows, Home, and End
 to select a view while keeping keyboard focus in the tab strip. Narrow Git panes
