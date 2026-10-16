@@ -11,28 +11,37 @@ only from this module's handlers.
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import ValidationError
 
 from cloud_agent.api._owner_auth import require_agent_owner
 from cloud_agent.api.deps import (
     get_agent_app_credentials,
     get_agent_gitlab_oauth,
+    get_client_ip,
     get_github_app_state,
     get_gitlab_load_status,
     get_storage,
     require_store,
 )
-from cloud_agent.entitlement import RepoNotAllowed, repos_for_user, require_entitled_repo
+from cloud_agent.entitlement import (
+    REPO_PATTERN,
+    RepoNotAllowed,
+    repos_for_user,
+    require_entitled_repo,
+)
 from cloud_agent.github_app import (
+    AppNotInstalled,
     GitHubAppError,
     RepositoryCreationError,
     UserAuthorizationRevoked,
 )
 from cloud_agent.github_user_token import (
+    LiveUserToken,
     UserTokenUnavailable,
     forget_revoked_token,
     user_access_token,
@@ -47,6 +56,8 @@ from cloud_agent.schemas import (
     McpIntegrationResponse,
     OAuthConnectRequest,
     RepoBranchesResponse,
+    RepositoryDirectWritePolicyResponse,
+    RepositoryDirectWriteUpdate,
     SourceControlAccount,
     SourceControlIntegrationsResponse,
     SourceControlProviderResponse,
@@ -220,6 +231,240 @@ async def create_github_repository(
         extra={"event": "agent_github_repository_created", "accessible": result.accessible},
     )
     return result
+
+
+async def _verified_repository_admin(
+    repo: str,
+    *,
+    user_id: str,
+    store: _SourceControlStorage,
+    app_credentials: Any | None,
+) -> dict[str, Any]:
+    """Resolve a repo through GitHub and require this linked user to be its admin."""
+    if not app_credentials:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": {"type": "github_unavailable", "message": "GitHub is unavailable."}},
+        )
+    if not re.fullmatch(REPO_PATTERN, repo or ""):
+        raise HTTPException(
+            status_code=422,
+            detail={"error": {"type": "invalid_repository", "message": "Use owner/repository."}},
+        )
+    token: LiveUserToken | None = None
+    try:
+        installation_id = await app_credentials.installation_id_for(repo)
+        grants = await store.source_control.list_repo_grants(user_id=user_id)
+        if not any(int(grant["installation_id"]) == installation_id for grant in grants):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": {
+                        "type": "repository_not_connected",
+                        "message": "Connect this GitHub installation before changing repository write access.",
+                    }
+                },
+            )
+        token = await user_access_token(
+            user_id, store=store.source_control, app_credentials=app_credentials
+        )
+        if token is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": {
+                        "type": "github_reconnect_required",
+                        "message": "Reconnect GitHub before changing repository write access.",
+                    }
+                },
+            )
+        repositories: list[dict[str, Any]] = await app_credentials.repositories_for_user(
+            token.value, installation_id
+        )
+    except HTTPException:
+        raise
+    except AppNotInstalled as exc:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "type": "repository_not_connected",
+                    "message": "Install the GitHub App on this repository before changing direct-write access.",
+                }
+            },
+        ) from exc
+    except UserAuthorizationRevoked as exc:
+        if token is not None:
+            await forget_revoked_token(user_id, token, store=store.source_control)
+        app_credentials.forget_user(user_id)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": {
+                    "type": "github_reconnect_required",
+                    "message": "Reconnect GitHub before changing repository write access.",
+                }
+            },
+        ) from exc
+    except (GitHubAppError, UserTokenUnavailable, SourceControlError, httpx.RequestError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "type": "github_unavailable",
+                    "message": "GitHub could not verify repository access. Try again later.",
+                }
+            },
+        ) from exc
+
+    entry = next(
+        (
+            item
+            for item in repositories
+            if isinstance(item.get("full_name"), str)
+            and item["full_name"].casefold() == repo.casefold()
+        ),
+        None,
+    )
+    if entry is None:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "type": "repository_not_authorized",
+                    "message": "Your linked GitHub account cannot administer this repository through the connected installation.",
+                }
+            },
+        )
+    repository_id = entry.get("id")
+    if not isinstance(repository_id, int) or repository_id <= 0:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "type": "repository_not_authorized",
+                    "message": "Your linked GitHub account cannot administer this repository through the connected installation.",
+                }
+            },
+        )
+    permissions = entry.get("permissions")
+    if not isinstance(permissions, dict) or permissions.get("admin") is not True:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "type": "repository_admin_required",
+                    "message": "A GitHub repository administrator must change direct-write access.",
+                }
+            },
+        )
+    return {
+        "github_repository_id": repository_id,
+        "repository_full_name": entry["full_name"],
+    }
+
+
+async def _revoke_direct_write_tokens(
+    tokens: list[dict[str, Any]], *, store: SourceControlPort, app_credentials: Any
+) -> int:
+    """Revoke persisted tokens and retain only records whose revocation failed."""
+    pending = 0
+    for record in tokens:
+        try:
+            token = app_credentials.direct_write_cipher.decrypt(record["token_ciphertext"])
+            await app_credentials.revoke_installation_token(token)
+        except Exception:
+            pending += 1
+            continue
+        await store.forget_direct_write_token(token_hash=record["token_hash"])
+    return pending
+
+
+def _direct_write_response(
+    policy: dict[str, Any], *, pending: int = 0
+) -> RepositoryDirectWritePolicyResponse:
+    """Build the credential-free public view of one policy revision."""
+    return RepositoryDirectWritePolicyResponse(
+        github_repository_id=int(policy["github_repository_id"]),
+        repository=policy["repository_full_name"],
+        enabled=bool(policy["enabled"]),
+        revision=int(policy["revision"]),
+        updated_by=policy.get("updated_by"),
+        updated_at=policy.get("updated_at"),
+        revocation_pending=pending,
+    )
+
+
+@router.get(
+    "/repositories/{owner}/{name}/direct-write",
+    response_model=RepositoryDirectWritePolicyResponse,
+)
+async def get_repository_direct_write_policy(
+    owner: str,
+    name: str,
+    user: dict[str, Any] = Depends(require_agent_owner),
+    store: _SourceControlStorage | None = Depends(get_storage),
+    app_credentials: Any = Depends(get_agent_app_credentials),
+) -> RepositoryDirectWritePolicyResponse:
+    """Read policy only after GitHub confirms the linked caller administers the repo."""
+    storage = _require_store(store)
+    repo = f"{owner}/{name}"
+    verified = await _verified_repository_admin(
+        repo,
+        user_id=user["user_id"],
+        store=storage,
+        app_credentials=app_credentials,
+    )
+    policy = await storage.source_control.get_direct_write_policy(**verified)
+    pending = await storage.source_control.list_direct_write_tokens(
+        github_repository_id=verified["github_repository_id"]
+    )
+    return _direct_write_response(policy, pending=len(pending))
+
+
+@router.put(
+    "/repositories/{owner}/{name}/direct-write",
+    response_model=RepositoryDirectWritePolicyResponse,
+)
+async def update_repository_direct_write_policy(
+    owner: str,
+    name: str,
+    body: RepositoryDirectWriteUpdate,
+    request: Request,
+    user: dict[str, Any] = Depends(require_agent_owner),
+    store: _SourceControlStorage | None = Depends(get_storage),
+    app_credentials: Any = Depends(get_agent_app_credentials),
+) -> RepositoryDirectWritePolicyResponse:
+    """Set per-repository sandbox write authorization with a GitHub admin check."""
+    storage = _require_store(store)
+    repo = f"{owner}/{name}"
+    verified = await _verified_repository_admin(
+        repo,
+        user_id=user["user_id"],
+        store=storage,
+        app_credentials=app_credentials,
+    )
+    result = await storage.source_control.set_direct_write_policy(
+        **verified,
+        enabled=body.enabled,
+        expected_revision=body.expected_revision,
+        actor_id=user["user_id"],
+        admin_ip=get_client_ip(request),
+    )
+    if result is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": {
+                    "type": "policy_revision_conflict",
+                    "message": "Repository write access changed in another session. Reload before trying again.",
+                }
+            },
+        )
+    pending = await _revoke_direct_write_tokens(
+        result["tokens"], store=storage.source_control, app_credentials=app_credentials
+    )
+    return _direct_write_response(result["policy"], pending=pending)
 
 
 async def _connect_github_for_user(
