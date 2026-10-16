@@ -213,12 +213,13 @@ requirement, and rules 4 and 5 remain permanent service boundaries.
   included, so code a member plants there — a Git hook or `core.fsmonitor`,
   a build or test script — runs with the credentials of whichever member
   executes it next. Spend remains governed by the gateway's per-user quota.
-  The runner also injects a separate short-lived GitHub App
-  token as `GH_TOKEN` in the owning member's environment, restricted to
-  `contents: write` and `pull_requests: write` on the job's repository. Account
-  tokens, refresh tokens, and the App's private key remain outside. Direct
-  sandbox publication does not pass through the trusted publisher's patch
-  gate; repository branch protection and GitHub rules still apply.
+  A separate short-lived GitHub App token is injected as `GH_TOKEN` only when
+  the repository's direct-write policy is enabled by a GitHub repository
+  administrator. It is restricted to `contents: write` and `pull_requests: write`
+  on that repository. Account tokens, refresh tokens, and the App's private key
+  remain outside. Direct sandbox publication does not pass through the trusted
+  publisher's patch gate; repository branch protection and GitHub rules still
+  apply.
 - **Owner-provided environment credentials.** An owner may deliberately inject
   personal variables and Secrets through a frozen environment binding. Repository
   code, dependencies and the agent can read them, send them through the existing
