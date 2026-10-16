@@ -8,6 +8,7 @@ they were; only the class holding them changed.
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING
 
@@ -157,6 +158,198 @@ class PostgresSourceControlRepository:
         """
         async with self._serialize_account(provider="gitlab", user_id=user_id) as session:
             yield session
+
+    async def get_direct_write_policy(
+        self, *, github_repository_id: int, repository_full_name: str
+    ) -> dict[str, Any]:
+        """Return the persisted policy, creating a disabled row on first sight."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO agent_repository_direct_write_policy
+                    (github_repository_id, repository_full_name)
+                VALUES ($1, $2)
+                ON CONFLICT (github_repository_id) DO UPDATE
+                    SET repository_full_name = EXCLUDED.repository_full_name
+                WHERE agent_repository_direct_write_policy.repository_full_name
+                    IS DISTINCT FROM EXCLUDED.repository_full_name
+                RETURNING github_repository_id, repository_full_name, enabled,
+                          revision, updated_by, updated_at
+                """,
+                github_repository_id,
+                repository_full_name,
+            )
+            if row is None:
+                row = await conn.fetchrow(
+                    """
+                    SELECT github_repository_id, repository_full_name, enabled,
+                           revision, updated_by, updated_at
+                    FROM agent_repository_direct_write_policy
+                    WHERE github_repository_id = $1
+                    """,
+                    github_repository_id,
+                )
+        if row is None:
+            raise RuntimeError("Direct-write policy disappeared while being read.")
+        return dict(row)
+
+    async def set_direct_write_policy(
+        self,
+        *,
+        github_repository_id: int,
+        repository_full_name: str,
+        enabled: bool,
+        expected_revision: int,
+        actor_id: str,
+        admin_ip: str,
+    ) -> dict[str, Any] | None:
+        """Revise and audit one repo policy in the same Postgres transaction."""
+        async with self._pool.acquire() as conn, conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO agent_repository_direct_write_policy
+                    (github_repository_id, repository_full_name)
+                VALUES ($1, $2)
+                ON CONFLICT (github_repository_id) DO NOTHING
+                """,
+                github_repository_id,
+                repository_full_name,
+            )
+            current = await conn.fetchrow(
+                """
+                SELECT github_repository_id, repository_full_name, enabled,
+                       revision, updated_by, updated_at
+                FROM agent_repository_direct_write_policy
+                WHERE github_repository_id = $1
+                FOR UPDATE
+                """,
+                github_repository_id,
+            )
+            if current is None or int(current["revision"]) != expected_revision:
+                return None
+            row = await conn.fetchrow(
+                """
+                UPDATE agent_repository_direct_write_policy
+                SET repository_full_name = $2,
+                    enabled = $3,
+                    revision = revision + 1,
+                    updated_by = $4,
+                    updated_at = NOW()
+                WHERE github_repository_id = $1
+                RETURNING github_repository_id, repository_full_name, enabled,
+                          revision, updated_by, updated_at
+                """,
+                github_repository_id,
+                repository_full_name,
+                enabled,
+                actor_id,
+            )
+            revision = int(row["revision"])
+            await conn.execute(
+                """
+                INSERT INTO agent_admin_audit_log
+                    (action, actor_id, admin_ip, details, success)
+                VALUES ($1, $2, $3, $4::jsonb, TRUE)
+                """,
+                "agent.repository_direct_write.enabled"
+                if enabled
+                else "agent.repository_direct_write.disabled",
+                actor_id,
+                admin_ip,
+                json.dumps(
+                    {
+                        "github_repository_id": github_repository_id,
+                        "repository": repository_full_name,
+                        "enabled": enabled,
+                        "revision": revision,
+                    }
+                ),
+            )
+            # Any policy revision invalidates credentials from the previous
+            # revision, including disable-then-reenable. Otherwise an old
+            # token could become usable again when GitHub accepts it.
+            await conn.execute(
+                "DELETE FROM agent_repository_direct_write_tokens WHERE expires_at <= NOW()"
+            )
+            tokens = await conn.fetch(
+                """
+                SELECT token_hash, token_ciphertext, expires_at
+                FROM agent_repository_direct_write_tokens
+                WHERE github_repository_id = $1
+                ORDER BY created_at
+                """,
+                github_repository_id,
+            )
+            revoked_candidates = [dict(token) for token in tokens]
+        return {"policy": dict(row), "tokens": revoked_candidates}
+
+    async def register_direct_write_token(
+        self,
+        *,
+        github_repository_id: int,
+        policy_revision: int,
+        token_hash: str,
+        token_ciphertext: str,
+        expires_at: Any,
+    ) -> bool:
+        """Register the bearer only while its exact enabled policy revision holds."""
+        async with self._pool.acquire() as conn:
+            inserted = await conn.fetchval(
+                """
+                INSERT INTO agent_repository_direct_write_tokens
+                    (token_hash, github_repository_id, policy_revision,
+                     token_ciphertext, expires_at)
+                SELECT $3, authorized.github_repository_id, $2, $4, $5
+                FROM (
+                    SELECT github_repository_id
+                    FROM agent_repository_direct_write_policy
+                    WHERE github_repository_id = $1
+                      AND enabled IS TRUE
+                      AND revision = $2
+                    FOR UPDATE
+                ) AS authorized
+                ON CONFLICT (token_hash) DO UPDATE SET
+                    github_repository_id = EXCLUDED.github_repository_id,
+                    policy_revision = EXCLUDED.policy_revision,
+                    token_ciphertext = EXCLUDED.token_ciphertext,
+                    expires_at = LEAST(
+                        agent_repository_direct_write_tokens.expires_at,
+                        EXCLUDED.expires_at
+                    )
+                RETURNING token_hash
+                """,
+                github_repository_id,
+                policy_revision,
+                token_hash,
+                token_ciphertext,
+                expires_at,
+            )
+        return inserted is not None
+
+    async def list_direct_write_tokens(self, *, github_repository_id: int) -> list[dict[str, Any]]:
+        """Return active revocation records and remove already-expired rows."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM agent_repository_direct_write_tokens WHERE expires_at <= NOW()"
+            )
+            rows = await conn.fetch(
+                """
+                SELECT token_hash, token_ciphertext, expires_at
+                FROM agent_repository_direct_write_tokens
+                WHERE github_repository_id = $1
+                ORDER BY created_at
+                """,
+                github_repository_id,
+            )
+        return [dict(row) for row in rows]
+
+    async def forget_direct_write_token(self, *, token_hash: str) -> None:
+        """Delete one token record after GitHub revoked it or it expired."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM agent_repository_direct_write_tokens WHERE token_hash = $1",
+                token_hash,
+            )
 
     async def connect_github_account(
         self,

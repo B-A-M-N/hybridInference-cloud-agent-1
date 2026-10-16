@@ -19,7 +19,9 @@ pytestmark = pytest.mark.dbtest
 _BEFORE = "0057_admin_sandbox_trajectory"
 _THIS = "0058_mcp_connector_invariant"
 _NEXT = "0059_counter_constraints"
-_HEAD = "0082_sandbox_deletion_attempts"
+_UPSTREAM_HEAD = "0083_host_move_out"
+_DIRECT_WRITE = "0084_repository_direct_write"
+_HEAD = "0085_sandbox_deletion_attempts"
 _OWNER = "user-owner"
 _OTHER = "user-other"
 _PRESERVED_AUTHORIZED_AT = datetime(2001, 2, 3, 4, 5, 6, tzinfo=timezone.utc)
@@ -45,7 +47,9 @@ def test_mcp_connector_invariant_revision_follows_trajectory_merge() -> None:
     assert (
         script.get_revision("0064_mcp_remembered_approvals").down_revision == "0063_user_profiles"
     )
-    assert script.get_revision("0065_environments").down_revision == "0064_mcp_remembered_approvals"
+    assert script.get_revision("0065_environments").down_revision == (
+        "0064_mcp_remembered_approvals"
+    )
     assert script.get_revision("0066_admin_job_listing_index").down_revision == "0065_environments"
     assert (
         script.get_revision("0067_failed_snapshot_wake").down_revision
@@ -75,10 +79,56 @@ def test_mcp_connector_invariant_revision_follows_trajectory_merge() -> None:
     )
     assert script.get_revision("0079_teams").down_revision == "0078_environment_snapshots"
     assert script.get_revision("0080_user_ssh_servers").down_revision == "0079_teams"
-    assert script.get_revision("0081_snapshot_pushed_commit").down_revision == (
-        "0080_user_ssh_servers"
+    assert (
+        script.get_revision("0081_snapshot_pushed_commit").down_revision == "0080_user_ssh_servers"
     )
-    assert script.get_revision(_HEAD).down_revision == "0081_snapshot_pushed_commit"
+    assert (
+        script.get_revision("0082_team_environments").down_revision
+        == "0081_snapshot_pushed_commit"
+    )
+    assert script.get_revision(_UPSTREAM_HEAD).down_revision == "0082_team_environments"
+    assert script.get_revision(_DIRECT_WRITE).down_revision == _UPSTREAM_HEAD
+    assert script.get_revision(_HEAD).down_revision == _DIRECT_WRITE
+
+
+@pytest.mark.asyncio
+async def test_feature_migrations_upgrade_from_current_upstream_head(pool) -> None:
+    """The policy and deletion-ledger tables apply over the current upstream head."""
+    config = _db_config()
+    downgrade_to(config, _UPSTREAM_HEAD)
+
+    async with pool.acquire() as conn:
+        version = await conn.fetchval("SELECT version_num FROM alembic_version")
+        policy_table = await conn.fetchval(
+            "SELECT to_regclass('public.agent_repository_direct_write_policy')"
+        )
+        token_table = await conn.fetchval(
+            "SELECT to_regclass('public.agent_repository_direct_write_tokens')"
+        )
+        attempts_table = await conn.fetchval(
+            "SELECT to_regclass('public.agent_sandbox_deletion_attempts')"
+        )
+    assert version == _UPSTREAM_HEAD
+    assert policy_table is None
+    assert token_table is None
+    assert attempts_table is None
+
+    apply_migrations(config)
+    async with pool.acquire() as conn:
+        version = await conn.fetchval("SELECT version_num FROM alembic_version")
+        policy_table = await conn.fetchval(
+            "SELECT to_regclass('public.agent_repository_direct_write_policy')"
+        )
+        token_table = await conn.fetchval(
+            "SELECT to_regclass('public.agent_repository_direct_write_tokens')"
+        )
+        attempts_table = await conn.fetchval(
+            "SELECT to_regclass('public.agent_sandbox_deletion_attempts')"
+        )
+    assert version == _HEAD
+    assert policy_table == "agent_repository_direct_write_policy"
+    assert token_table == "agent_repository_direct_write_tokens"
+    assert attempts_table == "agent_sandbox_deletion_attempts"
 
 
 async def _local_connection(

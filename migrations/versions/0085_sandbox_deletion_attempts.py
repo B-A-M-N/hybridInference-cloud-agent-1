@@ -2,8 +2,8 @@
 
 from alembic import op
 
-revision = "0082_sandbox_deletion_attempts"
-down_revision = "0081_snapshot_pushed_commit"
+revision = "0085_sandbox_deletion_attempts"
+down_revision = "0084_repository_direct_write"
 branch_labels = None
 depends_on = None
 

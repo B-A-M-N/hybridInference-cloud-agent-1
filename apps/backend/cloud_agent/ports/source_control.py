@@ -158,6 +158,45 @@ class SourceControlRepository(Protocol):
         """Serialize GitLab connect and disconnect for one user."""
         ...
 
+    async def get_direct_write_policy(
+        self, *, github_repository_id: int, repository_full_name: str
+    ) -> dict[str, Any]:
+        """Return or create the disabled-by-default policy for one GitHub repo."""
+        ...
+
+    async def set_direct_write_policy(
+        self,
+        *,
+        github_repository_id: int,
+        repository_full_name: str,
+        enabled: bool,
+        expected_revision: int,
+        actor_id: str,
+        admin_ip: str,
+    ) -> dict[str, Any] | None:
+        """Atomically revise a policy and audit it; ``None`` means stale revision."""
+        ...
+
+    async def register_direct_write_token(
+        self,
+        *,
+        github_repository_id: int,
+        policy_revision: int,
+        token_hash: str,
+        token_ciphertext: str,
+        expires_at: Any,
+    ) -> bool:
+        """Persist an encrypted token before checking its enabling revision."""
+        ...
+
+    async def list_direct_write_tokens(self, *, github_repository_id: int) -> list[dict[str, Any]]:
+        """List unexpired encrypted tokens that may need revocation."""
+        ...
+
+    async def forget_direct_write_token(self, *, token_hash: str) -> None:
+        """Forget a revoked or expired token without retaining its bearer value."""
+        ...
+
     async def connect_github_account(
         self,
         *,
