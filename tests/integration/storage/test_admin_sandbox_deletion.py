@@ -153,25 +153,28 @@ async def test_lost_stopped_sandbox_can_be_archived_without_becoming_recoverable
     assert not await store.sandbox.complete_admin_sandbox_deletion(**worker_fence(claim))
 
     # A stale busy census cannot reopen lost context while deletion owns the fence.
-    assert await store.sandbox.reconcile_thread_sandbox_observation(
-        thread_id=origin["thread_id"],
-        host=claim["host"],
-        sandbox_id=claim["id"],
-        container_id=claim["container_id"],
-        sandbox_generation=claim["generation"],
-        running=True,
-        activity_active=True,
-        members=[
-            {
-                "thread_id": origin["thread_id"],
-                "activation_generation": 0,
-                "process_generation": 0,
-                "residency_generation": 0,
-                "resident_state": "live",
-            }
-        ],
-        terminal_count=0,
-    ) is None
+    assert (
+        await store.sandbox.reconcile_thread_sandbox_observation(
+            thread_id=origin["thread_id"],
+            host=claim["host"],
+            sandbox_id=claim["id"],
+            container_id=claim["container_id"],
+            sandbox_generation=claim["generation"],
+            running=True,
+            activity_active=True,
+            members=[
+                {
+                    "thread_id": origin["thread_id"],
+                    "activation_generation": 0,
+                    "process_generation": 0,
+                    "residency_generation": 0,
+                    "resident_state": "live",
+                }
+            ],
+            terminal_count=0,
+        )
+        is None
+    )
     during_archive = await store.sandbox.thread_sandbox(thread_id=origin["thread_id"])
     assert during_archive is not None
     assert during_archive["state"] == "stopped"
