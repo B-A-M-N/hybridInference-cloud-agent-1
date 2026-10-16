@@ -171,12 +171,26 @@ class PostgresSourceControlRepository:
                 VALUES ($1, $2)
                 ON CONFLICT (github_repository_id) DO UPDATE
                     SET repository_full_name = EXCLUDED.repository_full_name
+                WHERE agent_repository_direct_write_policy.repository_full_name
+                    IS DISTINCT FROM EXCLUDED.repository_full_name
                 RETURNING github_repository_id, repository_full_name, enabled,
                           revision, updated_by, updated_at
                 """,
                 github_repository_id,
                 repository_full_name,
             )
+            if row is None:
+                row = await conn.fetchrow(
+                    """
+                    SELECT github_repository_id, repository_full_name, enabled,
+                           revision, updated_by, updated_at
+                    FROM agent_repository_direct_write_policy
+                    WHERE github_repository_id = $1
+                    """,
+                    github_repository_id,
+                )
+        if row is None:
+            raise RuntimeError("Direct-write policy disappeared while being read.")
         return dict(row)
 
     async def set_direct_write_policy(

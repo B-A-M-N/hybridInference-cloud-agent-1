@@ -19,6 +19,7 @@ pytestmark = pytest.mark.dbtest
 _BEFORE = "0057_admin_sandbox_trajectory"
 _THIS = "0058_mcp_connector_invariant"
 _NEXT = "0059_counter_constraints"
+_UPSTREAM_HEAD = "0082_team_environments"
 _HEAD = "0083_repository_direct_write"
 _OWNER = "user-owner"
 _OTHER = "user-other"
@@ -80,8 +81,40 @@ def test_mcp_connector_invariant_revision_follows_trajectory_merge() -> None:
     assert (
         script.get_revision("0081_snapshot_pushed_commit").down_revision == "0080_user_ssh_servers"
     )
-    assert script.get_revision("0082_team_environments").down_revision == "0081_snapshot_pushed_commit"
-    assert script.get_revision(_HEAD).down_revision == "0082_team_environments"
+    assert script.get_revision(_UPSTREAM_HEAD).down_revision == "0081_snapshot_pushed_commit"
+    assert script.get_revision(_HEAD).down_revision == _UPSTREAM_HEAD
+
+
+@pytest.mark.asyncio
+async def test_direct_write_migration_upgrades_from_current_upstream_head(pool) -> None:
+    """The policy tables apply cleanly over the actual upstream schema head."""
+    config = _db_config()
+    downgrade_to(config, _UPSTREAM_HEAD)
+
+    async with pool.acquire() as conn:
+        version = await conn.fetchval("SELECT version_num FROM alembic_version")
+        policy_table = await conn.fetchval(
+            "SELECT to_regclass('public.agent_repository_direct_write_policy')"
+        )
+        token_table = await conn.fetchval(
+            "SELECT to_regclass('public.agent_repository_direct_write_tokens')"
+        )
+    assert version == _UPSTREAM_HEAD
+    assert policy_table is None
+    assert token_table is None
+
+    apply_migrations(config)
+    async with pool.acquire() as conn:
+        version = await conn.fetchval("SELECT version_num FROM alembic_version")
+        policy_table = await conn.fetchval(
+            "SELECT to_regclass('public.agent_repository_direct_write_policy')"
+        )
+        token_table = await conn.fetchval(
+            "SELECT to_regclass('public.agent_repository_direct_write_tokens')"
+        )
+    assert version == _HEAD
+    assert policy_table == "agent_repository_direct_write_policy"
+    assert token_table == "agent_repository_direct_write_tokens"
 
 
 async def _local_connection(

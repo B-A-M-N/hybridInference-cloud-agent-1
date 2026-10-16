@@ -254,6 +254,70 @@ async def test_repository_direct_write_policy_is_revisioned_audited_and_revocabl
             )
 
 
+async def test_get_direct_write_policy_only_updates_a_changed_repository_name(
+    store: PostgresSourceControlRepository,
+    pool,
+) -> None:
+    """Repeated claim reads do not create new policy row versions."""
+    repository_id = uuid.uuid4().int & ((1 << 62) - 1)
+    repository_name = "octocat/private-project"
+
+    try:
+        first = await store.get_direct_write_policy(
+            github_repository_id=repository_id,
+            repository_full_name=repository_name,
+        )
+        async with pool.acquire() as conn:
+            initial_xmin = await conn.fetchval(
+                """
+                SELECT xmin::text
+                FROM agent_repository_direct_write_policy
+                WHERE github_repository_id = $1
+                """,
+                repository_id,
+            )
+
+        repeated = await store.get_direct_write_policy(
+            github_repository_id=repository_id,
+            repository_full_name=repository_name,
+        )
+        async with pool.acquire() as conn:
+            repeated_xmin = await conn.fetchval(
+                """
+                SELECT xmin::text
+                FROM agent_repository_direct_write_policy
+                WHERE github_repository_id = $1
+                """,
+                repository_id,
+            )
+
+        renamed = await store.get_direct_write_policy(
+            github_repository_id=repository_id,
+            repository_full_name="octocat/renamed-project",
+        )
+        async with pool.acquire() as conn:
+            renamed_xmin = await conn.fetchval(
+                """
+                SELECT xmin::text
+                FROM agent_repository_direct_write_policy
+                WHERE github_repository_id = $1
+                """,
+                repository_id,
+            )
+
+        assert first["repository_full_name"] == repository_name
+        assert repeated["repository_full_name"] == repository_name
+        assert repeated_xmin == initial_xmin
+        assert renamed["repository_full_name"] == "octocat/renamed-project"
+        assert renamed_xmin != repeated_xmin
+    finally:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM agent_repository_direct_write_policy WHERE github_repository_id = $1",
+                repository_id,
+            )
+
+
 @pytest.mark.parametrize("enabled_after_race", [False, True], ids=["disabled", "revision-bumped"])
 async def test_direct_write_token_registration_waits_for_the_exact_policy_row(
     store: PostgresSourceControlRepository,
