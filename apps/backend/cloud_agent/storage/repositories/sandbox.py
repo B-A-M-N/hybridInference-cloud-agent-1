@@ -1904,8 +1904,13 @@ class PostgresSandboxRepository:
         members: list[dict[str, Any]] | None = None,
         resource_usage: dict[str, Any] | None = None,
         terminal_count: int | None = None,
+        checkpoint: dict[str, Any] | None = None,
     ) -> str | None:
-        """Reconcile one authenticated shared-group Docker observation."""
+        """Reconcile one authenticated shared-group Docker observation.
+
+        ``checkpoint`` is the receipt the same beat carries, which the caller
+        records next with :meth:`record_sandbox_checkpoint`.
+        """
         return await self._reconcile_shared_sandbox_observation(
             thread_id=thread_id,
             host=host,
@@ -1918,6 +1923,7 @@ class PostgresSandboxRepository:
             members=members or [],
             resource_usage=resource_usage,
             terminal_count=terminal_count,
+            checkpoint=checkpoint,
         )
 
     async def record_sandbox_checkpoint(
@@ -2516,6 +2522,7 @@ class PostgresSandboxRepository:
         members: list[dict[str, Any]],
         resource_usage: dict[str, Any] | None,
         terminal_count: int | None,
+        checkpoint: dict[str, Any] | None,
     ) -> str | None:
         """Join one Docker group observation with independently fenced members."""
         async with self._pool.acquire() as conn, conn.transaction():
@@ -2736,12 +2743,23 @@ class PostgresSandboxRepository:
                     host,
                 )
             )
-            if removing and activity_active is True and group["state"] in {"running", "stopping"}:
+            if (
+                removing
+                and activity_active is True
+                and group["state"] in {"running", "stopping"}
+                and not await self._first_report_of_run_checkpoint(
+                    conn, group, container_id, checkpoint
+                )
+            ):
                 # The container is down, but the host is still archiving it
                 # and taking the checkpoint that carries the group to another
                 # host. The removal waits while the group is in one of these
-                # states, so it stays there until the beat that reports the
-                # stop finished, which also carries that checkpoint.
+                # states, so it stays there until that checkpoint arrives.
+                # The host lists it once saved, which can be a beat before it
+                # reports the stop finished. A receipt covers the group only
+                # when first recorded while the group is stopped, so the beat
+                # that first brings it records the stop here, before its
+                # caller records the receipt.
                 return None
             # A running group is taken as stopped only when a stop was due:
             # its idle deadline passed, or its host is being removed and the
@@ -2783,6 +2801,35 @@ class PostgresSandboxRepository:
             # A repeated stopped observation may still repair stale member
             # state, but it does not ask the host to perform another stop.
             return None if group["state"] == "stopped" else str(row["state"])
+
+    @staticmethod
+    async def _first_report_of_run_checkpoint(
+        conn: asyncpg.Connection,
+        group: asyncpg.Record,
+        container_id: str,
+        checkpoint: dict[str, Any] | None,
+    ) -> bool:
+        """Whether a beat's receipt is the current run's checkpoint, not yet recorded.
+
+        A receipt already recorded is the host repeating its latest one, which
+        may predate a start this group's row cannot see (one that did not
+        fence first), so it ends no wait.
+        """
+        if checkpoint is None:
+            return False
+        start_seq = checkpoint.get("start_seq")
+        if (
+            isinstance(start_seq, bool)
+            or start_seq != group["start_seq"]
+            or checkpoint.get("sandbox_id") != group["id"]
+            or checkpoint.get("generation") != group["generation"]
+            or checkpoint.get("container_id") != container_id
+        ):
+            return False
+        return not await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM agent_sandbox_checkpoints WHERE id = $1)",
+            checkpoint.get("checkpoint_id"),
+        )
 
     @staticmethod
     async def _record_terminal_observation(

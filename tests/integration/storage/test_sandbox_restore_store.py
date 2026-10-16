@@ -1073,6 +1073,59 @@ async def test_a_removal_finishes_once_its_group_stopped_under_a_checkpoint(pool
     assert claim["thread_sandbox"]["host"] == "runner-c"
 
 
+async def test_a_checkpoint_listed_before_the_stop_ends_still_covers_the_group(
+    pool, store: Storage
+):
+    """The host lists a checkpoint once saved, a beat before it reports the stop finished."""
+    job, group = await _settled_group(store, idle_timeout_seconds=1800)
+    assert await store.host_pool.remove_host(host="runner-a") == "draining"
+    receipt = _receipt(group, job)
+
+    # Each beat as the heartbeat handler takes it: the observation, then the
+    # receipt it carries.
+    await store.sandbox.reconcile_thread_sandbox_observation(
+        **_observed(job, group), running=False, activity_active=True, checkpoint=receipt
+    )
+    assert await store.sandbox.record_sandbox_checkpoint(
+        host="runner-a", thread_id=job["thread_id"], checkpoint=receipt
+    )
+    # The next beat reports the stop finished and repeats the receipt.
+    await store.sandbox.reconcile_thread_sandbox_observation(
+        **_observed(job, group), running=False, activity_active=False, checkpoint=receipt
+    )
+    assert not await store.sandbox.record_sandbox_checkpoint(
+        host="runner-a", thread_id=job["thread_id"], checkpoint=receipt
+    )
+
+    stopped = await _state(pool)
+    assert stopped["state"] == "stopped"
+    assert stopped["restore_checkpoint_id"] == "c" * 32
+    assert await store.host_pool.finish_host_removals() == ["runner-a"]
+    assert (await _state(pool))["state"] == "cold"
+
+
+async def test_a_receipt_already_recorded_does_not_end_a_removals_wait(pool, store: Storage):
+    """The host repeats its latest receipt, which may predate a start that did not fence."""
+    job, group = await _covered(pool, store)
+    # The container ran again, and the beat that saw it dropped the restore
+    # point; the host still lists the checkpoint of the earlier stop.
+    await store.sandbox.reconcile_thread_sandbox_observation(
+        **_observed(job, group), running=True, activity_active=False, idle_remaining_seconds=1800
+    )
+    assert (await _state(pool))["state"] == "running"
+    assert await store.host_pool.remove_host(host="runner-a") == "draining"
+
+    await store.sandbox.reconcile_thread_sandbox_observation(
+        **_observed(job, group),
+        running=False,
+        activity_active=True,
+        checkpoint=_receipt(group, job),
+    )
+
+    assert (await _state(pool))["state"] == "running"
+    assert await store.host_pool.finish_host_removals() == []
+
+
 async def test_a_checkpoint_landing_after_the_revocation_still_moves_the_group(
     pool, store: Storage
 ):
