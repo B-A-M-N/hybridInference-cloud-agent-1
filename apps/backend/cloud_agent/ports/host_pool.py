@@ -441,8 +441,9 @@ class HostPoolRepository(Protocol):
     async def runtime_download_targets(self) -> list[dict[str, str]]:
         """The agent versions every heartbeat answer tells hosts to hold.
 
-        At most two per runtime: the update's version and, until it switches
-        new chats, the downloaded version they use now.
+        At most two per runtime: the record's version, and the downloaded
+        version an update replaced, which new chats use until it switches them
+        and Roll back returns to after.
         """
         ...
 

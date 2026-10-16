@@ -1,8 +1,9 @@
 """Download the agent CLI versions an admin updated to, and check each one.
 
 Every heartbeat answer carries the control plane's *targets*: exact versions,
-at most two per runtime — the one new chats use and the one an update moves
-them to (``cloud_agent_shared.runtime_downloads``). This runner keeps each one
+at most two per runtime — the one an update moves new chats to and the one it
+replaced, which Roll back returns to after the switch
+(``cloud_agent_shared.runtime_downloads``). This runner keeps each one
 installed as a local image (``runtime_images``) built on the sandbox image it
 runs, and reports how far it has got on the next beat. The control plane
 switches new chats to a version once every online host reports it ready.

@@ -1530,11 +1530,18 @@ class PostgresHostPoolRepository:
     async def runtime_download_targets(self) -> list[dict[str, str]]:
         """What every heartbeat answer tells hosts to hold, per runtime.
 
-        The record's version, and until an update switches new chats, also the
-        downloaded version they use now: a host that joins while the update is
-        downloading, or after it failed, must still run what every other host
-        runs. Done targets stay, so a host that joins later, or restarts on a
-        new sandbox image, downloads and checks the version again.
+        The record's version, and the downloaded version an update replaced.
+        Until the update switches new chats, they still use that one: a host
+        that joins while the update is downloading, or after it failed, must
+        run what every other host runs. After the switch it is what Roll back
+        returns to, so rolling back is instant on every host, one that joins
+        later included. The switch waits only for the record's own version.
+        The version new chats use comes first. Done targets stay, so a host
+        that joins later, or restarts on a new sandbox image, downloads and
+        checks the version again.
+
+        A selection record, Roll back's included, replaced nothing to hold:
+        the version rolled back from stays only where chats still run it.
         """
         async with self._pool.acquire() as conn:
             policy = await conn.fetchrow(
@@ -1546,15 +1553,18 @@ class PostgresHostPoolRepository:
         for runtime, record in sorted(upgrades.items()):
             if not isinstance(record, dict):
                 continue
+            own = {"runtime": runtime, **_download_of(record)}
             held = record.get("previous_download")
-            if (
-                not record.get("activated_at")
-                and isinstance(held, dict)
-                and held.get("version") == selection.get(runtime)
-                and held.get("version") != record.get("version")
-            ):
-                targets.append({"runtime": runtime, **_download_of(held)})
-            targets.append({"runtime": runtime, **_download_of(record)})
+            if not isinstance(held, dict) or held.get("version") == record.get("version"):
+                targets.append(own)
+            elif not record.get("activated_at"):
+                if held.get("version") == selection.get(runtime):
+                    targets.append({"runtime": runtime, **_download_of(held)})
+                targets.append(own)
+            else:
+                targets.append(own)
+                if held.get("version") == record.get("previous_version"):
+                    targets.append({"runtime": runtime, **_download_of(held)})
         return targets
 
     async def request_runtime_upgrade(
