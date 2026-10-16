@@ -234,6 +234,11 @@ class RuntimeDownloads:
         with self._lock:
             return [report.to_wire() for report in self._reports.values()]
 
+    def targets(self) -> frozenset[_Key]:
+        """Every version this host was told to hold, for its menu to keep first."""
+        with self._lock:
+            return frozenset(self._targets) | (self._named or frozenset())
+
     # ── lifecycle ───────────────────────────────────────────────────────
 
     def start(self) -> None:

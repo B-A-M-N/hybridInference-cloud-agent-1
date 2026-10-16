@@ -4226,6 +4226,8 @@ def run_forever(
             registry=os.environ.get(ENV_RUNTIME_REGISTRY_URL, "").strip() or None,
             on_change=downloaded,
         )
+        # A menu too long to report keeps these first (``version_stamp``).
+        offered.targets = downloads.targets
 
     pool = HostHeartbeat(
         base_url=base_url,

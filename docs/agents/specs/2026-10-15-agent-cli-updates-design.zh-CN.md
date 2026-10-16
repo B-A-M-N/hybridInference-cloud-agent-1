@@ -107,7 +107,7 @@ Settings → Agent versions 里，每个可以更新的 agent 下面会显示：
 
 ## 六 版本记录与协议
 
-- 每次 attempt 照旧记录 `runtime_version`。主机上报的可用版本里包含已下载的版本，claim 时的回退规则（`resolve_runtime_version`）不变。
+- 每次 attempt 照旧记录 `runtime_version`。主机上报的可用版本里包含已下载的版本，claim 时的回退规则（`resolve_runtime_version`）不变。每个 runtime 的可用版本最多上报 64 个（见第八节）。
 - 共享 sandbox 协议里固定的默认版本（`SHARED_SANDBOX_RUNTIME_PINS`）不变。新版本是通过"管理员的选择"生效的，不是通过修改默认版本，所以 `shared-sandbox-v1` 的认证不受影响。没有选择时，主机仍然运行镜像默认版本。
 
 ## 七 存储与接口
@@ -144,6 +144,11 @@ Settings → Agent versions 里，每个可以更新的 agent 下面会显示：
   - 删除用不强制的 `docker rmi`。还有容器在用的镜像 Docker 会拒绝删除，比如对话正在从中复制 CLI 的源容器；下次清理时再试。
   - 建在旧沙箱镜像上的版本按同样的规则清理。新镜像发布时还有对话在用的版本留在旧镜像上，那些对话结束后，它也要能删掉。
   - 没有要下载的版本时清理，每次下载完成后也清理。清理出错只记日志，不影响下载。删除之后，下一次心跳上报的可用版本里就没有它了。
+- **每个 runtime 上报的可用版本最多 64 个。** 控制面会拒绝可用版本更多的心跳和 claim，整台主机因此离开主机池，所以主机自己保证不超过这个数（`cloud_agent_shared.shared_protocol.HOST_VERSION_MENU_MAX_ITEMS`，控制面用的也是它）。有了上面的清理，只有对话还在用很多个版本、或者没法清理时才会超出。超出时：
+  - 先去掉没有被需要的版本：已下载的从最老的开始，然后是镜像自带的，从最后一个开始。被需要的版本（目标，或者对话、检查点在用）只有在没有别的可去掉时才去掉，顺序相同。
+  - 镜像自带的第一个版本就是默认版本，始终保留。
+  - 去掉的版本这台主机不再提供。新对话选了它，在这台主机上用默认版本；用它的对话，如果这台主机的沙箱镜像已经换过，就不能在指定位置分叉，也不能中途插话（`HOST_SHIPS_GROUP_CLI`）。
+  - 去掉的版本有变化时记一条警告日志。只有超出上限时才去读对话在用的版本，读到的结果用一分钟。
 - **自测只能证明一件事：一轮对话的输出，生产驱动都能读懂，并且模型的回答出现在对话里。** 它覆盖不了 `drivers.py` 里那些照着固定版本具体行为写的处理，比如中途插话、后台子 agent、权限提示等。所以建议先在 staging 更新，确认没问题再更新生产，有问题就回退。
 - **要求所有在线主机都升级到包含此功能的 runner，切换才能完成。**
 - **控制面必须能访问 npm registry**（或 `AGENT_RUNTIME_REGISTRY_URL` 指定的 registry），否则页面上会提示无法检查更新。
@@ -153,7 +158,7 @@ Settings → Agent versions 里，每个可以更新的 agent 下面会显示：
 - **单元测试：**
   - 版本匹配规则与 `install-runtimes.sh` 逐条对照；上报和目标的格式校验；进度汇总（平均值、失败优先、按 nonce 区分请求、已完成的更新在重新自测期间保持已完成）；npm 查询和缓存；版本列表只留正式版、按数字从新到旧排、去掉废弃版本，整个包被废弃时照常列出并带上说明；版本列表每小时只读一次、同时只读一次、读失败很快重试（`test_runtime_upgrades.py`）。
   - 主机端用假的 Docker：联网和断网分别在哪一步、只保留自测通过的版本、失败后的重试规则、新镜像发布后重新下载、同一个 runtime 同时保留两个版本、清理遗留容器；删除不再需要的版本（保留目标和对话、检查点在用的版本，等满十分钟，收到目标列表之前和收到不带列表的回复之后不删除，Docker 拒绝删除或清理出错时下载照常进行）；复制进对话（`test_runtime_downloads.py`）。
-  - 心跳收发（`test_host_pool_api.py`、`test_host_enrollment.py`），Admin 接口，包括版本列表接口和选更老的版本（`test_admin_runtime_upgrades_api.py`），版本上报（`test_agent_sandbox.py`）。
+  - 心跳收发（`test_host_pool_api.py`、`test_host_enrollment.py`），Admin 接口，包括版本列表接口和选更老的版本（`test_admin_runtime_upgrades_api.py`），版本上报（`test_agent_sandbox.py`）。可用版本超过上限时去掉哪些（`test_agent_sandbox.py`），以及这样的主机的心跳照常被接受（`test_host_pool_api.py`）。
 - **数据库测试**：所有在线主机就绪后才切换、没有主机在线时不切换、上报的存储；重试只换 nonce（`before`、回退目标、切换状态都不变）；切换前主机同时保留在用的版本；回退后这个版本继续下发并沿用原来的 `before`；手动选择会取代更新、选回默认会清除（`test_host_pool_store.py`）。
 - **前端**：更新、下载中显示恐龙、完成后刷新版本菜单、失败与重试、回退、手动选择的版本下载失败、查不到 npm；下拉框分组列出 npm 版本、选服务器没有的版本走"下载并切换"、选都有的版本照常保存、整个包被废弃和读不到版本列表时的提示；恐龙进度条本身（`page.test.tsx`、`DinoProgress.test.tsx`）。
 - **真实环境**（`tests/external/test_runtime_updates_live.py`，需要已构建的沙箱镜像和 npm 网络）：在本机 Docker 上，用真实的 npm 和 CLI 跑完整条流程。Claude Code 2.1.300 和 OpenCode 1.19.0 能下载、自测、出现在可用版本里，复制进容器后成员能运行但不能修改；pi 0.73.1 走"镜像里已有"的路径；没有安装的版本自测会失败。开发过程中也用同一套代码跑通了 Codex 0.162.1 和 Claude Code 2.1.299。降级也用真实流程跑通了：Claude Code 2.1.200、Codex 0.140.0、OpenCode 1.18.0，都比镜像默认版本老。版本列表接口直接对真实 npm 调用：四个 agent 第一次共约 0.8 秒，之后走缓存；每个回复不到 9 KB。

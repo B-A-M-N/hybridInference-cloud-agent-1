@@ -678,6 +678,17 @@ def test_a_target_this_host_cannot_use_still_keeps_its_version(docker):
     assert _held_versions() == ["2.1.298", "2.1.299"]
 
 
+def test_a_menu_too_long_to_report_keeps_every_version_an_answer_names(docker):
+    """The version stamp keeps these first (``ContainerBackend.version_stamp``)."""
+    downloads = _downloads()
+    downloads.apply([_target(), {"runtime": "claude-code", "version": "2.1.298"}])
+    assert downloads.targets() == {("claude-code", "2.1.300"), ("claude-code", "2.1.298")}
+
+    # An answer without targets leaves the ones this host holds.
+    downloads.apply(None)
+    assert downloads.targets() == {("claude-code", "2.1.300")}
+
+
 def test_a_version_docker_will_not_remove_stays_and_the_rest_go(docker):
     """Docker refuses an image a container uses, such as a chat's copy source."""
     clock = Clock()

@@ -29,6 +29,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from cloud_agent_host.chat_sandbox_models import (
     CHAT_NAMESPACE_LABEL,
@@ -37,6 +38,9 @@ from cloud_agent_host.chat_sandbox_models import (
 )
 from cloud_agent_shared.runtime_catalog import downloadable_runtimes
 from cloud_agent_shared.runtime_downloads import is_exact_version
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Collection
 
 LABEL = "org.freeinference.runtime-download"
 #: Which deployment downloaded it. Staging and production share a Docker daemon
@@ -51,6 +55,9 @@ WORK_LABEL = f"{LABEL}.work"
 #: How long a discovered menu is reused. Short: a version that finished
 #: downloading should be offered on the next beat, not a minute later.
 _CACHE_S = 5.0
+#: How long what chats run is reused for a menu too long to report. Read only
+#: then, but a host can stay that way a while, and every beat and claim asks.
+_IN_USE_CACHE_S = 60.0
 
 
 @dataclass(frozen=True)
@@ -221,6 +228,11 @@ class DownloadedVersions:
         self._lock = threading.Lock()
         self._read_at = float("-inf")
         self._versions: dict[str, list[str]] = {}
+        #: The versions this host was told to hold. The runner wires in its
+        #: downloader's; a process with none has no targets.
+        self.targets: Callable[[], Collection[tuple[str, str]]] | None = None
+        self._in_use: set[tuple[str, str]] = set()
+        self._in_use_at = float("-inf")
 
     def versions(self) -> dict[str, list[str]]:
         """Downloaded versions per runtime, at most a few seconds old."""
@@ -229,6 +241,23 @@ class DownloadedVersions:
                 self._versions = by_runtime(discover(self._docker, self._namespace))
                 self._read_at = time.monotonic()
             return {runtime: list(found) for runtime, found in self._versions.items()}
+
+    def needed(self) -> set[tuple[str, str]]:
+        """What a menu too long to report keeps first: targets, and what chats run.
+
+        What chats run is at most a minute old; when Docker cannot say, the
+        last answer stands.
+        """
+        with self._lock:
+            if time.monotonic() - self._in_use_at >= _IN_USE_CACHE_S:
+                found = chat_versions(self._docker, self._namespace)
+                if found is not None:
+                    self._in_use = found
+                self._in_use_at = time.monotonic()
+            needed = set(self._in_use)
+        if self.targets is not None:
+            needed.update(self.targets())
+        return needed
 
     def invalidate(self) -> None:
         """Read Docker again next time: a download has just finished."""
