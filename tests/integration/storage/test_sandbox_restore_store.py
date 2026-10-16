@@ -783,6 +783,53 @@ async def test_workspace_requests_wait_for_a_cold_group(pool, store: Storage):
     assert (await _state(pool))["restore_checkpoint_id"] == "c" * 32
 
 
+async def test_forgetting_a_removed_host_leaves_its_cold_groups_restorable(pool, store: Storage):
+    job, _ = await _covered(pool, store)
+    follow_up = await store.conversation_commands.create_follow_up(
+        parent_job_id=job["id"], user_id="user-1", prompt="continue"
+    )
+    assert follow_up is not None
+    assert await store.host_pool.remove_host(host="runner-a") == "ok"
+    assert (await _state(pool))["state"] == "cold"
+
+    # The group no longer needs this machine: any restore-capable host takes it.
+    assert await store.host_pool.forget_runner_host(host="runner-a") == "deleted"
+
+    assert await store.host_pool.get_host(host="runner-a") is None
+    # It keeps naming the host it last ran on until a claim moves it.
+    forgotten = await _state(pool)
+    assert forgotten["state"] == "cold"
+    assert forgotten["host"] == "runner-a"
+    await _host(store, "runner-c", _RESTORE_HOST)
+    claim = await _claim(store, "runner-c", _RESTORE_HOST)
+    assert claim is not None and claim["id"] == follow_up["id"]
+    reserved = await _reserve(store, follow_up, claim, "runner-c")
+    assert reserved["restore"]["checkpoint_id"] == "c" * 32
+    assert await store.sandbox.mark_thread_sandbox_running(
+        **_fence(follow_up, claim, reserved),
+        container_id="container-c",
+        context_status="restored",
+    )
+    restored = await _state(pool)
+    assert (restored["state"], restored["host"], restored["generation"]) == (
+        "running",
+        "runner-c",
+        2,
+    )
+
+
+async def test_a_removed_hosts_uncovered_group_still_keeps_it_from_being_forgotten(
+    pool, store: Storage
+):
+    """A stopped group with no covering checkpoint continues only on that host."""
+    await _settled_stopped_group(pool, store)
+    assert await store.host_pool.remove_host(host="runner-a") == "ok"
+    assert (await _state(pool))["state"] == "stopped"
+
+    assert await store.host_pool.forget_runner_host(host="runner-a") == "retained_groups_present"
+    assert await store.host_pool.get_host(host="runner-a") is not None
+
+
 # ── Removing a host that still runs a group ─────────────────────────────
 
 

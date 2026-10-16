@@ -2094,6 +2094,11 @@ turn. **Remove now** revokes at once and does not wait for any group. A
 checkpoint carried by a heartbeat still in flight when the credential was
 revoked is handed on by the reaper's next pass.
 
+A `cold` group does not keep its old host from being forgotten, by **Forget**
+or by permanently removing the server: it no longer needs that machine. It
+keeps naming the host it last ran on until a claim moves it to the claiming
+host. Every other undeleted group still blocks forgetting.
+
 The next turn of any chat in a `cold` group is claimed by any host that
 advertises `sandbox-restore-v1` with archives enabled. The claim rehomes the
 group to that host and advances its generation (`restoring`), so anything the

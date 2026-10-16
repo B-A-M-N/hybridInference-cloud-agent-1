@@ -122,6 +122,18 @@ LIVE_ATTEMPT_HOST = """EXISTS (
 LIVE_GROUP_STATES = ("provisioning", "starting", "running", "stopping")
 
 
+#: Whether group ``g`` still needs the host it names, so that forgetting the
+#: host must wait. Binds the group as ``g``; the caller supplies that alias.
+#:
+#: A deleted group is an audit row. A ``cold`` group lives in its checkpoint:
+#: whichever restore-capable host claims it becomes its host. Until then it
+#: keeps naming the host it last ran on (``host`` is never NULL), and nothing
+#: reads that name for it: no foreign key ties it or its checkpoint's host to
+#: the host row, and the cold claim, the restore it hands out and the
+#: confirmation of the restored container do not look at either.
+HOST_RETAINED_GROUP = "g.deletion_state <> 'deleted' AND g.state <> 'cold'"
+
+
 #: Whether the host holding group ``g`` is being removed. Binds the group as
 #: ``g``; the caller supplies that alias.
 #:

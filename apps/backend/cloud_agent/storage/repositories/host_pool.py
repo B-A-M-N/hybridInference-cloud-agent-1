@@ -47,6 +47,7 @@ from cloud_agent.storage._sql.compute_admission import (
 from cloud_agent.storage._sql.hosts import (
     HOST_CAPACITY_COLUMNS,
     HOST_COLUMNS,
+    HOST_RETAINED_GROUP,
     LIVE_GROUP_STATES,
     QUALIFIED_HOST_COLUMNS,
     release_late_covered_sandboxes,
@@ -2011,10 +2012,13 @@ class PostgresHostPoolRepository:
         ``"retained_groups_present"``, ``"resource_bound"``,
         ``"active_attempts_present"`` and ``"pending_compute_operations"``.
         A sandbox whose deletion has completed is an audit row: it keeps the
-        host name and does not block forgetting. A live group, or one whose
-        deletion failed or is still in progress, does. A disabled attached
-        machine without external release capability may be deregistered after
-        dependency checks; this never shuts it down.
+        host name and does not block forgetting. Nor does a ``cold`` group,
+        which any restore-capable host may claim; it keeps naming this host as
+        the last it ran on until a claim moves it (``HOST_RETAINED_GROUP``).
+        A live or stopped group, or one whose deletion failed or is still in
+        progress, does block. A disabled attached machine without external
+        release capability may be deregistered after dependency checks; this
+        never shuts it down.
 
         The active-host refusal lives here rather than in the caller because
         checking there is a read the switch can outrun: the endpoint sees the
@@ -2030,7 +2034,7 @@ class PostgresHostPoolRepository:
             if active == host:
                 return "active"
             retained = await conn.fetchval(
-                "SELECT 1 FROM agent_sandboxes WHERE host=$1 AND deletion_state<>'deleted' LIMIT 1",
+                f"SELECT 1 FROM agent_sandboxes g WHERE g.host=$1 AND {HOST_RETAINED_GROUP} LIMIT 1",
                 host,
             )
             if retained:

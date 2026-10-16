@@ -23,7 +23,7 @@ from cloud_agent.domain.compute import (
     provider_resource_absent,
 )
 from cloud_agent.storage._sql.compute_admission import host_compute_admission, lock_compute_entry
-from cloud_agent.storage._sql.hosts import revoke_host_credentials
+from cloud_agent.storage._sql.hosts import HOST_RETAINED_GROUP, revoke_host_credentials
 from cloud_agent.storage._sql.rows import load_json
 
 if TYPE_CHECKING:
@@ -570,7 +570,9 @@ class PostgresComputeResourceRepository:
         This performs no provider or filesystem action. A releasable resource
         must already be confirmed absent; an acquisition that never submitted
         and a disabled attached machine can instead be deregistered locally.
-        User jobs and deleted sandbox audit rows survive the inventory cleanup.
+        User jobs and deleted sandbox audit rows survive the inventory cleanup,
+        and so do ``cold`` groups, which no longer need the machine: any
+        restore-capable host may claim them (``HOST_RETAINED_GROUP``).
         """
         async with self._pool.acquire() as conn, conn.transaction():
             active = await conn.fetchval(
@@ -688,8 +690,8 @@ class PostgresComputeResourceRepository:
             if any(host["drain_fence_active"] for host in host_rows):
                 raise ValueError("deployment_drain_active")
             if await conn.fetchval(
-                "SELECT 1 FROM agent_sandboxes WHERE host=ANY($1::text[]) "
-                "AND deletion_state<>'deleted' LIMIT 1",
+                "SELECT 1 FROM agent_sandboxes g WHERE g.host=ANY($1::text[]) "
+                f"AND {HOST_RETAINED_GROUP} LIMIT 1",
                 hosts,
             ):
                 raise ValueError("retained_groups_present")
