@@ -622,6 +622,59 @@ async def test_shared_snapshot_publishes_group_lineage_and_imports_the_new_base(
     assert "ajob_1" in captured_pr["body"] and "ajob_2" in captured_pr["body"]
 
 
+async def test_a_retried_base_import_bundles_against_the_workspaces_first_base(monkeypatch):
+    """The workspace keeps the commit it started from; Git prunes published ones together.
+
+    A published commit is imported as objects no ref names, and Git prunes
+    the commits published before it in the same pass. A bundle that needs the
+    previous published base can then never be unbundled again; one cut from
+    the base the group's first snapshot started from can, because the
+    workspace's own history holds that commit.
+    """
+    from cloud_agent import sandbox_manager_routing
+
+    store = FakeStore()
+    fetched: dict[str, Any] = {}
+
+    def fetch(**kwargs: Any) -> bytes:
+        fetched.update(kwargs)
+        return b"bundle"
+
+    class SandboxManager:
+        imported: tuple[str, bytes] | None = None
+
+        async def import_shared_base(self, row, *, commit_sha: str, bundle: bytes):
+            self.imported = (commit_sha, bundle)
+
+    sandbox_manager = SandboxManager()
+
+    async def route(_store, job_id: str):
+        assert job_id == "ajob_1"
+        return sandbox_manager
+
+    monkeypatch.setattr(publish_worker, "fetch_base_bundle", fetch)
+    monkeypatch.setattr(sandbox_manager_routing, "sandbox_manager_for_job", route)
+    pending = {
+        "snapshot_id": 9,
+        "anchor_job_id": "ajob_1",
+        "repo": "o/n",
+        "user_id": "u1",
+        "published_commit_sha": "c" * 40,
+        "base_sha": "b" * 40,
+        "origin_base_sha": "a" * 40,
+    }
+
+    assert await publish_worker._retry_base_import(
+        store, pending, credential=GitHubCredential("t"), app_credentials=None
+    )
+
+    assert fetched["commit_sha"] == "c" * 40
+    assert fetched["base_sha"] == "a" * 40
+    assert sandbox_manager.imported == ("c" * 40, b"bundle")
+    assert store.import_completed == (9, "c" * 40)
+    assert store.import_failed is None
+
+
 async def test_shared_snapshot_rejection_does_not_fail_its_successful_turn(monkeypatch):
     snapshot = {
         **_JOB,
@@ -1217,6 +1270,60 @@ async def test_github_error_becomes_a_publish_error():
             )
     finally:
         httpx.AsyncClient = original
+
+
+@pytest.mark.parametrize(("field", "retried"), [("head", True), ("base", False)])
+async def test_a_head_the_pr_api_cannot_see_yet_is_retried_after_the_push(
+    monkeypatch, field, retried
+):
+    """The draft is opened right after the push, which GitHub may not have seen yet.
+
+    Its ``head invalid`` returns the snapshot to the durable retry budget, with
+    the pushed commit still recorded for the retry to build on. A ``base
+    invalid`` names the owner's branch, which a retry cannot change, and still
+    fails the snapshot.
+    """
+    store = FakeStore(dict(_JOB))
+
+    def publish(**kwargs):
+        kwargs["before_push"]("pushed")
+        return PublishResult(branch="agent/athr_1", commit_sha="pushed", changed_files=["x"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=[])
+        assert request.method == "POST"
+        return httpx.Response(
+            422,
+            json={
+                "message": "Validation Failed",
+                "errors": [{"resource": "PullRequest", "field": field, "code": "invalid"}],
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    original = httpx.AsyncClient
+
+    class PatchedClient(original):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = transport
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(publish_worker, "publish_patch", publish)
+    monkeypatch.setattr(httpx, "AsyncClient", PatchedClient)
+
+    assert await publish_one(store, credential=GitHubCredential("t")) is None
+
+    assert store.pushes == [(9, 0, "pushed")]
+    assert store.snapshot_recorded is None
+    if retried:
+        assert store.snapshot_failed is None
+        assert store.snapshot_deferred is not None
+        assert "head branch" in store.snapshot_deferred[1]
+    else:
+        assert store.snapshot_deferred is None
+        assert store.snapshot_failed is not None
+        assert "base branch" in store.snapshot_failed[1]
 
 
 async def test_credential_never_appears_in_the_pr_body(monkeypatch):

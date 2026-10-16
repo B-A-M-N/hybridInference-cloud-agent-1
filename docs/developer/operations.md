@@ -55,6 +55,9 @@ settings are stored in the Agent database.
 The application API uses `GET /admin/agent/settings` and
 `PUT /admin/agent/settings`. Send a partial body such as
 `{"settings": {"max_attempts": 3}}`; omitted keys keep their current values.
+Add `"expected_revision"` with the `revision` you read to have the write
+refused with 409 if anyone saved settings since then. The editor always sends
+it, so applying a review never overwrites a change the review did not show.
 Writes use the existing administrator guard and appear in the Audit log.
 Application settings are read-only until you choose **Edit** on a group.
 Change the fields, select **Review changes**, check the current and proposed
@@ -2141,11 +2144,15 @@ stored like a checkpoint. Design: [install snapshots](../agents/specs/2026-10-15
   group from the sandbox image and installs in full; the turn never fails
   because of a snapshot. Without the encryption key, bindings carry no
   fingerprint and nothing is snapshotted.
-- **Retention.** The newest snapshot of an installation supersedes older ones,
-  which are deleted after 24 hours. A snapshot is not handed out after 25 days,
-  and is deleted after 7 days unused, when its environment is archived or
-  deleted by the owner, and beyond 20 GiB of ready snapshots per owner (least
-  recently used first).
+- **Retention.** The newest snapshot of an installation supersedes older ones.
+  Changing an installation — its install script, or a setup-time variable or
+  Secret, a global one included — supersedes the snapshots of the earlier
+  one, and a build that finishes after the change is superseded on receipt;
+  a snapshot built for a task's own install script is checked against that
+  script. Superseded snapshots are no longer handed out and are deleted after
+  24 hours. A snapshot is not handed out after 25 days, and is deleted after
+  7 days unused, when its environment is archived or deleted by the owner,
+  and beyond 20 GiB of ready snapshots per owner (least recently used first).
 - **Deletion.** Hosts poll `/v1/agent/worker/environment-snapshots/deletions`
   every 10 minutes and delete the object versions it names, least recently
   tried first, so objects the bucket refuses to delete never hold back the
@@ -2301,7 +2308,25 @@ the branch is still refused as a moved branch until that branch is deleted;
 the platform never force-pushes. A GitHub rate limit, answered with a 403 or a
 429, is retried after the wait GitHub names (`Retry-After`, or the reset time
 of an exhausted limit), up to an hour, and so is a published base's import
-whose credential hit one.
+whose credential hit one. A draft-PR refusal that names only its head branch
+(`head invalid`), which GitHub can answer until it has seen the branch just
+pushed, is retried within the same five-attempt budget; an invalid base branch
+is refused for good.
+
+The base import adds a published commit's objects to the workspace and writes
+no ref, HEAD or index, so Git's own housekeeping prunes them once their pack is
+old enough (two weeks for a default `git gc`). A capture that then finds the
+published base missing is not failed: the sandbox manager refuses it with a
+409 of its own, the group returns to `importing` for the same published base,
+the publisher fetches that commit from GitHub again and imports it, and the
+capture runs once the import completes. That bundle is cut from the commit the
+workspace started from, which its own history keeps, because Git prunes the
+published commits together. A missing base that no snapshot published has
+nothing to fetch, and its capture fails as before. A publication waiting on a
+base import that keeps failing (GitHub no longer serves the commit, access was
+withdrawn, or the workspace cannot take the bundle) fails after an hour and
+leaves its group `dirty`; the owner's next request captures, and imports,
+again.
 
 Disk-pressure admission and alerting and a non-mutating pre-prompt context
 fingerprint remain deferred. Local functional checks do not establish production

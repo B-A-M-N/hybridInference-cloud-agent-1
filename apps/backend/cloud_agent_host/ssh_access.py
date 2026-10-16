@@ -12,7 +12,9 @@ container and the host toward it, in three steps under one per-group lock:
    older one is still applied, but only as far as the newest allows, so a late
    delivery cannot reopen what a newer one closed, and is never skipped
    either. The same step removes the SSH directory of every slot whose chat the
-   newest state allows nothing.
+   newest state allows nothing. Guest root without capabilities, as in a runc
+   container, cannot open a member's tmpfs; such a slot is cleared in step 3
+   by its own member instead.
 2. **Host exceptions.** For a state that is the newest, the group bridge's
    ``ssh_targets`` become exactly its ``IPv4:port`` pairs. An older state
    leaves them alone.
@@ -25,8 +27,9 @@ container and the host toward it, in three steps under one per-group lock:
    as the member means a symlink the member planted can only ever redirect a
    write to somewhere the member could already write.
 
-When a newest state fails after it was recorded, the bridge's exceptions are
-cleared, so the group fails closed until a state applies whole.
+When a newest state fails after it was recorded, or the gate itself fails or
+times out and so may have recorded it, the bridge's exceptions are cleared, so
+the group fails closed until a state applies whole.
 
 Keys travel on stdin, never in argv, and live only in tmpfs: they are gone when
 the container stops and never reach the workspace, a snapshot or an archive.
@@ -199,6 +202,7 @@ if fresh:
 keep = sorted(
     {slot for thread, slot in request["slots"].items() if newest["members"].get(thread)}
 )
+unopened = []
 for slot in range(request["capacity"]):
     if slot in keep:
         continue
@@ -207,6 +211,12 @@ for slot in range(request["capacity"]):
             os.path.join(root, str(slot)), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         )
     except (FileNotFoundError, NotADirectoryError):
+        continue
+    except PermissionError:
+        # Root without CAP_DAC_OVERRIDE (a runc container drops every
+        # capability) cannot open a member's private tmpfs; its member
+        # clears it instead.
+        unopened.append(slot)
         continue
     except OSError as error:
         if error.errno == errno.ELOOP:
@@ -229,6 +239,7 @@ json.dump(
         "revision": newest["revision"],
         "members": newest["members"],
         "keep_slots": keep,
+        **({"member_clear": unopened} if unopened else {}),
     },
     sys.stdout,
 )
@@ -327,8 +338,15 @@ os.chmod(config, 0o600)
 """
 
 
-def _newest(stdout: bytes) -> tuple[bool, int, dict[str, set[str]], set[int]]:
-    """The gate's answer, checked: guest output decides nothing on the host but member files."""
+def _newest(
+    stdout: bytes, capacity: int
+) -> tuple[bool, int, dict[str, set[str]], set[int], set[int]]:
+    """The gate's answer, checked: guest output decides nothing on the host but member files.
+
+    The last item is the slots the gate could not open, which their own
+    members clear; each must be a slot of this sandbox the newest state keeps
+    nothing in.
+    """
     try:
         verdict = json.loads(stdout)
         fresh = verdict["fresh"]
@@ -338,13 +356,16 @@ def _newest(stdout: bytes) -> tuple[bool, int, dict[str, set[str]], set[int]]:
             for thread, digests in verdict["members"].items()
         }
         keep = {int(slot) for slot in verdict["keep_slots"]}
+        clear = {int(slot) for slot in verdict.get("member_clear", [])}
     except (ValueError, KeyError, TypeError, AttributeError) as exc:
         raise SandboxError("SSH access state check returned unreadable output") from exc
     if not isinstance(fresh, bool) or not isinstance(revision, int):
         raise SandboxError("SSH access state check returned unreadable output")
     if any(not _DIGEST.fullmatch(digest) for digests in members.values() for digest in digests):
         raise SandboxError("SSH access state check returned unreadable output")
-    return fresh, revision, members, keep
+    if any(not 0 <= slot < capacity or slot in keep for slot in clear):
+        raise SandboxError("SSH access state check returned unreadable output")
+    return fresh, revision, members, keep, clear
 
 
 def apply_ssh_access(
@@ -367,38 +388,47 @@ def apply_ssh_access(
     if any(slot >= spec.resident_slot_capacity for slot in slots.values()):
         raise SandboxError("SSH access names a slot outside this sandbox")
     with _group_lock(spec.sandbox_id):
-        gate = manager.exec_capture(
-            spec,
-            ["/usr/bin/python3", "-I", "-c", _GATE_SCRIPT],
-            workdir="/",
-            timeout_s=_TIMEOUT_S,
-            input_bytes=json.dumps(
-                {
-                    "revision": access.revision,
-                    "members": {
-                        member.thread_id: sorted(server.digest() for server in member.servers)
-                        for member in access.members
-                        if member.servers
-                    },
-                    "slots": slots,
-                    "state_file": STATE_FILE,
-                    "root": MEMBER_TMPFS_ROOT,
-                    "owner_uid": 0,
-                    "capacity": spec.resident_slot_capacity,
-                }
-            ).encode(),
-            user_uid=0,
-            user_gid=0,
-        )
-        if gate.returncode != 0:
-            raise SandboxError(
-                "SSH access state could not be checked: "
-                + gate.stderr.decode("utf-8", "replace")[-300:]
+        try:
+            gate = manager.exec_capture(
+                spec,
+                ["/usr/bin/python3", "-I", "-c", _GATE_SCRIPT],
+                workdir="/",
+                timeout_s=_TIMEOUT_S,
+                input_bytes=json.dumps(
+                    {
+                        "revision": access.revision,
+                        "members": {
+                            member.thread_id: sorted(server.digest() for server in member.servers)
+                            for member in access.members
+                            if member.servers
+                        },
+                        "slots": slots,
+                        "state_file": STATE_FILE,
+                        "root": MEMBER_TMPFS_ROOT,
+                        "owner_uid": 0,
+                        "capacity": spec.resident_slot_capacity,
+                    }
+                ).encode(),
+                user_uid=0,
+                user_gid=0,
             )
-        fresh, revision, allowed, keep = _newest(gate.stdout)
+            if gate.returncode != 0:
+                raise SandboxError(
+                    "SSH access state could not be checked: "
+                    + gate.stderr.decode("utf-8", "replace")[-300:]
+                )
+        except Exception:
+            # The gate records the newest state before it clears any slot, so
+            # one that failed or timed out may have recorded this state with
+            # nothing after it in place. Older states then leave the bridge
+            # alone, so it is closed here rather than left open.
+            _close_bridge(manager, spec)
+            raise
+        fresh, revision, allowed, keep, clear = _newest(gate.stdout, spec.resident_slot_capacity)
         try:
             if fresh:
                 manager.sync_ssh_targets(spec, access.targets())
+            payloads: list[tuple[int, dict[str, Any]]] = []
             for member in residents:
                 slot = slots[member.thread_id]
                 if slot not in keep:
@@ -410,6 +440,11 @@ def apply_ssh_access(
                     )
                 else:
                     payload = narrow_payload(slot, permitted)
+                payloads.append((slot, payload))
+            # A slot the gate could not open as root holds nothing the newest
+            # state allows: its member removes every server it holds, as itself.
+            payloads += [(slot, narrow_payload(slot, set())) for slot in sorted(clear)]
+            for slot, payload in payloads:
                 result = manager.exec_capture(
                     spec,
                     ["/usr/bin/python3", "-I", "-c", _MEMBER_SCRIPT],
@@ -428,10 +463,15 @@ def apply_ssh_access(
             if fresh:
                 # The newest state is recorded but not in place: close the
                 # bridge rather than leave an older selection open behind it.
-                with contextlib.suppress(Exception):
-                    manager.sync_ssh_targets(spec, set())
+                _close_bridge(manager, spec)
             raise
     return {"newest": fresh, "revision": revision}
+
+
+def _close_bridge(manager: ChatSandboxManager, spec: ChatSandboxSpec) -> None:
+    """Drop every SSH exception of the group's bridge, without masking the failure."""
+    with contextlib.suppress(Exception):
+        manager.sync_ssh_targets(spec, set())
 
 
 __all__ = [

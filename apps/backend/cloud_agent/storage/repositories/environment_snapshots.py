@@ -16,6 +16,10 @@ from typing import TYPE_CHECKING, Any
 from cloud_agent.execution_profiles import default_execution_profile
 from cloud_agent.sandbox_archive_credentials import load_stored_archive_policy
 from cloud_agent.storage._sql.rows import load_json
+from cloud_agent.storage.repositories.environments import (
+    lock_environment_snapshots,
+    retire_changed_snapshots,
+)
 from cloud_agent_shared.environment_snapshots import (
     SNAPSHOT_MAX_AGE_DAYS,
     SNAPSHOT_OWNER_QUOTA_BYTES,
@@ -276,7 +280,8 @@ class PostgresEnvironmentSnapshotRepository:
         that snapshot may have. A host can only report the snapshot it was
         handed, and only while its run may still report at all: the run row is
         locked with the snapshot, so a cancel or an expired lease cannot slip
-        between this check and the snapshot becoming ready.
+        between this check and the snapshot becoming ready. The owner's
+        snapshot lock comes first, as for a deletion of the same snapshots.
         """
         snapshot_id = str(receipt.get("snapshot_id") or "")
         lockfiles = receipt.get("lockfiles")
@@ -289,6 +294,12 @@ class PostgresEnvironmentSnapshotRepository:
         ):
             return False
         async with self._pool.acquire() as conn, conn.transaction():
+            owner = await conn.fetchval(
+                "SELECT user_id FROM agent_environment_snapshots WHERE id=$1", snapshot_id
+            )
+            if owner is None:
+                return False
+            await lock_environment_snapshots(conn, owner)
             row = await conn.fetchrow(
                 "SELECT s.* FROM agent_environment_snapshots s JOIN agent_environment_runs r ON r.id = s.run_id "
                 "WHERE s.id=$1 AND r.id=$2 AND r.host=$3 AND r.lease_generation=$4 AND s.state='building' "
@@ -338,6 +349,10 @@ class PostgresEnvironmentSnapshotRepository:
                 receipt["base_image"],
                 snapshot_id,
             )
+            # A build queued before the owner changed the installation, or for
+            # a task or test bound before it, installed with the old values:
+            # it is recorded, so it gets deleted, but never handed out.
+            await retire_changed_snapshots(conn, row["user_id"], [row["environment_id"]])
             await self._enforce_quota(conn, row["user_id"])
             return True
 
@@ -420,7 +435,12 @@ class PostgresEnvironmentSnapshotRepository:
     async def summaries(
         self, user_id: str, fingerprints: Mapping[str, str | None]
     ) -> dict[str, dict[str, Any] | None]:
-        """The latest snapshot of each environment's current installation."""
+        """The latest snapshot of each environment's current installation.
+
+        Each environment is matched with its own fingerprint: a copy installs
+        what the original did, so one environment's earlier snapshot can carry
+        another's current fingerprint.
+        """
         wanted = {env: fp for env, fp in fingerprints.items() if fp}
         result: dict[str, dict[str, Any] | None] = dict.fromkeys(fingerprints)
         if not wanted:
@@ -431,13 +451,15 @@ class PostgresEnvironmentSnapshotRepository:
                 SELECT DISTINCT ON (environment_id) environment_id, id, state, created_at,
                        ready_at, last_used_at, size_bytes, detail
                 FROM agent_environment_snapshots
-                WHERE user_id = $1 AND environment_id = ANY($2::text[])
-                  AND setup_fingerprint = ANY($3::text[]) AND state = ANY($4::text[])
+                WHERE user_id = $1
+                  AND (environment_id, setup_fingerprint) IN (
+                      SELECT * FROM unnest($2::text[], $3::text[]))
+                  AND state = ANY($4::text[])
                 ORDER BY environment_id, created_at DESC
                 """,
                 user_id,
                 list(wanted),
-                list(set(wanted.values())),
+                list(wanted.values()),
                 list(_SUMMARY_STATES),
             )
         for row in rows:
@@ -459,9 +481,12 @@ class PostgresEnvironmentSnapshotRepository:
 
         A prebuild is cancelled the way an owner cancels a test: a queued one
         is never claimed, and a running one's host is refused at its next
-        report and stops.
+        report and stops. The owner's snapshot lock comes first: the
+        statement below locks the snapshots in whatever order it scans them,
+        and a receipt holding one of them may be waiting for another.
         """
         async with self._pool.acquire() as conn, conn.transaction():
+            await lock_environment_snapshots(conn, user_id)
             rows = await conn.fetch(
                 "UPDATE agent_environment_snapshots SET state=CASE WHEN object_key IS NULL THEN 'deleted' ELSE 'deleting' END, "
                 "detail='Deleted by the owner', updated_at=NOW(), "
@@ -490,7 +515,7 @@ class PostgresEnvironmentSnapshotRepository:
                     detail=CASE
                         WHEN e.archived_at IS NOT NULL THEN 'Environment archived'
                         WHEN {_SAVED_BY_TEST} THEN 'Saved by an environment test'
-                        WHEN s.state='superseded' THEN 'Replaced by a newer snapshot'
+                        WHEN s.state='superseded' THEN COALESCE(s.detail, 'Replaced by a newer snapshot')
                         WHEN s.ready_at <= NOW() - INTERVAL '{SNAPSHOT_MAX_AGE_DAYS} days' THEN 'Snapshot expired'
                         ELSE 'Not used for {SNAPSHOT_UNUSED_DAYS} days' END
                 FROM agent_environments e
