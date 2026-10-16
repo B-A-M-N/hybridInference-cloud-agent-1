@@ -1,13 +1,13 @@
 """Make sandbox repository writes an explicit per-repository authorization.
 
-Revision ID: 0083_repository_direct_write
-Revises: 0082_team_environments
+Revision ID: 0084_repository_direct_write
+Revises: 0083_host_move_out
 """
 
 from alembic import op
 
-revision = "0083_repository_direct_write"
-down_revision = "0082_team_environments"
+revision = "0084_repository_direct_write"
+down_revision = "0083_host_move_out"
 branch_labels = None
 depends_on = None
 
