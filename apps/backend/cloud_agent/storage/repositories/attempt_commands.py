@@ -54,7 +54,11 @@ from cloud_agent.storage._sql.ledger import (
 )
 from cloud_agent.storage._sql.pending_messages import PAUSE_QUEUE_SQL
 from cloud_agent.storage._sql.rows import job_row_to_dict, load_json
-from cloud_agent.storage._sql.sandbox import THREAD_SANDBOX_SOURCE, release_failed_restore
+from cloud_agent.storage._sql.sandbox import (
+    THREAD_SANDBOX_SOURCE,
+    release_failed_restore,
+    restore_claim_due,
+)
 from cloud_agent.storage.deadlocks import retry_deadlock_victim
 from cloud_agent.task_titles import thread_title_needs_generation
 from cloud_agent_shared.sandbox_archive_settings import (
@@ -340,11 +344,13 @@ class PostgresAttemptCommands:
                         OR (
                             -- A group whose host is gone, held by its
                             -- checkpoint: any restore-capable host may take
-                            -- it, and the claim below rehomes it.
+                            -- it, and the claim below rehomes it. After a
+                            -- failed restore it waits before the next try.
                             s.state = 'cold'
                             AND $7::boolean
                             AND $6::boolean
                             AND s.restore_attempts < {MAX_RESTORE_ATTEMPTS}
+                            AND {restore_claim_due("s.restore_attempts", "s.group_last_activity_at")}
                             AND NOT EXISTS (
                                 SELECT 1 FROM agent_sandboxes deleting
                                 WHERE deleting.id = s.sandbox_id
@@ -381,7 +387,8 @@ class PostgresAttemptCommands:
                 # it only the first moves it.
                 claimable = await conn.fetchval(
                     "SELECT (state IN ('provisioning', 'starting', 'running', 'stopped') "
-                    "OR ($2 AND state = 'cold' AND restore_checkpoint_id IS NOT NULL)) "
+                    "OR ($2 AND state = 'cold' AND restore_checkpoint_id IS NOT NULL AND "
+                    f"{restore_claim_due('restore_attempts', 'last_activity_at')})) "
                     "AND stop_requested_at IS NULL "
                     "AND deletion_state NOT IN ('pending', 'archived', 'deleted') "
                     "FROM agent_sandboxes "

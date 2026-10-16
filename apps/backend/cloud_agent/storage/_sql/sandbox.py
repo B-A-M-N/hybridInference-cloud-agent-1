@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from cloud_agent_shared.sandbox_restore import MAX_RESTORE_ATTEMPTS
+from cloud_agent_shared.sandbox_restore import MAX_RESTORE_ATTEMPTS, RESTORE_RETRY_DELAYS_S
 from cloud_agent_shared.shared_protocol import (
     FORK_HELPER,
     MID_TURN_INPUT_CAPABILITY_PREFIX,
@@ -219,6 +219,24 @@ async def fence_sandbox_start(conn: Any, sandbox_id: str) -> str | None:
     )
 
 
+def restore_claim_due(attempts: str, failed_at: str) -> str:
+    """SQL: whether a cold group may be claimed for another restore now.
+
+    ``attempts`` names the group's ``restore_attempts`` and ``failed_at`` the
+    time its last restore failed, which is its ``last_activity_at``: every
+    path that hands a failed restore back to the checkpoint stamps it. A
+    group no restore has failed for is due at once. After the n-th failure it
+    waits the n-th of ``RESTORE_RETRY_DELAYS_S``, so the attempts outlast a
+    short registry or S3 outage instead of all failing inside it.
+    """
+    delays = ", ".join(repr(float(delay)) for delay in RESTORE_RETRY_DELAYS_S)
+    return (
+        f"({attempts} = 0 OR {failed_at} <= clock_timestamp() - make_interval(secs => "
+        f"(ARRAY[{delays}]::double precision[])"
+        f"[LEAST({attempts}, {len(RESTORE_RETRY_DELAYS_S)})]))"
+    )
+
+
 async def release_failed_restore(conn: Any, attempt_id: int, detail: str) -> str | None:
     """Return a group this attempt was recreating to its checkpoint.
 
@@ -228,8 +246,9 @@ async def release_failed_restore(conn: Any, attempt_id: int, detail: str) -> str
     checkpoint is untouched, so the group goes back to ``cold`` for another
     claim; a container the attempt may have left is fenced by the generation
     the next claim advances. Once the attempts run out it is ``lost`` instead.
-    Returns the group's new state, or ``None`` when the attempt restored
-    nothing.
+    The failure's time is the group's last activity, which the next claim
+    waits from (:func:`restore_claim_due`). Returns the group's new state, or
+    ``None`` when the attempt restored nothing.
     """
     # Memberships before their group, the order every writer keeps. The
     # restoring member may already hold the attempt from its reservation.
@@ -252,7 +271,7 @@ async def release_failed_restore(conn: Any, attempt_id: int, detail: str) -> str
                 WHEN restore_attempts >= {MAX_RESTORE_ATTEMPTS} THEN 'lost' ELSE 'cold'
             END,
             container_id = NULL, restore_attempt_id = NULL,
-            last_error = $2, updated_at = NOW()
+            last_error = $2, last_activity_at = NOW(), updated_at = NOW()
         WHERE restore_attempt_id = $1 AND state = 'restoring'
         RETURNING state
         """,

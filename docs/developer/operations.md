@@ -2111,10 +2111,13 @@ old host still holds is fenced out. The new host's Sandbox Manager:
    after any restart.
 
 A restore that fails before the turn is admitted returns the group to `cold`
-and the turn to the queue without spending an attempt; the third failed claim
-marks the group lost and fails its queued turns. The checkpoint is never
-changed. Workspace requests to a `cold` or `restoring` group return
-`workspace_restoring` (409) until a turn has restored it. Restore reads with
+and the turn to the queue without spending an attempt. The group is not
+claimed again until 30 seconds after its first failure, 5 minutes after its
+second and 30 minutes after its third, so the attempts outlast a short
+registry or S3 outage; the fourth failed claim marks the group lost and fails
+its queued turns. The checkpoint is never changed. Workspace requests to a
+`cold` or `restoring` group return `workspace_restoring` (409) until a turn
+has restored it. Restore reads with
 the archive credentials hosts already receive: `s3:GetObject` and
 `kms:Decrypt` on the archive prefix.
 

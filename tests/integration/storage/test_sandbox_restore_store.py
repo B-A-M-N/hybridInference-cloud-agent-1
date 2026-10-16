@@ -19,7 +19,11 @@ from tests.integration.storage.test_agent_job_store import (
 from cloud_agent.host_pool import HOST_REMOVAL_STOP_WAIT_S
 from cloud_agent.storage._sql.compute_admission import host_compute_admission
 from cloud_agent_shared.sandbox_archive_settings import SANDBOX_ARCHIVE_CAPABILITY
-from cloud_agent_shared.sandbox_restore import MAX_RESTORE_ATTEMPTS, SANDBOX_RESTORE_CAPABILITY
+from cloud_agent_shared.sandbox_restore import (
+    MAX_RESTORE_ATTEMPTS,
+    RESTORE_RETRY_DELAYS_S,
+    SANDBOX_RESTORE_CAPABILITY,
+)
 
 if TYPE_CHECKING:
     from cloud_agent.storage.assembly import Storage
@@ -221,6 +225,17 @@ async def _state(pool, sandbox_id: str = "asbx_restore") -> dict:
         )
     assert row is not None
     return dict(row)
+
+
+async def _age_restore_failure(pool, seconds: float, sandbox_id: str = "asbx_restore") -> None:
+    """Move the group's last failed restore ``seconds`` further into the past."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_sandboxes "
+            "SET last_activity_at = last_activity_at - make_interval(secs => $2) WHERE id = $1",
+            sandbox_id,
+            seconds,
+        )
 
 
 async def test_a_removed_hosts_covered_group_is_restored_on_another_host(pool, store: Storage):
@@ -581,11 +596,59 @@ async def test_a_failed_restore_returns_to_the_checkpoint_until_attempts_run_out
         if attempt < MAX_RESTORE_ATTEMPTS:
             assert state["state"] == "cold"
             assert (await store.conversation_queries.get_job(follow_up["id"]))["state"] == "queued"
+            # The next try waits out this failure's delay, however soon the
+            # queue hands the turn out again.
+            assert await _claim(store, "runner-c", _RESTORE_HOST) is None
+            await _age_restore_failure(pool, RESTORE_RETRY_DELAYS_S[attempt - 1])
 
     assert (await _state(pool))["state"] == "lost"
     failed = await store.conversation_queries.get_job(follow_up["id"])
     assert failed is not None and failed["state"] == "failed"
     assert await _claim(store, "runner-c", _RESTORE_HOST) is None
+
+
+async def test_restore_failures_during_a_short_outage_do_not_lose_the_chat(pool, store: Storage):
+    """Two minutes of a registry or S3 outage fail every restore tried in them."""
+    job, _ = await _covered(pool, store)
+    follow_up = await store.conversation_commands.create_follow_up(
+        parent_job_id=job["id"], user_id="user-1", prompt="continue"
+    )
+    assert follow_up is not None
+    assert await store.host_pool.remove_host(host="runner-a") == "ok"
+    await _host(store, "runner-c", _RESTORE_HOST)
+
+    # A claim every ten seconds, as fast as the queue hands the turn out, and
+    # every restore fails at once.
+    for _ in range(12):
+        claim = await _claim(store, "runner-c", _RESTORE_HOST)
+        if claim is not None:
+            assert await store.attempt_commands.release_claim(
+                job_id=follow_up["id"],
+                attempt_id=claim["attempt_id"],
+                lease_generation=claim["lease_generation"],
+                reason="sandbox_restore_failed",
+            )
+        await _age_restore_failure(pool, 10)
+
+    state = await _state(pool)
+    assert state["state"] == "cold"
+    assert state["restore_attempts"] == 2
+    waiting = await store.conversation_queries.get_job(follow_up["id"])
+    assert waiting is not None and waiting["state"] == "queued"
+
+    # The outage is over before the next wait is.
+    await _age_restore_failure(pool, RESTORE_RETRY_DELAYS_S[1])
+    claim = await _claim(store, "runner-c", _RESTORE_HOST)
+    assert claim is not None and claim["id"] == follow_up["id"]
+    reserved = await _reserve(store, follow_up, claim, "runner-c")
+    assert await store.sandbox.mark_thread_sandbox_running(
+        **_fence(follow_up, claim, reserved),
+        container_id="container-c",
+        context_status="restored",
+    )
+    restored = await _state(pool)
+    assert restored["state"] == "running"
+    assert restored["restore_attempts"] == 0
 
 
 async def test_an_expired_restore_returns_the_group_and_requeues_the_turn(pool, store: Storage):
@@ -605,6 +668,8 @@ async def test_an_expired_restore_returns_the_group_and_requeues_the_turn(pool, 
             "WHERE id = $1",
             claim["attempt_id"],
         )
+    # The group's activity before the restore lies long in the past.
+    await _age_restore_failure(pool, 3600)
 
     await store.attempt_commands.reap_expired()
 
@@ -618,6 +683,9 @@ async def test_an_expired_restore_returns_the_group_and_requeues_the_turn(pool, 
     # Nothing ran: the chat's context is the checkpoint's, not lost.
     assert member["context_status"] != "lost"
     assert member["active_attempt_id"] is None
+    # The lapsed lease counts as a failed restore: the next try waits from it.
+    assert await _claim(store, "runner-c", _RESTORE_HOST) is None
+    await _age_restore_failure(pool, RESTORE_RETRY_DELAYS_S[0])
     retry = await _claim(store, "runner-c", _RESTORE_HOST)
     assert retry is not None and retry["thread_sandbox"]["generation"] == 3
 
