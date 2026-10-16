@@ -76,6 +76,8 @@ class FakeDocker:
         self.hang_rmi: set[str] = set()
         #: What ``ps`` exits with; not 0 is a daemon that cannot answer.
         self.ps_exit = 0
+        #: What listing this deployment's downloaded versions exits with.
+        self.held_ls_exit = 0
         #: The daemon's clock, in seconds, and when each container was made,
         #: from which image: ``rmi`` refuses an image a container still uses,
         #: and ``container prune --filter until=`` goes by the age.
@@ -103,6 +105,8 @@ class FakeDocker:
                 }
                 return self._done("\n".join(sorted(found)))
             if args[2] == "--filter":
+                if self.held_ls_exit:
+                    return self._done("", self.held_ls_exit, "Cannot connect to the Docker daemon")
                 refs = [ref for ref in self.images if ref.startswith(repository(NAMESPACE) + ":")]
             else:
                 refs = [ref for ref in self.images if ref.startswith(args[2] + ":")]
@@ -881,6 +885,36 @@ def test_a_version_a_chat_still_runs_goes_once_that_chat_is_deleted(docker, monk
         _wait_for(lambda: passes() >= 2)
         assert withdrawn in docker.images
         docker.removed.add(chat)
+        _wait_for(lambda: withdrawn not in docker.images)
+    finally:
+        downloads.stop()
+
+    assert _held_versions() == []
+
+
+def test_a_failed_listing_of_the_held_versions_is_tried_again(docker, monkeypatch):
+    """A Docker that cannot list images has not said that this host holds none.
+
+    The answers name nothing, so nothing but a cleanup still owed makes the
+    worker look again.
+    """
+    monkeypatch.setattr(runtime_downloads, "UNNEEDED_GRACE_S", 0.0, raising=False)
+    monkeypatch.setattr(runtime_downloads, "_POLL_S", 0.01)
+    withdrawn = _held(docker, "2.1.200")
+    docker.held_ls_exit = 1
+    downloads = _downloads()
+    downloads.apply([])
+
+    def passes() -> int:
+        return sum(1 for call in docker.calls if call[:2] == ["container", "prune"])
+
+    downloads.start()
+    try:
+        # It keeps looking while Docker cannot say, and removes nothing.
+        _wait_for(lambda: passes() >= 3)
+        assert passes() >= 3
+        assert withdrawn in docker.images
+        docker.held_ls_exit = 0
         _wait_for(lambda: withdrawn not in docker.images)
     finally:
         downloads.stop()

@@ -113,27 +113,32 @@ def _parse(ref: str, namespace: str) -> RuntimeImage | None:
 
 def discover(docker: str, namespace: str, *, timeout: float = 15) -> list[RuntimeImage]:
     """Every downloaded version this deployment holds; empty if Docker cannot say."""
-    try:
-        listed = subprocess.run(
-            [
-                docker,
-                "image",
-                "ls",
-                "--filter",
-                f"label={NAMESPACE_LABEL}={namespace}",
-                "--format",
-                "{{.Repository}}:{{.Tag}}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return []
-    if listed.returncode != 0:
-        return []
-    found = (_parse(line.strip(), namespace) for line in listed.stdout.splitlines())
+    return discover_or_none(docker, namespace, timeout=timeout) or []
+
+
+def discover_or_none(
+    docker: str, namespace: str, *, timeout: float = 15
+) -> list[RuntimeImage] | None:
+    """Every downloaded version this deployment holds; ``None`` if Docker cannot say.
+
+    For a caller that must not take a failed listing for holding nothing, such
+    as a cleanup deciding whether it is still owed.
+    """
+    listed = _read(
+        docker,
+        [
+            "image",
+            "ls",
+            "--filter",
+            f"label={NAMESPACE_LABEL}={namespace}",
+            "--format",
+            "{{.Repository}}:{{.Tag}}",
+        ],
+        timeout,
+    )
+    if listed is None:
+        return None
+    found = (_parse(line.strip(), namespace) for line in listed.splitlines())
     return [image for image in found if image is not None]
 
 

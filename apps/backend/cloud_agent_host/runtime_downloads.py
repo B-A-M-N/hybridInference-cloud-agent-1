@@ -53,6 +53,7 @@ from cloud_agent_host.runtime_images import (
     WORK_LABEL,
     chat_versions,
     discover,
+    discover_or_none,
     image_id,
     image_ref,
     repository,
@@ -652,11 +653,14 @@ class RuntimeDownloads:
             # Time unneeded counts only while answers say what is needed.
             self._unneeded_since.clear()
             return
-        held = [
-            image
-            for image in discover(self._docker, self._namespace)
-            if (image.runtime, image.version) not in named
-        ]
+        listed = discover_or_none(self._docker, self._namespace)
+        if listed is None:
+            # Docker could not say what this host holds, which is not holding
+            # nothing: look again, though there may be nothing to download.
+            with self._lock:
+                self._cleanup_due = True
+            return
+        held = [image for image in listed if (image.runtime, image.version) not in named]
         if not held:
             self._unneeded_since.clear()
             return
