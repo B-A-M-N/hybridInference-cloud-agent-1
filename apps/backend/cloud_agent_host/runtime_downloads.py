@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING
 from cloud_agent_host.runtime_images import (
     NAMESPACE_LABEL,
     RUNTIME_LABEL,
+    SOURCE_LABEL,
     VERSION_LABEL,
     WORK_LABEL,
     chat_versions,
@@ -93,6 +94,10 @@ _DOCKER_TIMEOUT_S = 120.0
 #: snapshot can make a while. The version a switch has just replaced can be
 #: the one such a chat was given.
 UNNEEDED_GRACE_S = 600.0
+#: How old a chat's copy source must be before it counts as left behind, as
+#: Docker's ``until`` filter reads it (on the daemon's own clock). A copy
+#: streams for at most a few minutes (``runtime_install``).
+LEFT_BEHIND_SOURCE_AGE = "1h"
 
 #: Reported while each step runs. The admin page eases between them, so the
 #: bar keeps moving through a long fetch without this host inventing numbers.
@@ -591,12 +596,33 @@ class RuntimeDownloads:
     def _clean_up(self) -> None:
         """Remove what nothing needs; a failure is logged, never raised."""
         try:
+            self._remove_left_behind_sources()
             self._remove_unneeded()
         except Exception:
             logger.exception(
                 "runtime download cleanup failed",
                 extra={"event": "runtime_download_cleanup_error"},
             )
+
+    def _remove_left_behind_sources(self) -> None:
+        """Remove the copy sources chats' processes died before removing.
+
+        Each keeps its version's image from being removed. Only old ones go:
+        a young one may belong to a copy still running. ``container prune``
+        removes every container that is not running, and a source is never
+        started; ``until`` keeps the ones made in the last hour.
+        """
+        self._docker_run(
+            [
+                "container",
+                "prune",
+                "--force",
+                "--filter",
+                f"label={SOURCE_LABEL}={self._namespace}",
+                "--filter",
+                f"until={LEFT_BEHIND_SOURCE_AGE}",
+            ]
+        )
 
     def _remove_unneeded(self) -> None:
         """Remove the versions held here that nothing needs any more.
@@ -642,16 +668,18 @@ class RuntimeDownloads:
             # Never forced: Docker refuses an image a container still uses,
             # such as the source a chat is copying this version from, and the
             # next cleanup tries again.
-            if self._docker_run(["rmi", image.ref]).returncode == 0:
-                removed = True
-                logger.info(
-                    "runtime download removed",
-                    extra={
-                        "event": "runtime_download_removed",
-                        "runtime": image.runtime,
-                        "version": image.version,
-                    },
-                )
+            if self._docker_run(["rmi", image.ref]).returncode != 0:
+                waiting = True
+                continue
+            removed = True
+            logger.info(
+                "runtime download removed",
+                extra={
+                    "event": "runtime_download_removed",
+                    "runtime": image.runtime,
+                    "version": image.version,
+                },
+            )
         if waiting:
             with self._lock:
                 self._cleanup_due = True

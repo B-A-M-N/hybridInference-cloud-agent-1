@@ -76,6 +76,12 @@ class FakeDocker:
         self.hang_rmi: set[str] = set()
         #: What ``ps`` exits with; not 0 is a daemon that cannot answer.
         self.ps_exit = 0
+        #: The daemon's clock, in seconds, and when each container was made,
+        #: from which image: ``rmi`` refuses an image a container still uses,
+        #: and ``container prune --filter until=`` goes by the age.
+        self.now = 0.0
+        self.created: dict[str, float] = {}
+        self.made_from: dict[str, str] = {}
 
     def __call__(self, argv: list[str], **_kwargs: Any) -> SimpleNamespace:
         args = argv[1:]
@@ -111,6 +117,8 @@ class FakeDocker:
                 **self.labels.get(self.images.get(image, image), {}),
                 **self._pairs(args, "--label"),
             }
+            self.created[container] = self.now
+            self.made_from[container] = image
             return self._done(container)
         if verb == "start":
             created = self.containers[args[-1]]
@@ -134,13 +142,36 @@ class FakeDocker:
         if verb == "rmi":
             if args[1] in self.hang_rmi:
                 raise subprocess.TimeoutExpired(argv, 120)
-            if args[1] in self.refuse_rmi:
+            in_use = any(
+                self.made_from.get(container) == args[1]
+                for container in self.containers
+                if container not in self.removed
+            )
+            if in_use or args[1] in self.refuse_rmi:
                 return self._done("", 1, "conflict: unable to remove repository reference")
             self.images.pop(args[1], None)
             return self._done("")
         if verb == "rm":
             self.removed.add(args[-1])
             return self._done("")
+        if args[:2] == ["container", "prune"]:
+            # Every container not running, which a never-started one is not,
+            # with the labels named, made before ``until`` ago.
+            wanted = self._wanted(args)
+            (until,) = (arg.removeprefix("until=") for arg in args if arg.startswith("until="))
+            age = sum(
+                int(count) * {"h": 3600, "m": 60, "s": 1}[unit]
+                for count, unit in re.findall(r"(\d+)([hms])", until)
+            )
+            pruned = [
+                container
+                for container in self.containers
+                if container not in self.removed
+                and self.created.get(container, 0.0) <= self.now - age
+                and all(self._matches(self.labels[container], label) for label in wanted)
+            ]
+            self.removed.update(pruned)
+            return self._done("Deleted Containers:\n" + "\n".join(pruned))
         if verb == "ps":
             if self.ps_exit:
                 return self._done("", self.ps_exit, "Cannot connect to the Docker daemon")
@@ -919,6 +950,76 @@ def test_a_runner_restarting_mid_copy_leaves_the_copy_alone(downloaded):
     (source,) = downloaded.containers
     assert ["rm", "-f", source] not in downloaded.calls
     assert len(manager.copies) == 1
+
+
+def _leak_a_copy_source(docker: FakeDocker, version: str) -> str:
+    """Copy ``version`` into a chat whose process dies before removing its source.
+
+    The source container is made exactly as the copy makes it; only the
+    ``docker rm`` at the end never reaches Docker.
+    """
+
+    class Dying(FakeManager):
+        def _run(self, argv, *, timeout):
+            self.runs.append(argv)
+            if argv[1] == "rm":
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return subprocess.run(
+                argv, capture_output=True, text=True, timeout=timeout, check=False
+            )
+
+    runtime_install.ensure_downloaded_runtime(Dying(), None, "claude-code", version)
+    (source,) = (c for c in docker.containers if c not in docker.removed)
+    return source
+
+
+def test_a_copy_source_left_behind_goes_once_it_is_old_and_its_version_with_it(docker):
+    """The leaked source pins its version's image: Docker refuses to remove it."""
+    clock = Clock()
+    downloads = _downloads(clock=clock)
+    held = _held(docker, "2.1.200")
+    source = _leak_a_copy_source(docker, "2.1.200")
+    downloads.apply([])
+
+    _cleaned_up(downloads, clock)
+    assert held in docker.images
+
+    # An hour on, no copy can still be reading it.
+    docker.now += 3601
+    downloads._clean_up()
+
+    assert source in docker.removed
+    assert held not in docker.images
+
+
+def test_a_young_copy_source_is_left_alone(docker):
+    """A copy may still be reading it; only an old one is left behind for good."""
+    clock = Clock()
+    downloads = _downloads(clock=clock)
+    held = _held(docker, "2.1.200")
+    source = _leak_a_copy_source(docker, "2.1.200")
+    docker.now += 3599
+    downloads.apply([])
+
+    _cleaned_up(downloads, clock)
+
+    assert source not in docker.removed
+    assert held in docker.images
+    # Still owed, so a host with nothing to download tries again.
+    assert downloads._cleanup_due
+    # Only this deployment's copy sources, and only those an hour old.
+    pruned = {tuple(call) for call in docker.calls if call[:2] == ["container", "prune"]}
+    assert pruned == {
+        (
+            "container",
+            "prune",
+            "--force",
+            "--filter",
+            f"label={runtime_images.SOURCE_LABEL}={NAMESPACE}",
+            "--filter",
+            "until=1h",
+        )
+    }
 
 
 def test_the_activation_refuses_a_tree_root_does_not_own_outright(tmp_path):
