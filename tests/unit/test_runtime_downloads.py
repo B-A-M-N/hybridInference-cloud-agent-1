@@ -660,6 +660,32 @@ def test_a_version_goes_only_after_nothing_has_needed_it_for_a_while(docker):
     assert _held_versions() == ["2.1.300"]
 
 
+def test_a_version_an_answer_names_while_cleanup_runs_is_kept(docker, monkeypatch):
+    """An admin may select a version this host still offers while a cleanup decides.
+
+    The control plane accepts it because this host offers it, so a new chat
+    may be claimed on it before the next beat says it went.
+    """
+    clock = Clock()
+    downloads = _downloads(clock=clock)
+    selected = _held(docker, "2.1.200")
+    downloads.apply([_target()])
+    downloads._clean_up()
+    clock.now += runtime_downloads.UNNEEDED_GRACE_S
+    read_chats = runtime_downloads.chat_versions
+
+    def answered_meanwhile(*args: Any, **kwargs: Any) -> Any:
+        # The answer naming the selection lands after this pass read the list.
+        downloads.apply([_target("2.1.200", nonce="b" * 32), _target()])
+        return read_chats(*args, **kwargs)
+
+    monkeypatch.setattr(runtime_downloads, "chat_versions", answered_meanwhile)
+    downloads._clean_up()
+
+    assert selected in docker.images
+    assert docker.ran("rmi") == []
+
+
 def test_nothing_is_removed_until_an_answer_says_what_to_hold(docker):
     """An answer without targets comes from a control plane that does not send them."""
     clock = Clock()

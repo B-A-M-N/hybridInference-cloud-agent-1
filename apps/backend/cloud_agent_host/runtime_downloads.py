@@ -672,6 +672,12 @@ class RuntimeDownloads:
             if now - self._unneeded_since[key] < UNNEEDED_GRACE_S:
                 waiting = True
                 continue
+            # An answer may have named it since this pass read the list: an
+            # admin can select a version this host still offers, and the
+            # control plane takes it on that word.
+            with self._lock:
+                if self._named is None or key in self._named:
+                    continue
             # Never forced: Docker refuses an image a container still uses,
             # such as the source a chat is copying this version from, and the
             # next cleanup tries again.
