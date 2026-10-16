@@ -180,6 +180,18 @@ def test_claimed_github_write_token_reaches_only_the_resident_launch(monkeypatch
     )
 
 
+@pytest.mark.parametrize(
+    "write_fields",
+    [
+        {"github_token": "sandbox-write-token"},
+        {"direct_write_repo": "o/n"},
+    ],
+)
+def test_a_claim_requires_the_direct_write_token_and_target_as_a_pair(write_fields):
+    with pytest.raises(ValueError, match="must be paired"):
+        ClaimedJob.from_response({**_PAYLOAD, **write_fields})
+
+
 def _run_new_chat(
     monkeypatch,
     host_settings: dict[str, float] | None,
@@ -196,6 +208,7 @@ def _run_new_chat(
     retained.sandbox_metadata.return_value = {}
     retained.has_binary.return_value = True
     retained_origin: str | None = None
+    retained_push_urls: list[str] = []
 
     class Process:
         def __init__(self, output: str = "") -> None:
@@ -214,17 +227,29 @@ def _run_new_chat(
             return ""
 
     def retained_spawn(spec):
-        nonlocal retained_origin
+        nonlocal retained_origin, retained_push_urls
         if spec.argv == ["git", "remote"]:
             return Process("origin\n" if retained_origin else "")
+        if spec.argv == ["git", "config", "--local", "--name-only", "--list"]:
+            keys = []
+            if retained_origin:
+                keys.append("remote.origin.url")
+                keys.extend("remote.origin.pushurl" for _ in retained_push_urls)
+            return Process("".join(f"{key}\n" for key in keys))
         if spec.argv[:4] == ["git", "remote", "add", "origin"]:
             retained_origin = spec.argv[4]
+            retained_push_urls = []
             return Process()
-        if spec.argv[:4] == ["git", "remote", "set-url", "origin"]:
-            retained_origin = spec.argv[4]
+        if spec.argv == ["git", "remote", "get-url", "--push", "--all", "origin"]:
+            urls = retained_push_urls or ([retained_origin] if retained_origin else [])
+            return Process("".join(f"{url}\n" for url in urls))
+        if spec.argv == ["git", "config", "--local", "--remove-section", "remote.origin"]:
+            retained_origin = None
+            retained_push_urls = []
             return Process()
         if spec.argv == ["git", "remote", "remove", "origin"]:
             retained_origin = None
+            retained_push_urls = []
             return Process()
         raise AssertionError(spec.argv)
 

@@ -90,6 +90,8 @@ class ClaimedJob:
     clone_token: str | None = None
     # A separate repository-scoped contents/PR write token for sandbox gh.
     github_token: str | None = field(default=None, repr=False)
+    # Canonical repository for that token; the runner reconciles origin to it.
+    direct_write_repo: str | None = None
     parent_job_id: str | None = None
     turn_no: int = 1
     # MCP connection aliases this job was granted. Aliases only: the runner
@@ -119,6 +121,10 @@ class ClaimedJob:
     @classmethod
     def from_response(cls, body: dict[str, Any]) -> ClaimedJob:
         """Build from the claim endpoint's response."""
+        github_token = body.get("github_token") or None
+        direct_write_repo = body.get("direct_write_repo") or None
+        if bool(github_token) != bool(direct_write_repo):
+            raise ValueError("claim write credentials and repository target must be paired")
         raw_plugins = body.get("plugins", [])
         if not isinstance(raw_plugins, list) or len(raw_plugins) > MAX_SANDBOX_PLUGINS:
             raise ValueError("claim plugins must be a bounded list")
@@ -152,7 +158,8 @@ class ClaimedJob:
             sandbox_token=body["sandbox_token"],
             mcp_token=body.get("mcp_token") or "",
             clone_token=body.get("clone_token") or None,
-            github_token=body.get("github_token") or None,
+            github_token=github_token,
+            direct_write_repo=direct_write_repo,
             mcp_bindings=list(body.get("mcp_bindings") or []),
             runtime_version=body.get("runtime_version") or None,
             thread_sandbox=(

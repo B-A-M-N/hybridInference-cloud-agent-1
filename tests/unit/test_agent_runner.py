@@ -677,7 +677,11 @@ def _run_shared_boundary_case(
     # retained turn. These lifecycle tests are not about Git, so give that step
     # a successful empty ``git remote`` result; the worktree tests exercise
     # remote addition, replacement, and removal directly.
-    retained.spawn.return_value = SimpleNamespace(chunks=lambda: iter(()), wait=lambda: 0)
+    retained.spawn.return_value = SimpleNamespace(
+        chunks=lambda: iter(()),
+        wait=lambda: 0,
+        stderr_text=lambda: "",
+    )
     monkeypatch.setattr(runner_mod, "ChatSandboxManager", lambda _backend: manager)
     monkeypatch.setattr(runner_mod, "RetainedChatBackend", lambda *_args, **_kwargs: retained)
     monkeypatch.setattr(runner_mod, "_resident_base_ready", lambda *_args: True)

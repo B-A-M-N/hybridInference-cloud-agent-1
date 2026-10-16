@@ -18,6 +18,7 @@ from cloud_agent_host.runner import (
     WorktreeError,
     _assert_no_credential_on_disk,
     _auth_env,
+    _configure_direct_write_remote,
     _import_retained_base,
     checkout_output_branch,
     prepare_worktree,
@@ -116,6 +117,136 @@ def test_initial_chat_checkout_is_populated_and_has_no_push_remote(tmp_path: Pat
     assert resolved == head
     assert (workdir / "hello.py").read_text() == "def hello():\n    return 1\n"
     assert _git("remote", cwd=workdir).strip() == ""
+
+
+def test_authorized_direct_write_checkout_has_one_credential_free_push_remote(
+    tmp_path: Path, remote
+):
+    base, repo, _first, head = remote
+    workdir = tmp_path / "job"
+    workdir.mkdir()
+
+    resolved = prepare_worktree(
+        workdir=str(workdir),
+        repo=repo,
+        base_sha=None,
+        clone_token="synthetic-clone-token",
+        remote_base=base,
+        push_repo="owner/publish-target",
+    )
+
+    assert resolved == head
+    assert _git("remote", "get-url", "--push", "--all", "origin", cwd=workdir).splitlines() == [
+        "https://github.com/owner/publish-target.git"
+    ]
+    assert "synthetic-clone-token" not in (workdir / ".git" / "config").read_text()
+
+
+def test_malformed_direct_write_target_is_rejected_before_checkout(tmp_path: Path):
+    workdir = tmp_path / "job"
+    workdir.mkdir()
+
+    with pytest.raises(WorktreeError, match="push_repo must be a canonical"):
+        prepare_worktree(
+            workdir=str(workdir),
+            repo="owner/name",
+            base_sha=None,
+            remote_base="file:///not-used",
+            push_repo="owner/../other",
+        )
+
+    assert not (workdir / ".git").exists()
+
+
+class _GitProcess:
+    def __init__(self, result: subprocess.CompletedProcess[str]) -> None:
+        self.result = result
+
+    def chunks(self):
+        if self.result.stdout:
+            yield self.result.stdout
+
+    def wait(self) -> int:
+        return self.result.returncode
+
+    def kill(self) -> None:
+        return None
+
+    def stderr_text(self) -> str:
+        return self.result.stderr
+
+
+class _LocalGitBackend:
+    def spawn(self, spec):
+        result = subprocess.run(
+            spec.argv,
+            cwd=spec.workdir,
+            env={
+                **os.environ,
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_CONFIG_SYSTEM": "/dev/null",
+                **spec.env,
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return _GitProcess(result)
+
+
+def test_retained_origin_is_canonicalized_disabled_and_reenabled(tmp_path: Path, monkeypatch):
+    workdir = tmp_path / "retained"
+    workdir.mkdir()
+    _git("init", "--quiet", ".", cwd=workdir)
+    _git("remote", "add", "origin", "https://old.example.test/wrong/repo.git", cwd=workdir)
+    _git(
+        "remote",
+        "set-url",
+        "--add",
+        "--push",
+        "origin",
+        "https://old.example.test/first.git",
+        cwd=workdir,
+    )
+    _git(
+        "remote",
+        "set-url",
+        "--add",
+        "--push",
+        "origin",
+        "https://old.example.test/second.git",
+        cwd=workdir,
+    )
+    _git("remote", "add", "upstream", "https://example.test/upstream/repo.git", cwd=workdir)
+    _git("remote", "add", "workflow-publish", "https://example.test/workflow/repo.git", cwd=workdir)
+    monkeypatch.setattr(runner_mod, "CHAT_WORKDIR", str(workdir))
+    backend = _LocalGitBackend()
+
+    _configure_direct_write_remote("owner/repository", backend)
+
+    canonical = "https://github.com/owner/repository.git"
+    assert _git("remote", "get-url", "--push", "--all", "origin", cwd=workdir).splitlines() == [
+        canonical
+    ]
+    assert _git("remote", cwd=workdir).splitlines() == ["origin", "upstream", "workflow-publish"]
+
+    _configure_direct_write_remote("owner/renamed", backend)
+    assert _git("remote", "get-url", "--push", "--all", "origin", cwd=workdir).splitlines() == [
+        "https://github.com/owner/renamed.git"
+    ]
+
+    _configure_direct_write_remote(None, backend)
+    assert _git("remote", cwd=workdir).splitlines() == ["upstream", "workflow-publish"]
+    assert not any(
+        key.startswith("remote.origin.")
+        for key in _git("config", "--local", "--name-only", "--list", cwd=workdir).splitlines()
+    )
+
+    _configure_direct_write_remote("owner/repository", backend)
+    assert _git("remote", "get-url", "--push", "--all", "origin", cwd=workdir).splitlines() == [
+        canonical
+    ]
+    assert _git("remote", cwd=workdir).splitlines() == ["origin", "upstream", "workflow-publish"]
 
 
 def test_a_pinned_commit_is_the_one_streamed_into_the_container(tmp_path: Path, remote):

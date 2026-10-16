@@ -849,6 +849,7 @@ def prepare_worktree(
     base_sha: str | None,
     clone_token: str | None = None,
     remote_base: str = "https://github.com",
+    push_repo: str | None = None,
     depth: int = 1,
     max_bytes: int | None = None,
     stop: threading.Event | None = None,
@@ -859,9 +860,9 @@ def prepare_worktree(
     at this point the worktree is ours, not the agent's, so running git here is
     safe because later Git inspection runs inside the retained container.
 
-    A shallow single-commit fetch, with no remote recorded. Not adding a remote
-    is the point — it is what keeps the credential out of ``.git/config``, and
-    the runner has no reason to offer the agent a push path it must not use.
+    A shallow single-commit fetch. By default it records no remote; an
+    authorized direct-write claim may add a credential-free canonical GitHub
+    ``origin`` after checkout. Clone credentials are always invocation-only.
     ``depth`` 2 also brings the commit's parent, for a caller that bundles only
     what the commit adds to it.
 
@@ -880,6 +881,13 @@ def prepare_worktree(
         raise WorktreeError(f"repo must be 'owner/name', got {repo!r}")
     if base_sha and not _COMMIT_SHA.fullmatch(base_sha):
         raise WorktreeError(f"base_sha must be a commit hash, got {base_sha!r}")
+    push_parts = push_repo.split("/") if push_repo else []
+    if push_repo is not None and (
+        not _REPO_SLUG.fullmatch(push_repo)
+        or len(push_parts) != 2
+        or any(part in {".", ".."} for part in push_parts)
+    ):
+        raise WorktreeError(f"push_repo must be a canonical 'owner/name', got {push_repo!r}")
 
     url = f"{remote_base.rstrip('/')}/{repo}.git"
     auth = _auth_env(clone_token)
@@ -912,6 +920,15 @@ def prepare_worktree(
     checkout = run_writing(["checkout", "--quiet", "--detach", "FETCH_HEAD"])
     if checkout.returncode != 0:
         raise WorktreeError(f"could not check out {ref}: {checkout.stderr.strip()[:200]}")
+
+    if push_repo is not None:
+        push_url = f"https://github.com/{push_repo}.git"
+        remote = _run_git(["remote", "add", "origin", push_url], cwd=workdir)
+        if remote.returncode != 0:
+            raise WorktreeError("could not configure the authorized GitHub push remote")
+        effective_urls = _run_git(["remote", "get-url", "--push", "--all", "origin"], cwd=workdir)
+        if effective_urls.returncode != 0 or effective_urls.stdout.splitlines() != [push_url]:
+            raise WorktreeError("the authorized GitHub push target could not be verified")
 
     resolved = _run_git(["rev-parse", "HEAD"], cwd=workdir).stdout.strip()
     _assert_no_credential_on_disk(workdir, clone_token)
@@ -1040,7 +1057,9 @@ def _read_bounded(process: Any, *, deadline_s: float, max_bytes: int) -> str:
     """
     chunks: list[str] = []
     total = 0
-    output = OutputPump(getattr(process, "chunks", process.lines)(), name="agent-patch")
+    chunk_reader = getattr(process, "chunks", None)
+    stream = chunk_reader() if callable(chunk_reader) else process.lines()
+    output = OutputPump(stream, name="agent-patch")
     deadline = time.monotonic() + deadline_s
     try:
         while True:
@@ -1112,6 +1131,52 @@ def _sandbox_has_commit(workdir: str, commit: str, backend: SandboxBackend) -> b
     except WorktreeError:
         return False
     return True
+
+
+def _configure_direct_write_remote(repo: str | None, backend: SandboxBackend) -> None:
+    """Reconcile platform-owned ``origin`` with the current write policy.
+
+    ``origin`` is reserved for the authorized repository. Rebuilding that
+    remote removes stale and multiple ``pushurl`` overrides while preserving
+    other named remotes the agent may use for fetches.
+    """
+    parts = repo.split("/") if repo else []
+    if repo is not None and (
+        not _REPO_SLUG.fullmatch(repo)
+        or len(parts) != 2
+        or any(part in {".", ".."} for part in parts)
+    ):
+        raise WorktreeError("the direct-write repository is not a canonical owner/name")
+
+    def git(argv: list[str]) -> str:
+        process = backend.spawn(
+            SandboxSpec(argv=argv, workdir=CHAT_WORKDIR, env=dict(_SAFE_DIRECTORY_ENV))
+        )
+        return _read_bounded(process, deadline_s=_GIT_TIMEOUT_S, max_bytes=4096)
+
+    remote_names = git(["git", "remote"]).splitlines()
+    if "origin" in remote_names:
+        git(["git", "remote", "remove", "origin"])
+
+    # A remote may have lost its fetch URL while retaining a push URL. Clear
+    # any remaining platform-owned section before either disabling or adding
+    # the canonical remote.
+    config_keys = git(["git", "config", "--local", "--name-only", "--list"]).splitlines()
+    if any(key.startswith("remote.origin.") for key in config_keys):
+        git(["git", "config", "--local", "--remove-section", "remote.origin"])
+
+    if repo is None:
+        remote_names = git(["git", "remote"]).splitlines()
+        config_keys = git(["git", "config", "--local", "--name-only", "--list"]).splitlines()
+        if "origin" in remote_names or any(key.startswith("remote.origin.") for key in config_keys):
+            raise WorktreeError("the disabled direct-write origin could not be removed")
+        return
+
+    push_url = f"https://github.com/{repo}.git"
+    git(["git", "remote", "add", "origin", push_url])
+    effective_urls = git(["git", "remote", "get-url", "--push", "--all", "origin"])
+    if effective_urls.splitlines() != [push_url]:
+        raise WorktreeError("the authorized GitHub push target could not be verified")
 
 
 def runtime_version_unavailable(job: ClaimedJob, backend: SandboxBackend) -> str | None:
@@ -1681,6 +1746,7 @@ class _SourcePrefetch:
                         base_sha=self._job.base_sha,
                         clone_token=self._job.clone_token,
                         remote_base=repo_clone_base_url(clone_token=self._job.clone_token),
+                        push_repo=self._job.direct_write_repo,
                         max_bytes=self._max_bytes,
                         stop=self._stop,
                     )
@@ -2774,6 +2840,9 @@ def _run_shared_live_attempt(
             )
         )
 
+        stage = _stage(measurement, "direct_write_remote")
+        _configure_direct_write_remote(job.direct_write_repo, retained)
+
         stage = _stage(measurement, "runtime_preflight")
         version_problem = runtime_version_unavailable(job, retained)
         if version_problem is not None:
@@ -2833,7 +2902,7 @@ def _run_shared_live_attempt(
             credential=None,
             github_token=job.github_token,
             environment=job.environment,
-            github_repo=job.repo or "",
+            github_repo=job.direct_write_repo or job.repo or "",
             plugins=tuple(job.plugins),
             mcp_server_ids=tuple(job.mcp_bindings),
             # The MCP credential is process-fixed, and this turn's own token

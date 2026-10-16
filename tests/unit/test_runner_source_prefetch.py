@@ -48,11 +48,13 @@ class Source:
         if not hold:
             self.release.set()
         self.workdirs: list[str] = []
+        self.prepare_kwargs: list[dict[str, Any]] = []
         self.archives: list[Any] = []
         self.limits: list[int] = []
 
     def prepare_worktree(self, *, workdir: str, **_kwargs: Any) -> str:
         self.workdirs.append(workdir)
+        self.prepare_kwargs.append(_kwargs)
         self.started.set()
         assert self.release.wait(5), "the test never let the clone finish"
         if self.error is not None:
@@ -76,6 +78,7 @@ def _run_turn(
     has_context: bool = False,
     before_acquire: Callable[[], None] | None = None,
     setup_script: str | None = None,
+    direct_write_repo: str | None = None,
     heart: Any = None,
 ) -> SimpleNamespace:
     """Drive one shared turn with the clone scripted and everything else mocked."""
@@ -93,7 +96,11 @@ def _run_turn(
     retained = Mock()
     retained.sandbox_metadata.return_value = {}
     retained.has_binary.return_value = True
-    retained.spawn.return_value = SimpleNamespace(chunks=lambda: iter(()), wait=lambda: 0)
+    retained.spawn.return_value = SimpleNamespace(
+        chunks=lambda: iter(()),
+        wait=lambda: 0,
+        stderr_text=lambda: "",
+    )
     monkeypatch.setattr(runner_mod, "ChatSandboxManager", lambda _backend: manager)
     monkeypatch.setattr(runner_mod, "RetainedChatBackend", lambda *_args, **_kwargs: retained)
     monkeypatch.setattr(runner_mod, "_resident_base_ready", lambda *_args: True)
@@ -150,7 +157,7 @@ def _run_turn(
     finish = Mock()
     result = runner_mod._run_shared_live_attempt(
         runtime=get_runtime("claude-code"),
-        job=replace(_JOB, setup_script=setup_script),
+        job=replace(_JOB, setup_script=setup_script, direct_write_repo=direct_write_repo),
         control=control,
         heart=heart or SimpleNamespace(cancel_requested=False, lease_lost=False),
         backend=backend,
@@ -184,6 +191,16 @@ def test_a_new_chat_clones_while_its_container_starts(monkeypatch):
     assert source.limits == [64 * 1024 * 1024], "the turn's import limit reaches the archive"
     assert source.archives[0].closed
     assert not os.path.exists(source.workdirs[0]), "the clone's directory is removed"
+
+
+def test_an_authorized_write_target_reaches_the_initial_checkout(monkeypatch):
+    source = Source()
+    monkeypatch.setattr(runner_mod, "_configure_direct_write_remote", lambda *_args: None)
+
+    turn = _run_turn(monkeypatch, source, direct_write_repo="owner/publish-target")
+
+    assert turn.result == 0
+    assert source.prepare_kwargs[0]["push_repo"] == "owner/publish-target"
 
 
 def test_a_failed_clone_fails_the_turn_at_its_checkout(monkeypatch):
