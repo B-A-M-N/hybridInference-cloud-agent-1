@@ -55,6 +55,11 @@ class FakeDocker:
         self.committed: list[str] = []
         self.containers: dict[str, list[str]] = {}
         self.leftover_containers: list[str] = []
+        #: Labels by container and by image ID, inherited the way Docker does:
+        #: a container takes its image's, under its own ``--label``; ``commit``
+        #: takes the container's, under its ``--change LABEL``.
+        self.labels: dict[str, dict[str, str]] = {}
+        self.removed: set[str] = set()
 
     def __call__(self, argv: list[str], **_kwargs: Any) -> SimpleNamespace:
         args = argv[1:]
@@ -74,6 +79,11 @@ class FakeDocker:
                 return self._done("", 1, "Error response from daemon: no space left on device")
             container = f"c{len(self.containers)}"
             self.containers[container] = args
+            image = args[args.index("--entrypoint") + 2]
+            self.labels[container] = {
+                **self.labels.get(self.images.get(image, image), {}),
+                **self._pairs(args, "--label"),
+            }
             return self._done(container)
         if verb == "start":
             created = self.containers[args[-1]]
@@ -84,6 +94,10 @@ class FakeDocker:
             ref = args[-1] if ":" in args[-1] else None
             image = "sha256:" + f"{len(self.calls):064x}"
             self.committed.append(image)
+            self.labels[image] = {
+                **self.labels.get(args[-2] if ref else args[-1], {}),
+                **self._pairs(args, "--change", "LABEL "),
+            }
             if ref:
                 self.images[ref] = image
             return self._done(image)
@@ -93,9 +107,35 @@ class FakeDocker:
         if verb == "rmi":
             self.images.pop(args[1], None)
             return self._done("")
+        if verb == "rm":
+            self.removed.add(args[-1])
+            return self._done("")
         if verb == "ps":
-            return self._done("\n".join(self.leftover_containers))
+            wanted = [arg.removeprefix("label=") for arg in args if arg.startswith("label=")]
+            live = [
+                container
+                for container in self.containers
+                if container not in self.removed
+                and all(self._matches(self.labels[container], label) for label in wanted)
+            ]
+            return self._done("\n".join([*self.leftover_containers, *live]))
         return self._done("")
+
+    @staticmethod
+    def _pairs(args: list[str], flag: str, prefix: str = "") -> dict[str, str]:
+        """``KEY=VALUE`` after each ``flag`` whose value starts with ``prefix``."""
+        pairs: dict[str, str] = {}
+        for at, arg in enumerate(args[:-1]):
+            if arg == flag and args[at + 1].startswith(prefix):
+                key, _, value = args[at + 1].removeprefix(prefix).partition("=")
+                pairs[key] = value
+        return pairs
+
+    @staticmethod
+    def _matches(labels: dict[str, str], wanted: str) -> bool:
+        """Docker's ``label=`` filter: ``KEY`` is present, ``KEY=VALUE`` equal."""
+        key, equals, value = wanted.partition("=")
+        return key in labels and (not equals or labels[key] == value)
 
     @staticmethod
     def _done(stdout: str, code: int = 0, stderr: str = "") -> SimpleNamespace:
@@ -391,6 +431,27 @@ def test_a_restarted_runner_removes_what_a_stopped_download_left(docker):
     assert not any("-candidate:" in ref for ref in docker.images)
 
 
+def test_a_container_made_from_a_kept_version_is_not_install_work(docker):
+    """``docker commit`` keeps a container's labels; the kept version drops this one.
+
+    The install containers are marked so a restarted runner removes what a
+    stopped download left. A chat copies the CLI out of a container made from
+    the kept image (``runtime_install``): marked too, it would be removed by a
+    runner restarting during the copy, failing the chat's start.
+    """
+    downloads = _downloads()
+    downloads.apply([_target()])
+    _run_once(downloads)
+    final = image_ref(NAMESPACE, "claude-code", "2.1.300", BASE)
+    # Docker cannot unset a label; an empty one is what the filter skips.
+    assert docker.labels[docker.images[final]][runtime_images.WORK_LABEL] == ""
+    source = docker(["docker", "create", "--network", "none", "--entrypoint", "/bin/true", final])
+
+    downloads._remove_leftovers()
+
+    assert ["rm", "-f", source.stdout] not in docker.calls
+
+
 def test_with_nothing_to_hold_the_worker_only_cleans_up(docker):
     """Every host runs the worker; one never asked to download leaves Docker alone."""
     downloads = _downloads()
@@ -527,6 +588,37 @@ def test_a_tree_that_is_not_root_owned_is_refused(downloaded):
 def test_a_version_this_host_never_downloaded_says_how_to_fix_it(downloaded):
     with pytest.raises(SandboxError, match="update the agent again"):
         runtime_install.ensure_downloaded_runtime(FakeManager(), None, "claude-code", "2.1.301")
+
+
+def test_a_runner_restarting_mid_copy_leaves_the_copy_alone(downloaded):
+    """A version kept by an earlier release carries the install-work label.
+
+    Its source container would inherit it, and a runner restarting while a
+    chat copies the CLI removes every container that has it.
+    """
+    final = image_ref(NAMESPACE, "claude-code", "2.1.300", BASE)
+    downloaded.labels[downloaded.images[final]] = {runtime_images.WORK_LABEL: NAMESPACE}
+
+    class Manager(FakeManager):
+        """Creates the source container through Docker."""
+
+        def _run(self, argv, *, timeout):
+            self.runs.append(argv)
+            return subprocess.run(
+                argv, capture_output=True, text=True, timeout=timeout, check=False
+            )
+
+        def _run_bytes(self, argv, *, timeout, stdin=None, input_bytes=None):
+            # The runner restarts while the files stream into the chat.
+            _downloads()._remove_leftovers()
+            return super()._run_bytes(argv, timeout=timeout, stdin=stdin)
+
+    manager = Manager()
+    runtime_install.ensure_downloaded_runtime(manager, None, "claude-code", "2.1.300")
+
+    (source,) = downloaded.containers
+    assert ["rm", "-f", source] not in downloaded.calls
+    assert len(manager.copies) == 1
 
 
 def test_the_activation_refuses_a_tree_root_does_not_own_outright(tmp_path):

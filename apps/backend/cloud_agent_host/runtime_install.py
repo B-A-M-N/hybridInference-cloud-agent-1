@@ -25,7 +25,7 @@ import secrets
 import subprocess
 from typing import TYPE_CHECKING, BinaryIO, cast
 
-from cloud_agent_host.runtime_images import discover, image_id, short_id
+from cloud_agent_host.runtime_images import WORK_LABEL, discover, image_id, short_id
 from cloud_agent_host.sandbox import runtime_bin_dir
 from cloud_agent_shared.errors import SandboxError
 from cloud_agent_shared.runtime_catalog import downloadable_runtimes
@@ -128,6 +128,12 @@ def ensure_downloaded_runtime(
             "create",
             "--network",
             "none",
+            # Not install work, whatever the image says. A version kept by an
+            # earlier release carries the work label of the container it was
+            # committed from, and a runner restarting during this copy removes
+            # every container that has it (``RuntimeDownloads``).
+            "--label",
+            f"{WORK_LABEL}=",
             "--entrypoint",
             "/bin/true",
             _source_image(manager, runtime_id, version),

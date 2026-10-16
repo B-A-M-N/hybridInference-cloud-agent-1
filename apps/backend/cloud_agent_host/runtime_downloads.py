@@ -493,6 +493,15 @@ class RuntimeDownloads:
             labelled = self._docker_run(
                 [
                     "commit",
+                    # The container is install work, so a restarted runner
+                    # removes it; the version kept must not be. ``docker
+                    # commit`` keeps a container's labels, and every container
+                    # made from the image would inherit this one, among them
+                    # the one a chat copies the CLI from (``runtime_install``).
+                    # Docker cannot unset a label, but the leftover filter
+                    # names the namespace and does not match an empty value.
+                    "--change",
+                    f"LABEL {WORK_LABEL}=",
                     "--change",
                     f"LABEL {NAMESPACE_LABEL}={self._namespace}",
                     "--change",
