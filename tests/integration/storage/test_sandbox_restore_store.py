@@ -94,14 +94,22 @@ def _fence(job: dict, claim: dict, sandbox: dict) -> dict[str, Any]:
     }
 
 
-async def _reserve(store: Storage, job: dict, claim: dict, host: str) -> dict:
+async def _reserve(
+    store: Storage,
+    job: dict,
+    claim: dict,
+    host: str,
+    *,
+    sandbox_id: str = "asbx_restore",
+    container_name: str = "freeinference-chat-restore",
+) -> dict:
     sandbox = await store.sandbox.reserve_thread_sandbox(
         thread_id=job["thread_id"],
         attempt_id=claim["attempt_id"],
         lease_generation=claim["lease_generation"],
         host=host,
-        sandbox_id="asbx_restore",
-        container_name="freeinference-chat-restore",
+        sandbox_id=sandbox_id,
+        container_name=container_name,
         runtime_id="claude-code",
         runtime_version=claim.get("runtime_version"),
         sandbox_image_digest=claim.get("sandbox_image_digest"),
@@ -128,10 +136,24 @@ async def _settled_group(store: Storage, *, idle_timeout_seconds: float) -> tupl
     """One chat that ran a turn on ``runner-a``; its container is still up, idle."""
     await _enable_archives(store)
     await _host(store, "runner-a", _ARCHIVE_HOST)
+    return await _idle_after_a_turn(store, idle_timeout_seconds=idle_timeout_seconds)
+
+
+async def _idle_after_a_turn(
+    store: Storage,
+    *,
+    idle_timeout_seconds: float,
+    sandbox_id: str = "asbx_restore",
+    container_name: str = "freeinference-chat-restore",
+    container_id: str = "container-a",
+) -> tuple[dict, dict]:
+    """Another chat's turn on ``runner-a``, which is already set up; its container stays up."""
     job = await _create_job(store)
     claim = await _claim(store, "runner-a", _ARCHIVE_HOST)
     assert claim is not None and claim["id"] == job["id"]
-    sandbox = await _reserve(store, job, claim, "runner-a")
+    sandbox = await _reserve(
+        store, job, claim, "runner-a", sandbox_id=sandbox_id, container_name=container_name
+    )
     residency = await store.residency.establish_residency(
         thread_id=job["thread_id"],
         attempt_id=claim["attempt_id"],
@@ -145,7 +167,7 @@ async def _settled_group(store: Storage, *, idle_timeout_seconds: float) -> tupl
     assert residency is not None
     fence = _fence(job, claim, sandbox)
     assert await store.sandbox.mark_thread_sandbox_running(
-        **fence, container_id="container-a", context_status="new"
+        **fence, container_id=container_id, context_status="new"
     )
     assert await store.sandbox.admit_thread_sandbox_turn(
         **fence, residency_generation=residency["generation"], job_id=job["id"]
@@ -1224,12 +1246,84 @@ async def test_a_start_fenced_while_a_removal_is_decided_puts_the_removal_off(
 
     assert await store.host_pool.remove_host(host="runner-a") == "draining"
 
+    # Asked again, the removal found the group live and drained without
+    # revoking, so it could not race a second time.
     assert fenced == ["stopped"]
     host = await store.host_pool.get_host(host="runner-a")
     assert host["status"] == "draining"
     assert host["enrolled"] is True
     state = await _state(pool)
     assert state["state"] == "stopped" and state["host"] == "runner-a"
+
+
+async def test_a_removal_going_ahead_anyway_leaves_a_group_started_meanwhile(
+    pool,
+    store: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    """The host stopped beating, so nothing can stop its groups: a race changes nothing.
+
+    Rolled back on each race, a second race during the retry escaped the
+    removal as an error, and the host stayed in the pool.
+    """
+    job, _ = await _covered(pool, store)
+    other, other_group = await _idle_after_a_turn(
+        store,
+        idle_timeout_seconds=1800,
+        sandbox_id="asbx_other",
+        container_name="freeinference-chat-other",
+        container_id="container-o",
+    )
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_sandboxes SET state = 'stopped', idle_deadline = NULL WHERE id = $1",
+            "asbx_other",
+        )
+    assert await store.sandbox.record_sandbox_checkpoint(
+        host="runner-a",
+        thread_id=other["thread_id"],
+        checkpoint=_receipt(other_group, other, checkpoint_id="b" * 32, container_id="container-o"),
+    )
+    # Still running, idle: the removal would wait for it, but the host has
+    # stopped beating, so it goes ahead and leaves it.
+    await _idle_after_a_turn(
+        store,
+        idle_timeout_seconds=1800,
+        sandbox_id="asbx_running",
+        container_name="freeinference-chat-running",
+        container_id="container-r",
+    )
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_runner_hosts SET last_heartbeat_at = NOW() - INTERVAL '10 minutes' "
+            "WHERE host = 'runner-a'"
+        )
+    revoke = host_pool_repository.revoke_host_credentials
+    revoked: list[list[str]] = []
+    # One workspace request lands in each revocation's window.
+    opened = [job["thread_id"], other["thread_id"]]
+
+    async def revoke_after_a_workspace_request(conn: Any, hosts: list[str]) -> None:
+        revoked.append(hosts)
+        if opened:
+            assert await store.sandbox.fence_workspace_start(thread_id=opened.pop(0)) == "stopped"
+        await revoke(conn, hosts)
+
+    monkeypatch.setattr(
+        host_pool_repository, "revoke_host_credentials", revoke_after_a_workspace_request
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert await store.host_pool.remove_host(host="runner-a") == "ok"
+
+    assert revoked == [["runner-a"]]
+    assert (await store.host_pool.get_host(host="runner-a"))["status"] == "disabled"
+    (left,) = _left_bound(caplog)
+    assert left.reason == "host_not_heartbeating"
+    assert left.sandbox_ids == ["asbx_restore", "asbx_running"]
+    # The group no request reached was covered, and moves on.
+    assert (await _state(pool, "asbx_other"))["state"] == "cold"
 
 
 async def test_a_forced_removal_of_a_host_running_a_group_revokes_at_once(pool, store: Storage):

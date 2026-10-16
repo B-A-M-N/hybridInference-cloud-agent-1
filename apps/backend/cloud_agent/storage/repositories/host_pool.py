@@ -326,20 +326,26 @@ async def _groups_left_by_removal(conn: Any, host: str) -> tuple[list[str], str 
     return live, None
 
 
-async def _revoke_unless_raced(conn: Any, host: str, left: list[str]) -> None:
+async def _revoke_unless_raced(conn: Any, host: str, reason: str | None) -> list[str]:
     """Revoke ``host``, unless a group became live while that was decided.
 
     The groups were read without locks, which taking them here, after the host
     row, would invert the documented order for. A workspace request that
     fenced a stopped group after that read instead shows up in a second one,
-    made after the revocation: a group live now that was not before raises
-    :class:`RemovalRaced`, which rolls the revocation back, and the removal
-    waits for that group like any other.
+    made after the revocation. A removal that found nothing live (``reason``
+    is ``None``) then raises :class:`RemovalRaced`, which rolls the
+    revocation back, and asked again it finds that group live and waits for
+    it without revoking, so it cannot race twice. A removal going ahead
+    whatever is live (a ``reason`` is given) is not rolled back: a group that
+    started meanwhile is one more it leaves.
+
+    Returns the groups left bound to the host.
     """
     await revoke_host_credentials(conn, [host])
     live, _ = await _groups_left_by_removal(conn, host)
-    if set(live) - set(left):
+    if live and reason is None:
         raise RemovalRaced
+    return live
 
 
 def _log_groups_left_by_removal(host: str, sandbox_ids: list[str], reason: str | None) -> None:
@@ -1018,7 +1024,8 @@ class PostgresHostPoolRepository:
             return await self._remove_host_once(host=host, force=force)
         except RemovalRaced:
             # A group may have started as the removal was decided. Asked
-            # again, the removal finds it live and waits for it.
+            # again, the removal finds it live and waits for it without
+            # revoking, so this try cannot race (``_revoke_unless_raced``).
             return await self._remove_host_once(host=host, force=force)
 
     async def _remove_host_once(self, *, host: str, force: bool) -> str:
@@ -1060,7 +1067,7 @@ class PostgresHostPoolRepository:
             if force:
                 await revoke_host_credentials(conn, [host])
             else:
-                await _revoke_unless_raced(conn, host, left)
+                left = await _revoke_unless_raced(conn, host, reason)
         if left:
             _log_groups_left_by_removal(host, left, reason)
         return "ok"
@@ -1112,7 +1119,7 @@ class PostgresHostPoolRepository:
                         left, reason = await _groups_left_by_removal(conn, host)
                         if left and reason is None:
                             continue
-                        await _revoke_unless_raced(conn, host, left)
+                        left = await _revoke_unless_raced(conn, host, reason)
                 except RemovalRaced:
                     # The next pass waits for the group that started.
                     continue
