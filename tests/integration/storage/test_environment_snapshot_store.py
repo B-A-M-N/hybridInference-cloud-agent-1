@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 # ruff: noqa: F811 -- imported pytest fixtures remain parameters
+import secrets
+
 import pytest
 from tests.integration.storage.test_agent_job_store import (  # noqa: F401
     _SHARED_HOST_CAPABILITIES,
@@ -12,6 +14,10 @@ from tests.integration.storage.test_agent_job_store import (  # noqa: F401
 )
 from tests.integration.storage.test_environment_store import _job, _save
 
+from cloud_agent.storage.repositories import (
+    environment_snapshots as snapshots_module,
+    environments as environments_module,
+)
 from cloud_agent_shared.environment import EnvironmentScripts
 from cloud_agent_shared.environment_snapshots import owner_hash, snapshot_object_key
 
@@ -838,3 +844,136 @@ async def test_a_snapshot_of_a_tasks_own_install_script_follows_that_script(
     assert await handed_out() == snapshot_id
     await _change(store, changed, _RETIRING["setup Secret rotated"])
     assert await handed_out() is None
+
+
+async def _retires_nothing(conn, user_id, environment_ids=None) -> None:
+    """Publish as releases did before a publish retired the snapshots it changed."""
+
+
+async def _state_of(pool, snapshot_id: str) -> dict:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT state, detail FROM agent_environment_snapshots WHERE id=$1", snapshot_id
+        )
+    return dict(row)
+
+
+async def _stale_snapshot(pool, owner: str, environment_id: str) -> str:
+    """A ready snapshot of an installation ``environment_id`` does not have now."""
+    snapshot_id = secrets.token_hex(16)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO agent_environment_snapshots (id, user_id, environment_id, revision, "
+            "setup_fingerprint, state, base_image, source_sha, object_key, sha256, size_bytes, "
+            "ready_at) VALUES ($1, $2, $3, 1, $4, 'ready', $5, $6, $7, $8, 1024, NOW())",
+            snapshot_id,
+            owner,
+            environment_id,
+            "f" * 64,
+            IMAGE,
+            SOURCE,
+            snapshot_object_key(owner_hash(owner), snapshot_id),
+            "e" * 64,
+        )
+    return snapshot_id
+
+
+@pytest.mark.parametrize("change", list(_RETIRING))
+async def test_maintenance_retires_a_snapshot_whose_change_no_publish_retired(
+    store, pool, monkeypatch, change
+):
+    """A snapshot an earlier release left stale is retired by maintenance, then deleted.
+
+    Publishing a configuration and recording a build retire the snapshot of an
+    installation that changed. Releases before them did not, and neither looks
+    again at an environment that is never published again. Its snapshot stayed
+    ready, still handed out to tasks bound before the change and holding the
+    rotated or removed setup Secret, until it expired up to 25 days later. One
+    maintenance pass retires it, and the grace every retired snapshot gets ends
+    in its deletion.
+    """
+    env = await _configured(store, monkeypatch)
+    snapshot_id, binding, _run = await _ready_snapshot(store, pool, monkeypatch, env=env)
+    snapshots = store.environment_snapshots
+    with monkeypatch.context() as earlier_release:
+        earlier_release.setattr(environments_module, "retire_changed_snapshots", _retires_nothing)
+        await _change(store, env, _RETIRING[change])
+
+    async def handed_out() -> str | None:
+        found = await snapshots.snapshot_for_claim(
+            user_id="alice", binding_id=binding, base_image=IMAGE
+        )
+        return found["snapshot_id"] if found else None
+
+    assert await handed_out() == snapshot_id
+    await snapshots.maintain()
+    assert await _state_of(pool, snapshot_id) == {
+        "state": "superseded",
+        "detail": "The installation changed",
+    }
+    assert await handed_out() is None
+    assert await snapshots.deletions() == []
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_environment_snapshots SET updated_at=NOW()-INTERVAL '25 hours' WHERE id=$1",
+            snapshot_id,
+        )
+    await snapshots.maintain()
+    assert [d["snapshot_id"] for d in await snapshots.deletions()] == [snapshot_id]
+    assert await snapshots.retired_images([snapshot_id]) == [
+        {"snapshot_id": snapshot_id, "owner": owner_hash("alice")}
+    ]
+
+
+@pytest.mark.parametrize("change", list(_KEEPING))
+async def test_maintenance_keeps_a_snapshot_whose_installation_did_not_change(
+    store, pool, monkeypatch, change
+):
+    """Maintenance retires a snapshot only once its fingerprint no longer matches.
+
+    A change that installs the same thing leaves the fingerprint current, even
+    published with no retirement, and so does an environment nobody changed.
+    """
+    env = await _configured(store, monkeypatch)
+    first, _binding_id, _run = await _ready_snapshot(store, pool, monkeypatch, env=env)
+    other = await _save(store, repo="org/other", name="Other", script="pip install -r reqs.txt")
+    second = await _build(store, await _binding(store, pool, other), repo="org/other")
+    with monkeypatch.context() as earlier_release:
+        earlier_release.setattr(environments_module, "retire_changed_snapshots", _retires_nothing)
+        await _change(store, env, _KEEPING[change])
+    await store.environment_snapshots.maintain()
+    async with pool.acquire() as conn:
+        states = dict(await conn.fetch("SELECT id, state FROM agent_environment_snapshots"))
+    assert states == {first: "ready", second: "ready"}
+
+
+async def test_maintenance_checks_a_bounded_batch_of_owners_and_comes_back_around(
+    store, pool, monkeypatch
+):
+    """Each pass checks the next few owners, so it stays short however many there are.
+
+    The next pass goes on after the last owner checked, and the pass after the
+    last owner starts again from the first.
+    """
+    monkeypatch.setenv("AGENT_SOURCE_CONTROL_ENCRYPTION_KEY", "environment-test-key")
+    monkeypatch.setattr(snapshots_module, "OWNERS_CHECKED_PER_PASS", 2)
+    environments = {}
+    for owner in ("alice", "bob", "carol"):
+        environments[owner] = (await _save(store, owner=owner, script="npm ci"))["id"]
+        await _stale_snapshot(pool, owner, environments[owner])
+    snapshots = store.environment_snapshots
+
+    async def ready() -> set[str]:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT user_id FROM agent_environment_snapshots WHERE state='ready'"
+            )
+        return {row["user_id"] for row in rows}
+
+    await snapshots.maintain()
+    assert await ready() == {"carol"}
+    await snapshots.maintain()
+    assert await ready() == set()
+    await _stale_snapshot(pool, "alice", environments["alice"])
+    await snapshots.maintain()
+    assert await ready() == set()

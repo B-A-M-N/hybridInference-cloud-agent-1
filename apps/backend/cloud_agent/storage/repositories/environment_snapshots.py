@@ -67,6 +67,10 @@ _SAVED_BY_TEST = (
 #: can still ask for one. A setup that fails would otherwise rerun in the
 #: background beside every task.
 FAILED_BUILD_BACKOFF_HOURS = 6
+#: Owners one maintenance pass checks for snapshots of an installation they
+#: have since changed. The next pass goes on with the owners after them, so a
+#: pass stays short however many owners there are, and each is checked in turn.
+OWNERS_CHECKED_PER_PASS = 20
 
 
 def _ref(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -91,6 +95,9 @@ class PostgresEnvironmentSnapshotRepository:
     def __init__(self, pool: asyncpg.Pool) -> None:
         """Reuse the assembled persistence pool."""
         self._pool = pool
+        # The last owner maintenance checked for changed installations; the
+        # next pass goes on after them.
+        self._checked_owner = ""
 
     @staticmethod
     async def _enabled(conn: Any) -> bool:
@@ -507,7 +514,12 @@ class PostgresEnvironmentSnapshotRepository:
         return len(rows)
 
     async def maintain(self) -> None:
-        """Expire, retire and abandon snapshots; hosts then delete their objects."""
+        """Expire, retire and abandon snapshots; hosts then delete their objects.
+
+        Snapshots already due for deletion go first, so a stale one that is
+        also expired or unused is deleted now rather than after the grace a
+        retired one gets.
+        """
         async with self._pool.acquire() as conn:
             await conn.execute(
                 f"""
@@ -542,6 +554,43 @@ class PostgresEnvironmentSnapshotRepository:
                                AND r.finished_at <= NOW() - INTERVAL '5 minutes'))
                 """
             )
+        await self._retire_changed_installations()
+
+    async def _retire_changed_installations(self) -> None:
+        """Check the next owners' ready snapshots against what they install now.
+
+        Publishing a configuration and recording a build retire the snapshots
+        of an installation that changed. A snapshot can go stale with neither
+        to notice it: one already stale before they retired anything, say. If
+        its environment was never published again, it stayed ready until it
+        expired, up to 25 days later, with a rotated or removed setup Secret
+        in it.
+
+        Each owner is checked in a transaction of its own, under their snapshot
+        lock: every publish takes it before it commits, so the configuration
+        read here cannot change until this commits, and a snapshot whose
+        fingerprint still matches it is never retired.
+        """
+        async with self._pool.acquire() as conn:
+            owners = [
+                row["user_id"]
+                for row in await conn.fetch(
+                    "SELECT DISTINCT user_id FROM agent_environment_snapshots "
+                    "WHERE state='ready' AND user_id > $1 ORDER BY user_id LIMIT $2",
+                    self._checked_owner,
+                    OWNERS_CHECKED_PER_PASS,
+                )
+            ]
+        # Fewer than a batch left: the pass after this one starts over.
+        last = len(owners) < OWNERS_CHECKED_PER_PASS
+        for owner in owners:
+            # Recorded before the check: an owner whose check fails waits for
+            # the next round instead of holding back the owners after them.
+            self._checked_owner = owner
+            async with self._pool.acquire() as conn, conn.transaction():
+                await retire_changed_snapshots(conn, owner)
+        if last:
+            self._checked_owner = ""
 
     async def deletions(self, limit: int = 20) -> builtins.list[dict[str, Any]]:
         """Stored objects a host should delete, those waiting longest first.

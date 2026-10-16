@@ -2149,10 +2149,14 @@ stored like a checkpoint. Design: [install snapshots](../agents/specs/2026-10-15
   Secret, a global one included — supersedes the snapshots of the earlier
   one, and a build that finishes after the change is superseded on receipt;
   a snapshot built for a task's own install script is checked against that
-  script. Superseded snapshots are no longer handed out and are deleted after
-  24 hours. A snapshot is not handed out after 25 days, and is deleted after
-  7 days unused, when its environment is archived or deleted by the owner,
-  and beyond 20 GiB of ready snapshots per owner (least recently used first).
+  script. Maintenance also compares each owner's ready snapshots with their
+  current configuration, 20 owners per 30-second pass, so a snapshot that
+  went stale without a publish to notice it (one already stale before these
+  checks, say) is superseded too. Superseded snapshots are no longer handed
+  out and are deleted after 24 hours. A snapshot is not handed out after 25
+  days, and is deleted after 7 days unused, when its environment is archived
+  or deleted by the owner, and beyond 20 GiB of ready snapshots per owner
+  (least recently used first).
 - **Deletion.** Hosts poll `/v1/agent/worker/environment-snapshots/deletions`
   every 10 minutes and delete the object versions it names, least recently
   tried first, so objects the bucket refuses to delete never hold back the
