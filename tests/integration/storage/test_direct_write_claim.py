@@ -270,3 +270,78 @@ async def test_direct_write_mint_is_revoked_when_postgres_policy_changes_mid_min
                 "DELETE FROM agent_admin_audit_log WHERE details->>'github_repository_id' = $1",
                 str(repository_id),
             )
+
+
+async def test_cancel_after_direct_write_token_registration_revokes_and_forgets_token(
+    store: PostgresSourceControlRepository,
+    pool,
+) -> None:
+    """Cancellation after durable registration revokes and removes the undisclosed token."""
+    repository_id = uuid.uuid4().int & ((1 << 62) - 1)
+    repository_name = "octocat/cancelled-claim-project"
+
+    class CancellingStore:
+        async def get_direct_write_policy(self, **kwargs: Any) -> dict[str, Any]:
+            return await store.get_direct_write_policy(**kwargs)
+
+        async def register_direct_write_token(self, **kwargs: Any) -> bool:
+            registered = await store.register_direct_write_token(**kwargs)
+            assert registered
+            raise asyncio.CancelledError
+
+        async def forget_direct_write_token(self, **kwargs: Any) -> None:
+            await store.forget_direct_write_token(**kwargs)
+
+    class Credentials:
+        def __init__(self) -> None:
+            self.direct_write_cipher = SourceControlCipher("test-direct-write-cancel-key")
+            self.revoked: list[str] = []
+
+        async def repository_identity(self, repo: str) -> dict[str, Any]:
+            assert repo == repository_name
+            return {"repository_id": repository_id, "full_name": repository_name}
+
+        async def token_for(self, repo: str, **kwargs: Any) -> str:
+            assert repo == repository_name
+            assert kwargs["cache"] is False
+            return "cancelled-installation-token"
+
+        async def revoke_installation_token(self, token: str) -> None:
+            self.revoked.append(token)
+
+    credentials = Credentials()
+    try:
+        await store.get_direct_write_policy(
+            github_repository_id=repository_id,
+            repository_full_name=repository_name,
+        )
+        enabled = await store.set_direct_write_policy(
+            github_repository_id=repository_id,
+            repository_full_name=repository_name,
+            enabled=True,
+            expected_revision=0,
+            actor_id="github-user-42",
+            admin_ip="203.0.113.42",
+        )
+        assert enabled is not None
+
+        with pytest.raises(asyncio.CancelledError):
+            await _direct_write_token_for_claim(
+                repository_name,
+                store=CancellingStore(),  # type: ignore[arg-type]
+                app_credentials=credentials,
+                job_id="cancelled-registration-claim",
+            )
+
+        assert credentials.revoked == ["cancelled-installation-token"]
+        assert await store.list_direct_write_tokens(github_repository_id=repository_id) == []
+    finally:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM agent_repository_direct_write_policy WHERE github_repository_id = $1",
+                repository_id,
+            )
+            await conn.execute(
+                "DELETE FROM agent_admin_audit_log WHERE details->>'github_repository_id' = $1",
+                str(repository_id),
+            )

@@ -321,7 +321,6 @@ async def _direct_write_token_for_claim(
     """Issue only against the current opt-in revision and track for revocation."""
     token: str | None = None
     token_hash: str | None = None
-    registered = False
     try:
         identity = await app_credentials.repository_identity(repo)
         policy = await store.get_direct_write_policy(
@@ -356,7 +355,7 @@ async def _direct_write_token_for_claim(
                 extra={"event": "agent_direct_write_token_revoke_pending", "job_id": job_id},
             )
             return
-        if registered and token_hash is not None:
+        if token_hash is not None:
             try:
                 await store.forget_direct_write_token(token_hash=token_hash)
             except Exception:
@@ -391,6 +390,13 @@ async def _direct_write_token_for_claim(
         )
         if current.get("enabled") and int(current["revision"]) == revision:
             return token, identity["full_name"]
+    except asyncio.CancelledError:
+        # Cancellation can arrive after GitHub minted the token or after the
+        # durable record was written. Revoke known credentials before the
+        # cancellation escapes; forget is safe even if registration did not
+        # finish, and a failed revoke leaves its durable retry record intact.
+        await revoke_candidate()
+        raise
     except Exception as exc:
         logger.warning(
             "agent_direct_write_token_unavailable",
