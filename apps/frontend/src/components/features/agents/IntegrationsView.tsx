@@ -7,8 +7,16 @@ import {
   disconnectAgentIntegration,
   disconnectGitHubAccount,
   getAgentIntegrations,
+  getRepositoryDirectWritePolicy,
+  updateRepositoryDirectWritePolicy,
 } from '@/lib/api/agents';
-import type { AgentIntegrationProvider, AgentIntegrationProviderApi } from '@/lib/api/agents';
+import type {
+  AgentIntegrationProvider,
+  AgentIntegrationProviderApi,
+  AgentIntegrationRepositoryApi,
+  RepositoryDirectWritePolicyApi,
+} from '@/lib/api/agents';
+import { APIError } from '@/lib/utils/errors';
 import { SOURCE_CONTROL_RECHECK_MS } from './sourceControlRecovery';
 
 const PROVIDERS: AgentIntegrationProvider[] = ['github', 'gitlab'];
@@ -220,6 +228,173 @@ function ProviderActions({
   );
 }
 
+function DirectWriteSettings({ repositories }: { repositories: AgentIntegrationRepositoryApi[] }) {
+  const [selectedRepo, setSelectedRepo] = useState('');
+  const [policy, setPolicy] = useState<RepositoryDirectWritePolicyApi | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const requestId = useRef(0);
+
+  useEffect(() => {
+    const request = ++requestId.current;
+    setPolicy(null);
+    setLoading(false);
+    setSaving(false);
+    setError(null);
+    setNotice(null);
+    if (!selectedRepo) return;
+    setLoading(true);
+    void getRepositoryDirectWritePolicy(selectedRepo)
+      .then((value) => {
+        if (request === requestId.current) setPolicy(value);
+      })
+      .catch((cause: unknown) => {
+        if (request === requestId.current) {
+          setError(cause instanceof Error ? cause.message : 'Could not load repository policy.');
+        }
+      })
+      .finally(() => {
+        if (request === requestId.current) setLoading(false);
+      });
+    return () => {
+      requestId.current += 1;
+    };
+  }, [selectedRepo]);
+
+  async function togglePolicy() {
+    if (!policy) return;
+    const repo = selectedRepo;
+    const request = requestId.current;
+    setSaving(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const updated = await updateRepositoryDirectWritePolicy(
+        repo,
+        !policy.enabled,
+        policy.revision,
+      );
+      if (request === requestId.current) {
+        setPolicy(updated);
+        setNotice(
+          updated.enabled && updated.revocation_pending > 0
+            ? `Direct writes enabled for ${updated.repository}. ${updated.revocation_pending} previous token(s) still need revocation; each expires within one hour.`
+            : updated.enabled
+              ? `Direct writes enabled for ${updated.repository}.`
+              : updated.revocation_pending > 0
+                ? `Direct writes are disabled. ${updated.revocation_pending} active token(s) still need revocation; each expires within one hour.`
+                : `Direct writes disabled for ${updated.repository}.`,
+        );
+      }
+    } catch (cause: unknown) {
+      if (request !== requestId.current) return;
+      if (cause instanceof APIError && cause.statusCode === 409) {
+        setPolicy(null);
+        setLoading(true);
+        try {
+          const current = await getRepositoryDirectWritePolicy(repo);
+          if (request === requestId.current) {
+            setPolicy(current);
+            setError(
+              'Policy changed in another session. Current settings were reloaded; review them before making a new change.',
+            );
+          }
+        } catch {
+          if (request === requestId.current) {
+            setError(
+              'Policy changed in another session, but the current state could not be loaded. Select this repository again to retry.',
+            );
+          }
+        } finally {
+          if (request === requestId.current) setLoading(false);
+        }
+      } else {
+        setError(cause instanceof Error ? cause.message : 'Could not update repository policy.');
+      }
+    } finally {
+      if (request === requestId.current) setSaving(false);
+    }
+  }
+
+  return (
+    <section
+      aria-labelledby="direct-write-heading"
+      className="ui-card mt-6 rounded-2xl bg-surface px-4 py-5 sm:px-6"
+    >
+      <h2 id="direct-write-heading" className="text-base font-semibold text-foreground">
+        Repository direct writes
+      </h2>
+      <p className="mt-2 max-w-2xl text-sm leading-6 text-muted">
+        Direct pushes from agent sessions are off by default. A GitHub repository administrator must
+        enable them for each repository. Disabling blocks future claims and asks GitHub to revoke
+        active write tokens.
+      </p>
+      <p className="mt-1 max-w-2xl text-xs leading-5 text-muted">
+        If GitHub cannot revoke a token immediately, it expires within one hour.
+      </p>
+      <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-end">
+        <label className="flex min-w-0 flex-1 flex-col gap-1.5 text-sm font-medium text-foreground">
+          Repository
+          <select
+            aria-label="Repository for direct write settings"
+            className="ui-input min-h-11 w-full"
+            value={selectedRepo}
+            disabled={saving}
+            onChange={(event) => setSelectedRepo(event.target.value)}
+          >
+            <option value="">Choose a repository</option>
+            {repositories.map((repository) => (
+              <option key={repository.id} value={repository.name}>
+                {repository.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        {policy ? (
+          <button
+            type="button"
+            className={
+              policy.enabled
+                ? 'ui-button ui-button-secondary min-h-11'
+                : 'ui-button ui-button-primary min-h-11'
+            }
+            disabled={saving || loading}
+            onClick={() => void togglePolicy()}
+          >
+            {saving ? 'Saving…' : policy.enabled ? 'Disable direct writes' : 'Enable direct writes'}
+          </button>
+        ) : null}
+      </div>
+      {loading ? (
+        <p className="mt-3 text-sm text-muted" role="status">
+          Checking GitHub permissions and policy…
+        </p>
+      ) : null}
+      {policy && !loading ? (
+        <p className="mt-3 text-sm text-muted" role="status">
+          {policy.repository}: direct writes {policy.enabled ? 'enabled' : 'disabled'} · policy
+          revision {policy.revision}
+          {!policy.enabled && policy.revocation_pending > 0
+            ? ` · ${policy.revocation_pending} write token(s) still need revocation (expire within one hour)`
+            : ''}
+        </p>
+      ) : null}
+      {notice ? (
+        <p className="mt-3 text-sm text-foreground" role="status">
+          {notice}
+        </p>
+      ) : null}
+      {error ? (
+        <p className="mt-3 text-sm text-status-error" role="alert">
+          {error}
+        </p>
+      ) : null}
+    </section>
+  );
+}
+
 export function IntegrationsView({
   connectedProvider,
 }: {
@@ -325,6 +500,7 @@ export function IntegrationsView({
   }
 
   const providersByName = new Map(providers.map((provider) => [provider.provider, provider]));
+  const githubProvider = providersByName.get('github');
 
   return (
     <SettingsPage
@@ -419,6 +595,10 @@ export function IntegrationsView({
           })}
         </div>
       </section>
+
+      {githubProvider?.connected && githubProvider.repositories.length > 0 ? (
+        <DirectWriteSettings repositories={githubProvider.repositories} />
+      ) : null}
     </SettingsPage>
   );
 }

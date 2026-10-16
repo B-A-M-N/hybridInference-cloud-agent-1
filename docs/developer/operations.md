@@ -414,15 +414,16 @@ POST /v1/agent/jobs           owner queues work
       → native Agent CLI        one live process/session per member chat
       → normalized events       streamed to the owner over SSE
       → model calls             billed through the gateway into api_logs
-      → optional direct push    member's GH_TOKEN; skips the publisher's checks
+      → optional direct push    only for repositories with direct writes enabled
     → quiescent group snapshot  immutable diff for the trusted publisher
   → publisher validates         .github/ block, secret scan, path escape, size
     → agent/<origin-chat-id>     one stable branch per workspace group
       → draft PR                merges follow the repository's GitHub rules
 ```
 
-The agent can also push and open pull requests itself, and **Watch PR and
-merge** asks it to merge once the PR satisfies its required checks and reviews.
+When repository direct writes are enabled, the agent can also push and open
+pull requests itself, and **Watch PR and merge** asks it to merge once the PR
+satisfies its required checks and reviews.
 Branch protection and other GitHub rules on the repository decide what may
 merge without a person.
 
@@ -436,11 +437,13 @@ Keep these credential boundaries intact:
   the credential travels in git's environment rather than its argv, and the
   runner refuses to start the agent if it finds the token anywhere under
   `.git/`.
-- **The only repository credential in the sandbox is short-lived.** When the
-  GitHub App is configured, the owning member receives `GH_TOKEN`: an App
-  installation token limited to `contents: write` and `pull_requests: write`
-  on the job's repository, expiring after about one hour. Pushes made with it
-  skip the publisher's patch gate. See [credentials](#2-credentials).
+- **Sandbox write access is opt-in per GitHub repository.** It starts disabled.
+  A signed-in user can enable it only while their linked GitHub account has
+  current repository `admin` permission. The claim receives `GH_TOKEN` only
+  while that repository's persisted policy is enabled; the App token is scoped
+  to `contents: write` and `pull_requests: write` on that repository and expires
+  after about one hour. Pushes made with it skip the publisher's patch gate.
+  See [credentials](#2-credentials).
 - **The sandbox also has two narrow, non-interchangeable credentials.** The
   gateway-issued `agr` grant buys inference as the chat owner: it names the
   allowed model, is scoped to one member residency, and is renewed only while
@@ -1382,17 +1385,20 @@ holds unless it asks for less, so the clone token is requested as
 `contents: read` on the single repository being worked on. Checkout does not
 inherit the publisher's broader authority.
 
-The claim separately mints a single-repository installation token with
-`contents: write` and `pull_requests: write`, injected as `GH_TOKEN` in the
-owning sandbox member's Agent CLI environment. `GH_REPO` selects the job's
-repository and `GH_HOST` selects `github.com`; `gh` authenticates as the App
-installation, rather than as the user's account. The token is not written to
-Git or GitHub CLI configuration, shared workspace files, or the image. Setup
-scripts and standalone terminal sessions do not receive it. Git uses the
-`gh auth git-credential` helper through invocation-only environment settings,
-so `git push` and `gh pr create` can authenticate without an interactive login.
-The host clone credential stays read-only; user account/refresh tokens and
-the App's private key remain outside the sandbox.
+The claim mints a single-repository installation token with `contents: write`
+and `pull_requests: write` only while the persisted repository policy is
+enabled. A linked GitHub repository administrator must enable that policy.
+Each claim checks the policy before and after token minting. The token is
+injected as `GH_TOKEN` in the owning sandbox member's Agent CLI environment.
+`GH_REPO` selects the job's repository and `GH_HOST` selects `github.com`; `gh`
+authenticates as the App installation, rather than as the user's account. The
+token is not written to Git or GitHub CLI configuration, shared workspace
+files, or the image. Setup scripts and standalone terminal sessions do not
+receive it. Git uses the `gh auth git-credential` helper through
+invocation-only environment settings, so `git push` and `gh pr create` can
+authenticate without an interactive login. The host clone credential stays
+read-only; user account/refresh tokens and the App's private key remain outside
+the sandbox.
 
 Direct sandbox pushes bypass the trusted publisher's patch gate, including
 its workflow-file and secret checks. Repository branch protection and GitHub
