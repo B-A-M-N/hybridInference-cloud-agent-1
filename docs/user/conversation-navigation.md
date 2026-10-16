@@ -86,6 +86,10 @@ long:
   agent state its `wait` call reports.
 - pi has no subagents.
 
+A tool from an MCP server is never shown as a task list or a subagent, whatever
+its name. Codex sessions recorded before each call stored its MCP server can
+still show such a tool as a subagent.
+
 A card says when a reply is still pending, was not recorded, or was stored
 only in part. A failed or interrupted launch stays listed with what it
 returned. A background launch returns only a launch notice, and its card says

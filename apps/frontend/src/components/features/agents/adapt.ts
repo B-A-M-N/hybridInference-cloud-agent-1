@@ -195,6 +195,7 @@ export function toDisplayEvent(event: AgentJobEventApi): AgentEvent | null {
 
   if (type === 'tool_use') {
     const name = asText(payload, 'name', 'tool') || 'Bash';
+    const mcpServer = asText(payload, 'mcp_server');
     const exitCode = payload.exit_code;
     const output = toolOutput(payload);
     const outputIsError =
@@ -205,6 +206,7 @@ export function toDisplayEvent(event: AgentJobEventApi): AgentEvent | null {
     return {
       kind: 'tool_use',
       tool: name,
+      ...(mcpServer ? { mcpServer } : {}),
       id: asText(payload, 'id') || undefined,
       ...(Object.hasOwn(payload, 'input') ? { input: payload.input } : {}),
       ...(owner ? { parentToolUseId: owner } : {}),

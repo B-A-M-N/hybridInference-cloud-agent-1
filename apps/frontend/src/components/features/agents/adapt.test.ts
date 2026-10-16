@@ -250,6 +250,15 @@ describe('toDisplayEvent', () => {
     });
   });
 
+  it('keeps the MCP server a Codex call went to, and names none for other calls', () => {
+    const mcp = toDisplayEvent(
+      event(1, 'tool_use', { id: 'm', name: 'review__task', input: {}, mcp_server: 'session' }),
+    );
+    expect(mcp).toMatchObject({ kind: 'tool_use', tool: 'review__task', mcpServer: 'session' });
+    const command = toDisplayEvent(event(2, 'tool_use', { id: 'c', name: 'Bash', input: 'ls' }));
+    expect(command).not.toHaveProperty('mcpServer');
+  });
+
   it('keeps a plain error as a lifecycle row', () => {
     expect(toDisplayEvent(event(1, 'error', { detail: 'boom' }))).toEqual({
       kind: 'lifecycle',

@@ -1664,12 +1664,17 @@ class CodexAppServerSession(_JsonResidentSession[CodexRuntime]):
                 return raw_notification
             if item_id:
                 turn.reported_tools.add(item_id)
+            # An MCP call keeps the tool's own name, which a server may have
+            # called "task" or "list_agents"; the server it went to is what
+            # says it is not Codex's own delegation.
+            server = item.get("server") if item_type == "mcpToolCall" else None
             return HarnessEvent(
                 TOOL_USE,
                 {
                     "name": item.get("tool") or item_type,
                     "id": item_id or None,
                     "input": item.get("command") or item.get("arguments"),
+                    **({"mcp_server": server} if isinstance(server, str) and server else {}),
                     **owner,
                 },
                 raw_line=line,
