@@ -687,6 +687,9 @@ sandbox manager prepares the archive. The archive contains `manifest.json` and
 files. Archives larger than 5 GiB are refused before deletion. An immutable S3
 object must match both SHA-256 and byte length, and its receipt must commit to
 the database before the host may remove the exact reviewed stopped container.
+If the host reports that this container is missing or changed before archive
+verification, the request fails for operator review; that response never counts
+as a successful deletion.
 Upload failures retain the container. Once an archive is verified, uncertain
 deletion acknowledgements keep admission blocked and retry the same request.
 The sandbox manager stores its deletion receipts on its own persistent volume so an
