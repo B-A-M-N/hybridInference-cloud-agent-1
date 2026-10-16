@@ -482,6 +482,7 @@ class GitHubAppCredentials:
         permissions: dict[str, str] | None = None,
         repository_scoped: bool = False,
         min_ttl_s: float = 0.0,
+        cache: bool = True,
         cache_tag: str | None = None,
     ) -> str:
         """Return a live installation token for one repository.
@@ -502,6 +503,10 @@ class GitHubAppCredentials:
         work outlasts the usual refresh margin: a cached token closer to its
         expiry is replaced rather than handed out to fail midway.
 
+        ``cache`` is false for claim-scoped direct-write credentials, which
+        are persisted only in the revocation ledger and must not remain in this
+        process's reusable installation-token cache.
+
         ``cache_tag`` separates otherwise equal scopes whose authorization
         revision differs, so a newly enabled policy cannot reuse an earlier
         token cache entry.
@@ -514,6 +519,7 @@ class GitHubAppCredentials:
                 permissions=permissions,
                 repository=scope,
                 min_ttl_s=min_ttl_s,
+                cache=cache,
                 cache_tag=cache_tag,
             )
         except GitHubAppError as exc:
@@ -527,6 +533,7 @@ class GitHubAppCredentials:
                     permissions=permissions,
                     repository=scope,
                     min_ttl_s=min_ttl_s,
+                    cache=cache,
                     cache_tag=cache_tag,
                 )
             except GitHubAppError as retry_exc:
@@ -554,6 +561,7 @@ class GitHubAppCredentials:
         permissions: dict[str, str] | None = None,
         repository: str | None = None,
         min_ttl_s: float = 0.0,
+        cache: bool = True,
         cache_tag: str | None = None,
     ) -> tuple[str, bool]:
         """Return a token for one installation and scope, and whether it is new.
@@ -571,7 +579,7 @@ class GitHubAppCredentials:
         scope_key = json_module.dumps(
             {"p": permissions, "r": repository, "tag": cache_tag}, sort_keys=True
         )
-        cached = self._tokens.get((installation_id, scope_key))
+        cached = self._tokens.get((installation_id, scope_key)) if cache else None
         margin = max(_TOKEN_REFRESH_MARGIN_S, min_ttl_s)
         if cached and cached.expires_at - margin > time.time():
             return cached.token, False
