@@ -9,7 +9,8 @@ command on one. What the platform does is here:
   platform's key;
 * build a sandbox group's whole SSH state for the claim, and push it to a
   running group's host when the owner changes something, so a removal takes
-  effect at once instead of at the next turn.
+  effect at once instead of at the next turn, and again when a turn marks its
+  group running, so a change made while the group started reaches that turn.
 
 See ``docs/agents/specs/2026-10-15-user-ssh-servers-design.zh-CN.md``.
 """
@@ -436,9 +437,10 @@ async def push_ssh_access(
     A push only takes access away from a running member: a server turned off,
     deleted or given a new key stops working at once, while one turned on
     arrives with the member's next turn, whose runner masks its key. Best
-    effort by design: a group that is not running, or whose host cannot be
-    reached, gets the state before its next turn runs anything, because every
-    claim carries it.
+    effort by design. A group that is not running is sent its state when a
+    turn marks it running (``worker_mark_thread_sandbox_running``), because
+    the claim's own state is read before then and can miss a change made in
+    between. A host that cannot be reached gets the state with its next turn.
     """
     try:
         groups = await store.ssh_servers.running_groups_for_ssh_change(

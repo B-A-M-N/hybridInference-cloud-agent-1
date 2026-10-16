@@ -5024,6 +5024,70 @@ async def test_retained_lifecycle_writes_echo_every_generation_fence(
     ]
 
 
+async def test_marking_a_group_running_pushes_its_ssh_state_as_it_is_now(
+    client: AsyncClient, store: FakeStorage, monkeypatch
+):
+    """A change made while the group started reached no push; this one reaches it.
+
+    The claim's SSH state was read before the group was reserved, and an
+    owner's change only looks for running groups. Once the group is running,
+    every later change finds it, and this push covers the ones before.
+    """
+    job_id = await _create_job(client)
+    claim = await client.post("/v1/agent/worker/claim", json={"worker_id": "w1"})
+    auth = {"Authorization": f"Bearer {claim.json()['worker_token']}"}
+    thread_id = _thread_of(store, job_id)
+    pushes: list[tuple[Any, dict[str, Any]]] = []
+
+    async def push(storage: Any, **kwargs: Any) -> None:
+        pushes.append((storage, kwargs))
+
+    async def mark_thread_sandbox_running(**kwargs: Any) -> dict[str, Any] | None:
+        if not store._fenced(kwargs["attempt_id"], kwargs["lease_generation"]):
+            return None
+        return {
+            "thread_id": kwargs["thread_id"],
+            "sandbox_id": "asbx_test",
+            "generation": kwargs["sandbox_generation"],
+            "host": "runner-test",
+            "container_id": kwargs["container_id"],
+            "container_name": "freeinference-test",
+            "runtime_id": "claude-code",
+            "execution_profile": "trusted-v1",
+            "state": "running",
+            "context_status": kwargs["context_status"],
+            "activation_generation": kwargs["activation_generation"],
+            "process_generation": 0,
+        }
+
+    monkeypatch.setattr(worker, "push_ssh_access", push, raising=False)
+    monkeypatch.setattr(
+        store, "mark_thread_sandbox_running", mark_thread_sandbox_running, raising=False
+    )
+    body = {
+        "sandbox_generation": 3,
+        "activation_generation": 7,
+        "container_id": "container-test",
+        "context_status": "new",
+    }
+
+    running = await client.post(
+        f"/v1/agent/worker/jobs/{job_id}/sandbox/running", json=body, headers=auth
+    )
+
+    assert running.status_code == 200, running.text
+    assert pushes == [(store, {"thread_ids": [thread_id]})]
+
+    # A superseded attempt confirms nothing, and so pushes nothing.
+    store.live_fence = (101, 2)
+    lost = await client.post(
+        f"/v1/agent/worker/jobs/{job_id}/sandbox/running", json=body, headers=auth
+    )
+
+    assert lost.status_code == 409, lost.text
+    assert len(pushes) == 1
+
+
 async def test_shared_abandon_releases_the_exact_residency_and_grant(
     store: FakeStorage, monkeypatch
 ):

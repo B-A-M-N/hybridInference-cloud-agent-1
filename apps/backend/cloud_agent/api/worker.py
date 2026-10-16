@@ -52,6 +52,7 @@ from cloud_agent.application.residency import _mint_residency_grant, residency_t
 from cloud_agent.application.ssh_servers import (
     build_ssh_access,
     prompt_with_ssh_servers,
+    push_ssh_access,
     servers_for_thread,
     ssh_key_cipher,
 )
@@ -1643,6 +1644,7 @@ async def worker_report_environment_snapshot(
 async def worker_mark_thread_sandbox_running(
     job_id: str,
     body: WorkerSandboxRunningRequest,
+    background: BackgroundTasks,
     authorization: str | None = Header(None),
     store: _WorkerStorage | None = Depends(get_storage),
 ) -> WorkerThreadSandbox:
@@ -1662,6 +1664,12 @@ async def worker_mark_thread_sandbox_running(
     )
     if row is None:
         raise _lease_lost()
+    # The claim's SSH state was read before the group was reserved, and an
+    # owner's change made since found no running group to push to. This push
+    # is read after the group became running, so it holds every such change
+    # and is newer than the claim's: the sandbox manager keeps it whichever of
+    # the two arrives first. Every later change finds the group running.
+    background.add_task(push_ssh_access, job_store, thread_ids=[thread_id])
     return WorkerThreadSandbox(**row)
 
 

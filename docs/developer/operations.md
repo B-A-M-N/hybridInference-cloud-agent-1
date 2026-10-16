@@ -3997,9 +3997,13 @@ and the owner SSH servers entry in [AGENTS.md](../../AGENTS.md) §7.
   key changed, is deleted. A server turned on, or a new key, arrives with the
   chat's next turn, whose runner masks the key. If a newest state fails after
   it was recorded, the manager clears the bridge's SSH elements and the call
-  fails, so the group stays closed until a state applies whole. A stopped
-  group, or a host the control plane cannot reach, gets the state before its
-  next turn runs anything.
+  fails, so the group stays closed until a state applies whole. A push looks
+  only for running groups, and a claim's state is read before its group is
+  reserved, so a change made while a new, stopped or cold group starts reaches
+  neither. When the runner marks the group running, the control plane pushes
+  the group's state once more; it is newer than the claim's, and the manager
+  keeps it whichever of the two arrives first. A host the control plane cannot
+  reach gets the state with its next turn's claim.
 - **Checks dial out from the control plane.** A check resolves the address,
   refuses it whole if any answer is private, reserved or protected, reads the
   host keys with `ssh-keyscan`, and after the owner confirms a fingerprint logs
