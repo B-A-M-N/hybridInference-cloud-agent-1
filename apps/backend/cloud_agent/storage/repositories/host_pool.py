@@ -240,6 +240,14 @@ def _selection_record(earlier: object, version: str, stamp: datetime) -> dict[st
 #: A host whose last heartbeat is older than this is not delivering stops.
 #: The same allowance the offline reaper gives an enrolled host.
 _REMOVAL_HEARTBEAT_STALE_S = HEARTBEAT_INTERVAL_S * MISSED_HEARTBEATS_BEFORE_OFFLINE
+#: How long a stopped group counts as possibly starting after something asked
+#: for its container: the host reports the start on a later beat, and this is
+#: the same allowance of beats.
+_REMOVAL_START_REPORT_S = _REMOVAL_HEARTBEAT_STALE_S
+
+
+class _RemovalRaced(Exception):
+    """A group may have started while a removal was being decided."""
 
 
 async def _groups_left_by_removal(conn: Any, host: str) -> tuple[list[str], str | None]:
@@ -255,6 +263,14 @@ async def _groups_left_by_removal(conn: Any, host: str) -> tuple[list[str], str 
     ``"stop_wait_exceeded"`` when the removal goes ahead regardless, and
     ``None`` while it still waits or when no group is live.
 
+    A stopped group counts as live while something may be starting its
+    container, which the host reports only on a later beat: a capture or a
+    Fork while it runs, and for a while after a workspace request fenced the
+    checkpoint that covered the group (the fence stamps its activity). Revoked
+    then, the group would be left without the checkpoint that carries it to
+    another host, and its container would start on a host that can no longer
+    report it. A group no checkpoint covered stays on this host either way.
+
     Read under the caller's host-row lock, and taking no lock of its own.
     """
     row = await conn.fetchrow(
@@ -263,7 +279,24 @@ async def _groups_left_by_removal(conn: Any, host: str) -> tuple[list[str], str 
                    SELECT g.id FROM agent_sandboxes g
                    WHERE g.host = h.host AND g.deletion_state = 'none'
                      AND g.container_id IS NOT NULL
-                     AND g.state = ANY($2::text[])
+                     AND (
+                         g.state = ANY($2::text[])
+                         OR (g.state = 'stopped' AND (
+                             g.snapshot_state = 'snapshotting'
+                             OR g.active_operation_count > 0
+                             OR (
+                                 g.restore_checkpoint_id IS NULL
+                                 AND g.last_activity_at > NOW() - make_interval(secs => $5)
+                                 AND EXISTS (
+                                     SELECT 1 FROM agent_sandbox_checkpoints c
+                                     WHERE c.sandbox_id = g.id AND c.host = g.host
+                                       AND c.generation = g.generation
+                                       AND c.container_id = g.container_id
+                                       AND c.start_seq < g.start_seq
+                                 )
+                             )
+                         ))
+                     )
                    ORDER BY g.id
                ) AS live,
                (h.credential_hash IS NOT NULL
@@ -281,6 +314,7 @@ async def _groups_left_by_removal(conn: Any, host: str) -> tuple[list[str], str 
         list(LIVE_GROUP_STATES),
         _REMOVAL_HEARTBEAT_STALE_S,
         HOST_REMOVAL_STOP_WAIT_S,
+        _REMOVAL_START_REPORT_S,
     )
     if row is None or not row["live"]:
         return [], None
@@ -290,6 +324,22 @@ async def _groups_left_by_removal(conn: Any, host: str) -> tuple[list[str], str 
     if row["waited_out"]:
         return live, "stop_wait_exceeded"
     return live, None
+
+
+async def _revoke_unless_raced(conn: Any, host: str, left: list[str]) -> None:
+    """Revoke ``host``, unless a group became live while that was decided.
+
+    The groups were read without locks, which taking them here, after the host
+    row, would invert the documented order for. A workspace request that
+    fenced a stopped group after that read instead shows up in a second one,
+    made after the revocation: a group live now that was not before raises
+    :class:`_RemovalRaced`, which rolls the revocation back, and the removal
+    waits for that group like any other.
+    """
+    await revoke_host_credentials(conn, [host])
+    live, _ = await _groups_left_by_removal(conn, host)
+    if set(live) - set(left):
+        raise _RemovalRaced
 
 
 def _log_groups_left_by_removal(host: str, sandbox_ids: list[str], reason: str | None) -> None:
@@ -964,6 +1014,15 @@ class PostgresHostPoolRepository:
         administrative bookkeeping; it is not by itself proof that a retained
         Docker writable layer was deleted.
         """
+        try:
+            return await self._remove_host_once(host=host, force=force)
+        except _RemovalRaced:
+            # A group may have started as the removal was decided. Asked
+            # again, the removal finds it live and waits for it.
+            return await self._remove_host_once(host=host, force=force)
+
+    async def _remove_host_once(self, *, host: str, force: bool) -> str:
+        """One try of :meth:`remove_host`; raises :class:`_RemovalRaced`."""
         async with self._pool.acquire() as conn, conn.transaction():
             # The host's running attempts before its row: the order every
             # writer that ends an attempt keeps (move the attempt, then give
@@ -998,7 +1057,10 @@ class PostgresHostPoolRepository:
                         HOST_DRAINING,
                     )
                     return "draining"
-            await revoke_host_credentials(conn, [host])
+            if force:
+                await revoke_host_credentials(conn, [host])
+            else:
+                await _revoke_unless_raced(conn, host, left)
         if left:
             _log_groups_left_by_removal(host, left, reason)
         return "ok"
@@ -1033,23 +1095,27 @@ class PostgresHostPoolRepository:
             )
             for candidate in candidates:
                 host = candidate["host"]
-                async with conn.transaction():
-                    await conn.execute(
-                        "SELECT id FROM agent_attempts WHERE host_id = $1 AND status = 'running' "
-                        "ORDER BY id FOR UPDATE",
-                        host,
-                    )
-                    row = await conn.fetchrow(
-                        "SELECT slots_used, removal_requested_at "
-                        "FROM agent_runner_hosts WHERE host = $1 FOR UPDATE",
-                        host,
-                    )
-                    if row is None or row["removal_requested_at"] is None or row["slots_used"]:
-                        continue
-                    left, reason = await _groups_left_by_removal(conn, host)
-                    if left and reason is None:
-                        continue
-                    await revoke_host_credentials(conn, [host])
+                try:
+                    async with conn.transaction():
+                        await conn.execute(
+                            "SELECT id FROM agent_attempts "
+                            "WHERE host_id = $1 AND status = 'running' ORDER BY id FOR UPDATE",
+                            host,
+                        )
+                        row = await conn.fetchrow(
+                            "SELECT slots_used, removal_requested_at "
+                            "FROM agent_runner_hosts WHERE host = $1 FOR UPDATE",
+                            host,
+                        )
+                        if row is None or row["removal_requested_at"] is None or row["slots_used"]:
+                            continue
+                        left, reason = await _groups_left_by_removal(conn, host)
+                        if left and reason is None:
+                            continue
+                        await _revoke_unless_raced(conn, host, left)
+                except _RemovalRaced:
+                    # The next pass waits for the group that started.
+                    continue
                 if left:
                     _log_groups_left_by_removal(host, left, reason)
                 removed.append(host)

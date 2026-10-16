@@ -18,6 +18,7 @@ from tests.integration.storage.test_agent_job_store import (
 
 from cloud_agent.host_pool import HOST_REMOVAL_STOP_WAIT_S
 from cloud_agent.storage._sql.compute_admission import host_compute_admission
+from cloud_agent.storage.repositories import host_pool as host_pool_repository
 from cloud_agent_shared.sandbox_archive_settings import SANDBOX_ARCHIVE_CAPABILITY
 from cloud_agent_shared.sandbox_restore import (
     MAX_RESTORE_ATTEMPTS,
@@ -1136,6 +1137,89 @@ async def test_a_removal_stops_waiting_once_its_limit_has_passed(
     (left,) = _left_bound(caplog)
     assert left.reason == "stop_wait_exceeded"
     assert left.sandbox_ids == [group["sandbox_id"]]
+
+
+async def test_a_removal_waits_for_a_group_a_workspace_request_is_starting(pool, store: Storage):
+    """Opening Files fenced the checkpoint; the host reports the start only on a later beat.
+
+    Revoked in between, the group kept no checkpoint to move with, and its
+    container started on a host that could no longer report it.
+    """
+    job, group = await _covered(pool, store)
+    follow_up = await store.conversation_commands.create_follow_up(
+        parent_job_id=job["id"], user_id="user-1", prompt="continue"
+    )
+    assert follow_up is not None
+    assert await store.sandbox.fence_workspace_start(thread_id=job["thread_id"]) == "stopped"
+    assert (await _state(pool))["restore_checkpoint_id"] is None
+
+    assert await store.host_pool.remove_host(host="runner-a") == "draining"
+    assert await store.host_pool.finish_host_removals() == []
+
+    # The host reports the container the request started, and the removal
+    # stops it again like any idle group.
+    await store.sandbox.reconcile_thread_sandbox_observation(
+        **_observed(job, group), running=True, activity_active=False, idle_remaining_seconds=1800
+    )
+    assert (await _state(pool))["state"] == "running"
+    assert await store.sandbox.due_thread_sandbox_stop(**_observed(job, group)) is not None
+    await store.sandbox.reconcile_thread_sandbox_observation(
+        **_observed(job, group), running=False, activity_active=False
+    )
+    assert await store.sandbox.record_sandbox_checkpoint(
+        host="runner-a",
+        thread_id=job["thread_id"],
+        checkpoint=_receipt(group, job, checkpoint_id="f" * 32, start_seq=group["start_seq"] + 1),
+    )
+
+    assert await store.host_pool.finish_host_removals() == ["runner-a"]
+    moved = await _state(pool)
+    assert moved["state"] == "cold"
+    assert moved["restore_checkpoint_id"] == "f" * 32
+
+
+async def test_a_start_the_host_never_reports_holds_a_removal_only_briefly(pool, store: Storage):
+    job, _ = await _covered(pool, store)
+    assert await store.sandbox.fence_workspace_start(thread_id=job["thread_id"]) == "stopped"
+    assert await store.host_pool.remove_host(host="runner-a") == "draining"
+
+    # The request failed before the container started: no beat reports it.
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_sandboxes SET last_activity_at = last_activity_at - INTERVAL '10 minutes' "
+            "WHERE id = 'asbx_restore'"
+        )
+
+    assert await store.host_pool.finish_host_removals() == ["runner-a"]
+    # The fence spent its checkpoint, so the group stays on the removed host.
+    assert (await _state(pool))["state"] == "stopped"
+
+
+async def test_a_start_fenced_while_a_removal_is_decided_puts_the_removal_off(
+    pool, store: Storage, monkeypatch: pytest.MonkeyPatch
+):
+    """The fence commits after the removal read the groups and before it revoked the host."""
+    job, _ = await _covered(pool, store)
+    revoke = host_pool_repository.revoke_host_credentials
+    fenced: list[str | None] = []
+
+    async def revoke_after_a_workspace_request(conn: Any, hosts: list[str]) -> None:
+        if not fenced:
+            fenced.append(await store.sandbox.fence_workspace_start(thread_id=job["thread_id"]))
+        await revoke(conn, hosts)
+
+    monkeypatch.setattr(
+        host_pool_repository, "revoke_host_credentials", revoke_after_a_workspace_request
+    )
+
+    assert await store.host_pool.remove_host(host="runner-a") == "draining"
+
+    assert fenced == ["stopped"]
+    host = await store.host_pool.get_host(host="runner-a")
+    assert host["status"] == "draining"
+    assert host["enrolled"] is True
+    state = await _state(pool)
+    assert state["state"] == "stopped" and state["host"] == "runner-a"
 
 
 async def test_a_forced_removal_of_a_host_running_a_group_revokes_at_once(pool, store: Storage):

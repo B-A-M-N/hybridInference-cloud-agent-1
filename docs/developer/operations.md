@@ -2086,7 +2086,10 @@ running group at once, without waiting for its idle deadline. The host still
 refuses it while a terminal or a workspace operation is open in the group, and
 the next heartbeat offers it again. While the host is being removed, a group
 counts as stopped only on the heartbeat that reports its stop finished, final
-archive and checkpoint included, which also carries that checkpoint. The
+archive and checkpoint included, which also carries that checkpoint. A
+stopped group counts as running for up to 90 seconds after a workspace request
+(Files, Terminal or Git) fenced its checkpoint, until the host reports the
+container that request started. The
 reaper revokes the host once no turn and no group is running. It stops waiting, revokes the host as before, and logs the groups
 left on it (`agent_host_removed_with_live_sandboxes`) when the host stops
 heartbeating, or 30 minutes after the later of the request and the host's last
