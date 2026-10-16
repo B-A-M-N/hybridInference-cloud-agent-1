@@ -81,6 +81,7 @@ def _run(monkeypatch, job: ClaimedJob) -> Mock:
     prepared = SimpleNamespace(import_into=lambda *_args, **_kwargs: "b" * 40, discard=lambda: None)
     monkeypatch.setattr(runner_mod, "_prefetch_retained_source", lambda **_kwargs: prepared)
     monkeypatch.setattr(runner_mod, "runtime_version_unavailable", lambda *_args: None)
+    monkeypatch.setattr(runner_mod, "_configure_direct_write_remote", lambda *_args: None)
     control = Mock(spec=ControlPlane)
     control.reserve_chat_sandbox.side_effect = lambda seed: {
         **seed,
