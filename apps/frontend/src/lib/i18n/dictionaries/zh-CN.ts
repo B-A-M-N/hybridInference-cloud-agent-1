@@ -1188,6 +1188,8 @@ export const zhCN: Record<TranslationKey, string> = {
   'teams.error.invitationClosed': '这个邀请已经被使用。',
   'teams.error.invitationLimit': '这个团队未使用的邀请链接太多。请先撤销一个再创建。',
   'teams.error.invitationUnavailable': '这个邀请链接已经失效。请联系 Owner 或管理员获取新链接。',
+  'teams.error.noLongerMember':
+    '你已经不是这个团队的成员了。请联系 Owner 或管理员获取新的邀请链接。',
   'teams.error.notFound': '这个团队或成员已不存在，或你已不在团队中。',
   'teams.error.ownerCannotLeave': '请先把另一名成员设为 Owner，或删除团队。',
   'teams.error.ownerNotAdmitted': '这名成员目前无法使用 Agent，因此不能成为 Owner。',

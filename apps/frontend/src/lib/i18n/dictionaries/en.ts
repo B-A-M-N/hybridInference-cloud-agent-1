@@ -1272,6 +1272,8 @@ export const en = {
     'This team has too many open invitation links. Revoke one before creating another.',
   'teams.error.invitationUnavailable':
     'This invitation link is no longer valid. Ask an owner or admin for a new one.',
+  'teams.error.noLongerMember':
+    'You are no longer a member of this team. Ask an owner or admin for a new invitation link.',
   'teams.error.notFound': 'This team or member no longer exists, or you are no longer in it.',
   'teams.error.ownerCannotLeave': 'Make another member the owner, or delete the team, first.',
   'teams.error.ownerNotAdmitted':
