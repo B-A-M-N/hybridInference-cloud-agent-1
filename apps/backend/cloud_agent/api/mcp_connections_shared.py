@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from fastapi import HTTPException
 
+from cloud_agent.mcp.models import CapabilityKind, ToolPolicy
+
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from cloud_agent.ports import ConversationQueries, McpConnectionRepository
 
     class _McpConnectionsStorage(Protocol):
@@ -46,6 +50,36 @@ def _bad_request(message: str) -> HTTPException:
         status_code=400,
         detail={"error": {"type": "invalid_request_error", "message": message}},
     )
+
+
+def _capability_view(entry: Mapping[str, Any], kind: CapabilityKind) -> dict[str, Any]:
+    """Render one discovered capability for the selection dialog."""
+    return {
+        "kind": kind.value,
+        "name": str(entry.get("name") or ""),
+        "description": str(entry.get("description") or ""),
+        "input_schema": entry.get("input_schema"),
+        "annotations": entry.get("annotations") or {},
+    }
+
+
+def _capability_payload(capability: Any) -> dict[str, Any]:
+    """The stored form of one capability."""
+    return {
+        "name": capability.name,
+        "description": capability.description,
+        "input_schema": capability.input_schema,
+        "annotations": dict(capability.annotations),
+    }
+
+
+def _parse_policy(value: str) -> ToolPolicy:
+    """Read a capability policy."""
+    try:
+        return ToolPolicy(str(value))
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in ToolPolicy)
+        raise _bad_request(f"unknown policy {value!r}; use one of: {allowed}") from exc
 
 
 def _require_store(store: _McpConnectionsStorage | None) -> _McpConnectionsStorage:

@@ -18,14 +18,17 @@ from cloud_agent.api._owner_auth import require_agent_owner
 from cloud_agent.api.deps import get_storage
 from cloud_agent.api.mcp_connections_shared import (
     _bad_request,
+    _capability_payload,
+    _capability_view,
     _McpConnectionsStorage,
     _not_found,
+    _parse_policy,
     _require_store,
 )
 from cloud_agent.logging_utils import get_logger
 from cloud_agent.mcp.authorization import binding_from_selection
 from cloud_agent.mcp.binding_aliases import binding_aliases
-from cloud_agent.mcp.models import ConnectionStatus, ToolPolicy
+from cloud_agent.mcp.models import ConnectionStatus
 from cloud_agent.mcp.registry import resolve_connection
 
 logger = get_logger(__name__)
@@ -80,36 +83,6 @@ class ReplaceBindingsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     bindings: list[BindingRequest] = Field(default_factory=list)
-
-
-def _capability_view(entry: Mapping[str, Any], kind_text: str) -> dict[str, Any]:
-    """Render one discovered capability for the selection dialog."""
-    return {
-        "kind": kind_text,
-        "name": str(entry.get("name") or ""),
-        "description": str(entry.get("description") or ""),
-        "input_schema": entry.get("input_schema"),
-        "annotations": entry.get("annotations") or {},
-    }
-
-
-def _capability_payload(capability: Any) -> dict[str, Any]:
-    """The stored form of one capability."""
-    return {
-        "name": capability.name,
-        "description": capability.description,
-        "input_schema": capability.input_schema,
-        "annotations": dict(capability.annotations),
-    }
-
-
-def _parse_policy(value: str) -> ToolPolicy:
-    """Read a capability policy."""
-    try:
-        return ToolPolicy(str(value))
-    except ValueError as exc:
-        allowed = ", ".join(item.value for item in ToolPolicy)
-        raise _bad_request(f"unknown policy {value!r}; use one of: {allowed}") from exc
 
 
 def _default_alias(row: Mapping[str, Any], index: int) -> str:
@@ -276,7 +249,7 @@ async def _binding_views(
         snapshot = resolved.snapshot
         capabilities = (
             [
-                _capability_view(_capability_payload(item), item.kind.value)
+                _capability_view(_capability_payload(item), item.kind)
                 for item in snapshot.all_capabilities()
             ]
             if snapshot

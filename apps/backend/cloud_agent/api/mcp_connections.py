@@ -78,7 +78,6 @@ from cloud_agent.mcp.models import (
     InvocationStatus,
     LaunchSpec,
     Mount,
-    ToolPolicy,
     Transport,
 )
 from cloud_agent.mcp.net_policy import (
@@ -544,15 +543,6 @@ async def _view(store: _McpConnectionsStorage, row: Mapping[str, Any]) -> Connec
     )
 
 
-#: Where each capability kind is kept in a stored snapshot, in display order.
-_SNAPSHOT_SURFACES: tuple[tuple[str, CapabilityKind], ...] = (
-    ("tools", CapabilityKind.TOOL),
-    ("resources", CapabilityKind.RESOURCE),
-    ("resource_templates", CapabilityKind.RESOURCE_TEMPLATE),
-    ("prompts", CapabilityKind.PROMPT),
-)
-
-
 def _capability_view(entry: Mapping[str, Any], kind: CapabilityKind) -> dict[str, Any]:
     """Render one discovered capability for the selection dialog."""
     return {
@@ -562,6 +552,15 @@ def _capability_view(entry: Mapping[str, Any], kind: CapabilityKind) -> dict[str
         "input_schema": entry.get("input_schema"),
         "annotations": entry.get("annotations") or {},
     }
+
+
+#: Where each capability kind is kept in a stored snapshot, in display order.
+_SNAPSHOT_SURFACES: tuple[tuple[str, CapabilityKind], ...] = (
+    ("tools", CapabilityKind.TOOL),
+    ("resources", CapabilityKind.RESOURCE),
+    ("resource_templates", CapabilityKind.RESOURCE_TEMPLATE),
+    ("prompts", CapabilityKind.PROMPT),
+)
 
 
 # --------------------------------------------------------------------------
@@ -1976,15 +1975,6 @@ def _parse_auth_kind(value: str) -> AuthKind:
     except ValueError as exc:
         allowed = ", ".join(item.value for item in AuthKind)
         raise _bad_request(f"unknown auth kind {value!r}; use one of: {allowed}") from exc
-
-
-def _parse_policy(value: str) -> ToolPolicy:
-    """Read a capability policy."""
-    try:
-        return ToolPolicy(str(value))
-    except ValueError as exc:
-        allowed = ", ".join(item.value for item in ToolPolicy)
-        raise _bad_request(f"unknown policy {value!r}; use one of: {allowed}") from exc
 
 
 def _build_auth(
