@@ -34,7 +34,7 @@ from cloud_agent.mcp.models import ExecutionLocation
 
 logger = get_logger(__name__)
 
-router = APIRouter()
+router = APIRouter(prefix="/v1/agent/mcp", tags=["agent-mcp"])
 
 #: What a connection bound to a connector can expect today.
 CONNECTOR_RUNTIME_UNAVAILABLE = "unavailable"

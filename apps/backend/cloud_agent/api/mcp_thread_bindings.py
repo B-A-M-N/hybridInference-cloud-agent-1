@@ -30,7 +30,7 @@ from cloud_agent.mcp.registry import resolve_connection
 
 logger = get_logger(__name__)
 
-router = APIRouter()
+router = APIRouter(prefix="/v1/agent/mcp", tags=["agent-mcp"])
 
 
 class BindingRequest(BaseModel):
@@ -138,7 +138,9 @@ async def get_thread_bindings(
     """What one session may use, and what each connection offers."""
     job_store = _require_store(store)
     await _require_thread(job_store, thread_id=thread_id, user_id=user["user_id"])
-    return BindingsResponse(bindings=await _binding_views(job_store, thread_id=thread_id))
+    return BindingsResponse(
+        bindings=await _binding_views(job_store, thread_id=thread_id, user_id=user["user_id"])
+    )
 
 
 @router.put("/threads/{thread_id}/bindings", response_model=BindingsResponse)
@@ -253,18 +255,20 @@ async def _save_thread_bindings(
         "agent_mcp_bindings_replaced",
         extra={"event": "agent_mcp_bindings_replaced", "thread_id": thread_id},
     )
-    return BindingsResponse(bindings=await _binding_views(job_store, thread_id=thread_id))
+    return BindingsResponse(
+        bindings=await _binding_views(job_store, thread_id=thread_id, user_id=user["user_id"])
+    )
 
 
 async def _binding_views(
-    job_store: _McpConnectionsStorage, *, thread_id: str
+    job_store: _McpConnectionsStorage, *, thread_id: str, user_id: str
 ) -> list[BindingResponse]:
     """Render every binding on one thread, with what each connection offers."""
     rows = await job_store.mcp.list_mcp_bindings(thread_id=thread_id)
     views: list[BindingResponse] = []
     for row in rows:
         connection_row = await job_store.mcp.get_mcp_connection(
-            connection_id=int(row["connection_id"])
+            connection_id=int(row["connection_id"]), user_id=user_id
         )
         if connection_row is None or connection_row.get("deleted_at") is not None:
             continue

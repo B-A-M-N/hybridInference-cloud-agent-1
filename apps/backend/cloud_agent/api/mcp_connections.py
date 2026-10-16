@@ -2270,5 +2270,8 @@ __all__ = [
     "router",
 ]
 
-router.include_router(thread_bindings_router)
-router.include_router(connector_router)
+# Copy already-prefixed routes into the compatibility router. This keeps the
+# public router flat, so an application that includes it can bind dependency
+# overrides exactly as it did when every route lived here.
+router.routes.extend(thread_bindings_router.routes)
+router.routes.extend(connector_router.routes)
