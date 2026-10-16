@@ -9434,6 +9434,19 @@
             "minimum": 0.0,
             "title": "Revision",
             "type": "integer"
+          },
+          "team_id": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Team Id"
           }
         },
         "required": [
@@ -14319,7 +14332,7 @@
       },
       "RenewalPolicy": {
         "additionalProperties": false,
-        "description": "Independent resource deadlines, expressed in seconds.\n\nWith rotation, ``renew_before_seconds`` is also when a node is replaced:\nan extension is tried first; a refused one, or a node at its maximum age,\nstarts a move of the whole Host to a newly allocated node instead.",
+        "description": "Independent resource deadlines, expressed in seconds.\n\nWith rotation, ``renew_before_seconds`` is also when a node is replaced:\nan extension is tried first; a refused one, or a node at its maximum age,\nstarts a move of the whole Host to a newly allocated node instead.\n\nWithout rotation, ``move_out_before_seconds`` is when the Host starts\nmoving its groups out one at a time, through their checkpoints, to\nanother Host; 0 turns that off. An extension is tried before it starts.",
         "properties": {
           "enabled": {
             "default": false,
@@ -14338,6 +14351,13 @@
             "maximum": 2592000.0,
             "minimum": 3600.0,
             "title": "Max Node Age Seconds",
+            "type": "integer"
+          },
+          "move_out_before_seconds": {
+            "default": 7200,
+            "maximum": 604800.0,
+            "minimum": 0.0,
+            "title": "Move Out Before Seconds",
             "type": "integer"
           },
           "node_type_binding": {
@@ -15720,6 +15740,19 @@
             "maxLength": 8000,
             "title": "Start Script",
             "type": "string"
+          },
+          "team_id": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Team Id"
           },
           "update_script": {
             "default": "",
@@ -17297,7 +17330,10 @@
               "member_left",
               "member_removed",
               "member_role_changed",
-              "ownership_transferred"
+              "ownership_transferred",
+              "environment_created",
+              "environment_updated",
+              "environment_archived"
             ],
             "title": "Action",
             "type": "string"
@@ -28304,7 +28340,7 @@
     },
     "/v1/agent/environments/{environment_id}": {
       "delete": {
-        "description": "Archive an environment and clear a matching default.",
+        "description": "Archive an environment and clear every default that names it.",
         "operationId": "delete_environment_v1_agent_environments__environment_id__delete",
         "parameters": [
           {
@@ -28494,7 +28530,7 @@
     },
     "/v1/agent/environments/{environment_id}/copy": {
       "post": {
-        "description": "Copy scripts and encrypted variables within one owner.",
+        "description": "Copy scripts and encrypted variables to yourself or, as an editor, to a team.",
         "operationId": "copy_environment_v1_agent_environments__environment_id__copy_post",
         "parameters": [
           {

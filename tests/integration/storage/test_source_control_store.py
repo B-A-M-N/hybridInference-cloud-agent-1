@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -157,6 +158,239 @@ async def _connect_refreshable_gitlab(
         refresh_token_ciphertext=client.cipher.encrypt(refresh_token),
         expires_at=datetime.now(UTC) + expires_in,
     )
+
+
+async def test_repository_direct_write_policy_is_revisioned_audited_and_revocable(
+    store: PostgresSourceControlRepository,
+    pool,
+) -> None:
+    """Persist the default deny, audit changes, and return encrypted tokens to revoke."""
+    repository_id = uuid.uuid4().int & ((1 << 62) - 1)
+    repository_name = "octocat/private-project"
+    repository_id_text = str(repository_id)
+
+    try:
+        disabled = await store.get_direct_write_policy(
+            github_repository_id=repository_id,
+            repository_full_name=repository_name,
+        )
+        assert disabled["enabled"] is False
+        assert disabled["revision"] == 0
+
+        enabled = await store.set_direct_write_policy(
+            github_repository_id=repository_id,
+            repository_full_name=repository_name,
+            enabled=True,
+            expected_revision=0,
+            actor_id="github-user-42",
+            admin_ip="203.0.113.42",
+        )
+        assert enabled is not None
+        assert enabled["policy"]["enabled"] is True
+        assert enabled["policy"]["revision"] == 1
+        assert enabled["tokens"] == []
+
+        assert await store.register_direct_write_token(
+            github_repository_id=repository_id,
+            policy_revision=1,
+            token_hash="sha256:test-token-digest",
+            token_ciphertext="encrypted:test-token",
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+        stored_tokens = await store.list_direct_write_tokens(github_repository_id=repository_id)
+        assert len(stored_tokens) == 1
+        assert stored_tokens[0]["token_ciphertext"] == "encrypted:test-token"
+
+        disabled_again = await store.set_direct_write_policy(
+            github_repository_id=repository_id,
+            repository_full_name=repository_name,
+            enabled=False,
+            expected_revision=1,
+            actor_id="github-user-42",
+            admin_ip="203.0.113.42",
+        )
+        assert disabled_again is not None
+        assert disabled_again["policy"]["enabled"] is False
+        assert disabled_again["policy"]["revision"] == 2
+        assert [token["token_hash"] for token in disabled_again["tokens"]] == [
+            "sha256:test-token-digest"
+        ]
+
+        stale = await store.set_direct_write_policy(
+            github_repository_id=repository_id,
+            repository_full_name=repository_name,
+            enabled=True,
+            expected_revision=1,
+            actor_id="github-user-42",
+            admin_ip="203.0.113.42",
+        )
+        assert stale is None
+
+        async with pool.acquire() as conn:
+            audit_rows = await conn.fetch(
+                """
+                SELECT action, actor_id, admin_ip, details
+                FROM agent_admin_audit_log
+                WHERE details->>'github_repository_id' = $1
+                ORDER BY id
+                """,
+                repository_id_text,
+            )
+        assert [row["action"] for row in audit_rows] == [
+            "agent.repository_direct_write.enabled",
+            "agent.repository_direct_write.disabled",
+        ]
+        assert all(row["actor_id"] == "github-user-42" for row in audit_rows)
+        assert all(row["admin_ip"] == "203.0.113.42" for row in audit_rows)
+    finally:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM agent_repository_direct_write_policy WHERE github_repository_id = $1",
+                repository_id,
+            )
+            await conn.execute(
+                "DELETE FROM agent_admin_audit_log WHERE details->>'github_repository_id' = $1",
+                repository_id_text,
+            )
+
+
+async def test_get_direct_write_policy_only_updates_a_changed_repository_name(
+    store: PostgresSourceControlRepository,
+    pool,
+) -> None:
+    """Repeated claim reads do not create new policy row versions."""
+    repository_id = uuid.uuid4().int & ((1 << 62) - 1)
+    repository_name = "octocat/private-project"
+
+    try:
+        first = await store.get_direct_write_policy(
+            github_repository_id=repository_id,
+            repository_full_name=repository_name,
+        )
+        async with pool.acquire() as conn:
+            initial_xmin = await conn.fetchval(
+                """
+                SELECT xmin::text
+                FROM agent_repository_direct_write_policy
+                WHERE github_repository_id = $1
+                """,
+                repository_id,
+            )
+
+        repeated = await store.get_direct_write_policy(
+            github_repository_id=repository_id,
+            repository_full_name=repository_name,
+        )
+        async with pool.acquire() as conn:
+            repeated_xmin = await conn.fetchval(
+                """
+                SELECT xmin::text
+                FROM agent_repository_direct_write_policy
+                WHERE github_repository_id = $1
+                """,
+                repository_id,
+            )
+
+        renamed = await store.get_direct_write_policy(
+            github_repository_id=repository_id,
+            repository_full_name="octocat/renamed-project",
+        )
+        async with pool.acquire() as conn:
+            renamed_xmin = await conn.fetchval(
+                """
+                SELECT xmin::text
+                FROM agent_repository_direct_write_policy
+                WHERE github_repository_id = $1
+                """,
+                repository_id,
+            )
+
+        assert first["repository_full_name"] == repository_name
+        assert repeated["repository_full_name"] == repository_name
+        assert repeated_xmin == initial_xmin
+        assert renamed["repository_full_name"] == "octocat/renamed-project"
+        assert renamed_xmin != repeated_xmin
+    finally:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM agent_repository_direct_write_policy WHERE github_repository_id = $1",
+                repository_id,
+            )
+
+
+@pytest.mark.parametrize("enabled_after_race", [False, True], ids=["disabled", "revision-bumped"])
+async def test_direct_write_token_registration_waits_for_the_exact_policy_row(
+    store: PostgresSourceControlRepository,
+    pool,
+    enabled_after_race: bool,
+) -> None:
+    """A concurrent disable or revision change wins before a stale token inserts."""
+    repository_id = uuid.uuid4().int & ((1 << 62) - 1)
+    repository_name = "octocat/racing-project"
+
+    try:
+        await store.get_direct_write_policy(
+            github_repository_id=repository_id,
+            repository_full_name=repository_name,
+        )
+        enabled = await store.set_direct_write_policy(
+            github_repository_id=repository_id,
+            repository_full_name=repository_name,
+            enabled=True,
+            expected_revision=0,
+            actor_id="github-user-42",
+            admin_ip="203.0.113.42",
+        )
+        assert enabled is not None and enabled["policy"]["revision"] == 1
+
+        async with pool.acquire() as policy_writer, policy_writer.transaction():
+            await policy_writer.fetchval(
+                """
+                    SELECT github_repository_id
+                    FROM agent_repository_direct_write_policy
+                    WHERE github_repository_id = $1
+                    FOR UPDATE
+                    """,
+                repository_id,
+            )
+            registering = asyncio.create_task(
+                store.register_direct_write_token(
+                    github_repository_id=repository_id,
+                    policy_revision=1,
+                    token_hash=f"sha256:race-{repository_id}",
+                    token_ciphertext="encrypted:race-token",
+                    expires_at=datetime.now(UTC) + timedelta(hours=1),
+                )
+            )
+            await _wait_for_lock_wait(pool, "INSERT INTO agent_repository_direct_write_tokens")
+            await policy_writer.execute(
+                """
+                    UPDATE agent_repository_direct_write_policy
+                    SET enabled = $2, revision = revision + 1
+                    WHERE github_repository_id = $1
+                    """,
+                repository_id,
+                enabled_after_race,
+            )
+
+        assert await registering is False
+        current = await store.get_direct_write_policy(
+            github_repository_id=repository_id,
+            repository_full_name=repository_name,
+        )
+        assert current["enabled"] is enabled_after_race
+        assert current["revision"] == 2
+        assert await store.list_direct_write_tokens(github_repository_id=repository_id) == []
+    finally:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM agent_repository_direct_write_policy WHERE github_repository_id = $1",
+                repository_id,
+            )
+            await conn.execute(
+                "DELETE FROM agent_admin_audit_log WHERE details->>'github_repository_id' = $1",
+                str(repository_id),
+            )
 
 
 # ── The GitHub account ────────────────────────────────────────────────
