@@ -18,6 +18,8 @@ from cloud_agent.owner_usage import CONTAINER_CURSOR_SCOPE, OwnerContainerCursor
 pytestmark = [pytest.mark.dbtest, pytest.mark.asyncio]
 
 DAY = datetime(2026, 9, 20, tzinfo=UTC)
+#: Far from either midnight: a sample taken then stands for time on DAY alone.
+NOON = DAY + timedelta(hours=12)
 GIB = 1024**3
 
 
@@ -104,8 +106,10 @@ def days(start, count):
 async def sampled_at(db, sample_id, at):
     """Record the sample ``sample_id`` as taken ``at``.
 
-    The database dates a sample by its own clock, which a test cannot move to a
-    midnight, so a trigger dates this one instead.
+    The database dates a sample by its own clock, which a test cannot move, so
+    the days a sample counts on would depend on when the test runs: one taken
+    just after midnight counts partly on the day before. A trigger dates this
+    one instead.
     """
     await execute(
         db,
@@ -352,29 +356,27 @@ async def test_each_new_sample_adds_the_time_since_the_previous_one(db, store):
     job = await seed(db, store, "asbx_resources")
     first = sample(sample_id="s1", sample_age_ms=0.0, cpu_cores=2.0, cpu_window_seconds=15.0)
     first["memory_bytes"] = GIB
-    await store.sandbox.reconcile_thread_sandbox_observation(
-        **observation(job), resource_usage=first
-    )
+    async with sampled_at(db, "s1", NOON):
+        await store.sandbox.reconcile_thread_sandbox_observation(
+            **observation(job), resource_usage=first
+        )
     [day] = await usage_days(db, "asbx_resources")
     assert day["user_id"] == job["user_id"]
+    assert day["day"] == DAY.date()
     # The first sample after a start stands for its own measurement window.
     assert day["measured_seconds"] == pytest.approx(15.0)
     assert day["cpu_core_seconds"] == pytest.approx(30.0)
     assert day["memory_byte_seconds"] == pytest.approx(15.0 * GIB)
 
     # The host reports again 30 seconds later.
-    await execute(
-        db,
-        "UPDATE agent_sandboxes SET resource_sampled_at = resource_sampled_at - interval '30 seconds'"
-        " WHERE id = 'asbx_resources'",
-    )
     second = {**first, "sample_id": "s2", "cpu_cores": 1.0}
-    await store.sandbox.reconcile_thread_sandbox_observation(
-        **observation(job), resource_usage=second
-    )
+    async with sampled_at(db, "s2", NOON + timedelta(seconds=30)):
+        await store.sandbox.reconcile_thread_sandbox_observation(
+            **observation(job), resource_usage=second
+        )
     [day] = await usage_days(db, "asbx_resources")
-    assert day["measured_seconds"] == pytest.approx(45.0, abs=1.0)
-    assert day["cpu_core_seconds"] == pytest.approx(60.0, abs=1.0)
+    assert day["measured_seconds"] == pytest.approx(45.0)
+    assert day["cpu_core_seconds"] == pytest.approx(60.0)
 
     # The same sample again, or one without CPU, adds nothing.
     await store.sandbox.reconcile_thread_sandbox_observation(
@@ -391,14 +393,18 @@ async def test_each_new_sample_adds_the_time_since_the_previous_one(db, store):
 async def test_a_sample_after_a_stop_does_not_count_the_time_stopped(db, store):
     job = await seed(db, store, "asbx_resources")
     reading = sample(sample_id="before", sample_age_ms=0.0, cpu_window_seconds=10.0)
-    await store.sandbox.reconcile_thread_sandbox_observation(
-        **observation(job), resource_usage=reading
-    )
+    async with sampled_at(db, "before", NOON):
+        await store.sandbox.reconcile_thread_sandbox_observation(
+            **observation(job), resource_usage=reading
+        )
     await store.sandbox.reconcile_thread_sandbox_observation(**observation(job, running=False))
-    await store.sandbox.reconcile_thread_sandbox_observation(
-        **observation(job), resource_usage={**reading, "sample_id": "after"}
-    )
+    # Had the stop kept the earlier sample, this one would count the 30 seconds since it.
+    async with sampled_at(db, "after", NOON + timedelta(seconds=30)):
+        await store.sandbox.reconcile_thread_sandbox_observation(
+            **observation(job), resource_usage={**reading, "sample_id": "after"}
+        )
     [day] = await usage_days(db, "asbx_resources")
+    assert day["day"] == DAY.date()
     assert day["measured_seconds"] == pytest.approx(20.0)
 
 
