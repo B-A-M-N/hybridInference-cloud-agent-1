@@ -743,6 +743,8 @@ async def test_shared_workspace_snapshot_publishes_without_rewriting_turn_state(
     assert await store.snapshot.complete_snapshot_base_import(
         snapshot_id=capture["snapshot_id"],
         commit_sha=commit_sha,
+        generation=pending_import["generation"],
+        container_id=pending_import["container_id"],
     )
     final_sandbox = await store.sandbox.thread_sandbox(thread_id=job["thread_id"])
     assert final_sandbox is not None
@@ -847,6 +849,8 @@ async def test_snapshot_publication_uses_latest_current_attempt_replies_from_inc
         assert await store.snapshot.complete_snapshot_base_import(
             snapshot_id=prior_capture["snapshot_id"],
             commit_sha="b" * 40,
+            generation=prior_publication["generation"],
+            container_id=prior_publication["container_id"],
         )
     child = await store.conversation_commands.create_follow_up(
         parent_job_id=parent["id"], user_id=parent["user_id"], prompt="also update the docs"

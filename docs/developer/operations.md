@@ -2356,6 +2356,11 @@ withdrawn, or the workspace cannot take the bundle) fails after an hour and
 leaves its group `dirty`; the owner's next request captures, and imports,
 again.
 
+An import completes only for the generation and container it was sent to. If
+the group's host is removed and another host restores the group while an
+import is still out, the old host's late answer changes nothing, and the
+import is sent again to the restored container.
+
 Disk-pressure admission and alerting and a non-mutating pre-prompt context
 fingerprint remain deferred. Local functional checks do not establish production
 Kata, live-provider, or operational acceptance.

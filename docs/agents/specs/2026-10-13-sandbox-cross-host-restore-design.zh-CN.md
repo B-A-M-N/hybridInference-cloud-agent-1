@@ -243,6 +243,7 @@
 - runner 拿到的组信息带上 `restore`：检查点 id、对象位置、版本、SHA-256、大小、基础镜像。reservation 保持 `restoring` 不变，也不清空 `restore_checkpoint_id`。
 - `restoring` 期间组内其他对话不能被领取，沿用现有的单活跃规则。
 - 工作区请求遇到 `cold`/`restoring` 的组，直接返回"正在迁移，发一条消息即可恢复"，**不转发给 Manager**。原因：转发前会注册组，`container_id` 为空时 Manager 会走"新建组"的路，建出一个空容器。
+- 快照发布后的基础提交导入（2026-10-16 修订）：组是 `cold`/`restoring` 时不下发。已经发出去的导入，只对它发出时的 `generation` 和容器生效：`complete_snapshot_base_import` 要求组当前的 `generation` 和 `container_id` 与导入请求里的一致。旧机器在恢复确认之后才回复的成功，不会把新容器记成已导入；导入随后重新发给恢复出的容器。这两个值本来就在导入请求里（`generation`、`expected_container_id`），协议不变。
 
 ### 6.5 Manager 恢复
 

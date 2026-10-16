@@ -1684,7 +1684,9 @@ async def test_the_import_retry_brings_back_a_base_git_pruned_with_the_one_befor
     async def failed(*, snapshot_id: int, detail: str, delay_s: float | None = None) -> None:
         outcomes.append(("failed", snapshot_id, detail))
 
-    async def completed(*, snapshot_id: int, commit_sha: str) -> bool:
+    async def completed(
+        *, snapshot_id: int, commit_sha: str, generation: int, container_id: str | None
+    ) -> bool:
         outcomes.append(("completed", snapshot_id, commit_sha))
         return True
 
@@ -1706,6 +1708,8 @@ async def test_the_import_retry_brings_back_a_base_git_pruned_with_the_one_befor
         # The second publication was cut from the first: what the retry used.
         "base_sha": first,
         "origin_base_sha": setup.base,
+        "generation": 1,
+        "container_id": "container-gc",
     }
 
     imported = await publish_worker._retry_base_import(

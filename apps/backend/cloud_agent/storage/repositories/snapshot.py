@@ -1464,8 +1464,22 @@ class PostgresSnapshotRepository:
         result["members"] = load_json(result.get("members")) or []
         return result
 
-    async def complete_snapshot_base_import(self, *, snapshot_id: int, commit_sha: str) -> bool:
-        """Acknowledge that the exact published commit resolves in Docker."""
+    async def complete_snapshot_base_import(
+        self,
+        *,
+        snapshot_id: int,
+        commit_sha: str,
+        generation: int,
+        container_id: str | None,
+    ) -> bool:
+        """Acknowledge that the exact published commit resolves in Docker.
+
+        Fenced to the generation and container the import was sent to, which
+        the import request named and its host checked. A restore moves a group
+        to a new generation and container while an import sent to the old one
+        may still be on its way back. Without the fence that late answer
+        marked the restored container imported, though its base never was.
+        """
         async with self._pool.acquire() as conn, conn.transaction():
             sandbox_id = await conn.fetchval(
                 """
@@ -1503,12 +1517,18 @@ class PostgresSnapshotRepository:
                   AND g.published_base_sha = $2
                   -- An import answered by a host that no longer holds the
                   -- group did not land in it; the restored container imports
-                  -- again. Marking the group running here would strand it.
+                  -- again. Marking the group running here would strand it,
+                  -- and once the restore is confirmed, mark the new container
+                  -- as holding a base it never received.
                   AND g.state NOT IN ('cold', 'restoring')
+                  AND g.generation = $3
+                  AND g.container_id IS NOT DISTINCT FROM $4
                 RETURNING g.id
                 """,
                 sandbox_id,
                 commit_sha,
+                generation,
+                container_id,
             )
             if updated is not None:
                 await conn.execute(

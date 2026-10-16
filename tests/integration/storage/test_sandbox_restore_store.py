@@ -503,7 +503,10 @@ async def test_a_cold_groups_base_import_waits_for_the_restore(pool, store: Stor
     # the group back to life there, where no host can ever claim it again.
     assert await store.snapshot.pending_snapshot_base_import() is None
     assert not await store.snapshot.complete_snapshot_base_import(
-        snapshot_id=capture["snapshot_id"], commit_sha=commit_sha
+        snapshot_id=capture["snapshot_id"],
+        commit_sha=commit_sha,
+        generation=capture["generation"],
+        container_id=capture["container_id"],
     )
     assert (await _state(pool))["state"] == "cold"
 
@@ -523,6 +526,117 @@ async def test_a_cold_groups_base_import_waits_for_the_restore(pool, store: Stor
     pending = await store.snapshot.pending_snapshot_base_import()
     assert pending is not None
     assert pending["generation"] == 2 and pending["container_id"] == "container-c"
+
+
+async def test_an_import_answered_by_the_old_host_after_the_restore_changes_nothing(
+    pool, store: Storage, monkeypatch: pytest.MonkeyPatch
+):
+    """The import was sent before the move and comes back after the restore was confirmed."""
+    from cloud_agent import publish_worker, sandbox_manager_routing
+
+    job, _ = await _settled_stopped_group(pool, store)
+    requested = await store.snapshot.request_snapshot_publication(
+        thread_id=job["thread_id"], user_id=job["user_id"]
+    )
+    assert requested.get("requested") is True, requested
+    capture = await store.snapshot.claim_due_sandbox_snapshot()
+    assert capture is not None
+    patch = "diff --git a/answer.txt b/answer.txt\nnew file mode 100644\n"
+    assert (
+        await store.snapshot.record_sandbox_snapshot_capture(
+            snapshot_id=capture["snapshot_id"],
+            sandbox_id=capture["sandbox_id"],
+            sandbox_generation=capture["generation"],
+            container_id=capture["container_id"],
+            workspace_epoch=capture["workspace_epoch"],
+            base_sha=capture["base_sha"],
+            patch=patch,
+            content_sha256=hashlib.sha256(patch.encode()).hexdigest(),
+        )
+        == "captured"
+    )
+    publication = await store.snapshot.claim_for_publish()
+    assert publication is not None
+    commit_sha = "b" * 40
+    assert await store.snapshot.record_snapshot_publish(
+        snapshot_id=capture["snapshot_id"],
+        expected_publish_attempt_count=publication["publish_attempt_count"],
+        pr_url="https://example.test/pull/1",
+        commit_sha=commit_sha,
+    )
+    # The publisher sends the base import to runner-a, which holds the group.
+    sent = await store.snapshot.pending_snapshot_base_import()
+    assert sent is not None
+    assert (sent["generation"], sent["container_id"]) == (1, "container-a")
+
+    # Before runner-a answers, the chat goes on, runner-a is removed, and
+    # runner-c restores the group from the checkpoint of its last stop.
+    latest = await _run_turn_and_stop(pool, store, job)
+    group = await store.sandbox.thread_sandbox(thread_id=job["thread_id"])
+    assert group is not None
+    assert await store.sandbox.record_sandbox_checkpoint(
+        host="runner-a",
+        thread_id=job["thread_id"],
+        checkpoint=_receipt(
+            group,
+            job,
+            members=[
+                {
+                    "thread_id": job["thread_id"],
+                    "native_session_id": "native-restore",
+                    "last_settled_job_id": latest["id"],
+                    "context_status": "live",
+                }
+            ],
+        ),
+    )
+    assert await store.host_pool.remove_host(host="runner-a") == "ok"
+    await _host(store, "runner-c", _RESTORE_HOST)
+    follow_up = await store.conversation_commands.create_follow_up(
+        parent_job_id=latest["id"], user_id="user-1", prompt="continue"
+    )
+    assert follow_up is not None
+    claim = await _claim(store, "runner-c", _RESTORE_HOST)
+    assert claim is not None and claim["id"] == follow_up["id"]
+    reserved = await _reserve(store, follow_up, claim, "runner-c")
+    assert await store.sandbox.mark_thread_sandbox_running(
+        **_fence(follow_up, claim, reserved),
+        container_id="container-c",
+        context_status="restored",
+    )
+
+    # Now runner-a answers: the commit landed in its old container.
+    class _OldHost:
+        async def import_shared_base(self, row, *, commit_sha: str, bundle: bytes):
+            assert (row["generation"], row["container_id"]) == (1, "container-a")
+            return {"ok": True}
+
+    async def route(_store, job_id: str):
+        assert job_id == sent["anchor_job_id"]
+        return _OldHost()
+
+    monkeypatch.setattr(sandbox_manager_routing, "sandbox_manager_for_job", route)
+
+    assert not await publish_worker._import_snapshot_base(
+        store, snapshot=sent, commit_sha=commit_sha, bundle=b"bundle"
+    )
+
+    # The restored container still lacks the base, and it is what the import
+    # is sent to next.
+    async with pool.acquire() as conn:
+        importing = await conn.fetchval(
+            "SELECT snapshot_state FROM agent_sandboxes WHERE id = $1", "asbx_restore"
+        )
+    assert importing == "importing"
+    pending = await store.snapshot.pending_snapshot_base_import()
+    assert pending is not None
+    assert (pending["generation"], pending["container_id"]) == (2, "container-c")
+    assert await store.snapshot.complete_snapshot_base_import(
+        snapshot_id=pending["snapshot_id"],
+        commit_sha=commit_sha,
+        generation=pending["generation"],
+        container_id=pending["container_id"],
+    )
 
 
 async def test_a_stale_host_cannot_touch_a_rehomed_group(pool, store: Storage):
