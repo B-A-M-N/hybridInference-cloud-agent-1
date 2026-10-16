@@ -16,7 +16,7 @@ from uuid import uuid4
 from cloud_agent.capacity_protocol import FRESH_AFTER_SECONDS
 from cloud_agent.domain.execution import TERMINAL_STATES
 from cloud_agent.logging_utils import get_logger
-from cloud_agent.owner_usage import measured_interval
+from cloud_agent.owner_usage import measured_interval, utc_day_shares
 from cloud_agent.storage._sql.compute_admission import lock_compute_entry
 from cloud_agent.storage._sql.jobs import fail_unrunnable_follow_ups
 from cloud_agent.storage._sql.rows import load_json, sandbox_row_to_dict
@@ -2724,28 +2724,33 @@ class PostgresSandboxRepository:
         if seconds <= 0:
             return
         # The owner's history is optional too: losing one day's addition must
-        # not lose the sample the admin inventory shows.
+        # not lose the sample the admin inventory shows. The time a sample
+        # stands for can begin before midnight, so each UTC day it covers gets
+        # its own share, earliest day first.
         try:
             async with conn.transaction():
-                await conn.execute(
-                    """
-                    INSERT INTO agent_sandbox_usage_days AS d (
-                        sandbox_id, user_id, day,
-                        measured_seconds, cpu_core_seconds, memory_byte_seconds
+                for day, share in utc_day_shares(
+                    ended_at=accepted["resource_sampled_at"], seconds=seconds
+                ):
+                    await conn.execute(
+                        """
+                        INSERT INTO agent_sandbox_usage_days AS d (
+                            sandbox_id, user_id, day,
+                            measured_seconds, cpu_core_seconds, memory_byte_seconds
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6)
+                        ON CONFLICT (sandbox_id, day) DO UPDATE SET
+                            measured_seconds = d.measured_seconds + EXCLUDED.measured_seconds,
+                            cpu_core_seconds = d.cpu_core_seconds + EXCLUDED.cpu_core_seconds,
+                            memory_byte_seconds = d.memory_byte_seconds + EXCLUDED.memory_byte_seconds,
+                            updated_at = NOW()
+                        """,
+                        sandbox_id,
+                        accepted["user_id"],
+                        day,
+                        share,
+                        sample.cpu_cores * share,
+                        float(sample.memory_bytes) * share,
                     )
-                    VALUES ($1, $2, ($3::timestamptz AT TIME ZONE 'UTC')::date, $4, $5, $6)
-                    ON CONFLICT (sandbox_id, day) DO UPDATE SET
-                        measured_seconds = d.measured_seconds + EXCLUDED.measured_seconds,
-                        cpu_core_seconds = d.cpu_core_seconds + EXCLUDED.cpu_core_seconds,
-                        memory_byte_seconds = d.memory_byte_seconds + EXCLUDED.memory_byte_seconds,
-                        updated_at = NOW()
-                    """,
-                    sandbox_id,
-                    accepted["user_id"],
-                    accepted["resource_sampled_at"],
-                    seconds,
-                    sample.cpu_cores * seconds,
-                    float(sample.memory_bytes) * seconds,
-                )
         except Exception:
             logger.warning("sandbox_usage_day_unavailable", exc_info=True)

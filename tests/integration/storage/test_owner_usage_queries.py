@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from datetime import UTC, datetime, timedelta
 
@@ -97,6 +98,35 @@ async def usage_days(db, sandbox_id):
 
 def days(start, count):
     return [(start + timedelta(days=n), start + timedelta(days=n + 1)) for n in range(count)]
+
+
+@contextlib.asynccontextmanager
+async def sampled_at(db, sample_id, at):
+    """Record the sample ``sample_id`` as taken ``at``.
+
+    The database dates a sample by its own clock, which a test cannot move to a
+    midnight, so a trigger dates this one instead.
+    """
+    await execute(
+        db,
+        f"""
+        CREATE FUNCTION test_sampled_at() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            NEW.resource_sampled_at := '{at.isoformat()}'::timestamptz;
+            RETURN NEW;
+        END $$;
+        CREATE TRIGGER test_sampled_at BEFORE UPDATE OF resource_snapshot ON agent_sandboxes
+            FOR EACH ROW WHEN (NEW.resource_snapshot->>'sample_id' = '{sample_id}')
+            EXECUTE FUNCTION test_sampled_at();
+        """,
+    )
+    try:
+        yield
+    finally:
+        await execute(
+            db,
+            "DROP TRIGGER test_sampled_at ON agent_sandboxes; DROP FUNCTION test_sampled_at();",
+        )
 
 
 async def test_an_owner_sees_only_containers_behind_chats_they_can_reach(db, store):
@@ -370,3 +400,36 @@ async def test_a_sample_after_a_stop_does_not_count_the_time_stopped(db, store):
     )
     [day] = await usage_days(db, "asbx_resources")
     assert day["measured_seconds"] == pytest.approx(20.0)
+
+
+async def test_a_sample_across_utc_midnight_counts_on_both_days(db, store):
+    """The time a sample stands for is split at UTC midnight.
+
+    It all went to the day the sample was taken on, so up to 120 seconds a
+    container used before midnight counted on the next day.
+    """
+    job = await seed(db, store, "asbx_resources")
+    # Two samples thirty seconds apart, twenty of them before midnight.
+    before = {**sample(sample_id="before", cpu_cores=2.0), "memory_bytes": GIB}
+    await execute(
+        db,
+        "UPDATE agent_sandboxes SET resource_snapshot = $2::jsonb, resource_sampled_at = $3,"
+        " resource_received_at = $3 WHERE id = $1",
+        "asbx_resources",
+        json.dumps(before),
+        DAY - timedelta(seconds=20),
+    )
+    async with sampled_at(db, "after", DAY + timedelta(seconds=10)):
+        await store.sandbox.reconcile_thread_sandbox_observation(
+            **observation(job), resource_usage={**before, "sample_id": "after"}
+        )
+
+    rows = await usage_days(db, "asbx_resources")
+    assert [row["day"] for row in rows] == [(DAY - timedelta(days=1)).date(), DAY.date()]
+    assert [row["measured_seconds"] for row in rows] == pytest.approx([20.0, 10.0])
+    assert [row["cpu_core_seconds"] for row in rows] == pytest.approx([40.0, 20.0])
+    assert [row["memory_byte_seconds"] for row in rows] == pytest.approx([20.0 * GIB, 10.0 * GIB])
+    history = await store.owner_usage.resource_history(
+        job["user_id"], buckets=days(DAY - timedelta(days=1), 2)
+    )
+    assert [day.measured_seconds for day in history.days] == pytest.approx([20.0, 10.0])

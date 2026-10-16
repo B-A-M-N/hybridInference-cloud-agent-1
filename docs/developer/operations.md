@@ -807,9 +807,10 @@ history back to `0046_admin_sandbox_trajectory`. CPU and memory history starts
 with migration `0077_sandbox_usage_days`: each accepted sample adds the time
 since the previous accepted sample of the same running container (at most
 120 seconds; after a start or a longer gap, only the sample's own CPU window),
-and its CPU cores and memory bytes over that time, to the container's row for
-the sample's UTC day. The page states how much of the running time the
-measurements cover. Disk usage is not measured.
+and its CPU cores and memory bytes over that time, to the container's rows for
+the UTC days that time falls on: time that spans 00:00 UTC is split there, so
+the part before midnight counts on the day before. The page states how much of
+the running time the measurements cover. Disk usage is not measured.
 
 Days are UTC days on purpose: the Gateway's daily limit resets at 00:00 UTC,
 so the page's "today" and the limit's "today" agree. The page says so and
