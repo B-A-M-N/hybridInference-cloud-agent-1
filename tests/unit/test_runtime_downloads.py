@@ -794,6 +794,36 @@ def test_a_failed_cleanup_never_stops_the_worker(docker, monkeypatch, caplog):
     assert "runtime download cleanup failed" in caplog.text
 
 
+def test_a_version_a_chat_still_runs_goes_once_that_chat_is_deleted(docker, monkeypatch):
+    """No answer comes when a chat is deleted, and the host may have nothing to download.
+
+    Every update was rolled back to the image default, so the answers name
+    nothing, and the one chat still on a downloaded version is deleted later.
+    The worker has to look again by itself.
+    """
+    monkeypatch.setattr(runtime_downloads, "UNNEEDED_GRACE_S", 0.0, raising=False)
+    monkeypatch.setattr(runtime_downloads, "_POLL_S", 0.01)
+    withdrawn = _held(docker, "2.1.200")
+    chat = _chat(docker, "2.1.200")
+    downloads = _downloads()
+    downloads.apply([])
+
+    def passes() -> int:
+        return sum(1 for call in docker.calls if call[:2] == ["container", "prune"])
+
+    downloads.start()
+    try:
+        # It has looked twice, and kept the version the chat runs both times.
+        _wait_for(lambda: passes() >= 2)
+        assert withdrawn in docker.images
+        docker.removed.add(chat)
+        _wait_for(lambda: withdrawn not in docker.images)
+    finally:
+        downloads.stop()
+
+    assert _held_versions() == []
+
+
 # ── naming the images ─────────────────────────────────────────────────────
 
 

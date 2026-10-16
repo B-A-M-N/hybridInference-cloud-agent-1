@@ -94,6 +94,8 @@ _DOCKER_TIMEOUT_S = 120.0
 #: snapshot can make a while. The version a switch has just replaced can be
 #: the one such a chat was given.
 UNNEEDED_GRACE_S = 600.0
+#: How long the worker waits for an answer to wake it before it looks again.
+_POLL_S = 60.0
 #: How old a chat's copy source must be before it counts as left behind, as
 #: Docker's ``until`` filter reads it (on the daemon's own clock). A copy
 #: streams for at most a few minutes (``runtime_install``).
@@ -181,7 +183,8 @@ class RuntimeDownloads:
         #: while it is ``None``.
         self._named: frozenset[_Key] | None = None
         #: Whether a cleanup is owed though there is nothing to download: the
-        #: list changed, or a version is still waiting out its grace period.
+        #: list changed, a version is still waiting out its grace period, or a
+        #: chat still runs a version no answer names.
         self._cleanup_due = False
         #: When each held version was first seen unneeded; worker thread only.
         self._unneeded_since: dict[_Key, float] = {}
@@ -324,7 +327,7 @@ class RuntimeDownloads:
             if idle:
                 # Nothing to hold or remove: no reason to ask Docker anything
                 # until an answer changes the list, which wakes this thread.
-                self._wake.wait(60.0)
+                self._wake.wait(_POLL_S)
                 continue
             try:
                 base_id = image_id(self._docker, self._image)
@@ -349,7 +352,7 @@ class RuntimeDownloads:
                 )
             # Nothing left to download.
             self._clean_up()
-            self._wake.wait(60.0)
+            self._wake.wait(_POLL_S)
 
     def _download(self, job: _Job) -> None:
         target = job.target
@@ -661,6 +664,10 @@ class RuntimeDownloads:
         for image in held:
             key = (image.runtime, image.version)
             if key not in unneeded:
+                # A chat still runs it. Nothing tells this worker when that
+                # chat is deleted, so the check stays owed: a host with
+                # nothing to download would otherwise never look again.
+                waiting = True
                 continue
             if now - self._unneeded_since[key] < UNNEEDED_GRACE_S:
                 waiting = True
