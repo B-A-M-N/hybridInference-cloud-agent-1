@@ -50,6 +50,7 @@ from cloud_agent.storage._sql.hosts import (
     HOST_RETAINED_GROUP,
     LIVE_GROUP_STATES,
     QUALIFIED_HOST_COLUMNS,
+    RemovalRaced,
     release_late_covered_sandboxes,
     revoke_host_credentials,
 )
@@ -246,10 +247,6 @@ _REMOVAL_HEARTBEAT_STALE_S = HEARTBEAT_INTERVAL_S * MISSED_HEARTBEATS_BEFORE_OFF
 _REMOVAL_START_REPORT_S = _REMOVAL_HEARTBEAT_STALE_S
 
 
-class _RemovalRaced(Exception):
-    """A group may have started while a removal was being decided."""
-
-
 async def _groups_left_by_removal(conn: Any, host: str) -> tuple[list[str], str | None]:
     """The host's live groups, and why a removal need not wait for them.
 
@@ -336,13 +333,13 @@ async def _revoke_unless_raced(conn: Any, host: str, left: list[str]) -> None:
     row, would invert the documented order for. A workspace request that
     fenced a stopped group after that read instead shows up in a second one,
     made after the revocation: a group live now that was not before raises
-    :class:`_RemovalRaced`, which rolls the revocation back, and the removal
+    :class:`RemovalRaced`, which rolls the revocation back, and the removal
     waits for that group like any other.
     """
     await revoke_host_credentials(conn, [host])
     live, _ = await _groups_left_by_removal(conn, host)
     if set(live) - set(left):
-        raise _RemovalRaced
+        raise RemovalRaced
 
 
 def _log_groups_left_by_removal(host: str, sandbox_ids: list[str], reason: str | None) -> None:
@@ -1019,13 +1016,13 @@ class PostgresHostPoolRepository:
         """
         try:
             return await self._remove_host_once(host=host, force=force)
-        except _RemovalRaced:
+        except RemovalRaced:
             # A group may have started as the removal was decided. Asked
             # again, the removal finds it live and waits for it.
             return await self._remove_host_once(host=host, force=force)
 
     async def _remove_host_once(self, *, host: str, force: bool) -> str:
-        """One try of :meth:`remove_host`; raises :class:`_RemovalRaced`."""
+        """One try of :meth:`remove_host`; raises :class:`RemovalRaced`."""
         async with self._pool.acquire() as conn, conn.transaction():
             # The host's running attempts before its row: the order every
             # writer that ends an attempt keeps (move the attempt, then give
@@ -1116,7 +1113,7 @@ class PostgresHostPoolRepository:
                         if left and reason is None:
                             continue
                         await _revoke_unless_raced(conn, host, left)
-                except _RemovalRaced:
+                except RemovalRaced:
                     # The next pass waits for the group that started.
                     continue
                 if left:

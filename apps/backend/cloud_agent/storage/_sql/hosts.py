@@ -147,6 +147,14 @@ HOST_REMOVAL_REQUESTED = """EXISTS (
 )"""
 
 
+class RemovalRaced(Exception):
+    """A sandbox group may have started while a host's removal was being decided.
+
+    Raised inside the removal's transaction to roll its revocation back; the
+    removal then waits for that group like any other.
+    """
+
+
 def host_claim_ceiling(slots_total: int | None, slots_desired: int | None) -> int | None:
     """The concurrency a host may be asked for: the lower of its two numbers.
 
