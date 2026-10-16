@@ -195,7 +195,13 @@ async def revoke_host_credentials(conn: Any, hosts: list[str]) -> None:
     await release_covered_sandboxes(conn, hosts)
 
 
-async def release_covered_sandboxes(conn: Any, hosts: list[str]) -> list[str]:
+async def release_covered_sandboxes(
+    conn: Any,
+    hosts: list[str],
+    *,
+    sandbox_ids: list[str] | None = None,
+    live_host: bool = False,
+) -> list[str]:
     """Hand every stopped group a checkpoint covers to whichever host claims it.
 
     The machine is leaving the pool, and with it the only Docker copy of its
@@ -205,6 +211,16 @@ async def release_covered_sandboxes(conn: Any, hosts: list[str]) -> list[str]:
     turn -- becomes ``cold``: the next turn of any of its chats is claimed by
     a restore-capable host and recreated there. Everything else stays bound to
     this host, as before, and continues only if the same host returns.
+
+    ``sandbox_ids`` limits the hand-over to those groups, as a Host moving out
+    does once each checkpoint arrives.
+
+    ``live_host`` is for a Host that still runs, as one moving out does. It
+    may have claimed a chat's next turn before its hold began, and that turn
+    reserves the group only after the claim; such a group is not handed over.
+    Callers lock the candidate groups first, so this statement's snapshot sees
+    every claim that a group's row lock waited for. A revoked Host's claimed
+    turns are requeued instead, and their groups move as before.
     """
     rows = await conn.fetch(
         f"""
@@ -213,6 +229,7 @@ async def release_covered_sandboxes(conn: Any, hosts: list[str]) -> list[str]:
             idle_deadline = NULL, updated_at = NOW()
         FROM agent_sandbox_checkpoints c
         WHERE g.host = ANY($1::text[])
+          AND ($2::text[] IS NULL OR g.id = ANY($2::text[]))
           AND g.state = 'stopped'
           AND g.deletion_state = 'none'
           AND g.stop_requested_at IS NULL
@@ -222,6 +239,14 @@ async def release_covered_sandboxes(conn: Any, hosts: list[str]) -> list[str]:
           AND c.start_seq = g.start_seq
           AND c.base_image = g.sandbox_image_digest
           AND c.base_image ~ '{PULLABLE_IMAGE_PATTERN}'
+          AND (
+              NOT $3::boolean
+              OR NOT EXISTS (
+                  SELECT 1 FROM agent_thread_sandbox_memberships claimed
+                  JOIN agent_jobs j ON j.thread_id = claimed.thread_id
+                  WHERE claimed.sandbox_id = g.id AND j.state = 'running'
+              )
+          )
           AND NOT EXISTS (
               SELECT 1 FROM agent_thread_sandbox_memberships m
               WHERE m.sandbox_id = g.id
@@ -243,5 +268,26 @@ async def release_covered_sandboxes(conn: Any, hosts: list[str]) -> list[str]:
         RETURNING g.id
         """,
         hosts,
+        sandbox_ids,
+        live_host,
     )
     return [str(row["id"]) for row in rows]
+
+
+# A Host in its move-out window: no claims, and each group stopped and handed
+# to another Host through its checkpoint. ``{host}`` names the Host column.
+MOVING_OUT_HOST_SQL = """EXISTS (
+    SELECT 1 FROM agent_host_admission_holds move_out
+    WHERE move_out.host = {host} AND move_out.purpose = 'move_out'
+)"""
+
+
+async def moving_out_hosts(conn: Any) -> list[str]:
+    """Every enrolled Host now moving its groups out."""
+    rows = await conn.fetch(
+        "SELECT h.host FROM agent_runner_hosts h "
+        "WHERE h.credential_hash IS NOT NULL AND "
+        + MOVING_OUT_HOST_SQL.format(host="h.host")
+        + " ORDER BY h.host"
+    )
+    return [str(row["host"]) for row in rows]
