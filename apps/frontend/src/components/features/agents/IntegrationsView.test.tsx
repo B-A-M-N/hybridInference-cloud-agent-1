@@ -40,8 +40,6 @@ vi.mock('@/lib/api/userProfile', () => ({ getUserProfile: vi.fn(), saveUserProfi
 vi.mock('@/lib/api/agents', () => ({
   getAgentConfig: vi.fn(),
   getAgentIntegrations: vi.fn(),
-  getRepositoryDirectWritePolicy: vi.fn(),
-  updateRepositoryDirectWritePolicy: vi.fn(),
   disconnectAgentIntegration: vi.fn(),
   disconnectGitHubAccount: vi.fn(),
 }));
@@ -84,11 +82,8 @@ import {
   disconnectGitHubAccount,
   getAgentConfig,
   getAgentIntegrations,
-  getRepositoryDirectWritePolicy,
-  updateRepositoryDirectWritePolicy,
 } from '@/lib/api/agents';
 import { listMcpConnections } from '@/lib/api/mcp';
-import { APIError } from '@/lib/utils/errors';
 
 const mockedGetIntegrations = getAgentIntegrations as unknown as ReturnType<typeof vi.fn>;
 const mockedDisconnect = disconnectAgentIntegration as unknown as ReturnType<typeof vi.fn>;
@@ -229,88 +224,6 @@ describe('IntegrationsView', () => {
     expect(getMemories).not.toHaveBeenCalled();
     expect(listSkills).not.toHaveBeenCalled();
     expect(listMcpConnections).not.toHaveBeenCalled();
-  });
-
-  it('loads and changes direct-write policy through the backend API', async () => {
-    mockedGetIntegrations.mockResolvedValue(integrations);
-    vi.mocked(getRepositoryDirectWritePolicy).mockResolvedValue({
-      github_repository_id: 17,
-      repository: 'HarvardMadSys/one',
-      enabled: false,
-      revision: 0,
-      updated_by: null,
-      updated_at: null,
-      revocation_pending: 0,
-    });
-    vi.mocked(updateRepositoryDirectWritePolicy).mockResolvedValue({
-      github_repository_id: 17,
-      repository: 'HarvardMadSys/one',
-      enabled: true,
-      revision: 1,
-      updated_by: 'settings-owner',
-      updated_at: null,
-      revocation_pending: 0,
-    });
-
-    render(<IntegrationsView />);
-
-    fireEvent.change(
-      await screen.findByRole('combobox', { name: 'Repository for direct write settings' }),
-      { target: { value: 'HarvardMadSys/one' } },
-    );
-    fireEvent.click(await screen.findByRole('button', { name: 'Enable direct writes' }));
-
-    await waitFor(() =>
-      expect(updateRepositoryDirectWritePolicy).toHaveBeenCalledWith('HarvardMadSys/one', true, 0),
-    );
-    expect(
-      await screen.findByText('Direct writes enabled for HarvardMadSys/one.'),
-    ).toBeInTheDocument();
-  });
-
-  it('reloads a conflicting policy and waits for a new user decision', async () => {
-    mockedGetIntegrations.mockResolvedValue(integrations);
-    vi.mocked(getRepositoryDirectWritePolicy)
-      .mockResolvedValueOnce({
-        github_repository_id: 17,
-        repository: 'HarvardMadSys/one',
-        enabled: false,
-        revision: 0,
-        updated_by: null,
-        updated_at: null,
-        revocation_pending: 0,
-      })
-      .mockResolvedValueOnce({
-        github_repository_id: 17,
-        repository: 'HarvardMadSys/one',
-        enabled: true,
-        revision: 1,
-        updated_by: 'another-admin',
-        updated_at: null,
-        revocation_pending: 0,
-      });
-    vi.mocked(updateRepositoryDirectWritePolicy).mockRejectedValue(
-      new APIError('policy_revision_conflict', 'Stale policy revision.', 409),
-    );
-
-    render(<IntegrationsView />);
-
-    fireEvent.change(
-      await screen.findByRole('combobox', { name: 'Repository for direct write settings' }),
-      { target: { value: 'HarvardMadSys/one' } },
-    );
-    fireEvent.click(await screen.findByRole('button', { name: 'Enable direct writes' }));
-
-    expect(
-      await screen.findByRole('button', { name: 'Disable direct writes' }),
-    ).toBeInTheDocument();
-    expect(
-      await screen.findByText(
-        'Policy changed in another session. Current settings were reloaded; review them before making a new change.',
-      ),
-    ).toBeInTheDocument();
-    expect(getRepositoryDirectWritePolicy).toHaveBeenCalledTimes(2);
-    expect(updateRepositoryDirectWritePolicy).toHaveBeenCalledTimes(1);
   });
   it('keeps profile and notifications in My Settings', async () => {
     render(<MySettingsView />);

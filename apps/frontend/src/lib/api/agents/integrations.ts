@@ -73,44 +73,6 @@ export interface AgentIntegrationsApi {
   providers: AgentIntegrationProviderApi[];
 }
 
-export interface RepositoryDirectWritePolicyApi {
-  github_repository_id: number;
-  repository: string;
-  enabled: boolean;
-  revision: number;
-  updated_by: string | null;
-  updated_at: string | null;
-  revocation_pending: number;
-}
-
-function directWritePolicyPath(repo: string): string {
-  const [owner, name, ...extra] = repo.split('/');
-  if (!owner || !name || extra.length) throw new Error('Use owner/repository.');
-  return `/v1/agent/repositories/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/direct-write`;
-}
-
-/** Read the admin-verified direct-write policy for one repository. */
-export async function getRepositoryDirectWritePolicy(
-  repo: string,
-): Promise<RepositoryDirectWritePolicyApi> {
-  const resp = await fetchWithAuth(API_BASE, directWritePolicyPath(repo));
-  return jsonOrThrow(resp);
-}
-
-/** Change policy against the revision last read by this settings view. */
-export async function updateRepositoryDirectWritePolicy(
-  repo: string,
-  enabled: boolean,
-  expectedRevision: number,
-): Promise<RepositoryDirectWritePolicyApi> {
-  const resp = await fetchWithAuth(API_BASE, directWritePolicyPath(repo), {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ enabled, expected_revision: expectedRevision }),
-  });
-  return jsonOrThrow(resp);
-}
-
 export async function getAgentIntegrations(): Promise<AgentIntegrationsApi> {
   const resp = await fetchWithAuth(API_BASE, '/v1/agent/integrations');
   return jsonOrThrow(resp);

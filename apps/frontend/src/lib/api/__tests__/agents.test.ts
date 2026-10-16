@@ -18,7 +18,6 @@ import {
   forkAgentJob,
   getAgentGoal,
   getAgentIntegrations,
-  getRepositoryDirectWritePolicy,
   getAgentJob,
   getAgentAttemptTelemetry,
   getAgentJobFiles,
@@ -39,7 +38,6 @@ import {
   setAgentGoal,
   streamAgentTerminal,
   streamAgentJob,
-  updateRepositoryDirectWritePolicy,
   unpinAgentJob,
   writeAgentTerminalInput,
   writeAgentJobFile,
@@ -462,54 +460,6 @@ describe('agents api', () => {
 
     expect(result.providers[0].provider).toBe('github');
     expect(fetchWithAuth).toHaveBeenCalledWith(expect.any(String), '/v1/agent/integrations');
-  });
-
-  it('reads the backend direct-write policy using repository path segments', async () => {
-    fetchWithAuth.mockResolvedValue(
-      jsonResponse({
-        github_repository_id: 17,
-        repository: 'org/repo',
-        enabled: false,
-        revision: 0,
-      }),
-    );
-
-    const policy = await getRepositoryDirectWritePolicy('org/repo');
-
-    expect(policy.enabled).toBe(false);
-    expect(fetchWithAuth).toHaveBeenCalledWith(
-      expect.any(String),
-      '/v1/agent/repositories/org/repo/direct-write',
-    );
-  });
-
-  it('updates direct-write policy with the backend revision', async () => {
-    fetchWithAuth.mockResolvedValue(
-      jsonResponse({
-        github_repository_id: 17,
-        repository: 'org/repo',
-        enabled: true,
-        revision: 1,
-      }),
-    );
-
-    await updateRepositoryDirectWritePolicy('org/repo', true, 0);
-
-    expect(fetchWithAuth).toHaveBeenCalledWith(
-      expect.any(String),
-      '/v1/agent/repositories/org/repo/direct-write',
-      expect.objectContaining({
-        method: 'PUT',
-        body: JSON.stringify({ enabled: true, expected_revision: 0 }),
-      }),
-    );
-  });
-
-  it('rejects malformed direct-write repository names before making a request', async () => {
-    await expect(getRepositoryDirectWritePolicy('org/repo/extra')).rejects.toThrow(
-      'Use owner/repository.',
-    );
-    expect(fetchWithAuth).not.toHaveBeenCalled();
   });
 
   it.each([

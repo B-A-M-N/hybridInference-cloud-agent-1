@@ -640,7 +640,7 @@ class GitHubAppCredentials:
         repositories: list[dict[str, Any]] = []
         page = 1
         async with self._http() as client:
-            while page <= 11:
+            while page <= 10:
                 response = await client.get(
                     f"{self._config.api_base}/user/installations/{installation_id}/repositories",
                     params={"per_page": 100, "page": page},
@@ -653,29 +653,14 @@ class GitHubAppCredentials:
                 if response.status_code == 401:
                     raise UserAuthorizationRevoked("GitHub refused the user's token")
                 if response.status_code in (403, 404):
-                    retry_after_s = rate_limit_wait(response)
-                    if retry_after_s is not None:
-                        raise GitHubAppError(
-                            f"could not list the user's repositories in installation "
-                            f"{installation_id} ({response.status_code})",
-                            status=response.status_code,
-                            retry_after_s=retry_after_s,
-                        )
                     return []
                 if response.status_code >= 400:
                     raise GitHubAppError(
                         f"could not list the user's repositories in installation "
                         f"{installation_id} ({response.status_code})",
                         status=response.status_code,
-                        retry_after_s=rate_limit_wait(response),
                     )
                 entries = response.json().get("repositories", [])
-                if page > 10:
-                    if entries:
-                        raise GitHubAppError(
-                            "could not verify repository access beyond 1000 repositories"
-                        )
-                    break
                 repositories.extend(
                     {
                         "id": entry.get("id"),

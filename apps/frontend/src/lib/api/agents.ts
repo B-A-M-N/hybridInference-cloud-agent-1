@@ -15,7 +15,6 @@ export type {
   AgentIntegrationRepositoryApi,
   AgentIntegrationProviderApi,
   AgentIntegrationsApi,
-  RepositoryDirectWritePolicyApi,
   GitHubConnectionApi,
   RepoBranchesApi,
 } from './agents/integrations';
@@ -28,8 +27,6 @@ export {
   disconnectGitHubAccount,
   disconnectAgentIntegration,
   listRepoBranches,
-  getRepositoryDirectWritePolicy,
-  updateRepositoryDirectWritePolicy,
 } from './agents/integrations';
 
 export type {
