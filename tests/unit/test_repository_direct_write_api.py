@@ -31,8 +31,15 @@ class _GitHub:
         "test-user-token-key", domain=b"hybridinference/direct-write-token/v1"
     )
 
-    def __init__(self, *, admin: bool = True, revoke_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        admin: bool = True,
+        revoke_error: Exception | None = None,
+        repository_error: Exception | None = None,
+    ) -> None:
         self.admin = admin
+        self.repository_error = repository_error
         self.revoke_installation_token = AsyncMock(side_effect=revoke_error)
 
     async def installation_id_for(self, repo: str) -> int:
@@ -44,6 +51,8 @@ class _GitHub:
     ) -> list[dict[str, Any]]:
         assert user_token == "verified-user-token"
         assert installation_id == _INSTALLATION_ID
+        if self.repository_error is not None:
+            raise self.repository_error
         return [
             {
                 "id": _REPOSITORY_ID,
@@ -146,6 +155,25 @@ async def test_connected_app_installation_is_not_enough_to_enable_policy() -> No
     assert response.status_code == 403
     assert response.json()["detail"]["error"]["type"] == "repository_not_connected"
     repository.set_direct_write_policy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_github_rate_limit_is_reported_as_unavailable_not_repository_denial() -> None:
+    from cloud_agent.github_app import GitHubAppError
+
+    repository = _repository()
+    github = _GitHub(
+        repository_error=GitHubAppError("GitHub rate limit", status=403, retry_after_s=30)
+    )
+    _app, client = _make_client(repository, github)
+    try:
+        response = await client.get("/v1/agent/repositories/example/project/direct-write")
+    finally:
+        await client.aclose()
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["error"]["type"] == "github_unavailable"
+    repository.get_direct_write_policy.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -341,6 +341,75 @@ async def test_linked_user_repository_permissions_are_preserved(config):
     assert result == [{"id": 55, "full_name": "O/N", "permissions": {"admin": True, "push": True}}]
 
 
+async def test_admin_repository_list_accepts_exactly_ten_full_pages(config):
+    requested_pages: list[int] = []
+
+    def respond(request):
+        page = int(request.url.params["page"])
+        requested_pages.append(page)
+        entries = (
+            [{"id": index, "full_name": f"acme/repo-{index}"} for index in range(100)]
+            if page <= 10
+            else []
+        )
+        return httpx.Response(200, json={"repositories": entries})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        repositories = await GitHubAppCredentials(config, client=client).repositories_for_user(
+            "user-token", 7
+        )
+
+    assert len(repositories) == 1000
+    assert requested_pages == list(range(1, 12))
+
+
+async def test_admin_repository_list_rejects_results_beyond_its_limit(config):
+    requested_pages: list[int] = []
+
+    def respond(request):
+        page = int(request.url.params["page"])
+        requested_pages.append(page)
+        entries = (
+            [{"id": page, "full_name": f"acme/repo-{page}"}]
+            if page == 11
+            else [{"id": index, "full_name": f"acme/repo-{index}"} for index in range(100)]
+        )
+        return httpx.Response(200, json={"repositories": entries})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        with pytest.raises(GitHubAppError, match="beyond 1000 repositories"):
+            await GitHubAppCredentials(config, client=client).repositories_for_user("user-token", 7)
+
+    assert requested_pages == list(range(1, 12))
+
+
+async def test_admin_repository_list_keeps_permission_denial_separate_from_rate_limits(config):
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(403, json={"message": "Forbidden"})
+        )
+    ) as client:
+        assert (
+            await GitHubAppCredentials(config, client=client).repositories_for_user("user-token", 7)
+            == []
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                403,
+                headers={"Retry-After": "15"},
+                json={"message": "You have exceeded a secondary rate limit"},
+            )
+        )
+    ) as client:
+        with pytest.raises(GitHubAppError) as raised:
+            await GitHubAppCredentials(config, client=client).repositories_for_user("user-token", 7)
+
+    assert raised.value.status == 403
+    assert raised.value.retry_after_s == 15
+
+
 async def test_installation_token_revocation_uses_the_presented_token(config):
     requests: list[httpx.Request] = []
 

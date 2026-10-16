@@ -372,6 +372,8 @@ __all__ = [
     "ReleaseHostDrainFenceRequest",
     "RenameTeamRequest",
     "RepoBranchesResponse",
+    "RepositoryDirectWritePolicyResponse",
+    "RepositoryDirectWriteUpdate",
     "RequestRuntimeUpgradeRequest",
     "ResidencyBeat",
     "ResourceMetricBrief",
