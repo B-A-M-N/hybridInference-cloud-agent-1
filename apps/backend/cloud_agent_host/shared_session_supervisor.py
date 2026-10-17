@@ -1944,15 +1944,18 @@ class SharedChatSessionSupervisor:
     ) -> ChatSandboxInspection:
         """Recreate a moved group's container from its checkpoint, stopped.
 
-        Any failure leaves nothing behind that could be taken for the group and
-        is reported as :class:`SandboxRestoreFailed`, which hands the turn back
-        rather than marking the chat lost: the checkpoint is unchanged.
+        Any failure is reported as :class:`SandboxRestoreFailed`, which hands
+        the turn back rather than marking the chat lost: the checkpoint is
+        unchanged. What the attempt made goes with it: ``create`` removes a
+        container it made that failed its checks, and the image this restore
+        loaded is removed here. Any host may claim the next try, and nothing
+        would tell this one that the group lives elsewhere.
         """
         hook = self.checkpoint_restore_hook
         if hook is None:
             raise SandboxRestoreFailed("this sandbox manager cannot restore checkpoints")
         try:
-            self._manager.remove_superseded(spec)
+            self._manager.remove_superseded(spec, keep_checkpoint=restore.checkpoint_id)
             image = hook(spec.sandbox_id, restore)
             return self._manager.create(
                 spec,
@@ -1974,8 +1977,13 @@ class SharedChatSessionSupervisor:
                     "error_type": type(exc).__name__,
                 },
             )
+            # Nothing is kept for a retry here: an older container goes with
+            # its image even when it is this checkpoint's, and so does the
+            # image this restore loaded. Docker keeps one a container uses.
             with contextlib.suppress(Exception):
                 self._manager.remove_superseded(spec)
+            with contextlib.suppress(Exception):
+                self._manager.remove_checkpoint_image(spec, restore.checkpoint_id)
             raise SandboxRestoreFailed(f"sandbox checkpoint could not be restored: {exc}") from exc
 
     def _create_from_snapshot(
@@ -5398,25 +5406,31 @@ class SharedChatSessionSupervisor:
         closed — stop them all, which releases their bridges and
         keeps their workspaces. Waking one reinstalls and verifies the rules
         before it runs again, and refuses while they cannot be.
+
+        The running groups are named to the check: a table it (or another
+        process) reinstalled holds none of their relay or SSH exceptions, and
+        it gives back what each still-running group lost.
         """
         with self._lock:
-            running = [
-                (next(iter(group.members)), group.spec.generation)
+            groups = [
+                group
                 for group in self._groups.values()
                 if group.inspection.running and not group.stopping and group.members
             ]
+            running = [(next(iter(group.members)), group.spec.generation) for group in groups]
+            specs = [group.spec for group in groups]
         if not running:
             self._renew_idle_host_rules()
             return []
         try:
-            self._manager.verify_host_rules()
+            self._manager.verify_host_rules(specs)
             return []
         except SandboxError:
             pass
         try:
             # A failed check is never cached, so this is a full second attempt:
             # one Docker hiccup is not reason enough to stop every group.
-            self._manager.verify_host_rules()
+            self._manager.verify_host_rules(specs)
             return []
         except SandboxError as exc:
             logger.error(

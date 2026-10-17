@@ -516,7 +516,9 @@ groups can really move:
   current archive revision would pass claim admission for new groups now. A
   Host under a `new_groups` hold, in its own lease window or with a stale
   observation does not count, and of two Hosts entering their windows
-  together only one moves out.
+  together only one moves out. When an `untrusted-kata-v1` group would move,
+  that Host must also run the Kata runtime: no other Host is ever handed such
+  a chat, so without one the group would wait in its checkpoint for good.
 
 Without a target nothing changes, and the Host serves until its lease ends as
 before. A move that has started continues if its target goes away, and stops
@@ -529,7 +531,10 @@ left for the next pass, so running turns are never interrupted. The stop
 stores the group's final checkpoint, and once that checkpoint covers the group
 it becomes `cold` at once, without waiting for the Host to be removed. Each
 chat's next turn is claimed by another Host and restored there; to the user,
-that message waits a little longer than usual.
+that message waits a little longer than usual. A sandbox whose deletion failed
+before its archive still serves its chats, so it is counted, moved and, with a
+reclaimed machine, lost like any other; one whose deletion is pending or
+verified is left to that deletion.
 
 In an autoscaled CloudLab pool a moving-out member stops counting toward
 `min_hosts`, so its replacement is acquired while it still serves. It still
