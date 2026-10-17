@@ -166,8 +166,9 @@ defaults are saved for future setups. **Start new setup** retains those inputs
 and creates a new request on submission; it leaves an unfinished setup
 unavailable. Tunnel credentials, the install directory, and enrollment stay
 fixed. A control-plane release rolls managed hosts forward: stored profiles
-that share the previous commit and bundle, and the live allocations using
-them, advance together so a later node replacement still sees one revision.
+that share the previous commit and bundle, and the live allocations and
+autoscaling reservations using them, advance together so a later node
+replacement or new pool member still sees one revision.
 That rollout starts only once the new control plane runs, so the deployment's
 readiness check does not wait for managed hosts; they take new chats again
 when they report the new commit.
@@ -444,7 +445,7 @@ creates a new command.
 | --- | --- |
 | SSH key or identity refused | Verify the machine/key, update the selected connection and retry the same operation. Existing-SSH and registered CloudLab connections keep host-key checks enabled. |
 | Cloud create outcome unknown, no UUID saved | Identify the actual experiment in the exact account/project and resolve explicitly. The worker never repeats POST or adopts an experiment by name. |
-| UUID saved, later observation failed | Repair access and resume the same resource. |
+| UUID saved, later observation failed | Repair access and resume the same resource. Releasing the server instead deletes that experiment by its saved UUID. |
 | Installation or readiness failed | Inspect deployment checks, repair prerequisites/profile and retry the same resource. Failure does not destroy it. |
 | Extension pending or unknown | Check actual expiry. Retries retain the fixed absolute target; shorter extensions are not successful. The provider may reject or limit extensions. An expiry that has not moved ten minutes after the request blocks as `extension_unconfirmed`, so the server's other operations and a replacement can proceed; retry sends the same target again. |
 | Retained state remains | Keep the resource available or manage its chat lifecycle. Stopped containers and archived chats remain dependencies. |
@@ -474,11 +475,11 @@ Pool and resource actions have different effects:
 
 | Action | Effect |
 | --- | --- |
-| `Remove from pool` | Revokes the Host credential; leaves the machine intact. A Host still running turns stops taking new work and shows `removing` until they finish, and the reaper then revokes it. |
-| `Cancel removal` | Puts a `removing` Host back to work. |
-| `Remove now` | Revokes a `removing` Host at once and ends its running turns: they are requeued once, or a chat whose turn may already have run is marked lost. |
-| `Forget` | Removes an eligible history record. |
-| `Retire/release` | Releases the complete allocation; for CloudLab, the whole experiment. Existing SSH has no cloud-destruction capability. |
+| `Remove from pool` | Revokes the Host credential; leaves the machine intact. A Host still running sandboxes that can move to another Host moves them out first, as one does before its lease ends (below): it takes no new work and shows `removing`, each idle sandbox stops into a checkpoint and is handed over, and the reaper revokes the Host once none is left and its running turns have finished. A Host still running turns moves out the same way whenever another Host could take its sandboxes, since a turn it is restoring, or one it claimed before the removal, leaves its sandbox running there. A stopped sandbox its checkpoint covers moves when the Host is revoked. Before leaving any sandbox behind, because no other Host can take it or it can never move (its checkpoint failed, or its first turn failed before Docker created its container, say), the page asks; removing anyway leaves it on the Host until the Host returns. |
+| `Cancel removal` | Puts a `removing` Host back to work. Sandboxes already moved stay on their new Hosts. |
+| `Remove now` | Revokes a `removing` Host at once and ends its running turns: they are requeued once, or a chat whose turn may already have run is marked lost. Sandboxes not yet moved stay on the removed Host. |
+| `Forget` | Removes an eligible history record. A `cold` sandbox, which waits in its checkpoint for any Host, does not block it. |
+| `Retire/release` | Releases the complete allocation; for CloudLab, the whole experiment. An acquisition still waiting on the server, for its Host's first heartbeat say, is cancelled when the release commits, and so is an upgrade a control-plane release queued for it: nothing can run either afterwards. An autoscaled server's profile is then free for the pool once the release is confirmed, and later releases move its deployment profile as usual. Existing SSH has no cloud-destruction capability. |
 
 The page has no separate pause action. A Host held by a deployment drain shows
 `updating`; one drained through the `/drain` API shows `paused` and offers
@@ -499,9 +500,11 @@ groups to other Hosts one at a time before its lease ends, through their
 The lead is **Move sandboxes to other servers before expiry** in the
 allocation's renewal settings: 120 minutes by default, 0 to turn it off.
 Replacement moves the whole Host instead, so the setting is not offered there.
-With renewal enabled, extension is tried before the window opens, and the
-window is capped ten minutes short of the extension horizon: an extension that
-succeeds ends a move rather than starting one.
+With renewal enabled, extension is tried 15 minutes before the window opens:
+longer than an extension the provider neither applies nor refuses is awaited,
+so by then it has been granted or given up, and only a lease it could not
+extend starts a move. The window is capped 25 minutes short of the extension
+horizon, so an extension that succeeds ends a move rather than starting one.
 
 Inside the window the Host gets a `move_out` admission hold only when its
 groups can really move:

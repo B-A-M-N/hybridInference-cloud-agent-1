@@ -172,6 +172,8 @@ async def retire_changed_snapshots(
     Only the current configuration says what is current, and a fingerprint
     needs the deployment's key, so this runs in the transaction that
     publishes a configuration and in the one that records a build.
+    Maintenance also runs it for each owner in turn, for a snapshot that went
+    stale with neither to notice.
 
     A snapshot built for a task that replaced the install script is checked
     against that script with the current values. ``environment_ids`` limits

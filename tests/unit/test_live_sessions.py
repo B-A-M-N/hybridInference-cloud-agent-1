@@ -927,6 +927,36 @@ def test_codex_reports_the_error_that_fails_its_turn(tmp_path):
     assert turn.wait().status == "failed"
 
 
+def test_codex_records_the_server_an_mcp_call_went_to(tmp_path):
+    """Codex names an MCP call by the tool's own name, which may be "task".
+
+    The server it went to is what tells the trajectory it is not Codex's own
+    delegation, so the call records it. A command names no server.
+    """
+    process, turn = _codex_turn(tmp_path)
+    arguments = {"description": "Review", "prompt": "Review this change."}
+    mcp = {
+        "type": "mcpToolCall",
+        "id": "mcp-1",
+        "server": "session",
+        "tool": "review__task",
+        "status": "inProgress",
+        "arguments": arguments,
+    }
+    command = {"type": "commandExecution", "id": "cmd-1", "command": "ls"}
+    process.feed = _turn_lines(
+        {"method": "item/started", "params": {"item": mcp}},
+        {"method": "item/started", "params": {"item": command}},
+        {"method": "turn/completed", "params": {"turn": {"id": "turn-a", "status": "completed"}}},
+    )
+    calls = [event.payload for event in turn.iter_events() if event.event_type == "tool_use"]
+
+    assert calls == [
+        {"name": "review__task", "id": "mcp-1", "input": arguments, "mcp_server": "session"},
+        {"name": "commandExecution", "id": "cmd-1", "input": "ls"},
+    ]
+
+
 def test_a_codex_json_rpc_error_reads_as_its_message(tmp_path):
     process, turn = _codex_turn(tmp_path)
     error = {"code": -32600, "message": "turn is not active"}

@@ -112,6 +112,11 @@ HOST_CONCURRENCY_MAX_SLOTS = 128
 #: refuses a longer one together with the whole beat, so the host trims to it:
 #: a long explanation must never be what takes a host offline.
 HOST_LAUNCH_ERROR_MAX_CHARS = 500
+#: The most versions one runtime's menu may list, in a heartbeat or a claim's
+#: attestation. The control plane refuses a longer one with the whole beat or
+#: claim, so the host leaves the least needed off: a long menu must never be
+#: what takes a host out of the pool.
+HOST_VERSION_MENU_MAX_ITEMS = 64
 SHARED_DEPLOYMENT_CAPABILITY_PREFIX = "shared-sandbox-deployment:"
 ENV_DEPLOYMENT_SHA = "AGENT_DEPLOYMENT_SHA"
 #: Stored in the legacy-named ``sampler_version`` field for a current retained

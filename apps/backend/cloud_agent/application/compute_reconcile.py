@@ -19,6 +19,7 @@ from cloud_agent.application.host_commands import HostCommands
 from cloud_agent.compute_config import current_observation_seconds, current_registration_url
 from cloud_agent.compute_secrets import ComputeSecretError
 from cloud_agent.domain.compute import (
+    MOVE_OUT_RENEWAL_LEAD_SECONDS,
     ComputeRefusal,
     fingerprint,
     move_out_window_seconds,
@@ -200,11 +201,13 @@ class ComputeReconciler:
                 await self._remind_unfinished_move_out(row, policy, now, expires)
             if not policy.enabled or expires is None or not row.get("expiration_known"):
                 continue
-            # An extension is tried before the move-out window opens, so a
-            # granted one keeps the groups where they are.
+            # An extension is tried, and granted or given up, before the
+            # move-out window opens, so a granted one keeps the groups where
+            # they are.
+            window = move_out_window_seconds(policy.model_dump())
             renew_before = max(
                 policy.renew_before_seconds,
-                move_out_window_seconds(policy.model_dump()),
+                window + MOVE_OUT_RENEWAL_LEAD_SECONDS if window else 0,
             )
             if row["management_mode"] != "manage" or expires - now > timedelta(
                 seconds=renew_before
@@ -1463,12 +1466,36 @@ class ComputeReconciler:
     async def _release_absent_provider_resource(
         self, operation: dict[str, Any], allocation: dict[str, Any]
     ) -> None:
-        """Finish retirement when the provider never created a resource.
+        """Finish retirement of a server whose provider resource was never observed.
 
         Inspect and delete both require an experiment id. A missing profile, or
-        a create cancelled before submission, leaves none. Recording absence
-        locally is the whole release.
+        a create cancelled before submission, leaves none: recording absence
+        locally is the whole release. A create the provider answered left its
+        id with the acquisition, and that experiment is deleted. No Host ran
+        there: deployment starts only on a node an observation recorded.
         """
+        ref = await self._provider_resource(allocation)
+        if ref is not None:
+            observation = await self._delete_by_identity(operation, allocation, ref)
+            if observation.state != "terminated":
+                await self._finish(
+                    operation,
+                    "waiting",
+                    "confirming_release",
+                    "Waiting for provider termination confirmation.",
+                    result={"external_pending": True},
+                    retry=30,
+                )
+                return
+            await self._save_observation(operation, allocation, observation)
+            await self._finish(
+                operation,
+                "succeeded",
+                "released",
+                "Provider confirmed that the resource is terminated.",
+                result={"external_pending": False, "blocked_reasons": []},
+            )
+            return
         await self.repository.observe_allocation(
             allocation_id=allocation["id"],
             observation={
@@ -1486,6 +1513,42 @@ class ComputeReconciler:
             "No provider resource exists for this server, so it was released locally.",
             result={"external_pending": False, "blocked_reasons": []},
         )
+
+    async def _provider_resource(self, allocation: dict[str, Any]) -> ResourceRef | None:
+        """The provider resource of this allocation, or None if none was ever named.
+
+        Its identity is the allocation's once an observation recorded it. Until
+        then only the acquisition the provider answered keeps it.
+        """
+        if allocation.get("external_id"):
+            return self._ref(allocation)
+        for prior in await self.repository.list_operations(
+            allocation_id=allocation["id"], kinds=["acquire", "import"]
+        ):
+            result = prior.get("result") or {}
+            if result.get("resource_ref"):
+                return ResourceRef.model_validate(result["resource_ref"])
+            named = result.get("external_id") or result.get("resolved_external_id")
+            if named:
+                return ResourceRef(external_id=named, config=allocation["configuration"])
+        return None
+
+    async def _delete_by_identity(
+        self, operation: dict[str, Any], allocation: dict[str, Any], ref: ResourceRef
+    ) -> ResourceObservation:
+        """Delete one resource by its exact identity and return what the provider reports.
+
+        Its node scope is not reviewed: the caller knows no Host of ours ran there.
+        """
+        provider = self.commands.registry.get(allocation["provider_id"]).provider
+        observation = await provider.inspect(ref)
+        if observation.state != "terminated":
+            await self._checkpoint(
+                operation, "releasing", {"release_requested": True, "external_pending": True}
+            )
+            receipt = await provider.release(ref, self._intent(operation, allocation))
+            observation = receipt.observation or await provider.inspect(ref)
+        return observation
 
     async def _verify_empty_inventory(
         self, operation: dict[str, Any], allocation: dict[str, Any]

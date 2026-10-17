@@ -26,6 +26,8 @@ from cloud_agent.domain.compute import (
 from cloud_agent.storage._sql.compute_admission import host_compute_admission, lock_compute_entry
 from cloud_agent.storage._sql.hosts import (
     GROUP_TURN_CLAIMED_SQL,
+    HOST_RETAINED_GROUP,
+    lock_hosts_for_revocation,
     release_covered_sandboxes,
     revoke_host_credentials,
 )
@@ -177,7 +179,8 @@ class PostgresComputeResourceRepository:
         """Move every stored profile of one release, and the live hosts using it.
 
         A profile another deployment is currently installing is left unchanged.
-        The calling allocation must end on the new revision.
+        An autoscaling route's snapshot moves with its stored profile. The
+        calling allocation must end on the new revision.
         """
         if previous_sha == deployment_sha and previous_digest == source_sha256:
             return
@@ -210,6 +213,26 @@ class PostgresComputeResourceRepository:
                 source_sha256,
                 deployment_sha,
                 operation_id,
+            )
+            # A reserved route deploys its next pool member from this snapshot.
+            # It names the stored bundle, so it moves only with that profile.
+            await conn.execute(
+                """UPDATE agent_cloudlab_autoscaling_profile_reservations AS reservation
+                SET profile_snapshot=reservation.profile_snapshot
+                      || jsonb_build_object('deployment_sha',$3::text,'source_sha256',$4::text),
+                    updated_at=NOW()
+                FROM agent_compute_deployment_profiles AS profile
+                WHERE profile.id=reservation.deployment_profile
+                  AND reservation.profile_snapshot->>'source_bundle'
+                      ='stored-profile:'||profile.id||':bundle'
+                  AND reservation.profile_snapshot->>'deployment_sha'=$1
+                  AND reservation.profile_snapshot->>'source_sha256'=$2
+                  AND profile.configuration->>'deployment_sha'=$3
+                  AND profile.source_sha256=$4""",
+                previous_sha,
+                previous_digest,
+                deployment_sha,
+                source_sha256,
             )
             await conn.execute(
                 """UPDATE agent_compute_allocations AS allocation
@@ -613,7 +636,9 @@ class PostgresComputeResourceRepository:
         This performs no provider or filesystem action. A releasable resource
         must already be confirmed absent; an acquisition that never submitted
         and a disabled attached machine can instead be deregistered locally.
-        User jobs and deleted sandbox audit rows survive the inventory cleanup.
+        User jobs and deleted sandbox audit rows survive the inventory cleanup,
+        and so do ``cold`` groups, which no longer need the machine: any
+        restore-capable host may claim them (``HOST_RETAINED_GROUP``).
         """
         async with self._pool.acquire() as conn, conn.transaction():
             active = await conn.fetchval(
@@ -731,8 +756,8 @@ class PostgresComputeResourceRepository:
             if any(host["drain_fence_active"] for host in host_rows):
                 raise ValueError("deployment_drain_active")
             if await conn.fetchval(
-                "SELECT 1 FROM agent_sandboxes WHERE host=ANY($1::text[]) "
-                "AND deletion_state<>'deleted' LIMIT 1",
+                "SELECT 1 FROM agent_sandboxes g WHERE g.host=ANY($1::text[]) "
+                f"AND {HOST_RETAINED_GROUP} LIMIT 1",
                 hosts,
             ):
                 raise ValueError("retained_groups_present")
@@ -1802,15 +1827,18 @@ class PostgresComputeResourceRepository:
             allocation_id,
         ):
             return False
+        # Read under the exclusive compute fence, which every binding change
+        # takes; the revocation's rows are locked before the host rows.
         hosts = [
             row["host"]
             for row in await conn.fetch(
                 """SELECT h.host FROM agent_compute_nodes n
                    JOIN agent_runner_hosts h ON h.compute_node_id=n.id
-                   WHERE n.allocation_id=$1 FOR UPDATE OF h""",
+                   WHERE n.allocation_id=$1 ORDER BY h.host""",
                 allocation_id,
             )
         ]
+        await lock_hosts_for_revocation(conn, hosts)
         await conn.execute(
             """UPDATE agent_compute_allocations
                SET desired_state='absent',
@@ -3258,11 +3286,19 @@ class PostgresComputeResourceRepository:
                 raise ValueError("allocation_not_found")
             if allocation["release_committed_at"] is not None:
                 return {"release_committed": True, "blocked_reasons": []}
-            await conn.fetch(
-                """SELECT h.host FROM agent_compute_nodes n
-                   JOIN agent_runner_hosts h ON h.compute_node_id=n.id
-                   WHERE n.allocation_id=$1 FOR UPDATE OF h""",
-                allocation_id,
+            # The rows the revocation below writes, then the host rows: a
+            # provider-terminal release proceeds past attempts still running.
+            await lock_hosts_for_revocation(
+                conn,
+                [
+                    row["host"]
+                    for row in await conn.fetch(
+                        """SELECT h.host FROM agent_compute_nodes n
+                           JOIN agent_runner_hosts h ON h.compute_node_id=n.id
+                           WHERE n.allocation_id=$1 ORDER BY h.host""",
+                        allocation_id,
+                    )
+                ],
             )
             impact = await self._retirement_impact(conn, allocation_id)
             provider_terminal = allocation["desired_state"] == "absent" and allocation[
@@ -3303,15 +3339,34 @@ class PostgresComputeResourceRepository:
                     allocation_id,
                     operation_id,
                 )
+            else:
+                # An acquisition between its checks -- waiting for its Host's
+                # first heartbeat, or blocked on a deployment given up on -- is
+                # never claimed again after this commit. Left waiting, it kept
+                # an autoscaled server's route reserved for good. The release
+                # deletes the resource by the allocation's own identity.
+                await conn.execute(
+                    """UPDATE agent_compute_operations
+                    SET state='cancelled',message='release_committed',
+                        completed_at=NOW(),updated_at=NOW()
+                    WHERE allocation_id=$1 AND id<>$2
+                      AND kind IN ('acquire','import')
+                      AND state IN ('pending','waiting','blocked')""",
+                    allocation_id,
+                    operation_id,
+                )
             await conn.execute(
                 "UPDATE agent_compute_allocations SET release_committed_at=NOW(),updated_at=NOW() WHERE id=$1",
                 allocation_id,
             )
             await revoke_host_credentials(conn, [h["host"] for h in impact["hosts"]])
-            # Later pending extensions must never escape after the commit.
+            # Later pending extensions must never escape after the commit. Nor
+            # is an upgrade claimed after it (claim_operation), and one left
+            # waiting would hold its deployment profile back from every later
+            # host release, as if it were still being installed.
             await conn.execute(
                 """UPDATE agent_compute_operations SET state='cancelled',message='release_committed',completed_at=NOW()
-                WHERE allocation_id=$1 AND id<>$2 AND kind='extend' AND state IN ('pending','waiting','blocked')""",
+                WHERE allocation_id=$1 AND id<>$2 AND kind IN ('extend','upgrade') AND state IN ('pending','waiting','blocked')""",
                 allocation_id,
                 operation_id,
             )
