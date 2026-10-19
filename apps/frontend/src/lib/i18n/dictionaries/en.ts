@@ -189,6 +189,8 @@ export const en = {
   'environment.snapshot.failed': 'Prebuild failed',
   'environment.snapshot.rebuild': 'Prebuild again',
   'environment.snapshot.delete': 'Delete saved installation',
+  'environment.snapshot.deleteConfirm':
+    'Delete the saved installation of {name}? New tasks install from scratch until it is prebuilt again.',
   'environment.snapshot.prebuildAfterTest':
     'A passing test queues a prebuild of this installation. New tasks start from it while the lockfiles are unchanged.',
   'environment.choose': 'Choose environment',
@@ -435,6 +437,9 @@ export const en = {
   'shell.accessRequired.title': 'Agent access required',
   'shell.accessRequired.body': 'This account has not been granted access to this Agent deployment.',
   'shell.accessRequired.back': 'Back to Dashboard',
+  'shell.renderError.title': 'This page could not be displayed',
+  'shell.renderError.body':
+    'Something on it failed to render. Retry, or open another chat or page.',
 
   // ── Sidebar ─────────────────────────────────────────────────────────────
   'sidebar.pinned': 'Pinned',
@@ -545,6 +550,10 @@ export const en = {
   'settings.ssh': 'SSH connections',
   'settings.integrationsDescription':
     'Connect your source control accounts and manage repository access.',
+  'integrations.disconnectConfirm':
+    'Disconnect {name}? Agents can no longer use it until you connect it again.',
+  'integrations.disconnect': 'Disconnect',
+  'integrations.cancel': 'Cancel',
   'settings.environments': 'Environments',
   'settings.environmentsDescription':
     'Manage repository environments, setup scripts, and personal variables.',
@@ -1093,6 +1102,7 @@ export const en = {
   'goal.resumeHint': 'Continue the goal and queue its next round',
   'goal.editHint': 'Change the objective; the round in flight is left alone',
   'goal.clearHint': 'Remove the goal and stop future rounds; the chat and its history stay',
+  'goal.clearConfirm': 'Clear this goal? Future rounds stop; the chat and its history stay.',
   // The one bound that exists is one the owner wrote, and nothing in the
   // product edits it. So Resume is what lifts it, and the band says so.
   'goal.limitResumeLifts':

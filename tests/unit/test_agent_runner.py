@@ -25,6 +25,7 @@ from cloud_agent_host.runtimes import ClaudeCodeRuntime, get_runtime
 from cloud_agent_host.sandbox import ContainerBackend, ProcessBackend, SandboxError
 from cloud_agent_host.session_supervisor_client import SessionSupervisorError
 from cloud_agent_shared import operation_profiling
+from cloud_agent_shared.environment import BoundEnvironment
 
 
 @pytest.fixture(autouse=True)
@@ -745,7 +746,10 @@ def _run_shared_boundary_case(
             **(job_changes or {}),
         ),
         control=control,
-        heart=heart or SimpleNamespace(cancel_requested=False, lease_lost=False),
+        heart=heart
+        or SimpleNamespace(
+            cancel_requested=False, lease_lost=False, ttl=runner_mod.DEFAULT_LEASE_TTL_S
+        ),
         backend=backend,
         host="host-a",
         gateway_base_url="http://gateway",
@@ -1037,6 +1041,72 @@ def test_a_stop_during_the_resident_start_is_honoured_right_before_admission(mon
     assert finish.call_args.args[:2] == ("cancelled", "cancelled by owner")
 
 
+def test_a_stop_during_environment_preparation_cancels_the_turn(monkeypatch):
+    """Stop kills the running setup script, and the preparation it ends is no failure.
+
+    Nothing has reached the CLI, so the Stop is honoured as anywhere else before
+    admission. The killed script used to fail the turn instead.
+    """
+    heart = SimpleNamespace(cancel_requested=False, lease_lost=False)
+
+    def configure(_control, supervisor, _finish):
+        def prepare(*_args, cancelled, **_kwargs):
+            heart.cancel_requested = True
+            assert cancelled()
+            raise SessionSupervisorError(
+                500,
+                "sandbox manager failed unexpectedly (SandboxError in POST "
+                "/workspaces/{workspace_id}/environment/prepare)",
+            )
+
+        supervisor.prepare_environment.side_effect = prepare
+
+    result, control, supervisor, finish = _run_shared_boundary_case(
+        monkeypatch,
+        0,
+        None,
+        "claude-code",
+        configure=configure,
+        heart=heart,
+        job_changes={"environment": BoundEnvironment(binding_id="b", setup_script="npm ci")},
+    )
+
+    assert result == 0
+    supervisor.prepare_environment.assert_called_once()
+    control.admit_chat_turn.assert_not_called()
+    assert supervisor.abandon_shared.call_args.kwargs["lost"] is False
+    assert control.abandon_chat_sandbox.call_args.kwargs["lost"] is False
+    finish.assert_called_once()
+    assert finish.call_args.args[:2] == ("cancelled", "cancelled by owner")
+    assert all(call.args[0].event_type != "error" for call in control.append_event.call_args_list)
+
+
+def test_a_follow_up_claimed_while_its_sandbox_is_busy_goes_back_to_the_queue(monkeypatch):
+    """A snapshot capture can outlast the sandbox manager's wait; nothing has run yet.
+
+    The control plane claims a follow-up whatever the group is doing, and the
+    turn used to fail with the capture's busy refusal although the chat was
+    untouched and the next try would have run it.
+    """
+
+    def configure(_control, supervisor, _finish):
+        supervisor.acquire_shared.side_effect = SessionSupervisorError(
+            409, "shared workspace snapshot is in progress"
+        )
+
+    result, control, supervisor, finish = _run_shared_boundary_case(
+        monkeypatch, 0, None, "claude-code", configure=configure
+    )
+
+    assert result == 0
+    control.release_turn.assert_called_once_with("sandbox_busy")
+    finish.assert_not_called()
+    assert control.abandon_chat_sandbox.call_args.kwargs["lost"] is False
+    supervisor.abandon_shared.assert_not_called()
+    control.admit_chat_turn.assert_not_called()
+    assert all(call.args[0].event_type != "error" for call in control.append_event.call_args_list)
+
+
 @pytest.mark.parametrize(
     ("error", "expected_code"),
     [(httpx.ReadTimeout("completion notice unavailable"), 0), (LeaseLost("expired"), 3)],
@@ -1315,6 +1385,99 @@ def test_control_lease_rejection_never_retries_settlement(monkeypatch):
     with pytest.raises(LeaseLost):
         runner_mod._retry_lifecycle_receipt("settle", "ajob_test", request)
     request.assert_called_once()
+
+
+@pytest.mark.parametrize("stage", ["admission", "control_settle"])
+def test_a_control_plane_restart_at_the_turn_boundary_does_not_fail_the_turn(monkeypatch, stage):
+    """Admission and settlement wait out the control plane being recreated.
+
+    A deploy refuses connections for longer than the three quick tries these
+    receipts had. A settlement given up on that way failed a turn the sandbox
+    had already settled, and the control plane marked the conversation lost.
+    """
+    clock = _virtual_clock(monkeypatch)
+    tries: list[float] = []
+
+    def receipt(**_kwargs):
+        tries.append(clock.now)
+        if clock.now < 30:
+            raise httpx.ConnectError("connection refused")
+        return {}
+
+    def configure(control, _supervisor, _finish):
+        if stage == "admission":
+            control.admit_chat_turn.side_effect = receipt
+        else:
+            control.settle_chat_sandbox.side_effect = receipt
+
+    result, control, supervisor, finish = _run_shared_boundary_case(
+        monkeypatch, 0, None, "claude-code", configure=configure
+    )
+
+    assert result == 0
+    assert [call.args[0] for call in finish.call_args_list] == ["succeeded"]
+    supervisor.settle_shared.assert_called_once()
+    supervisor.abandon_shared.assert_not_called()
+    control.abandon_chat_sandbox.assert_not_called()
+    assert len(tries) > 3 and tries[-1] >= 30
+    assert max(clock.sleeps) == control_plane_client._EVENT_RETRY_MAX_DELAY_S
+
+
+@pytest.mark.parametrize("lease_runs_out", [True, False])
+def test_a_settlement_the_control_plane_never_records_keeps_the_sandboxs_session(
+    monkeypatch, lease_runs_out
+):
+    """Once the sandbox has settled the turn, its session is never torn down as lost.
+
+    The receipt is retried while the lease holds: the control plane marks an
+    admitted turn it never saw settle lost however the attempt ends, so only
+    the receipt landing keeps the conversation. Once the heartbeat has lost the
+    lease, nothing more is sent. A control plane that keeps renewing the lease
+    while it fails the receipt is given up on after one lease, and the failure
+    reported.
+    """
+    clock = _virtual_clock(monkeypatch)
+    tries: list[float] = []
+    ttl = runner_mod.DEFAULT_LEASE_TTL_S
+
+    class Heart:
+        cancel_requested = False
+
+        def __init__(self) -> None:
+            self.ttl = ttl
+
+        @property
+        def lease_lost(self) -> bool:
+            # The heartbeat's last renewal was 30 seconds before the turn ended.
+            return lease_runs_out and clock.now >= ttl - 30
+
+    def receipt(**_kwargs):
+        tries.append(clock.now)
+        if lease_runs_out:
+            raise httpx.ConnectError("connection refused")
+        raise _status_error(503)
+
+    def configure(control, _supervisor, _finish):
+        control.settle_chat_sandbox.side_effect = receipt
+
+    result, control, supervisor, finish = _run_shared_boundary_case(
+        monkeypatch, 0, None, "claude-code", configure=configure, heart=Heart()
+    )
+
+    supervisor.settle_shared.assert_called_once()
+    supervisor.abandon_shared.assert_not_called()
+    assert max(clock.sleeps) == control_plane_client._EVENT_RETRY_MAX_DELAY_S
+    if lease_runs_out:
+        assert result == 3
+        assert tries[-1] >= ttl - 30
+        finish.assert_not_called()
+        assert all(
+            call.args[0].event_type != "error" for call in control.append_event.call_args_list
+        )
+    else:
+        assert result == 2
+        assert ttl - control_plane_client._EVENT_RETRY_MAX_DELAY_S <= tries[-1] <= ttl
+        assert [call.args[0] for call in finish.call_args_list] == ["failed"]
 
 
 @pytest.mark.parametrize(

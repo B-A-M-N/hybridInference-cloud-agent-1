@@ -331,6 +331,27 @@ async def test_a_stale_revision_is_refused_and_nothing_is_written(store):
     assert (unchanged["objective"], unchanged["revision"]) == ("ship it safely", 2)
 
 
+async def test_a_clear_against_a_stale_revision_is_refused_and_removes_nothing(store):
+    job, _ = await _goal_job(store)
+    await store.goals.set_goal(
+        thread_id=job["thread_id"],
+        user_id=job["user_id"],
+        goal=GoalInput(objective="ship it safely"),
+        expected_revision=1,
+    )
+    with pytest.raises(GoalConflict):
+        await store.goals.clear_goal(
+            thread_id=job["thread_id"], user_id=job["user_id"], expected_revision=1
+        )
+    unchanged = await store.goals.get_goal(thread_id=job["thread_id"])
+    assert (unchanged["objective"], unchanged["revision"]) == ("ship it safely", 2)
+
+    assert await store.goals.clear_goal(
+        thread_id=job["thread_id"], user_id=job["user_id"], expected_revision=2
+    )
+    assert await store.goals.get_goal(thread_id=job["thread_id"]) is None
+
+
 async def test_editing_a_paused_goal_leaves_it_paused(store):
     """Changing the words is not resuming it, and the reason it stopped stands."""
     job, goal = await _goal_job(store)
@@ -1167,6 +1188,53 @@ async def test_a_persons_turn_stopped_while_its_claim_was_handed_back_leaves_the
 
     assert (await store.conversation_queries.get_job(human["id"]))["state"] == "cancelled"
     assert (await store.goals.get_goal(thread_id=job["thread_id"]))["state"] == "active"
+
+
+async def test_a_round_reaped_for_the_last_time_pauses_its_goal(store, pool):
+    job, first, goal = await _live_goal_job(store)
+    await _finish(pool, first)
+    work = await _round(store, job=job, goal=goal)
+    claimed = await _claim_round(store)
+    assert claimed is not None and claimed["id"] == work["id"]
+    await _expire_attempt(pool, store, claimed["attempt_id"])
+
+    actions = await store.attempt_commands.reap_expired(max_attempts=1)
+
+    assert [action["action"] for action in actions] == ["failed"]
+    after = await store.goals.get_goal(thread_id=job["thread_id"])
+    assert (after["state"], after["pause_reason"]) == ("paused", "execution_failed")
+
+
+async def test_a_replaced_objectives_round_cannot_pause_the_goal_that_replaced_it(store, pool):
+    """A round ending badly stops the goal it was run for, and no other.
+
+    Replacing the objective mints a new identity and withdraws the queued
+    rounds, but a round already running carries on under the old one. Reaped
+    or stopped, it paused whatever goal was active: the objective its owner had
+    just set stopped as ``execution_failed`` for a round it never ran.
+    """
+    job, first, goal = await _live_goal_job(store)
+    await _finish(pool, first)
+    work = await _round(store, job=job, goal=goal)
+    claimed = await _claim_round(store)
+    assert claimed is not None and claimed["id"] == work["id"]
+    replaced = await store.goals.set_goal(
+        thread_id=job["thread_id"],
+        user_id=job["user_id"],
+        goal=GoalInput(objective="a different objective"),
+    )
+    assert replaced is not None and replaced["goal_id"] != goal["goal_id"]
+    await _expire_attempt(pool, store, claimed["attempt_id"])
+
+    actions = await store.attempt_commands.reap_expired(max_attempts=1)
+
+    assert [action["action"] for action in actions] == ["failed"]
+    after = await store.goals.get_goal(thread_id=job["thread_id"])
+    assert (after["state"], after["goal_id"], after["revision"]) == (
+        "active",
+        replaced["goal_id"],
+        replaced["revision"],
+    )
 
 
 async def test_sweep_cancels_a_stale_round_and_rearms_its_live_goal(store, pool):

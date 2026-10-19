@@ -32,8 +32,10 @@ request timeout (40 seconds): a shorter `AGENT_LEASE_TTL` is ignored in favour
 of the default, and a shorter `--lease-ttl` is refused. A cancellation does not
 end renewal; the lease is kept while the runner releases or drains the turn.
 
-With the first heartbeat at 30 seconds and repeated ten-second read timeouts,
-retry requests start at 30, 45, 60, 75, 90 and 105 seconds after claim. This
+The first heartbeat is sent as soon as the process running the turn starts: the
+lease runs from the claim, and that process's handover and preflight have
+already spent part of it. With repeated ten-second read timeouts, retry requests
+then start at 0, 15, 30, 45, 60, 75, 90 and 105 seconds after it starts. This
 illustrates opportunities to reconnect before the original 120-second lease
 ends; it is not a wall-clock guarantee. HTTP timeout limits apply separately to
 connection, pool, write and read operations. An outage longer than the remaining
@@ -92,10 +94,17 @@ the final `shared_workspace_settled` notice does not fail the turn: the runner
 still submits its successful terminal state. Lease rejection prevents that
 write. Earlier settlement failures remain failures.
 
-Admission and settlement receipts allow **up to three attempts**, using
-ten-second HTTP timeouts and five-second delays. Only transport failures and
-HTTP 408/502/503/504 are retried; 409/410 are definitive. The prompt is sent
-exactly once, after its admission acknowledgement succeeds.
+The control plane's admission and settlement receipts are retried **for as long
+as the lease holds**, using ten-second HTTP timeouts and delays that double from
+one second up to eight. That rides out a control-plane container being
+recreated: however an attempt ends, by a failed finish or the reaper, a turn the
+control plane admitted but never saw settle is marked LOST, even when the
+supervisor had settled it. Retries stop once the heartbeat has lost the lease,
+or after a whole lease of failures from a control plane that keeps renewing it,
+and a failed receipt never tears down a session the supervisor has settled.
+Supervisor settlement allows three attempts, five seconds apart. Only transport
+failures and HTTP 408/502/503/504 are retried; 409/410 are definitive. The
+prompt is sent exactly once, after its admission acknowledgement succeeds.
 
 Supervisor settlement retains the last token's receipt until another activation
 takes ownership. Control-plane settlement returns the recorded boundary only

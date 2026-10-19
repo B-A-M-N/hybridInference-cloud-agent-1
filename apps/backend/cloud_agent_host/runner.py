@@ -67,6 +67,7 @@ from cloud_agent_host.claimed_job import (
     WorkWaitUnsupported as WorkWaitUnsupported,
 )
 from cloud_agent_host.control_plane_client import (
+    _EVENT_RETRY_MAX_DELAY_S,
     _HEARTBEAT_TIMEOUT_S,
     ControlPlane as ControlPlane,
 )
@@ -204,16 +205,21 @@ HEARTBEAT_INTERVAL_S = 30.0
 FIRST_SETTINGS_WAIT_S = 30.0
 # Heartbeats use a short per-request timeout and retry promptly, so a slow
 # control request cannot consume the remaining lease in normal cadence sleeps.
-# Idempotent lifecycle receipts reuse the same short retry interval.
+# Idempotent lifecycle receipts reuse the same short retry interval, except the
+# control plane's admission and settlement, which wait out a restart instead.
 _CONTROL_RETRY_INTERVAL_S = 5.0
+#: Answers a repeated receipt can change: the answer was lost on the way, or
+#: the server was briefly unavailable. Anything else is the receipt refused.
+_RECEIPT_RETRY_STATUSES = frozenset({408, 502, 503, 504})
 #: Heartbeat answers no retry can change. The worker token and the job it names
 #: are fixed for the attempt, so a renewal refused for either is refused every
 #: time, and the lease runs out regardless.
 _HEARTBEAT_REFUSALS = frozenset({401, 403, 404})
-#: The longest lease that still cannot be renewed: the first renewal is sent
-#: one heartbeat interval in and may take a whole request timeout to land, so a
-#: lease no longer than that expires first and every attempt is lost at its
-#: first beat. The control plane itself only requires a positive number.
+#: The longest lease that still cannot be renewed: each renewal after the first
+#: is sent one heartbeat interval after the last and may take a whole request
+#: timeout to land, so a lease no longer than that expires first and every
+#: attempt is lost by its second beat. The control plane itself only requires a
+#: positive number.
 _UNRENEWABLE_LEASE_S = HEARTBEAT_INTERVAL_S + _HEARTBEAT_TIMEOUT_S
 #: How long a host polls before asking again for the wait endpoint a control
 #: plane did not have. Hosts deploy first, so this is the rest of a rollout.
@@ -283,11 +289,48 @@ def _retry_lifecycle_receipt(operation: str, job_id: str, call: Callable[[], Any
                 if isinstance(exc, SessionSupervisorError)
                 else None
             )
-            if attempt == 2 or (status is not None and status not in {408, 502, 503, 504}):
+            if attempt == 2 or (status is not None and status not in _RECEIPT_RETRY_STATUSES):
                 raise
             _log_control_failure(operation, job_id, exc)
             time.sleep(_CONTROL_RETRY_INTERVAL_S)
     raise AssertionError("lifecycle retry exhausted without a result")
+
+
+def _retry_control_receipt(
+    operation: str, job_id: str, call: Callable[[], Any], *, heart: Heartbeater
+) -> Any:
+    """Retry the control plane's admission or settlement receipt while the lease holds.
+
+    A deploy that recreates the control-plane container refuses connections,
+    or its proxy answers 502, for longer than three quick tries cover, and
+    giving up on either receipt failed the turn over a restart. A settlement
+    costs more: however the attempt then ends, by a failed finish or by the
+    lease reaper, the control plane marks an admitted turn it never saw settle
+    lost, though the sandbox holds it settled. So these back off as event
+    uploads do for as long as the lease holds; once the heartbeat has lost it,
+    no receipt can land. A control plane that renews the lease all along but
+    fails the receipt for a whole lease is not restarting, and is given up on.
+    """
+    give_up_at: float | None = None
+    delay = 1.0
+    while True:
+        try:
+            return call()
+        except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+            if (
+                isinstance(exc, httpx.HTTPStatusError)
+                and exc.response.status_code not in _RECEIPT_RETRY_STATUSES
+            ):
+                raise
+            if heart.lease_lost:
+                raise LeaseLost(f"lease lost while retrying {operation}") from exc
+            if give_up_at is None:
+                give_up_at = time.monotonic() + heart.ttl
+            if time.monotonic() + delay > give_up_at:
+                raise
+            _log_control_failure(operation, job_id, exc)
+        time.sleep(delay)
+        delay = min(delay * 2, _EVENT_RETRY_MAX_DELAY_S)
 
 
 # Both are interpolated into a URL and handed to git, which reads a leading
@@ -367,6 +410,11 @@ class Heartbeater:
         self.cancel_requested = False
         self.lease_lost = False
 
+    @property
+    def ttl(self) -> float:
+        """How long each renewal extends the lease."""
+        return self._ttl
+
     def start(self) -> None:
         """Begin heartbeating on a daemon thread."""
         self._thread = threading.Thread(target=self._run, daemon=True, name="agent-heartbeat")
@@ -379,7 +427,11 @@ class Heartbeater:
             self._thread.join(timeout=5)
 
     def _run(self) -> None:
-        delay = self._interval
+        # The first renewal goes out at once. The lease runs from the claim,
+        # and the process running the turn has already spent part of it on its
+        # handover and preflight; a whole interval more let a slow start reach
+        # an expired lease, which the control plane refuses to renew.
+        delay = 0.0
         last_success = time.monotonic()
         failures = 0
         while not self._stop.wait(delay):
@@ -2196,8 +2248,16 @@ def _stage(measurement: operation_profiling.Measurement | None, name: str) -> st
     return name
 
 
-class _RestoreHandBack(Exception):
-    """The sandbox manager could not recreate a moved group; the turn goes back."""
+class _HandBack(Exception):
+    """The sandbox manager refused the turn before anything ran; the turn goes back.
+
+    It could not recreate a moved group, or the group stayed busy past its
+    wait. ``reason`` is the release reason the control plane records.
+    """
+
+    def __init__(self, reason: str, detail: str) -> None:
+        super().__init__(detail)
+        self.reason = reason
 
 
 def _run_shared_live_attempt(
@@ -2403,6 +2463,9 @@ def _run_shared_live_attempt(
     source: _SourcePrefetch | None = None
     lease_token: str | None = None
     settled = False
+    # The sandbox manager has settled the turn: its session is good whatever
+    # the control plane's receipt says next, and no longer leased to this attempt.
+    locally_settled = False
     abandoned = False
     turn_admitted = False
     terminals_suspended = False
@@ -2416,7 +2479,7 @@ def _run_shared_live_attempt(
         nonlocal abandoned
         if abandoned or settled:
             return
-        if supervisor is not None and lease_token is not None:
+        if supervisor is not None and lease_token is not None and not locally_settled:
             try:
                 supervisor.abandon_shared(job.thread_id, token=lease_token, lost=lost)
             except Exception as exc:
@@ -2531,7 +2594,14 @@ def _run_shared_live_attempt(
             )
         except SessionSupervisorError as exc:
             if restore is not None and exc.status_code == 424:
-                raise _RestoreHandBack(str(exc)) from exc
+                raise _HandBack(
+                    RESTORE_FAILED_RELEASE_REASON, f"sandbox restore failed: {exc}"
+                ) from exc
+            if exc.status_code == 409:
+                # The group stayed busy past the sandbox manager's wait: a
+                # snapshot capture can take longer, and the control plane
+                # claims a follow-up whatever the group is doing.
+                raise _HandBack("sandbox_busy", f"sandbox busy: {exc}") from exc
             context_invalid = has_context and exc.status_code == 410
             raise
         lease_token = str(lease["token"])
@@ -2828,12 +2898,19 @@ def _run_shared_live_attempt(
                 job.thread_id, job.ssh_access.with_slot(job.thread_id, ssh_slot), starting=True
             )
         if job.environment is not None:
-            prepared = supervisor.prepare_environment(
-                job.thread_id,
-                job.environment,
-                activation_owner=lease_token,
-                cancelled=lambda: heart.cancel_requested or heart.lease_lost,
-            )
+            try:
+                prepared = supervisor.prepare_environment(
+                    job.thread_id,
+                    job.environment,
+                    activation_owner=lease_token,
+                    cancelled=lambda: heart.cancel_requested or heart.lease_lost,
+                )
+            except SessionSupervisorError:
+                # A Stop kills the running script, and the preparation then
+                # fails. Nothing has reached the CLI yet, so it is no failure.
+                if stopped_before_admission(base_sha):
+                    return 0
+                raise
             control.append_event(
                 NormalizedEvent("lifecycle", {"phase": "environment_prepared", **prepared})
             )
@@ -2963,7 +3040,7 @@ def _run_shared_live_attempt(
         # The last point at which a Stop costs nothing.
         if stopped_before_admission(base_sha):
             return 0
-        _retry_lifecycle_receipt(
+        _retry_control_receipt(
             "prompt_admission_retry",
             job.job_id,
             lambda: control.admit_chat_turn(
@@ -2971,6 +3048,7 @@ def _run_shared_live_attempt(
                 activation_generation=activation_generation,
                 residency_generation=launch.residency_generation,
             ),
+            heart=heart,
         )
         turn_admitted = True
         result_frame: dict[str, Any] | None = None
@@ -3091,7 +3169,8 @@ def _run_shared_live_attempt(
             observed_session_id=local_settle.get("native_session_id"),
             has_context=has_context,
         )
-        _retry_lifecycle_receipt(
+        locally_settled = True
+        _retry_control_receipt(
             "control_settlement_retry",
             job.job_id,
             lambda: control.settle_chat_sandbox(
@@ -3103,6 +3182,7 @@ def _run_shared_live_attempt(
                 base_sha=base_sha,
                 idle_timeout_seconds=idle_timeout_s,
             ),
+            heart=heart,
         )
         settled = True
         if settled_failure:
@@ -3141,12 +3221,14 @@ def _run_shared_live_attempt(
         failure_detail = "attempt lease lost during shared live execution"
         operation_profiling.finish(measurement, outcome="lease_lost", failure_stage=stage)
         return 3
-    except _RestoreHandBack as exc:
-        # Nothing ran and the checkpoint is unchanged: give the group back to
-        # it and the turn back to the queue, for this host or another to try
-        # again. Once the control plane has run out of attempts it marks the
-        # group lost instead, and this turn fails with it.
-        failure_detail = f"sandbox restore failed: {exc}"
+    except _HandBack as exc:
+        # Nothing ran and the chat is unchanged: release the activation, which
+        # gives a group being restored back to its checkpoint, and the turn
+        # back to the queue, for this host or another to try again once the
+        # control plane's retry delay has passed. Once the control plane has
+        # run out of restore attempts it marks the group lost instead, and this
+        # turn fails with it.
+        failure_detail = str(exc)
         _log_control_failure(stage, job.job_id, exc)
         abandoned = True
         try:
@@ -3163,7 +3245,7 @@ def _run_shared_live_attempt(
         if isinstance(group, dict) and group.get("state") == "lost":
             report_failure()
             return 2
-        return 0 if control.release_turn(RESTORE_FAILED_RELEASE_REASON) else 2
+        return 0 if control.release_turn(exc.reason) else 2
     except (DriverError, SandboxError, SessionSupervisorError, WorktreeError) as exc:
         failure_detail = str(exc)
         _log_control_failure(stage, job.job_id, exc)
@@ -4869,7 +4951,7 @@ def _env_float(name: str, fallback: float) -> float:
 
 
 def _lease_ttl_arg(raw: str) -> float:
-    """Parse ``--lease-ttl``, refusing a lease that expires before its first renewal."""
+    """Parse ``--lease-ttl``, refusing a lease that expires before its next renewal."""
     try:
         ttl = float(raw)
     except ValueError as exc:

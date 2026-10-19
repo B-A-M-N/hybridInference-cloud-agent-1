@@ -179,6 +179,8 @@ export const zhCN: Record<TranslationKey, string> = {
   'environment.snapshot.failed': '预构建失败',
   'environment.snapshot.rebuild': '重新预构建',
   'environment.snapshot.delete': '删除安装快照',
+  'environment.snapshot.deleteConfirm':
+    '删除「{name}」的安装快照？重新预构建之前，新任务会从头安装。',
   'environment.snapshot.prebuildAfterTest':
     '测试通过后会为这份安装排一次预构建。锁文件不变时，新任务会直接从它开始。',
   'environment.choose': '选择环境',
@@ -411,6 +413,8 @@ export const zhCN: Record<TranslationKey, string> = {
   'shell.accessRequired.title': '需要 Agent 使用权限',
   'shell.accessRequired.body': '当前账户尚未获得此 Agent 部署的使用权限。',
   'shell.accessRequired.back': '返回控制台',
+  'shell.renderError.title': '无法显示此页面',
+  'shell.renderError.body': '页面中的部分内容渲染失败。请重试，或打开其他对话或页面。',
 
   // ── Sidebar ─────────────────────────────────────────────────────────────
   'sidebar.pinned': '已置顶',
@@ -518,6 +522,9 @@ export const zhCN: Record<TranslationKey, string> = {
   'settings.integrations': '集成',
   'settings.ssh': 'SSH 连接',
   'settings.integrationsDescription': '连接代码托管账号，管理仓库访问权限。',
+  'integrations.disconnectConfirm': '断开 {name}？重新连接之前，Agent 将无法使用它。',
+  'integrations.disconnect': '断开连接',
+  'integrations.cancel': '取消',
   'settings.environments': '环境',
   'settings.environmentsDescription': '管理仓库环境、初始化脚本和个人变量。',
   'settings.helpDescription': '连接仓库、准备环境，然后开始你的第一个对话。',
@@ -1029,6 +1036,7 @@ export const zhCN: Record<TranslationKey, string> = {
   'goal.resumeHint': '继续这个目标,并安排下一轮',
   'goal.editHint': '修改目标;正在跑的这一轮不受影响',
   'goal.clearHint': '移除目标并停止后续自动续跑;对话和执行历史都会保留',
+  'goal.clearConfirm': '清除此目标？后续自动续跑将停止；对话和执行历史都会保留。',
   // 唯一存在的上限是用户自己写的,产品里没有任何地方能改它。
   // 所以「继续」就是解除它的入口,状态条要把这件事说清楚。
   'goal.limitResumeLifts': '点「继续」会解除你为这个目标设置的 {max} 轮上限。',
