@@ -9,10 +9,25 @@ operations it needs rather than on the whole persistence surface.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from datetime import datetime
+
+
+@dataclass(frozen=True, slots=True)
+class DeletionFailureDecision:
+    """Database-authoritative result of a fenced deletion failure transition."""
+
+    recorded: bool
+    retry_scheduled: bool
+    retry_at: datetime | None
+    terminal_reason: str | None
+
+    def __bool__(self) -> bool:
+        """Keep existing truth tests aligned with whether the fence was recorded."""
+        return self.recorded
 
 
 class SandboxRepository(Protocol):
@@ -50,6 +65,31 @@ class SandboxRepository(Protocol):
         """Lease one pending or archive-verified deletion without duplicate workers."""
         ...
 
+    async def update_admin_sandbox_deletion_attempt_stage(
+        self,
+        *,
+        correlation_id: str,
+        stage: str,
+        sandbox_manager_status: int | None = None,
+        cleanup_outcome: str | None = None,
+    ) -> bool:
+        """Record best-effort diagnostics without changing deletion fencing."""
+        ...
+
+    async def finish_admin_sandbox_deletion_attempt(
+        self,
+        *,
+        correlation_id: str,
+        outcome: str,
+        failure_code: str | None = None,
+        sandbox_manager_status: int | None = None,
+        retry_class: str | None = None,
+        retry_scheduled: bool | None = None,
+        cleanup_outcome: str = "not_required",
+    ) -> bool:
+        """Persist one attempt's sanitized result after its business decision."""
+        ...
+
     async def record_admin_sandbox_archive(
         self,
         *,
@@ -74,6 +114,7 @@ class SandboxRepository(Protocol):
         claim_token: str,
         generation: int,
         container_id: str,
+        attempt_correlation_id: str | None = None,
     ) -> bool:
         """Retain the archive and ledger after an exact host deletion acknowledgement."""
         ...
@@ -86,13 +127,27 @@ class SandboxRepository(Protocol):
         claim_token: str,
         generation: int,
         container_id: str,
+        attempt_correlation_id: str | None = None,
         reclaimed_quiet_seconds: float | None = None,
     ) -> bool:
         """Mark native context lost after the host removes a container with no archive.
 
-        With ``reclaimed_quiet_seconds``, finish without the host instead, only
-        when its provider confirmed the machine terminated and the host has
-        been silent that long; otherwise return ``False`` and change nothing.
+        With ``reclaimed_quiet_seconds``, finish without the host only when its
+        provider confirmed the machine terminated and the host has been silent
+        that long. ``attempt_correlation_id`` closes the external attempt in
+        the same fenced transition.
+        """
+        ...
+
+    async def recover_reclaimed_admin_sandbox_discard(
+        self, *, reclaimed_quiet_seconds: float
+    ) -> bool:
+        """Finalize one provider-confirmed discard without claiming another host attempt.
+
+        This recovery remains available after automatic retries stop, whether
+        the bounded budget is exhausted or the failure requires operator
+        action. Provider reclamation and the quiet-host interval fence the
+        state transition; no retry counter is consumed.
         """
         ...
 
@@ -106,8 +161,13 @@ class SandboxRepository(Protocol):
         container_id: str,
         error: str,
         retain_pending: bool = False,
-    ) -> bool:
-        """Release safe pre-archive failures but keep ambiguous deletion fenced."""
+        attempt_correlation_id: str | None = None,
+        failure_code: str | None = None,
+        sandbox_manager_status: int | None = None,
+        retry_class: str | None = None,
+        cleanup_outcome: str = "not_required",
+    ) -> DeletionFailureDecision:
+        """Apply a fenced failure transition and return its persisted retry decision."""
         ...
 
     async def renew_admin_sandbox_deletion_claim(
