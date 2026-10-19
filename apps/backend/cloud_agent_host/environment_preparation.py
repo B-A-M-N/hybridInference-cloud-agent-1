@@ -20,7 +20,22 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from cloud_agent_host.chat_sandbox import RetainedChatBackend
+    from cloud_agent_host.setup import SetupResult
     from cloud_agent_shared.environment import BoundEnvironment
+
+
+def step_state(result: SetupResult, cancel: threading.Event | None) -> str:
+    """Name the state an environment script's finished step is recorded in.
+
+    Cancelling the preparation or test run kills its script, which run_setup
+    then reports as stopped (130): the step was cancelled. A timeout, and any
+    nonzero exit of the script's own, 130 included, failed.
+    """
+    if result.exit_code == 0:
+        return "succeeded"
+    if result.exit_code == 130 and cancel is not None and cancel.is_set():
+        return "cancelled"
+    return "failed"
 
 
 def write_setup_marker(
@@ -157,7 +172,7 @@ class EnvironmentPreparation:
                     phase=phase,
                 )
                 step.update(
-                    state="succeeded" if result.exit_code == 0 else "failed",
+                    state=step_state(result, cancel),
                     exit_code=result.exit_code,
                     duration_seconds=time.monotonic() - started,
                     ran=result.ran,
