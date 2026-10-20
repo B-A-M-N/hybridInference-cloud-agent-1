@@ -46,6 +46,7 @@ from cloud_agent.ports.external.host_bootstrap import (
     BootstrapIntent,
     BootstrapResult,
     DeploymentProfile,
+    RecordedHostState,
 )
 from cloud_agent.sandbox_manager_client import SandboxManagerError
 from cloud_agent.sandbox_manager_routing import sandbox_manager_for_host
@@ -1941,6 +1942,100 @@ class ComputeReconciler:
             observation = receipt.observation or await provider.inspect(ref)
         return observation
 
+    async def _remove_superseded(
+        self, operation: dict[str, Any], host: dict[str, Any], sandbox_manager: Any
+    ) -> list[dict[str, Any]]:
+        """Remove the containers this Host's groups left behind; return what it still holds.
+
+        A group handed over by its checkpoint, or restored elsewhere since,
+        leaves its stopped container here, and release refuses a Host that
+        holds one. Only those the control plane proves superseded go
+        (``SUPERSEDED_CONTAINER_SQL``), whether or not the group's chats ever
+        run again, and only once that proof is recorded under the group's row
+        lock (``authorize_superseded_removals``): a group that became ``lost``
+        first keeps its container. Each goes by its exact id through the
+        Sandbox Manager's discard, which requires it stopped and idle under
+        the reported generation, and records the request before Docker
+        removes it. A retry sends what was authorized under the same request
+        id, and one that finds the container gone completes. So does a removal
+        the Host carried out but whose answer was lost: the container no
+        longer shows, and its receipt is fetched again before release goes on.
+        """
+        held = await sandbox_manager.list_sandboxes()
+        stopped = [
+            row
+            for row in held
+            if row.get("running") is False
+            and type(row.get("generation")) is int
+            and all(
+                isinstance(row.get(key), str) and row[key]
+                for key in ("sandbox_id", "container_id", "origin_thread_id")
+            )
+        ]
+        superseded = await self.repository.authorize_superseded_removals(
+            host=str(host["host"]), containers=stopped, operation_id=str(operation["id"])
+        )
+        if not superseded:
+            return held
+        for container in superseded:
+            request_id = container["request_id"]
+            try:
+                receipt = await sandbox_manager.discard_sandbox_deletion(
+                    container["origin_thread_id"],
+                    {
+                        "request_id": request_id,
+                        "generation": container["generation"],
+                        "expected_container_id": container["container_id"],
+                        "sandbox_id": container["sandbox_id"],
+                    },
+                )
+            except SandboxManagerError as exc:
+                status = exc.status_code
+                # Busy, unreachable or overloaded passes; the request is the
+                # same one next time. A refusal of the request itself waits
+                # for an administrator.
+                retryable = status <= 0 or status in {408, 409, 425, 429} or status >= 500
+                raise ProviderError(
+                    "superseded_container_not_removed",
+                    "A container this Host's groups left behind could not be removed yet"
+                    if retryable
+                    else "The Host refused to remove a container its groups left behind",
+                    retryable=retryable,
+                ) from None
+            if (
+                receipt.get("deleted") is not True
+                or receipt.get("request_id") != request_id
+                or receipt.get("container_id") != container["container_id"]
+            ):
+                raise ProviderError(
+                    "superseded_container_not_removed",
+                    "The Host did not confirm removing a container its groups left behind",
+                )
+            await self.repository.record_superseded_removal(request_id=request_id)
+            logger.info(
+                "superseded_container_removed",
+                extra={
+                    "event": "superseded_container_removed",
+                    "host": host["host"],
+                    "sandbox_id": container["sandbox_id"],
+                    "generation": container["generation"],
+                },
+            )
+        return await sandbox_manager.list_sandboxes()
+
+    async def _count_superseded(
+        self, operation: dict[str, Any], allocation: dict[str, Any]
+    ) -> None:
+        """Report how many left-behind containers this machine's Hosts confirmed removed.
+
+        Read from the durable record, so a pass that stopped after some
+        removals were confirmed loses none of them.
+        """
+        hosts = [str(host["host"]) for host in allocation.get("hosts", [])]
+        removed = await self.repository.superseded_removals(hosts=hosts)
+        if removed and operation.get("result", {}).get("superseded_removed") != removed:
+            await self._checkpoint(operation, "checking_retention", {"superseded_removed": removed})
+
     async def _verify_empty_inventory(
         self, operation: dict[str, Any], allocation: dict[str, Any]
     ) -> None:
@@ -1955,13 +2050,16 @@ class ComputeReconciler:
             if sandbox_manager is None:
                 continue  # A trusted full-node scan below must prove this host empty.
             try:
-                if await sandbox_manager.list_sandboxes():
-                    raise ProviderError(
-                        "retained_groups_present",
-                        "The sandbox manager still reports retained sandbox state",
-                    )
+                retained = await self._remove_superseded(operation, host, sandbox_manager)
             except SandboxManagerError:
                 continue  # Never infer emptiness; require the full-node scan below.
+            finally:
+                await self._count_superseded(operation, allocation)
+            if retained:
+                raise ProviderError(
+                    "retained_groups_present",
+                    "The sandbox manager still reports retained sandbox state",
+                )
         # This control plane reaches a registering node only through the key
         # its registration supplied, and binds a Host only after pinning it.
         # A node that never registered, with no key and no Host, never ran
@@ -1978,9 +2076,13 @@ class ComputeReconciler:
                 and node["id"] not in bound
             ):
                 continue
-            proof = await self.bootstrap.inventory(
-                self._node(node), profile, self._bootstrap_intent(operation, allocation, node)
+            intent = self._bootstrap_intent(operation, allocation, node)
+            # Receipts the Host keeps of what the control plane recorded, and
+            # nothing else, are not retained state.
+            receipts = RecordedHostState.model_validate(
+                await self.repository.recorded_host_state(host=intent.host)
             )
+            proof = await self.bootstrap.inventory(self._node(node), profile, intent, receipts)
             if (
                 not proof.complete
                 or proof.retained_containers

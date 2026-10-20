@@ -27,7 +27,9 @@ from cloud_agent.domain.compute import (
 from cloud_agent.storage._sql.compute_admission import host_compute_admission, lock_compute_entry
 from cloud_agent.storage._sql.hosts import (
     GROUP_TURN_CLAIMED_SQL,
+    HANDED_OVER_GROUP_SQL,
     HOST_RETAINED_GROUP,
+    authorize_superseded_removals,
     lock_hosts_for_revocation,
     release_covered_sandboxes,
     revoke_host_credentials,
@@ -2009,10 +2011,34 @@ class PostgresComputeResourceRepository:
                 await self._release_terminal_autoscaling_reservation(conn, allocation_id)
                 if row["observed_state"] == "terminated":
                     await self._release_terminated_groups(conn, allocation_id)
+                if row["desired_state"] == "absent" and row["release_committed_at"] is None:
+                    await self._resume_blocked_retirement(conn, allocation_id)
                 row = await conn.fetchrow(
                     "SELECT * FROM agent_compute_allocations WHERE id=$1", allocation_id
                 )
             return _row(row)
+
+    @staticmethod
+    async def _resume_blocked_retirement(conn: Any, allocation_id: str) -> None:
+        """Queue again a release that stopped for attention once its machine is gone.
+
+        A release blocked by what the Host still held waits for an
+        administrator, but the provider ending the machine settles it: the
+        next run finds the resource terminal and commits the release
+        (``_settle_terminal_retirement``). Without this the operation stayed
+        blocked, and the allocation unreleased, after the machine was gone.
+        A pool member's terminal release settles through its reservation.
+        """
+        await conn.execute(
+            """UPDATE agent_compute_operations o
+               SET state='pending',next_attempt_at=NOW(),completed_at=NULL,updated_at=NOW()
+               WHERE o.allocation_id=$1 AND o.kind='retire' AND o.state='blocked'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM agent_cloudlab_autoscaling_members m
+                     WHERE m.allocation_id=o.allocation_id
+                 )""",
+            allocation_id,
+        )
 
     @staticmethod
     async def _release_terminated_groups(conn: Any, allocation_id: str) -> None:
@@ -2756,6 +2782,72 @@ class PostgresComputeResourceRepository:
                 )
             )
 
+    async def authorize_superseded_removals(
+        self, *, host: str, containers: list[dict[str, Any]], operation_id: str
+    ) -> list[dict[str, Any]]:
+        """Record which containers ``host`` reports its moved groups left behind.
+
+        See :func:`~cloud_agent.storage._sql.hosts.authorize_superseded_removals`.
+        """
+        async with self._pool.acquire() as conn, conn.transaction():
+            return await authorize_superseded_removals(conn, host, containers, operation_id)
+
+    async def record_superseded_removal(self, *, request_id: str) -> None:
+        """Record that the Host confirmed an authorized removal."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE agent_superseded_container_removals SET removed_at = NOW() "
+                "WHERE request_id = $1 AND removed_at IS NULL",
+                request_id,
+            )
+
+    async def superseded_removals(self, *, hosts: list[str]) -> int:
+        """Count the confirmed removals of containers left behind on ``hosts``."""
+        async with self._pool.acquire() as conn:
+            return int(
+                await conn.fetchval(
+                    "SELECT count(*) FROM agent_superseded_container_removals "
+                    "WHERE host = ANY($1::text[]) AND removed_at IS NOT NULL",
+                    hosts,
+                )
+            )
+
+    async def recorded_host_state(self, *, host: str) -> dict[str, Any]:
+        """The receipts ``host`` keeps on disk that the control plane recorded.
+
+        Each sandbox's latest checkpoint captured there, and each confirmed
+        removal of a container left behind there. See ``RecordedHostState``.
+        """
+        async with self._pool.acquire() as conn:
+            checkpoints = await conn.fetch(
+                """SELECT DISTINCT ON (sandbox_id)
+                          id AS checkpoint_id, sandbox_id, generation, container_id,
+                          base_image, runtime_id, runtime_version, object_key,
+                          object_version_id AS version_id, sha256, size_bytes,
+                          new_layer_bytes, layer_count, format_version, start_seq
+                   FROM agent_sandbox_checkpoints WHERE host = $1
+                   ORDER BY sandbox_id, captured_at DESC, recorded_at DESC""",
+                host,
+            )
+            removals = await conn.fetch(
+                "SELECT request_id, origin_thread_id, sandbox_id, generation, container_id "
+                "FROM agent_superseded_container_removals "
+                "WHERE host = $1 AND removed_at IS NOT NULL ORDER BY request_id",
+                host,
+            )
+        return {
+            "checkpoints": {str(row["sandbox_id"]): dict(row) for row in checkpoints},
+            "removals": {
+                str(row["request_id"]): {
+                    "thread_id": str(row["origin_thread_id"]),
+                    "sandbox_id": str(row["sandbox_id"]),
+                    "generation": int(row["generation"]),
+                    "container_id": str(row["container_id"]),
+                }
+                for row in removals
+            },
+        }
+
     async def move_out_report(self, *, allocation_id: str) -> dict[str, Any]:
         """Whether this allocation's groups are moving out, why not, and what stays.
 
@@ -3242,12 +3334,17 @@ class PostgresComputeResourceRepository:
             reasons.append("placement_pinned")
         if any(host["drain_fence_active"] for host in allocation["hosts"]):
             reasons.append("deployment_drain_active")
+        # A group handed over lives in its checkpoint, whatever host it still
+        # names; the container it left here goes before the inventory below.
         groups = await conn.fetch(
-            "SELECT id,host,state,active_operation_count FROM agent_sandboxes "
-            "WHERE host=ANY($1::text[]) AND deletion_state<>'deleted'",
+            f"""SELECT g.id,g.host,g.state,g.active_operation_count,
+                       {HANDED_OVER_GROUP_SQL} AS handed_over
+                FROM agent_sandboxes g
+                WHERE g.host=ANY($1::text[]) AND g.deletion_state<>'deleted'""",
             hosts,
         )
-        if groups:
+        retained = [g for g in groups if not g["handed_over"]]
+        if retained:
             reasons.append("retained_groups_present")
         if any(g["active_operation_count"] for g in groups):
             reasons.append("workspace_operations_present")
@@ -3301,7 +3398,10 @@ class PostgresComputeResourceRepository:
             "deployment_profile_configured": bool(allocation["deployment_profile"]),
             "nodes": allocation["nodes"],
             "hosts": allocation["hosts"],
-            "retained_groups": [dict(g) for g in groups],
+            "retained_groups": [
+                {key: g[key] for key in ("id", "host", "state", "active_operation_count")}
+                for g in retained
+            ],
             "active_attempts": attempts,
             "active_forks": forks,
             "blocked_reasons": list(dict.fromkeys(reasons)),

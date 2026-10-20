@@ -27,6 +27,7 @@ from cloud_agent.ports.external.host_bootstrap import (
     BootstrapResult,
     HostInventory,
     PreflightResult,
+    RecordedHostState,
     TransferResult,
 )
 from cloud_agent.providers.compute.ssh import known_hosts_line
@@ -1057,14 +1058,22 @@ class SshHostBootstrap:
         )
 
     async def inventory(
-        self, node: NodeObservation, profile: DeploymentProfile, intent: BootstrapIntent
+        self,
+        node: NodeObservation,
+        profile: DeploymentProfile,
+        intent: BootstrapIntent,
+        recorded: RecordedHostState | None = None,
     ) -> HostInventory:
         """Read complete Docker and retained state without deleting or adopting it."""
         params = self._params(profile, intent)
         script = (
             "sudo -n python3 -c " + shlex.quote(_INVENTORY) + " " + shlex.quote(json.dumps(params))
         )
-        result = self._json(await self._transport.run(self._connection(node), script, timeout=60))
+        # The records grow with the Host's history; the command line must not.
+        records = (recorded or RecordedHostState()).model_dump_json().encode()
+        result = self._json(
+            await self._transport.run(self._connection(node), script, stdin=records, timeout=60)
+        )
         return HostInventory.model_validate(result)
 
     async def stop(
@@ -1466,7 +1475,7 @@ print(json.dumps({'wiped': removed and started}))
 
 
 _INVENTORY = r"""
-import json, shutil, subprocess, sys
+import hashlib, json, shutil, subprocess, sys
 from pathlib import Path
 params = json.loads(sys.argv[1])
 root = Path(params['root'])
@@ -1498,8 +1507,62 @@ else:
         # are inert. Another host, nested same-named file, or a symlink can
         # hide retained state and must never be excused by its basename.
         inert = {state / 'credential', state / '.enroll.lock'}
+        # Besides them, only receipts the control plane recorded exactly: the
+        # latest checkpoint of each sandbox (its data is in object storage),
+        # and each confirmed removal of a container a moved group left behind.
+        # Anything else in the archive state, finished or not, still counts.
+        archives = state / 'sandbox-archives'
+        recorded = json.loads(sys.stdin.read() or '{}')
+        def digest(value):
+            return hashlib.sha256(str(value).encode()).hexdigest()
+        checkpoints = {digest(sandbox): expected for sandbox, expected in (recorded.get('checkpoints') or {}).items()}
+        removals = {digest(request): dict(expected, request_id=request) for request, expected in (recorded.get('removals') or {}).items()}
+        def receipt(path):
+            try:
+                value = json.loads(path.read_text())
+            except (OSError, ValueError):
+                return None
+            return value if isinstance(value, dict) else None
+        def removed(directory, expected):
+            # The two receipts the Sandbox Manager's discard leaves, exactly as
+            # it writes them for this request: the container it removed, or one
+            # it proved already absent.
+            if directory.is_symlink() or sorted(p.name for p in directory.iterdir()) != ['discard.json', 'discarded.json']:
+                return False
+            started, finished = receipt(directory / 'discard.json'), receipt(directory / 'discarded.json')
+            identity = {
+                'thread_id': expected['thread_id'], 'request_id': expected['request_id'],
+                'generation': expected['generation'], 'container_id': expected['container_id'],
+                'archive_key': '',
+            }
+            if started is None or started.get('identity') != identity:
+                return False
+            if started.get('target_absent') is True:
+                return (
+                    started == {'identity': identity, 'sandbox_id': expected['sandbox_id'], 'target_absent': True}
+                    and finished == {'identity': identity, 'sandbox_id': expected['sandbox_id']}
+                )
+            spec = started.get('spec')
+            return (
+                set(started) == {'identity', 'spec'} and isinstance(spec, dict)
+                and spec.get('sandbox_id') == expected['sandbox_id']
+                and spec.get('generation') == expected['generation']
+                and finished == {'identity': identity}
+            )
+        def accounted(path):
+            if path.parent == archives / 'checkpoints' and path.suffix == '.json':
+                # The latest checkpoint the control plane holds for that
+                # sandbox from this Host, every recorded field the same.
+                expected, value = checkpoints.get(path.stem), receipt(path)
+                return (
+                    expected is not None and value is not None
+                    and all(key in value and value[key] == expected[key] for key in expected)
+                )
+            if path.parent.parent == archives and path.parent.name in removals:
+                return removed(path.parent, removals[path.parent.name])
+            return False
         paths = list(state_root.rglob('*')) if state_root.exists() else []
-        unexpected = state_root.is_symlink() or any(p.is_symlink() or (not p.is_dir() and p not in inert) for p in paths)
+        unexpected = state_root.is_symlink() or any(p.is_symlink() or (not p.is_dir() and p not in inert and not accounted(p)) for p in paths)
         legacy = Path('/var/lib/hybridinference')
         result['orphan_state'] = bool(networks or volumes or unexpected or (legacy.exists() and any(legacy.iterdir())))
         result['complete'] = True

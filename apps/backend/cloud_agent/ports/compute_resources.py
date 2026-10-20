@@ -466,6 +466,24 @@ class ComputeResourceRepository(Protocol):
         """Mark LOST each group that went with a machine its provider reclaimed."""
         ...
 
+    async def authorize_superseded_removals(
+        self, *, host: str, containers: list[dict[str, Any]], operation_id: str
+    ) -> list[dict[str, Any]]:
+        """Record which containers ``host`` reports its moved groups left behind."""
+        ...
+
+    async def record_superseded_removal(self, *, request_id: str) -> None:
+        """Record that the Host confirmed an authorized removal."""
+        ...
+
+    async def superseded_removals(self, *, hosts: list[str]) -> int:
+        """Count the confirmed removals of containers left behind on ``hosts``."""
+        ...
+
+    async def recorded_host_state(self, *, host: str) -> dict[str, Any]:
+        """The receipts ``host`` keeps on disk that the control plane recorded."""
+        ...
+
     async def running_attempts(self, *, host: str) -> int:
         """Count the turns a Host is executing now."""
         ...
