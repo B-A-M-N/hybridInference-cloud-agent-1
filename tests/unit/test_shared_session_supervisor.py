@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import stat
 import subprocess
 import tarfile
@@ -2513,6 +2514,22 @@ def test_fork_copies_a_private_home_without_widening_either_side(tmp_path: Path,
     source = manager.local(source_home)
     (source / "sessions").mkdir()
     (source / "sessions/rollout.jsonl").write_text('{"id":"native-source"}\n')
+    if runtime_id == "codex":
+        index = sqlite3.connect(source / "state_5.sqlite")
+        index.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)")
+        index.executemany(
+            "INSERT INTO threads (id, rollout_path) VALUES (?, ?)",
+            [
+                ("native-source", str(source / "sessions/rollout.jsonl")),
+                ("codex fork child", str(source / "sessions/child-rollout.jsonl")),
+                ("unrelated", "/outside/source/home/rollout.jsonl"),
+                ("prefix collision", str(source) + "-sibling/rollout.jsonl"),
+            ],
+        )
+        index.commit()
+        index.close()
+        (source / "sessions/child-rollout.jsonl").write_text("child\n")
+        (source / "state_5.sqlite").chmod(0o600)
     (source / ".hidden").write_text("dotfile")
     (source / "tmp").mkdir(exist_ok=True)
     (source / "tmp/scratch").write_text("never copied")
@@ -2528,6 +2545,14 @@ def test_fork_copies_a_private_home_without_widening_either_side(tmp_path: Path,
     assert stat.S_IMODE(source.stat().st_mode) == 0o700
     assert manager.calls == [("exec", None), ("pipe", MEMBER_UID_BASE + 0, MEMBER_UID_BASE + 2)]
     assert (child / "sessions/rollout.jsonl").read_text() == '{"id":"native-source"}\n'
+    if runtime_id == "codex":
+        child_index = sqlite3.connect(f"file:{child / 'state_5.sqlite'}?mode=ro", uri=True)
+        paths = dict(child_index.execute("SELECT id, rollout_path FROM threads"))
+        child_index.close()
+        assert paths["native-source"] == str(child / "sessions/rollout.jsonl")
+        assert paths["codex fork child"] == str(child / "sessions/child-rollout.jsonl")
+        assert paths["unrelated"] == "/outside/source/home/rollout.jsonl"
+        assert paths["prefix collision"] == str(source) + "-sibling/rollout.jsonl"
     assert (child / ".hidden").read_text() == "dotfile"
     assert list((child / "tmp").iterdir()) == []
     assert (child / ".freeinference-member-state-v1").exists()
