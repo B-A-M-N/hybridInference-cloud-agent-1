@@ -96,7 +96,15 @@ try:
     changed = 0
     for thread_id, rollout_path in rows:
         if isinstance(rollout_path, str) and rollout_path.startswith(prefix):
-            rebased = str(target) + rollout_path[len(source):]
+            suffix = rollout_path[len(source):]
+            relative = Path(rollout_path).relative_to(source)
+            if not relative.parts or ".." in relative.parts:
+                raise SystemExit("Codex fork rollout path escaped its private home")
+            rebased = str(target) + suffix
+            try:
+                Path(rebased).resolve(strict=False).relative_to(target)
+            except ValueError:
+                raise SystemExit("Codex fork rollout path escaped its private home") from None
             connection.execute(
                 "UPDATE threads SET rollout_path = ? WHERE id = ?",
                 (rebased, thread_id),

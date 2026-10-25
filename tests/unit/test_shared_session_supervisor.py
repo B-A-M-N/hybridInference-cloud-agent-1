@@ -2526,6 +2526,13 @@ def test_fork_copies_a_private_home_without_widening_either_side(tmp_path: Path,
                 ("codex fork child", str(source / "sessions/child-rollout.jsonl")),
                 ("unrelated", "/outside/source/home/rollout.jsonl"),
                 ("prefix collision", str(source) + "-sibling/rollout.jsonl"),
+                (
+                    "already target-rooted",
+                    str(
+                        manager.local(factory._member_state_dir(target_launch))
+                        / "sessions/target.jsonl"
+                    ),
+                ),
             ],
         )
         index.commit()
@@ -2563,6 +2570,9 @@ def test_fork_copies_a_private_home_without_widening_either_side(tmp_path: Path,
         assert paths["codex fork child"] == str(child / "sessions/child-rollout.jsonl")
         assert paths["unrelated"] == "/outside/source/home/rollout.jsonl"
         assert paths["prefix collision"] == str(source) + "-sibling/rollout.jsonl"
+        assert paths["already target-rooted"] == str(
+            manager.local(factory._member_state_dir(target_launch)) / "sessions/target.jsonl"
+        )
         assert Path(paths["native-source"]).read_text() == '{"id":"native-source"}\n'
         assert Path(paths["codex fork child"]).read_text() == "child\n"
         Path(paths["codex fork child"]).write_text("child changed\n")
@@ -2615,6 +2625,42 @@ def test_codex_rollout_rebase_failure_rolls_back_target_index(tmp_path: Path):
     child_index.close()
     assert paths == {"first": str(rollout), "second": str(rollout)}
     assert rollout.read_text() == "source rollout\n"
+
+
+def test_codex_rollout_rebase_rejects_parent_traversal(tmp_path: Path):
+    _private_state_root(tmp_path)
+    manager = _LocalMemberShell(tmp_path)
+    factory = ResidentTransportFactory(manager)  # type: ignore[arg-type]
+    source_launch = replace(
+        _launch("athr_source", native_session_id="native-source", slot=0), runtime_id="codex"
+    )
+    target_launch = replace(
+        _launch("athr_child", native_session_id=None, slot=2), runtime_id="codex"
+    )
+    factory._prepare_member_state(_spec(), source_launch, factory._member_state_dir(source_launch))
+    source = manager.local(factory._member_state_dir(source_launch))
+    (source / "sessions").mkdir()
+    (source / "sessions/rollout.jsonl").write_text("source rollout\n")
+    escaped = str(source / "../outside/rollout.jsonl")
+    index_path = source / "state_5.sqlite"
+    index = sqlite3.connect(index_path)
+    index.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)")
+    index.execute("INSERT INTO threads (id, rollout_path) VALUES (?, ?)", ("escape", escaped))
+    index.commit()
+    index.close()
+    source_index_before = index_path.read_bytes()
+
+    with pytest.raises(DriverError, match="state could not be materialized"):
+        factory._clone_private_member_state(_spec(), source_launch, target_launch)
+
+    assert index_path.read_bytes() == source_index_before
+    child_index = sqlite3.connect(
+        manager.local(factory._member_state_dir(target_launch)) / "state_5.sqlite"
+    )
+    assert child_index.execute(
+        "SELECT rollout_path FROM threads WHERE id = 'escape'"
+    ).fetchone() == (escaped,)
+    child_index.close()
 
 
 @pytest.fixture
